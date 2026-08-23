@@ -968,3 +968,201 @@ describe('LivePreview — a live preview is left alone', () => {
     expect(container.textContent).not.toMatch(/asleep/i)
   })
 })
+
+// ---------------------------------------------------------------------------------------
+// R16 / R18 — THE COVER (U12)
+//
+// On 2026-08-18 a full-screen framework compile-error screen filled this pane for ~66 seconds
+// in each of three builds, in front of a client. This is the fix, and it is a fix that reaches
+// apps ALREADY BUILT: the pane covers its own frame from the outside, so nothing about the
+// app — its Next version, its files, its image — is consulted or changed.
+//
+// Every absence assertion below is paired with a liveness assertion in the same test. A
+// `queryBy(...).toBeNull()` also passes when the component threw, and this file is exactly the
+// place that would go unnoticed.
+// ---------------------------------------------------------------------------------------
+
+const HOLDING = /Putting the latest change together/i
+const HOLDING_SLOW = /taking longer than usual — it will appear here/i
+// Mirrors `HOLDING_ESCALATE_MS` in the component. Kept as a literal on purpose: a test that
+// imports the constant it is pinning asserts only that the code equals itself.
+const ESCALATE_MS = 20000
+
+/** The cover is an opaque, full-bleed element over the frame. Identified by what makes it a
+ *  cover rather than by a test id, so a refactor that stops covering fails here. */
+function coverEl(container) {
+  return [...container.querySelectorAll('div')].find(
+    (el) =>
+      el.className.includes('absolute inset-0') &&
+      el.textContent &&
+      (HOLDING.test(el.textContent) || HOLDING_SLOW.test(el.textContent)),
+  )
+}
+
+describe('LivePreview — the cover (R16/R18): the framework error screen is never seen', () => {
+  it('covers the frame when the app fails to compile, and shows the holding state (AE10)', () => {
+    const { container } = setup({ compileState: 'failed' })
+
+    const cover = coverEl(container)
+    expect(cover).toBeTruthy()
+    expect(cover.textContent).toMatch(HOLDING)
+    // The frame stays MOUNTED underneath — covering is not unmounting. Unmounting it would
+    // throw away the document that is about to recover, and would make the HMR socket that
+    // recovers it reconnect from scratch.
+    expect(container.querySelector('iframe')).toBeTruthy()
+    // …and nothing from the framework's own screen is reproduced here. This pane renders one
+    // sentence; it never renders error text, a file path, or a stack.
+    expect(container.textContent).not.toMatch(/unhandled runtime error|module not found|\.tsx/i)
+  })
+
+  it('covers an app built before any of this shipped — no version is ever consulted (AE14)', () => {
+    // THE FLEET ASSERTION. The cover takes no prop describing the app, its framework version or
+    // its image; it is driven purely by a signal about compilation. That is what makes it the
+    // only mechanism that reaches the apps already out there, and this test fails the moment
+    // someone gates it on something the existing fleet cannot report.
+    const { container, rerender } = setup({ compileState: 'failed' })
+    expect(coverEl(container)).toBeTruthy()
+
+    rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="clean" />)
+    expect(coverEl(container)).toBeFalsy()
+    expect(container.querySelector('iframe')).toBeTruthy() // liveness: the pane still renders
+  })
+
+  it('HOLDS the cover when the signal goes unknown — absent is never good news', () => {
+    // The fail-closed arm, and the single most important assertion in this file. `unknown` is
+    // what a container reports when nothing has connected, when the socket is down, and — for
+    // every app provisioned before the signal existed — permanently. Clearing on it would
+    // uncover the exact screen this cover exists to hide.
+    const { container, rerender } = setup({ compileState: 'failed' })
+    expect(coverEl(container)).toBeTruthy()
+
+    rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="unknown" />)
+    expect(coverEl(container)).toBeTruthy()
+    expect(container.querySelector('iframe')).toBeTruthy()
+  })
+
+  it('holds the cover DOWN on unknown too — fail-closed means hold, not raise', () => {
+    // The other direction, and it matters just as much: an unknown reading must not throw a
+    // holding card over a perfectly healthy app the citizen is using.
+    const { container, rerender } = setup({ compileState: 'clean' })
+    expect(coverEl(container)).toBeFalsy()
+
+    rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="unknown" />)
+    expect(coverEl(container)).toBeFalsy()
+    expect(container.querySelector('iframe')).toBeTruthy()
+  })
+
+  it('holds the cover down when nothing has been reported at all', () => {
+    // `null` is "no signal on this turn", which is how the pane behaved before the cover
+    // existed. It must not raise a cover nobody asked for.
+    const { container } = setup({ compileState: null })
+    expect(coverEl(container)).toBeFalsy()
+    expect(container.querySelector('iframe')).toBeTruthy()
+  })
+
+  it('clears the cover on an affirmative clean, and stops intercepting the frame', () => {
+    const { container, rerender } = setup({ compileState: 'building' })
+    expect(coverEl(container)).toBeTruthy()
+
+    rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="clean" />)
+    expect(coverEl(container)).toBeFalsy()
+    // Cleared means GONE, not transparent: an invisible element over the frame would swallow
+    // every click the citizen makes on their own app.
+    expect(container.querySelector('iframe')).toBeTruthy()
+  })
+
+  it('escalates the wording exactly once, at the pinned interval, and never again', () => {
+    vi.useFakeTimers()
+    try {
+      const { container } = setup({ compileState: 'building' })
+      expect(coverEl(container).textContent).toMatch(HOLDING)
+
+      act(() => vi.advanceTimersByTime(ESCALATE_MS - 1))
+      expect(coverEl(container).textContent).toMatch(HOLDING)
+
+      act(() => vi.advanceTimersByTime(1))
+      expect(coverEl(container).textContent).toMatch(HOLDING_SLOW)
+
+      // A card that keeps re-narrating itself reads as broken. There is one escalation.
+      act(() => vi.advanceTimersByTime(ESCALATE_MS * 3))
+      expect(coverEl(container).textContent).toMatch(HOLDING_SLOW)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('re-arms the escalation for a NEW cover rather than opening in a stale complaint', () => {
+    vi.useFakeTimers()
+    try {
+      const { container, rerender } = setup({ compileState: 'building' })
+      act(() => vi.advanceTimersByTime(ESCALATE_MS))
+      expect(coverEl(container).textContent).toMatch(HOLDING_SLOW)
+
+      rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="clean" />)
+      rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="failed" />)
+      expect(coverEl(container).textContent).toMatch(HOLDING)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('covers a fresh mount mid-build — a manual page refresh must not land on the error screen', () => {
+    // Reloading the tab while a build is running remounts this component from nothing. The
+    // cover is derived from the CURRENT signal, not from a transition, so the very first paint
+    // after a refresh is already covered.
+    const { container } = setup({ compileState: 'failed' })
+    expect(coverEl(container)).toBeTruthy()
+    expect(container.querySelector('iframe')).toBeTruthy()
+  })
+
+  it('loses to a restore in flight — the restoring card wins and no cover is drawn', () => {
+    const { container } = setup({ compileState: 'failed', relaunching: true })
+    expect(screen.getAllByText(/Restoring your app/i).length).toBeGreaterThan(0) // liveness for the winner
+    expect(coverEl(container)).toBeFalsy()
+  })
+
+  it('loses to a terminal session and to a container that is not serving', () => {
+    const terminal = render(<LivePreview previewUrl={SANDBOX_URL} status="ended" compileState="failed" />)
+    expect(coverEl(terminal.container)).toBeFalsy()
+    expect(terminal.container.textContent).toMatch(/preview/i) // liveness: the placeholder rendered
+    cleanup()
+
+    const asleep = render(
+      <LivePreview previewUrl={SANDBOX_URL} status="ready" previewState="asleep" compileState="failed" />,
+    )
+    expect(coverEl(asleep.container)).toBeFalsy()
+    expect(screen.getAllByText(/Your workspace is asleep/i).length).toBeGreaterThan(0) // liveness
+  })
+
+  it('beats the frame-load wait: two waits are never on screen at once', () => {
+    // `showLoading` is true here (the frame is mounted and its `load` has not fired), and so is
+    // the cover. The file's existing rule is that the waits share one anchor so they can never
+    // co-exist; the cover joins that rule rather than becoming a third card stacked on them.
+    const { container } = setup({ compileState: 'building' })
+    expect(coverEl(container)).toBeTruthy()
+    expect(screen.queryByText(/Starting your app/i)).toBeNull()
+    expect(container.querySelector('iframe')).toBeTruthy() // liveness
+  })
+
+  it('announces the holding state through the pane’s ONE live region, and gives it back', () => {
+    const { container, rerender } = setup({ compileState: 'failed' })
+    const regions = container.querySelectorAll('[role="status"]')
+    expect(regions).toHaveLength(1) // no second live region is introduced
+    expect(regions[0].textContent).toMatch(HOLDING)
+
+    rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="clean" />)
+    expect(container.querySelectorAll('[role="status"]')).toHaveLength(1)
+    expect(container.querySelector('[role="status"]').textContent).not.toMatch(HOLDING)
+  })
+
+  it('announces the escalated wording too, rather than going quiet as the wait gets longer', () => {
+    vi.useFakeTimers()
+    try {
+      const { container } = setup({ compileState: 'building' })
+      act(() => vi.advanceTimersByTime(ESCALATE_MS))
+      expect(container.querySelector('[role="status"]').textContent).toMatch(HOLDING_SLOW)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})

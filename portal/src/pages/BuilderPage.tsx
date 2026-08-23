@@ -30,6 +30,7 @@ import { usePendingAttachments } from '../hooks/usePendingAttachments'
 import type { PendingAttachment } from '../utils/attachmentInput'
 import { startTurn, readTurnStream, buildFromPlan, switchMode, stopTurn, TurnStartError } from '../utils/turnStreamApi'
 import { isKnownFrame } from '../utils/turnStreamApi'
+import type { CompileState } from '../utils/compileState'
 import type { TurnFrame, PlanOptionsItem, StepItem, ConversationMode, DiagnosticFrame, StreamOutcome, BuildFromPlanOutcome } from '../utils/turnStreamApi'
 import { narrativeEnvelopes, narrativeStatus } from '../utils/turnNarrative'
 import type { TurnNarrative } from '../utils/turnNarrative'
@@ -385,6 +386,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const [turnSteps, setTurnSteps] = useState<Record<string, StepItem>>({})
   const [turnWorkspace, setTurnWorkspace] = useState<TurnNarrative['workspace']>(null)
   const [turnPreview, setTurnPreview] = useState<TurnNarrative['preview']>({ url: null, state: null })
+  // R17/R18 — what the app's dev server is compiling, streamed on the turn feed. `null` until
+  // the container reports, which for an app on an image predating the signal is forever — and
+  // `unknown` when it reported that it could not tell. The pane HOLDS its cover on both; this
+  // page's only job is to carry the value through without interpreting it.
+  const [turnCompile, setTurnCompile] = useState<CompileState | null>(null)
   const [turnDiagnostics, setTurnDiagnostics] = useState<DiagnosticFrame[]>([])
   // Read inside async callbacks that outlive their render (the build watcher's terminal),
   // where the closed-over state value would be whatever it was when the build STARTED.
@@ -505,6 +511,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     setTurnDiagnostics([])
     setTurnQuota(null)
     setTurnWorkspace(null)
+    // Deliberately reset to `null` rather than to `'clean'`: a new turn has learned NOTHING
+    // about compilation yet, and starting it at clean would uncover a preview whose app may
+    // still be broken from the turn before.
+    setTurnCompile(null)
     setTurnTerminal(null)
     setTurnStartedAt(Date.now())
     setStoppingTurn(false)
@@ -1002,6 +1012,8 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         // this as a failure would tell the user their build died four times on its way to
         // succeeding. It renders as an in-narrative alert row instead.
         setTurnDiagnostics((prev) => [...prev, frame])
+      } else if (frame.type === 'compile') {
+        setTurnCompile(frame.state)
       } else if (frame.type === 'quota') {
         setTurnQuota({ limit: frame.limit, used: frame.used, resetsAt: frame.resetsAt })
       } else if (frame.type === 'turn_ended') {
@@ -2367,6 +2379,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
             previewState={previewState?.state ?? null}
             occupyingProjectName={previewState?.occupyingProjectName ?? null}
             reconnecting={(turnNarrativeIsThisChat && turnPreview.state === 'reconnecting') || (showSession && session.reconnecting)}
+            compileState={turnNarrativeIsThisChat ? turnCompile : null}
           />
         </div>
       </div>
