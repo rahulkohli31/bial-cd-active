@@ -971,7 +971,15 @@ def dev_start(body: DevStartBody) -> dict[str, Any]:
     proc = subprocess.Popen(  # noqa: S603
         body.cmd,
         cwd=cwd,
-        env=_child_env({"PORT": "3000", "HOST": "0.0.0.0"}),
+        # NEXT_PRIVATE_DISABLE_DEV_OVERLAY_UX (Next 16.3+, PR #94346) suppresses BOTH the compile
+        # and the runtime error overlay (ASM15) — defence in depth behind plan one's portal cover
+        # (U12) and client-error arm (U13), which is why this can't land before those do (a
+        # runtime crash would otherwise go silent end-to-end). Set here, as a literal `extra`
+        # entry rather than an image env var, so it's baked outside `/workspace/app`: the agent's
+        # write surface (R19) never reaches it, and a restore can't overlay it away.
+        env=_child_env(
+            {"PORT": "3000", "HOST": "0.0.0.0", "NEXT_PRIVATE_DISABLE_DEV_OVERLAY_UX": "1"}
+        ),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

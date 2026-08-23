@@ -985,6 +985,79 @@ def test_dev_start_with_a_free_port_still_spawns(monkeypatch: pytest.MonkeyPatch
     assert spawned == [["npm", "run", "dev"]]
 
 
+# --- U14: the overlay kill switch is baked into dev_start, outside /workspace/app -------------
+def test_dev_start_spawns_with_the_overlay_kill_switch_in_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`NEXT_PRIVATE_DISABLE_DEV_OVERLAY_UX=1` (Next 16.3+, PR #94346) must reach the ACTUAL
+    spawned child's environment — asserted on the `Popen` call itself, not merely on `_child_env`
+    as a pure function, so a mutation that drops it from `dev_start`'s literal `extra` (while
+    leaving `_child_env` untouched) still fails this test. It suppresses BOTH the compile and the
+    runtime overlay (ASM15) — defence in depth behind plan one's portal cover (U12) and
+    client-error arm (U13).
+
+    The allowlist's fail-closed behaviour is unchanged by adding this one literal: a real secret
+    seeded on the parent still does not reach the child on this same spawn.
+    """
+    monkeypatch.setattr(sup._Dev, "proc", None)
+    monkeypatch.setattr(sup._Dev, "ready", False)
+    monkeypatch.setattr(sup, "_dev_port_bound", lambda *a: False)
+    monkeypatch.setenv("SUPERVISOR_TOKEN_DECOY", "should-never-leak")  # not on the allowlist
+    captured: dict[str, object] = {}
+
+    def fake_popen(cmd: list[str], **kwargs: object) -> _FakeProc:
+        captured.update(kwargs)
+        return _FakeProc(None)
+
+    monkeypatch.setattr(sup.subprocess, "Popen", fake_popen)
+    r = client.post("/dev/start", json={}, headers=AUTH)
+    assert r.status_code == 200
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["NEXT_PRIVATE_DISABLE_DEV_OVERLAY_UX"] == "1"
+    assert env["PORT"] == "3000"
+    assert env["HOST"] == "0.0.0.0"
+    assert "SUPERVISOR_TOKEN_DECOY" not in env  # the allowlist still fails closed for the rest
+
+
+def test_overlay_kill_switch_reaches_no_tracked_template_file() -> None:
+    """R19's second clause, pinned as an assertion rather than a hope: the flag must be settable
+    ONLY from `dev_start`'s hard-coded `extra` literal, baked into the image outside
+    `/workspace/app` — never from the golden template that seeds the workspace. If it ever leaked
+    into a tracked template file, a restore (which replays tracked files) or the agent's own write
+    surface could override or remove it; `git grep` over the tracked tree is what proves it can't.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        ["git", "grep", "-Il", "NEXT_PRIVATE_DISABLE_DEV_OVERLAY_UX", "--", "sandbox/template"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    # git grep: 0 = match found, 1 = no match in any tracked file, >1 = a real error.
+    assert result.returncode == 1, f"leaked into: {result.stdout!r} stderr={result.stderr!r}"
+    assert result.stdout == ""
+
+
+def test_next_cache_stays_gitignored_and_untracked() -> None:
+    """The persistent build cache (`.next/cache`) is on by default from 16.3 — verified, not
+    assumed, that the template's existing `/.next` .gitignore entry already covers it and that
+    nothing under `.next/` has ever been tracked, so the bump does not newly leak a multi-MB cache
+    into a future C4 git-bundle snapshot."""
+    repo_root = Path(__file__).resolve().parents[2]
+    gitignore = (repo_root / "sandbox" / "template" / ".gitignore").read_text(encoding="utf-8")
+    assert "/.next" in gitignore.splitlines()
+
+    tracked = subprocess.run(
+        ["git", "ls-files", "sandbox/template"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    assert [p for p in tracked if p.startswith("sandbox/template/.next/")] == []
+
+
 def test_dev_start_refuses_a_bound_but_silent_port_without_spawning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
