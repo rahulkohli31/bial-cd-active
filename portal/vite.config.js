@@ -10,6 +10,12 @@ export default defineConfig({
     alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) },
   },
   server: {
+    // DEV ONLY. Vite answers 403 for any Host it does not recognise, before the request ever
+    // reaches the proxy below — so a tunnelled dev server serves nothing. The leading dot
+    // matches subdomains, covering the per-run hostname a cloudflare quick tunnel mints.
+    // Needed because a generated app fetches the platform's JWKS from BIAL_PORTAL_ORIGIN
+    // server-side, from inside an Azure container: that origin cannot be localhost.
+    allowedHosts: ['.trycloudflare.com'],
     // Disable vite's own dev-server CORS. The builder live-preview runs in a
     // sandboxed, opaque-origin iframe (Origin: null) and calls the Data Service at
     // /api/apps/:id/records cross-origin. Vite 6's built-in CORS middleware answers
