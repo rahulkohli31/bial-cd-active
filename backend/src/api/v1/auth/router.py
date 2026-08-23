@@ -541,8 +541,14 @@ async def mint_preview_assertion(
     can never obtain a "deployed"-plane assertion through this endpoint (R6's
     app+plane binding starts at the mint site, not only at verification)."""
     app = await db.get(AppRegistry, body.app_id)
-    is_owner = app is not None and app.user_id == user.id
-    if not is_owner and not is_super_duper_admin(user, settings.superadmin_emails):
+    # EXISTENCE FIRST, ownership second. Folding the two into one condition let the superadmin
+    # arm short-circuit the `app is not None` half, so a superadmin minting for an id that had
+    # never existed got a signed assertion whose `aud` names nothing. Harmless — nothing would
+    # ever accept it — but the check reads as though it validates existence, and the next reader
+    # is entitled to believe that.
+    if app is None:
+        raise AppApiError(404, "App not found.")
+    if app.user_id != user.id and not is_super_duper_admin(user, settings.superadmin_emails):
         # A cross-user id is indistinguishable from a missing one (no ownership leak).
         raise AppApiError(404, "App not found.")
     assertion = mint_app_assertion(
