@@ -137,6 +137,7 @@ from src.services.orchestrator.selfheal import (
     CONTINUE_PROMPT,
     HealthState,
     Readiness,
+    VerifyOutcome,
     dev_not_ready_error,
     verify,
     where_are_we,
@@ -145,6 +146,12 @@ from src.services.redis import get_redis
 from src.services.sandbox import SandboxClient, SandboxError
 from src.services.sandbox.base import CompileState
 from src.services.storage.snapshot_read import NoAppYet, extract_snapshot
+from src.services.turns.copy import (
+    DID_NOT_COME_TOGETHER_TEXT,
+    STILL_SHOWING_EARLIER,
+    STILL_SHOWING_NOTHING,
+    STILL_SHOWING_TEMPLATE,
+)
 from src.services.turns.guard import claim_conversation, release_conversation
 from src.services.turns.plan_options import META_PENDING
 from src.services.usage.gate import (
@@ -544,6 +551,27 @@ class _TurnState:
 
 PersistUserTurn = Callable[[], Awaitable[None]]
 SessionFactory = async_sessionmaker[AsyncSession]
+
+
+def _what_it_is_showing(outcome: VerifyOutcome) -> str:
+    """Which of `DID_NOT_COME_TOGETHER_TEXT`'s three arms this verdict earns (U7, R13).
+
+    Read off the verdict rather than inferred, and the ordering is what makes each arm true rather
+    than merely plausible. Not serving comes first: an app that is down has no version to describe,
+    and calling it "an earlier version of itself" would send the citizen looking for a page nobody
+    is serving. Then the starter template, which is a specific and actionable thing to be shown.
+    The earlier-version arm is last because it is the residual — everything that is genuinely the
+    user's app, just without this change in it.
+
+    A verdict with no serving answer at all (the probe never came back) takes the same arm as one
+    that is down. That is a small over-claim and the honest one available: we could not reach the
+    app, and telling someone their app is fine on the strength of a check that never completed is
+    the failure this whole plan exists to remove."""
+    if outcome.served is None or not (200 <= outcome.served.status < 400):
+        return STILL_SHOWING_NOTHING
+    if outcome.baseline is BaselineIdentity.STILL_THE_BASELINE:
+        return STILL_SHOWING_TEMPLATE
+    return STILL_SHOWING_EARLIER
 
 
 def _workspace_of(ctx: RunContext[ChatDeps]) -> ReadOnlyWorkspace:
@@ -1420,11 +1448,14 @@ class TurnEngine:
                             "before wrapping up. Your changes are still in the workspace — "
                             "click Save to keep them, or send a message to continue.",
                         )
+                    # U7 / R13 — THE HONEST ENDING. The sentence it replaces named a defect
+                    # ("your app still has an error") and left the citizen to work out what they
+                    # were looking at; this one says what the app is currently showing, from the
+                    # verdict rather than from a guess, because that is what decides what they
+                    # should do next. The holding state on the preview stops with it.
                     raise _WriteEndedError(
                         "self_heal_budget_exhausted",
-                        "Your app still has an error the assistant could not fix on its own. "
-                        "Your changes are still in the workspace — tell it what you see and "
-                        "it will try again.",
+                        DID_NOT_COME_TOGETHER_TEXT.format(showing=_what_it_is_showing(outcome)),
                     )
                 if error is not None:
                     # U13 / R17 — A CLIENT-CLASS REPORT IS AGENT INPUT, NOT NARRATIVE. The whole

@@ -216,17 +216,30 @@ async def test_cadence_turn_rides_the_reminder_into_the_model_request(
         for part in message.parts
         if isinstance(part, UserPromptPart)
     ]
-    # The reminder sits at the tail of history, just before this turn's prompt.
-    assert prompts[-2] == mode_reminder(ConversationMode.ASK, full=False)
+    # The reminder sits near the tail of history, just before this turn's prompt — with U8's
+    # workspace note between the two, because that one rides EVERY turn and this one does not.
+    assert prompts[-3] == mode_reminder(ConversationMode.ASK, full=False)
     assert prompts[-1] == "and one more thing"
 
 
 async def test_between_cadence_points_the_model_sees_no_reminder(
     _fresh_engine, db_session, session_factory
 ) -> None:
+    """The CADENCE holds: off an anchor, no mode reminder rides.
+
+    Narrowed from "no `<system-note>` at all" when U8 landed, and the narrowing is the point
+    rather than an accommodation. Both notes wear the same private-guidance envelope, and they
+    have opposite delivery rules on purpose: the mode reminder is cadence-gated because repeating
+    it every turn makes it wallpaper, and the workspace note is unconditional because its whole
+    claim is that answering from stale history is impossible — a fact delivered on one turn in
+    four would not be one. Asserting on the envelope would have made the cadence test go red the
+    moment anything else private was ever said."""
     seen, _ = await _run_with_history(_fresh_engine, db_session, session_factory, _turns(3))
     dumped = ModelMessagesTypeAdapter.dump_json(seen[0]).decode()
-    assert "system-note" not in dumped
+    assert "mode is active" not in dumped, "no mode reminder off a cadence anchor"
+    # …and the workspace note IS there, which is what proves the assertion above narrowed rather
+    # than simply stopped testing anything.
+    assert "checked this app's workspace just now" in dumped
 
 
 async def test_reminders_never_reach_a_persisted_row(

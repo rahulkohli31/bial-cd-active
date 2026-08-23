@@ -100,6 +100,18 @@ const HOLDING_SLOW_TEXT =
 // place — not because 20s is measured. The holding-state duration counter is what settles it.
 const HOLDING_ESCALATE_MS = 20000
 
+// R13/R4 — WHAT THE COVER SAYS WHEN NOTHING IS COMING. "Putting the latest change together…" is
+// true for exactly as long as a turn is running; the moment one ends without the app coming back,
+// the same words become a progress state that runs forever — which is the failure U7 exists to
+// end, reproduced on the other pane. The turn's ending is explained in the banner above the
+// composer; this is what the citizen sees where their app should be.
+//
+// The cover STAYS UP rather than clearing, because what is behind it is the framework's error
+// screen today and a blank page once the framework's own overlay is disabled. Clearing it would
+// trade a lie about progress for a lie about the app.
+const STOPPED_RUNNING_TEXT =
+  'Your app stopped running and needs to be brought back. Send a message and we\u2019ll restore it.'
+
 /** The headline for a pane whose container is not serving this project — C3 §8.3.
  *
  *  NONE OF THESE IS AN ERROR, and the copy is the whole deliverable of R16/R17. A reclaimed
@@ -311,6 +323,12 @@ export interface LivePreviewProps {
   // it. `null` = nothing has been reported on this turn at all, which is the pre-signal state
   // and behaves exactly as this pane did before the cover existed.
   compileState?: CompileState | null
+  // Is a turn running on this project RIGHT NOW? It decides which of the cover's two sentences is
+  // true — a wait that describes work nobody is doing is the progress-state-that-never-ends this
+  // plan exists to remove — and nothing else. It deliberately does NOT decide whether to cover:
+  // an app that is broken is just as broken between turns, and the error screen behind the cover
+  // does not become safe to show because the build stopped.
+  turnRunning?: boolean
   // `slot_taken` only — the sibling project standing in the way, so the copy can name it.
   occupyingProjectName?: string | null
   saveDirty?: boolean | null
@@ -344,6 +362,11 @@ export default function LivePreview({
   // that forgot the prop uncover the frame over an error screen nobody looked at — which is the
   // exact failure this whole mechanism exists to stop.
   compileState = null,
+  // Absent means NO TURN IS RUNNING, which is the safe default here: it selects the sentence that
+  // asks the citizen to send a message, and telling someone their app needs a nudge when a build
+  // is quietly in flight costs them one message. The reverse — claiming work is in progress when
+  // none is — is the failure this prop exists to prevent.
+  turnRunning = false,
   occupyingProjectName = null,
   // The save model (KTD-5e). `saveDirty` is TRI-STATE: true = unsaved work, false = saved,
   // null = UNKNOWN (no live workspace, or the server could not compare). Unknown must not
@@ -521,6 +544,22 @@ export default function LivePreview({
     return () => clearTimeout(t)
   }, [covered])
 
+  // WHICH SENTENCE THE COVER IS TELLING THE TRUTH WITH (U7/R13).
+  //
+  // The holding wording is a claim about work in progress, so it holds only while a turn is
+  // actually running. When one ends — with the change made or not — the claim expires with it,
+  // and a cover still saying "putting the latest change together" IS the progress state that runs
+  // forever: the citizen's only way to learn the build was over would be to wait long enough to
+  // stop believing it.
+  //
+  // The escalation is inside the running arm rather than beside it, because "taking longer than
+  // usual" is the same claim with more emphasis — if the first sentence has expired, so has this.
+  const coverText = turnRunning
+    ? holdingSlow
+      ? HOLDING_SLOW_TEXT
+      : HOLDING_TEXT
+    : STOPPED_RUNNING_TEXT
+
   const [loadedUrl, setLoadedUrl] = useState<string | null>(null)
   const [stalledUrl, setStalledUrl] = useState<string | null>(null)
   // Both verdicts track the FRAME KEY, not the URL. Keyed on the URL they survived a remount, so
@@ -584,6 +623,21 @@ export default function LivePreview({
   // re-reports within a poll, and clearing on remount would mean a frame swap silently uncovers
   // a broken app for a second. The verdict is about the APP, not about this DOM node.
 
+  // R11 — THE REVEAL, AND WHAT IT IS NOT ALLOWED TO REST ON. `load` is not evidence that the app
+  // works: it fires for a 500 exactly as it does for a 200, this pane cannot read a cross-origin
+  // status, and the in-container proxy emits its handle-block headers even on the 502 it returns
+  // when the dev server is down — so `load` fires on that too. Pairing it with the compile verdict
+  // is what makes the reveal mean something, and the verdict is evaluated continuously through the
+  // build rather than claimed once per turn.
+  //
+  // TWO PROPERTIES FALL OUT OF `!covered` THAT ARE WORTH NAMING. A verdict that flips to failed
+  // after a reveal RETRACTS it — the app goes back to hidden and the cover explains — and an
+  // UNKNOWN verdict does not, because `covered` holds on unknown rather than moving. Those are
+  // exactly R4's retraction and AE8's don't-retract, and neither needs a rule of its own here.
+  //
+  // This unit controls opacity and nothing else: it renders no overlay, and every visible surface
+  // above the frame belongs to the cover.
+  const revealed = frameLoaded && !covered
   const framePending = showFrame && !frameLoaded && !frameStalled
   const showLoading =
     framePending || (!isTerminal && !relaunching && !previewUrl && (status === 'provisioning' || status === 'building'))
@@ -606,9 +660,7 @@ export default function LivePreview({
     : showReconnecting
       ? 'Reconnecting to your preview…'
       : showCover
-        ? holdingSlow
-          ? HOLDING_SLOW_TEXT
-          : HOLDING_TEXT
+        ? coverText
         : frameStalled
           ? SLOW_TEXT
           : showLoading
@@ -625,7 +677,7 @@ export default function LivePreview({
                   ? // The honest sentence for a check that did not happen. It deliberately does
                     // NOT disturb the frame — nothing was learned, so nothing changes on screen.
                     'We could not check on your preview just now — it may still be running'
-                  : frameLoaded
+                  : revealed
                     ? 'Your app preview is live'
                     : ''
 
@@ -916,7 +968,7 @@ export default function LivePreview({
               // nothing) — that is the U5 fade, and until it runs the card is opacity-0 with the
               // labelled wait sitting over it. Hidden, not unmounted: an iframe that never mounts
               // never loads, and `load` is the only thing that reveals it.
-              className={`shrink-0 mx-auto h-full transition-[box-shadow,border-radius,opacity] duration-300 rounded-xl overflow-hidden shadow-lg bg-white relative ${frameLoaded ? 'opacity-100' : 'opacity-0'}`}
+              className={`shrink-0 mx-auto h-full transition-[box-shadow,border-radius,opacity] duration-300 rounded-xl overflow-hidden shadow-lg bg-white relative ${revealed ? 'opacity-100' : 'opacity-0'}`}
             >
               {/* A subtle "still iterating" overlay while the loop keeps refining a LIVE preview
                   (status holds at `ready` and new step/log envelopes keep arriving). Non-blocking
@@ -997,7 +1049,7 @@ export default function LivePreview({
             alongside it — the cover shows exactly one thing. */}
         {showCover && (
           <BouncingWait className="text-center px-6 max-w-sm">
-            {holdingSlow ? HOLDING_SLOW_TEXT : HOLDING_TEXT}
+            {coverText}
           </BouncingWait>
         )}
 

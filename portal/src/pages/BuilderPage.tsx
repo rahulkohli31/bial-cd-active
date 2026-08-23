@@ -11,6 +11,7 @@ import BuildProgress, { hasBuildNarrative, StepHistoryCollapsible } from '../com
 import type { StepHistoryItem } from '../components/chat/BuildProgress'
 import MessageContent from '../components/chat/MessageContent'
 import SessionBanners from '../components/chat/SessionBanners'
+import TurnBanner from '../components/chat/TurnBanner'
 import AttachmentLightbox from '../components/AttachmentLightbox'
 import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
 import { listProjectConversations } from '../utils/conversationApi'
@@ -2223,11 +2224,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
               onReconnect={() => session.reconnect()}
               onStartAgain={handleStartAgain}
             />
-            {turnError && (
-              <div className="text-[11px] text-danger bg-danger/5 border border-danger/20 rounded-lg px-2.5 py-1.5">
-                {turnError}
-              </div>
-            )}
+            <TurnBanner text={turnError} />
             {sessionProjectMatches && session.error && (
               <div
                 aria-live="assertive"
@@ -2441,6 +2438,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                (the preview probe above). Gating it would blank the signal the moment the user
                opened a sibling chat, and blanking it is what leaves an error screen uncovered. */
             compileState={turnCompile}
+            /* Which of the cover's two sentences is true — see `turnRunning` on the pane. Read
+               off the same per-chat generating flag the composer uses, because "a turn is
+               running" is the fact both are asking about; a second source for it would be a
+               second thing to keep in step. */
+            turnRunning={generatingChatId !== null}
             onFrameMessage={handleFrameMessage}
           />
         </div>

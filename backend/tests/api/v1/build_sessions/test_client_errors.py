@@ -36,7 +36,7 @@ from src.services.build_sessions import app_name_for
 from src.services.orchestrator import client_errors
 from src.services.orchestrator.errors import CLIENT_ERROR_TITLE
 from src.services.orchestrator.prompt import build_repair_prompt
-from src.services.orchestrator.selfheal import verify
+from src.services.orchestrator.selfheal import VerifyOutcome, verify
 from src.services.sandbox import ExecResult
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.api.v1.build_sessions.test_csrf import _MUTATING_POSTS
@@ -44,6 +44,26 @@ from tests.factories import AppRegistryFactory, ProjectFactory, UserFactory
 from tests.services.orchestrator.fake_sandbox import FakeSandbox
 
 _ROUTE = "/v1/build-sessions/projects/{project_id}/client-error"
+
+_APP_ID = uuid.UUID("0198f2c0-0000-7000-8000-00000000d013")
+
+
+async def _verify(fake: FakeSandbox) -> tuple[VerifyOutcome, int]:
+    """`verify` with this file's defaults. The content check is OFF and the patience budget is
+    ZERO: this file is about the browser-side witness, and both of those would spend whole passes
+    re-establishing facts other files already pin."""
+    return await verify(
+        fake,
+        fake.handle(),
+        log_cursor=0,
+        max_polls=3,
+        poll_s=0.0,
+        app_id=_APP_ID,
+        had_prior_building_turns=False,
+        indeterminate_retries=0,
+        indeterminate_backoff_s=0.0,
+    )
+
 
 _A_CRASH = {
     "source": "window.onerror",
@@ -322,11 +342,11 @@ async def test_a_reported_crash_makes_a_server_clean_verify_not_green() -> None:
     fake = FakeSandbox()
     fake.dev_ready = True
 
-    baseline, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    baseline, _ = await _verify(fake)
     assert baseline.green is True  # the state the report has to be able to overturn
 
     client_errors.park_client_error(fake.handle().app_name, **_A_CRASH)
-    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    outcome, _ = await _verify(fake)
 
     assert outcome.green is False
     assert outcome.error is not None and outcome.error.source == ErrorSource.CLIENT
@@ -341,8 +361,8 @@ async def test_a_report_counts_against_exactly_one_verdict() -> None:
     fake.dev_ready = True
     client_errors.park_client_error(fake.handle().app_name, **_A_CRASH)
 
-    first, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
-    second, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    first, _ = await _verify(fake)
+    second, _ = await _verify(fake)
 
     assert first.green is False
     assert second.green is True
@@ -359,7 +379,7 @@ async def test_a_compile_error_outranks_the_report_but_the_verdict_still_falls()
     fake.queue_commands(ExecResult(stdout="app/x.tsx(1,1): error TS2322: bad", stderr="", exit=2))
     client_errors.park_client_error(fake.handle().app_name, **_A_CRASH)
 
-    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    outcome, _ = await _verify(fake)
 
     assert outcome.green is False
     assert outcome.error is not None and outcome.error.source == ErrorSource.TSC
@@ -375,7 +395,7 @@ async def _client_error_from_a_report(**report: str) -> BuildError:
     fake = FakeSandbox()
     fake.dev_ready = True
     client_errors.park_client_error(fake.handle().app_name, **report)
-    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    outcome, _ = await _verify(fake)
     assert outcome.error is not None
     return outcome.error
 
@@ -587,7 +607,7 @@ async def test_a_console_warning_does_not_fail_the_build() -> None:
             fake.handle().app_name, source=source, title="Each child needs a key prop", stack=""
         )
 
-    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    outcome, _ = await _verify(fake)
 
     assert outcome.green is True, "a noisy app is not a broken app"
     assert outcome.error is None
@@ -609,7 +629,7 @@ async def test_a_real_crash_still_fails_the_build_and_carries_the_warnings_as_co
         stack="at RecordsTable",
     )
 
-    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    outcome, _ = await _verify(fake)
 
     assert outcome.green is False
     assert outcome.error is not None
@@ -655,7 +675,7 @@ async def test_an_unrecognised_reporter_source_is_treated_as_a_crash() -> None:
         fake.handle().app_name, source="window.onunhandledsomething", title="boom", stack=""
     )
 
-    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    outcome, _ = await _verify(fake)
 
     assert outcome.green is False, "a source we do not recognise must not be assumed harmless"
     assert outcome.error is not None

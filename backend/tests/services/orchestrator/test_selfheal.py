@@ -24,7 +24,13 @@ from src.services.orchestrator.selfheal import (
     verify,
     where_are_we,
 )
-from src.services.sandbox import ExecResult, SandboxError, SandboxGoneError
+from src.services.sandbox import (
+    ExecResult,
+    SandboxError,
+    SandboxGoneError,
+    SandboxHandle,
+    ServedPage,
+)
 from tests.factories import UserFactory
 from tests.services.orchestrator.conftest import make_orchestrator
 from tests.services.orchestrator.fake_sandbox import BASELINE_UNTOUCHED_STDOUT, FakeSandbox
@@ -722,24 +728,13 @@ async def test_an_indeterminate_verdict_is_asked_again_before_it_is_believed() -
     rule with an escape hatch.
 
     Mutation check: return on the first pass regardless of state and this goes red."""
-    fake = FakeSandbox()
+    fake = _AnswersOnTheSecondLook()
     fake.dev_ready = True
     fake.warm_status = None  # unanswerable on the first look…
 
-    calls = {"n": 0}
-    original = fake.what_is_it_serving
-
-    async def answers_on_the_second_look(handle):  # type: ignore[no-untyped-def]
-        calls["n"] += 1
-        if calls["n"] > 1:
-            fake.warm_status = 200
-        return await original(handle)
-
-    fake.what_is_it_serving = answers_on_the_second_look  # type: ignore[method-assign]
-
     outcome, _ = await _verify(fake, log_cursor=0, max_polls=3, indeterminate_retries=2)
 
-    assert calls["n"] == 2, "asked again, and stopped as soon as it got an answer"
+    assert fake.serving_calls == 2, "asked again, and stopped as soon as it got an answer"
     assert outcome.state is HealthState.HEALTHY
 
 
@@ -772,6 +767,19 @@ async def test_may_never_be_green_is_true_for_exactly_one_state() -> None:
 # =============================================================================
 # U9 / R15 — the stale-evidence re-check
 # =============================================================================
+
+
+class _AnswersOnTheSecondLook(FakeSandbox):
+    """A container whose root route is unreachable on the first ask and answers on the second.
+
+    A SUBCLASS rather than a reassigned bound method, which is what this file's own
+    `_WarmOrderSandbox` note explains: assigning over a bound method is a type error under `ty`,
+    and the fakes here are subclassed anyway."""
+
+    async def what_is_it_serving(self, handle: SandboxHandle) -> ServedPage | None:
+        if self.serving_calls >= 1:
+            self.warm_status = 200
+        return await super().what_is_it_serving(handle)
 
 
 async def test_a_crash_the_agent_has_already_fixed_costs_no_repair_round_trip() -> None:
@@ -843,12 +851,7 @@ async def test_a_container_that_cannot_answer_the_watermark_changes_nothing() ->
     fake.dev_ready = True
     fake.push_dev_logs("⨯ unhandledRejection Error: boom")
 
-    def cannot_answer(cmd: list[str]) -> ExecResult:
-        if cmd[0] == "sh":
-            return ExecResult(stdout="", stderr="find: not found", exit=127)
-        return ExecResult(stdout="", stderr="", exit=0)
-
-    fake.exec_handler = cannot_answer
+    fake.probes_fail = True
 
     outcome, _ = await _verify(fake, log_cursor=0, max_polls=3)
 
