@@ -35,6 +35,7 @@ import httpx
 import structlog
 from redis.exceptions import RedisError
 
+from src.core.redaction import scrub_untrusted
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
@@ -548,20 +549,39 @@ class AcaSandboxClient(SandboxClient):
         try:
             async with (
                 asyncio.timeout(_SERVING_TIMEOUT_SECONDS),
-                self._http.stream("GET", handle.preview_url) as resp,
+                self._http.stream(
+                    "GET", handle.preview_url, headers={"Accept-Encoding": "identity"}
+                ) as resp,
             ):
                 chunks: list[bytes] = []
                 size = 0
-                # BYTES on the way in, characters on the way out. The cap is a character budget,
-                # but the wire carries bytes and a multi-byte glyph must not be able to buy more
-                # of them than a byte-blind reader would allow — so the read stops at the same
-                # number of BYTES and the decode can only shrink from there.
-                async for chunk in resp.aiter_bytes():
+                # `aiter_raw`, NOT `aiter_bytes`, and it is the difference between a bound and a
+                # suggestion. `aiter_bytes` yields DECODED bytes: httpx negotiates gzip by
+                # default and its decoder expands a whole network read in one call with no
+                # length limit, so a single 64 KiB raw chunk can decode to tens of megabytes and
+                # be appended here before the cap is ever evaluated — measured at 204 KB on the
+                # wire buffering 67 MB. The body is written by unreviewed code inside the
+                # citizen's sandbox, so that is the app choosing the control plane's allocation.
+                # Reading the wire makes the cap a bound over bytes nothing can amplify.
+                #
+                # `Accept-Encoding: identity` is the other half: it asks for the plain body so
+                # the evidence is readable. An app that compresses anyway yields an unreadable
+                # head rather than an unbounded one, which is the right way round for a field
+                # whose whole job is "what was it actually serving?".
+                async for chunk in resp.aiter_raw():
                     chunks.append(chunk)
                     size += len(chunk)
                     if size >= SERVED_HEAD_MAX_CHARS:
                         break
-                head = b"".join(chunks).decode("utf-8", "replace")[:SERVED_HEAD_MAX_CHARS]
+                raw = b"".join(chunks)[:SERVED_HEAD_MAX_CHARS]
+                # SCRUBBED HERE, at the boundary, so the raw text never leaves this method.
+                # `.claude/rules/security.md` is absolute about credential values in logs, and
+                # the sandbox child env holds `BIAL_DATABASE_URL` and `BIAL_BLOB_SAS` — a page
+                # that renders a server value, or a dev error page quoting a connection string
+                # in a stack, puts one straight into the first 2 KB of the document. Doing it
+                # once here rather than at each reader is what makes the field U25 persists safe
+                # by construction instead of by everyone remembering.
+                head = scrub_untrusted(raw.decode("utf-8", "replace"), limit=SERVED_HEAD_MAX_CHARS)
                 return ServedPage(status=resp.status_code, head=head)
         except Exception:  # noqa: BLE001 - `None` is the contract; nothing may reach the verdict
             # `exc_info` for the same reason the warm request carries it: a silent swallow makes

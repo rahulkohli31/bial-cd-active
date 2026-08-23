@@ -147,6 +147,7 @@ from src.services.sandbox import SandboxClient, SandboxError
 from src.services.sandbox.base import CompileState
 from src.services.storage.snapshot_read import NoAppYet, extract_snapshot
 from src.services.turns.copy import (
+    COULD_NOT_CONFIRM_TEXT,
     DID_NOT_COME_TOGETHER_TEXT,
     STILL_SHOWING_EARLIER,
     STILL_SHOWING_NOTHING,
@@ -527,9 +528,6 @@ class _TurnState:
     # check: a brand-new project is SUPPOSED to be showing the starter template, and checking it
     # would manufacture an accusation rather than catch one.
     had_prior_building_turns: bool = False
-    # The newest health verdict this turn reached, or None before the first verify. Read by the
-    # ephemeral workspace note the model is handed (R14) and by the turn's ending.
-    verdict: HealthState | None = None
     # WRITE only, and the whole difference between the two zero-mutation endings. A Write
     # turn the citizen typed into may legitimately touch nothing (they asked a question);
     # a turn started from a Build-it click was ASKED to build, so touching nothing is a
@@ -553,7 +551,7 @@ PersistUserTurn = Callable[[], Awaitable[None]]
 SessionFactory = async_sessionmaker[AsyncSession]
 
 
-def _what_it_is_showing(outcome: VerifyOutcome) -> str:
+def _what_it_is_showing(outcome: VerifyOutcome, *, ever_built: bool) -> str:
     """Which of `DID_NOT_COME_TOGETHER_TEXT`'s three arms this verdict earns (U7, R13).
 
     Read off the verdict rather than inferred, and the ordering is what makes each arm true rather
@@ -570,6 +568,14 @@ def _what_it_is_showing(outcome: VerifyOutcome) -> str:
     if outcome.served is None or not (200 <= outcome.served.status < 400):
         return STILL_SHOWING_NOTHING
     if outcome.baseline is BaselineIdentity.STILL_THE_BASELINE:
+        return STILL_SHOWING_TEMPLATE
+    if not ever_built:
+        # THE FIRST BUILD, which is the likeliest way this sentence ever appears. The content
+        # check is deliberately not asked of an app nobody has built yet — a brand-new project is
+        # SUPPOSED to be showing the template, and asking would manufacture an accusation — so
+        # `baseline` is None here and the residual arm below would tell the citizen their app is
+        # "showing an earlier version of itself" while they look at the starting template. There
+        # is no earlier version. This is it.
         return STILL_SHOWING_TEMPLATE
     return STILL_SHOWING_EARLIER
 
@@ -1415,7 +1421,6 @@ class TurnEngine:
                     # learn a fact that cannot change inside one turn.
                     had_prior_building_turns=state.had_prior_building_turns,
                 )
-                state.verdict = outcome.state
                 self._emit_verify_step(state, iteration, phase="finished", verdict=outcome.state)
 
                 if outcome.dev_ready and state.claim_preview_frame():
@@ -1427,11 +1432,35 @@ class TurnEngine:
                     state.snapshot_committed = None  # the finalize answers this, not us
                     return
 
+                # UNANSWERABLE IS NOT A DEFECT, and this is the line where that stops
+                # being true if the condition is written as `not outcome.green`. `verify`
+                # returns INDETERMINATE with no error BY CONSTRUCTION, so a green-shaped test
+                # here synthesizes `dev_not_ready_error()` for it — whose prose says the dev
+                # server never reported ready, about an app that reported ready. The citizen
+                # then reads a fabricated defect, the model is re-seeded to repair a fault that
+                # does not exist, and a repair run is charged for it. That is precisely the
+                # misdiagnosis the third state was added to remove, reappearing one arm
+                # downstream of where it was fixed.
+                #
+                # An unanswerable verdict ends the turn instead, and only when the model has
+                # claimed to be finished: it gates the COMPLETION CLAIM, so with no claim
+                # outstanding there is nothing for it to gate and the loop carries on as
+                # before. Nothing here spends a repair attempt on it.
+                if outcome.state is HealthState.INDETERMINATE:
+                    # BOUNDED HERE, because this arm `continue`s past the budget guard below and
+                    # an unanswerable verdict that repeats would otherwise spin against the wall
+                    # clock alone. The budget is checked before it is spent, so the last
+                    # iteration ends the turn rather than buying a run it cannot pay for.
+                    if sandbox.done_requested or budget <= 0:
+                        raise _WriteEndedError("verdict_unanswerable", COULD_NOT_CONFIRM_TEXT)
+                    turn_prompt = CONTINUE_PROMPT
+                    budget -= 1
+                    continue
                 # `error is None` does NOT imply green: a clean `tsc` with a dev server that
                 # never came up is red with nothing to report. Synthesize the server error
                 # or a budget-exhausted turn ends with no diagnostic at all.
                 error = outcome.error
-                if error is None and not outcome.green:
+                if error is None and outcome.state is HealthState.UNHEALTHY:
                     error = dev_not_ready_error()
                 if budget <= 0:
                     # Exhausted is not one state but two, and only one of them is a defect.
@@ -1455,7 +1484,11 @@ class TurnEngine:
                     # should do next. The holding state on the preview stops with it.
                     raise _WriteEndedError(
                         "self_heal_budget_exhausted",
-                        DID_NOT_COME_TOGETHER_TEXT.format(showing=_what_it_is_showing(outcome)),
+                        DID_NOT_COME_TOGETHER_TEXT.format(
+                            showing=_what_it_is_showing(
+                                outcome, ever_built=state.had_prior_building_turns
+                            )
+                        ),
                     )
                 if error is not None:
                     # U13 / R17 — A CLIENT-CLASS REPORT IS AGENT INPUT, NOT NARRATIVE. The whole

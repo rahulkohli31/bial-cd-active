@@ -45,3 +45,19 @@ stop believing it. Ending is not the failure — pretending not to have ended is
 `{showing}` is filled from the health verdict, never guessed, and it is there because "it didn't
 work" leaves the user unable to act: whether they are looking at the starting template, at their
 own app one change behind, or at nothing at all changes what they should do next."""
+
+
+COULD_NOT_CONFIRM_TEXT: Final = (
+    "Your app looks like it's running, but we couldn't confirm this change went in. "
+    "Open the preview and see — and if something looks wrong, say so and we'll fix it."
+)
+"""R10 — how a turn ends when the platform genuinely could not tell.
+
+RARE BY CONSTRUCTION, and it has to exist anyway. The health verdict already asks again before
+reporting anything, so reaching this means several checks in a row came back unanswerable. The
+alternative was to dress that up as a defect — which is what the platform used to do, and it cost
+the citizen a repair run, their tokens and their time chasing a fault that was never there.
+
+It does not apologise and it does not alarm. The likeliest truth is that the app is fine; what we
+are short of is a confirmation, and the person looking at the preview can supply one in a second.
+"""

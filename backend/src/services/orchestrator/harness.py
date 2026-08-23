@@ -411,8 +411,26 @@ class BuildOrchestrator:
             # readiness budget three times over; "the dev server did not report ready" has stopped
             # being our impatience and started being a fact about the app. What U6 removed is the
             # repair run spent on the FIRST timeout, and it removed it inside `verify`.
+            # UNANSWERABLE IS NOT A DEFECT — the same rule as the live loop, in the loop
+            # `selfheal` exists to keep honest as well. `verify` returns INDETERMINATE with no
+            # error by construction, so a `not outcome.green` test here would fabricate a
+            # "dev server did not report ready" diagnostic about an app that reported ready.
+            if outcome.state is HealthState.INDETERMINATE:
+                # Bounded before it is spent, for the reason the live loop states: this arm
+                # `continue`s past the budget guard, so an unanswerable verdict that repeats
+                # would spin against the wall clock alone.
+                if deps.sandbox.done_requested or budget <= 0:
+                    return _escalation(
+                        reason="verdict_unanswerable",
+                        detail="the build could not be confirmed either way",
+                        ended_reason="build_failed",
+                        preview_url=outcome.preview_url,
+                    )
+                turn_prompt = CONTINUE_PROMPT
+                budget -= 1
+                continue
             error = outcome.error
-            if error is None and not outcome.green:
+            if error is None and outcome.state is HealthState.UNHEALTHY:
                 error = dev_not_ready_error()
 
             if budget <= 0:

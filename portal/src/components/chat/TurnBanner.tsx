@@ -19,7 +19,8 @@
  *
  * ANNOUNCED POLITELY, never assertively. These are endings with an action attached, not alarms —
  * `assertive` is reserved on this page for the two things that genuinely interrupt (a failed
- * relaunch, a failed save), and spending it here would make those stop cutting through.
+ * relaunch, a failed save), and spending it here would make those stop cutting through. The
+ * region is permanent and only its text changes, for the reason the render comment gives.
  */
 interface TurnBannerProps {
   /** The sentence to show, or `null` for nothing. One value: newest wins by construction. */
@@ -27,15 +28,27 @@ interface TurnBannerProps {
 }
 
 export default function TurnBanner({ text }: TurnBannerProps) {
-  if (!text) return null
+  // THE LIVE REGION WRAPS THE BOX AND IS ALWAYS MOUNTED; the box is what appears and disappears.
+  // Inserting a region together with its text announces inconsistently — several reader and
+  // browser combinations miss it entirely — so the element has to be in the accessibility tree
+  // BEFORE the text arrives. The preview pane already learned this the hard way and keeps a
+  // permanent region for the same reason.
+  //
+  // WRAPPING rather than a second `sr-only` copy, which is what this was first written as: two
+  // elements carrying the same sentence is one sentence rendered twice as far as anything reading
+  // the DOM is concerned, and it broke three existing tests that look the banner up by its text.
+  // A duplicate is also a real hazard on its own — the next person to add a visual tweak has two
+  // places to change and no reason to suspect the second.
   return (
-    <div
-      data-testid="turn-banner"
-      role="status"
-      aria-live="polite"
-      className="text-[11px] text-danger bg-danger/5 border border-danger/20 rounded-lg px-2.5 py-1.5"
-    >
-      {text}
+    <div role="status" aria-live="polite">
+      {text ? (
+        <div
+          data-testid="turn-banner"
+          className="text-[11px] text-danger bg-danger/5 border border-danger/20 rounded-lg px-2.5 py-1.5"
+        >
+          {text}
+        </div>
+      ) : null}
     </div>
   )
 }

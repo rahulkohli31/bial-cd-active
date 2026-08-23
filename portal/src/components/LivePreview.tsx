@@ -100,17 +100,23 @@ const HOLDING_SLOW_TEXT =
 // place — not because 20s is measured. The holding-state duration counter is what settles it.
 const HOLDING_ESCALATE_MS = 20000
 
-// R13/R4 — WHAT THE COVER SAYS WHEN NOTHING IS COMING. "Putting the latest change together…" is
-// true for exactly as long as a turn is running; the moment one ends without the app coming back,
-// the same words become a progress state that runs forever — which is the failure U7 exists to
-// end, reproduced on the other pane. The turn's ending is explained in the banner above the
-// composer; this is what the citizen sees where their app should be.
+// R13 — WHAT THE COVER SAYS WHEN NO TURN IS RUNNING. "Putting the latest change together…" is
+// true for exactly as long as one is; left up afterwards it becomes a progress state that never
+// resolves, which is the failure U7 exists to end, reproduced on the other pane.
 //
-// The cover STAYS UP rather than clearing, because what is behind it is the framework's error
-// screen today and a blank page once the framework's own overlay is disabled. Clearing it would
-// trade a lie about progress for a lie about the app.
-const STOPPED_RUNNING_TEXT =
-  'Your app stopped running and needs to be brought back. Send a message and we\u2019ll restore it.'
+// TWO SENTENCES, BECAUSE THE COVER HAS TWO IDLE CAUSES AND THEY ARE OPPOSITES. `failed` means the
+// app is not serving anything usable. `building` means the app is compiling a route right now —
+// which the supervisor publishes for any on-demand compile inside a perfectly healthy app, so a
+// single "your app stopped running" would be told over a working, completed build.
+//
+// NEITHER CLEARS THE COVER. Behind it is the framework's error screen today and a blank page once
+// that is suppressed, so clearing would trade a lie about progress for a lie about the app.
+//
+// Deliberately NOT the retraction sentence a later unit adds. That one means the workspace was
+// lost and a restore is coming; promising a restore for a compile error would be a third lie.
+const IDLE_BUSY_TEXT = 'Getting your app ready…'
+const IDLE_BROKEN_TEXT =
+  'Your app isn\u2019t running right now. Send a message describing what you\u2019d like and we\u2019ll get it working.'
 
 /** The headline for a pane whose container is not serving this project — C3 §8.3.
  *
@@ -536,13 +542,18 @@ export default function LivePreview({
   // genuinely slow build could keep resetting to the shorter wording forever.
   const [holdingSlow, setHoldingSlow] = useState(false)
   useEffect(() => {
-    if (!covered) {
+    // SCOPED TO THE TURN AS WELL AS TO THE COVER, and the turn half is what U7 made necessary.
+    // The escalated wording is a claim about how long THIS change has been coming together, and
+    // `covered` does not fall between turns — a failed turn leaves the compile state at `failed`,
+    // so a cover raised twenty seconds into turn 1 was still armed when turn 2 began and the new
+    // turn opened by telling the citizen it was already taking longer than usual.
+    if (!covered || !turnRunning) {
       setHoldingSlow(false)
       return
     }
     const t = setTimeout(() => setHoldingSlow(true), HOLDING_ESCALATE_MS)
     return () => clearTimeout(t)
-  }, [covered])
+  }, [covered, turnRunning])
 
   // WHICH SENTENCE THE COVER IS TELLING THE TRUTH WITH (U7/R13).
   //
@@ -558,7 +569,9 @@ export default function LivePreview({
     ? holdingSlow
       ? HOLDING_SLOW_TEXT
       : HOLDING_TEXT
-    : STOPPED_RUNNING_TEXT
+    : compileState === 'failed'
+      ? IDLE_BROKEN_TEXT
+      : IDLE_BUSY_TEXT
 
   const [loadedUrl, setLoadedUrl] = useState<string | null>(null)
   const [stalledUrl, setStalledUrl] = useState<string | null>(null)
@@ -637,6 +650,16 @@ export default function LivePreview({
   //
   // This unit controls opacity and nothing else: it renders no overlay, and every visible surface
   // above the frame belongs to the cover.
+  //
+  // WHAT THIS DOES NOT CLOSE, stated rather than left to be discovered. `covered` moves on
+  // `building`/`failed`/`clean` and HOLDS on `unknown` and on `null` — so where no compile
+  // verdict has ever been reported, the load still reveals on its own, exactly as it did before
+  // this unit. That is every container running an image older than the compile endpoint, and the
+  // opening moments of every turn. It is a deliberate compatibility concession and not an
+  // oversight: gating on a POSITIVE verdict would leave the whole existing fleet's preview
+  // permanently blank, which is a worse failure than the one being fixed. The signal reaches an
+  // app on its next provision or restore, and the reveal gets teeth at the same moment the cover
+  // does — the same trade the cover already documents.
   const revealed = frameLoaded && !covered
   const framePending = showFrame && !frameLoaded && !frameStalled
   const showLoading =

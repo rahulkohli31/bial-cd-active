@@ -50,10 +50,16 @@ _CHANGED_MARKER = "-newer /tmp/.bial-agent-watermark"  # noqa: S108 - same
 
 BASELINE_ROOT_SHA = "0" * 40
 BASELINE_TEMPLATE_BLOB = "1" * 40
-BASELINE_DIVERGED_STDOUT = f"{BASELINE_ROOT_SHA}@@{BASELINE_TEMPLATE_BLOB}@@{'2' * 40}"
-"""A BUILT app: one root commit, and a root route the agent has since rewritten."""
+SEEDED_SUBJECT = "bial: golden template baseline"
+"""The subject the sandbox client commits the seeded template under. The probe MATCHES it rather
+than assuming it: a root commit written by anything else holds the finished app, not the
+template — and comparing against that would accuse a working app forever."""
+BASELINE_DIVERGED_STDOUT = (
+    f"{BASELINE_ROOT_SHA}@@{BASELINE_TEMPLATE_BLOB}@@{'2' * 40}@@{SEEDED_SUBJECT}"
+)
+"""A BUILT app: a root commit that IS the seeded template, and a root route the agent rewrote."""
 BASELINE_UNTOUCHED_STDOUT = (
-    f"{BASELINE_ROOT_SHA}@@{BASELINE_TEMPLATE_BLOB}@@{BASELINE_TEMPLATE_BLOB}"
+    f"{BASELINE_ROOT_SHA}@@{BASELINE_TEMPLATE_BLOB}@@{BASELINE_TEMPLATE_BLOB}@@{SEEDED_SUBJECT}"
 )
 """THE 2026-08-18 SHAPE: every server-side check green, and `app/page.tsx` byte-identical to the
 golden template the workspace was born with."""
@@ -129,6 +135,13 @@ class FakeSandbox(SandboxClient):
         # no `find`, a shell that is not there. Every probe returns a non-zero exit, which each
         # of them reads as "we could not find out" rather than as a fact about the workspace.
         self.probes_fail = False
+        # The U9 marker file is missing — a stamp that failed, or a container restarted with a
+        # fresh `/tmp`. The real script's `[ -f … ] || exit 1` guard is what turns that into a
+        # non-zero exit rather than an empty answer at exit 0, so the fake models the exit.
+        self.watermark_marker_missing = False
+        # A probe that RAISES rather than answering — a supervisor blip. Distinct from
+        # `probes_fail`, which is a container that answers "no" to the script itself.
+        self.probe_error: SandboxError | None = None
         # call records (assertions)
         self.command_calls: list[list[str]] = []
         self.command_timeouts: list[int] = []  # the timeout_s each exec was invoked with
@@ -262,10 +275,15 @@ class FakeSandbox(SandboxClient):
         if len(cmd) != 3 or cmd[0] != "sh":
             return None
         script = cmd[2]
-        if self.probes_fail and (
+        is_probe = (
             _STAMP_MARKER in script or _CHANGED_MARKER in script or _BASELINE_MARKER in script
-        ):
+        )
+        if is_probe and self.probe_error is not None:
+            raise self.probe_error
+        if is_probe and self.probes_fail:
             return ExecResult(stdout="", stderr="sh: not found", exit=127)
+        if _CHANGED_MARKER in script and self.watermark_marker_missing:
+            return ExecResult(stdout="", stderr="", exit=1)
         if _STAMP_MARKER in script:  # U9 — mark "now" before the agent runs
             self.watermark_stamps += 1
             return ExecResult(stdout="", stderr="", exit=0)

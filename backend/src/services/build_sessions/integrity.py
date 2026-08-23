@@ -78,6 +78,22 @@ An agent that REPLACES the root with a redirect satisfies this correctly and for
 # root, and a repository with two roots (an agent that fetched and merged an unrelated history) is
 # a question this probe cannot answer — but the SHELL must not be the thing that decides that,
 # because `wc -l` on empty output is 0 and on one root is 1 and the two mean opposite things.
+BASELINE_COMMIT_SUBJECT: Final = "bial: golden template baseline"
+"""The subject line the sandbox client commits the seeded template under.
+
+MATCHED, NOT ASSUMED, and this is the difference between a check and an accusation. The whole
+comparison rests on "the root commit IS the golden template", and that is only true when the root
+was written by `client._INIT_REPO_SCRIPT` — which is BEST-EFFORT: it logs and carries on when it
+fails. The documented fallback is `snapshot._COMMIT_SCRIPT`, whose `git init && git add -A &&
+git commit -m bial-snapshot` creates the repository at the END of a turn, so its root commit holds
+the FINISHED APP. Comparing against that root would find `app/page.tsx` identical forever, and the
+app would be permanently and irreversibly accused of serving the starter page — a completion claim
+that can never be earned again, which is worse than the false claim this check exists to stop.
+
+Spelled here rather than imported from `services/sandbox/client.py` for the reason `reaper.py`
+documents about that direction of import: this module must stay importable by the worker. The two
+literals are pinned equal by a test."""
+
 _BASELINE_SCRIPT: Final = (
     "roots=$(git rev-list --max-parents=0 HEAD 2>/dev/null || true); "
     'printf "%s" "$roots"; echo "@@"; '
@@ -86,7 +102,10 @@ _BASELINE_SCRIPT: Final = (
     f'git rev-parse --verify --quiet "$root:{BASELINE_PATH}" 2>/dev/null || true; '
     "fi; "
     'echo "@@"; '
-    f"git hash-object {BASELINE_PATH} 2>/dev/null || true"
+    f"git hash-object {BASELINE_PATH} 2>/dev/null; "
+    'echo "@@"; '
+    'if [ -n "$root" ]; then git log -1 --format=%s "$root" 2>/dev/null; fi; '
+    "true"
 )
 
 
@@ -98,12 +117,20 @@ def parse_baseline_identity(stdout: str) -> BaselineIdentity:
     otherwise malformed body reads as `UNANSWERABLE` — `partition` yields empty strings for the
     fields that were not there, and every empty field already denies."""
     roots_text, _, rest = stdout.partition("@@")
-    baseline_text, _, working_text = rest.partition("@@")
+    baseline_text, _, rest = rest.partition("@@")
+    working_text, _, subject_text = rest.partition("@@")
     roots = [line for line in roots_text.split() if line]
     if len(roots) != 1:
         # No root commit at all (no repository, or an unreadable one), or more than one. Both are
         # structural: there is no single birth certificate to compare against, and re-running the
         # probe will keep saying so.
+        return BaselineIdentity.UNANSWERABLE
+    if subject_text.strip() != BASELINE_COMMIT_SUBJECT:
+        # THE ROOT IS NOT THE SEEDED TEMPLATE. Either the provision-time `git init` did not run
+        # and a later snapshot created the repository from a tree that already held the app, or
+        # the agent re-initialised it in its own shell. Either way there is no birth certificate
+        # to compare against — and answering "still the template" on a root that IS the app is
+        # how a working app gets locked out of ever completing again.
         return BaselineIdentity.UNANSWERABLE
     baseline_blob = baseline_text.strip()
     if not baseline_blob:
@@ -163,8 +190,23 @@ _STAMP_WATERMARK_SCRIPT: Final = f"touch {_WATERMARK_PATH}"
 
 _CHANGED_SINCE_SCRIPT: Final = (
     "find . \\( -name node_modules -o -name .next -o -name .git \\) -prune -o "
+    # …AND THE FILES THE TOOLCHAIN REWRITES ON ITS OWN. `next dev` regenerates `next-env.d.ts`
+    # and normalises `tsconfig.json` on every boot — that is why `_FRAMEWORK_CHURN` exists at all
+    # — so leaving them in makes "the agent changed something" true on essentially every pass,
+    # whether it did or not. A watermark that is always true is not a watermark.
+    "-name next-env.d.ts -prune -o -name tsconfig.json -prune -o "
     f"-type f -newer {_WATERMARK_PATH} -print 2>/dev/null "
     "| head -n 1"
+)
+
+_CHANGED_SINCE_GUARDED: Final = (
+    # THE MARKER HAS TO EXIST FOR THE QUESTION TO MEAN ANYTHING, and without this guard nothing
+    # would say so: a shell pipeline reports the status of its LAST command, and `head` exits 0
+    # on empty input whatever `find` did. So a missing marker — a failed stamp, or a container
+    # restarted with a fresh `/tmp` — produced an empty answer at exit 0, which reads as "nothing
+    # changed" rather than "we could not tell". That is the wrong direction on a guard: it turns
+    # off U9's re-check silently, exactly when the container is misbehaving.
+    f"[ -f {_WATERMARK_PATH} ] || exit 1; " + _CHANGED_SINCE_SCRIPT
 )
 
 
@@ -198,7 +240,7 @@ async def anything_changed_since_the_watermark(
     costs the improvement rather than the correctness."""
     run_command = sandbox_client.exec  # aliased to keep the call off the JS-oriented exec guard
     try:
-        result = await run_command(handle, ["sh", "-c", _CHANGED_SINCE_SCRIPT], timeout_s=30)
+        result = await run_command(handle, ["sh", "-c", _CHANGED_SINCE_GUARDED], timeout_s=30)
     except SandboxError:
         _log.warning("watermark_compare_failed", app=handle.app_name, exc_info=True)
         return None
@@ -219,6 +261,13 @@ async def has_ever_been_built(app_id: uuid.UUID) -> bool:
     cheap nor obviously correct — but `finish_turn_sandbox` writes a recovery copy on any turn that
     touched files, which is exactly why `_nothing_to_lose` already uses its absence to mean "no
     turn ever did". One HEAD request, and the integrity gate resolves it once per turn anyway.
+
+    A DELIBERATE NARROWING of what the plan specified, stated so it is a decision rather than a
+    drift: the plan says `newest_restore_source(app_id) is not None`, which is a different
+    question — that one answers "is the recovery copy NEWER than the saved bundle", and returns
+    `None` for an app whose Save happens to be more recent than its last turn. Plain presence is
+    the closer answer to "has any turn ever done real work", and unlike its sibling it cannot
+    raise on an unreadable store, which matters on a path that must never fail a turn.
 
     ITS ONE BLIND SPOT, stated rather than hidden: an app whose building turns ALL failed to write
     a recovery copy reads as never-built. That is precisely the failure U3's "recovery write did

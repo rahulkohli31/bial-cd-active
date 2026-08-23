@@ -14,6 +14,15 @@ is the sanctioned home — both `src/__init__.py` and `src/core/__init__.py` are
 this executes this file and nothing else, which is the whole property that keeps it out of the
 cycle (`runtime_env.py` says the same thing at length).
 
+NOT THE ONLY CUT, and the alternative is worth naming rather than leaving to be re-derived. The
+cycle is caused by where `integrity.py` SITS, not by what it contains — it imports only the
+sandbox client, the object store and structlog, none of which reach the orchestrator — so moving
+that module out of `services/build_sessions/` entirely would remove the need for this file and for
+the function-scoped call wrappers. It stays where it is because the rest of the workspace-integrity
+work lands beside it and is read by `manager` and `reaper`, both of which live in that package; the
+one module reaching in from outside is the health verdict. One leaf plus three deferred calls is
+the smaller price.
+
 Nothing here may grow a module-scope import. The moment this reaches for a client, a store or a
 settings object it stops being a leaf and the cycle comes back."""
 
