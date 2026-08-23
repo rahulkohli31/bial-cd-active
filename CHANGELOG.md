@@ -4,6 +4,43 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.17] - 2026-08-23
+
+**"Build complete" only appears when your app is actually your app.** On the demo that started
+this work, "Build complete — your app is live below" sat above the untouched starting template for
+nine minutes. Every check the platform had came back green, because every one of them was asking
+"is an app running here" and none of them was asking "is it theirs".
+
+Two questions now decide it. The platform loads your app's home page the way your browser would,
+so a page that answers with an error can no longer pass. And it compares that home page against
+the one your workspace was created with — if they are still identical, nothing you asked for is on
+the page you actually look at, and the build is not finished. This works on every app that already
+exists: it is a fact about your app's own history, not a marker the platform had to add.
+
+**A change that cannot be finished now ends, and says what you are looking at.** It used to end by
+saying your app "still has an error" and leaving you to work out what was on screen — or worse, to
+leave the preview saying "putting the latest change together…" for as long as you left the tab
+open, so the only way to learn it had stopped was to wait long enough to stop believing it.
+
+It now tells you the change did not come together and which of three things your app is currently
+showing: the starting template, an earlier version of itself, or nothing yet. Those are different
+situations and they change what you would do next. The preview stops claiming progress at the same
+moment.
+
+**Fewer wasted rebuilds, and a shorter wait.** Two of the demo's four repair rounds were the
+platform re-reporting problems the assistant had already fixed, because it was reading a log that
+outlived the fix. It now checks whether anything changed since the error was recorded and, if so,
+looks again before spending another rebuild on it.
+
+Related: the platform used to treat "I could not check" and "it is broken" as the same answer, so a
+slow-starting app was reported to the assistant as a fault and cost you a rebuild chasing it. It
+now asks again instead, and only says something is wrong when it actually found something wrong.
+
+**The assistant is told what your app is doing before it answers you.** If you said your app was
+broken, it used to answer from the conversation — where your app had been working — because that
+was the only account of your app it had. It is now handed the current state of your workspace on
+every message, so answering from a stale memory is not something it has to remember to avoid.
+
 ## [1.6.16] - 2026-08-23
 
 **The preview stops lying about your app.** Three things changed, and all three were things the
