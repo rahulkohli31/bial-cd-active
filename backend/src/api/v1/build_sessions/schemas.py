@@ -592,3 +592,43 @@ commit, and there is no request-scoped `get_db` on a background task. Tests bind
 the rolled-back test session (the exact substitution `claude/router.py` makes via
 `dependency_overrides` on its `billing_session_factory`). Same shape as the chat relay.
 """
+
+
+class ParkedTree(CamelModel):
+    """One tree this plan set aside — a U2 quarantine or a U3 divert."""
+
+    key: str
+    kind: Literal["quarantine", "divert"]
+    head_sha: str | None
+    size_bytes: int
+    taken_at: datetime | None
+
+
+class ParkedTreesResponse(CamelModel):
+    """`POST /v1/build-sessions/internal/apps/{app_id}/parked` → 200 (U25).
+
+    THE TREES THIS PLAN SETS ASIDE WOULD OTHERWISE BE WRITE-ONLY: no reader, no retention, no
+    runbook. In a false-`REVERTED` case those objects hold the only copy of a citizen's newest
+    work, and this plan names exactly that shape as a defect elsewhere — so it must not reproduce
+    it. Newest first, because the useful one is almost always the last one."""
+
+    trees: list[ParkedTree]
+
+
+class PromoteParkedRequest(CamelModel):
+    """`POST /v1/build-sessions/internal/apps/{app_id}/promote` — put one parked tree back.
+
+    The key is named explicitly rather than "the newest": an operator promoting the wrong tree
+    over somebody's recovery slot is the failure this whole plan is about, and a request that
+    cannot name what it means is one that can be misread."""
+
+    key: str
+
+
+class PromoteParkedResponse(CamelModel):
+    """What the promotion did. `promoted` is False when the guard refused it — which is not an
+    error and must not read as one: it means the tree is not a descendant of what the slot holds,
+    and forcing it would be the data loss the guard exists to prevent."""
+
+    promoted: bool
+    detail: str

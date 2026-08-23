@@ -638,3 +638,31 @@ class FeedbackItem(CamelModel):
 class FeedbackResponse(CamelModel):
     feedback: list[FeedbackItem]
     total: int
+
+
+class HarnessCounterRow(CamelModel):
+    """One counter's total, and when it was last seen (U25, R32)."""
+
+    name: str
+    total: int
+    occurrences: int
+    last_seen_at: datetime | None
+
+
+class HarnessCountersResponse(CamelModel):
+    """`GET /v1/admin/harness-counters` → 200 — the build-harness outcomes, totalled.
+
+    THE QUESTION THIS ANSWERS, in the words the plan's success criteria use: did the verdict block
+    a false claim, how often did we restore, and did any turn fail to reach a durable copy. After a
+    week in production those are answerable from this one response.
+
+    NO METRICS DEPENDENCY, deliberately. There is no metrics system in this deployment (this
+    module says so elsewhere at length), so the shape is a `GROUP BY` over a small append-only
+    table — the same trade `worker_passes` already makes.
+
+    Rows are whatever names have been WRITTEN, not the enum's members: the vocabulary is open by
+    design, and a counter the companion plan adds at the tool boundary shows up here with no
+    change to this file."""
+
+    counters: list[HarnessCounterRow]
+    since: datetime

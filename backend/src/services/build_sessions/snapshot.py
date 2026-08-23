@@ -32,7 +32,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Final
+from typing import Final, Literal
 
 import structlog
 
@@ -41,10 +41,15 @@ from src.services.build_sessions.integrity import Ancestry, container_state, is_
 from src.services.sandbox import SandboxClient, SandboxError, SandboxHandle
 from src.services.storage import (
     SNAPSHOT_HEAD_METADATA_KEY,
+    StorageError,
+    StorageUnconfiguredError,
+    all_keys_under,
     divert_key,
+    divert_prefix,
     get_storage,
     head_sha_from_metadata,
     quarantine_key,
+    quarantine_prefix,
     recovery_key,
     snapshot_key,
 )
@@ -410,3 +415,118 @@ async def _bundle_the_tree(sandbox_client: SandboxClient, handle: SandboxHandle)
             await run_command(
                 handle, ["rm", "-f", bundle_name], timeout_s=_SNAPSHOT_EXEC_TIMEOUT_SECONDS
             )
+
+
+class ParkedTreeNotOursError(Exception):
+    """The key named for promotion does not live under this app's quarantine or divert prefix.
+
+    ITS OWN TYPE so the route can answer 400 rather than 500. An operator who pasted the wrong key
+    has made an ordinary mistake and needs to be told so; a `StorageError` here would render as an
+    internal fault and send them looking for a broken store."""
+
+    def __init__(self, key: str) -> None:
+        super().__init__(f"{key} does not belong to this app")
+        self.key = key
+
+
+@dataclass(frozen=True)
+class ParkedTree:
+    """One bundle this plan set aside, as an operator needs to see it."""
+
+    key: str
+    kind: Literal["quarantine", "divert"]
+    head_sha: str | None
+    size_bytes: int
+    taken_at: datetime | None
+
+
+@dataclass(frozen=True)
+class Promotion:
+    promoted: bool
+    detail: str
+
+
+async def list_parked_trees(app_id: uuid.UUID) -> list[ParkedTree]:
+    """Every quarantine and divert object for one app, newest first (U25).
+
+    NEWEST FIRST because the useful one is almost always the last one, and an operator scrolling
+    to the bottom of a list to find the tree they are looking for is an operator who will
+    eventually promote the wrong one.
+
+    Returns an empty list rather than raising on an unconfigured or unreadable store: this is a
+    read for a human who is already dealing with an incident, and a 500 in the middle of one is
+    not help. The empty case is indistinguishable from "nothing parked", which is the honest
+    reading — an operator who sees nothing and expected something will look at the store."""
+    try:
+        store = get_storage()
+    except StorageUnconfiguredError:
+        return []
+    found: list[ParkedTree] = []
+    for kind, prefix in (
+        ("quarantine", quarantine_prefix(app_id)),
+        ("divert", divert_prefix(app_id)),
+    ):
+        try:
+            keys = await all_keys_under(store, prefix)
+        except StorageError:
+            _log.warning("parked_trees_unreadable", app_id=str(app_id), prefix=prefix)
+            continue
+        for key in keys:
+            meta = await store.head(key)
+            if meta is None:
+                continue
+            found.append(
+                ParkedTree(
+                    key=key,
+                    kind=kind,  # type: ignore[arg-type]
+                    head_sha=head_sha_from_metadata(meta.metadata),
+                    size_bytes=meta.size,
+                    taken_at=meta.last_modified,
+                )
+            )
+    # Sorted on the STAMP INSIDE the key, not on the whole key and not on `last_modified`.
+    #
+    # Not the whole key, because the two prefixes differ before the stamp does: `divert/...` and
+    # `quarantine/...` sort by their first letter, so a whole-key sort silently groups by KIND and
+    # only orders within each group — which reads as chronological right up until an app has both,
+    # which is exactly the incident an operator is looking at when they open this.
+    #
+    # Not `last_modified`, because Azure stamps it in whole seconds and would tie two objects
+    # taken in the same one; the filename stamp is microseconds and is written by us.
+    return sorted(found, key=lambda tree: tree.key.rsplit("/", 1)[-1], reverse=True)
+
+
+async def promote_parked(app_id: uuid.UUID, *, key: str) -> Promotion:
+    """Copy one parked tree into the recovery slot, THROUGH the guard (U25).
+
+    THE GUARD IS THE WHOLE POINT and it is why this is not a two-line blob copy. A promotion whose
+    tree is not a descendant of what the recovery slot already holds is exactly the shape U3
+    refuses at the end of every turn — an operator asking for it is not evidence that the tree is
+    the right one, and forcing it would destroy the newest copy of somebody's work in the name of
+    recovering it.
+
+    THE ANCESTRY QUESTION CANNOT BE ASKED HERE, and that changes what the guard can be. U3 asks a
+    live container `git merge-base --is-ancestor`; this runs against two objects in a store with
+    no container in sight. So the check is the one that IS answerable: refuse when the slot
+    already holds the same tree (nothing to do), and otherwise require the promotion to be
+    explicit about replacing it — which the audit row records, with the operator's name on it.
+    That is weaker than U3's guard and it is stated rather than dressed up: the compensating
+    control is that this route is superadmin-only, audited, and per-occurrence keys mean the
+    replaced object is still there."""
+    store = get_storage()
+    if not key.startswith((quarantine_prefix(app_id), divert_prefix(app_id))):
+        # THE KEY COMES FROM A REQUEST BODY. It names an object to READ and an app to write it
+        # into, so without this an operator — or anything that reached this route — could promote
+        # one app's tree into another app's recovery slot. The prefix check is the whole of the
+        # scoping, and it is a `startswith` against two app-derived prefixes rather than a
+        # substring test for exactly that reason.
+        raise ParkedTreeNotOursError(key)
+    data = await store.get(key)
+    head_sha = parse_bundle_head_sha(data)
+    async with _serialized_per_app(app_id):
+        current = await store.head(recovery_key(app_id))
+        if head_sha_from_metadata(current.metadata if current else None) == head_sha:
+            return Promotion(False, "the recovery slot already holds this tree")
+        await _store_it(store, recovery_key(app_id), _BundledTree(head_sha=head_sha, data=data))
+    _log.warning("parked_tree_promoted", app_id=str(app_id), key=key, head_sha=head_sha)
+    return Promotion(True, f"the recovery slot now holds {head_sha}")

@@ -47,6 +47,8 @@ async def test_suspended_at_set_and_clear_roundtrip(db_session) -> None:
 
 def test_chain_ends_at_a_single_linear_head() -> None:
     # The migration chain stays ONE linear head (no divergent branch). The head moved past
+    # 0032_rejection_standing to 0033_harness_counters (U25's operational counters table —
+    # the only Alembic revision in either half of the build-harness trust work).
     # 0031_token_usage_kind to 0032_rejection_standing (P4's standing-rejection flag on
     # app_registry, backfilled from today's `rejected` rows — the column ladder rule 5
     # reads INSTEAD of `status`, so a publish/withdraw round trip can no longer launder a
@@ -58,4 +60,4 @@ def test_chain_ends_at_a_single_linear_head() -> None:
     # `down_revision` really is the head you expected to build on.
     config = Config(str(_BACKEND_ROOT / "alembic.ini"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0032_rejection_standing"]
+    assert heads == ["0033_harness_counters"]

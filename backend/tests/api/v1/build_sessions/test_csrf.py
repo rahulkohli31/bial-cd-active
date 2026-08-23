@@ -39,6 +39,11 @@ _MUTATING_POSTS = [
     # U4 — the idle-tab workspace check. A POST rather than a GET because it costs a container
     # exec and can raise an operational alarm, which is exactly the kind of thing CSRF is for.
     "/v1/build-sessions/projects/{project_id}/workspace-check",
+    # U25 — the operator surface for the trees this plan parks. Superadmin-gated, but CSRF'd
+    # like every other mutating POST here: the gate answers WHO, the token answers whether
+    # they meant to.
+    "/v1/build-sessions/internal/apps/{app_id}/parked",
+    "/v1/build-sessions/internal/apps/{app_id}/promote",
 ]
 
 

@@ -43,7 +43,11 @@ from src.api.v1.build_sessions.schemas import (
     HeartbeatResponse,
     LockReleaseResponse,
     LockStateResponse,
+    ParkedTree,
+    ParkedTreesResponse,
     PreviewLifeState,
+    PromoteParkedRequest,
+    PromoteParkedResponse,
     RelaunchPreviewRequest,
     RelaunchPreviewResponse,
     StartBuildRequest,
@@ -75,6 +79,11 @@ from src.services.build_sessions import (
     renew_lock,
     sweep_all,
     write_heartbeat,
+)
+from src.services.build_sessions.snapshot import (
+    ParkedTreeNotOursError,
+    list_parked_trees,
+    promote_parked,
 )
 from src.services.orchestrator.client_errors import (
     park_client_error,
@@ -178,6 +187,87 @@ def _coordination_is_gone() -> AppApiError:
 
 
 # --- internal/reap (registered FIRST so `internal` is never parsed as a session id) ---
+
+
+@router.post(
+    "/internal/apps/{app_id}/parked",
+    dependencies=[RequireCsrf],
+    responses=error_responses(AUTH_401, (403, ErrorEnvelope, "CSRF check failed")),
+)
+async def parked_trees(
+    app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
+) -> ParkedTreesResponse:
+    """The trees this plan set aside for one app — U2 quarantines and U3 diverts (U25).
+
+    WITHOUT THIS THEY ARE WRITE-ONLY: no reader, no retention, no runbook. In a false-`REVERTED`
+    case those objects hold the only copy of a citizen's newest work, and this plan names exactly
+    that shape as a defect elsewhere, so it must not reproduce it.
+
+    `CurrentSuperadmin`, and mounted beside `internal/reap` deliberately: this is an operator
+    action in the same category as the reaper, not the user-facing viewing surface the plan's
+    Scope Boundaries exclude. Audited, like every gated action (ADR-0005)."""
+    trees = await list_parked_trees(app_id)
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="harness:parked:list",
+        resource_type="app",
+        resource_id=str(app_id),
+        detail={"found": len(trees)},
+    )
+    await db.commit()
+    return ParkedTreesResponse(
+        trees=[
+            ParkedTree(
+                key=tree.key,
+                kind=tree.kind,
+                head_sha=tree.head_sha,
+                size_bytes=tree.size_bytes,
+                taken_at=tree.taken_at,
+            )
+            for tree in trees
+        ]
+    )
+
+
+@router.post(
+    "/internal/apps/{app_id}/promote",
+    dependencies=[RequireCsrf],
+    responses=error_responses(AUTH_401, (403, ErrorEnvelope, "CSRF check failed")),
+)
+async def promote_parked_tree(
+    app_id: uuid.UUID,
+    body: PromoteParkedRequest,
+    admin: CurrentSuperadmin,
+    db: DbSession,
+) -> PromoteParkedResponse:
+    """Put one parked tree back into the recovery slot (U25).
+
+    THROUGH U3'S GUARD, never around it. A promotion whose tree is not a descendant of what the
+    slot already holds is REFUSED and alarmed rather than forced — an operator recovering the
+    wrong tree over somebody's newest work is the precise failure this plan exists to stop, and
+    "an operator asked for it" is not evidence that the tree is the right one.
+
+    The key is named explicitly rather than "the newest": a request that cannot say what it means
+    is one that can be misread."""
+    try:
+        outcome = await promote_parked(app_id, key=body.key)
+    except ParkedTreeNotOursError as exc:
+        # A 400, not a 500: pasting the wrong key is an ordinary operator mistake, and rendering
+        # it as an internal fault sends them looking for a broken store instead of at the key.
+        raise AppApiError(
+            status.HTTP_400_BAD_REQUEST, "That parked tree belongs to a different app."
+        ) from exc
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="harness:parked:promote",
+        resource_type="app",
+        resource_id=str(app_id),
+        detail={"key": body.key, "promoted": outcome.promoted},
+    )
+    await db.commit()
+    return PromoteParkedResponse(promoted=outcome.promoted, detail=outcome.detail)
 
 
 @router.post(

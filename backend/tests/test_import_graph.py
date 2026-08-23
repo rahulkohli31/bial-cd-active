@@ -196,10 +196,12 @@ def test_the_app_still_builds_with_its_full_route_surface() -> None:
     # U11 added `projects/{project_id}/compile-state` (the compile signal for a tab with no live
     # turn — the turn stream's producer stops at the terminal), and U4 added
     # `projects/{project_id}/workspace-check` (the idle-tab integrity probe, for the reversion
-    # that happens while nobody is sending messages). Each recorded in C3 §9 in the same change
-    # that added the route.
-    assert len(build_session_paths) == 19, (
-        f"the C3 build-session route surface changed: expected 19 paths, found "
+    # that happens while nobody is sending messages), and U25 added the two superadmin operator
+    # routes for the trees U2 and U3 park (`internal/apps/{app_id}/parked` and `.../promote`) —
+    # without a reader those objects would be write-only, and in a false-reversion they hold the
+    # only copy of somebody's work. Each recorded in C3 §9 in the same change that added it.
+    assert len(build_session_paths) == 21, (
+        f"the C3 build-session route surface changed: expected 21 paths, found "
         f"{len(build_session_paths)}. If a route was deliberately added or removed, amend C3 "
         f"and update this number in the same change.\n{sorted(build_session_paths)}"
     )

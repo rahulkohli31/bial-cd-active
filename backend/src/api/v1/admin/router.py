@@ -58,6 +58,8 @@ from src.api.v1.admin.schemas import (
     DeployReconcileResponse,
     FeedbackItem,
     FeedbackResponse,
+    HarnessCounterRow,
+    HarnessCountersResponse,
     LimitFields,
     LimitsPatchResponse,
     MarkDeployedRequest,
@@ -99,6 +101,7 @@ from src.db.models.app_registry import (
 from src.db.models.attachment import Attachment
 from src.db.models.audit import AuditLog
 from src.db.models.feedback import Feedback
+from src.db.models.harness_counter import HarnessCount
 from src.db.models.project import Project
 from src.db.models.project_database import ProjectDatabase
 from src.db.models.token_usage import TokenUsage, TokenUsageKind
@@ -2235,4 +2238,53 @@ async def read_feedback(admin: CurrentSuperadmin, db: DbSession) -> FeedbackResp
             for row in rows
         ],
         total=total,
+    )
+
+
+@users_router.get("/harness-counters", responses=error_responses(*_ADMIN_AUTH))
+async def harness_counters(
+    admin: CurrentSuperadmin, db: DbSession, days: int = 7
+) -> HarnessCountersResponse:
+    """The build-harness outcomes, totalled — R32's "counter to watch" (U25).
+
+    WHAT IT IS FOR, in the words of the plan's success criteria: did the verdict block a false
+    claim, how often did we restore, and did any turn fail to reach a durable copy. There is no
+    metrics system in this deployment, so if these are not readable here they are not readable
+    anywhere — and an outcome nobody can count is an outcome nobody will notice regressing.
+
+    `CurrentSuperadmin`, and the gate in this package is OPT-IN PER ROUTE (see `app_counts`).
+    Silence would ship a citizen-readable endpoint leaking aggregate operational and usage data
+    across every user in the tenant.
+
+    NO `user_id` PREDICATE, like every route in this file: these are properties of the deployment,
+    not of any citizen, and the table holds no user data.
+
+    One `GROUP BY` over an indexed column on a small append-only table. `days` bounds it so the
+    query cannot grow without limit as the history does.
+
+    MOUNTED ON THE `/admin` ROUTER, not `/admin/apps`, and the distinction is real rather than
+    cosmetic: everything under `/admin/apps` is about one app's governance, and these counters are
+    about the DEPLOYMENT. They would answer the same numbers whether any app existed or not."""
+    since = datetime.now(UTC) - timedelta(days=max(1, min(days, 90)))
+    rows = (
+        await db.execute(
+            sa.select(
+                HarnessCount.name,
+                sa.func.sum(HarnessCount.value),
+                sa.func.count(),
+                sa.func.max(HarnessCount.occurred_at),
+            )
+            .where(HarnessCount.occurred_at >= since)
+            .group_by(HarnessCount.name)
+            .order_by(HarnessCount.name)
+        )
+    ).all()
+    return HarnessCountersResponse(
+        counters=[
+            HarnessCounterRow(
+                name=name, total=int(total or 0), occurrences=occurrences, last_seen_at=last_seen
+            )
+            for name, total, occurrences, last_seen in rows
+        ],
+        since=since,
     )

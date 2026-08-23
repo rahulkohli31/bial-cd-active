@@ -53,6 +53,7 @@ from src.api.v1.build_sessions.schemas import (
 )
 from src.db.base import async_session_factory
 from src.db.models.app_registry import AppRegistry
+from src.db.models.harness_counter import HarnessCounter
 from src.db.models.project import Project
 from src.db.models.user import User
 from src.services.build_sessions.alarms import (
@@ -63,6 +64,7 @@ from src.services.build_sessions.appdata import build_app_env, resolve_app_for_p
 from src.services.build_sessions.appdb_env import provision_app_database
 from src.services.build_sessions.appstorage import provision_app_storage
 from src.services.build_sessions.attachments import resolve_build_attachments
+from src.services.build_sessions.counters import count
 from src.services.build_sessions.integrity import (
     IntegrityVerdict,
     WorkspaceState,
@@ -94,6 +96,7 @@ from src.services.build_sessions.outcome import (
 from src.services.build_sessions.reaper import reap_user, reconcile_user
 from src.services.build_sessions.snapshot import (
     Destination,
+    RecoveryOutcome,
     consecutive_diverts,
     write_recovery_copy,
     write_snapshot,
@@ -2717,6 +2720,7 @@ class SessionManager:
             _log.exception("workspace restore failed after quarantine", app_id=str(app_id))
             await _say(announce, RecoveryNews.UNRECOVERABLE)
             return _ResolvedSandbox(handle, attached=True, news=RecoveryNews.UNRECOVERABLE)
+        await count(HarnessCounter.RESTORE_PERFORMED, app_id=app_id)
         _log.warning(
             "workspace_restored_after_reversion",
             app_id=str(app_id),
@@ -3373,6 +3377,11 @@ class SessionManager:
                         session.app_id,
                         taken_at=datetime.now(UTC),
                     )
+                if written.outcome is RecoveryOutcome.DIVERTED:
+                    # THE NUMBER THAT SETTLES 2026-08-18 the next time it happens: the difference
+                    # between "the platform failed to CHECK the workspace" and "the platform
+                    # failed to make it DURABLE", which nobody could answer on the day.
+                    await count(HarnessCounter.RECOVERY_WRITE_MISSED, app_id=session.app_id)
                 _log.info(
                     "recovery copy",
                     app_id=str(session.app_id),
@@ -3393,6 +3402,7 @@ class SessionManager:
                     reason="failed",
                     exc_info=True,
                 )
+                await count(HarnessCounter.RECOVERY_WRITE_MISSED, app_id=session.app_id)
 
         # 2/3. Pardon: grant the stay while the lock is STILL HELD, then release. The order
         #      is load-bearing (see `_pardon_the_container`) — releasing first opens a window
