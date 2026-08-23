@@ -44,6 +44,7 @@ from pydantic_ai.models.function import (
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import BuildError, ErrorSource
+from src.api.v1.conversations.schemas import StepFrame
 from src.config import settings
 from src.core.integrity_types import BaselineIdentity
 from src.db.models.conversation import ConversationMode
@@ -1767,12 +1768,13 @@ async def test_an_unanswerable_verdict_does_not_wear_the_failure_label_in_the_li
         client=client,
     )
 
-    verify_steps = [
-        f.item
-        for f in state.ring
-        if getattr(f, "type", None) == "step" and getattr(f.item, "tool", None) == "verify"
+    finished = [
+        frame.item
+        for frame in state.ring
+        if isinstance(frame, StepFrame)
+        and frame.item.tool == "verify"
+        and frame.item.state != "pending"
     ]
-    finished = [s for s in verify_steps if s.state != "pending"]
     # LIVENESS: the spinner really was resolved, so the assertions below are about WHICH arm ran
     # rather than about a step that never landed.
     assert finished, "the verify spinner must resolve, or this proves nothing"
