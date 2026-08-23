@@ -988,20 +988,29 @@ const HOLDING_SLOW = /taking longer than usual — it will appear here/i
 // imports the constant it is pinning asserts only that the code equals itself.
 const ESCALATE_MS = 20000
 
+// …and what the cover says when no turn is running, so the holding wording cannot outlive the
+// work it describes (U7/R13).
+const STOPPED = /Your app stopped running and needs to be brought back/i
+
 /** The cover is an opaque, full-bleed element over the frame. Identified by what makes it a
- *  cover rather than by a test id, so a refactor that stops covering fails here. */
+ *  cover rather than by a test id, so a refactor that stops covering fails here — and matched
+ *  on ANY of its three sentences, because which one it is telling is a separate question from
+ *  whether it is covering. Matching on one of them would have made every idle-state test read
+ *  as "no cover at all". */
 function coverEl(container) {
   return [...container.querySelectorAll('div')].find(
     (el) =>
       el.className.includes('absolute inset-0') &&
       el.textContent &&
-      (HOLDING.test(el.textContent) || HOLDING_SLOW.test(el.textContent)),
+      (HOLDING.test(el.textContent) ||
+        HOLDING_SLOW.test(el.textContent) ||
+        STOPPED.test(el.textContent)),
   )
 }
 
 describe('LivePreview — the cover (R16/R18): the framework error screen is never seen', () => {
   it('covers the frame when the app fails to compile, and shows the holding state (AE10)', () => {
-    const { container } = setup({ compileState: 'failed' })
+    const { container } = setup({ turnRunning: true,  compileState: 'failed' })
 
     const cover = coverEl(container)
     expect(cover).toBeTruthy()
@@ -1020,10 +1029,10 @@ describe('LivePreview — the cover (R16/R18): the framework error screen is nev
     // its image; it is driven purely by a signal about compilation. That is what makes it the
     // only mechanism that reaches the apps already out there, and this test fails the moment
     // someone gates it on something the existing fleet cannot report.
-    const { container, rerender } = setup({ compileState: 'failed' })
+    const { container, rerender } = setup({ turnRunning: true,  compileState: 'failed' })
     expect(coverEl(container)).toBeTruthy()
 
-    rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="clean" />)
+    rerender(<LivePreview turnRunning previewUrl={SANDBOX_URL} status="ready" compileState="clean" />)
     expect(coverEl(container)).toBeFalsy()
     expect(container.querySelector('iframe')).toBeTruthy() // liveness: the pane still renders
   })
@@ -1033,10 +1042,10 @@ describe('LivePreview — the cover (R16/R18): the framework error screen is nev
     // what a container reports when nothing has connected, when the socket is down, and — for
     // every app provisioned before the signal existed — permanently. Clearing on it would
     // uncover the exact screen this cover exists to hide.
-    const { container, rerender } = setup({ compileState: 'failed' })
+    const { container, rerender } = setup({ turnRunning: true,  compileState: 'failed' })
     expect(coverEl(container)).toBeTruthy()
 
-    rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="unknown" />)
+    rerender(<LivePreview turnRunning previewUrl={SANDBOX_URL} status="ready" compileState="unknown" />)
     expect(coverEl(container)).toBeTruthy()
     expect(container.querySelector('iframe')).toBeTruthy()
   })
@@ -1044,10 +1053,10 @@ describe('LivePreview — the cover (R16/R18): the framework error screen is nev
   it('holds the cover DOWN on unknown too — fail-closed means hold, not raise', () => {
     // The other direction, and it matters just as much: an unknown reading must not throw a
     // holding card over a perfectly healthy app the citizen is using.
-    const { container, rerender } = setup({ compileState: 'clean' })
+    const { container, rerender } = setup({ turnRunning: true,  compileState: 'clean' })
     expect(coverEl(container)).toBeFalsy()
 
-    rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="unknown" />)
+    rerender(<LivePreview turnRunning previewUrl={SANDBOX_URL} status="ready" compileState="unknown" />)
     expect(coverEl(container)).toBeFalsy()
     expect(container.querySelector('iframe')).toBeTruthy()
   })
@@ -1055,7 +1064,7 @@ describe('LivePreview — the cover (R16/R18): the framework error screen is nev
   it('holds the cover down when nothing has been reported at all', () => {
     // `null` is "no signal on this turn", which is how the pane behaved before the cover
     // existed. It must not raise a cover nobody asked for.
-    const { container } = setup({ compileState: null })
+    const { container } = setup({ turnRunning: true,  compileState: null })
     expect(coverEl(container)).toBeFalsy()
     expect(container.querySelector('iframe')).toBeTruthy()
   })
@@ -1065,10 +1074,10 @@ describe('LivePreview — the cover (R16/R18): the framework error screen is nev
     // an absent signal says nothing about the app being covered; a new preview url means we are
     // not covering that app any more, and keeping the card up would be a claim about code this
     // container has never seen. Reachable by switching conversations in the same pane.
-    const { container, rerender } = setup({ compileState: 'failed' })
+    const { container, rerender } = setup({ turnRunning: true,  compileState: 'failed' })
     expect(coverEl(container)).toBeTruthy()
 
-    rerender(<LivePreview previewUrl={SANDBOX_URL_2} status="ready" compileState={null} />)
+    rerender(<LivePreview turnRunning previewUrl={SANDBOX_URL_2} status="ready" compileState={null} />)
     expect(coverEl(container)).toBeFalsy()
     expect(container.querySelector('iframe')).toBeTruthy() // liveness
   })
@@ -1080,10 +1089,10 @@ describe('LivePreview — the cover (R16/R18): the framework error screen is nev
     // Reset-on-url and apply-on-verdict as two effects meant React skipped the verdict effect on
     // that path (its dep did not change), and the reset won uncontested: the pane uncovered
     // itself over a broken app, which is the exact failure this whole mechanism exists to stop.
-    const { container, rerender } = setup({ compileState: 'failed' })
+    const { container, rerender } = setup({ turnRunning: true,  compileState: 'failed' })
     expect(coverEl(container)).toBeTruthy()
 
-    rerender(<LivePreview previewUrl={SANDBOX_URL_2} status="ready" compileState="failed" />)
+    rerender(<LivePreview turnRunning previewUrl={SANDBOX_URL_2} status="ready" compileState="failed" />)
     expect(coverEl(container)).toBeTruthy()
     expect(container.querySelector('iframe')).toBeTruthy() // liveness
   })
@@ -1094,28 +1103,28 @@ describe('LivePreview — the cover (R16/R18): the framework error screen is nev
     // signal is still `unknown`: app B has reported nothing, so covering it would be a claim
     // about code nothing has looked at. Without the url dep the effect never re-runs here and
     // app B inherits app A's cover.
-    const { container, rerender } = setup({ compileState: 'failed' })
-    rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="unknown" />)
+    const { container, rerender } = setup({ turnRunning: true,  compileState: 'failed' })
+    rerender(<LivePreview turnRunning previewUrl={SANDBOX_URL} status="ready" compileState="unknown" />)
     expect(coverEl(container)).toBeTruthy() // held through the unknown, same app
 
-    rerender(<LivePreview previewUrl={SANDBOX_URL_2} status="ready" compileState="unknown" />)
+    rerender(<LivePreview turnRunning previewUrl={SANDBOX_URL_2} status="ready" compileState="unknown" />)
     expect(coverEl(container)).toBeFalsy()
     expect(container.querySelector('iframe')).toBeTruthy() // liveness
   })
 
   it('applies the new app’s own verdict when the url and the signal change together', () => {
-    const { container, rerender } = setup({ compileState: 'clean' })
+    const { container, rerender } = setup({ turnRunning: true,  compileState: 'clean' })
     expect(coverEl(container)).toBeFalsy()
 
-    rerender(<LivePreview previewUrl={SANDBOX_URL_2} status="ready" compileState="failed" />)
+    rerender(<LivePreview turnRunning previewUrl={SANDBOX_URL_2} status="ready" compileState="failed" />)
     expect(coverEl(container)).toBeTruthy()
   })
 
   it('clears the cover on an affirmative clean, and stops intercepting the frame', () => {
-    const { container, rerender } = setup({ compileState: 'building' })
+    const { container, rerender } = setup({ turnRunning: true,  compileState: 'building' })
     expect(coverEl(container)).toBeTruthy()
 
-    rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="clean" />)
+    rerender(<LivePreview turnRunning previewUrl={SANDBOX_URL} status="ready" compileState="clean" />)
     expect(coverEl(container)).toBeFalsy()
     // Cleared means GONE, not transparent: an invisible element over the frame would swallow
     // every click the citizen makes on their own app.
@@ -1125,7 +1134,7 @@ describe('LivePreview — the cover (R16/R18): the framework error screen is nev
   it('escalates the wording exactly once, at the pinned interval, and never again', () => {
     vi.useFakeTimers()
     try {
-      const { container } = setup({ compileState: 'building' })
+      const { container } = setup({ turnRunning: true,  compileState: 'building' })
       expect(coverEl(container).textContent).toMatch(HOLDING)
 
       act(() => vi.advanceTimersByTime(ESCALATE_MS - 1))
@@ -1145,12 +1154,12 @@ describe('LivePreview — the cover (R16/R18): the framework error screen is nev
   it('re-arms the escalation for a NEW cover rather than opening in a stale complaint', () => {
     vi.useFakeTimers()
     try {
-      const { container, rerender } = setup({ compileState: 'building' })
+      const { container, rerender } = setup({ turnRunning: true,  compileState: 'building' })
       act(() => vi.advanceTimersByTime(ESCALATE_MS))
       expect(coverEl(container).textContent).toMatch(HOLDING_SLOW)
 
-      rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="clean" />)
-      rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="failed" />)
+      rerender(<LivePreview turnRunning previewUrl={SANDBOX_URL} status="ready" compileState="clean" />)
+      rerender(<LivePreview turnRunning previewUrl={SANDBOX_URL} status="ready" compileState="failed" />)
       expect(coverEl(container).textContent).toMatch(HOLDING)
     } finally {
       vi.useRealTimers()
@@ -1161,25 +1170,25 @@ describe('LivePreview — the cover (R16/R18): the framework error screen is nev
     // Reloading the tab while a build is running remounts this component from nothing. The
     // cover is derived from the CURRENT signal, not from a transition, so the very first paint
     // after a refresh is already covered.
-    const { container } = setup({ compileState: 'failed' })
+    const { container } = setup({ turnRunning: true,  compileState: 'failed' })
     expect(coverEl(container)).toBeTruthy()
     expect(container.querySelector('iframe')).toBeTruthy()
   })
 
   it('loses to a restore in flight — the restoring card wins and no cover is drawn', () => {
-    const { container } = setup({ compileState: 'failed', relaunching: true })
+    const { container } = setup({ turnRunning: true,  compileState: 'failed', relaunching: true })
     expect(screen.getAllByText(/Restoring your app/i).length).toBeGreaterThan(0) // liveness for the winner
     expect(coverEl(container)).toBeFalsy()
   })
 
   it('loses to a terminal session and to a container that is not serving', () => {
-    const terminal = render(<LivePreview previewUrl={SANDBOX_URL} status="ended" compileState="failed" />)
+    const terminal = render(<LivePreview turnRunning previewUrl={SANDBOX_URL} status="ended" compileState="failed" />)
     expect(coverEl(terminal.container)).toBeFalsy()
     expect(terminal.container.textContent).toMatch(/preview/i) // liveness: the placeholder rendered
     cleanup()
 
     const asleep = render(
-      <LivePreview previewUrl={SANDBOX_URL} status="ready" previewState="asleep" compileState="failed" />,
+      <LivePreview turnRunning previewUrl={SANDBOX_URL} status="ready" previewState="asleep" compileState="failed" />,
     )
     expect(coverEl(asleep.container)).toBeFalsy()
     expect(screen.getAllByText(/Your workspace is asleep/i).length).toBeGreaterThan(0) // liveness
@@ -1189,19 +1198,19 @@ describe('LivePreview — the cover (R16/R18): the framework error screen is nev
     // `showLoading` is true here (the frame is mounted and its `load` has not fired), and so is
     // the cover. The file's existing rule is that the waits share one anchor so they can never
     // co-exist; the cover joins that rule rather than becoming a third card stacked on them.
-    const { container } = setup({ compileState: 'building' })
+    const { container } = setup({ turnRunning: true,  compileState: 'building' })
     expect(coverEl(container)).toBeTruthy()
     expect(screen.queryByText(/Starting your app/i)).toBeNull()
     expect(container.querySelector('iframe')).toBeTruthy() // liveness
   })
 
   it('announces the holding state through the pane’s ONE live region, and gives it back', () => {
-    const { container, rerender } = setup({ compileState: 'failed' })
+    const { container, rerender } = setup({ turnRunning: true,  compileState: 'failed' })
     const regions = container.querySelectorAll('[role="status"]')
     expect(regions).toHaveLength(1) // no second live region is introduced
     expect(regions[0].textContent).toMatch(HOLDING)
 
-    rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="clean" />)
+    rerender(<LivePreview turnRunning previewUrl={SANDBOX_URL} status="ready" compileState="clean" />)
     expect(container.querySelectorAll('[role="status"]')).toHaveLength(1)
     expect(container.querySelector('[role="status"]').textContent).not.toMatch(HOLDING)
   })
@@ -1209,7 +1218,7 @@ describe('LivePreview — the cover (R16/R18): the framework error screen is nev
   it('announces the escalated wording too, rather than going quiet as the wait gets longer', () => {
     vi.useFakeTimers()
     try {
-      const { container } = setup({ compileState: 'building' })
+      const { container } = setup({ turnRunning: true,  compileState: 'building' })
       act(() => vi.advanceTimersByTime(ESCALATE_MS))
       expect(container.querySelector('[role="status"]').textContent).toMatch(HOLDING_SLOW)
     } finally {
@@ -1217,3 +1226,152 @@ describe('LivePreview — the cover (R16/R18): the framework error screen is nev
     }
   })
 })
+
+// ---------------------------------------------------------------------------------------
+// U7 (R13) — the holding state stops when the work does
+// U10 (R11) — the frame is revealed on the verdict AND the load, never on the load alone
+// ---------------------------------------------------------------------------------------
+
+/** The device card carries the reveal. `opacity-100` is the revealed state; `opacity-0` is
+ *  mounted-but-hidden, which is deliberately NOT unmounted — an iframe that never mounts never
+ *  loads, and `load` is the only thing that can reveal it. */
+function deviceCard(container) {
+  return container.querySelector('[data-testid="device-card"]')
+}
+
+function loadTheFrame(container) {
+  act(() => {
+    fireEvent.load(container.querySelector('iframe'))
+  })
+}
+
+describe('LivePreview — the holding state stops when the turn does (U7/R13)', () => {
+  it('says the app stopped running once no turn is in flight, and stops claiming progress', () => {
+    // THE FAILURE THIS CLOSES. "Putting the latest change together…" is true for exactly as long
+    // as a turn is running. Left up after one ends it becomes a progress state that never
+    // resolves — the citizen's only way to learn the build was over is to wait long enough to
+    // stop believing it, which is the shape of the nine-minute false success inverted.
+    const { container } = setup({ compileState: 'failed', turnRunning: false })
+
+    const cover = coverEl(container)
+    expect(cover).toBeTruthy() // LIVENESS: still covering; what is behind it is still an error
+    expect(cover.textContent).toMatch(STOPPED)
+    expect(cover.textContent).not.toMatch(HOLDING)
+  })
+
+  it('switches wording when a running turn ends, without uncovering the error screen', () => {
+    const { container, rerender } = setup({ compileState: 'failed', turnRunning: true })
+    expect(coverEl(container).textContent).toMatch(HOLDING)
+
+    rerender(
+      <LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="failed" turnRunning={false} />,
+    )
+
+    expect(coverEl(container).textContent).toMatch(STOPPED)
+    // The cover STAYS. Clearing it would trade a lie about progress for a lie about the app —
+    // behind it is the framework's error screen today and a blank page once that is suppressed.
+    expect(container.querySelector('iframe')).toBeTruthy()
+  })
+
+  it('does not escalate an idle cover — the escalation is the same claim with more emphasis', () => {
+    vi.useFakeTimers()
+    try {
+      const { container } = setup({ compileState: 'building', turnRunning: false })
+      act(() => vi.advanceTimersByTime(ESCALATE_MS * 2))
+      expect(coverEl(container).textContent).toMatch(STOPPED)
+      expect(coverEl(container).textContent).not.toMatch(HOLDING_SLOW)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('announces the idle wording through the same single live region', () => {
+    const { container } = setup({ compileState: 'failed', turnRunning: false })
+    const regions = container.querySelectorAll('[role="status"]')
+    expect(regions).toHaveLength(1) // still no second live region
+    expect(regions[0].textContent).toMatch(STOPPED)
+  })
+})
+
+describe('LivePreview — the reveal is earned twice over (U10/R11)', () => {
+  it('reveals when the verdict passes AND the frame loads', () => {
+    const { container } = setup({ compileState: 'clean' })
+    expect(deviceCard(container).className).toMatch(/opacity-0/)
+
+    loadTheFrame(container)
+
+    expect(deviceCard(container).className).toMatch(/opacity-100/)
+  })
+
+  it('does NOT reveal on the load event alone when the verdict says the app failed', () => {
+    // ★ THE POINT OF THE UNIT. `load` fires for a 500 exactly as it does for a 200, this pane
+    // cannot read a cross-origin status, and the in-container proxy emits its handle-block
+    // headers even on the 502 it returns when the dev server is down — so `load` fires on that
+    // too. On its own it is not evidence of anything.
+    const { container } = setup({ compileState: 'failed', turnRunning: true })
+
+    loadTheFrame(container)
+
+    expect(deviceCard(container).className).toMatch(/opacity-0/)
+    expect(coverEl(container)).toBeTruthy() // LIVENESS: the pane rendered and is covering
+  })
+
+  it('does not reveal on a passing verdict alone — the document still has to load', () => {
+    const { container } = setup({ compileState: 'clean' })
+    expect(deviceCard(container)).toBeTruthy() // LIVENESS: the card is mounted, just hidden
+    expect(deviceCard(container).className).toMatch(/opacity-0/)
+  })
+
+  it('RETRACTS a reveal when the verdict flips to failed (R4), and the cover explains', () => {
+    const { container, rerender } = setup({ compileState: 'clean' })
+    loadTheFrame(container)
+    expect(deviceCard(container).className).toMatch(/opacity-100/)
+
+    rerender(
+      <LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="failed" turnRunning />,
+    )
+
+    expect(deviceCard(container).className).toMatch(/opacity-0/)
+    expect(coverEl(container).textContent).toMatch(HOLDING)
+  })
+
+  it('does NOT retract a reveal on an unanswerable verdict (AE8)', () => {
+    // `unknown` HOLDS whatever is showing rather than moving it — the same fail-closed rule that
+    // stops an absent signal uncovering a broken app stops it hiding a working one.
+    const { container, rerender } = setup({ compileState: 'clean' })
+    loadTheFrame(container)
+    expect(deviceCard(container).className).toMatch(/opacity-100/)
+
+    rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="unknown" />)
+
+    expect(deviceCard(container).className).toMatch(/opacity-100/)
+  })
+
+  it('introduces no overlay of its own — the reveal is opacity and nothing else', () => {
+    // An inertness guard, paired with liveness. This unit controls the frame's transparency;
+    // everything visible ABOVE the frame belongs to the cover, and a second surface here would
+    // be one more thing that can contradict it.
+    const revealed = setup({ compileState: 'clean' })
+    loadTheFrame(revealed.container)
+    const overlaysWhenRevealed = revealed.container.querySelectorAll('.absolute.inset-0').length
+    cleanup()
+
+    const hidden = render(
+      <LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="failed" turnRunning />,
+    )
+    loadTheFrame(hidden.container)
+
+    expect(deviceCard(hidden.container)).toBeTruthy() // LIVENESS
+    // Exactly ONE more full-bleed element than the revealed case: the cover. Not two.
+    expect(hidden.container.querySelectorAll('.absolute.inset-0').length).toBe(
+      overlaysWhenRevealed + 1,
+    )
+  })
+
+  it('keeps the announcement honest: an unrevealed frame is not "your app preview is live"', () => {
+    const { container } = setup({ compileState: 'failed', turnRunning: false })
+    loadTheFrame(container)
+    expect(container.querySelector('[role="status"]').textContent).not.toMatch(/preview is live/i)
+  })
+})
+

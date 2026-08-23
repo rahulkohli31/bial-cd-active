@@ -125,6 +125,10 @@ class FakeSandbox(SandboxClient):
         # before U9 silently starts paying for a second verify pass.
         self.changed_since_watermark = False
         self.watermark_stamps = 0
+        # A container that cannot answer the harness's own `sh -c` probes at all — an image with
+        # no `find`, a shell that is not there. Every probe returns a non-zero exit, which each
+        # of them reads as "we could not find out" rather than as a fact about the workspace.
+        self.probes_fail = False
         # call records (assertions)
         self.command_calls: list[list[str]] = []
         self.command_timeouts: list[int] = []  # the timeout_s each exec was invoked with
@@ -258,6 +262,10 @@ class FakeSandbox(SandboxClient):
         if len(cmd) != 3 or cmd[0] != "sh":
             return None
         script = cmd[2]
+        if self.probes_fail and (
+            _STAMP_MARKER in script or _CHANGED_MARKER in script or _BASELINE_MARKER in script
+        ):
+            return ExecResult(stdout="", stderr="sh: not found", exit=127)
         if _STAMP_MARKER in script:  # U9 — mark "now" before the agent runs
             self.watermark_stamps += 1
             return ExecResult(stdout="", stderr="", exit=0)
