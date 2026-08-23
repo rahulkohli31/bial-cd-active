@@ -224,6 +224,71 @@ _WRITE_REMINDER_NUDGE = (
 )
 
 
+# --- U8 (R14): the ephemeral workspace note ------------------------------------------
+#
+# THE MODEL IS TOLD WHAT THE WORKSPACE IS DOING RIGHT NOW, on every turn, whether it asked or not.
+# The prohibition ("do not answer from memory") existed and was obeyed the way prohibitions are:
+# a user said their app was broken, and the assistant answered from the conversation — where the
+# app had been working — because that was the only account of the app it had. Instructing a model
+# not to answer from stale context, while giving it nothing else, asks it to know something it
+# cannot know. This hands it the fact instead, so answering from stale history stops being
+# forbidden and starts being unnecessary.
+#
+# IT RIDES THE HISTORY TAIL AND IS NEVER PERSISTED, exactly like the reminders above and for the
+# same structural reason: `_persistable_messages` drops requests carrying a `UserPromptPart`, so
+# nothing downstream has to remember to strip it. It is emphatically NOT part of `_reminder_text`,
+# which is cadence-gated and returns `None` between anchors — riding that would inject the
+# workspace state on roughly one turn in four, while this exists precisely to hold on all of them.
+
+_WORKSPACE_NOTE_HEAD = "<system-note>The platform checked this app's workspace just now: "
+
+_WORKSPACE_NOTE_TAIL = (
+    " Use this rather than what earlier messages in this conversation said about the app — those "
+    "describe how it was, and this is how it is." + _PRIVATE + "</system-note>"
+)
+
+_WORKSPACE_UNKNOWN = (
+    "the platform could not tell what state it is in this time. If the user says something is "
+    "wrong, look at the app's files and check for yourself rather than assuming it still works."
+)
+
+_WORKSPACE_NOT_SERVING = (
+    "the app is not currently serving. Something it needs at startup is most likely failing, so "
+    "treat any question about what the app does today as a question about a broken app."
+)
+
+_WORKSPACE_STILL_TEMPLATE = (
+    "the app is serving, and its home page is still byte-for-byte the starter template the "
+    "workspace was created with — nothing the user asked for is on the page they actually look "
+    "at. Whatever else exists in the files, the app they see has not been built yet."
+)
+
+_WORKSPACE_LIVE = "the app is serving, and its home page is no longer the starter template."
+
+
+def workspace_note(*, serving: bool | None, still_the_template: bool | None) -> str:
+    """The private note telling the model what this app's workspace is doing, right now (U8/R14).
+
+    `None` means the platform could not find out, and it is deliberately not collapsed into either
+    of the other answers: a model told "your app is fine" on the strength of a check that never
+    completed is worse off than one told nothing, because it will now defend the claim.
+
+    Ordering. "Could not tell" wins over everything — an unanswered check cannot be reported as a
+    finding. Then "not serving", because an app that is down is not an app whose home page is
+    worth discussing. Only then the content answer."""
+    if serving is None:
+        body = _WORKSPACE_UNKNOWN
+    elif not serving:
+        body = _WORKSPACE_NOT_SERVING
+    elif still_the_template is None:
+        body = _WORKSPACE_UNKNOWN
+    elif still_the_template:
+        body = _WORKSPACE_STILL_TEMPLATE
+    else:
+        body = _WORKSPACE_LIVE
+    return f"{_WORKSPACE_NOTE_HEAD}{body}{_WORKSPACE_NOTE_TAIL}"
+
+
 def mode_reminder(
     mode: ConversationMode, *, full: bool, plan_options_outstanding: bool = False
 ) -> str:

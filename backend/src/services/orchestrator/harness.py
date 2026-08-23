@@ -68,7 +68,12 @@ from src.services.orchestrator.constants import (
 from src.services.orchestrator.deps import BuildDeps, SandboxSession
 from src.services.orchestrator.progress import ProgressEmitter
 from src.services.orchestrator.prompt import build_repair_prompt
-from src.services.orchestrator.selfheal import CONTINUE_PROMPT, dev_not_ready_error, verify
+from src.services.orchestrator.selfheal import (
+    CONTINUE_PROMPT,
+    HealthState,
+    dev_not_ready_error,
+    verify,
+)
 from src.services.orchestrator.trace import record_run_messages, record_tool_calls
 from src.services.sandbox import (
     SandboxClient,
@@ -350,6 +355,13 @@ class BuildOrchestrator:
                 log_cursor=log_cursor,
                 max_polls=self._readiness_max_polls,
                 poll_s=self._readiness_poll_s,
+                app_id=deps.sandbox.app_id,
+                # RESOLVED PER PASS, not once per build, and cheaply: it is one HEAD on the
+                # recovery slot. This loop has no attach path to hang it off (the live turn engine
+                # resolves it where it pins the workspace), and a build long enough to write its
+                # first recovery copy mid-run should start applying the content check from the
+                # pass after it — not from the next build.
+                had_prior_building_turns=await _has_this_app_ever_been_built(deps.sandbox.app_id),
             )
             if (
                 outcome.dev_ready and deps.claim_preview_frame()
@@ -362,11 +374,20 @@ class BuildOrchestrator:
                 )
 
             if deps.sandbox.done_requested:  # resolve the spinner `declare_done` opened (C7 §3.1)
-                await emitter.step(
-                    name="declare_done",
-                    label="Build verified." if outcome.green else "Not green yet — continuing.",
-                    state="ok" if outcome.green else "failed",
-                )
+                # THREE ARMS, because the verdict has three values (U6). An INDETERMINATE
+                # verdict is not a failure and must not be labelled as one: "Not green yet"
+                # over a check that could not be reached tells the citizen their app is broken
+                # on the strength of our own timeout. It resolves the spinner with a neutral
+                # word and a neutral state instead.
+                label: str
+                step_state: Literal["started", "ok", "failed"]
+                if outcome.state is HealthState.INDETERMINATE:
+                    label, step_state = "Still checking…", "ok"
+                elif outcome.green:
+                    label, step_state = "Build verified.", "ok"
+                else:
+                    label, step_state = "Not green yet — continuing.", "failed"
+                await emitter.step(name="declare_done", label=label, state=step_state)
 
             if outcome.green and deps.sandbox.done_requested:  # objective done-gate (KD-6)
                 return _Terminal(kind="completed", preview_url=outcome.preview_url)
@@ -376,6 +397,15 @@ class BuildOrchestrator:
             # the poll budget — synthesize a server error so neither the repair prompt nor a
             # budget-exhausted escalation is ever left diagnostic-free. `error is None` does NOT
             # imply green (open-Q F): only `CONTINUE_PROMPT` below may run on a truly green build.
+            # `verify` names its own defects now — every UNHEALTHY arm carries a diagnostic — so
+            # what is left for this line is the INDETERMINATE verdict that outlasted `verify`'s
+            # own patience, plus the belt against a red arm that somehow says nothing.
+            #
+            # AND AT THAT POINT THE DIAGNOSIS IS HONEST, which is the whole reason INDETERMINATE
+            # does not need a message class of its own. `verify` has by now spent its full
+            # readiness budget three times over; "the dev server did not report ready" has stopped
+            # being our impatience and started being a fact about the app. What U6 removed is the
+            # repair run spent on the FIRST timeout, and it removed it inside `verify`.
             error = outcome.error
             if error is None and not outcome.green:
                 error = dev_not_ready_error()
@@ -703,6 +733,18 @@ async def _frame_the_preview(
         await sandbox_client.someone_has_to_go_first(handle)
     finally:
         await emitter.preview_ready(preview_url=preview_url)
+
+
+async def _has_this_app_ever_been_built(app_id: uuid.UUID) -> bool:
+    """`integrity.has_ever_been_built`, reached through a function-scoped import.
+
+    Same cycle, same answer, same precedent as `selfheal._ask_the_container_what_it_is_showing`
+    and `reaper`'s `_container_state`: `src.services.build_sessions.__init__` reaches
+    `services.orchestrator.__init__` by way of `appdata` → `services.projects` → `agent.agent`, so
+    a module-level import here fails at interpreter start rather than at call time."""
+    from src.services.build_sessions.integrity import has_ever_been_built
+
+    return await has_ever_been_built(app_id)
 
 
 async def _stop_watcher(task: asyncio.Task[None] | None) -> None:

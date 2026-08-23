@@ -49,9 +49,31 @@ from src.services.sandbox.base import (
     SandboxClient,
     SandboxGoneError,
     SandboxHandle,
+    ServedPage,
 )
 from src.services.storage.base import ListPage, ObjectMeta, ObjectStorage
 from src.services.storage.errors import StorageNotFoundError
+
+# U6's baseline-identity probe, as a fake container answers it. Matched on a fragment of the real
+# script rather than on the whole thing: the script is a private constant whose wording is allowed
+# to change, and a fake that string-matched all of it would go quietly inert the first time it did
+# — answering the generic empty result, which parses as `UNANSWERABLE`.
+_BASELINE_MARKER = "git rev-list --max-parents=0"
+
+BASELINE_ROOT_SHA = "0" * 40
+"""The root commit a fake container reports — the `bial: golden template baseline`."""
+
+BASELINE_TEMPLATE_BLOB = "1" * 40
+"""The blob the root commit stored at `app/page.tsx`."""
+
+BASELINE_DIVERGED_STDOUT = f"{BASELINE_ROOT_SHA}@@{BASELINE_TEMPLATE_BLOB}@@{'2' * 40}"
+"""A BUILT app: one root commit, and a root route the agent has since rewritten."""
+
+BASELINE_UNTOUCHED_STDOUT = (
+    f"{BASELINE_ROOT_SHA}@@{BASELINE_TEMPLATE_BLOB}@@{BASELINE_TEMPLATE_BLOB}"
+)
+"""THE 2026-08-18 SHAPE: every server-side check green, and `app/page.tsx` byte-identical to the
+golden template the workspace was born with."""
 
 
 def a_git_bundle(sha: str = "a" * 40) -> bytes:
@@ -241,6 +263,12 @@ class FakeSandboxClient(SandboxClient):
             state=CompileState.UNKNOWN, reason="endpoint_absent"
         )
         self.compile_polls = 0
+        # U6/R9 — what the app's own root answers, and every URL that was asked. `None` scripts
+        # the probe that could not reach the app at all, which is an INDETERMINATE input.
+        self.served_page: ServedPage | None = ServedPage(
+            status=200, head="<!DOCTYPE html><html><body>an app</body></html>"
+        )
+        self.served_probes: list[str] = []
 
     async def provision_new(
         self, user_id: str, app_name: str, *, app_env: dict[str, str]
@@ -315,6 +343,17 @@ class FakeSandboxClient(SandboxClient):
     ) -> ExecResult:
         if self.exec_handler is not None:
             return self.exec_handler(cmd)
+        if len(cmd) == 3 and cmd[0] == "sh" and _BASELINE_MARKER in cmd[2]:
+            # U6's baseline-identity probe. The default is a BUILT app — one root commit, and a
+            # root route whose blob no longer matches the one the baseline stored — for the same
+            # reason the `base64` arm below exists: the realistic answer, not the empty one.
+            #
+            # AND IT IS THE NON-ACCUSING DEFAULT ON PURPOSE. An empty stdout parses as
+            # `UNANSWERABLE`, so every test that happens to switch the content check on without
+            # scripting `exec` would silently start exercising the INDETERMINATE retry path —
+            # slow, and asserting something other than what it says. A test that wants the app to
+            # still be the starter page says so by overriding `exec_handler`.
+            return ExecResult(stdout=BASELINE_DIVERGED_STDOUT, stderr="", exit=0)
         if cmd[:1] == ["base64"]:
             # `write_snapshot` reads its bundle back through `base64 <file>` and now validates
             # the bytes before uploading them, so an empty default stdout would decode to b""
@@ -345,6 +384,17 @@ class FakeSandboxClient(SandboxClient):
         a state most real containers cannot produce."""
         self.compile_polls += 1
         return self.compile_report
+
+    async def what_is_it_serving(self, handle: SandboxHandle) -> ServedPage | None:
+        """U6's serving probe — the health verdict's own GET at the app root.
+
+        SEPARATE FROM `warm_status` even though production makes one request for both jobs,
+        because the two are asserted for opposite reasons: `warmed` answers "was the first route
+        paid for before the frame went out", and this answers "what did the app say when we
+        decided whether to let it claim it finished". A test scripting one must not silently move
+        the other."""
+        self.served_probes.append(handle.preview_url)
+        return self.served_page
 
     async def someone_has_to_go_first(self, handle: SandboxHandle) -> int | None:
         """The U3 warm request. Recorded rather than performed — the real one is a live GET at

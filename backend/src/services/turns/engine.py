@@ -80,12 +80,13 @@ from src.api.v1.conversations.schemas import (
     TurnStreamFrame,
     WorkspaceFrame,
 )
+from src.core.integrity_types import BaselineIdentity
 from src.core.redaction import redact_secrets
 from src.db.models.conversation import Conversation, ConversationMode
 from src.db.models.message import MessageEntryKind, MessageVisibility
 from src.db.models.user import User
 from src.services.agent.agent import ChatDeps, chat_agent
-from src.services.agent.mode_prompts import PromptContext, mode_reminder
+from src.services.agent.mode_prompts import PromptContext, mode_reminder, workspace_note
 from src.services.agent.read_tools import (
     EmptyProjectWorkspace,
     ExtractedSnapshotWorkspace,
@@ -94,6 +95,7 @@ from src.services.agent.read_tools import (
 )
 from src.services.agent.toolsets import plan_options_only_toolset, toolsets_for_mode
 from src.services.build_sessions.alarms import HMR_PROTOCOL_DRIFT_EVENT
+from src.services.build_sessions.integrity import baseline_identity, has_ever_been_built
 from src.services.build_sessions.locks import release_liveness_lease, renew_liveness_lease
 from src.services.build_sessions.manager import (
     BuildSession,
@@ -123,10 +125,18 @@ from src.services.orchestrator.constants import (
     RUN_WALL_CLOCK_DEADLINE_S,
     SELF_HEAL_MAX_RETRIES,
     TEMPERATURE,
+    WORKSPACE_NOTE_MAX_POLLS,
 )
 from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.prompt import build_repair_prompt
-from src.services.orchestrator.selfheal import CONTINUE_PROMPT, dev_not_ready_error, verify
+from src.services.orchestrator.selfheal import (
+    CONTINUE_PROMPT,
+    HealthState,
+    Readiness,
+    dev_not_ready_error,
+    verify,
+    where_are_we,
+)
 from src.services.redis import get_redis
 from src.services.sandbox import SandboxClient, SandboxError
 from src.services.sandbox.base import CompileState
@@ -500,6 +510,15 @@ class _TurnState:
     # Claim-once for the preview frame, shared by the watcher and the between-verify
     # fallback: whichever sees the dev server first emits, the other stays quiet.
     preview_framed: bool = False
+    # Has any turn on this app ever done real work? Resolved ONCE where the workspace is pinned
+    # (one HEAD on the recovery slot) and carried, because it cannot change inside one turn and
+    # the self-heal loop asks the health verdict for it up to four times. It gates U6's content
+    # check: a brand-new project is SUPPOSED to be showing the starter template, and checking it
+    # would manufacture an accusation rather than catch one.
+    had_prior_building_turns: bool = False
+    # The newest health verdict this turn reached, or None before the first verify. Read by the
+    # ephemeral workspace note the model is handed (R14) and by the turn's ending.
+    verdict: HealthState | None = None
     # WRITE only, and the whole difference between the two zero-mutation endings. A Write
     # turn the citizen typed into may legitimately touch nothing (they asked a question);
     # a turn started from a Build-it click was ASKED to build, so touching nothing is a
@@ -774,6 +793,15 @@ class TurnEngine:
             reminder = _reminder_text(state.mode, history)
             if reminder is not None:
                 history = [*history, ModelRequest(parts=[UserPromptPart(content=reminder)])]
+            # U8 / R14 — AND THE WORKSPACE NOTE, UNCONDITIONALLY, on every turn that pinned a
+            # sandbox. Same mechanism as the reminder above (an ephemeral tail on
+            # `message_history`, structurally excluded from the persisted rows) and deliberately
+            # NOT the same delivery: `_reminder_text` is cadence-gated and silent between anchors,
+            # so riding it would tell the model what its app is doing on roughly one turn in four
+            # while U8's entire claim is that answering from stale history is impossible.
+            if workspace is not None:
+                note = await self._workspace_note(state)
+                history = [*history, ModelRequest(parts=[UserPromptPart(content=note)])]
             if state.mode is ConversationMode.WRITE:
                 # A Write turn bills PER MODEL STEP, inside the loop — `record_usage` is
                 # called once per step and that is the only fold. Claiming the turn as
@@ -1180,6 +1208,12 @@ class TurnEngine:
                 app_name=session.handle.app_name,
                 discarded=discarded,
             )
+        # U6 — HAS THIS APP EVER BEEN BUILT? One HEAD on the recovery slot, resolved here because
+        # this is where the turn already holds the app id and because the answer cannot change
+        # while the turn runs. It gates the content half of the health verdict: a brand-new
+        # project is legitimately showing the starter template, and the whole point of the check
+        # is to catch an app that is showing it AFTER someone asked for something else.
+        state.had_prior_building_turns = await has_ever_been_built(session.app_id)
         state.workspace_state = "ready"
         self._emit(state, lambda seq: WorkspaceFrame(seq=seq, state="ready"))
         # BOOT THE DEV SERVER THE MOMENT WE HOLD THE CONTAINER, not after the whole model run
@@ -1333,8 +1367,15 @@ class TurnEngine:
                     log_cursor=log_cursor,
                     max_polls=READINESS_MAX_POLLS,
                     poll_s=READINESS_POLL_S,
+                    app_id=sandbox.app_id,
+                    # Resolved ONCE at attach and carried on the turn state — the content half of
+                    # the verdict is only meaningful for an app that has been built before, and
+                    # re-asking the store on every self-heal pass would be three HEAD requests to
+                    # learn a fact that cannot change inside one turn.
+                    had_prior_building_turns=state.had_prior_building_turns,
                 )
-                self._emit_verify_step(state, iteration, phase="finished", ok=outcome.green)
+                state.verdict = outcome.state
+                self._emit_verify_step(state, iteration, phase="finished", verdict=outcome.state)
 
                 if outcome.dev_ready and state.claim_preview_frame():
                     await self._emit_preview_ready(
@@ -1625,30 +1666,89 @@ class TurnEngine:
                 turn_id=str(state.turn_id),
             )
 
+    async def _workspace_note(self, state: _TurnState) -> str:
+        """What this app's workspace is doing RIGHT NOW, as a private note for the model (U8/R14).
+
+        THE CHEAP HALF OF THE HEALTH VERDICT, and cheap is a requirement rather than a preference:
+        this runs on every turn in every mode, including a one-line Ask question, so it must not
+        cost what `verify` costs. A bounded readiness poll plus one exec — no `tsc`, no full
+        readiness budget, and no serving GET that would block on a cold first-route compile.
+
+        "STILL STARTING UP" IS REPORTED AS "COULD NOT TELL", NOT AS "DOWN". `dev_start` fires at
+        attach, and Next's first route compile is measured at 5-7s, so a note composed the instant
+        after would call almost every cold turn's app dead. `Readiness.STILL_TRYING` is exactly
+        that state and it maps to the honest answer.
+
+        The baseline check runs for a brand-new project too, unlike the health verdict's, and the
+        difference is what each one is FOR: the verdict decides whether to block a completion
+        claim, where accusing an unbuilt app of showing the template would be a false positive;
+        the note tells the model what the user is looking at, where "there is no app on the home
+        page yet" is true, useful, and exactly what Ask mode's own segment asks it to say.
+
+        NEVER RAISES. A note that could fail would take the turn down with it, and every failure
+        already has a value: not knowing."""
+        sandbox = state.sandbox
+        if sandbox is None:
+            return workspace_note(serving=None, still_the_template=None)
+        serving: bool | None
+        try:
+            readiness = await where_are_we(
+                sandbox.sandbox_client,
+                sandbox.handle,
+                max_polls=WORKSPACE_NOTE_MAX_POLLS,
+                poll_s=READINESS_POLL_S,
+            )
+        except SandboxError:
+            serving = None
+        else:
+            serving = {
+                Readiness.READY: True,
+                Readiness.DIED: False,
+                Readiness.STILL_TRYING: None,
+            }[readiness]
+        still_the_template: bool | None = None
+        if serving:
+            baseline = await baseline_identity(sandbox.sandbox_client, sandbox.handle)
+            if baseline is not BaselineIdentity.UNANSWERABLE:
+                still_the_template = baseline is BaselineIdentity.STILL_THE_BASELINE
+        return workspace_note(serving=serving, still_the_template=still_the_template)
+
     def _emit_verify_step(
         self,
         state: _TurnState,
         iteration: int,
         *,
         phase: Literal["started", "finished"],
-        ok: bool = False,
+        verdict: HealthState | None = None,
     ) -> None:
         """The verify spinner. Synthetic and never persisted — it is a progress affordance
         for a 30s wait, not part of the record, and it is correct for it to vanish on
-        reload."""
+        reload.
+
+        THREE FINISHED ARMS, not two, and the third is why this takes the verdict rather than a
+        bool (U6). "Not green yet" over a check that could not be REACHED tells the citizen their
+        app is broken on the strength of our own timeout — the platform blaming the app for its
+        own silence, which is the same shape of untruth as claiming a build finished when it did
+        not. An unreachable verdict resolves the spinner neutrally and says so."""
         started = phase == "started"
+        label: str
+        step_state: Literal["ok", "failed", "pending"]
+        if started:
+            label, step_state = "Checking your app…", "pending"
+        elif verdict is HealthState.INDETERMINATE:
+            label, step_state = "Still checking…", "ok"
+        elif verdict is HealthState.HEALTHY:
+            label, step_state = "Build verified.", "ok"
+        else:
+            label, step_state = "Not green yet — continuing.", "failed"
         item = StepItem(
             seq=0,
             mode=ConversationMode.WRITE.value,
             tool="verify",
-            label=(
-                "Checking your app…"
-                if started
-                else ("Build verified." if ok else "Not green yet — continuing.")
-            ),
+            label=label,
             # `pending` IS the in-flight state in this vocabulary — the same one a real
             # tool call sits in between its call and its return.
-            state="pending" if started else ("ok" if ok else "failed"),
+            state=step_state,
             hidden=False,
             detail=step_detail(None, None),
         )
