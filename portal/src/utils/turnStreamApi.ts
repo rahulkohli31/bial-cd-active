@@ -142,13 +142,21 @@ export interface PreviewFrame {
 }
 
 /** An in-narrative build diagnostic. NOT a failure: a repair run follows, and rendering it as
- *  an error would tell the user their build died on its way to succeeding. */
+ *  an error would tell the user their build died on its way to succeeding.
+ *
+ *  TWO AUDIENCES, ONE FRAME (U16). `title` and `cleanedStack` are the MODEL's half — `title` is
+ *  the compiler's own first meaningful line, which is exactly why the repair run needs it and
+ *  exactly why no citizen should read it. `userMessage` / `userAction` are the citizen's half,
+ *  and they are the only two fields the feed renders. Both always arrive non-empty: the server
+ *  derives them from the error class when its producer supplies none. */
 export interface DiagnosticFrame {
   type: 'diagnostic'
   seq: number
   source: 'tsc' | 'next_build' | 'server' | 'client'
   title: string
   cleanedStack: string
+  userMessage: string
+  userAction: string
 }
 
 /** The daily cap, hit mid-turn. Structured so the client can format the numbers itself. */
@@ -435,6 +443,11 @@ function toTurnFrame(parsed: unknown): TurnFrame | null {
             : 'server',
         title: asString(parsed.title),
         cleanedStack: asString(parsed.cleanedStack),
+        // Empty from an older server that predates the pair — NOT a parse failure. The feed
+        // owns the fallback sentence + action for exactly this case, so an empty string here
+        // degrades to product copy rather than to a blank error row.
+        userMessage: asString(parsed.userMessage),
+        userAction: asString(parsed.userAction),
       }
     }
     case 'quota':

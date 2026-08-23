@@ -1,10 +1,15 @@
 /**
  * The chat-native build narrative (U15): ONE assistant bubble that carries the whole
- * live build — friendly steps, a working indicator with elapsed-time reassurance, the
- * Stop / Force-end controls, and a Details expander holding the raw (server-redacted)
- * output. It replaces the cockpit's ActivityFeed pane and SessionControls row: the
- * right pane frames only the app, and the build can never look "dead" — this bubble is
- * visibly alive for exactly as long as the session is.
+ * live build — friendly steps, a working indicator with elapsed-time reassurance, and the
+ * Stop / Force-end controls. It replaces the cockpit's ActivityFeed pane and SessionControls
+ * row: the right pane frames only the app, and the build can never look "dead" — this bubble
+ * is visibly alive for exactly as long as the session is.
+ *
+ * NOTHING IN THIS BUBBLE IS ADDRESSED TO A DEVELOPER (U16). The raw-output expander is gone —
+ * it was the last place a citizen could open and find shell lines — and an error status renders
+ * the platform's product sentence plus a next action, never the compiler's own title and never
+ * a <pre> stack. The developer detail still exists and still travels; it goes to the agent,
+ * which is the party that can act on it.
  *
  * Input is the same C7 envelope stream the feed consumed (pushed into visible React
  * state up front by `useBuildSession` — never a remount). `preview_ready` stays routed
@@ -34,7 +39,6 @@ import type {
   ErrorEvent,
   EscalationEvent,
   FeedEnvelope,
-  LogEvent,
   QuotaExceededEvent,
   StepEvent,
 } from '../../utils/buildSessionTypes'
@@ -71,6 +75,34 @@ export interface BuildProgressProps {
    *  pass it; the row below falls back to the client-side quota copy rather than rendering
    *  nothing, so a missing prop degrades the message instead of losing it. */
   atLimitText?: string | null
+}
+
+/**
+ * THE COMMITTED FALLBACK (U16), for a failure with no product-language equivalent.
+ *
+ * Named constants because every copy decision in this codebase is one — `LivePreview.tsx` sets
+ * the convention with `FRAMING_TEXT` / `SLOW_TEXT` / `GONE_TITLE` — and it lives HERE, in the
+ * feed's own module, rather than being imported across from the preview pane: the two surfaces
+ * answer different questions and should be free to move apart.
+ *
+ * THE ACTION HALF IS NOT DECORATION. Deleting a stack trace and leaving a bare apology trades a
+ * dead end the reader cannot act on for a quieter one; a rendered error status without a next
+ * step is still a rendered error status the reader cannot act on. Both halves render, always —
+ * for the legacy C7 feed, which carries neither field, and for any error class the server has
+ * no sentence for. The server's own last-resort copy is word-for-word identical, so which side
+ * supplied it is invisible to the reader.
+ */
+export const ERROR_FALLBACK_MESSAGE = 'We hit a problem finishing that change.'
+export const ERROR_FALLBACK_ACTION =
+  'Try describing what you want again, or ask for something simpler.'
+
+/** The citizen-facing pair for one error status — the server's when it sent one, the committed
+ *  fallback when it did not. Never returns an empty half. */
+function userFacingError(env: ErrorEvent): { message: string; action: string } {
+  return {
+    message: env.user_message || ERROR_FALLBACK_MESSAGE,
+    action: env.user_action || ERROR_FALLBACK_ACTION,
+  }
 }
 
 /** An email address inside otherwise-plain prose. Deliberately CONSERVATIVE — it must not match
@@ -340,7 +372,10 @@ export default function BuildProgress({
   // F3/U3: read-only + housekeeping steps are dropped from the VISIBLE feed (the raw command still
   // reaches the model). Everything below the fold renders the FRIENDLY label only — no raw shell.
   const visibleSteps = steps.filter((env) => !env.hidden)
-  const logs = rows.filter((env): env is LogEvent => env.type === 'log')
+  // `log` envelopes are deliberately NOT read here any more (U16). The Details expander that
+  // rendered them was the last surface in the chat where a citizen could open a disclosure and
+  // find raw, redacted-but-still-raw shell output — a developer surface behind one click. The
+  // lines are still produced and still relayed; nothing in this bubble renders them.
   const alerts = rows.filter(
     (env): env is AlertEnvelope =>
       env.type === 'error' || env.type === 'escalation' || env.type === 'quota_exceeded',
@@ -428,12 +463,14 @@ export default function BuildProgress({
 
       {alerts.map((env) => {
         if (env.type === 'error') {
+          // ONE PAIR, BOTH ARMS. Whether a failure reads as a retry or as the terminal red
+          // block changes the framing around it, never what the reader is told about their app
+          // or what they can do next.
+          const { message, action } = userFacingError(env)
           if (env.recovering) {
-            // A self-heal in progress, not a failure. The detail renders ONCE — the
-            // word-boundary-sliced title, no <pre> — so the old double render (prose +
-            // monospace, both clipped mid-word) cannot come back through the stack copy.
-            // At a terminal this envelope renders nothing: the outcome message owns the
-            // ending, and exactly one failure presentation may be visible there.
+            // A self-heal in progress, not a failure. At a terminal this envelope renders
+            // nothing: the outcome message owns the ending, and exactly one failure
+            // presentation may be visible there.
             if (!working) return null
             return (
               <div
@@ -446,9 +483,12 @@ export default function BuildProgress({
                   <RotateCw size={13} className="flex-shrink-0" />
                   <span>That didn’t work — trying another way</span>
                 </div>
-                {env.title && (
-                  <p className="mt-1 text-[11px] leading-relaxed text-neutral">{env.title}</p>
-                )}
+                <p className="mt-1 text-[11px] leading-relaxed text-neutral" data-part="message">
+                  {message}
+                </p>
+                <p className="mt-0.5 text-[11px] leading-relaxed text-neutral/80" data-part="action">
+                  {action}
+                </p>
               </div>
             )
           }
@@ -461,13 +501,15 @@ export default function BuildProgress({
             >
               <div className="flex items-center gap-1.5 text-xs font-semibold text-danger">
                 <XCircle size={13} className="flex-shrink-0" />
-                <span>{env.title}</span>
+                <span data-part="message">{message}</span>
               </div>
-              {env.cleaned_stack && (
-                <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-all text-[11px] leading-relaxed text-danger/80">
-                  {env.cleaned_stack}
-                </pre>
-              )}
+              {/* No <pre>, and no `title`. `cleaned_stack` is the de-noised compiler log and
+                  `title` its first meaningful line — both are built for the repair run, both
+                  still travel on the envelope, and neither is a thing to hand a citizen. What
+                  replaces them is the one line that tells the reader what to do next. */}
+              <p className="mt-1 text-[11px] leading-relaxed text-danger/80" data-part="action">
+                {action}
+              </p>
             </div>
           )
         }
@@ -481,11 +523,15 @@ export default function BuildProgress({
             >
               <div className="flex items-center gap-1.5 text-xs font-semibold text-tertiary">
                 <AlertTriangle size={13} className="flex-shrink-0 text-warning" />
-                <span>{env.detail || env.reason}</span>
+                <span data-part="message">{env.detail || env.reason}</span>
               </div>
-              {env.last_error && (
-                <p className="mt-1 text-[11px] text-neutral">{env.last_error.title}</p>
-              )}
+              {/* `last_error.title` used to render here. It is the SAME compiler-authored line
+                  the error arm above stopped showing, so leaving it on this row would have kept
+                  the developer surface alive one branch over. An escalation is an error status
+                  like any other, so it carries an action clause too. */}
+              <p className="mt-1 text-[11px] leading-relaxed text-neutral" data-part="action">
+                {ERROR_FALLBACK_ACTION}
+              </p>
             </div>
           )
         }
@@ -514,28 +560,6 @@ export default function BuildProgress({
           </div>
         )
       })}
-
-      {logs.length > 0 && (
-        // The raw output stays available, never ambient: server-redacted log lines live
-        // behind this expander only — the chat shows zero raw shell lines otherwise.
-        <details className="text-[11px]">
-          <summary className="cursor-pointer select-none text-neutral/70 hover:text-tertiary">
-            Details
-          </summary>
-          <div className="mt-1 max-h-48 space-y-0.5 overflow-auto rounded-lg bg-tertiary/5 p-2 font-mono">
-            {logs.map((env) => (
-              <div key={env.seq} className="flex items-start gap-2" data-kind="log" data-stream={env.stream}>
-                <span className="flex-shrink-0 select-none text-neutral/50">{env.source}</span>
-                <span
-                  className={`whitespace-pre-wrap break-all ${env.stream === 'stderr' ? 'text-danger/90' : 'text-neutral'}`}
-                >
-                  {env.text}
-                </span>
-              </div>
-            ))}
-          </div>
-        </details>
-      )}
 
       {active && !confirmingForceEnd && (
         <div className="flex items-center gap-2 pt-0.5">

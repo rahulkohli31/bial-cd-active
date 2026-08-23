@@ -269,10 +269,17 @@ def _friendly_area(path: str) -> tuple[str, bool]:
 
 
 def _file_step_label(tool_name: str, path: str | None) -> tuple[str, bool]:
-    """(label, hidden) for a file-mutation tool — the friendly AREA, never the raw path.
-    `write_file` reads as *Building*, edits as *Updating*; the state glyph carries done-ness."""
+    """(label, hidden) for a file tool — the friendly AREA, never the raw path.
+    `write_file` reads as *Building*, edits as *Updating*, a read as *Looking at*; the state
+    glyph carries done-ness.
+
+    READS COME THROUGH HERE TOO (U16). The read arm used to build its own label as
+    `f"Read {path}"`, which contradicted three invariants stated in this module's own comments —
+    including `_friendly_area`, which exists precisely so a citizen sees an app AREA and never a
+    filename — and it reached BOTH feeds, live and reload. Routing it through the same helper the
+    writes use is what makes that structurally impossible to reintroduce on one side only."""
     area, hidden = _friendly_area(path) if path else (_AREA_GENERIC, False)
-    verb = "Building" if tool_name == "write_file" else "Updating"
+    verb = {"write_file": "Building", "read_file": "Looking at"}.get(tool_name, "Updating")
     return (f"{verb} {area}", hidden)
 
 
@@ -282,7 +289,11 @@ def _step_label(tool_name: str, args: dict[str, Any]) -> tuple[str, bool]:
     if tool_name in _FILE_MUTATORS:
         return _file_step_label(tool_name, path)
     if tool_name == "read_file":
-        return (f"Read {path}" if path else "Read a file", True)
+        # Hidden regardless of the area's own noise verdict: a read is inspection, and the whole
+        # class stays out of the visible feed (F3/U3). The LABEL still has to be clean, because
+        # an expanded Details view renders it.
+        label, _ = _file_step_label(tool_name, path)
+        return (label, True)
     if tool_name in ("list_files", "search_files"):  # fmt: skip
         return ("Looked through the app's files", True)
     if tool_name == "declare_done":

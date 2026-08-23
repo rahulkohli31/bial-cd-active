@@ -194,9 +194,9 @@ export interface HeartbeatResponse {
 // ─── C7: the tagged-union progress envelope (snake_case surface) ─────────────
 
 /**
- * Where a self-heal-relevant error came from (C7 §3). `client` is RESERVED for the
- * Wave-1 browser client-error arm and is not emitted in Stage 0 — it stays in the
- * union so the type is future-proof, but nothing produces it yet.
+ * Where a self-heal-relevant error came from (C7 §3). `client` is the browser client-error
+ * arm — LIVE, and rendered through the same split-audience path as every other class: its
+ * report text stays agent-only, the citizen reads the platform's sentence for the class.
  */
 export type ErrorSource = 'tsc' | 'next_build' | 'server' | 'client'
 
@@ -241,6 +241,18 @@ export interface ErrorEvent {
    *  repair run follows — so it renders as a retry, never as the terminal red block. Absent
    *  on the legacy C7 feed, which keeps its historical red rendering. */
   recovering?: boolean
+  /**
+   * U16 — the CITIZEN-facing half of the split. `title` and `cleaned_stack` above are the
+   * model's: `title` is built to be the compiler's own first meaningful line, so it names a
+   * file and a framework construct by design. These two are what the feed renders instead —
+   * a plain sentence about the app, and something the reader can actually do.
+   *
+   * OPTIONAL, because the legacy C7 feed emits neither. `BuildProgress` supplies its own
+   * committed fallback pair when they are missing, so an error status is never rendered
+   * without an action clause — that is the invariant, not the presence of these fields.
+   */
+  user_message?: string
+  user_action?: string
 }
 
 /** `preview_ready` — the dev server is live and framable. Flips status → `ready` and triggers the iframe (re)load (C7 §3.4). */

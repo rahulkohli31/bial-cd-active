@@ -622,6 +622,15 @@ def test_build_frames_speak_camel_case_on_the_wire() -> None:
         "source": "server",
         "title": "Boom",
         "cleanedStack": "at line 1",
+        # U16 — the citizen-facing half, derived from the error class because the producer
+        # supplied none. It is asserted HERE, on the exact wire dict, for the reason this test
+        # exists at all: the portal narrows on the camelCase key, so a snake_case spelling of
+        # either field is a sentence the citizen never reads and a blank error row.
+        "userMessage": "Your app ran into a problem while it was starting up.",
+        "userAction": (
+            "Nothing to do right now — we're working on it. "
+            "If it keeps happening, try asking for something simpler."
+        ),
     }
     quota = QuotaFrame(seq=4, limit=10, used=11, resets_at="2026-07-30T00:00:00Z")
     assert json.loads(quota.model_dump_json(by_alias=True)) == {

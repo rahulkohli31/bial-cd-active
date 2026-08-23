@@ -387,13 +387,27 @@ class ErrorSource(enum.StrEnum):
     TSC = "tsc"  # `tsc` typecheck failure, read over C1 /exec.
     NEXT_BUILD = "next_build"  # `next build` failure, read over C1 /exec.
     SERVER = "server"  # dev-server stderr, read over C1 /dev/logs.
-    CLIENT = "client"  # the browser client-error arm — LIVE as of U13; agent-only, never rendered.
+    # The browser client-error arm — LIVE as of U13, and no longer a class the user never
+    # hears about. Its REPORT stays agent-only (see `agent_only_detail`); what reaches the
+    # citizen is the platform's own sentence for the class, which `errors.user_facing` owns
+    # and `DiagnosticFrame` carries (U16). "Never emitted" and "never rendered" are both
+    # stale readings of this member — do not restore either.
+    CLIENT = "client"
 
 
 class BuildError(BaseModel):
     """The structured, self-heal-relevant error shape (C7 §3) — `{source, title,
     cleaned_stack}`, reused by the `error` envelope, `escalation.last_error`, and
-    `BuildResult.error`."""
+    `BuildResult.error`.
+
+    THIS SHAPE IS THE MODEL'S, and U16 deliberately left it alone. `title` is BUILT to be the
+    compiler's own first meaningful line — that is what makes it useful to a repair run, and
+    what made rendering it the most developer-looking thing a citizen ever read. The fix was to
+    stop rendering it, not to soften it: the citizen-facing sentence + next action live in
+    `errors.user_facing` and travel on `DiagnosticFrame`, so `title` and `cleaned_stack` stay
+    byte-identical for a given raw input and the self-heal loop reads exactly what it always
+    did. Anyone tempted to make these two fields friendlier is about to break the repair prompt.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
