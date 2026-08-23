@@ -23,6 +23,13 @@ categories where you and the automatic check disagreed, naming who said what and
 on record, followed by everything you declared and the explanation you wrote. Rejecting requires a
 note, because that note is the only thing that comes back to you.
 
+**An administrator can now take a published app off the air.** One action removes the running
+container and the address stops serving. Nothing is destroyed — the app's code, its own database
+and its files are untouched, and publishing again brings it back at the same address. The owner is
+told what happened: where the app said **Live** it now says **Taken down**, with a line explaining
+that an administrator did it and that a new Publish restores it. There is no button for this in the
+admin console yet — the endpoint and the owner-facing half ship here, the console control follows.
+
 ### Added
 
 - Pre-publish data-classification review: a model-free credential scan followed by an AI review of
@@ -39,6 +46,20 @@ note, because that note is the only thing that comes back to you.
   names.
 - Evaluation harness for measuring the review's accuracy, budgets and scan precision against a
   labelled corpus.
+- **Take a published app off the air** (superadmin): removes the running container and marks that
+  deployment as taken down. The accountability record is written before Azure is touched, so a
+  timeout part-way through still records who acted. The app row, its database and its files are
+  never named on this path.
+- **Automated checks now cover the backend**, which had none at all: formatting, linting and all
+  three type checkers run on every pull request, plus a check that the database migration history
+  has a single head — the failure that otherwise surfaces at deploy time, once two branches have
+  each added a migration on the same parent. The backend test suite still runs by hand; it needs a
+  prepared database, and a check that fails by default would block every pull request.
+- **Regression tests for two things that had none**: both Save endpoints (ownership, cross-user
+  scoping, CSRF, conflict handling, and what actually reaches the layer beneath), and the
+  crafted-sign-in-link fix released in 1.6.9 — plus the admin limits panel's "0 (default)"
+  placeholder, which no test had been checking. Each was verified by deliberately breaking the
+  code it covers, so a silent revert turns a named test red rather than passing unnoticed.
 
 ### Changed
 
@@ -49,6 +70,13 @@ note, because that note is the only thing that comes back to you.
   claiming yours is always kept.
 - Approval and rejection state now reaches you even where automatic deployment is not configured.
 - Internal identifiers no longer appear in the admin app list, review dialog, or audit trail.
+- Everywhere the portal said an app was live, it now asks whether the app is reachable *now*
+  rather than whether its last deployment succeeded — a deployment that has since been taken down
+  keeps that status forever. A taken-down app shows no link at all, because a dead link is
+  indistinguishable from an app that has broken.
+- The admin review dialog now describes the review that is actually possible: the submission
+  details on screen, and the fact that approving pins that exact submission and does not deploy it.
+  It previously told reviewers to download and inspect the bundle first.
 
 ### Fixed
 
@@ -56,6 +84,31 @@ note, because that note is the only thing that comes back to you.
   live on a category the developer had themselves declared.
 - Three surfaces reported state that had moved on: an epoch date above the approve button, a
   self-publish promise on apps the gate would still refuse, and a queue badge that never refreshed.
+- **The scheduled background worker consumed nothing.** It started, connected and reported healthy,
+  then failed on every poll: its queue keys were spread across shards of the managed Redis, and the
+  transaction it issues on each poll requires them to sit on one. The keys are now pinned together.
+  A single-node Redis puts every key on one shard and cannot reproduce this, which is why it
+  appeared only in production.
+- **A preview could load and then never finish starting up** once apps are served from a
+  `bialairport.com` address: the workspace's web server silently blocks pages requested from an
+  origin it was not told about, so the browser gets a page and then a loading screen that never
+  clears. The new address is now allowed. This lives in the workspace image, so it takes effect at
+  the next rebuild.
+- **The portal's own test suite failed on a stopwatch**, naming a different set of tests on each
+  run and going green on a re-run. Its time limit is a wall clock the whole parallel run competes
+  for, so heavy tests crossed it having done nothing wrong. No test was skipped and no assertion
+  was changed.
+
+### Removed
+
+- The admin console's **Download bundle** button, which had never worked in any browser: the call
+  behind it returns nothing by specification, so the button's own "pop-up blocked" warning fired on
+  every click. Removed rather than repaired. Administrators still have no in-product way to inspect
+  a build before approving it; that gap is tracked separately.
+
+*Recorded 23 August. The takedown control, the backend checks, the worker and preview fixes, the
+retired Download bundle button and the new Save and sign-in tests all shipped in this release but
+were left out of this entry when it was written.*
 
 ## [1.6.14] - 2026-08-17
 
