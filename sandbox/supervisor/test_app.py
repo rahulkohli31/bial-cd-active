@@ -1264,3 +1264,230 @@ def test_a_uri_that_is_not_a_path_is_ignored() -> None:
     assert _served_request_count(_caddy_log("http://elsewhere.example/x")) == 0
     assert _served_request_count('{"request":{"uri":12345}}') == 0
     assert _served_request_count('{"request":"not-an-object"}') == 0
+
+
+# --- R17/R18: the compile state derived from the dev server's HMR socket ---------------------
+#
+# The consumer THREAD is not exercised here (it needs a live `next dev`); what is pinned is the
+# part that decides what the platform believes: frame -> state, the debounce, the fail-closed
+# `unknown`, and the endpoint's shape. The socket half is covered in-container.
+
+
+def _reset_compile() -> None:
+    from app import _Compile
+
+    with _Compile.lock:
+        _Compile.state = "unknown"
+        _Compile.errors = ()
+        _Compile.reason = "never_connected"
+        _Compile.connect_generation = 0
+        _Compile.pending = None
+        _Compile.pending_at = 0.0
+        # Never let a test start the real reconnect loop: it would sit dialling :3000 forever.
+        _Compile.consumer_started = True
+
+
+def test_a_built_frame_with_no_errors_is_clean() -> None:
+    from app import _derive_compile
+
+    assert _derive_compile({"action": "built", "errors": [], "warnings": []}) == ("clean", ())
+
+
+def test_a_built_frame_with_errors_is_failed_and_carries_them() -> None:
+    from app import _derive_compile
+
+    state, errors = _derive_compile({"action": "built", "errors": ["./app/page.tsx\nboom"]})
+    assert state == "failed"
+    assert errors == ("./app/page.tsx\nboom",)
+
+
+def test_a_building_frame_is_building() -> None:
+    from app import _derive_compile
+
+    assert _derive_compile({"action": "building"}) == ("building", ())
+
+
+def test_the_sync_sent_on_connect_reports_the_current_failure() -> None:
+    """The decisive property of this protocol: attach at any moment and the server immediately
+    says whether the app is broken. Without it a consumer could only learn from the NEXT edit."""
+    from app import _derive_compile
+
+    assert _derive_compile({"action": "sync", "errors": ["still broken"]})[0] == "failed"
+    assert _derive_compile({"action": "sync", "errors": []})[0] == "clean"
+
+
+def test_the_verb_is_read_from_either_action_or_type() -> None:
+    from app import _derive_compile
+
+    assert _derive_compile({"type": "building"}) == ("building", ())
+
+
+def test_an_unknown_frame_verb_says_nothing_rather_than_saying_clean() -> None:
+    """The whole fail-closed contract in one assertion: an unrecognised frame returns None, so
+    it can never publish a state. A frame we do not understand is not good news."""
+    from app import _derive_compile
+
+    assert _derive_compile({"action": "serverComponentChanges"}) is None
+    assert _derive_compile({"action": "appIsrManifest", "data": {}}) is None
+    assert _derive_compile("not-an-object") is None
+    assert _derive_compile({"no": "verb"}) is None
+
+
+def test_a_frame_missing_its_errors_field_is_read_as_clean_not_as_a_crash() -> None:
+    from app import _derive_compile
+
+    assert _derive_compile({"action": "built"}) == ("clean", ())
+    assert _derive_compile({"action": "built", "errors": "not-a-list"}) == ("clean", ())
+
+
+def test_ansi_colour_is_stripped_before_the_error_text_leaves_the_container() -> None:
+    from app import _derive_compile
+
+    state, errors = _derive_compile(
+        {"action": "built", "errors": ["\x1b[31mError\x1b[39m: \x1b[1mboom\x1b[22m"]}
+    )
+    assert state == "failed"
+    assert errors == ("Error: boom",)
+    assert "\x1b" not in errors[0]
+
+
+def test_error_payloads_are_bounded_in_count_and_size() -> None:
+    """This text becomes model input. An unbounded webpack dump must not become the turn."""
+    from app import _COMPILE_MAX_ERROR_CHARS, _COMPILE_MAX_ERRORS, _derive_compile
+
+    _, errors = _derive_compile(
+        {"action": "built", "errors": ["x" * (_COMPILE_MAX_ERROR_CHARS + 500)] * 20}
+    )
+    assert len(errors) == _COMPILE_MAX_ERRORS
+    assert all(len(e) == _COMPILE_MAX_ERROR_CHARS for e in errors)
+
+
+def test_an_injected_secret_is_redacted_out_of_a_compile_error() -> None:
+    """★ The same rule `/exec`, `/dev/logs` and `/files` already follow, applied to the newest
+    output surface. A compile error is dev-server output, and an unparseable `BIAL_DATABASE_URL`
+    is a COMPILE-TIME failure, not an exotic one — so without this the per-project database
+    password rides an error frame out of the container and into a model prompt."""
+    import os
+
+    import app as sup
+
+    dsn = "postgres://bialrole_x:s3cr3t-pa55word@db.example:5432/bialapp_x"
+    os.environ["BIAL_DATABASE_URL"] = dsn
+    try:
+        _, errors = sup._derive_compile({"action": "built", "errors": [f"Invalid URL: {dsn}"]})
+    finally:
+        os.environ.pop("BIAL_DATABASE_URL", None)
+
+    assert errors, "guard the premise: the frame really did carry an error"
+    # Both halves: the whole value AND the parsed password sub-token, which is what the scrub
+    # registers separately and what a naive whole-value-only redaction would leak.
+    assert dsn not in errors[0]
+    assert "s3cr3t-pa55word" not in errors[0]
+    assert "Invalid URL:" in errors[0], "the diagnostic itself must survive the redaction"
+
+
+def test_a_webpack_shaped_error_object_still_yields_text() -> None:
+    from app import _derive_compile
+
+    _, errors = _derive_compile(
+        {"action": "built", "errors": [{"moduleName": "./app/page.tsx", "message": "boom"}]}
+    )
+    assert errors == ("./app/page.tsx\nboom",)
+
+
+def test_building_and_failed_publish_immediately_but_clean_waits_out_the_debounce() -> None:
+    """Deliberately asymmetric, and the asymmetry is the safety property: the states that COVER
+    the preview are instant, and only the state that UNCOVERS it has to settle. One edit emits
+    several `built` frames, so publishing every one would flap the cover mid-change."""
+    import app as sup
+
+    _reset_compile()
+    sup._note_frame("building", ())
+    assert sup._Compile.state == "building"
+
+    sup._note_frame("failed", ("boom",))
+    assert sup._Compile.state == "failed"
+
+    sup._note_frame("clean", ())
+    assert sup._Compile.state == "failed", "clean must not publish before it has settled"
+
+    with sup._Compile.lock:
+        sup._settle_locked(sup._Compile.pending_at + sup._COMPILE_DEBOUNCE_S / 2)
+    assert sup._Compile.state == "failed", "half the interval is not the interval"
+
+    with sup._Compile.lock:
+        sup._settle_locked(sup._Compile.pending_at + sup._COMPILE_DEBOUNCE_S * 2)
+    assert sup._Compile.state == "clean"
+    assert sup._Compile.errors == ()
+
+
+def test_a_failure_arriving_inside_the_debounce_window_supersedes_the_pending_clean() -> None:
+    import app as sup
+
+    _reset_compile()
+    sup._note_frame("clean", ())
+    sup._note_frame("failed", ("boom",))
+    with sup._Compile.lock:
+        sup._settle_locked(time.monotonic() + 60)
+    assert sup._Compile.state == "failed", "a settled clean must not resurrect over a failure"
+
+
+def test_every_way_of_losing_the_signal_lands_on_unknown_with_a_stated_reason() -> None:
+    import app as sup
+
+    _reset_compile()
+    sup._note_frame("clean", ())
+    with sup._Compile.lock:
+        sup._settle_locked(time.monotonic() + 60)
+    assert sup._Compile.state == "clean"
+
+    sup._forget_compile("no_recognised_frame")
+    assert sup._Compile.state == "unknown"
+    assert sup._Compile.reason == "no_recognised_frame"
+    assert sup._Compile.errors == ()
+
+
+def test_the_compile_endpoint_reports_state_reason_and_connect_generation() -> None:
+    import app as sup
+
+    _reset_compile()
+    sup._note_frame("failed", ("boom",))
+    with sup._Compile.lock:
+        sup._Compile.connect_generation = 3
+
+    body = client.get("/dev/compile", headers=AUTH).json()
+    assert body == {
+        "state": "failed",
+        "errors": ["boom"],
+        "reason": None,
+        "connect_generation": 3,
+    }
+
+
+def test_the_compile_endpoint_requires_the_bearer_token() -> None:
+    _reset_compile()
+    assert client.get("/dev/compile").status_code == 401
+
+
+def test_the_endpoint_settles_a_pending_clean_on_read() -> None:
+    """The consumer thread is blocked in `recv()` and cannot wake itself to publish, so the
+    promotion happens on the read. A caller polling once a second sees `clean` on its next poll."""
+    import app as sup
+
+    _reset_compile()
+    sup._note_frame("clean", ())
+    with sup._Compile.lock:
+        sup._Compile.pending_at = time.monotonic() - sup._COMPILE_DEBOUNCE_S - 1
+    assert client.get("/dev/compile", headers=AUTH).json()["state"] == "clean"
+
+
+def test_a_fresh_supervisor_reports_unknown_never_clean() -> None:
+    """The state a container is in before anything has connected. Reading it as clean would
+    clear the platform's cover over an app nobody has checked."""
+    import app as sup
+
+    _reset_compile()
+    body = client.get("/dev/compile", headers=AUTH).json()
+    assert body["state"] == "unknown"
+    assert body["reason"] == "never_connected"
+    assert sup._Compile.state == "unknown"

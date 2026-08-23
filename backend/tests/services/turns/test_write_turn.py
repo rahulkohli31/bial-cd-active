@@ -43,14 +43,19 @@ from pydantic_ai.models.function import (
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.v1.build_sessions.schemas import BuildError, ErrorSource
 from src.config import settings
 from src.db.models.conversation import ConversationMode
 from src.db.models.message import Message, MessageEntryKind
 from src.db.models.token_usage import TokenUsage
 from src.services.agent.mode_prompts import PromptContext
+from src.services.build_sessions.alarms import HMR_PROTOCOL_DRIFT_EVENT
 from src.services.build_sessions.manager import SessionManager
+from src.services.orchestrator.deps import SandboxSession
+from src.services.orchestrator.errors import from_client, from_tsc
 from src.services.orchestrator.selfheal import VerifyOutcome
 from src.services.sandbox import DevStatus, SandboxError, SandboxHandle
+from src.services.sandbox.base import CompileReport, CompileState
 from src.services.sandbox.client import _ALREADY_RUNNING_PID
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
@@ -1074,3 +1079,289 @@ async def test_a_cancel_during_the_sandbox_terminal_still_frees_the_conversation
     # this test from leaving pending-task noise on whatever runs next.
     never.set()
     await asyncio.sleep(0)
+
+
+# --- R17/R18: the compile signal's channel to the portal --------------------------------------
+#
+# The consumer half lives in the container; what is pinned here is the CHANNEL — that the state
+# reaches a subscribed client as a turn frame, on change only, and that a signal we cannot read
+# never travels as good news. Exercised directly against the watcher's per-poll step rather than
+# through a whole timed turn: the loop's own 1s cadence is not the contract, the frames are.
+
+
+def _compile_frames(state: _TurnState) -> list[object]:
+    return [f for f in state.ring if getattr(f, "type", None) == "compile"]
+
+
+def _compile_state_of(frame: object) -> object:
+    return getattr(frame, "state", None)
+
+
+def _a_turn_state() -> _TurnState:
+    return _TurnState(
+        turn_id=uuid.uuid4(),
+        conversation_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        mode=ConversationMode.WRITE,
+    )
+
+
+def _a_sandbox(client: FakeSandboxClient) -> SandboxSession:
+    return SandboxSession(
+        sandbox_client=client,
+        handle=SandboxHandle(
+            fqdn="app-xyz.example",
+            token="tok",
+            app_name="sbx-abc",
+            preview_url="https://app-xyz.example/",
+            ready=True,
+        ),
+        app_id=uuid.uuid4(),
+    )
+
+
+async def test_the_compile_state_reaches_a_subscriber_as_a_turn_frame(
+    _fresh_engine,
+) -> None:
+    engine, state = _fresh_engine, _a_turn_state()
+    client = FakeSandboxClient()
+    client.compile_report = CompileReport(state=CompileState.FAILED, errors=("boom",))
+
+    await engine._poll_compile_state(state, _a_sandbox(client))
+
+    assert [_compile_state_of(f) for f in _compile_frames(state)] == [CompileState.FAILED]
+
+
+async def test_the_frame_is_emitted_on_change_not_on_every_poll(_fresh_engine) -> None:
+    """The ring is sized for narrative and the watcher polls once a second for the whole build.
+    A frame per poll would be several hundred per turn and would evict the story it carries —
+    the compile state is a LEVEL, not an event."""
+    engine, state = _fresh_engine, _a_turn_state()
+    client = FakeSandboxClient()
+    sandbox = _a_sandbox(client)
+
+    client.compile_report = CompileReport(state=CompileState.BUILDING)
+    await engine._poll_compile_state(state, sandbox)
+    await engine._poll_compile_state(state, sandbox)
+    await engine._poll_compile_state(state, sandbox)
+    client.compile_report = CompileReport(state=CompileState.CLEAN)
+    await engine._poll_compile_state(state, sandbox)
+
+    assert client.compile_polls == 4, "guard the premise: every poll really did ask"
+    assert [_compile_state_of(f) for f in _compile_frames(state)] == [
+        CompileState.BUILDING,
+        CompileState.CLEAN,
+    ]
+
+
+async def test_an_unknown_reading_travels_as_unknown_and_never_as_clean(_fresh_engine) -> None:
+    """The fleet case. A container whose image predates `/dev/compile` answers 404 on every
+    poll, which the client maps to `unknown`. That must reach the pane as `unknown` — the value
+    it HOLDS its cover on — rather than being dropped, which the pane would read as nothing
+    having changed since the last `clean`."""
+    engine, state = _fresh_engine, _a_turn_state()
+    client = FakeSandboxClient()
+    sandbox = _a_sandbox(client)
+
+    client.compile_report = CompileReport(state=CompileState.CLEAN)
+    await engine._poll_compile_state(state, sandbox)
+    client.compile_report = CompileReport(state=CompileState.UNKNOWN, reason="endpoint_absent")
+    await engine._poll_compile_state(state, sandbox)
+
+    assert [_compile_state_of(f) for f in _compile_frames(state)] == [
+        CompileState.CLEAN,
+        CompileState.UNKNOWN,
+    ]
+
+
+async def test_the_protocol_drift_alarm_fires_once_per_connect_not_once_per_poll(
+    _fresh_engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ The canary. Defensive parsing is what keeps a bundler upgrade from crashing the
+    consumer, and it is exactly what would make an upstream rename SILENT — so the one signal
+    that says the protocol moved has to be loud, and has to be loud once. Keyed on the connect
+    generation because a drifted container polls forever: an alarm per poll is an alarm nobody
+    reads by the second minute."""
+    engine, state = _fresh_engine, _a_turn_state()
+    client = FakeSandboxClient()
+    sandbox = _a_sandbox(client)
+    raised: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        engine_module._log,
+        "warning",
+        lambda event, **kw: raised.append((event, kw)),
+    )
+
+    drifted = CompileReport(
+        state=CompileState.UNKNOWN, reason="no_recognised_frame", connect_generation=7
+    )
+    client.compile_report = drifted
+    await engine._poll_compile_state(state, sandbox)
+    await engine._poll_compile_state(state, sandbox)
+    await engine._poll_compile_state(state, sandbox)
+
+    assert [e for e, _ in raised] == [HMR_PROTOCOL_DRIFT_EVENT]
+    assert raised[0][1]["connect_generation"] == 7
+    assert raised[0][1]["app_name"] == "sbx-abc"
+
+    # A RECONNECT is a new fact about the protocol, so it earns a second alarm.
+    client.compile_report = CompileReport(
+        state=CompileState.UNKNOWN, reason="no_recognised_frame", connect_generation=8
+    )
+    await engine._poll_compile_state(state, sandbox)
+    assert [e for e, _ in raised] == [HMR_PROTOCOL_DRIFT_EVENT, HMR_PROTOCOL_DRIFT_EVENT]
+
+
+async def test_a_socket_that_is_merely_down_is_not_reported_as_protocol_drift(
+    _fresh_engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`unknown` has several causes and only one of them means the vocabulary moved. Alarming
+    on all of them would make the canary fire on every container restart and be muted."""
+    engine, state = _fresh_engine, _a_turn_state()
+    client = FakeSandboxClient()
+    raised: list[str] = []
+    monkeypatch.setattr(engine_module._log, "warning", lambda event, **kw: raised.append(event))
+
+    for reason in ("endpoint_absent", "disconnected", "transport_error", "connected_no_frame_yet"):
+        client.compile_report = CompileReport(state=CompileState.UNKNOWN, reason=reason)
+        await engine._poll_compile_state(state, _a_sandbox(client))
+
+    assert raised == []
+
+
+async def test_a_compile_poll_never_takes_the_preview_watcher_down(_fresh_engine) -> None:
+    """The watcher that carries this also owns crash detection. `compile_state` is specified
+    never to raise, and this is the assertion that the emit path does not reintroduce one —
+    trading a covered preview for an undetected dead dev server would be a bad trade."""
+    engine, state = _fresh_engine, _a_turn_state()
+    client = FakeSandboxClient()
+    client.compile_report = CompileReport(state=CompileState.UNKNOWN, reason="malformed_body")
+
+    await engine._poll_compile_state(state, _a_sandbox(client))
+
+    assert state.compile_state is CompileState.UNKNOWN
+
+
+# --- R17 (runtime half): a browser crash repairs, and does not narrate ------------------------
+
+
+def _diagnostic_frames(state: _TurnState) -> list[object]:
+    return [f for f in state.ring if getattr(f, "type", None) == "diagnostic"]
+
+
+async def test_a_client_class_error_repairs_the_app_without_narrating_it(
+    _fresh_engine,
+    db_session,
+    session_factory,
+    fake_redis: aioredis.Redis,
+    fake_storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ U13's verification, at the only place it can be checked: a runtime crash is visible to
+    the agent and to the verdict, and invisible to the user except as the absence of a success
+    claim.
+
+    THE TRAP THIS PINS. The tidier-looking way to reach the same outcome is to have `verify`
+    return red with no error at all — and ten lines above the emit, a red outcome with no error
+    synthesizes `dev_not_ready_error()`. The user would then get a SERVER diagnostic that is both
+    rendered AND wrong, and the model would be handed the same misdiagnosis to chase. So the
+    verdict carries the real error and only the render is skipped, which is what the pairing of
+    assertions below actually proves."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt-client-err@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+    monkeypatch.setattr(engine_module, "SELF_HEAL_MAX_RETRIES", 1)
+    prompts: list[str] = []
+
+    def _record_repair(error: BuildError) -> str:
+        prompts.append(error.source.value)
+        return "fix it"
+
+    monkeypatch.setattr(engine_module, "build_repair_prompt", _record_repair)
+
+    async def _client_red(*_a: object, **_k: object) -> tuple[VerifyOutcome, int]:
+        return (
+            VerifyOutcome(
+                green=False,
+                dev_ready=True,
+                error=from_client("TypeError: undefined is not a function\n  at Records"),
+                preview_url="https://app-xyz.example/",
+            ),
+            0,
+        )
+
+    monkeypatch.setattr(engine_module, "verify", _client_red)
+    model, _ = _scripted([[_WROTE_A_FILE, _DECLARED_DONE], [_WROTE_A_FILE, "tried again."]])
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+    )
+
+    # ABSENCE: nothing about the crash is narrated. The report was written by code inside the
+    # generated app; a stack trace under a file-path title is the developer surface this plan
+    # exists not to create.
+    assert _diagnostic_frames(state) == []
+    ring_text = " ".join(str(getattr(f, "title", "")) for f in state.ring)
+    assert "TypeError" not in ring_text
+
+    # LIVENESS, and it is what makes the absence mean anything: the turn really did reach the
+    # repair arm with the CLIENT error in hand, so the emit was SKIPPED rather than never
+    # approached — and it was not silently converted into the misleading server diagnosis.
+    assert prompts == ["client"], "the repair prompt must be built from the client error itself"
+
+    # …and the one thing the user IS entitled to notice: no completion claim was made.
+    assert state.status == "failed"
+
+
+async def test_a_compile_error_still_narrates_exactly_as_before(
+    _fresh_engine,
+    db_session,
+    session_factory,
+    fake_redis: aioredis.Redis,
+    fake_storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half of the guard. The skip is for ONE source; a mutant that drops the frame for
+    every source would pass the test above on its own."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt-tsc-err@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+    monkeypatch.setattr(engine_module, "SELF_HEAL_MAX_RETRIES", 1)
+
+    async def _tsc_red(*_a: object, **_k: object) -> tuple[VerifyOutcome, int]:
+        return (
+            VerifyOutcome(
+                green=False,
+                dev_ready=True,
+                error=from_tsc("app/page.tsx(4,10): error TS2304: Cannot find name 'Foo'."),
+                preview_url="https://app-xyz.example/",
+            ),
+            0,
+        )
+
+    monkeypatch.setattr(engine_module, "verify", _tsc_red)
+    model, _ = _scripted([[_WROTE_A_FILE, _DECLARED_DONE], [_WROTE_A_FILE, "tried again."]])
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+    )
+
+    frames = _diagnostic_frames(state)
+    assert frames, "a compile error is still narrated in the build feed"
+    assert getattr(frames[0], "source", None) is ErrorSource.TSC

@@ -8,6 +8,14 @@ slow-but-healthy dev server is distinguished from a stuck one by a bounded readi
 any run is burned (open-Q F). A red signal becomes a redacted `BuildError` the loop re-seeds as the
 next run's prompt (KD-5).
 
+Every one of those signals is asked of the SERVER, and an app can satisfy all of them and still
+throw in the browser before it paints. U13 adds the missing witness: the app's own error reporter
+POSTs what it caught, `client_errors` parks it, and `verify` drains it here — so a reported
+browser-side crash is a not-green verdict exactly like a failed type-check (R17, AE11). This is
+the ONE authority both loops consult, which is why the runtime half lands here rather than at
+either call site: `turns/engine.py` runs the live path and `harness.py` the vestigial one, and a
+health rule that only one of them knew would be a health rule with an escape hatch.
+
 A DEAD dev child gets the IT Crowd treatment first — "have you tried turning it off and on
 again?": verify captures the child's last output + exit code (the ring resets on restart), calls
 `dev_start` once, and only then polls readiness. Before this rescue, nothing in the system ever
@@ -21,10 +29,12 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Final
 
 import structlog
 
 from src.api.v1.build_sessions.schemas import BuildError
+from src.services.orchestrator.client_errors import ClientErrorReport, drain_client_errors
 from src.services.orchestrator.constants import (
     EXEC_TIMEOUT_S,
     LOG_TAIL_MAX_LINES,
@@ -32,7 +42,7 @@ from src.services.orchestrator.constants import (
     VERIFY_RETRY_BACKOFF_S,
     VERIFY_TRANSIENT_RETRIES,
 )
-from src.services.orchestrator.errors import from_server, from_tsc
+from src.services.orchestrator.errors import from_client, from_server, from_tsc
 from src.services.sandbox import SandboxClient, SandboxError, SandboxGoneError, SandboxHandle
 
 logger = structlog.get_logger()
@@ -103,6 +113,61 @@ def dev_died_error(
     if last_output:
         detail += "\n\nLast dev-server output before it died:\n" + "\n".join(last_output)
     return from_server(detail)
+
+
+NON_FATAL_CLIENT_SOURCES: Final = frozenset({"console.error", "console.warn"})
+"""The reporter sources that mean the app SAID something, as opposed to actually broke.
+
+A DENYLIST, NOT AN ALLOWLIST, and the direction is the whole point. `source` is a free-form label
+the capture component chooses — `schemas.py` keeps it a bounded string rather than an enum
+precisely so that the day the template learns a fifth capture point, the backend does not answer
+422 and make the crash it was reporting invisible. An allowlist of FATAL sources would reintroduce
+that failure by the back door and without the 422 to notice it by: a new reporter would land
+outside the list, read as non-fatal, and a real crash would pass as green. Naming the two that are
+NOT crashes fails closed instead — anything unrecognised is treated as a crash.
+
+The capture component wraps four things: `window.onerror`, `unhandledrejection`, `console.error`
+and `console.warn`. Only the first two are crashes. The other two are ordinary output — and React
+logs its own development warnings (a missing `key`, a hydration mismatch, a deprecated lifecycle)
+through `console.error`, not `console.warn`, so "console.error fired" is emphatically not a
+synonym for "the app is broken".
+
+GATING THE VERDICT ON ALL FOUR WOULD FAIL ALMOST EVERY BUILD. A single missing `key` prop would
+make `verify` red, spend the whole self-heal budget chasing a warning, and — because the client
+diagnostic is deliberately not narrated — do it with nothing on screen explaining why. That is a
+worse lie than the one this feature exists to remove, so the verdict gates on crashes only.
+
+The non-fatal reports are not thrown away when a crash IS present: they ride along as context in
+the same diagnostic, because a warning emitted just before a crash is often the thing that
+explains it. With no crash they are dropped, which is what "the app is noisy but working" means."""
+
+
+def the_call_is_coming_from_inside_the_house(reports: list[ClientErrorReport]) -> BuildError:
+    """The diagnostic for "every server-side check is clean and the app is still broken" (U13,
+    R17 runtime half).
+
+    Named for what these reports mean: the dev server answered, `tsc` is clean, the log tail is
+    quiet, `/dev/status` says ready — and the app is dead anyway, because the failure was inside
+    the browser the whole time. That class is invisible to every signal the harness polls, which
+    is precisely why suppressing the framework's runtime overlay could otherwise turn a crash the
+    user could SEE into a success nobody could see at all.
+
+    The blob assembled here is app-authored text and is handled as such by `from_client`: redacted
+    on the same single path as any other sandbox output, then wrapped in a data-only frame. The
+    numbering matters more than it looks — a crash loop reports the same fault repeatedly, and an
+    explicit `[1] … [2] …` is what stops the model reading a repeated stack as several distinct
+    faults to chase."""
+    # Crashes first, then whatever else the browser said. A warning logged moments before a crash
+    # is frequently the thing that explains it, so the context is worth carrying — but it is
+    # carried BEHIND the crash, because the crash is what the agent has to fix.
+    ordered = [r for r in reports if r.source not in NON_FATAL_CLIENT_SOURCES] + [
+        r for r in reports if r.source in NON_FATAL_CLIENT_SOURCES
+    ]
+    blocks = [
+        f"[{index}] {report.source}: {report.title}\n{report.stack}".rstrip()
+        for index, report in enumerate(ordered, start=1)
+    ]
+    return from_client("\n\n".join(blocks))
 
 
 @dataclass(frozen=True)
@@ -258,6 +323,22 @@ async def verify(
     tail = (died_lines + logs.lines)[-LOG_TAIL_MAX_LINES:]
     server_crash = detect_server_crash(tail)
 
+    # U13 / R17 — THE RUNTIME HALF OF THE HEALTH VERDICT. Everything above this line is asked of
+    # the SERVER; a Next app can pass all of it and still throw before it paints a single pixel,
+    # and the only witness to that is the browser. The app's own error reporter has been relaying
+    # those crashes to the framing portal since Stage 0 with nobody listening; the ingest route
+    # parks what the portal forwards, and this is where it is collected.
+    #
+    # DRAINED unconditionally, including on the arms below where a compile error already outranks
+    # it. A report counts against exactly one verdict: left parked, one browser crash would fail
+    # every remaining verify of the build and burn the whole self-heal budget re-reporting itself
+    # while the agent fixed it on the first pass. If the crash is still there after the repair,
+    # the browser is still framing the app and says so again.
+    client_reports = drain_client_errors(handle.app_name)
+    # Only a CRASH gates the verdict — see `NON_FATAL_CLIENT_SOURCES`. Both lists are kept: the
+    # fatal ones decide, the full set is what the agent gets to read when they decide red.
+    fatal_reports = [r for r in client_reports if r.source not in NON_FATAL_CLIENT_SOURCES]
+
     error: BuildError | None = None
     if not tsc_ok:
         error = from_tsc(f"{typecheck.stdout}\n{typecheck.stderr}")
@@ -269,8 +350,19 @@ async def verify(
             restarted=restarted,
             last_output=died_lines[-_DEATH_TAIL_LINES:],
         )
+    elif fatal_reports:
+        # LAST in the chain on purpose. A build that does not compile is not a build whose runtime
+        # is worth diagnosing — the browser is reporting on whatever was last served, which is a
+        # different tree from the one the agent just wrote. When the compile signals are clean,
+        # this is the only remaining explanation for a broken app, and it is the whole point.
+        error = the_call_is_coming_from_inside_the_house(client_reports)
 
-    green = tsc_ok and dev_ready and server_crash is None
+    # `not fatal_reports`, not "no client error object": a reported CRASH gates the VERDICT even
+    # on the arms where a compile error took the diagnostic slot. This is the conjunct that stops
+    # the completion claim — the harness gate is `green AND done_requested` — so a suppressed
+    # overlay can never convert a visible crash into a silent success (AE11). A console warning is
+    # not a crash and deliberately does not appear here.
+    green = tsc_ok and dev_ready and server_crash is None and not fatal_reports
     preview_url = handle.preview_url if dev_ready else None
     return VerifyOutcome(
         green=green, dev_ready=dev_ready, error=error, preview_url=preview_url

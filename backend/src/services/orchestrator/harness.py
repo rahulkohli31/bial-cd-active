@@ -41,7 +41,12 @@ from pydantic_ai.models.anthropic import AnthropicModelSettings
 from pydantic_ai.usage import RequestUsage, UsageLimits
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.v1.build_sessions.schemas import BuildError, BuildResult, BuildSessionStatus
+from src.api.v1.build_sessions.schemas import (
+    BuildError,
+    BuildResult,
+    BuildSessionStatus,
+    ErrorSource,
+)
 from src.db.models.conversation import ConversationMode
 from src.db.models.message import MessageEntryKind
 from src.services.messages.store import append_batch
@@ -384,7 +389,13 @@ class BuildOrchestrator:
                     preview_url=outcome.preview_url,
                 )
             if error is not None:
-                await emitter.error(error)  # a repair run is coming (KD-5)
+                # U13 — a CLIENT-class report is agent input, not narrative, and the rule has to
+                # hold in BOTH loops. `selfheal` is the single health authority precisely so a
+                # verdict cannot mean two things depending on which harness built the app; a
+                # rule only the live loop knew would be a rule with an escape hatch. The turn
+                # engine skips its own emit for the same source and for the same reason.
+                if error.source is not ErrorSource.CLIENT:
+                    await emitter.error(error)  # a repair run is coming (KD-5)
                 turn_prompt = build_repair_prompt(error)
             else:
                 # green but declare_done not called — nudge, not an error envelope (KD-7)

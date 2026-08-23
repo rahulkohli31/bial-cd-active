@@ -17,6 +17,7 @@ Endpoints:
   POST /dev/start  {cmd?:[..], cwd?}              -> {"pid": N}
   GET  /dev/status                                -> {"running","ready","port","exit_code"}
   GET  /dev/logs?since=N                          -> {"lines":[..], "next": M}
+  GET  /dev/compile   -> {"state","errors","reason","connect_generation"}   (R17/R18)
   GET  /env/manifest              -> {"vars":[{name,description}]}  (names only, no values)
   GET  /served                                    -> {"served": N, "truncated": bool}   (R14)
 
@@ -37,6 +38,7 @@ import http.client
 import json
 import os
 import pwd
+import re
 import socket
 import subprocess
 import threading
@@ -500,6 +502,258 @@ def _pump(proc: subprocess.Popen[str]) -> None:
                 _Dev.ready = True
 
 
+# --- R17/R18: the dev server's own compile state, read off its HMR socket --------------------
+#
+# WHY A SOCKET AND NOT THE LOG TAIL. `/dev/logs` was the only compile signal the platform had,
+# which means string-matching a human-formatted stream at whatever cadence the control plane
+# happens to poll. The dev server already publishes the answer as structured frames on its own
+# HMR websocket, and — the decisive property — it sends the CURRENT state immediately on connect,
+# so a consumer attaching at any moment learns whether the app is broken RIGHT NOW. There is no
+# missed-edge problem and no scrollback to re-read. Measured latency from a file write to the
+# `built` frame is ~100ms.
+#
+# WHY IT MUST NEVER FAIL OPEN. The platform covers the preview frame while this reads `building`
+# or `failed`, and uncovers it on `clean`. An absent signal read as clean would clear the cover
+# over the very error screen the cover exists to hide. So "no idea" is a FIRST-CLASS value
+# (`unknown`) and every failure lands on it: never connected, connection dropped, unparseable
+# frame, library missing from the image, or the protocol renamed upstream.
+#
+# THE PROTOCOL IS UNVERSIONED AND INTERNAL. `/_next/webpack-hmr` keeps its name under Turbopack
+# (the default bundler in Next 16) and the frame verbs were identical across 16.2.10 and 16.3.1,
+# but none of that is a promise. Parsing is therefore defensive — unknown verbs and missing
+# fields are ignored rather than thrown — which on its own would make an upstream rename
+# INVISIBLE: we would quietly receive nothing forever while reporting a clean app. `_HMR_CANARY_S`
+# is what gives that teeth. It exploits the sync-on-connect property: a SUCCESSFUL connect that
+# produces no recognised frame within the window is reported as `unknown` with a `reason` the
+# control plane raises a pinned alarm on. That is the one signal that says the protocol moved.
+_HMR_PATH = "/_next/webpack-hmr"
+
+_HMR_CONNECT_TIMEOUT = 3.0
+"""Connect budget for one attempt at the HMR socket. Loopback: a refusal (nothing listening
+yet) is instant, so this only bounds the pathological case."""
+
+_HMR_RETRY_S = 1.0
+"""Pause between connect attempts. The dev server is restarted by `/dev/start`, by self-heal's
+dead-child rescue, and by the agent's own shell — so this thread reconnects forever rather than
+being wired to any one of those events."""
+
+_HMR_CANARY_S = 5.0
+"""How long we may be owed a frame we understand before calling it protocol drift.
+
+Armed at connect (the server sends `sync` within milliseconds, so five seconds of nothing there
+is not slowness) and re-armed by any frame we do NOT recognise — traffic we cannot read is the
+signal that the vocabulary moved. Never armed by quiet alone: an idle dev server sends nothing
+for minutes and is perfectly healthy."""
+
+_COMPILE_DEBOUNCE_S = 0.4
+"""How long `clean` must hold before it is published. One edit produces several `built` frames
+(client and server compilations land separately), with `building` in between — publishing each
+one would flap the platform's cover down and up mid-change.
+
+DELIBERATELY ASYMMETRIC: `building` and `failed` publish IMMEDIATELY and only `clean` waits.
+The covering states are the safe ones, so they must be fast; the clearing state is the one that
+can lie, so it is the one that has to settle. This is also the interval the portal's cover is
+specified to clear within — it imports the value rather than keeping a second copy of it."""
+
+_COMPILE_MAX_ERRORS = 5
+_COMPILE_MAX_ERROR_CHARS = 4000
+"""Bounds on what one compile failure may hand upward. The text ends up in a model prompt, so a
+webpack error dump with a thousand frames must not become the turn's whole context."""
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+class _Compile:
+    """The derived compile state, published by the HMR consumer thread and read by `/dev/compile`.
+
+    `connect_generation` counts SUCCESSFUL connects. It is on the wire so the control plane can
+    raise the protocol-drift alarm exactly once per connect instead of once per poll — without it,
+    a drifted protocol would emit an alarm every second for the life of the container.
+
+    `pending` holds a `clean` that has not served its debounce yet. Settling happens on the READ
+    (`_settle_locked`), not on a timer in the writer: the consumer thread is blocked in `recv()`
+    for most of its life and cannot wake itself to publish, and a read-side promotion is exactly
+    as prompt for a caller polling every second while staying deterministic under test."""
+
+    lock = threading.Lock()
+    state: str = "unknown"  # "building" | "clean" | "failed" | "unknown"
+    errors: tuple[str, ...] = ()
+    reason: str | None = "never_connected"  # why the state is `unknown`; None when it is not
+    connect_generation: int = 0
+    pending: tuple[str, tuple[str, ...]] | None = None
+    pending_at: float = 0.0
+    consumer_started: bool = False
+
+
+def _strip_ansi(text: str) -> str:
+    """HMR error payloads carry terminal colour. It reaches a model prompt and a JSON field —
+    both of which render it as literal garbage — so it comes off here, at the source."""
+    return _ANSI_RE.sub("", text)
+
+
+def _error_text(item: Any, secrets: tuple[str, ...]) -> str:
+    """One HMR error entry as plain text, REDACTED. The wire form is normally a preformatted
+    string, but webpack-shaped object entries are a documented variant, so both are handled and
+    anything else degrades to its repr rather than throwing inside the consumer thread.
+
+    THE REDACTION IS NOT OPTIONAL, and it is the same rule `/exec`, `/dev/logs` and `/files`
+    already follow (see this module's header): a compile error is dev-server output, and dev-server
+    output is exactly as credential-shaped as a log line. A Next error that echoes a bad
+    `BIAL_DATABASE_URL` — an unparseable DSN is a compile-time failure, not an exotic one — would
+    otherwise carry the per-project database password out of the container, into the control
+    plane, and on into a model prompt. The scrub is a substring replace of known values, so it
+    catches the whole DSN and its parsed password sub-token both (C9 §6.4)."""
+    if isinstance(item, str):
+        text = item
+    elif isinstance(item, dict):
+        parts = [str(item[k]) for k in ("moduleName", "message") if isinstance(item.get(k), str)]
+        text = "\n".join(parts) if parts else json.dumps(item, default=str)
+    else:
+        text = str(item)
+    return _redact(_strip_ansi(text), secrets)[:_COMPILE_MAX_ERROR_CHARS]
+
+
+def _derive_compile(msg: Any) -> tuple[str, tuple[str, ...]] | None:
+    """Derive `(state, errors)` from one HMR frame, or None if this frame says nothing about
+    compilation. None is the ONLY answer for an unrecognised frame — never a state — because
+    an unknown verb must not be read as good news.
+
+    The verb is taken from `action` OR `type`: the frames carry `action`, the surrounding
+    protocol documentation says `type`, and reading whichever is present costs one line and
+    removes a whole class of silent break."""
+    if not isinstance(msg, dict):
+        return None
+    verb = msg.get("action")
+    if not isinstance(verb, str):
+        verb = msg.get("type")
+    if not isinstance(verb, str):
+        return None
+    if verb == "building":
+        return ("building", ())
+    if verb in ("built", "sync"):
+        raw = msg.get("errors")
+        # Secrets resolved ONCE per frame rather than per error, exactly as `/dev/logs` does it.
+        secrets = _redaction_secrets() if isinstance(raw, list) and raw else ()
+        errors = (
+            tuple(_error_text(e, secrets) for e in raw[:_COMPILE_MAX_ERRORS])
+            if isinstance(raw, list)
+            else ()
+        )
+        return ("failed", errors) if errors else ("clean", ())
+    return None
+
+
+def _publish_locked(state: str, errors: tuple[str, ...], reason: str | None = None) -> None:
+    _Compile.state = state
+    _Compile.errors = errors
+    _Compile.reason = reason
+    _Compile.pending = None
+
+
+def _note_frame(state: str, errors: tuple[str, ...]) -> None:
+    """Record a recognised frame. See `_COMPILE_DEBOUNCE_S` for why only `clean` waits."""
+    with _Compile.lock:
+        if state == "clean":
+            _Compile.pending = (state, errors)
+            _Compile.pending_at = time.monotonic()
+            return
+        _publish_locked(state, errors)
+
+
+def _settle_locked(now: float) -> None:
+    pending = _Compile.pending
+    if pending is not None and now - _Compile.pending_at >= _COMPILE_DEBOUNCE_S:
+        _publish_locked(pending[0], pending[1])
+
+
+def _forget_compile(reason: str) -> None:
+    """Drop to `unknown` with a stated reason — every path that loses the signal comes here."""
+    with _Compile.lock:
+        _publish_locked("unknown", (), reason)
+
+
+def _consume_hmr() -> None:
+    """Hold a connection to the dev server's HMR socket and publish what it says. Forever, and
+    without ever raising: this runs in a daemon thread whose death would silently pin the state
+    at whatever it last published, which is the one outcome worse than `unknown`."""
+    try:
+        from websockets.sync.client import connect
+    except Exception:  # pragma: no cover - a broken image, not a runtime condition
+        # The library ships with `uvicorn[standard]` and is pinned in the image. If it is
+        # somehow absent the supervisor must still serve /exec and /dev/* — a module-level
+        # import would have taken the whole container down for a diagnostic feature.
+        _forget_compile("consumer_unavailable")
+        return
+    url = f"ws://127.0.0.1:{_DEV_PORT}{_HMR_PATH}"
+    while True:
+        try:
+            with connect(url, open_timeout=_HMR_CONNECT_TIMEOUT, close_timeout=1.0) as ws:
+                with _Compile.lock:
+                    _Compile.connect_generation += 1
+                    _publish_locked("unknown", (), "connected_no_frame_yet")
+                # The canary is ARMED WHENEVER WE ARE OWED AN ANSWER, not just at connect.
+                #
+                # A one-shot latch was the obvious shape and it disarms the alarm for every case
+                # except connect-time drift: one recognised frame set the timeout to None forever,
+                # so a rename that lands mid-session — or a PARTIAL rename, where `sync` still
+                # parses and `built` stops — would pin the state at whatever was last understood
+                # and never fire. That is precisely the silent failure the alarm exists for.
+                #
+                # SILENCE ALONE IS NOT DRIFT. An idle dev server sends nothing for minutes and is
+                # perfectly healthy, so the window is armed only while UNRECOGNISED frames have
+                # arrived since the last recognised one. Traffic we cannot read is the signal;
+                # quiet is not.
+                owed_since: float | None = time.monotonic()
+                while True:
+                    timeout = (
+                        None
+                        if owed_since is None
+                        else max(0.0, owed_since + _HMR_CANARY_S - time.monotonic())
+                    )
+                    try:
+                        raw = ws.recv(timeout=timeout)
+                    except TimeoutError:
+                        # We were owed an answer and did not get one we understand.
+                        owed_since = None
+                        _forget_compile("no_recognised_frame")
+                        continue
+                    text = raw if isinstance(raw, str) else bytes(raw).decode("utf-8", "replace")
+                    try:
+                        msg = json.loads(text)
+                    except ValueError:
+                        continue
+                    derived = _derive_compile(msg)
+                    if derived is None:
+                        # Traffic we cannot read. Start owing an answer again (unless we already
+                        # are), so a vocabulary that moves mid-session still trips the alarm.
+                        if owed_since is None:
+                            owed_since = time.monotonic()
+                        continue
+                    owed_since = None
+                    _note_frame(*derived)
+        except Exception:  # noqa: BLE001 - every transport failure is the same answer: unknown
+            _forget_compile("disconnected")
+        time.sleep(_HMR_RETRY_S)
+
+
+def _ensure_hmr_consumer() -> None:
+    """Start the consumer on first ask. Lazy rather than at import so nothing spawns a
+    reconnect loop in a test process or in a container whose app never gets polled, and
+    single-flight so the 1s control-plane cadence cannot stack threads."""
+    with _Compile.lock:
+        if _Compile.consumer_started:
+            return
+        _Compile.consumer_started = True
+    try:
+        threading.Thread(target=_consume_hmr, daemon=True, name="hmr-compile").start()
+    except BaseException:
+        # Hand the slot back, exactly as `_dev_is_serving` does: a spawn that failed under
+        # memory pressure must not latch "started" for the life of the container.
+        with _Compile.lock:
+            _Compile.consumer_started = False
+        raise
+
+
 # --- the TTY escape hatch ------------------------------------------------------------------
 # `stdin=DEVNULL` below is not enough, and we have the trace to prove it: told to run a bare
 # `npx drizzle-kit generate`, which prompts, the agent worked around the closed stdin by
@@ -708,6 +962,11 @@ def dev_start(body: DevStartBody) -> dict[str, Any]:
     # this one is still compiling. `selfheal.verify`'s dead-child rescue restarts the dev server
     # mid-verify, so this path is walked at runtime, not just at provision.
     _forget_ready()
+    # Same reasoning as `_forget_ready` above, for the compile signal: the server about to be
+    # spawned has compiled nothing, and its predecessor's verdict describes a process that no
+    # longer exists. The consumer reconnects on its own; this only stops the gap being narrated
+    # with the dead server's answer.
+    _forget_compile("dev_restarted")
     cwd = str(_resolve(body.cwd)) if body.cwd else str(WORKSPACE)
     proc = subprocess.Popen(  # noqa: S603
         body.cmd,
@@ -769,6 +1028,32 @@ def dev_logs(since: int = 0) -> dict[str, Any]:
         secrets = _redaction_secrets()
         lines = [_redact(line, secrets) for line in buffered[start:]]
         return {"lines": lines, "next": total}
+
+
+@app.get("/dev/compile", dependencies=[Depends(_auth)])
+def dev_compile() -> dict[str, Any]:
+    """Is the app currently compiling, compiled, or broken? — the signal the platform covers
+    the preview frame with (R17/R18).
+
+    `state` is one of `building` | `clean` | `failed` | `unknown`, and `unknown` is a real
+    answer, not an error: the consumer has not connected yet, the socket is down between
+    reconnects, or a successful connect produced nothing recognisable. `reason` names which.
+    A caller must treat `unknown` as "hold whatever you are showing" — never as clean.
+
+    `connect_generation` counts successful connects, so the control plane can raise the
+    protocol-drift alarm once per connect rather than once per poll.
+
+    Starting the consumer HERE, on first ask, is deliberate: nothing spawns a reconnect loop
+    in a container the platform never polls, and the first answer is honestly `unknown`."""
+    _ensure_hmr_consumer()
+    with _Compile.lock:
+        _settle_locked(time.monotonic())
+        return {
+            "state": _Compile.state,
+            "errors": list(_Compile.errors),
+            "reason": _Compile.reason,
+            "connect_generation": _Compile.connect_generation,
+        }
 
 
 @app.get("/env/manifest", dependencies=[Depends(_auth)])

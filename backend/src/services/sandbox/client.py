@@ -57,6 +57,8 @@ from src.services.sandbox.aca import (
     create_aca_control_plane,
 )
 from src.services.sandbox.base import (
+    CompileReport,
+    CompileState,
     DevLogs,
     DevStatus,
     ExecResult,
@@ -75,6 +77,8 @@ from src.services.sandbox.config import SandboxConfig
 from src.services.storage import get_storage, snapshot_key
 
 _log = structlog.get_logger()
+
+_COMPILE_VALUES: Final = frozenset(m.value for m in CompileState)
 
 # Caddy routes `/_sup/*` to the supervisor (stripping the prefix); every call the
 # client makes carries it. `handle.fqdn` is host-only (no scheme), so we prepend https.
@@ -110,6 +114,13 @@ _WARM_TIMEOUT_SECONDS: Final = 8.0
 # is up and return this sentinel — 0 is never a real Popen pid, so it unambiguously
 # reads as "already running, pid unknown" without raising (idempotent, C2).
 _ALREADY_RUNNING_PID: Final = 0
+
+# `/dev/compile` is polled on the preview watcher's 1s cadence, so it gets its OWN budget
+# rather than the 30s `_OP_TIMEOUT_SECONDS` every other supervisor call shares. The endpoint
+# answers from an in-memory value and never touches the dev server, so anything past a few
+# seconds is a wedged supervisor — and waiting 30s for that would stall the watcher that also
+# owns crash detection. Timing out is not a failure here: it is `UNKNOWN`, which holds.
+_COMPILE_TIMEOUT_SECONDS: Final = 5.0
 
 # Supervisor bearer token + registry token_ref sizing (secrets, never a UUID — ADR-0006).
 _SUPERVISOR_TOKEN_BYTES: Final = 32
@@ -457,6 +468,50 @@ class AcaSandboxClient(SandboxClient):
                 raise SandboxNotReadyError(f"dev server not ready within {timeout_s}s")
             await _asleep(delay)
             delay = min(delay * _READY_BACKOFF_FACTOR, _READY_POLL_MAX_SECONDS)
+
+    async def compile_state(self, handle: SandboxHandle) -> CompileReport:
+        """Ask the supervisor what the dev server is compiling — C1 `GET /dev/compile`.
+
+        NEVER RAISES, and that is the contract rather than a convenience. Every failure this
+        call can have — a supervisor image predating the endpoint (404), a transport error, a
+        malformed body — means the same thing: we do not know. Returning `UNKNOWN` is how that
+        reaches the caller, because the alternative (an exception) would have to be handled at
+        every call site, and the one handler that forgot would take a turn down over a
+        diagnostic signal. `reason` keeps the distinction observable.
+
+        THE 404 ARM IS LOAD-BEARING. Containers provisioned from an image built before this
+        endpoint existed answer 404 forever, and `/health` returns only `{"ok": true}`, so the
+        control plane cannot tell by asking. Those containers must read `UNKNOWN` — which the
+        portal's cover holds on — until they are next provisioned or restored."""
+        try:
+            resp = await self._get(handle, "dev/compile", timeout=_COMPILE_TIMEOUT_SECONDS)
+        except SandboxError:
+            return CompileReport(state=CompileState.UNKNOWN, reason="transport_error")
+        if resp.status_code == 404:
+            return CompileReport(state=CompileState.UNKNOWN, reason="endpoint_absent")
+        if resp.status_code != 200:
+            return CompileReport(state=CompileState.UNKNOWN, reason="status_error")
+        try:
+            data: Any = resp.json()
+            raw_state = str(data["state"])
+            raw_errors = data.get("errors")
+            errors = tuple(str(e) for e in raw_errors) if isinstance(raw_errors, list) else ()
+            if raw_state not in _COMPILE_VALUES:
+                # An unrecognised state string is `UNKNOWN`, never a guess. The supervisor and
+                # this client ship in separate images and can be a release apart in either
+                # direction, so a value one of them has not heard of is a real state — and it
+                # gets its OWN reason rather than inheriting the body's, which describes a
+                # state we just declined to believe.
+                return CompileReport(state=CompileState.UNKNOWN, reason="unrecognised_state")
+            raw_reason = data.get("reason")
+            return CompileReport(
+                state=CompileState(raw_state),
+                errors=errors,
+                reason=None if raw_reason is None else str(raw_reason),
+                connect_generation=int(data.get("connect_generation") or 0),
+            )
+        except (KeyError, TypeError, ValueError):  # fmt: skip  # ruff py314 strips parens
+            return CompileReport(state=CompileState.UNKNOWN, reason="malformed_body")
 
     async def someone_has_to_go_first(self, handle: SandboxHandle) -> int | None:
         """Pay the first Turbopack route compile so the citizen's browser does not (U3, R3).

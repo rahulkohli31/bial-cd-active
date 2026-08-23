@@ -4,6 +4,7 @@ import { Monitor, Tablet, Smartphone, LayoutTemplate, PowerOff, RotateCcw, WifiO
 import { relaunchRetryable } from '../utils/buildSessionTypes'
 import type { RelaunchError, BuildSessionStatus } from '../utils/buildSessionTypes'
 import type { PreviewLifeState } from '../utils/buildSessionApi'
+import type { CompileState } from '../utils/compileState'
 
 // Device-card widths drive the preview's REAL rendered pixel width (an inline style on
 // the wrapper, not a Tailwind max-width class) so the framed cross-origin doc's own media
@@ -72,6 +73,32 @@ const FRAMING_TEXT = 'Starting your app…'
 // ("my app has not opened yet") and naming it twice depending on which internal timer happens
 // to be running is the pane talking about itself instead of to them.
 const SLOW_TEXT = 'Your app is taking longer than usual to open'
+
+// R16/R18 — THE COVER. What the citizen sees instead of the framework's full-screen compile-error
+// screen, which filled the preview for ~66 seconds in each of three builds during the 2026-08-18
+// demo.
+//
+// WHY A COVER AND NOT A FIX INSIDE THE APP. The app is framed genuinely cross-origin, so this
+// pane cannot reach into `contentDocument` — but it can absolutely put its own element on top.
+// That is the whole reason this is the right mechanism: it needs no per-app change, no Caddy
+// plugin and no edit to a file the build agent could overwrite; it survives a restore by
+// construction; and it works identically on every Next version, which makes it the ONLY fix that
+// reaches apps already built. A framework env var (a later plan) is defence in depth for new
+// apps, not the fix.
+//
+// THERE IS NO LAST-GOOD-VIEW, and the reason is the same cross-origin wall: the parent cannot
+// copy or screenshot the working render either. It would also be actively harmful in the case it
+// sounds best in — a citizen whose workspace was wiped would keep watching their app apparently
+// rendering, which is the 2026-08-18 failure inverted. The cover shows the holding state, full
+// stop.
+const HOLDING_TEXT = 'Putting the latest change together…'
+// …and the ONE escalation, because a wait that never changes its wording stops being read as a
+// wait. Said once and never again — a card that keeps re-narrating itself reads as broken.
+const HOLDING_SLOW_TEXT =
+  'This change is taking longer than usual — it will appear here as soon as it\u2019s ready.'
+// Pinned as a named constant BESIDE `FRAME_LOAD_CAP_MS` so it is testable and changeable in one
+// place — not because 20s is measured. The holding-state duration counter is what settles it.
+const HOLDING_ESCALATE_MS = 20000
 
 /** The headline for a pane whose container is not serving this project — C3 §8.3.
  *
@@ -158,6 +185,39 @@ function RelaunchAffordance({ onRelaunch, relaunchError, label }: RelaunchAfford
 }
 
 /**
+ * The calm wait: an opaque full-bleed card with the pane's bouncing dots and one sentence.
+ *
+ * ONE component for both waits on this pane — the frame-load wait and the compile cover — because
+ * their visual identity is the point, not a coincidence: the citizen is in one situation ("my app
+ * has not opened yet") and two subtly different cards would be the pane talking about itself. It
+ * was two verbatim copies of this markup, kept in step by a comment; this keeps them in step by
+ * construction. Deliberately NOT shared with the frame-stall card below, which uses the
+ * spinner-plus-warning tint reserved for a dev server that is genuinely down — that one means
+ * something different and must stay able to diverge.
+ *
+ * The two call sites keep their own guards. Only the chrome is shared, never the condition.
+ */
+function BouncingWait({ children, className = '' }: { children: ReactNode; className?: string }) {
+  return (
+    <div
+      className="absolute inset-0 z-20 bg-[#e8edf2] flex flex-col items-center justify-center gap-4"
+      aria-busy="true"
+    >
+      <div className="flex gap-2">
+        {[0, 1, 2].map((i) => (
+          <div
+            key={i}
+            className="w-3 h-3 bg-primary rounded-full animate-bounce"
+            style={{ animationDelay: `${i * 0.2}s` }}
+          />
+        ))}
+      </div>
+      <p className={`text-sm text-neutral font-medium ${className}`}>{children}</p>
+    </div>
+  )
+}
+
+/**
  * The live-preview pane.
  *
  * Phase-2 model: the agent builds a REAL running Next.js app inside a per-user sandbox, and
@@ -173,10 +233,12 @@ function RelaunchAffordance({ onRelaunch, relaunchError, label }: RelaunchAfford
  *   - `status`     — the C3 lifecycle; drives loading / framed / terminal visuals.
  *   - `iterating`  — true while the loop keeps emitting step/log envelopes AFTER the preview
  *                    went live (a refine turn holding at `ready`); shows a subtle overlay.
- *   - `onFrameMessage` — the FUTURE Wave-1 client-error receiver seam. The inbound `message`
- *                    listener still validates `e.origin` against the sandbox origin (the C8 §3
- *                    security assertion, pinned by the skeleton) and forwards ONLY origin-valid
- *                    messages here. No relay is wired yet (C7 §7 is deferred); the gate stands.
+ *   - `onFrameMessage` — the client-error receiver seam, LIVE as of U13. The inbound `message`
+ *                    listener validates `e.origin` against the sandbox origin (the C8 §3 security
+ *                    assertion, pinned by the skeleton) and forwards ONLY origin-valid messages
+ *                    here; `BuilderPage` relays them to the harness, where a reported browser
+ *                    crash makes the health verdict not-green. Origin proves PROVENANCE, not
+ *                    content — the shape check lives on the receiving side.
  *
  *   - `onRelaunch` — when set, the terminal (ended/failed) placeholder offers a "Relaunch preview"
  *                    button (#43): restore the torn-down app from its snapshot into a fresh sandbox.
@@ -242,6 +304,13 @@ export interface LivePreviewProps {
   // a reclaimed container through it would spin the 20s RECONNECT_CAP_MS countdown lying
   // about a reconnect that will never happen.
   previewState?: PreviewLifeState | null
+  // R17/R18 — what the app's dev server is compiling RIGHT NOW, streamed from the container.
+  // FOUR values, and the fourth is why this is not a boolean: `unknown` means the platform
+  // could not tell (no signal yet, socket down, or a container image predating the signal —
+  // which is every app built before this shipped), and it HOLDS the cover rather than clearing
+  // it. `null` = nothing has been reported on this turn at all, which is the pre-signal state
+  // and behaves exactly as this pane did before the cover existed.
+  compileState?: CompileState | null
   // `slot_taken` only — the sibling project standing in the way, so the copy can name it.
   occupyingProjectName?: string | null
   saveDirty?: boolean | null
@@ -271,6 +340,10 @@ export default function LivePreview({
   // `hasSavedBuild` follows, and for the same reason: a caller that forgot the prop must not
   // be able to render a verdict nobody reached.
   previewState = null,
+  // Absent means NOTHING WAS REPORTED, never "clean". A default of `'clean'` would let a caller
+  // that forgot the prop uncover the frame over an error screen nobody looked at — which is the
+  // exact failure this whole mechanism exists to stop.
+  compileState = null,
   occupyingProjectName = null,
   // The save model (KTD-5e). `saveDirty` is TRI-STATE: true = unsaved work, false = saved,
   // null = UNKNOWN (no live workspace, or the server could not compare). Unknown must not
@@ -304,8 +377,8 @@ export default function LivePreview({
   // preview origin — the only trusted sender — BEFORE trusting the payload. A null previewOrigin
   // (preview dark) rejects everything. This is a security assertion, not a nicety; the walking
   // skeleton (scripts/skeleton) pins the reject path for real. The forwarded payload feeds the
-  // future Wave-1 browser client-error self-heal arm — the seam exists now so nothing is
-  // retrofitted later, but nothing consumes it yet.
+  // browser client-error arm of self-heal (U13), which is wired: passing this gate proves only
+  // WHERE the bytes came from, so the receiver narrows their shape before forwarding them on.
   useEffect(() => {
     const onMsg = (e: MessageEvent) => {
       if (!previewOriginRef.current || e.origin !== previewOriginRef.current) return
@@ -398,6 +471,56 @@ export default function LivePreview({
   }, [iterating, previewUrl])
   const frameKey = previewUrl ? `${previewUrl}#${reloadNonce}` : null
 
+  const [covered, setCovered] = useState(false)
+  // Which app the current verdict describes. A ref rather than state because it must not itself
+  // cause a render — it exists only to tell "a new verdict about the same app" from "the same
+  // verdict about a new app".
+  const coveredUrlRef = useRef<string | null>(null)
+  // ONE effect over BOTH inputs, and it must stay one.
+  //
+  // This was two effects — reset-on-url, then apply-on-verdict — and that shape had a hole the
+  // signal's own vocabulary walks straight into. There are only four possible values, so "a new
+  // app" and "the same verdict as the last app" routinely coincide: a relaunch onto a container
+  // that is still failing carries `failed` -> `failed` across the url change with NO delta. React
+  // skips an effect whose deps did not change, so the verdict effect never ran, the reset won
+  // uncontested, and the pane uncovered itself over a broken app — the precise failure this
+  // mechanism exists to prevent. Depending on the two effects' declaration order was the tell.
+  //
+  // Re-deriving from scratch on either input closes it, and the hold still holds: `unknown` and
+  // `null` change nothing for an app we are already covering. They only uncover on a genuinely
+  // NEW app, which we have learned nothing about yet — and nothing is exposed in that gap, since
+  // a new url remounts the frame and the frame-load wait owns the screen until the first report.
+  useEffect(() => {
+    const sameApp = coveredUrlRef.current === previewUrl
+    coveredUrlRef.current = previewUrl
+    if (compileState === 'building' || compileState === 'failed') setCovered(true)
+    else if (compileState === 'clean') setCovered(false)
+    else if (!sameApp) setCovered(false)
+  }, [previewUrl, compileState])
+
+  // The cover only exists over a frame. Everything above it in the precedence chain
+  // (restoring / terminal / reconnecting / unavailable) already replaces the frame entirely, and
+  // `showFrame` is false in every one of those states — so this single conjunction expresses the
+  // whole of `showRestoring > showTerminal > showReconnecting > showUnavailable > cover`.
+  const showCover = showFrame && covered
+
+  // …and the escalation, exactly once.
+  //
+  // Armed off `covered` — the VERDICT — rather than off `showCover`, which folds in the frame and
+  // reconnect context. The citizen is being told how long their CHANGE has been coming together,
+  // and that clock does not restart because a dev-server blip briefly put the reconnecting card
+  // in front of the cover. Off `showCover` it did: a flicker reset the countdown mid-wait, so a
+  // genuinely slow build could keep resetting to the shorter wording forever.
+  const [holdingSlow, setHoldingSlow] = useState(false)
+  useEffect(() => {
+    if (!covered) {
+      setHoldingSlow(false)
+      return
+    }
+    const t = setTimeout(() => setHoldingSlow(true), HOLDING_ESCALATE_MS)
+    return () => clearTimeout(t)
+  }, [covered])
+
   const [loadedUrl, setLoadedUrl] = useState<string | null>(null)
   const [stalledUrl, setStalledUrl] = useState<string | null>(null)
   // Both verdicts track the FRAME KEY, not the URL. Keyed on the URL they survived a remount, so
@@ -414,9 +537,19 @@ export default function LivePreview({
       return
     }
     if (frameLoaded) return
+    // Do not count the wait while the cover is up. The cap exists to label a frame that never
+    // loaded for no visible reason; under the cover we know exactly why it has not loaded, and
+    // the card this timer arms tells the citizen to relaunch — advice that is wrong mid-build.
+    // Worse, a timer left running lands the instant the cover clears, so the pane would answer a
+    // successful recovery with "your app is taking longer than usual". Any verdict earned while
+    // covered is dropped, and the wait restarts from the uncover.
+    if (showCover) {
+      setStalledUrl(null)
+      return
+    }
     const t = setTimeout(() => setStalledUrl(frameKey), FRAME_LOAD_CAP_MS)
     return () => clearTimeout(t)
-  }, [showFrame, frameKey, frameLoaded])
+  }, [showFrame, frameKey, frameLoaded, showCover])
 
   // U5 — ONE honest wait, running from "no URL yet" all the way to the framed document's own
   // `load`. It used to be destroyed the instant `previewUrl` arrived, which is precisely when the
@@ -437,6 +570,19 @@ export default function LivePreview({
     const t = setTimeout(() => setRelaunchSlow(true), FRAME_LOAD_CAP_MS)
     return () => clearTimeout(t)
   }, [relaunching])
+
+  // R16/R18 — THE COVER'S STATE, and the whole safety property is in which signals move it.
+  //
+  // Only an AFFIRMATIVE `clean` takes the cover down. `building` and `failed` raise it;
+  // `unknown` HOLDS whatever is currently showing, and `null` (nothing reported yet) leaves it
+  // alone too. Absent-reads-as-clean is the one behaviour that must never exist here: today its
+  // consequence is uncovering a red screen, and once the framework's own overlay is disabled
+  // for new apps its consequence is uncovering a BLANK one. Holding is the fail-closed answer
+  // in both directions — it never raises a cover over a healthy app either.
+  //
+  // Deliberately NOT tied to the frame's lifecycle. A remount does not reset this: the container
+  // re-reports within a poll, and clearing on remount would mean a frame swap silently uncovers
+  // a broken app for a second. The verdict is about the APP, not about this DOM node.
 
   const framePending = showFrame && !frameLoaded && !frameStalled
   const showLoading =
@@ -459,25 +605,29 @@ export default function LivePreview({
       : 'Restoring your app…'
     : showReconnecting
       ? 'Reconnecting to your preview…'
-      : frameStalled
-        ? SLOW_TEXT
-        : showLoading
-          ? framePending
-            ? FRAMING_TEXT
-            : ((status && LOADING_TEXT[status]) ?? 'Building your app…')
-          : showUnavailable
-            ? goneState
-              ? GONE_TITLE[goneState]
-              : 'Preview unavailable'
-            : showTerminal
-              ? 'The preview is no longer running'
-              : previewState === 'unknown'
-                ? // The honest sentence for a check that did not happen. It deliberately does
-                  // NOT disturb the frame — nothing was learned, so nothing changes on screen.
-                  'We could not check on your preview just now — it may still be running'
-                : frameLoaded
-                  ? 'Your app preview is live'
-                  : ''
+      : showCover
+        ? holdingSlow
+          ? HOLDING_SLOW_TEXT
+          : HOLDING_TEXT
+        : frameStalled
+          ? SLOW_TEXT
+          : showLoading
+            ? framePending
+              ? FRAMING_TEXT
+              : ((status && LOADING_TEXT[status]) ?? 'Building your app…')
+            : showUnavailable
+              ? goneState
+                ? GONE_TITLE[goneState]
+                : 'Preview unavailable'
+              : showTerminal
+                ? 'The preview is no longer running'
+                : previewState === 'unknown'
+                  ? // The honest sentence for a check that did not happen. It deliberately does
+                    // NOT disturb the frame — nothing was learned, so nothing changes on screen.
+                    'We could not check on your preview just now — it may still be running'
+                  : frameLoaded
+                    ? 'Your app preview is live'
+                    : ''
 
   return (
     <div className="flex flex-col h-full">
@@ -836,31 +986,36 @@ export default function LivePreview({
             mounted-but-unrevealed frame (the frame must be loading for `load` to ever fire), and
             the device card owns the pane's whole content width, so a sibling would be squeezed to
             nothing. Same anchor for both waits, so they can never be on screen at once. */}
-        {showLoading && (
-          <div
-            className="absolute inset-0 z-20 bg-[#e8edf2] flex flex-col items-center justify-center gap-4"
-            aria-busy="true"
-          >
-            <div className="flex gap-2">
-              {[0, 1, 2].map((i) => (
-                <div
-                  key={i}
-                  className="w-3 h-3 bg-primary rounded-full animate-bounce"
-                  style={{ animationDelay: `${i * 0.2}s` }}
-                />
-              ))}
-            </div>
-            <p className="text-sm text-neutral font-medium">
-              {framePending ? FRAMING_TEXT : ((status && LOADING_TEXT[status]) ?? 'Building your app…')}
-            </p>
-          </div>
+        {/* R16/R18 — THE COVER, over the frame and under nothing. Same anchor and same calm
+            bouncing-dots treatment as the wait below it, DELIBERATELY: the citizen is in one
+            situation ("my app has not opened yet") and the spinner-plus-warning tint two blocks
+            down means something else — a dev server that is genuinely down. Do not borrow it.
+
+            Its precedence is expressed by `showFrame` (everything above it in the chain
+            unmounts the frame) plus the `!showCover` guards on the two waits below. A later
+            unit adds the retraction card into this same cover, ABOVE this content and never
+            alongside it — the cover shows exactly one thing. */}
+        {showCover && (
+          <BouncingWait className="text-center px-6 max-w-sm">
+            {holdingSlow ? HOLDING_SLOW_TEXT : HOLDING_TEXT}
+          </BouncingWait>
+        )}
+
+        {showLoading && !showCover && (
+          <BouncingWait>
+            {framePending ? FRAMING_TEXT : ((status && LOADING_TEXT[status]) ?? 'Building your app…')}
+          </BouncingWait>
         )}
 
         {/* U5 — the bounded degradation: the frame never loaded, so say so and offer a way out,
             while leaving it MOUNTED underneath. Unmounting it would make the timeout permanent by
             construction (the `load` it is waiting for could never arrive), so this says "slow",
             not "dead" — a load that lands after FRAME_LOAD_CAP_MS still wins and reveals. */}
-        {frameStalled && (
+        {/* …and this degraded twin loses to the cover for the same reason the wait above does:
+            when the cover is up we KNOW why the frame has not loaded (the app is compiling, or
+            it failed to), and this card's "relaunch it" advice would be wrong. Two waits never
+            share the screen — the rule this file already kept, extended to the third. */}
+        {frameStalled && !showCover && (
           <div className="absolute inset-0 z-20 bg-[#e8edf2] flex flex-col items-center justify-center text-center px-6">
             <div className="w-16 h-16 rounded-2xl bg-gray-100 flex items-center justify-center mb-4">
               <Loader2 size={26} className="text-warning animate-spin" style={{ animationDuration: '1.8s' }} />

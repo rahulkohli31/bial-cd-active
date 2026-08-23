@@ -30,10 +30,12 @@ import { usePendingAttachments } from '../hooks/usePendingAttachments'
 import type { PendingAttachment } from '../utils/attachmentInput'
 import { startTurn, readTurnStream, buildFromPlan, switchMode, stopTurn, TurnStartError } from '../utils/turnStreamApi'
 import { isKnownFrame } from '../utils/turnStreamApi'
+import type { CompileState } from '../utils/compileState'
+import { makeClientErrorRelay } from '../utils/clientErrorRelay'
 import type { TurnFrame, PlanOptionsItem, StepItem, ConversationMode, DiagnosticFrame, StreamOutcome, BuildFromPlanOutcome } from '../utils/turnStreamApi'
 import { narrativeEnvelopes, narrativeStatus } from '../utils/turnNarrative'
 import type { TurnNarrative } from '../utils/turnNarrative'
-import { fetchSaveState, saveProject, releaseProject, stopActiveBuild, asReclaimBlocked, fetchPreviewState } from '../utils/buildSessionApi'
+import { fetchSaveState, saveProject, releaseProject, stopActiveBuild, asReclaimBlocked, fetchPreviewState, fetchCompileState } from '../utils/buildSessionApi'
 import type { ReclaimBlocked, PreviewState, PreviewLifeState } from '../utils/buildSessionApi'
 import ReclaimWorkspaceDialog from '../components/projects/ReclaimWorkspaceDialog'
 import { PlanOptionsCard } from '../components/chat/PlanOptionsCard'
@@ -385,6 +387,26 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const [turnSteps, setTurnSteps] = useState<Record<string, StepItem>>({})
   const [turnWorkspace, setTurnWorkspace] = useState<TurnNarrative['workspace']>(null)
   const [turnPreview, setTurnPreview] = useState<TurnNarrative['preview']>({ url: null, state: null })
+  // R17/R18 — what the app's dev server is compiling, streamed on the turn feed. `null` until
+  // the container reports, which for an app on an image predating the signal is forever — and
+  // `unknown` when it reported that it could not tell. The pane HOLDS its cover on both; this
+  // page's only job is to carry the value through without interpreting it.
+  const [turnCompile, setTurnCompile] = useState<CompileState | null>(null)
+
+  // R17 (runtime half) — the receiving end of the app's own error reporter. The app has always
+  // posted its browser-side crashes to this frame (`error-capture.tsx`); `LivePreview` validates
+  // the sender's origin and hands them here, and this relays them to the build harness, where a
+  // reported crash makes the health verdict not-green. NOTHING about the report is shown to the
+  // user — the only visible consequence is that the completion claim does not appear.
+  //
+  // A ref so the relay's own throttle counter survives re-renders: rebuilding it every render
+  // would reset the count on every keystroke and defeat the cap entirely.
+  // Lazy, not `useRef(makeClientErrorRelay())`: an argument to `useRef` is evaluated on every
+  // render and then thrown away on all but the first, so the eager form allocates a fresh relay
+  // (and its throttle counter) on every streamed frame of a build. The counter surviving is the
+  // whole point of holding it in a ref.
+  const clientErrorRelayRef = useRef<ReturnType<typeof makeClientErrorRelay> | null>(null)
+  if (clientErrorRelayRef.current === null) clientErrorRelayRef.current = makeClientErrorRelay()
   const [turnDiagnostics, setTurnDiagnostics] = useState<DiagnosticFrame[]>([])
   // Read inside async callbacks that outlive their render (the build watcher's terminal),
   // where the closed-over state value would be whatever it was when the build STARTED.
@@ -505,6 +527,15 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     setTurnDiagnostics([])
     setTurnQuota(null)
     setTurnWorkspace(null)
+    // Deliberately reset to `null` rather than to `'clean'`: a new turn has learned NOTHING
+    // about compilation yet, and starting it at clean would uncover a preview whose app may
+    // still be broken from the turn before.
+    setTurnCompile(null)
+    // A FRESH CRASH-REPORT BUDGET FOR THIS TURN. The relay's scope key is the framed url, which
+    // is byte-identical across repair turns on the attach arm — so without this the budget was
+    // effectively per page-load: eight crashes into a session the relay went quiet for good, and
+    // every later verify came back green on silence the platform itself had caused.
+    clientErrorRelayRef.current?.reset()
     setTurnTerminal(null)
     setTurnStartedAt(Date.now())
     setStoppingTurn(false)
@@ -966,6 +997,9 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         // second REST round-trip, and from an empty preview pane over a running app.
         if (frame.turnId) liveTurnIdRef.current = frame.turnId
         if (frame.workspaceState) setTurnWorkspace({ state: frame.workspaceState, message: null })
+        // Only when the server actually said something. A snapshot with no compile fact must
+        // leave whatever the live tail already established alone.
+        if (frame.compileState) setTurnCompile(frame.compileState)
         if (frame.previewUrl || frame.previewState) {
           setTurnPreview((prev) => ({
             url: frame.previewUrl ?? prev.url,
@@ -1002,6 +1036,8 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         // this as a failure would tell the user their build died four times on its way to
         // succeeding. It renders as an in-narrative alert row instead.
         setTurnDiagnostics((prev) => [...prev, frame])
+      } else if (frame.type === 'compile') {
+        setTurnCompile(frame.state)
       } else if (frame.type === 'quota') {
         setTurnQuota({ limit: frame.limit, used: frame.used, resetsAt: frame.resetsAt })
       } else if (frame.type === 'turn_ended') {
@@ -1702,6 +1738,21 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // build. Keyed on the url so a NEW sandbox remounts the iframe rather than showing a frame
   // pointing at a container that no longer exists.
   const framedPreviewUrl = (turnNarrativeIsThisChat ? turnPreview.url : null) ?? relaunchedUrl ?? (showSession ? session.previewUrl : null)
+
+  // The receiving end of the app's own error reporter (see `clientErrorRelayRef` above). Declared
+  // HERE rather than beside the ref because it reads `framedPreviewUrl`, which is derived further
+  // down the render.
+  const handleFrameMessage = useCallback(
+    (data: unknown) => {
+      // No project, nothing to address the report to. A conversation with no project behind it
+      // has no app for the harness to judge either, so nothing is lost by dropping it.
+      if (!projectId) return
+      // Scoped to the FRAMED URL, not to the project: a rebuild or a restore gives the app a new
+      // container, and the crash loop that silenced the relay belonged to the old one.
+      void clientErrorRelayRef.current?.relay(projectId, framedPreviewUrl ?? '', data)
+    },
+    [projectId, framedPreviewUrl],
+  )
   const framedStatus = turnBuildStatus ?? (relaunchedUrl ? 'ready' : (previewStatus ?? (newestOutcome ? 'ended' : null)))
   // The build bubble's two sources, resolved ONCE — the turn wins when it has something to say.
   // Naming them here is what lets the wrapper ask `hasBuildNarrative` the same question
@@ -1830,6 +1881,23 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         // so it will start fresh") over a workspace sitting safely on Blob, with no way back
         // and no timer left to correct it. A thing that decided nothing is not terminal,
         // whichever field declined to decide.
+        // R17/R18 — THE COMPILE SIGNAL FOR A TAB WITH NO LIVE TURN. During a turn the state
+        // arrives on the turn stream; that producer stops at the terminal, so a tab that
+        // reloads after a red turn has nothing to cover a broken preview with and comes up
+        // showing the framework's error screen under a live-preview label.
+        //
+        // Asked on THIS tick rather than on a timer of its own — same cadence, same visibility
+        // rule, same generation guard — and only when there is something to ask about: a live
+        // container, and no turn already reporting. Both conditions matter. Without the first
+        // the call is an attach against a dead workspace; without the second it races the
+        // stream and can move the pane backwards to an older reading.
+        if (state.state === 'alive' && liveTurnIdRef.current === null) {
+          const compiling = await fetchCompileState(projectId)
+          if (!live || generation !== latestProbe) return
+          // Still no live turn: one may have started while this was in flight, and the stream
+          // is the better authority the moment it exists.
+          if (liveTurnIdRef.current === null) setTurnCompile(compiling)
+        }
         if (SETTLED_GONE.has(state.state) && state.restorable !== null) stopAsking()
         else keepAsking()
       } catch {
@@ -2367,6 +2435,13 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
             previewState={previewState?.state ?? null}
             occupyingProjectName={previewState?.occupyingProjectName ?? null}
             reconnecting={(turnNarrativeIsThisChat && turnPreview.state === 'reconnecting') || (showSession && session.reconnecting)}
+            /* NOT gated on `turnNarrativeIsThisChat`, unlike the narrative props above it. This
+               is a fact about the PROJECT'S APP — one app per project — not about which
+               conversation happens to be open, and it now has a producer that outlives the turn
+               (the preview probe above). Gating it would blank the signal the moment the user
+               opened a sibling chat, and blanking it is what leaves an error screen uncovered. */
+            compileState={turnCompile}
+            onFrameMessage={handleFrameMessage}
           />
         </div>
       </div>

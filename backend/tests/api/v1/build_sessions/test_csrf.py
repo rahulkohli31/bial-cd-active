@@ -32,6 +32,10 @@ _MUTATING_POSTS = [
     "/v1/build-sessions/{sid}/heartbeat",
     "/v1/build-sessions/internal/reap",
     "/v1/build-sessions/projects/{project_id}/save",
+    # U13 — the app's own client-error report. This table is HAND-MAINTAINED, not
+    # auto-discovered from the route tree, so a new mutating POST is only covered here
+    # because the change that added it added this row too.
+    "/v1/build-sessions/projects/{project_id}/client-error",
 ]
 
 
@@ -41,6 +45,7 @@ def _slug(path_tmpl: str) -> str:
         .replace("/", "-")
         .replace("{sid}", "sid")
         .replace("{project_id}", "project_id")
+        .replace("{app_id}", "app_id")
     )
 
 
@@ -103,7 +108,7 @@ async def test_missing_csrf_header_is_403_on_every_mutating_post(
         db_session, email=f"csrf-miss-{_slug(path_tmpl)}@rvaiglobal.com"
     )
     wire.app.dependency_overrides[superadmin_allowlist] = lambda: frozenset({user.email})
-    path = path_tmpl.format(sid=uuid.uuid4(), project_id=uuid.uuid4())
+    path = path_tmpl.format(sid=uuid.uuid4(), project_id=uuid.uuid4(), app_id=uuid.uuid4())
     resp = await client.post(path, headers=auth_headers(user, with_csrf=False))
     assert resp.status_code == 403
     assert resp.json()["error"]["code"] == "csrf_failed"
@@ -120,7 +125,7 @@ async def test_mismatched_csrf_token_is_403_on_every_mutating_post(
     jwt = mint_session_jwt(user.id, user.token_version, _TTL)
     # Cookie CSRF and header CSRF disagree -> double-submit fails.
     headers = {"Cookie": f"session={jwt}; csrf=aaa.bbb", "X-CSRF-Token": "ccc.ddd"}
-    path = path_tmpl.format(sid=uuid.uuid4(), project_id=uuid.uuid4())
+    path = path_tmpl.format(sid=uuid.uuid4(), project_id=uuid.uuid4(), app_id=uuid.uuid4())
     resp = await client.post(path, headers=headers)
     assert resp.status_code == 403
     assert resp.json()["error"]["code"] == "csrf_failed"

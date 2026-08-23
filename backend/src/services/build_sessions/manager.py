@@ -90,6 +90,7 @@ from src.services.redis.keys import (
 )
 from src.services.sandbox import (
     SANDBOX_NAME_PREFIX,
+    CompileState,
     SandboxClient,
     SandboxError,
     SandboxGoneError,
@@ -1298,6 +1299,41 @@ class SessionManager:
         # settle its indicator, and one that did not exist a moment ago.
         saved = await _container_state(sandbox_client, handle)
         return SaveOutcome(app_id=app_id, head_sha=saved.head if saved else None)
+
+    async def project_compile_state(
+        self,
+        db: AsyncSession,
+        user: User,
+        project_id: uuid.UUID,
+        *,
+        sandbox_client: SandboxClient,
+    ) -> CompileState:
+        """What is the app currently compiling? — for a tab with no live turn (R17/R18).
+
+        WHY THIS EXISTS SEPARATELY FROM THE TURN STREAM. The compile signal is emitted by the
+        turn's preview watcher, so it stops the moment a turn ends. A tab that reloads after a
+        red turn therefore has no producer at all: the pane initialises uncovered, and the
+        citizen is shown the framework's error screen under a live-preview label — the exact
+        thing the cover was built to stop, reachable by pressing F5.
+
+        WHY NOT ON `project_preview_state`. That route's budget is frozen in C3 §8.3 at NO
+        container call of any kind, because it is a browser tab on a 45-second timer. This one
+        is deliberately its own call, gated by the caller on a preview that is already framed.
+
+        `UNKNOWN` for every unanswerable case — no app, no live container, storage or transport
+        trouble — because absent must never read as clean. `compile_state` never raises, so the
+        only failure this has to name is "there is nothing to ask"."""
+        app_id = await _existing_app_id(db, user.id, project_id)
+        if app_id is None:
+            return CompileState.UNKNOWN
+        try:
+            handle = await self._attach_for_read(user.id, app_id, sandbox_client)
+        except NoLiveSandboxError:
+            # Nothing is serving this project. The pane has its own vocabulary for that
+            # (`previewState`), and answering `clean` here would uncover over a dead app.
+            return CompileState.UNKNOWN
+        report = await sandbox_client.compile_state(handle)
+        return report.state
 
     async def project_save_state(
         self,

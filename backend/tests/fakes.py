@@ -38,6 +38,8 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_TOKEN_REF,
 )
 from src.services.sandbox.base import (
+    CompileReport,
+    CompileState,
     DevLogs,
     DevStatus,
     ExecResult,
@@ -234,6 +236,11 @@ class FakeSandboxClient(SandboxClient):
         # The U3 warm requests this client was asked for, and the status each one answers with.
         self.warmed: list[str] = []
         self.warm_status: int | None = 200
+        # The R17/R18 compile signal this container reports, and how often it was asked.
+        self.compile_report: CompileReport = CompileReport(
+            state=CompileState.UNKNOWN, reason="endpoint_absent"
+        )
+        self.compile_polls = 0
 
     async def provision_new(
         self, user_id: str, app_name: str, *, app_env: dict[str, str]
@@ -327,6 +334,17 @@ class FakeSandboxClient(SandboxClient):
 
     async def dev_status(self, handle: SandboxHandle) -> DevStatus:
         return DevStatus(running=True, ready=True, port=3000)
+
+    async def compile_state(self, handle: SandboxHandle) -> CompileReport:
+        """The R17/R18 compile signal, scripted per test.
+
+        The DEFAULT is `UNKNOWN`, not `CLEAN`, and that is a deliberate copy of production
+        rather than laziness: an existing container answers 404 here until it is next
+        provisioned from an image carrying `/dev/compile`, so `UNKNOWN` is what the whole live
+        fleet says. A fake that defaulted to `CLEAN` would make every turn test assert against
+        a state most real containers cannot produce."""
+        self.compile_polls += 1
+        return self.compile_report
 
     async def someone_has_to_go_first(self, handle: SandboxHandle) -> int | None:
         """The U3 warm request. Recorded rather than performed — the real one is a live GET at

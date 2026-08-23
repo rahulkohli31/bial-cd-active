@@ -65,8 +65,9 @@ from pydantic_ai.tools import DeferredToolRequests
 from pydantic_ai.usage import RequestUsage, RunUsage, UsageLimits
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from src.api.v1.build_sessions.schemas import LIVENESS_LEASE_RENEW_CADENCE_SECONDS
+from src.api.v1.build_sessions.schemas import LIVENESS_LEASE_RENEW_CADENCE_SECONDS, ErrorSource
 from src.api.v1.conversations.schemas import (
+    CompileFrame,
     DiagnosticFrame,
     PlanOptionsFrame,
     PreviewFrame,
@@ -92,6 +93,7 @@ from src.services.agent.read_tools import (
     ReadOnlyWorkspace,
 )
 from src.services.agent.toolsets import plan_options_only_toolset, toolsets_for_mode
+from src.services.build_sessions.alarms import HMR_PROTOCOL_DRIFT_EVENT
 from src.services.build_sessions.locks import release_liveness_lease, renew_liveness_lease
 from src.services.build_sessions.manager import (
     BuildSession,
@@ -110,6 +112,7 @@ from src.services.messages.projection import (
     step_detail,
 )
 from src.services.messages.store import append_batch
+from src.services.orchestrator.client_errors import discard_client_errors
 from src.services.orchestrator.constants import (
     CACHE_TTL,
     CRASH_EDGE_CONSECUTIVE_POLLS,
@@ -126,6 +129,7 @@ from src.services.orchestrator.prompt import build_repair_prompt
 from src.services.orchestrator.selfheal import CONTINUE_PROMPT, dev_not_ready_error, verify
 from src.services.redis import get_redis
 from src.services.sandbox import SandboxClient, SandboxError
+from src.services.sandbox.base import CompileState
 from src.services.storage.snapshot_read import NoAppYet, extract_snapshot
 from src.services.turns.guard import claim_conversation, release_conversation
 from src.services.turns.plan_options import META_PENDING
@@ -484,6 +488,15 @@ class _TurnState:
     # True once the finalize actually pushed a snapshot. TRI-STATE on the wire: None here
     # means "nothing to say" (a chat turn, or a Write turn that never reached the save).
     snapshot_committed: bool | None = None
+    # The newest compile state PUBLISHED to the client, so the watcher can emit on CHANGE
+    # rather than once per poll. `None` = nothing emitted yet, which is not the same as
+    # `UNKNOWN` (a state we have said out loud). A turn that never learns anything sends no
+    # compile frame at all, and the pane keeps whatever it was showing.
+    compile_state: CompileState | None = None
+    # The supervisor connect the protocol-drift alarm has already fired for. The canary is a
+    # per-connect fact, so keyed on the generation the alarm is raised once per connect
+    # instead of once per second for the life of a drifted container.
+    compile_drift_generation: int | None = None
     # Claim-once for the preview frame, shared by the watcher and the between-verify
     # fallback: whichever sees the dev server first emits, the other stays quiet.
     preview_framed: bool = False
@@ -1153,6 +1166,20 @@ class TurnEngine:
             # and a second feed would draw every step twice.
             emitter=None,
         )
+        # U13 — FENCE OFF ANY BROWSER CRASH REPORT THAT PREDATES THIS TURN. A report describes
+        # the tree the browser was rendering when it crashed, and this turn is about to change
+        # that tree; draining it at the end would fail a verify on a fault the agent may have
+        # just fixed. The gap between turns is not even a quiet one: the pane reloads its frame
+        # at every terminal, so it actively manufactures reports about the OLD tree. Discarded
+        # once, here, where "the agent has not started yet" is still true.
+        discarded = discard_client_errors(session.handle.app_name)
+        if discarded:
+            _log.info(
+                "client_error_reports_fenced",
+                conversation_id=str(state.conversation_id),
+                app_name=session.handle.app_name,
+                discarded=discarded,
+            )
         state.workspace_state = "ready"
         self._emit(state, lambda seq: WorkspaceFrame(seq=seq, state="ready"))
         # BOOT THE DEV SERVER THE MOMENT WE HOLD THE CONTAINER, not after the whole model run
@@ -1346,16 +1373,34 @@ class TurnEngine:
                         "it will try again.",
                     )
                 if error is not None:
-                    source, title, stack = error.source, error.title, error.cleaned_stack
-                    self._emit(
-                        state,
-                        lambda seq: DiagnosticFrame(
-                            seq=seq,
-                            source=source,
-                            title=title,
-                            cleaned_stack=stack,
-                        ),
-                    )
+                    # U13 / R17 — A CLIENT-CLASS REPORT IS AGENT INPUT, NOT NARRATIVE. The whole
+                    # user-visible consequence of a browser-side crash is that the completion
+                    # claim does not appear; the report itself was written by code inside the
+                    # generated app, and this plan removes developer surfaces rather than adding
+                    # one. It still repairs — `build_repair_prompt` below is reached exactly as
+                    # for any other source — it just does not narrate.
+                    #
+                    # THE TRAP, and it is why this guard is here and not in `verify`: making
+                    # `verify` return `green=False, error=None` for this class would look like
+                    # the tidier fix and is strictly worse. Ten lines up, a red outcome with no
+                    # error synthesizes `dev_not_ready_error()` — so the user would get a SERVER
+                    # diagnostic that is both rendered AND wrong, and the model would be handed
+                    # the same misdiagnosis to chase. The verdict has to carry the real error;
+                    # only the RENDER is skipped.
+                    #
+                    # A later plan brings this class into a split-audience rendering with copy of
+                    # its own. Until then, silence is the honest surface.
+                    if error.source is not ErrorSource.CLIENT:
+                        source, title, stack = error.source, error.title, error.cleaned_stack
+                        self._emit(
+                            state,
+                            lambda seq: DiagnosticFrame(
+                                seq=seq,
+                                source=source,
+                                title=title,
+                                cleaned_stack=stack,
+                            ),
+                        )
                     turn_prompt = build_repair_prompt(error)
                 else:
                     # Green, but the model never said it was done — a nudge, not an error.
@@ -1366,6 +1411,9 @@ class TurnEngine:
             # frame that lands after `turn_ended` arrives after the transport has already
             # sent `[DONE]`, so it is not late — it is lost.
             await self._stop_preview_watcher(state)
+            # …and only then settle a compile state left mid-build, for the same reason in
+            # reverse: after the watcher is down, nothing else will ever report on this app.
+            await self._settle_compile_state(state)
 
     async def _run_write_once(
         self,
@@ -1645,6 +1693,38 @@ class TurnEngine:
                 lambda seq: PreviewFrame(seq=seq, state="ready", preview_url=preview_url),
             )
 
+    async def _poll_compile_state(self, state: _TurnState, sandbox: SandboxSession) -> None:
+        """Ask the container what it is compiling and publish it — the signal the preview pane
+        covers its frame with (R17/R18).
+
+        RIDES THE PREVIEW WATCHER rather than owning a loop. The watcher already polls once a
+        second for the whole turn, which is the cadence "appears and clears within seconds"
+        needs; a second task would double the timers, the cancellation paths and the ways a
+        frame can land after the terminal, and buy nothing.
+
+        EMITTED ON CHANGE. The ring is sized for narrative, and one frame per poll would be
+        several hundred per build — the compile state is a level, not an event.
+
+        `compile_state` NEVER RAISES (see the client), so there is nothing to catch here. That
+        is deliberate: an exception on this path would kill the watcher that also owns crash
+        detection, trading a covered preview for an undetected dead dev server."""
+        report = await sandbox.sandbox_client.compile_state(sandbox.handle)
+        if report.protocol_drifted and state.compile_drift_generation != report.connect_generation:
+            # Once per SUCCESSFUL connect. The alarm says the frame vocabulary moved upstream,
+            # which no amount of retrying fixes and which nothing else in the system can see:
+            # defensive parsing means a renamed protocol looks exactly like a quiet one.
+            state.compile_drift_generation = report.connect_generation
+            _log.warning(
+                HMR_PROTOCOL_DRIFT_EVENT,
+                app_name=sandbox.handle.app_name,
+                connect_generation=report.connect_generation,
+                reason=report.reason,
+            )
+        if report.state is state.compile_state:
+            return
+        state.compile_state = report.state
+        self._emit(state, lambda seq: CompileFrame(seq=seq, state=report.state))
+
     async def _watch_preview(self, state: _TurnState) -> None:
         """Poll the dev server so the preview appears the moment it is servable, and so a
         crash is REPORTED rather than left as a blank iframe.
@@ -1672,6 +1752,7 @@ class TurnEngine:
                 # unretrieved exception at teardown.
                 await asyncio.sleep(READINESS_POLL_S)
                 continue
+            await self._poll_compile_state(state, sandbox)
             if status.ready:
                 unanswered_polls = 0
                 if state.claim_preview_frame() or reconnecting:
@@ -1695,6 +1776,23 @@ class TurnEngine:
                     state.preview_state = "reconnecting"
                     self._emit(state, lambda seq: PreviewFrame(seq=seq, state="reconnecting"))
             await asyncio.sleep(READINESS_POLL_S)
+
+    async def _settle_compile_state(self, state: _TurnState) -> None:
+        """One last compile poll when the turn ends mid-build, so the pane is not left holding a
+        cover nothing will ever lower.
+
+        `building` cannot outlive the turn that caused it, but the watcher that reports it is
+        cancelled at the terminal — so a turn that ends in the second between "compiling" and
+        "compiled" strands the preview under "Putting the latest change together…" with no
+        remaining producer. One poll usually settles it to `clean` or `failed`, either of which
+        resolves the pane correctly.
+
+        ONLY on `building`, so the common path pays nothing. If it is STILL building afterwards
+        the cover stays up, which is at least honest — and the next turn resolves it."""
+        sandbox = state.sandbox
+        if sandbox is None or state.compile_state is not CompileState.BUILDING:
+            return
+        await self._poll_compile_state(state, sandbox)
 
     async def _stop_preview_watcher(self, state: _TurnState) -> None:
         task = state.preview_task
@@ -2021,6 +2119,7 @@ class TurnEngine:
             workspace_state=state.workspace_state,
             preview_url=state.preview_url,
             preview_state=state.preview_state,
+            compile_state=state.compile_state,
         )
 
 

@@ -11,6 +11,8 @@
  */
 
 import { authFetch } from './api'
+import { asCompileState } from './compileState'
+import type { CompileState } from './compileState'
 import { readApiError } from './apiError'
 
 // ---------------------------------------------------------------------------------------
@@ -67,6 +69,10 @@ export interface SnapshotFrame {
   workspaceState?: 'preparing' | 'ready' | 'unavailable' | null
   previewUrl?: string | null
   previewState?: 'ready' | 'reconnecting' | null
+  /** R17/R18. Compile frames are emitted ON CHANGE, so a tab that reloads while the app is
+   *  sitting broken would learn nothing until the next change — and would show an uncovered
+   *  error screen until then. This is what makes a refresh mid-build land covered. */
+  compileState?: CompileState | null
 }
 
 export interface TextDeltaFrame {
@@ -147,6 +153,17 @@ export interface QuotaFrame {
   resetsAt: string
 }
 
+/** What the app's dev server is compiling right now (R17/R18) — the preview pane covers its
+ *  frame while this is `building` or `failed`, and uncovers on `clean`. Emitted ON CHANGE, not
+ *  per poll. `unknown` is a real value the pane must HOLD its current cover on: it means the
+ *  platform could not tell, which after a container image predating the signal is the normal
+ *  reading for the whole existing fleet. */
+export interface CompileFrame {
+  type: 'compile'
+  seq: number
+  state: CompileState
+}
+
 export interface UnknownFrame {
   type: string
   seq: number
@@ -164,6 +181,7 @@ export type KnownTurnFrame =
   | PreviewFrame
   | DiagnosticFrame
   | QuotaFrame
+  | CompileFrame
 
 export type TurnFrame = KnownTurnFrame | UnknownFrame
 
@@ -181,6 +199,7 @@ const KNOWN_FRAME_TYPES = new Set([
   'preview',
   'diagnostic',
   'quota',
+  'compile',
 ])
 
 export function isKnownFrame(frame: TurnFrame): frame is KnownTurnFrame {
@@ -331,6 +350,9 @@ function toTurnFrame(parsed: unknown): TurnFrame | null {
         workspaceState: asWorkspaceState(parsed.workspaceState),
         previewUrl: typeof parsed.previewUrl === 'string' ? parsed.previewUrl : null,
         previewState: asPreviewState(parsed.previewState),
+        // `null` when the server said nothing, `'unknown'` when it said it could not tell.
+        // Both HOLD the pane's cover; only a stated value moves it.
+        compileState: parsed.compileState == null ? null : asCompileState(parsed.compileState),
       }
     }
     case 'text_delta':
@@ -415,6 +437,11 @@ function toTurnFrame(parsed: unknown): TurnFrame | null {
         used: typeof parsed.used === 'number' ? parsed.used : 0,
         resetsAt: asString(parsed.resetsAt),
       }
+    case 'compile':
+      // A state string this client does not recognise narrows to `unknown`, which HOLDS the
+      // cover. The container and this bundle ship separately and can be a release apart in
+      // either direction, so an unheard-of value is a real state — never a reason to uncover.
+      return { type: 'compile', seq, state: asCompileState(parsed.state) }
     default:
       return { ...parsed, type: parsed.type, seq }
   }

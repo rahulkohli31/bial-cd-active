@@ -56,11 +56,20 @@ that used to be typed out here is imported, so the two cannot drift while both e
 
 def build_repair_prompt(error: BuildError) -> str:
     """Frame a redacted `BuildError` as the next run's user prompt (KD-1 / KD-5). The
-    `cleaned_stack` is already de-noised + secret-redacted by `errors.declutter`."""
+    `cleaned_stack` is already de-noised + secret-redacted by `errors.declutter`.
+
+    THE ONE PLACE `agent_only_detail` IS READ (U13). A `client`-class report is text the generated
+    app wrote, so it is deliberately absent from the two fields that egress to the portal and
+    carried instead on a field that never serializes — which means the model's copy of the
+    diagnostic can only be assembled here, in-process. It arrives pre-wrapped in the data-only
+    frame `errors.from_client` builds; do not unwrap it, and do not "simplify" this back to a bare
+    `cleaned_stack` read, which would silently send the model an empty diagnostic for the entire
+    runtime-crash class."""
+    detail = error.agent_only_detail or error.cleaned_stack
     return (
         f"The build is not green yet — a `{error.source.value}` check failed:\n\n"
         f"{error.title}\n\n"
-        f"{error.cleaned_stack}\n\n"
+        f"{detail}\n\n"
         "Fix the root cause in your code, then call `declare_done` again. You may use "
         "`run_command` to investigate (re-run a check, inspect a file, reinstall a dependency)."
     )

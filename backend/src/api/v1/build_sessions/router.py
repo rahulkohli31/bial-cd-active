@@ -5,6 +5,12 @@ owner-scoped by `user.id` (ADR-0004): every not-found-or-other-user case is a no
 404 EXCEPT the one owner-asserted 403 on `force-end` (C3). The mutating POSTs carry the
 reusable `RequireCsrf` dependency (KTD-4); the `status` GET and the GET-SSE progress feed
 (`sse.py`, `Last-Event-ID`-resumable) are exempt.
+
+U13 adds one inbound route that is not a control op at all — `projects/{project_id}/client-error`,
+where the app's own in-browser error reporter's findings arrive by way of the portal. It follows
+the same pattern as everything else here (CSRF, `CurrentUser`, owned-or-404), and the reason it
+lives in THIS router rather than under `apps/` is that its only consumer is the build harness's
+health verdict.
 """
 
 from __future__ import annotations
@@ -12,6 +18,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
+import sqlalchemy as sa
 from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -29,6 +36,9 @@ from src.api.v1.build_sessions.schemas import (
     LOCK_TTL_SECONDS,
     BuildSessionStatus,
     BuildSessionStatusResponse,
+    ClientErrorReportRequest,
+    ClientErrorReportResponse,
+    CompileStateResponse,
     ForceEndResponse,
     HeartbeatResponse,
     LockReleaseResponse,
@@ -44,6 +54,7 @@ from src.api.v1.build_sessions.schemas import (
 from src.api.v1.build_sessions.sse import build_sse_response
 from src.api.v1.live_build import ReclaimBlockedError, reclaim_blocked_response
 from src.core.errors import AppApiError
+from src.db.models.app_registry import AppRegistry
 from src.schemas import AUTH_401, CamelModel, ErrorEnvelope, error_responses
 from src.services.audit.log import append_audit
 from src.services.build_sessions import (
@@ -56,11 +67,15 @@ from src.services.build_sessions import (
     SandboxReclaimBlockedError,
     SessionManager,
     SnapshotUnavailableError,
+    app_name_for,
     lock_expires_at,
     release_lock_as_holder,
     renew_lock,
     sweep_all,
     write_heartbeat,
+)
+from src.services.orchestrator.client_errors import (
+    park_client_error,
 )
 from src.services.projects.resolve import owned_project_or_404
 from src.services.redis import (
@@ -69,6 +84,7 @@ from src.services.redis import (
     get_redis,
 )
 from src.services.sandbox import SandboxError
+from src.services.sandbox.base import CompileState
 
 router = APIRouter(prefix="/build-sessions", tags=["build_sessions"])
 
@@ -887,6 +903,44 @@ async def preview_state(
 
 
 @router.get(
+    "/projects/{project_id}/compile-state",
+    response_model=CompileStateResponse,
+    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Project not found")),
+)
+async def compile_state(
+    project_id: uuid.UUID,
+    user: CurrentUser,
+    db: DbSession,
+    manager: SessionManagerDep,
+    sandbox: OptionalSandbox,
+) -> CompileStateResponse:
+    """Is the app compiling, compiled, or broken — asked by a tab with NO LIVE TURN (R17/R18).
+
+    THE RELOAD HOLE THIS CLOSES. The compile signal reaches the portal as a frame on the turn
+    stream, so its producer stops the moment the turn does. Reload the page after a turn that
+    ended red and the pane comes up with no signal at all: it initialises uncovered, and the
+    citizen is shown the framework's full-screen error screen underneath a live-preview label.
+    That is the exact failure the cover exists to prevent, reachable by pressing F5.
+
+    DELIBERATELY NOT FOLDED INTO `preview-state`, whose cost budget is frozen in C3 §8.3 at NO
+    container call of any kind — it is a browser tab on a 45-second timer and that ceiling is
+    the contract. This is its own route, and the client only calls it when it is already framing
+    a preview and no turn is running, so the two never both fire on a dark pane.
+
+    CHEAP BY CONSTRUCTION on the answer side: `/dev/compile` reads an in-memory value in the
+    container and never touches the dev server. The expensive part is the attach, which is why
+    the no-live-container case short-circuits before it.
+
+    `unknown` for everything unanswerable, and the caller HOLDS its cover on it. Absent must
+    never read as clean — that is the whole contract of this signal."""
+    await owned_project_or_404(db, user.id, project_id)
+    if sandbox is None:
+        return CompileStateResponse(state=CompileState.UNKNOWN)
+    state = await manager.project_compile_state(db, user, project_id, sandbox_client=sandbox)
+    return CompileStateResponse(state=state)
+
+
+@router.get(
     "/projects/{project_id}/save-state",
     response_model=SaveStateResponse,
     responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Project not found")),
@@ -912,3 +966,84 @@ async def save_state(
         saved_head=state.saved_head,
         recovery_at=state.recovery_at,
     )
+
+
+# --- the app's own client-error report (U13, R17 runtime half) ----------------
+
+
+@router.post(
+    "/projects/{project_id}/client-error",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=ClientErrorReportResponse,
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        (403, ErrorEnvelope, "CSRF check failed"),
+        AUTH_401,
+        (404, ErrorEnvelope, "Project not found"),
+    ),
+)
+async def report_client_error(
+    project_id: uuid.UUID,
+    body: ClientErrorReportRequest,
+    user: CurrentUser,
+    db: DbSession,
+) -> ClientErrorReportResponse:
+    """The app crashed in the browser; the platform is being told (R17 runtime half, AE11).
+
+    THE MISSING WITNESS. Every health signal the harness has runs against the SERVER — the
+    type-check, the dev-server log tail, `/dev/status`, the root-route warm — and a Next app can
+    satisfy all four and still throw before it paints anything. The only observer of that failure
+    is the browser, and the generated app has been relaying its own `window.onerror` /
+    `unhandledrejection` / `console.*` captures to the framing portal since Stage 0 with nothing
+    on the receiving end (`sandbox/template/components/bial/error-capture.tsx` says so in its own
+    header). This route is the receiving end: the portal validates the frame's origin and forwards
+    what it caught, and the report is parked for the next `selfheal.verify` to collect, where it
+    makes the verdict not-green. That is the whole user-visible consequence — the completion claim
+    does not appear — because the report's own text goes to the AGENT and to nobody else.
+
+    202, not 200: nothing has happened yet when this returns. The report is parked, and whether it
+    changes anything depends on a verify that has not run.
+
+    `recorded: false` is still a 202. The one thing that can be refused here is a report the store
+    had no room for, and that is not a client error to raise — it is a fact about volume the
+    caller deserves to be told (see `ClientErrorReportResponse`).
+
+    OWNED-OR-404 on the app, like every other route in this file: a cross-user app id and a
+    missing one are the same non-leaking answer (ADR-0004). Not 403 — telling a caller "that app
+    exists but is not yours" is exactly the probe the 404 exists to refuse, and there is no
+    force-end-style owner assertion here to make an exception for.
+
+    NO SESSION, NO REDIS, NO SANDBOX. Deliberately PROJECT-scoped rather than session-scoped: the
+    crash arrives from a framed preview, and a preview outlives its build session by design
+    (relaunch registers none at all). A route that needed a live session would be unable to
+    receive a report about an app the user is simply looking at, which is most of them. Project
+    rather than app because a project has exactly one app (KTD-6) and the project is what the
+    caller holds — the framing pane is addressed by project everywhere else in the portal, and an
+    ingest that needed an app id would have to buy one with an extra round trip per crash.
+
+    READ-ONLY on the way to the app. `resolve_app_for_project` is the usual accessor and it is
+    the wrong one here: it UPSERTS, so a stray report against a project nobody has ever built
+    would MINT an app row. An app that does not exist is a 404 — there is no build for a browser
+    crash to be about."""
+    await owned_project_or_404(db, user.id, project_id)
+    # Owner AND project in the predicate, not just project: the scope is the isolation boundary,
+    # not a nicety (ADR-0004). `owned_project_or_404` above already refused another user's
+    # project, and the second predicate is what keeps that true if this query is ever moved.
+    app_id = (
+        await db.execute(
+            sa.select(AppRegistry.id).where(
+                AppRegistry.project_id == project_id, AppRegistry.user_id == user.id
+            )
+        )
+    ).scalar_one_or_none()
+    if app_id is None:
+        # Same non-leaking answer as an unowned project: "nothing here to report against".
+        raise AppApiError(status.HTTP_404_NOT_FOUND, "Project not found.")
+    # `app_name_for` is the same forward mapping the sandbox is NAMED by, so the key written here
+    # is exactly the `SandboxHandle.app_name` the verify reads back. It is deliberately not
+    # reversed anywhere — the mapping is lossy (28 of 32 hex chars) and only ever computed
+    # forwards, which is the property `inventory.py` relies on for the same reason.
+    recorded = park_client_error(
+        app_name_for(app_id), source=body.source, title=body.title, stack=body.stack
+    )
+    return ClientErrorReportResponse(recorded=recorded)
