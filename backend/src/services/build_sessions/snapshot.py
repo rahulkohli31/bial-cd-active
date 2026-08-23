@@ -220,6 +220,30 @@ async def write_snapshot(
         return tree.head_sha
 
 
+# HOW MANY TIMES IN A ROW THIS APP'S RECOVERY WRITE HAS BEEN REFUSED.
+#
+# U2 reads it to bound the refusal loop, and the reason is a shape the 2026-08-18 Summary
+# describes: once the recovery slot has been overwritten with a bad tree, `recoverable_work` ranks
+# the two bundles by `last_modified`, not by ancestry — so a poisoned-but-newer recovery copy
+# outranks a perfectly good saved one, and every restore afterwards hands back the poison. Two
+# consecutive refusals for one app is the signal that the slot itself is the problem rather than
+# this turn, and U2 restores from the SAVED bundle instead.
+#
+# Process-local like the snapshot locks, and self-pruning: any outcome that is not a refusal drops
+# the entry.
+_consecutive_diverts: dict[uuid.UUID, int] = {}
+
+
+def consecutive_diverts(app_id: uuid.UUID) -> int:
+    """How many turns in a row have failed to promote a tree into this app's recovery slot."""
+    return _consecutive_diverts.get(app_id, 0)
+
+
+def reset_divert_streaks_for_tests() -> None:
+    """Drop the per-app refusal counters. Process-local state, so a streak must not leak."""
+    _consecutive_diverts.clear()
+
+
 async def write_recovery_copy(
     sandbox_client: SandboxClient,
     handle: SandboxHandle,
@@ -258,6 +282,7 @@ async def write_recovery_copy(
             # No copy yet, or one written before the head stamp existed. There is nothing to
             # overwrite and nothing to compare against, so the first write simply proceeds.
             await _store_it(store, recovery_key(app_id), tree)
+            _consecutive_diverts.pop(app_id, None)
             return RecoveryWrite(
                 RecoveryOutcome.WRITTEN, "no previous copy to protect", bundled_head=tree.head_sha
             )
@@ -265,6 +290,7 @@ async def write_recovery_copy(
         if tree.head_sha == recorded:
             # The commit step found nothing to commit AND the tree is where the copy already is.
             # Normal, and it must NOT alarm: this is every read-only turn.
+            _consecutive_diverts.pop(app_id, None)
             return RecoveryWrite(
                 RecoveryOutcome.SKIPPED,
                 "the tree has not moved since the last copy",
@@ -275,6 +301,7 @@ async def write_recovery_copy(
         ancestry = await _where_head_sits_relative_to(sandbox_client, handle, recorded)
         if ancestry is Ancestry.DESCENDANT:
             await _store_it(store, recovery_key(app_id), tree)
+            _consecutive_diverts.pop(app_id, None)
             return RecoveryWrite(
                 RecoveryOutcome.WRITTEN,
                 "this turn built on the copy it is replacing",
@@ -288,6 +315,7 @@ async def write_recovery_copy(
         # than dropped: in a false refusal they are the newest copy of somebody's afternoon.
         where = divert_key(app_id, taken_at)
         await _store_it(store, where, tree)
+        _consecutive_diverts[app_id] = _consecutive_diverts.get(app_id, 0) + 1
         _log.error(
             RECOVERY_WRITE_DID_NOT_LAND_EVENT,
             app_id=str(app_id),

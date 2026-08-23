@@ -324,11 +324,16 @@ async def test_a_brand_new_project_offers_a_save_rather_than_reading_unknown(
     builds their first app and has no way to keep it."""
     user, project_id = await _mk(db_session, "w6f@rvaiglobal.com")
     manager = SessionManager()
-    client = FakeSandboxClient()  # default exec: exit 0, empty stdout -> no head, clean tree
+    client = FakeSandboxClient()
     session = await manager.ensure_sandbox(
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
     client.attach_handle = session.handle
+    # SAID EXPLICITLY, because the fake's default is now a container that HOLDS work (U2). It has
+    # to be: read as "no head at exit 0", the old empty default made every turn test with a
+    # recovery bundle exercise the confirmed-reversion branch while asserting something else.
+    # A test that means "this container has no repository" says so.
+    client.exec_handler = lambda cmd: ExecResult(stdout="", stderr="", exit=0)
 
     state = await manager.project_save_state(db_session, user, project_id, sandbox_client=client)
 

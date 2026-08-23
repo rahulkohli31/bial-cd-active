@@ -183,6 +183,16 @@ class WorkspaceFrame(CamelModel):
     seq: int
     state: Literal["preparing", "ready", "unavailable"]
     message: str | None = None
+    # U2 — SOMETHING THE PLATFORM NEEDS THE CITIZEN TO SEE, as distinct from `message`, which
+    # narrates the phase this frame announces ("Getting your workspace ready…").
+    #
+    # The two are different kinds of speech and they belong in different places on screen, which
+    # is why they are different fields rather than one. `message` describes what is happening
+    # right now and is correctly replaced by whatever happens next. A notice is a statement about
+    # the APP — it was reset and is being put back, it was reset and cannot be, we could not check
+    # it — and it stays true after the phase that carried it has passed. Sharing one field made
+    # every ordinary turn post its phase narration into the banner slot above the composer.
+    notice: str | None = None
 
 
 class PreviewFrame(CamelModel):

@@ -379,6 +379,17 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // `turnError` covers the chat half (429 daily cap, refused turn, in-band failure);
   // `session.error` covers the build half. Distinct sources, both above the composer.
   const [turnError, setTurnError] = useState<string | null>(null)
+  // U2 — what the PLATFORM has to say about the workspace itself: it was reset and is being put
+  // back, it was reset and cannot be, we could not check it. These arrive as `workspace` frames
+  // carrying a message, and they share the banner slot with `turnError` because they compete for
+  // the same moment and the same square inch — see `TurnBanner` for why the slot holds one.
+  //
+  // IT WINS OVER `turnError` WHILE IT IS SET, rather than the two racing through one setter.
+  // `setTurnError` has fifteen call sites and mirroring each one is fifteen chances to miss;
+  // precedence is one expression at the render site. And precedence is the right answer on the
+  // merits: a workspace sentence ENDS the turn, so nothing that follows it in the same turn can
+  // be more current, and both are cleared together when the next turn starts.
+  const [workspaceSays, setWorkspaceSays] = useState<string | null>(null)
 
   // ── The Write turn's narrative, straight off the turn stream (U5) ─────────────────────
   // A build used to speak through the C7 session feed; it is a turn now, so these four
@@ -525,6 +536,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const resetTurnNarrative = useCallback(() => {
     turnNarrativeChatRef.current = buildIdRef.current
     setTurnSteps({})
+    setWorkspaceSays(null)
     setTurnDiagnostics([])
     setTurnQuota(null)
     setTurnWorkspace(null)
@@ -751,6 +763,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     setPlanOverrides({})
     setPlanErrors({})
     setTurnError(null)
+    setWorkspaceSays(null)
 
     getBuild(buildId)
       .then((saved) => {
@@ -1018,6 +1031,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         setLivePlanOptions(frame.item)
       } else if (frame.type === 'error') {
         setTurnError(frame.message)
+        setWorkspaceSays(frame.message)
       } else if (frame.type === 'step') {
         // U5: the arm this handler used to DROP entirely. A Write turn's whole narrative —
         // every file written, every command run — arrives as step frames, so without this a
@@ -1025,6 +1039,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         setTurnSteps((prev) => ({ ...prev, [frame.toolCallId]: frame.item }))
       } else if (frame.type === 'workspace') {
         setTurnWorkspace({ state: frame.state, message: frame.message ?? null })
+        // U2 — `notice`, never `message`. The ordinary lifecycle pair carries a `message`
+        // ("Getting your workspace ready…") on EVERY turn, and routing that here would post the
+        // phase narration above the composer every time anyone sent anything. A notice is a
+        // statement about the app; only the integrity gate sends one.
+        if (frame.notice) setWorkspaceSays(frame.notice)
       } else if (frame.type === 'preview') {
         // Keyed on the url: a NEW url remounts the iframe, which is how a restored sandbox
         // gets reloaded rather than left showing a dead frame.
@@ -2034,6 +2053,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // conditions SessionBanners/turnError already render on below, so the dot lights up exactly
   // when there'd be something to see if the panel were open.
   const chatNeedsAttention = Boolean(
+    workspaceSays ||
     turnError ||
     (sessionProjectMatches && session.error) ||
     (sessionProjectMatches && session.blocked) ||
@@ -2224,7 +2244,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
               onReconnect={() => session.reconnect()}
               onStartAgain={handleStartAgain}
             />
-            <TurnBanner text={turnError} />
+            <TurnBanner text={workspaceSays ?? turnError} />
             {sessionProjectMatches && session.error && (
               <div
                 aria-live="assertive"

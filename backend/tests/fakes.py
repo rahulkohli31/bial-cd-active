@@ -70,6 +70,20 @@ _BASELINE_STDOUT = (
 )
 
 
+_STATE_MARKER = "git rev-list --count HEAD"
+
+#: The default answer to U1's workspace-state probe: a container holding real work, at the very
+#: sha the default bundle carries, whose HEAD is a descendant of whatever it was asked about.
+#:
+#: THE DEFAULT MATTERS MORE THAN IT LOOKS, and the version that was not here is the reason this
+#: constant is. `exec` used to answer every unrecognised command with `ExecResult(stdout="")`,
+#: which `parse_state` reads as `head=None` at exit 0 — and under U1 a repo-less container with a
+#: recovery bundle present is a CONFIRMED REVERSION. So every existing turn test that happened to
+#: seed a bundle would have exercised the quarantine-and-restore branch, silently, while asserting
+#: something else entirely. A fake's default has to be the ordinary case, not the empty one.
+_STATE_STDOUT = f"{'a' * 40}@@@@4"
+
+
 def a_git_bundle(sha: str = "a" * 40) -> bytes:
     """Bytes that survive `parse_bundle_head_sha`.
 
@@ -348,6 +362,14 @@ class FakeSandboxClient(SandboxClient):
             # slow, and asserting something other than what it says. A test that wants the app to
             # still be the starter page says so by overriding `exec_handler`.
             return ExecResult(stdout=_BASELINE_STDOUT, stderr="", exit=0)
+        if len(cmd) == 3 and cmd[0] == "sh" and _STATE_MARKER in cmd[2]:
+            # U1's workspace-state probe. The ancestry field answers only when the probe ASKED —
+            # `0 0`, "the reference is in this repository and HEAD is below it", which is the
+            # shape of a container that moved forward normally. Answering unconditionally would
+            # be worse than useless: `Ancestry.NOT_ASKED` exists precisely to keep an unasked
+            # question distinguishable from a judgement.
+            answered = "0 0" if "merge-base" in cmd[2] else ""
+            return ExecResult(stdout=f"{_STATE_STDOUT}@@{answered}", stderr="", exit=0)
         if cmd[:1] == ["base64"]:
             # `write_snapshot` reads its bundle back through `base64 <file>` and now validates
             # the bytes before uploading them, so an empty default stdout would decode to b""

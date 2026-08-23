@@ -109,7 +109,7 @@ export const BUILD_TURN_ID = 'bt-1'
 
 /** The sandbox lifecycle. `narrativeStatus` returns null until one of these lands, so a build
  *  test that omits it renders no bubble at all — the workspace frame IS the build's beginning. */
-export const T_WORKSPACE = (state = 'ready', seq = 1, message = null) => ({ type: 'workspace', seq, state, message })
+export const T_WORKSPACE = (state = 'ready', seq = 1, message = null, notice = null) => ({ type: 'workspace', seq, state, message, notice })
 
 /** One tool call. `pending` is the in-flight state on the wire; the same `toolCallId` arriving a
  *  second time REPLACES the first, which is how a spinner becomes its own result. */

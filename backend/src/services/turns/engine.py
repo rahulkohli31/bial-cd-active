@@ -104,9 +104,11 @@ from src.services.build_sessions.locks import release_liveness_lease, renew_live
 from src.services.build_sessions.manager import (
     BuildSession,
     BuildSessionConflictError,
+    RecoveryNews,
     SandboxReclaimBlockedError,
     SessionManager,
     SnapshotUnavailableError,
+    WorkspaceUnreadableError,
 )
 from src.services.build_sessions.outcome import STOPPED_BY_USER
 from src.services.messages.projection import (
@@ -147,11 +149,15 @@ from src.services.sandbox import SandboxClient, SandboxError
 from src.services.sandbox.base import CompileState
 from src.services.storage.snapshot_read import NoAppYet, extract_snapshot
 from src.services.turns.copy import (
+    COULD_NOT_CHECK_TEXT,
     COULD_NOT_CONFIRM_TEXT,
     DID_NOT_COME_TOGETHER_TEXT,
+    NOT_RECOVERED_TEXT,
+    RECOVERED_TEXT,
     STILL_SHOWING_EARLIER,
     STILL_SHOWING_NOTHING,
     STILL_SHOWING_TEMPLATE,
+    UNVERIFIED_TEXT,
 )
 from src.services.turns.guard import claim_conversation, release_conversation
 from src.services.turns.plan_options import META_PENDING
@@ -528,6 +534,10 @@ class _TurnState:
     # check: a brand-new project is SUPPOSED to be showing the starter template, and checking it
     # would manufacture an accusation rather than catch one.
     had_prior_building_turns: bool = False
+    # U2 — `UNVERIFIED_TEXT` describes the state of the app, not an event, so it is said once
+    # and then not again. Repeating it would train the reader to skip the one sentence most
+    # likely to matter.
+    said_it_could_not_check: bool = False
     # WRITE only, and the whole difference between the two zero-mutation endings. A Write
     # turn the citizen typed into may legitimately touch nothing (they asked a question);
     # a turn started from a Build-it click was ASKED to build, so touching nothing is a
@@ -1155,6 +1165,30 @@ class TurnEngine:
 
     # -- the WRITE run -------------------------------------------------------------------
 
+    async def _say_what_the_workspace_did(self, state: _TurnState, news: RecoveryNews) -> None:
+        """Turn the integrity gate's finding into the one sentence the citizen reads (U2).
+
+        THE MANAGER KNOWS WHAT HAPPENED; THIS KNOWS HOW TO SAY IT. The gate cannot import these
+        strings — `services.turns` reaches `build_sessions`, so an import back would close the
+        cycle — and it should not want to: which words a citizen sees is a product decision that
+        belongs beside the rest of them.
+
+        `UNVERIFIED` IS SAID ONCE PER TURN AND THEN NOT AGAIN. It describes the state of the app
+        rather than an event, so repeating it would train the reader to skip the one sentence
+        most likely to matter."""
+        if news is RecoveryNews.UNVERIFIED:
+            if state.said_it_could_not_check:
+                return
+            state.said_it_could_not_check = True
+        message = {
+            RecoveryNews.RESTORING: RECOVERED_TEXT,
+            RecoveryNews.UNRECOVERABLE: NOT_RECOVERED_TEXT,
+            RecoveryNews.UNVERIFIED: UNVERIFIED_TEXT,
+        }[news]
+        # A NOTICE, NOT A MESSAGE. `message` narrates the phase and is replaced by the next
+        # one; this is a statement about the app that has to survive the phase passing.
+        self._emit(state, lambda seq: WorkspaceFrame(seq=seq, state="preparing", notice=message))
+
     async def _attach_sandbox(
         self,
         state: _TurnState,
@@ -1207,7 +1241,27 @@ class TurnEngine:
                     # container identically — and reading it as "always writing" made a read-
                     # only question refuse the Save button and claim the app was being built.
                     may_write=state.mode is ConversationMode.WRITE,
+                    # U2 — THE SENTENCE HAS TO ARRIVE BEFORE THE SLOW WORK, not after it. The
+                    # recovery path adds tens of seconds of otherwise-silent latency, and the
+                    # gate calls this the moment it knows, from inside the attach.
+                    announce=partial(self._say_what_the_workspace_did, state),
                 )
+        except WorkspaceUnreadableError as exc:
+            # RETRYABLE, and deliberately not a verdict about the app. The container is still
+            # running and still attached, so the retry has something to attach to.
+            _log.warning(
+                "workspace_integrity_unreadable",
+                conversation_id=str(state.conversation_id),
+                app_id=str(exc.app_id),
+            )
+            state.workspace_state = "unavailable"
+            self._emit(
+                state,
+                lambda seq: WorkspaceFrame(
+                    seq=seq, state="unavailable", notice=COULD_NOT_CHECK_TEXT
+                ),
+            )
+            raise _WriteEndedError("workspace_unreadable", COULD_NOT_CHECK_TEXT) from exc
         except _WriteEndedError:
             raise
         except Exception as exc:
@@ -1222,6 +1276,18 @@ class TurnEngine:
                 state, lambda seq: WorkspaceFrame(seq=seq, state="unavailable", message=message)
             )
             raise _WriteEndedError("sandbox_unavailable", message) from exc
+
+        if session.news is RecoveryNews.UNRECOVERABLE:
+            # AE3. Nothing was put back, and the container is showing a template. The one thing
+            # that must not happen is the agent building on it and the turn-end copy making that
+            # permanent, so the turn ends here.
+            raise _WriteEndedError("workspace_unrecoverable", NOT_RECOVERED_TEXT)
+        if session.restored:
+            # THE HELD MESSAGE (R5). The instruction was written against a workspace that no
+            # longer exists; running it now would execute an instruction whose premise was true
+            # when it was typed and false when it ran. The citizen re-sends when they have looked
+            # at what came back.
+            raise _WriteEndedError("workspace_restored", RECOVERED_TEXT)
 
         state.write_session = session
         state.sandbox = SandboxSession(

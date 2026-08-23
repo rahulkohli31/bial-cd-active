@@ -606,8 +606,22 @@ class IntegrityVerdict:
 
     state: WorkspaceState
     reason: str
-    #: The tree holds nothing beyond the seeded baseline (modulo framework churn).
+    #: The tree holds nothing beyond the seeded baseline — OR there is no repository at all, in
+    #: which case nothing can be read from it. This is the REVERTED predicate; it is NOT the
+    #: question "is there anything here worth keeping", which is `provably_bare` below.
     content_empty: bool = False
+    #: We can SEE the tree and it is the starter template: one commit, clean modulo framework
+    #: churn. Positive knowledge, and the distinction from `content_empty` is load-bearing.
+    #:
+    #: A container with no `.git` at all reports an empty porcelain, so it satisfies
+    #: `content_empty` whether its working directory holds the bare template or somebody's
+    #: finished app with the repository deleted out from under it. Gating U2's quarantine write
+    #: on `content_empty` — which is what the plan specified — would therefore do two bad things
+    #: at once: skip the write on EVERY reversion (since `REVERTED` requires `content_empty` by
+    #: construction, so the write would be unreachable code), and skip it precisely in the case
+    #: where the working tree is the only surviving copy of the user's app. Quarantine unless we
+    #: positively know there is nothing to quarantine.
+    provably_bare: bool = False
     #: The container's HEAD at the moment of the verdict, for the alarm payload.
     head: str | None = None
     #: The bundle this verdict compared against — the one a restore would hand back.
@@ -682,6 +696,7 @@ def judge_workspace(container: ContainerState, facts: _DurableFacts) -> Integrit
             state,
             reason,
             content_empty=content_empty,
+            provably_bare=empty_tree,
             head=container.head,
             reference_key=facts.reference_key,
             durable_copy_exists=facts.any_copy,
