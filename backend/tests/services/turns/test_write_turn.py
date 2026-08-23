@@ -43,6 +43,7 @@ from pydantic_ai.models.function import (
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.v1.build_sessions.schemas import BuildError, ErrorSource
 from src.config import settings
 from src.db.models.conversation import ConversationMode
 from src.db.models.message import Message, MessageEntryKind
@@ -51,6 +52,7 @@ from src.services.agent.mode_prompts import PromptContext
 from src.services.build_sessions.alarms import HMR_PROTOCOL_DRIFT_EVENT
 from src.services.build_sessions.manager import SessionManager
 from src.services.orchestrator.deps import SandboxSession
+from src.services.orchestrator.errors import from_client, from_tsc
 from src.services.orchestrator.selfheal import VerifyOutcome
 from src.services.sandbox import DevStatus, SandboxError, SandboxHandle
 from src.services.sandbox.base import CompileReport, CompileState
@@ -1238,3 +1240,128 @@ async def test_a_compile_poll_never_takes_the_preview_watcher_down(_fresh_engine
     await engine._poll_compile_state(state, _a_sandbox(client))
 
     assert state.compile_state is CompileState.UNKNOWN
+
+
+# --- R17 (runtime half): a browser crash repairs, and does not narrate ------------------------
+
+
+def _diagnostic_frames(state: _TurnState) -> list[object]:
+    return [f for f in state.ring if getattr(f, "type", None) == "diagnostic"]
+
+
+async def test_a_client_class_error_repairs_the_app_without_narrating_it(
+    _fresh_engine,
+    db_session,
+    session_factory,
+    fake_redis: aioredis.Redis,
+    fake_storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ U13's verification, at the only place it can be checked: a runtime crash is visible to
+    the agent and to the verdict, and invisible to the user except as the absence of a success
+    claim.
+
+    THE TRAP THIS PINS. The tidier-looking way to reach the same outcome is to have `verify`
+    return red with no error at all — and ten lines above the emit, a red outcome with no error
+    synthesizes `dev_not_ready_error()`. The user would then get a SERVER diagnostic that is both
+    rendered AND wrong, and the model would be handed the same misdiagnosis to chase. So the
+    verdict carries the real error and only the render is skipped, which is what the pairing of
+    assertions below actually proves."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt-client-err@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+    monkeypatch.setattr(engine_module, "SELF_HEAL_MAX_RETRIES", 1)
+    prompts: list[str] = []
+
+    def _record_repair(error: BuildError) -> str:
+        prompts.append(error.source.value)
+        return "fix it"
+
+    monkeypatch.setattr(engine_module, "build_repair_prompt", _record_repair)
+
+    async def _client_red(*_a: object, **_k: object) -> tuple[VerifyOutcome, int]:
+        return (
+            VerifyOutcome(
+                green=False,
+                dev_ready=True,
+                error=from_client("TypeError: undefined is not a function\n  at Records"),
+                preview_url="https://app-xyz.example/",
+            ),
+            0,
+        )
+
+    monkeypatch.setattr(engine_module, "verify", _client_red)
+    model, _ = _scripted([[_WROTE_A_FILE, _DECLARED_DONE], [_WROTE_A_FILE, "tried again."]])
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+    )
+
+    # ABSENCE: nothing about the crash is narrated. The report was written by code inside the
+    # generated app; a stack trace under a file-path title is the developer surface this plan
+    # exists not to create.
+    assert _diagnostic_frames(state) == []
+    ring_text = " ".join(str(getattr(f, "title", "")) for f in state.ring)
+    assert "TypeError" not in ring_text
+
+    # LIVENESS, and it is what makes the absence mean anything: the turn really did reach the
+    # repair arm with the CLIENT error in hand, so the emit was SKIPPED rather than never
+    # approached — and it was not silently converted into the misleading server diagnosis.
+    assert prompts == ["client"], "the repair prompt must be built from the client error itself"
+
+    # …and the one thing the user IS entitled to notice: no completion claim was made.
+    assert state.status == "failed"
+
+
+async def test_a_compile_error_still_narrates_exactly_as_before(
+    _fresh_engine,
+    db_session,
+    session_factory,
+    fake_redis: aioredis.Redis,
+    fake_storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half of the guard. The skip is for ONE source; a mutant that drops the frame for
+    every source would pass the test above on its own."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt-tsc-err@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+    monkeypatch.setattr(engine_module, "SELF_HEAL_MAX_RETRIES", 1)
+
+    async def _tsc_red(*_a: object, **_k: object) -> tuple[VerifyOutcome, int]:
+        return (
+            VerifyOutcome(
+                green=False,
+                dev_ready=True,
+                error=from_tsc("app/page.tsx(4,10): error TS2304: Cannot find name 'Foo'."),
+                preview_url="https://app-xyz.example/",
+            ),
+            0,
+        )
+
+    monkeypatch.setattr(engine_module, "verify", _tsc_red)
+    model, _ = _scripted([[_WROTE_A_FILE, _DECLARED_DONE], [_WROTE_A_FILE, "tried again."]])
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+    )
+
+    frames = _diagnostic_frames(state)
+    assert frames, "a compile error is still narrated in the build feed"
+    assert getattr(frames[0], "source", None) is ErrorSource.TSC

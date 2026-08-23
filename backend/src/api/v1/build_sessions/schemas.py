@@ -285,6 +285,58 @@ class HeartbeatResponse(CamelModel):
     heartbeat_expires_at: datetime  # UTC instant the reaper considers the session idle.
 
 
+# --- the app's own client-error report (U13, R17 runtime half) ----------------
+#
+# The generated app relays its `window.onerror` / `unhandledrejection` / `console.*` captures to
+# the framing portal by postMessage (`sandbox/template/components/bial/error-capture.tsx`); the
+# portal validates the origin and POSTs the payload here. Every field below is text the app wrote,
+# so the caps are the boundary's job: parked verbatim, redacted and framed at the point of use.
+
+CLIENT_ERROR_SOURCE_MAX_CHARS = 64
+"""Cap on the reporter LABEL (`window.onerror`, `unhandledrejection`, `console.error`, …).
+
+A bounded free string rather than an enum of the four the template emits today, deliberately. The
+value is a label on a diagnostic, never a branch: pinning the set here would mean that the day the
+template learns a fifth capture point, the backend answers 422 and the crash it was reporting
+becomes invisible — fail-closed on the one signal this whole unit exists to make visible."""
+
+CLIENT_ERROR_TITLE_MAX_CHARS = 1_000
+"""Cap on the report's headline. The template already slices its own titles to 500; this leaves
+room for a reporter that does not, without accepting a payload of arbitrary size."""
+
+CLIENT_ERROR_STACK_MAX_CHARS = 20_000
+"""Cap on the report's stack. Generous — a deep component tree produces a long stack and cutting a
+real one short would cost the agent the frame that names the faulty file — but finite, because the
+writer is a crashing browser inside an app whose code we did not author. Anything past this is a
+422; `declutter` then truncates what IS accepted to `CLEANED_STACK_MAX_CHARS` anyway."""
+
+
+class ClientErrorReportRequest(CamelModel):
+    """`POST /v1/build-sessions/apps/{appId}/client-error` body (U13).
+
+    Mirrors the payload the app's capture component posts to the portal, minus two fields the
+    portal must NOT forward: `type` (the postMessage discriminator — it has done its job by the
+    time the portal is calling us) and `ts` (the app's own clock, which is app-controlled and
+    would only ever be used for expiry, where our own arrival time is the honest value)."""
+
+    source: str = Field(max_length=CLIENT_ERROR_SOURCE_MAX_CHARS)
+    title: str = Field(max_length=CLIENT_ERROR_TITLE_MAX_CHARS)
+    # Defaulted because the template sends `""` for the `console.error` / `console.warn` arms —
+    # those have a message and no stack, and a required field would reject the commonest report.
+    stack: str = Field(default="", max_length=CLIENT_ERROR_STACK_MAX_CHARS)
+
+
+class ClientErrorReportResponse(CamelModel):
+    """`POST /v1/build-sessions/apps/{appId}/client-error` → 202 (U13).
+
+    `recorded: false` is a SUCCESS, and it is the one thing worth saying here: this app already
+    has as many reports waiting for the next health verdict as the store keeps, so this one was
+    dropped. Answering an unqualified 202 would tell a crash loop that all four hundred of its
+    copies were collected, and would leave a client with no way to see it is being throttled."""
+
+    recorded: bool
+
+
 # =============================================================================
 # C7 — Brain interface + tagged-union progress envelope
 # =============================================================================
@@ -314,6 +366,20 @@ class BuildError(BaseModel):
     source: ErrorSource
     title: str  # short human summary (first meaningful error line).
     cleaned_stack: str  # de-noised diagnostic BRAIN feeds back into the self-heal prompt.
+    # U13 — the AGENT-ONLY half of a deliberately dual-purpose object. `BuildError` is read by two
+    # audiences with opposite needs: it becomes the portal's `error` envelope / `diagnostic` frame
+    # AND the next run's repair prompt. For a `client`-class report those two must diverge — the
+    # text was written by code inside the generated app, so it may reach the model (which can act
+    # on it) and must not reach the user (for whom a JS stack trace is not a product surface).
+    #
+    # `exclude=True` is what makes that structural instead of a convention: the field is dropped
+    # from EVERY serialization, so `BuildResult.error` and `EscalationEvent.last_error` cannot
+    # carry it out to the portal by simply forgetting about it. `build_repair_prompt` reads the
+    # attribute in-process, which is the only path that sees it at all.
+    #
+    # Absent (None) on every other source, where `cleaned_stack` is already safe to render and the
+    # repair prompt uses it unchanged — so nothing about the tsc / server / next_build arms moves.
+    agent_only_detail: str | None = Field(default=None, exclude=True)
 
 
 class _ProgressEventBase(BaseModel):

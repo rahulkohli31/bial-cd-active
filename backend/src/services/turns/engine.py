@@ -65,7 +65,7 @@ from pydantic_ai.tools import DeferredToolRequests
 from pydantic_ai.usage import RequestUsage, RunUsage, UsageLimits
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from src.api.v1.build_sessions.schemas import LIVENESS_LEASE_RENEW_CADENCE_SECONDS
+from src.api.v1.build_sessions.schemas import LIVENESS_LEASE_RENEW_CADENCE_SECONDS, ErrorSource
 from src.api.v1.conversations.schemas import (
     CompileFrame,
     DiagnosticFrame,
@@ -1358,16 +1358,34 @@ class TurnEngine:
                         "it will try again.",
                     )
                 if error is not None:
-                    source, title, stack = error.source, error.title, error.cleaned_stack
-                    self._emit(
-                        state,
-                        lambda seq: DiagnosticFrame(
-                            seq=seq,
-                            source=source,
-                            title=title,
-                            cleaned_stack=stack,
-                        ),
-                    )
+                    # U13 / R17 — A CLIENT-CLASS REPORT IS AGENT INPUT, NOT NARRATIVE. The whole
+                    # user-visible consequence of a browser-side crash is that the completion
+                    # claim does not appear; the report itself was written by code inside the
+                    # generated app, and this plan removes developer surfaces rather than adding
+                    # one. It still repairs — `build_repair_prompt` below is reached exactly as
+                    # for any other source — it just does not narrate.
+                    #
+                    # THE TRAP, and it is why this guard is here and not in `verify`: making
+                    # `verify` return `green=False, error=None` for this class would look like
+                    # the tidier fix and is strictly worse. Ten lines up, a red outcome with no
+                    # error synthesizes `dev_not_ready_error()` — so the user would get a SERVER
+                    # diagnostic that is both rendered AND wrong, and the model would be handed
+                    # the same misdiagnosis to chase. The verdict has to carry the real error;
+                    # only the RENDER is skipped.
+                    #
+                    # A later plan brings this class into a split-audience rendering with copy of
+                    # its own. Until then, silence is the honest surface.
+                    if error.source is not ErrorSource.CLIENT:
+                        source, title, stack = error.source, error.title, error.cleaned_stack
+                        self._emit(
+                            state,
+                            lambda seq: DiagnosticFrame(
+                                seq=seq,
+                                source=source,
+                                title=title,
+                                cleaned_stack=stack,
+                            ),
+                        )
                     turn_prompt = build_repair_prompt(error)
                 else:
                     # Green, but the model never said it was done — a nudge, not an error.
