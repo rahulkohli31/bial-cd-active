@@ -6,7 +6,10 @@ assertions stay loose to avoid brittleness."""
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -249,6 +252,122 @@ def test_prompt_has_no_stale_app_records_demo_reference() -> None:
     the prompt must no longer tell the model to hunt for and delete it. Only the stale REMOVE
     SCAFFOLDING parenthetical ever referenced it, and it is gone."""
     assert "app/records" not in BUILD_SYSTEM_PROMPT
+
+
+def test_prompt_names_no_demonstration_data_model_or_example_component() -> None:
+    """U21/R27/AE15 — two inertness guards modelled on
+    `test_prompt_has_no_stale_app_records_demo_reference` just above. The template's
+    demonstration data model (`items`/`item_status`/`audit_events`, the tables the old baseline
+    migration created) and the deleted worked-reference component must never resurface in the
+    composed prompt: the first is the demonstration table AE15 forbids the agent's first schema
+    change from dropping, the second is the 271-line file the agent no longer has any reason to
+    open."""
+    prompt = BUILD_SYSTEM_PROMPT
+    lowered = prompt.lower()
+    # GUARD 1 — the deleted worked-reference component, in either spelling.
+    assert "example-request-board" not in lowered
+    assert "examplerequestboard" not in lowered
+    # GUARD 2 — the demo table/enum identifiers the deleted baseline migration created.
+    assert re.search(r"\bitems\b", lowered) is None
+    assert "audit_events" not in lowered
+    assert "item_status" not in lowered
+
+
+def test_the_golden_template_manifest_names_no_removed_path() -> None:
+    """U21/R27 — the other half of the manifest tripwire.
+    `test_every_golden_template_manifest_file_exists` proves every path the manifest names still
+    exists; it says nothing about a path the template used to ship staying named after it is
+    deleted. Pinned separately so reverting only the manifest edit (and not the file deletions)
+    still trips something."""
+    manifest = BUILD_SYSTEM_PROMPT[BUILD_SYSTEM_PROMPT.index("The app starts from a minimal") :]
+    for removed in ("0000_baseline.sql", "0000_snapshot.json", "example-request-board.tsx"):
+        assert removed not in manifest, f"the manifest still names the removed path {removed!r}"
+
+
+def test_responsive_advice_survives_the_deleted_reference_component() -> None:
+    """U21/R27 — deleting `components/example-request-board.tsx` must not silently delete the
+    three-patterns advice it introduced (the RESPONSIVE block used to point at the file's own
+    docstring for this). TWO HALVES: the inertness half is the "copy from it, into your own
+    route" sentence naming the now-deleted file; the liveness half beside it is the toolbar/
+    table/form guidance itself, restated inline where the reference used to be — an inertness
+    guard alone would pass just as happily against a RESPONSIVE block someone had gutted
+    outright."""
+    prompt = BUILD_SYSTEM_PROMPT
+    lowered = prompt.lower()
+
+    # INERTNESS — the sentence that pointed at the deleted file.
+    assert "copy from it, into your own route" not in lowered
+    assert "example-request-board" not in lowered
+
+    # LIVENESS — the three patterns it taught, restated where the reference used to be.
+    assert "toolbar" in lowered
+    assert "flex-col sm:flex-row" in prompt
+    assert "overflow-x-auto" in prompt
+    assert "grid sm:grid-cols-2" in prompt
+
+
+def test_the_publish_path_still_finds_a_drizzle_directory() -> None:
+    """U21/ASM11 — Prerequisite 4's answer, recorded as a passing assertion rather than built as
+    a guard: `backend/src/services/deploy/assets/next.config.ts`'s `outputFileTracingIncludes`
+    globs `./drizzle/**`, and ASM27 keeps `drizzle/meta/_journal.json` (emptied, not deleted), so
+    `drizzle/` is never an empty directory and that glob always matches something. No change to
+    `next.config.ts` was needed — this just proves the premise still holds against the actual
+    template tree.
+
+    Checked as FILES, not merely directory entries: `rglob("*")` also yields the empty `meta/`
+    subdirectory itself, which would make this pass even with the journal file gone — the exact
+    state `./drizzle/**` needs a real file under, to actually match something."""
+    drizzle_dir = _TEMPLATE_ROOT / "drizzle"
+    assert drizzle_dir.is_dir()
+    files = [path for path in drizzle_dir.rglob("*") if path.is_file()]
+    assert files, "drizzle/ has no files — the outputFileTracingIncludes glob would match nothing"
+    assert (drizzle_dir / "meta" / "_journal.json") in files
+
+
+def test_app_boots_with_the_emptied_journal_and_prints_no_migration_failure() -> None:
+    """★ AE15 / ASM27 — THE ASSERTION THAT MUST NOT BE SKIPPED.
+
+    Runs the REAL, unmodified `scripts/db-migrate.mjs` exactly the way `npm run dev` runs it on
+    every boot, against the template's actual (emptied, not deleted) `drizzle/meta/_journal.json`.
+    Drizzle's vendored `readMigrationFiles` (`node_modules/drizzle-orm/migrator.js`) throws
+    `Can't find meta/_journal.json file` when the journal is absent, and `db-migrate.mjs` catches
+    every failure and still exits 0 by design (see its own file header) — so a missing journal
+    would print that failure into every app's dev-server stdout on EVERY boot, silently, straight
+    into the stream the self-heal verify tails.
+
+    `BIAL_DATABASE_URL` points at a closed local port so this needs no live Postgres: the journal
+    read happens before any database round-trip (`migrate()` calls `readMigrationFiles`
+    synchronously first), so a fast, deterministic connection-refused failure AFTER a successful
+    journal read is exactly the boundary this test is pinned to.
+
+    Mutation-checked by hand: with `meta/_journal.json` renamed away, this identical invocation
+    prints `Can't find meta/_journal.json file` to stderr and still exits 0 — the regression this
+    guards against. Skipped, not failed, when `node` is not on PATH, so an environment gap can
+    never read as a pass; it is not skipped when the environment (this repo's checked-in
+    `sandbox/template/node_modules`) is present, which it is."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not on PATH — cannot boot the template's db-migrate.mjs")
+
+    script = _TEMPLATE_ROOT / "scripts" / "db-migrate.mjs"
+    result = subprocess.run(
+        [node, str(script)],
+        env={**os.environ, "BIAL_DATABASE_URL": "postgres://u:p@127.0.0.1:1/nonexistent"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    output = result.stdout + result.stderr
+
+    assert result.returncode == 0  # db-migrate.mjs always exits 0 — see its own file header.
+    assert "Can't find meta/_journal.json" not in output, (
+        "the journal read failed — see ASM27: this is what prints a migration failure into "
+        f"every app's dev-server stdout on every boot. Full output:\n{output}"
+    )
+    # LIVENESS — the run actually reached the migrate step (the env var arrived at the
+    # subprocess and the connection was attempted), or the inertness assertion above would pass
+    # vacuously against a run that never got that far.
+    assert "migrations failed" in output.lower() or "migrations up to date" in output.lower()
 
 
 def test_prompt_teaches_the_drizzle_migration_discipline() -> None:

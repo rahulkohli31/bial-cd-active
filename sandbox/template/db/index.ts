@@ -6,10 +6,10 @@
  * `"use client"` module imports is shipped to the browser. The `window` guard below turns that
  * mistake into a loud error instead of a leak.
  *
- * Usage:
+ * Usage — `yourTable` is whatever you defined in `db/schema.ts`, which starts empty:
  *   import { getDb } from "@/db";
- *   import { items } from "@/db/schema";
- *   const rows = await getDb().select().from(items);
+ *   import { yourTable } from "@/db/schema";
+ *   const rows = await getDb().select().from(yourTable);
  */
 
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";

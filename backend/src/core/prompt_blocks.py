@@ -20,20 +20,18 @@ no file is frozen:
                             portal origin to window.__BIAL_CONFIG and captures runtime errors)
   app/page.tsx              home page — replace with your app's UI
   app/globals.css           Tailwind globals
-  db/schema.ts              the Drizzle schema — a small reference table plus one worked example;
-                            extend it, or delete it and write the tables your app needs
+  db/schema.ts              the Drizzle schema — starts EMPTY, no demonstration tables to work
+                            around or delete; add the tables your app needs
   db/index.ts               the SERVER-ONLY Drizzle client with a pinned pool — do not widen it
   drizzle.config.ts         drizzle-kit config; reads the connection string from the environment
-  drizzle/*.sql             generated migrations, plus drizzle/meta (see DATABASE above for
-                            how they are made and why they stay)
+  drizzle/meta/_journal.json  the migration journal — starts empty (see DATABASE above for how
+                            migrations are made); `generate` adds an entry plus its `.sql` file
+                            here, and both stay in the workspace once they exist
   scripts/db-migrate.mjs    the non-fatal migrate step `npm run dev` runs before `next dev`
   lib/bial-config.ts        the injected-config type + the window.__BIAL_CONFIG declaration
   lib/utils.ts              the cn() class helper
   components/ui/*.tsx        shadcn primitives (button, card, dialog, form, input, label, ...) —
                             editable
-  components/example-request-board.tsx  a worked example of a responsive table + form +
-                            toolbar (see RESPONSIVE below), NOT mounted on any route — copy the
-                            patterns into your own page, then delete this file
   components/bial/error-capture.tsx  runtime-error + config-bootstrap shim — editable
   package.json, next.config.ts, tsconfig.json, postcss.config.mjs, components.json  — editable
 Add routes, components, libraries, and dependencies as your app needs them."""
@@ -199,10 +197,11 @@ a `NEXT_PUBLIC_*` variable, and NEVER return it in a client-visible response.
 - `BIAL_PORTAL_ORIGIN` — the portal origin (used by the error-capture shim).
 
 DATABASE — Drizzle owns the schema, and migrations are how the schema changes. The template \
-ships `db/schema.ts` (the tables), `db/index.ts` (the server-only client), `drizzle.config.ts`, \
-and a `drizzle/` directory of generated migration SQL. The loop:
-- Edit `db/schema.ts`. The tables it ships with are a reference starting point — extend them, \
-rename them, or delete them and write your app's real tables.
+ships `db/schema.ts` (empty — no demonstration tables), `db/index.ts` (the server-only client), \
+`drizzle.config.ts`, and a `drizzle/` directory that starts with an empty migration journal and \
+no generated SQL. The loop:
+- Edit `db/schema.ts` — it starts empty, so your first change is purely additive with nothing to \
+drop. Add the tables your app needs.
 - Run `run_command(["npx","drizzle-kit","generate","--name","<what_changed>"])` — that writes a \
 new versioned `.sql` file under `drizzle/` describing exactly what changed. ALWAYS pass \
 `--name`: without it the file is named at random (`0001_special_fantastic_four.sql`), and a \
@@ -283,9 +282,11 @@ screen nobody requested is a defect.
 
 RESPONSIVE — the app must be usable on a phone. At a 390px-wide viewport there is NO horizontal \
 overflow: tables, toolbars, controls, and forms wrap or stack instead of pushing the page \
-sideways. Design and check the narrow width, not only the desktop layout. \
-`components/example-request-board.tsx` is a worked reference for these three patterns — copy \
-from it, into your own route.
+sideways. Design and check the narrow width, not only the desktop layout. Three patterns cover \
+most of it: a TOOLBAR stacks instead of overflowing below Tailwind's `sm:` breakpoint \
+(`flex-col sm:flex-row`); a wide TABLE scrolls inside its own box instead of widening the page \
+(wrap it in `overflow-x-auto`, as `components/ui/table.tsx` already does); and a FORM's fields \
+stack to one column on a phone and pair up from `sm:` up (`grid sm:grid-cols-2`).
 
 {NARRATION_VOICE}
 
