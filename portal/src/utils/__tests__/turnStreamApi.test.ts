@@ -10,6 +10,7 @@ import {
   TURN_STREAM_STALL_TIMEOUT_MS,
   TurnStartError,
   buildFromPlan,
+  isKnownFrame,
   parseSseText,
   readTurnStream,
   resolvePlanOptions,
@@ -108,6 +109,39 @@ function streamResponse(chunks: string[]): Response {
   })
   return new Response(body, { status: 200 })
 }
+
+describe('the compile frame (R17/R18) — an absent signal is never good news', () => {
+  const parseOne = (json: string) => parseSseText(`data: ${json}\n\n`).frames
+
+  it('parses each of the four states', () => {
+    for (const state of ['building', 'clean', 'failed', 'unknown']) {
+      expect(parseOne(`{"type":"compile","seq":1,"state":"${state}"}`)).toEqual([
+        { type: 'compile', seq: 1, state },
+      ])
+    }
+  })
+
+  it('narrows a state string it does not recognise to unknown, never to clean', () => {
+    // The container and this bundle ship separately and can be a release apart in either
+    // direction. A value one of them has not heard of is a real state — and the pane HOLDS
+    // its cover on `unknown`, so this is the difference between covering a red screen and
+    // uncovering over one.
+    expect(parseOne('{"type":"compile","seq":1,"state":"recompiling"}')).toEqual([
+      { type: 'compile', seq: 1, state: 'unknown' },
+    ])
+    expect(parseOne('{"type":"compile","seq":1}')).toEqual([
+      { type: 'compile', seq: 1, state: 'unknown' },
+    ])
+  })
+
+  it('is a KNOWN frame, so it is not swallowed by the forward-compat escape hatch', () => {
+    // The both-places trap: a type listed in the union but missing from KNOWN_FRAME_TYPES
+    // still parses — as an unknown frame — and the consumer's `isKnownFrame` guard drops it
+    // silently. Mirrors the server's own `_KNOWN_FRAME_TAGS` assertion.
+    const [frame] = parseOne('{"type":"compile","seq":1,"state":"failed"}')
+    expect(isKnownFrame(frame)).toBe(true)
+  })
+})
 
 describe('readTurnStream', () => {
   it('delivers frames split across chunks and resolves completed on [DONE]', async () => {

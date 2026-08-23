@@ -48,9 +48,12 @@ from src.db.models.conversation import ConversationMode
 from src.db.models.message import Message, MessageEntryKind
 from src.db.models.token_usage import TokenUsage
 from src.services.agent.mode_prompts import PromptContext
+from src.services.build_sessions.alarms import HMR_PROTOCOL_DRIFT_EVENT
 from src.services.build_sessions.manager import SessionManager
+from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.selfheal import VerifyOutcome
 from src.services.sandbox import DevStatus, SandboxError, SandboxHandle
+from src.services.sandbox.base import CompileReport, CompileState
 from src.services.sandbox.client import _ALREADY_RUNNING_PID
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
@@ -1074,3 +1077,164 @@ async def test_a_cancel_during_the_sandbox_terminal_still_frees_the_conversation
     # this test from leaving pending-task noise on whatever runs next.
     never.set()
     await asyncio.sleep(0)
+
+
+# --- R17/R18: the compile signal's channel to the portal --------------------------------------
+#
+# The consumer half lives in the container; what is pinned here is the CHANNEL — that the state
+# reaches a subscribed client as a turn frame, on change only, and that a signal we cannot read
+# never travels as good news. Exercised directly against the watcher's per-poll step rather than
+# through a whole timed turn: the loop's own 1s cadence is not the contract, the frames are.
+
+
+def _compile_frames(state: _TurnState) -> list[object]:
+    return [f for f in state.ring if getattr(f, "type", None) == "compile"]
+
+
+def _compile_state_of(frame: object) -> object:
+    return getattr(frame, "state", None)
+
+
+def _a_turn_state() -> _TurnState:
+    return _TurnState(
+        turn_id=uuid.uuid4(),
+        conversation_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        mode=ConversationMode.WRITE,
+    )
+
+
+def _a_sandbox(client: FakeSandboxClient) -> SandboxSession:
+    return SandboxSession(
+        sandbox_client=client,
+        handle=SandboxHandle(
+            fqdn="app-xyz.example",
+            token="tok",
+            app_name="sbx-abc",
+            preview_url="https://app-xyz.example/",
+            ready=True,
+        ),
+        app_id=uuid.uuid4(),
+    )
+
+
+async def test_the_compile_state_reaches_a_subscriber_as_a_turn_frame(
+    _fresh_engine,
+) -> None:
+    engine, state = _fresh_engine, _a_turn_state()
+    client = FakeSandboxClient()
+    client.compile_report = CompileReport(state=CompileState.FAILED, errors=("boom",))
+
+    await engine._poll_compile_state(state, _a_sandbox(client))
+
+    assert [_compile_state_of(f) for f in _compile_frames(state)] == [CompileState.FAILED]
+
+
+async def test_the_frame_is_emitted_on_change_not_on_every_poll(_fresh_engine) -> None:
+    """The ring is sized for narrative and the watcher polls once a second for the whole build.
+    A frame per poll would be several hundred per turn and would evict the story it carries —
+    the compile state is a LEVEL, not an event."""
+    engine, state = _fresh_engine, _a_turn_state()
+    client = FakeSandboxClient()
+    sandbox = _a_sandbox(client)
+
+    client.compile_report = CompileReport(state=CompileState.BUILDING)
+    await engine._poll_compile_state(state, sandbox)
+    await engine._poll_compile_state(state, sandbox)
+    await engine._poll_compile_state(state, sandbox)
+    client.compile_report = CompileReport(state=CompileState.CLEAN)
+    await engine._poll_compile_state(state, sandbox)
+
+    assert client.compile_polls == 4, "guard the premise: every poll really did ask"
+    assert [_compile_state_of(f) for f in _compile_frames(state)] == [
+        CompileState.BUILDING,
+        CompileState.CLEAN,
+    ]
+
+
+async def test_an_unknown_reading_travels_as_unknown_and_never_as_clean(_fresh_engine) -> None:
+    """The fleet case. A container whose image predates `/dev/compile` answers 404 on every
+    poll, which the client maps to `unknown`. That must reach the pane as `unknown` — the value
+    it HOLDS its cover on — rather than being dropped, which the pane would read as nothing
+    having changed since the last `clean`."""
+    engine, state = _fresh_engine, _a_turn_state()
+    client = FakeSandboxClient()
+    sandbox = _a_sandbox(client)
+
+    client.compile_report = CompileReport(state=CompileState.CLEAN)
+    await engine._poll_compile_state(state, sandbox)
+    client.compile_report = CompileReport(state=CompileState.UNKNOWN, reason="endpoint_absent")
+    await engine._poll_compile_state(state, sandbox)
+
+    assert [_compile_state_of(f) for f in _compile_frames(state)] == [
+        CompileState.CLEAN,
+        CompileState.UNKNOWN,
+    ]
+
+
+async def test_the_protocol_drift_alarm_fires_once_per_connect_not_once_per_poll(
+    _fresh_engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ The canary. Defensive parsing is what keeps a bundler upgrade from crashing the
+    consumer, and it is exactly what would make an upstream rename SILENT — so the one signal
+    that says the protocol moved has to be loud, and has to be loud once. Keyed on the connect
+    generation because a drifted container polls forever: an alarm per poll is an alarm nobody
+    reads by the second minute."""
+    engine, state = _fresh_engine, _a_turn_state()
+    client = FakeSandboxClient()
+    sandbox = _a_sandbox(client)
+    raised: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        engine_module._log,
+        "warning",
+        lambda event, **kw: raised.append((event, kw)),
+    )
+
+    drifted = CompileReport(
+        state=CompileState.UNKNOWN, reason="no_recognised_frame", connect_generation=7
+    )
+    client.compile_report = drifted
+    await engine._poll_compile_state(state, sandbox)
+    await engine._poll_compile_state(state, sandbox)
+    await engine._poll_compile_state(state, sandbox)
+
+    assert [e for e, _ in raised] == [HMR_PROTOCOL_DRIFT_EVENT]
+    assert raised[0][1]["connect_generation"] == 7
+    assert raised[0][1]["app_name"] == "sbx-abc"
+
+    # A RECONNECT is a new fact about the protocol, so it earns a second alarm.
+    client.compile_report = CompileReport(
+        state=CompileState.UNKNOWN, reason="no_recognised_frame", connect_generation=8
+    )
+    await engine._poll_compile_state(state, sandbox)
+    assert [e for e, _ in raised] == [HMR_PROTOCOL_DRIFT_EVENT, HMR_PROTOCOL_DRIFT_EVENT]
+
+
+async def test_a_socket_that_is_merely_down_is_not_reported_as_protocol_drift(
+    _fresh_engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`unknown` has several causes and only one of them means the vocabulary moved. Alarming
+    on all of them would make the canary fire on every container restart and be muted."""
+    engine, state = _fresh_engine, _a_turn_state()
+    client = FakeSandboxClient()
+    raised: list[str] = []
+    monkeypatch.setattr(engine_module._log, "warning", lambda event, **kw: raised.append(event))
+
+    for reason in ("endpoint_absent", "disconnected", "transport_error", "connected_no_frame_yet"):
+        client.compile_report = CompileReport(state=CompileState.UNKNOWN, reason=reason)
+        await engine._poll_compile_state(state, _a_sandbox(client))
+
+    assert raised == []
+
+
+async def test_a_compile_poll_never_takes_the_preview_watcher_down(_fresh_engine) -> None:
+    """The watcher that carries this also owns crash detection. `compile_state` is specified
+    never to raise, and this is the assertion that the emit path does not reintroduce one —
+    trading a covered preview for an undetected dead dev server would be a bad trade."""
+    engine, state = _fresh_engine, _a_turn_state()
+    client = FakeSandboxClient()
+    client.compile_report = CompileReport(state=CompileState.UNKNOWN, reason="malformed_body")
+
+    await engine._poll_compile_state(state, _a_sandbox(client))
+
+    assert state.compile_state is CompileState.UNKNOWN

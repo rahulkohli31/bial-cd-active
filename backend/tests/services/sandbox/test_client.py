@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
+from typing import cast
 
 import httpx
 import pytest
@@ -16,8 +17,10 @@ from pydantic import SecretStr
 
 from src.services.sandbox import client as client_module
 from src.services.sandbox.base import (
+    CompileState,
     ExecResult,
     FileStrReplace,
+    SandboxClient,
     SandboxError,
     SandboxHandle,
     SandboxNotReadyError,
@@ -497,3 +500,122 @@ async def test_the_warm_request_never_reads_the_apps_body() -> None:
         "the status line is the whole answer — pulling even one chunk of an app-controlled "
         "body is the start of an unbounded read the control plane cannot afford"
     )
+
+
+# --- R17/R18: the compile-state transport ----------------------------------------------------
+#
+# The contract this section pins is one sentence: NO failure of this call may produce a
+# confidently-clean reading, and no failure may reach the caller as an exception.
+
+
+def _compile_handler(status: int, body: object) -> Handler:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/_sup/dev/compile"
+        assert request.headers.get("authorization") == "Bearer tok-secret"
+        return httpx.Response(status, json=body)
+
+    return handler
+
+
+async def test_compile_state_maps_a_failed_report_with_its_errors() -> None:
+    report = await _client(
+        _compile_handler(
+            200,
+            {
+                "state": "failed",
+                "errors": ["./app/page.tsx\nModule not found"],
+                "reason": None,
+                "connect_generation": 4,
+            },
+        )
+    ).compile_state(_handle())
+    assert report.state is CompileState.FAILED
+    assert report.errors == ("./app/page.tsx\nModule not found",)
+    assert report.connect_generation == 4
+    assert report.protocol_drifted is False
+
+
+async def test_compile_state_maps_clean_and_building() -> None:
+    clean = await _client(_compile_handler(200, {"state": "clean", "errors": []})).compile_state(
+        _handle()
+    )
+    building = await _client(_compile_handler(200, {"state": "building"})).compile_state(_handle())
+    assert clean.state is CompileState.CLEAN
+    assert building.state is CompileState.BUILDING
+
+
+async def test_an_old_supervisor_image_reads_unknown_not_clean() -> None:
+    """THE FLEET CASE. Every container provisioned before `/dev/compile` existed answers 404
+    forever, and `/health` returns only `{"ok": true}` so the control plane cannot tell by
+    asking. A 404 read as clean would uncover the preview over a red screen on the entire
+    existing fleet — which is the population this work exists to reach."""
+    report = await _client(_compile_handler(404, {"detail": "Not Found"})).compile_state(_handle())
+    assert report.state is CompileState.UNKNOWN
+    assert report.reason == "endpoint_absent"
+
+
+async def test_a_transport_error_reads_unknown_and_does_not_raise() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom", request=request)
+
+    report = await _client(handler).compile_state(_handle())
+    assert report.state is CompileState.UNKNOWN
+    assert report.reason == "transport_error"
+
+
+async def test_a_non_200_non_404_reads_unknown_and_does_not_raise() -> None:
+    report = await _client(_compile_handler(503, {"detail": "unavailable"})).compile_state(
+        _handle()
+    )
+    assert report.state is CompileState.UNKNOWN
+    assert report.reason == "status_error"
+
+
+async def test_a_malformed_body_reads_unknown_and_does_not_raise() -> None:
+    """Every other method on this client turns a malformed 200 into a `SandboxError`. This one
+    does not, on purpose: an exception here would have to be handled at every call site, and
+    the one that forgot would take a turn down over a diagnostic signal."""
+    for body in ({"no": "state"}, ["not", "an", "object"]):
+        report = await _client(_compile_handler(200, body)).compile_state(_handle())
+        assert report.state is CompileState.UNKNOWN
+        assert report.reason == "malformed_body"
+
+
+async def test_an_unrecognised_state_string_reads_unknown_not_a_guess() -> None:
+    """The supervisor and this client ship in separate images and can be a release apart in
+    either direction, so a value one of them has not heard of is a real state — and the only
+    safe reading of a state we do not understand is that we do not understand it."""
+    for body in ({"state": "recompiling"}, {"state": None}):
+        report = await _client(_compile_handler(200, body)).compile_state(_handle())
+        assert report.state is CompileState.UNKNOWN
+        assert report.reason == "unrecognised_state"
+
+
+async def test_the_drift_canary_is_recognised_from_the_reason() -> None:
+    """A successful connect that produced no recognisable frame — the ONE reading that means
+    the upstream protocol moved, as opposed to the socket merely being down. Derived on the
+    report so no call site re-spells the reason string."""
+    drifted = await _client(
+        _compile_handler(
+            200, {"state": "unknown", "reason": "no_recognised_frame", "connect_generation": 2}
+        )
+    ).compile_state(_handle())
+    down = await _client(
+        _compile_handler(200, {"state": "unknown", "reason": "disconnected"})
+    ).compile_state(_handle())
+    assert drifted.protocol_drifted is True
+    assert down.protocol_drifted is False
+
+
+async def test_the_default_client_declines_with_unknown_rather_than_clean() -> None:
+    """`SandboxClient.compile_state` is non-abstract so the frozen C2 set stays frozen (the
+    `someone_has_to_go_first` precedent). Its default has to DECLINE, and declining is
+    `unknown` — a default of `clean` would make every client that never implements it report
+    a healthy app it has never looked at.
+
+    Called unbound: the default touches no state, and constructing a concrete subclass would
+    mean stubbing all ten abstract C2 methods to assert one line."""
+    nobody = cast(SandboxClient, None)  # the default reads no state off `self`
+    report = await SandboxClient.compile_state(nobody, _handle())
+    assert report.state is CompileState.UNKNOWN
+    assert report.reason == "no_sandbox_client"

@@ -25,6 +25,7 @@ from src.api.v1.build_sessions.schemas import ErrorSource
 from src.db.models.conversation import ConversationKind, ConversationMode
 from src.schemas import CamelModel
 from src.services.messages.projection import DisplayItem, PlanOptionsItem, StepItem
+from src.services.sandbox.base import CompileState
 
 
 class HeaderOut(CamelModel):
@@ -188,6 +189,26 @@ class PreviewFrame(CamelModel):
     preview_url: str | None = None
 
 
+class CompileFrame(CamelModel):
+    """What the app's dev server is compiling right now (R17/R18), so the preview pane can
+    cover its frame instead of letting the framework's full-screen error screen fill it.
+
+    Emitted ON CHANGE, not on every poll: the watcher asks once a second for the whole turn,
+    and a frame per poll would be several hundred per build on a ring sized for narrative.
+
+    `unknown` is a real value and the client MUST hold its current cover on it rather than
+    clearing — see `CompileState`. The signal reaches a container only once it runs an image
+    carrying `/dev/compile`; until then every poll is `unknown`, which is precisely why an
+    absent signal may never read as clean."""
+
+    type: Literal["compile"] = "compile"
+    seq: int
+    # The build's OWN enum rather than a re-spelled Literal, exactly as `DiagnosticFrame.source`
+    # does: a StrEnum has an identical wire shape, and a second copy of the member list is a
+    # copy that can drift from the value the producer already holds.
+    state: CompileState
+
+
 class DiagnosticFrame(CamelModel):
     """An in-narrative build diagnostic. Deliberately NOT an `error` frame: the turn is not
     failing — a repair run follows. `cleaned_stack` is already de-noised and secret-redacted
@@ -261,6 +282,7 @@ _KNOWN_FRAME_TAGS: Final = frozenset(
         "preview",
         "diagnostic",
         "quota",
+        "compile",
     }
 )
 
@@ -288,6 +310,7 @@ TurnStreamFrame = Annotated[
     | Annotated[PreviewFrame, Tag("preview")]
     | Annotated[DiagnosticFrame, Tag("diagnostic")]
     | Annotated[QuotaFrame, Tag("quota")]
+    | Annotated[CompileFrame, Tag("compile")]
     | Annotated[UnknownFrame, Tag("unknown")],
     Discriminator(_frame_tag),
 ]

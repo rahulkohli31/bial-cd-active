@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import abc
 import datetime as dt
+import enum
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -401,6 +402,49 @@ class DevLogs:
     next_cursor: int
 
 
+class CompileState(enum.StrEnum):
+    """What the app's dev server is doing right now, derived from its HMR socket (R17/R18).
+
+    FOUR values, not three, and the fourth is the point. `UNKNOWN` means the platform has no
+    idea: the supervisor has not connected to the socket yet, it is down between reconnects,
+    the container runs an image that predates `/dev/compile` (a 404), or the transport failed.
+    Every one of those must read as "no idea" and never as `CLEAN` — a caller that treats an
+    absent signal as good news uncovers the preview over the exact error screen the signal
+    exists to hide."""
+
+    BUILDING = "building"
+    CLEAN = "clean"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class CompileReport:
+    """Mirrors C1 `GET /dev/compile`.
+
+    `errors` is the de-coloured compile output, bounded in the container — it feeds the agent
+    and the health verdict, never the user. `reason` says WHY the state is `UNKNOWN` and is
+    None when it is not. `connect_generation` counts the supervisor's successful socket
+    connects, so the control plane raises the protocol-drift alarm once per connect rather
+    than once per poll."""
+
+    state: CompileState
+    errors: tuple[str, ...] = ()
+    reason: str | None = None
+    connect_generation: int = 0
+
+    @property
+    def protocol_drifted(self) -> bool:
+        """A SUCCESSFUL connect that produced no frame this client recognises — the one
+        reading that means the upstream protocol moved, as opposed to the socket being down.
+        Named here so no call site re-derives it from the reason string."""
+        return self.state is CompileState.UNKNOWN and self.reason == _DRIFT_REASON
+
+
+_DRIFT_REASON: Final = "no_recognised_frame"
+"""The supervisor's word for the canary firing. Matched, not re-spelled, in one place."""
+
+
 @dataclass(frozen=True)
 class FileResult:
     """Mirrors the C1 `POST /files` per-action response. `detail` carries the
@@ -571,6 +615,20 @@ class SandboxClient(abc.ABC):
         ...
 
     # --- outside the frozen set: a courtesy, not a contract ------------------
+
+    async def compile_state(self, handle: SandboxHandle) -> CompileReport:
+        """What the app's dev server is compiling right now — C1 `GET /dev/compile` (R17/R18).
+
+        DELIBERATELY NOT abstract, for the same reason as `someone_has_to_go_first` below:
+        `test_abstractmethod_set_equals_the_c2_contract` pins the C2 set so the contract
+        cannot drift, and adding a member to that frozen set is a cross-track break. Follow
+        the precedent — a new capability arrives non-abstract with a safe default — rather
+        than amending `_C2_METHODS`.
+
+        The default declines, and declining is `UNKNOWN`. A client fronting no real container
+        has no dev server to ask, and the whole contract of this signal is that "no idea" is a
+        first-class answer which callers must hold on rather than read as clean."""
+        return CompileReport(state=CompileState.UNKNOWN, reason="no_sandbox_client")
 
     async def someone_has_to_go_first(self, handle: SandboxHandle) -> int | None:
         """Pay the app's first route compile so the citizen's browser does not (U3, R3).

@@ -67,6 +67,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.api.v1.build_sessions.schemas import LIVENESS_LEASE_RENEW_CADENCE_SECONDS
 from src.api.v1.conversations.schemas import (
+    CompileFrame,
     DiagnosticFrame,
     PlanOptionsFrame,
     PreviewFrame,
@@ -92,6 +93,7 @@ from src.services.agent.read_tools import (
     ReadOnlyWorkspace,
 )
 from src.services.agent.toolsets import plan_options_only_toolset, toolsets_for_mode
+from src.services.build_sessions.alarms import HMR_PROTOCOL_DRIFT_EVENT
 from src.services.build_sessions.locks import release_liveness_lease, renew_liveness_lease
 from src.services.build_sessions.manager import (
     BuildSession,
@@ -126,6 +128,7 @@ from src.services.orchestrator.prompt import build_repair_prompt
 from src.services.orchestrator.selfheal import CONTINUE_PROMPT, dev_not_ready_error, verify
 from src.services.redis import get_redis
 from src.services.sandbox import SandboxClient, SandboxError
+from src.services.sandbox.base import CompileState
 from src.services.storage.snapshot_read import NoAppYet, extract_snapshot
 from src.services.turns.guard import claim_conversation, release_conversation
 from src.services.turns.plan_options import META_PENDING
@@ -484,6 +487,15 @@ class _TurnState:
     # True once the finalize actually pushed a snapshot. TRI-STATE on the wire: None here
     # means "nothing to say" (a chat turn, or a Write turn that never reached the save).
     snapshot_committed: bool | None = None
+    # The newest compile state PUBLISHED to the client, so the watcher can emit on CHANGE
+    # rather than once per poll. `None` = nothing emitted yet, which is not the same as
+    # `UNKNOWN` (a state we have said out loud). A turn that never learns anything sends no
+    # compile frame at all, and the pane keeps whatever it was showing.
+    compile_state: CompileState | None = None
+    # The supervisor connect the protocol-drift alarm has already fired for. The canary is a
+    # per-connect fact, so keyed on the generation the alarm is raised once per connect
+    # instead of once per second for the life of a drifted container.
+    compile_drift_generation: int | None = None
     # Claim-once for the preview frame, shared by the watcher and the between-verify
     # fallback: whichever sees the dev server first emits, the other stays quiet.
     preview_framed: bool = False
@@ -1645,6 +1657,38 @@ class TurnEngine:
                 lambda seq: PreviewFrame(seq=seq, state="ready", preview_url=preview_url),
             )
 
+    async def _poll_compile_state(self, state: _TurnState, sandbox: SandboxSession) -> None:
+        """Ask the container what it is compiling and publish it — the signal the preview pane
+        covers its frame with (R17/R18).
+
+        RIDES THE PREVIEW WATCHER rather than owning a loop. The watcher already polls once a
+        second for the whole turn, which is the cadence "appears and clears within seconds"
+        needs; a second task would double the timers, the cancellation paths and the ways a
+        frame can land after the terminal, and buy nothing.
+
+        EMITTED ON CHANGE. The ring is sized for narrative, and one frame per poll would be
+        several hundred per build — the compile state is a level, not an event.
+
+        `compile_state` NEVER RAISES (see the client), so there is nothing to catch here. That
+        is deliberate: an exception on this path would kill the watcher that also owns crash
+        detection, trading a covered preview for an undetected dead dev server."""
+        report = await sandbox.sandbox_client.compile_state(sandbox.handle)
+        if report.protocol_drifted and state.compile_drift_generation != report.connect_generation:
+            # Once per SUCCESSFUL connect. The alarm says the frame vocabulary moved upstream,
+            # which no amount of retrying fixes and which nothing else in the system can see:
+            # defensive parsing means a renamed protocol looks exactly like a quiet one.
+            state.compile_drift_generation = report.connect_generation
+            _log.warning(
+                HMR_PROTOCOL_DRIFT_EVENT,
+                app_name=sandbox.handle.app_name,
+                connect_generation=report.connect_generation,
+                reason=report.reason,
+            )
+        if report.state is state.compile_state:
+            return
+        state.compile_state = report.state
+        self._emit(state, lambda seq: CompileFrame(seq=seq, state=report.state))
+
     async def _watch_preview(self, state: _TurnState) -> None:
         """Poll the dev server so the preview appears the moment it is servable, and so a
         crash is REPORTED rather than left as a blank iframe.
@@ -1672,6 +1716,7 @@ class TurnEngine:
                 # unretrieved exception at teardown.
                 await asyncio.sleep(READINESS_POLL_S)
                 continue
+            await self._poll_compile_state(state, sandbox)
             if status.ready:
                 unanswered_polls = 0
                 if state.claim_preview_frame() or reconnecting:
