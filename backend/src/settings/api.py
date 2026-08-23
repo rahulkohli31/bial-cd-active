@@ -58,6 +58,24 @@ class ApiSettings(CoreSettings):
     # pre-parse so the env value is a plain comma-separated string.
     superadmin_emails: Annotated[frozenset[str], NoDecode]
 
+    # WHO A CITIZEN ASKS WHEN THE PLATFORM SAYS NO.
+    #
+    # The at-limit message (R31/U24) has to end in something the reader can actually do, and
+    # until this field existed the product had no way to say who. `superadmin_emails` is the
+    # nearest thing to an admin roster, and naming one of its entries would publish a
+    # colleague's inbox as a support desk without their having agreed to it — while naming all
+    # of them turns a dead end into a broadcast. So the support desk is its own fact, set once
+    # by whoever runs the deployment.
+    #
+    # NO DEFAULT, DELIBERATELY, and the consequence is stated here rather than discovered
+    # during an incident: this must be set in the App Service configuration BEFORE the release
+    # ships, or the API refuses to start. That is the intended behaviour
+    # (`.claude/rules/fail-first-python.md`), and it is the cheaper failure by a wide margin. A
+    # default would have to be a placeholder address, and a placeholder address sends a citizen
+    # who is already stuck to a mailbox nobody reads — a failure that surfaces as silence,
+    # weeks later, from the one person least able to escalate it.
+    SUPPORT_CONTACT_EMAIL: str
+
     # ============================================================ REQUIRED IN PRODUCTION
     # `X | None = None` plus a `_require_<field>_in_production` gate below. Dev and test boot
     # without these; production refuses to start and the message names the variables to set.
@@ -143,6 +161,26 @@ class ApiSettings(CoreSettings):
                 "no configured admins cannot approve apps or manage users."
             )
         return emails
+
+    @field_validator("SUPPORT_CONTACT_EMAIL")
+    @classmethod
+    def _reject_a_support_address_nobody_could_write_to(cls, value: str) -> str:
+        # A no-default field only guarantees that SOMETHING was supplied, and the shape an
+        # operator supplies under time pressure is `SUPPORT_CONTACT_EMAIL=` — present, empty,
+        # and accepted by a bare `str`. The whole point of the setting is that the sentence
+        # ends in a working address, so an empty or address-shaped-in-name-only value is the
+        # same misconfiguration as the missing variable and fails in the same place.
+        #
+        # Deliberately NOT a full RFC 5322 check. This is a fat-finger guard, not a validator
+        # that decides whether a mailbox exists — only sending to it can answer that, and a
+        # strict pattern here would reject legitimate addresses at boot for no benefit.
+        address = value.strip()
+        if address.count("@") != 1 or address.startswith("@") or address.endswith("@"):
+            raise ValueError(
+                "SUPPORT_CONTACT_EMAIL must be a single email address a citizen can write "
+                "to: it is rendered to the user when the platform has to refuse them."
+            )
+        return address
 
     @model_validator(mode="after")
     def _require_storage_in_production(self) -> Self:

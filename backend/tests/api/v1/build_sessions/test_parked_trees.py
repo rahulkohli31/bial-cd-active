@@ -18,6 +18,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.db.models.user import User
 from src.services.storage import divert_key, quarantine_key, recovery_key
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.factories import UserFactory
@@ -32,11 +33,11 @@ _LIST = "/v1/build-sessions/internal/apps/{app_id}/parked"
 _PROMOTE = "/v1/build-sessions/internal/apps/{app_id}/promote"
 
 
-async def _admin(db: AsyncSession) -> object:
+async def _admin(db: AsyncSession) -> User:
     return await UserFactory.create(db, email="admin@bial.com")
 
 
-async def _citizen(db: AsyncSession) -> object:
+async def _citizen(db: AsyncSession) -> User:
     return await UserFactory.create(db, email="nobody@rvaiglobal.com")
 
 

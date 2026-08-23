@@ -13,8 +13,13 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, cleanup, fireEvent, screen } from '@testing-library/react'
-import BuildProgress, { hasBuildNarrative } from '../BuildProgress'
-import type { FeedEnvelope } from '../../../utils/buildSessionTypes'
+import BuildProgress, {
+  atLimitSendState,
+  formatResetTime,
+  hasBuildNarrative,
+  withMailtoLinks,
+} from '../BuildProgress'
+import type { FeedEnvelope, QuotaExceededEvent } from '../../../utils/buildSessionTypes'
 
 afterEach(cleanup)
 
@@ -471,5 +476,132 @@ describe('a self-healed failure reads as a retry, once, whole (U4)', () => {
     const { container } = draw({ envelopes: [terminalError], status: 'failed' })
     expect(container.querySelector('[data-kind="error"]')).toBeTruthy()
     expect(hasBuildNarrative('failed', [terminalError])).toBe(true)
+  })
+})
+
+/**
+ * U24 — the at-limit experience.
+ *
+ * The old refusal told the citizen to click Save and secured nothing, and the client's own copy
+ * ("You've hit your daily limit of 1,000,000 tokens") could never say the two things that
+ * actually matter: whether their app was secured on the way out, and who they can write to. Both
+ * are facts only the server holds, so the sentence arrives as a prop and this component's job is
+ * to render it — including turning the configured address into something clickable.
+ */
+describe('U24: what a citizen sees when their budget is gone', () => {
+  const RESETS_AT = '2026-07-15T18:30:00.000Z'
+  const AT_LIMIT =
+    "You've used up your building budget for today, we've kept a copy of your app, so nothing " +
+    'you did today is lost. You can carry on after midnight, and if you need more before then, ' +
+    'email citizen-developer-support@bial.com.'
+  const quota = (seq = 3): QuotaExceededEvent => ({
+    type: 'quota_exceeded',
+    seq,
+    limit: 1_000_000,
+    used: 1_000_001,
+    resets_at: RESETS_AT,
+  })
+
+  it("renders the server's sentence and turns the support address into a real mailto: link", () => {
+    // WITHOUT THIS the citizen reads an address and has to retype it into their mail client — at
+    // the exact moment they are already blocked and least patient. Deleting this test would let
+    // the row silently fall back to printing the sentence as inert text.
+    //
+    // Mutation check: render `{atLimitText}` directly instead of `withMailtoLinks(atLimitText)`
+    // and this goes red on the anchor lookup.
+    const { container } = draw({ envelopes: [quota()], atLimitText: AT_LIMIT, status: 'failed' })
+    const row = container.querySelector('[data-kind="quota_exceeded"]')
+    expect(row?.textContent).toContain('used up your building budget')
+    expect(row?.textContent).toContain('after midnight')
+
+    const link = row?.querySelector('a')
+    expect(link?.getAttribute('href')).toBe('mailto:citizen-developer-support@bial.com')
+    expect(link?.textContent).toBe('citizen-developer-support@bial.com')
+    // The prose either side of the address survives — a linkifier that returns ONLY the matches
+    // would pass every assertion above and lose the entire message.
+    expect(row?.textContent).toContain('if you need more before then, email')
+  })
+
+  it('carries the reset time onto the row, and degrades rather than printing "Invalid Date"', () => {
+    // `resets_at` is a wire value and the suite already feeds this component the string 'x'. A
+    // naive `new Date(iso).toLocaleTimeString()` renders the literal words "Invalid Date" into a
+    // citizen's banner, which is worse than a slightly vaguer sentence.
+    //
+    // Mutation check: drop the `Number.isNaN` guard in `formatResetTime` and this goes red.
+    const { container } = draw({ envelopes: [quota()], status: 'failed' })
+    const row = container.querySelector('[data-kind="quota_exceeded"]')
+    expect(row?.getAttribute('data-resets-at')).toBe(RESETS_AT)
+    expect(row?.getAttribute('title')).toBe(atLimitSendState([quota()])?.title)
+
+    expect(formatResetTime('x')).toBeNull()
+    expect(formatResetTime(RESETS_AT)).not.toBeNull()
+    expect(formatResetTime(RESETS_AT)).not.toContain('Invalid')
+  })
+
+  it('falls back to the client-side quota copy when the server sent no sentence', () => {
+    // Every surface that has not been wired to pass `atLimitText` must still say SOMETHING. A
+    // prop-or-nothing render would leave a citizen looking at an empty amber box.
+    const { container } = draw({ envelopes: [quota()], status: 'failed' })
+    const row = container.querySelector('[data-kind="quota_exceeded"]')
+    expect(row?.textContent).toMatch(/daily limit/i)
+    expect(row?.querySelector('a')).toBeNull()
+  })
+
+  it('the SEND control is disabled and its title names when sending works again', () => {
+    // THE COMPOSER STAYS ENABLED — this describes the send control only. A citizen who is
+    // refused mid-thought has usually just typed something worth keeping, and disabling the
+    // textarea takes their draft hostage until midnight (and, per KTD-3, blurs focus to the
+    // document body). This is the state the composer applies to Send and to Send alone.
+    //
+    // Mutation check: return `null` unconditionally from `atLimitSendState` and this goes red.
+    const state = atLimitSendState([quota()])
+    expect(state?.disabled).toBe(true)
+    expect(state?.title).toMatch(/^You can send again after /)
+    expect(state?.title).toContain(formatResetTime(RESETS_AT) as string)
+  })
+
+  it('says nothing about sending while the citizen still has budget', () => {
+    // The state must be ABSENT rather than a disabled-false object: a composer that spreads it
+    // unconditionally would otherwise disable Send on every ordinary turn.
+    expect(atLimitSendState([])).toBeNull()
+    expect(
+      atLimitSendState([{ type: 'step', seq: 1, name: 's', label: 'x', state: 'ok' }]),
+    ).toBeNull()
+  })
+
+  it('takes the NEWEST reset time by seq, not the last envelope that happened to arrive', () => {
+    // A reconnect replays the stream, so envelopes arrive out of order. Reading the last ARRIVED
+    // envelope hands the citizen a stale reset time from a replayed frame — and "when can I send
+    // again" is the only question this row exists to answer.
+    //
+    // The two instants differ in TIME OF DAY, not merely in date. `formatResetTime` renders a
+    // clock time, so two different DATES at the same hour render identically and the assertion
+    // would pass against either implementation — which is exactly what an earlier version of
+    // this test did.
+    //
+    // Mutation check: pick the last array element instead of sorting by seq and this goes red.
+    const stale: QuotaExceededEvent = { ...quota(9), resets_at: '2026-07-15T06:15:00.000Z' }
+    const newest: QuotaExceededEvent = { ...quota(12), resets_at: '2026-07-15T18:30:00.000Z' }
+
+    // Deliberately out of array order: newest first, stale last.
+    const state = atLimitSendState([newest, stale])
+
+    expect(state?.title).toContain(formatResetTime(newest.resets_at) as string)
+    expect(state?.title).not.toContain(formatResetTime(stale.resets_at) as string)
+  })
+
+  it('linkifies every address in the sentence and never swallows a trailing full stop', () => {
+    // A `mailto:` that carries the sentence's final "." into the mailbox name bounces, and the
+    // citizen has no way to tell why.
+    const nodes = withMailtoLinks('Write to a@b.com or c@d.co.uk.')
+    const hrefs = nodes
+      .filter((n): n is React.ReactElement<{ href: string }> => typeof n !== 'string')
+      .map((n) => n.props.href)
+    expect(hrefs).toEqual(['mailto:a@b.com', 'mailto:c@d.co.uk'])
+    expect(nodes.filter((n) => typeof n === 'string').join('')).toBe('Write to  or .')
+  })
+
+  it('leaves a sentence with no address exactly as it was', () => {
+    expect(withMailtoLinks('Nothing to link here.')).toEqual(['Nothing to link here.'])
   })
 })

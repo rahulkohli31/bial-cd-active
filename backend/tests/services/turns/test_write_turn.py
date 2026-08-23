@@ -60,12 +60,14 @@ from src.services.sandbox import DevStatus, SandboxError, SandboxHandle, ServedP
 from src.services.sandbox.base import CompileReport, CompileState
 from src.services.sandbox.client import _ALREADY_RUNNING_PID
 from src.services.sandbox.config import SandboxConfig
-from src.services.storage import snapshot_key
+from src.services.storage import recovery_key, snapshot_key
 from src.services.turns import copy as copy_module
 from src.services.turns import engine as engine_module
 from src.services.turns.copy import (
+    AT_LIMIT_TEXT,
     COULD_NOT_CONFIRM_TEXT,
     DID_NOT_COME_TOGETHER_TEXT,
+    KEPT_A_COPY,
     STILL_SHOWING_EARLIER,
     STILL_SHOWING_NOTHING,
     STILL_SHOWING_TEMPLATE,
@@ -365,8 +367,17 @@ async def test_the_daily_cap_is_checked_before_every_model_request(
     assert counts["requests"] == 2  # …and the third request NEVER fired
     assert state.status == "failed"
     assert state.end_reason == "quota_exceeded"
-    # The copy names tomorrow, not support: a spent budget is not a malfunction.
-    assert "budget" in (state.error_message or "")
+    # THE WHOLE SENTENCE, not the substring "budget" — which the pre-U24 hardcoded string also
+    # contained, so the weaker assertion stayed green through a full revert of the unit. It names
+    # what happened, that a copy was kept, when it resets, and who to ask (R31/AE18).
+    assert state.error_message == AT_LIMIT_TEXT.format(
+        kept=KEPT_A_COPY, contact=settings.SUPPORT_CONTACT_EMAIL
+    )
+    # …AND THE WORK IS DURABLE BEFORE THE CITIZEN IS TOLD. That is the unit's entire guarantee and
+    # it lives at this one call site: without it the turn's work exists only inside a container
+    # the reaper is entitled to collect, and nothing said so.
+    assert state.write_session is not None, "the turn must have taken a workspace to secure"
+    assert await fake_storage.head(recovery_key(state.write_session.app_id)) is not None
 
 
 async def test_one_write_turn_folds_its_usage_exactly_once(

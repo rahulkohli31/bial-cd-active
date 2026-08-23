@@ -68,3 +68,29 @@ describe('TurnBanner — one banner, newest wins (U7/R13)', () => {
     expect(screen.queryByTestId('turn-banner')).toBeNull()
   })
 })
+
+// U24 — "who to ask for more" has to be CLICKABLE, or it is a string the citizen retypes.
+describe('an address in a platform sentence', () => {
+  // ★ THIS IS THE SURFACE THE SENTENCE ACTUALLY LANDS ON. The at-limit copy also renders inside
+  // the build-progress panel, but a plain Write turn never opens one — so the panel's own mailto
+  // rendering is unreachable for exactly the citizen who has just run out of budget. Testing the
+  // linkifier in isolation passes whether or not anything ever hands it the sentence; this fails
+  // if the banner stops doing so.
+  it('renders as a real mailto anchor', () => {
+    render(
+      <TurnBanner text="Today's budget is used up. If you need more before then, ask support@bial.example." />,
+    )
+
+    const link = screen.getByRole('link', { name: 'support@bial.example' })
+    expect(link.getAttribute('href')).toBe('mailto:support@bial.example')
+  })
+
+  it('leaves a sentence with no address byte-identical', () => {
+    const plain = 'Your workspace had been reset, so we are putting your app back.'
+    render(<TurnBanner text={plain} />)
+
+    expect(screen.getByTestId('turn-banner').textContent).toBe(plain)
+    // LIVENESS: the linkifier really did run over this text and chose to add nothing.
+    expect(screen.queryByRole('link')).toBeNull()
+  })
+})

@@ -12,6 +12,7 @@ import type { StepHistoryItem } from '../components/chat/BuildProgress'
 import MessageContent from '../components/chat/MessageContent'
 import SessionBanners from '../components/chat/SessionBanners'
 import TurnBanner from '../components/chat/TurnBanner'
+import { atLimitSendState } from '../components/chat/BuildProgress'
 import AttachmentLightbox from '../components/AttachmentLightbox'
 import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
 import { listProjectConversations } from '../utils/conversationApi'
@@ -484,6 +485,8 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   )
 
   const turnEnvelopes = useMemo(() => narrativeEnvelopes(turnNarrative), [turnNarrative])
+  // U24 — `null` unless today's budget is spent, in which case it carries the reset time.
+  const atLimit = useMemo(() => atLimitSendState(turnEnvelopes), [turnEnvelopes])
   const turnNarrativeIsThisChat = turnNarrativeChatRef.current === buildId
   const turnBuildStatus = useMemo(
     () =>
@@ -2299,6 +2302,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                     // BuildProgress hides the button rather than render a kill switch that
                     // confirms "this kills in-progress work" and then does nothing.
                     onForceEnd={turnBuildStatus === null ? () => session.forceEnd() : undefined}
+                    // U24 — the server's at-limit sentence, which names when the budget resets
+                    // and who to ask. The row renders the address as a real `mailto:` anchor;
+                    // the sentence itself stays plain text because it also lands in the banner
+                    // slot, which is a plain-text surface.
+                    atLimitText={turnError}
                   />
                 </div>
               </div>
@@ -2456,9 +2464,19 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                   `handleSend` is the enforcement; this is affordance only. */}
               <button
                 onClick={handleSend}
-                aria-disabled={sendUnavailable || (!input.trim() && pendingAttachments.length === 0)}
+                // U24 — when today's budget is spent, the SEND control is what says so, and its
+                // title names the moment sending works again. The composer itself stays enabled
+                // (KTD-2) so the citizen can copy their draft out rather than losing it.
+                title={atLimit?.title}
+                aria-disabled={
+                  atLimit?.disabled ||
+                  sendUnavailable ||
+                  (!input.trim() && pendingAttachments.length === 0)
+                }
                 className={`flex-shrink-0 w-9 h-9 bg-secondary text-white rounded-xl flex items-center justify-center transition ${
-                  sendUnavailable || (!input.trim() && pendingAttachments.length === 0)
+                  atLimit?.disabled ||
+                  sendUnavailable ||
+                  (!input.trim() && pendingAttachments.length === 0)
                     ? 'opacity-40 cursor-default'
                     : 'hover:bg-secondary-600'
                 }`}

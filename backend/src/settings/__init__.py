@@ -36,6 +36,7 @@ WHICH BLOCKS EACH ROLE READS
     DATABASE_URL         REQUIRED (core)             REQUIRED (core)
     AUTH__               REQUIRED                    --
     SUPERADMIN_EMAILS    REQUIRED                    --
+    SUPPORT_CONTACT_EMAIL REQUIRED                   --
     OBJECT_STORE__       required in production      REQUIRED
     REDIS__              required in production      REQUIRED
     SANDBOX__            required in production      REQUIRED

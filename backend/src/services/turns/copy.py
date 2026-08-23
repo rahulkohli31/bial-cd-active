@@ -127,3 +127,60 @@ structural — retrying will not help, so that turn PROCEEDS while this one stop
 Stopping is the right trade exactly once, which is why the verdict caps consecutive unanswerable
 checks at two: a container that has permanently stopped answering must not be able to refuse a
 citizen their own project on every message, with a retry prompt that can never succeed."""
+
+
+KEPT_A_COPY: Final = "we've kept a copy of your app, so nothing you did today is lost"
+"""The reassuring half of `AT_LIMIT_TEXT`, said only when a copy has actually been stored.
+
+A SEPARATE CONSTANT BECAUSE THE CLAIM IS CONDITIONAL. Folding "your app is safe" into the
+at-limit sentence would make the platform assert it on the one path where it might not be true —
+and a false reassurance is worse here than no reassurance at all, because the citizen acts on it
+by closing the tab."""
+
+
+COULD_NOT_KEEP_A_COPY: Final = (
+    "we weren't able to keep a copy of your app just now, so save it before you leave this page"
+)
+"""The other half, and the reason the reassurance is conditional at all.
+
+WHAT IT REPLACES is the old at-limit sentence, which told every citizen to click Save whether or
+not anything had been secured, and secured nothing itself. That reads as a formality — most
+people ignore it — so on the day the copy genuinely did not land, the one sentence that should
+have been alarming looked exactly like the boilerplate it appeared beside every other time.
+
+Saying it ONLY when it is true is what gives it teeth. It also has to be honest about the order
+of events: the platform tried first and failed, so this is a request for help rather than an
+instruction the citizen was always going to be given."""
+
+
+AT_LIMIT_TEXT: Final = (
+    "You've used up your building budget for today, {kept}. "
+    "You can carry on after midnight, and if you need more before then, email {contact}."
+)
+"""R31/AE18 — what a citizen is told when their daily budget runs out.
+
+THREE FACTS, AND EACH ONE IS THERE BECAUSE ITS ABSENCE COST SOMEBODY SOMETHING.
+
+*What happened*, in the words the person used to ask for the app: a budget for the day, used up.
+Not a token cap, not a quota, not a limit exceeded — none of which tell a non-technical reader
+whether they broke something, whether it will happen again, or whether it is about them at all.
+"Budget" is also the word the existing surfaces already use for the same fact, so the citizen is
+not asked to learn a second name for one thing.
+
+*Whether their work survived*, filled from `KEPT_A_COPY` / `COULD_NOT_KEEP_A_COPY` by the caller
+that actually performed the write. The old sentence said "your changes are still in the
+workspace — click Save to keep them", which was a guess dressed as a fact: it was true only for
+as long as the container lived, and nothing in the sentence had checked.
+
+*When it comes back, and who to ask if that is too late.* "Contact your administrator" was the
+previous answer and it names a role, not a person — the citizen has no way to turn it into an
+address, so the sentence ends in a dead end. `{contact}` is a single configured support address
+(`ApiSettings.SUPPORT_CONTACT_EMAIL`), and it is a plain address rather than a `mailto:` URI on
+purpose: the banner above the composer renders text, and a URI scheme printed mid-sentence is
+exactly the register this module exists to keep out. Making it clickable is the renderer's job —
+`BuildProgress` turns the address in this sentence into a real `mailto:` link.
+
+"After midnight" rather than a clock time: the reset is the next IST midnight, this is a
+single-tenant deployment in one timezone, and a rendered timestamp would invite the reader to
+work out whether it means tonight or tomorrow. The exact instant is still on the wire
+(`QuotaFrame.resets_at`) for the surfaces that want to show it."""

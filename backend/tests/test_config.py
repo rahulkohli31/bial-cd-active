@@ -35,6 +35,8 @@ _BASE_ENV: dict[str, object] = {
     "auth": _AUTH,
     # superadmin_emails is required (no default) — every Settings built here needs it.
     "superadmin_emails": ["admin@bial.com"],
+    # So is the at-limit support contact (U24), for the same reason.
+    "SUPPORT_CONTACT_EMAIL": "help@bial.com",
 }
 
 

@@ -26,6 +26,7 @@ import {
   Square,
   XCircle,
 } from 'lucide-react'
+import type { ReactElement } from 'react'
 import { useEffect, useState } from 'react'
 import { cn } from '@/lib/utils'
 import type {
@@ -57,6 +58,114 @@ export interface BuildProgressProps {
    *  kill switch that confirms "this kills in-progress work" and then silently does nothing,
    *  which is how an operator comes to believe a runaway build was stopped. */
   onForceEnd?: () => void
+  /** U24 — the server's own at-limit sentence for this turn, when there is one.
+   *
+   *  IT COMES FROM THE SERVER RATHER THAN BEING WRITTEN HERE because two of its three facts are
+   *  things only the server knows: whether a copy of the app was actually secured on the way out
+   *  (the platform tries, and the try can fail), and which support address this deployment is
+   *  configured with. A sentence assembled in the browser would have to guess at both, and the
+   *  guess it would make — "your work is safe, contact your administrator" — is exactly the
+   *  false-reassurance-plus-dead-end this unit exists to delete.
+   *
+   *  Absent (`null`/omitted) is the ordinary case for every surface that has not been wired to
+   *  pass it; the row below falls back to the client-side quota copy rather than rendering
+   *  nothing, so a missing prop degrades the message instead of losing it. */
+  atLimitText?: string | null
+}
+
+/** An email address inside otherwise-plain prose. Deliberately CONSERVATIVE — it must not match
+ *  a trailing full stop, or the `mailto:` would carry it into the mailbox name. */
+const AN_EMAIL_ADDRESS = /[^\s<>@]+@[^\s<>@.]+(?:\.[^\s<>@.]+)+/g
+
+/**
+ * The at-limit sentence with its support address turned into a real `mailto:` link.
+ *
+ * THE ADDRESS ARRIVES AS TEXT, and that is a deliberate division of labour rather than an
+ * oversight. The server owns the words — it renders the sentence into a plain-text banner slot
+ * above the composer as well as into this row, and a `mailto:` URI spelled out mid-sentence is
+ * precisely the register `services/turns/copy.py` exists to keep out. Making it clickable is a
+ * rendering concern, so it happens where there is a DOM to click.
+ *
+ * Returns an array of React nodes, never a string of markup: the sentence is server copy today,
+ * but a renderer that interprets its input as HTML is one configuration change away from being an
+ * injection sink, and there is nothing here that needs the risk.
+ */
+export function withMailtoLinks(text: string): (string | ReactElement)[] {
+  const out: (string | ReactElement)[] = []
+  let cursor = 0
+  // `matchAll` starts a fresh iteration each call — the regex is module-level and `g`-flagged, so
+  // reusing `exec` across calls would carry `lastIndex` between renders and drop links at random.
+  for (const match of text.matchAll(AN_EMAIL_ADDRESS)) {
+    const at = match.index
+    if (at > cursor) out.push(text.slice(cursor, at))
+    out.push(
+      <a
+        key={`${at}-${match[0]}`}
+        href={`mailto:${match[0]}`}
+        className="font-semibold underline underline-offset-2"
+      >
+        {match[0]}
+      </a>,
+    )
+    cursor = at + match[0].length
+  }
+  if (cursor < text.length) out.push(text.slice(cursor))
+  return out
+}
+
+/** What the composer's SEND control does while the citizen is out of budget. */
+export interface AtLimitSendState {
+  /** Always true — the value exists so the call site reads as what it sets, not as a bare flag. */
+  disabled: true
+  /** The `title`, naming when sending starts working again. A disabled control with no
+   *  explanation is the single most frustrating state a UI can be in: it looks broken, and the
+   *  reader has no way to tell whether waiting would help. */
+  title: string
+}
+
+/**
+ * The SEND control's state while today's budget is spent — `null` when it is not.
+ *
+ * THE COMPOSER ITSELF STAYS ENABLED, and that is the whole reason this describes the send control
+ * rather than the composer. A citizen who is refused mid-thought has usually just typed something
+ * they want to keep; disabling the textarea takes their draft hostage until midnight, and (KTD-3)
+ * `disabled` on a focused element blurs it to `document.body`, dropping keyboard focus out of the
+ * page entirely. They can still select, copy, and paste their draft somewhere safe — they simply
+ * cannot spend budget they do not have.
+ *
+ * Exported for the composer to apply, in the same way `hasBuildNarrative` is exported for the
+ * bubble's chrome: one expression, two readers, so the row below and the control above the
+ * composer can never disagree about whether the citizen is at their limit.
+ */
+export function atLimitSendState(envelopes: FeedEnvelope[]): AtLimitSendState | null {
+  // NEWEST WINS, by seq rather than by array order. A reconnect replays the stream and a resumed
+  // subscriber receives frames out of order; picking the last ARRIVED envelope would hand back a
+  // stale reset time from a replayed frame.
+  const quota = bySeq(envelopes).filter(
+    (env): env is QuotaExceededEvent => env.type === 'quota_exceeded',
+  )
+  const newest = quota.length > 0 ? quota[quota.length - 1] : null
+  if (!newest) return null
+  const when = formatResetTime(newest.resets_at)
+  return {
+    disabled: true,
+    title: when ? `You can send again after ${when}` : 'You can send again after midnight',
+  }
+}
+
+/**
+ * `resets_at` as a time a person can read, or `null` when it is not a usable instant.
+ *
+ * FALLS BACK RATHER THAN THROWING. The field is a wire value, and an unparseable one has already
+ * reached this component in the existing tests — `new Date('x').toLocaleTimeString()` renders the
+ * literal string "Invalid Date" into the citizen's banner, which is worse than saying nothing
+ * specific at all. The caller's fallback ("after midnight") is true regardless of the wire value,
+ * because the reset IS the next IST midnight.
+ */
+export function formatResetTime(isoUtc: string): string | null {
+  const at = new Date(isoUtc)
+  if (Number.isNaN(at.getTime())) return null
+  return at.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
 }
 
 /** Dedup by `seq` (last-wins) and order by `seq` — C3 §4.2's replay property, kept. */
@@ -198,6 +307,7 @@ export default function BuildProgress({
   stopping,
   onStop,
   onForceEnd,
+  atLimitText,
 }: BuildProgressProps) {
   const [confirmingForceEnd, setConfirmingForceEnd] = useState(false)
   const reduced = usePrefersReducedMotion()
@@ -379,14 +489,28 @@ export default function BuildProgress({
             </div>
           )
         }
+        // THE AT-LIMIT ROW (U24). The server's sentence when there is one, the client-side quota
+        // copy when there is not — never nothing. The two differ in more than wording: the
+        // server's says whether the citizen's work was actually secured, which is a fact no
+        // amount of client-side phrasing can supply, and it names a real support address instead
+        // of a role nobody can write to.
+        //
+        // `title` carries the reset time onto the row for the same reason the send control gets
+        // it: the one question a person has here is "when does this stop being true".
         return (
           <div
             key={env.seq}
             className="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 px-2.5 py-2 text-xs text-tertiary"
             data-kind="quota_exceeded"
+            data-resets-at={env.resets_at}
+            title={atLimitSendState([env])?.title}
           >
             <Clock size={13} className="mt-0.5 flex-shrink-0 text-warning" />
-            <span>{formatDailyLimitMessage(env.limit, env.used)}</span>
+            <span>
+              {atLimitText
+                ? withMailtoLinks(atLimitText)
+                : formatDailyLimitMessage(env.limit, env.used)}
+            </span>
           </div>
         )
       })}

@@ -83,6 +83,7 @@ from src.api.v1.conversations.schemas import (
 from src.core.integrity_types import BaselineIdentity
 from src.core.redaction import redact_secrets
 from src.db.models.conversation import Conversation, ConversationMode
+from src.db.models.harness_counter import HarnessCounter
 from src.db.models.message import MessageEntryKind, MessageVisibility
 from src.db.models.user import User
 from src.services.agent.agent import ChatDeps, chat_agent
@@ -95,6 +96,7 @@ from src.services.agent.read_tools import (
 )
 from src.services.agent.toolsets import plan_options_only_toolset, toolsets_for_mode
 from src.services.build_sessions.alarms import HMR_PROTOCOL_DRIFT_EVENT
+from src.services.build_sessions.counters import count
 from src.services.build_sessions.integrity import (
     baseline_identity,
     has_ever_been_built,
@@ -163,6 +165,7 @@ from src.services.turns.guard import claim_conversation, release_conversation
 from src.services.turns.plan_options import META_PENDING
 from src.services.usage.gate import (
     DailyTokenLimitExceededError,
+    at_limit_ending,
     enforce_daily_limit,
     next_ist_midnight_iso,
     record_usage,
@@ -1512,6 +1515,21 @@ class TurnEngine:
                 # claimed to be finished: it gates the COMPLETION CLAIM, so with no claim
                 # outstanding there is nothing for it to gate and the loop carries on as
                 # before. Nothing here spends a repair attempt on it.
+                if not outcome.green and outcome.state is not HealthState.INDETERMINATE:
+                    # U25/R32 — THE HEADLINE NUMBER: how often the platform would have told a
+                    # citizen their app was finished when it was not. Counted only on a POSITIVE
+                    # verdict of "not finished" — an unanswerable one blocked nothing, it merely
+                    # asked again, and folding the two together would make the number that
+                    # measures this plan's whole point unreadable.
+                    #
+                    # Fire-and-forget by construction (`count` owns its own session and swallows
+                    # everything), because a counter that can fail the turn it is counting is
+                    # worse than no counter.
+                    await count(
+                        HarnessCounter.CLAIM_BLOCKED,
+                        app_id=state.write_session.app_id if state.write_session else None,
+                        served_head=outcome.served.head if outcome.served else None,
+                    )
                 if outcome.state is HealthState.INDETERMINATE:
                     # BOUNDED HERE, because this arm `continue`s past the budget guard below and
                     # an unanswerable verdict that repeats would otherwise spin against the wall
@@ -1651,29 +1669,34 @@ class TurnEngine:
             node = run.next_node
             while not Agent.is_end_node(node):
                 if Agent.is_model_request_node(node):
-                    async with session_factory() as gate_db:
-                        try:
+                    # THE SESSION CLOSES BEFORE THE ENDING IS BUILT, which is why the `try`
+                    # is on the outside now (U24). `at_limit_ending` bundles and uploads the
+                    # citizen's tree, and doing that inside the `async with` would pin a
+                    # pooled connection for the duration of a container round trip — on the
+                    # one path where every user who hits their cap in the same hour arrives
+                    # at once. Nothing else about this block moved.
+                    try:
+                        async with session_factory() as gate_db:
                             await enforce_daily_limit(gate_db, state.user_id)
-                        except DailyTokenLimitExceededError as exc:
-                            # The request never fires. Graceful, not a crash: the work so
-                            # far is real and the finalize will save it.
-                            limit, used = exc.limit, exc.used
-                            resets_at = next_ist_midnight_iso()
-                            self._emit(
-                                state,
-                                lambda seq: QuotaFrame(
-                                    seq=seq,
-                                    limit=limit,
-                                    used=used,
-                                    resets_at=resets_at,
-                                ),
-                            )
-                            raise _WriteEndedError(
-                                "quota_exceeded",
-                                "You have used today's token budget. Your changes are still "
-                                "in the workspace — click Save to keep them; this picks back "
-                                "up after midnight IST.",
-                            ) from exc
+                    except DailyTokenLimitExceededError as exc:
+                        # The request never fires. Graceful, not a crash: the work so
+                        # far is real, and U24 makes it DURABLE here rather than leaving it
+                        # to whether the exit path's best-effort autosave happens to succeed.
+                        limit, used = exc.limit, exc.used
+                        resets_at = next_ist_midnight_iso()
+                        self._emit(
+                            state,
+                            lambda seq: QuotaFrame(
+                                seq=seq,
+                                limit=limit,
+                                used=used,
+                                resets_at=resets_at,
+                            ),
+                        )
+                        raise _WriteEndedError(
+                            "quota_exceeded",
+                            (await at_limit_ending(state.sandbox)).message,
+                        ) from exc
                     async with node.stream(run.ctx) as stream:
                         async for event in stream:
                             self._on_event(state, event)
