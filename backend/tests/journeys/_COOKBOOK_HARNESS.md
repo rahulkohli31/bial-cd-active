@@ -158,14 +158,20 @@ returns the same id and the same key (`tests/services/build_sessions/test_appdat
 project owned by another user is a non-leaking **404**; a project whose app belongs to another
 user is a **409**.
 
-### 3b. submit (owner cookie) — `POST /v1/apps/{app_id}/submit`
+### 3b. submit — `submit_app_for_review` (NOT an endpoint; ASM18/U8)
 
-Submit takes **NO body** (APPROVAL R19): the artifact is the app's server-side git-bundle
-snapshot, which submit copies to an immutable per-submission blob. Wire a `FakeStorage`
-and seed the snapshot first (`test_lifecycle.py`):
+The citizen HTTP route (`POST /v1/apps/{app_id}/submit`) is **retired** — R15a allows
+exactly one route into the review queue, and it runs through the publish request
+(`POST /v1/projects/{project_id}/deploy`), which attaches both declaration answer sets.
+`tests/api/v1/apps/test_submit_retired.py` guards the old route 404/405 forever, even
+for the owner with a valid staged bundle. The behaviour it used to carry lives on as
+`services/approvals/submit.py`'s `submit_app_for_review`, called in-process exactly as
+the publish gate calls it — a journey drives it the same way, not through `client`:
 
 ```python
 from src.api.deps import storage_dependency
+from src.db.models.app_registry import AppRegistry, ApprovalRoute
+from src.services.approvals.submit import submit_app_for_review
 from src.services.storage import snapshot_key, submission_key
 from tests.fakes import FakeStorage
 
@@ -176,19 +182,25 @@ store = FakeStorage()
 app.dependency_overrides[storage_dependency] = lambda: store   # the `app` FIXTURE
 store.objects[snapshot_key(uuid.UUID(app_id))] = _BUNDLE
 
-resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
-assert resp.status_code == 200
-body = resp.json()
-# body == {"appId", "status": "pending", "submissionId", "commitSha", "submittedAt"}
+app_row = await db_session.get(AppRegistry, uuid.UUID(app_id))
+receipt = await submit_app_for_review(
+    db_session, store, user_id=owner.id, app=app_row,
+    declaration={"citizen": {}, "review": {}, "differences": [], "explanation": ""},
+    route=ApprovalRoute.SELF_PUBLISH,
+)
+await db_session.commit()
+# receipt == SubmissionReceipt(submission_id, commit_sha, submitted_at)
 ```
 
 After submit, the row carries the typed refs (`source_submission_id`,
 `source_commit_sha`, `submitted_at`) and the immutable copy exists at
-`submission_key(app_id, submission_id)` — byte-identical to the snapshot.
+`submission_key(app_id, receipt.submission_id)` — byte-identical to the snapshot. Read
+the pending state back over the wire at `GET /v1/apps/{app_id}/status`.
 
-Rejections: no snapshot blob → **409** `"Nothing to submit — generate an app first."`;
-corrupt (non-bundle) snapshot → **409**; a live build-session lock (D8) → **409**;
-transient storage error → **503**. Unknown app → **404**. No cookie → **401**.
+Rejections (raised as `AppApiError` from the call, not a response you assert against a
+`client` request): no snapshot blob → **409** `"Nothing to submit — generate an app
+first."`; corrupt (non-bundle) snapshot → **409**; a live build-session lock (D8) →
+**409**; transient storage error → **503**; cross-user `app.user_id` → **404**.
 
 ### 3c. approve (ADMIN cookie) — `POST /v1/admin/apps/{app_id}/approve`
 
@@ -536,8 +548,9 @@ assert resp.status_code == 500
 import uuid
 import sqlalchemy as sa
 from src.config import settings
-from src.db.models.app_registry import AppRegistry, AppStatus
+from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
 from src.db.models.audit import AuditLog
+from src.services.approvals.submit import submit_app_for_review
 from src.services.auth.session_jwt import mint_session_jwt
 from tests.factories import UserFactory
 
@@ -555,15 +568,22 @@ async def test_owner_builds_admin_approves(client, app, db_session):
 
     # 1. owner's build session mints the app row; the build finalized a snapshot bundle
     owner = await UserFactory.create(db_session, email="owner@rvaiglobal.com")
-    oh = _cookie(mint_session_jwt(owner.id, owner.token_version, _TTL))
     project = await ProjectFactory.create(db_session, owner.id)
     app_id = await resolve_app_for_project(db_session, owner.id, project.id)
     await db_session.commit()
     store.objects[snapshot_key(app_id)] = _BUNDLE
 
-    # 2. owner submits: draft -> pending + an immutable per-submission copy
-    assert (await client.post(f"/v1/apps/{app_id}/submit",
-            headers=oh)).json()["status"] == "pending"
+    # 2. owner submits: draft -> pending + an immutable per-submission copy. There is no
+    #    citizen HTTP route for this (§3b, ASM18) — call the service directly, the way the
+    #    publish gate does.
+    app_row = await db_session.get(AppRegistry, app_id)
+    receipt = await submit_app_for_review(
+        db_session, store, user_id=owner.id, app=app_row,
+        declaration={"citizen": {}, "review": {}, "differences": [], "explanation": ""},
+        route=ApprovalRoute.SELF_PUBLISH,
+    )
+    await db_session.commit()
+    assert receipt.commit_sha == _SHA
 
     # 3. admin approves
     admin = await UserFactory.create(db_session, email="admin@bial.com")

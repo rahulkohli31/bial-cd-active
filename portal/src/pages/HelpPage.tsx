@@ -54,16 +54,12 @@ const FAQS = [
     a: 'Any BIAL staff member with a valid Staff ID (BIAL-XXXXX) can log in and start building apps. No programming experience is required.',
   },
   {
-    q: 'What happens when I click "Generate App"?',
-    a: 'The AI analyzes your prompt, creates a wireframe layout, generates the application code, and renders a live preview. This typically takes 10–15 seconds. You can then refine the app using the chat interface.',
+    q: 'What happens when I click "Start Chat"?',
+    a: 'The AI analyzes your prompt and starts building a real, running application behind the scenes — this is a multi-minute build, not an instant preview. You can watch its progress and keep chatting to refine the app as it comes together.',
   },
   {
     q: 'Can I edit the app after it is generated?',
     a: 'Yes. The chat panel on the left side of the builder lets you request changes in plain English. You can ask to change colors, add tables, remove sections, switch to mobile layout, and more.',
-  },
-  {
-    q: 'Can I see the actual code behind my app?',
-    a: 'Yes. Click the "View Code" button in the builder toolbar to see the generated React code. However, you do not need to understand or edit the code — the AI chat handles all changes.',
   },
   {
     q: 'How does my app get its data?',

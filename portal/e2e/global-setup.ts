@@ -26,7 +26,7 @@ async function globalSetup(_config: FullConfig) {
   }
 
   throw new Error(`global-setup: ${target} never returned 200 within 120s (last: ${lastErr}). ` +
-    'Is the dev stack (npm run dev:full) or the container up?')
+    'Is the dev stack (npm run dev, plus the backend) or the container up?')
 }
 
 export default globalSetup
