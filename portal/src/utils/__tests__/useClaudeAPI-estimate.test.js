@@ -77,6 +77,9 @@ describe('estimateConversationTokens', () => {
   })
 })
 
+// U30: deck parts are dropped from the wire entirely by wireMessageFromParts
+// (attachmentStore.ts:180) — no deck bytes ever reach the server — so the estimator
+// must bill zero for them, on the first turn and on every later (sticky) turn.
 describe('estimateConversationTokens — deck (.pptx) parts', () => {
   const PPTX_TYPE = 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
   const textPart = (text) => ({ type: 'text', text })
@@ -85,37 +88,37 @@ describe('estimateConversationTokens — deck (.pptx) parts', () => {
     name: 'q3.pptx', size: 1, pdfFileId: 'file_d1', pageCount: 10, ...extra,
   })
 
-  it('adds a heavy per-page cost for a deck (far more than a nominal binary)', () => {
-    // 10 pages — counted on its (first) turn even though it carries no `text`.
-    const est = estimateConversationTokens([{ role: 'user', parts: [deckPart({ pageCount: 10 })] }], '')
-    expect(est).toBe(10 * 3000)
-    expect(est).toBeGreaterThan(1600) // not the flat per-file nominal
+  it('charges zero for a 20-page deck on its first turn (flips the old pages × 3000 charge)', () => {
+    // Previously: 20 pages * 3000 = 60,000. Now: the content never ships, so it's 0.
+    const est = estimateConversationTokens([{ role: 'user', parts: [deckPart({ pageCount: 20 })] }], '')
+    expect(est).toBe(0)
   })
 
-  it('counts a sticky deck mostly ONCE (first turn full, follow-ups ~0.1x), not full every turn', () => {
-    const dp = deckPart({ pageCount: 20 }) // 60,000 full
-    const oneTurn = estimateConversationTokens([{ role: 'user', parts: [dp, textPart('a')] }], '')
+  it('charges zero for the same sticky deck on every later turn too, not just the first', () => {
+    const dp = deckPart({ pageCount: 20 })
+    const oneTurn = estimateConversationTokens([{ role: 'user', parts: [dp, textPart('')] }], '')
     const threeTurns = estimateConversationTokens(
       [
-        { role: 'user', parts: [dp, textPart('a')] },
-        { role: 'assistant', parts: [textPart('ok')] },
-        { role: 'user', parts: [dp, textPart('b')] }, // SAME sticky deck again
+        { role: 'user', parts: [dp, textPart('')] },
+        { role: 'assistant', parts: [textPart('')] },
+        { role: 'user', parts: [dp, textPart('')] }, // SAME sticky deck again
       ],
       '',
     )
-    // The repeated deck adds only ~0.1x on its second appearance — nowhere near 2x.
-    expect(threeTurns).toBeLessThan(oneTurn * 1.3)
-    expect(threeTurns).toBeGreaterThan(oneTurn) // the cached re-read still adds a little
+    expect(oneTurn).toBe(0)
+    expect(threeTurns).toBe(0)
   })
 
-  it('falls back to 1 page when pageCount is missing/invalid', () => {
-    expect(estimateConversationTokens([{ role: 'user', parts: [deckPart({ pageCount: undefined })] }], '')).toBe(3000)
-    expect(estimateConversationTokens([{ role: 'user', parts: [deckPart({ pageCount: 0 })] }], '')).toBe(3000)
+  it('charges zero regardless of pageCount, including when it is missing/invalid', () => {
+    expect(estimateConversationTokens([{ role: 'user', parts: [deckPart({ pageCount: undefined })] }], '')).toBe(0)
+    expect(estimateConversationTokens([{ role: 'user', parts: [deckPart({ pageCount: 0 })] }], '')).toBe(0)
   })
 
-  it('a large deck pushes the estimate past the soft warn threshold', () => {
-    // 60 pages * 3000 = 180,000 > CONTEXT_SOFT_LIMIT (150k) → the high-usage warning fires.
+  it('does not push the estimate toward the soft warn threshold, however many pages it claims', () => {
+    // 60 pages would have been 180,000 (past CONTEXT_SOFT_LIMIT) under the old charge.
+    // Now it contributes nothing, so a lone deck never trips the high-usage warning.
     const est = estimateConversationTokens([{ role: 'user', parts: [deckPart({ pageCount: 60 })] }], '')
-    expect(est).toBeGreaterThan(CONTEXT_SOFT_LIMIT)
+    expect(est).toBe(0)
+    expect(est).toBeLessThan(CONTEXT_SOFT_LIMIT)
   })
 })

@@ -12,13 +12,15 @@ const CHARS_PER_TOKEN = 4
 // counted server-side; this only keeps the client-side history estimate from
 // either crashing on an array or under-counting a multi-MB file as ~2 tokens.
 const NOMINAL_FILE_TOKENS = 1_600
-// A deck (.pptx) is sent as a vision PDF: roughly per-page (text + image) tokens.
-// Heuristic only, to drive the warn/block UI — never to gate the API call. The
-// deck is STICKY and prompt-cached, so the FIRST turn pays the full (cache-write)
-// cost and each sticky follow-up re-reads at ~0.1x; the estimate reflects that
-// rather than billing the full deck on every turn (which would over-warn badly).
-const DECK_TOKENS_PER_PAGE = 3_000
-const DECK_CACHED_FACTOR = 0.1
+// A deck (.pptx) part is dropped from the wire entirely — wireMessageFromParts
+// (portal/src/utils/attachmentStore.ts:180) excludes `kind === 'deck'` from both
+// attachmentTexts and attachmentIds, because deck attachments are disabled
+// server-side (no stateless equivalent to the retired Files-API `file_id` path).
+// Nothing is sent, so the estimator bills zero for it below (see the deck arm in
+// estimateConversationTokens). If a future change starts sending deck bytes again,
+// restore a real per-page/cached charge there AND remove the attachmentStore.ts:180
+// exclusion in the same change — re-enabling one without the other either bills
+// for bytes that never ship, or ships bytes nobody bills for.
 
 // Conversation context-length guardrail, anchored to the 200k Opus 4.7 window.
 // The chat surfaces warn at SOFT (non-blocking banner + "new chat" CTA) and
@@ -67,7 +69,7 @@ export function estimateConversationTokens(messages: unknown, systemText = ''): 
   // UNCHECKED (matches pre-migration behavior): asserted after the Array.isArray guard.
   const msgs = messages as ChatMessage[]
   const lastIdx = msgs.length - 1
-  const seenDecks = new Set<string>() // first occurrence pays full; later (sticky) ~0.1x
+  const seenDecks = new Set<string>() // de-dup bookkeeping only — decks are billed zero, see below
   let tokens = 0
   msgs.forEach((m, i) => {
     for (const p of m?.parts || []) {
@@ -78,17 +80,13 @@ export function estimateConversationTokens(messages: unknown, systemText = ''): 
         // EVERY turn by its real length — not the nominal one-turn binary cost.
         tokens += Math.ceil((p.text || '').length / CHARS_PER_TOKEN)
       } else if (p?.type === 'file' && p.kind === 'deck') {
-        // Deck = a sticky, cached vision PDF: full per-page cost on its first turn
-        // (cache write), ~0.1x on each later turn (cache read). De-dup by file_id.
-        const pages = Number.isInteger(p.pageCount) && p.pageCount > 0 ? p.pageCount : 1
-        const full = pages * DECK_TOKENS_PER_PAGE
+        // Zero charge: attachmentStore.ts:180 drops deck parts before the wire, so
+        // this content never ships (see the top-of-file comment below
+        // NOMINAL_FILE_TOKENS for the full reasoning). seenDecks bookkeeping is kept
+        // for a future path that does send deck content — it costs nothing to keep
+        // and saves re-deriving the key logic.
         const key = p.pdfFileId || p.attachmentId
-        if (seenDecks.has(key)) {
-          tokens += Math.ceil(full * DECK_CACHED_FACTOR)
-        } else {
-          seenDecks.add(key)
-          tokens += full
-        }
+        seenDecks.add(key)
       } else if (p?.type === 'file' && i === lastIdx) {
         tokens += NOMINAL_FILE_TOKENS
       }
