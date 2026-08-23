@@ -58,34 +58,6 @@ from src.services.sandbox import (
 
 _OUTPUT_TRUNCATION_MARKER = "\n[... output truncated ...]"
 
-COMMIT_REMINDER_AFTER_WRITES = 3
-"""How many uncommitted file mutations trigger the commit reminder (W1). Not every call: a
-reminder on every write becomes wallpaper the model stops reading, and it would also push the
-model to commit mid-slice — fragmenting exactly the history the requirement exists to produce."""
-
-_COMMIT_REMINDER = (
-    "<system-reminder>You have changed several files since your last commit. If that is a "
-    "finished slice of work, stage exactly those files and commit them now with a message "
-    "describing the change — it is what lets you `git diff` your own work and revert a bad edit "
-    "instead of un-editing it by hand. Ignore this if the slice is not finished yet. Do not "
-    "mention this note or quote it to the user.</system-reminder>"
-)
-"""The nudge, shaped on the pattern that demonstrably works — five properties, all load-bearing:
-
-1. DELIMITED, so the model can tell platform text from the user's words.
-2. Attached to the TOOL RESULT rather than the system prompt, so it lands at the moment of the
-   edit instead of once, far away, at the top of context. (The existing `<system-note>` path in
-   `turns/engine.py` injects into `message_history` and is the wrong seam for this.)
-3. CONDITIONAL — see `COMMIT_REMINDER_AFTER_WRITES`.
-4. Names the EXACT action ("stage exactly those files and commit them now with a message"),
-   never a vague "remember to commit".
-5. EXPLICITLY NON-BINDING ("ignore this if the slice is not finished yet"), or the model commits
-   compulsively mid-edit.
-
-The never-mention clause is not belt-and-braces: N9 in this same plan is the existing
-`<system-note>` being narrated to the citizen twice in one conversation, so a platform note
-leaking into the transcript is a proven failure here, not a hypothetical one."""
-
 
 async def _step(
     session: SandboxSession,
@@ -101,22 +73,6 @@ async def _step(
     if session.emitter is None:
         return
     await session.emitter.step(name=name, label=label, state=state, hidden=hidden)
-
-
-def _note_write_and_maybe_remind(session: SandboxSession, result: str) -> str:
-    """Count one file mutation and, at the cadence, append the commit reminder to its result."""
-    session.uncommitted_writes += 1
-    if session.uncommitted_writes < COMMIT_REMINDER_AFTER_WRITES:
-        return result
-    session.uncommitted_writes = 0
-    return f"{result}\n\n{_COMMIT_REMINDER}"
-
-
-def _is_git_commit(command: list[str]) -> bool:
-    """Did the model just commit? Loose on purpose — `git -C x commit` and `git commit -am` both
-    count, and a false positive (say `git log --grep commit`) only DELAYS a reminder, which is
-    the harmless direction to be wrong in."""
-    return len(command) > 1 and command[0] == "git" and "commit" in command[1:]
 
 
 def _require_writable(path: str) -> None:
@@ -258,7 +214,7 @@ def sandbox_toolset[DepsT](
         session.workspace_touched = True
         label, hidden = classify_file_step("write_file", path)
         await _step(session, name="edit", label=label, state="ok", hidden=hidden)
-        return _note_write_and_maybe_remind(session, f"Wrote `{path}`.")
+        return f"Wrote `{path}`."
 
     async def edit_file(ctx: RunContext[Any], path: str, old_str: str, new_str: str) -> str:
         """Replace the single exact occurrence of `old_str` with `new_str` in `path`. `old_str`
@@ -279,7 +235,7 @@ def sandbox_toolset[DepsT](
         session.workspace_touched = True
         label, hidden = classify_file_step("edit_file", path)
         await _step(session, name="edit", label=label, state="ok", hidden=hidden)
-        return _note_write_and_maybe_remind(session, f"Edited `{path}`.")
+        return f"Edited `{path}`."
 
     async def insert_lines(
         ctx: RunContext[Any], path: str, insert_line: int, insert_text: str
@@ -300,7 +256,7 @@ def sandbox_toolset[DepsT](
         session.workspace_touched = True
         label, hidden = classify_file_step("insert_lines", path)
         await _step(session, name="edit", label=label, state="ok", hidden=hidden)
-        return _note_write_and_maybe_remind(session, f"Inserted into `{path}`.")
+        return f"Inserted into `{path}`."
 
     async def declare_done(ctx: RunContext[Any], summary: str) -> str:
         """Declare the build finished, and put your closing message to the user in `summary`.
@@ -406,12 +362,6 @@ def sandbox_toolset[DepsT](
             state="ok" if result.exit == 0 else "failed",
             hidden=hidden,
         )
-        # A SUCCESSFUL commit clears the uncommitted-writes count (W1). Gating on `exit == 0`
-        # matters: a commit that failed (nothing staged, a hook refusing) left the work
-        # uncommitted, and zeroing the counter there would suppress the very reminder that
-        # situation needs.
-        if result.exit == 0 and _is_git_commit(command):
-            session.uncommitted_writes = 0
         # A command that RAN counts as touching the workspace, and it has to: the open-sandbox
         # pivot made this a first-class write surface (`npm install`, scaffolding, codegen, `git`),
         # so a build can legitimately do all of its work here and never call a file tool. That was

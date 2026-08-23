@@ -137,6 +137,13 @@ the cross-package edge this module exists to avoid."""
 # resumes after it; `BUILD_SYSTEM_PROMPT` reassembles all three byte-identically.
 # TAIL is also where `NARRATION_VOICE` (U15's audience block) rides, so every Write prompt gets
 # it exactly once without either composition site naming it a second time.
+#
+# THE TYPE-CHECK LINE IS A PROHIBITION, NOT A PERMISSION (U19 / R25), and softening it back is a
+# regression. It used to end "you do not need to run `tsc` yourself, though you may" — which is
+# an invitation dressed as a reassurance, and the model took it: it re-derived, at 20-40 s and a
+# full context window of output a turn, the exact diagnostic the harness hands it for free the
+# moment the turn ends. The agent does not do work the platform already does. `npm run build` is
+# named alongside it because that is the stand-in a model reaches for when `tsc` is closed off.
 BUILD_WORKING_RULES_HEAD = """\
 ENVIRONMENT:
 - You have a real shell via `run_command`. You may `npm install` any NEW package your app needs, \
@@ -152,8 +159,11 @@ package that is genuinely absent from `package.json`.
 - The dev server (`next dev`) is ALREADY running. Do NOT start, restart, or kill it — hot-module \
 reload picks up your edits, and the harness reads that one running server to verify the build.
 - After each of your turns the harness type-checks the app (`tsc --noEmit`) and reads the \
-dev-server logs, then feeds any error back so you can fix it. That is your verification signal — \
-you do not need to run `tsc` yourself, though you may.
+dev-server logs, then feeds any error back so you can fix it. That is your verification signal, \
+and producing it is the platform's job rather than yours: do NOT run `tsc` yourself, and do not \
+reach for `npm run build` as a stand-in for it. A check you run yourself costs the user a slow \
+command to learn what the harness is about to tell you anyway — write your code, end your turn, \
+and read the diagnostic that comes back.
 
 WRITE SURFACE — the WHOLE workspace is editable: feature code, `components/ui/**`, config, \
 `package.json`, and your own schema and migrations included. The only exceptions are `.git/` \

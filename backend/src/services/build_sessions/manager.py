@@ -1433,6 +1433,23 @@ class SessionManager:
         container (a ghost — reap it, do not block the user) apart from a reachable one that
         will not answer (unknown — ask), and `_attach_for_read` collapses both into
         `NoLiveSandboxError`.
+
+        THE UNCOMMITTED ARM IS NOW THE LOAD-BEARING ONE (U19 / R25 / ASM5), and that is a change
+        of WEIGHT rather than of behaviour — which is exactly why it is written down. The agent
+        used to be told to commit each coherent slice, so between turns a container's work had
+        normally BECOME commits and the comparison at the bottom of this ladder answered nearly
+        every real question. U19 deleted that instruction: the platform commits the tree itself,
+        once, inside the turn-boundary bundle (`snapshot._COMMIT_SCRIPT`). Until that runs — for
+        the whole of every building turn, and forever afterwards if the turn died before its
+        finalizer — the user's new work exists ONLY as an uncommitted worktree sitting at an
+        unmoved HEAD.
+
+        So "compare the commits" is no longer a sufficient answer; on its own it would report
+        `dirty=False` ("all changes saved") over a tree full of work nothing has saved anywhere.
+        Deleting or reordering the arm below therefore breaks the save indicator in the direction
+        that loses work, and it breaks it silently. `test_save_state.py` pins it.
+
+        `dirty` stays TRI-STATE throughout: `None` is "nobody could check", never "clean".
         """
         state = await container_state(sandbox_client, handle)
         if state is None:
@@ -1440,8 +1457,10 @@ class SessionManager:
             return SaveState(app_id=app_id, dirty=None, container_head=None, saved_head=None)
         recovery_at = await _recovery_written_at(app_id)
         saved_head = await _saved_head(app_id)
-        # UNCOMMITTED WORK IS DIRTY regardless of what the commits say. This arm is what stops
-        # "all changes saved" appearing over files the agent wrote and never committed.
+        # UNCOMMITTED WORK IS DIRTY regardless of what the commits say — see the docstring.
+        # `saved_head` is still reported alongside it: the answer is "there is unsaved work on top
+        # of the version you saved", not "nothing here is saved", and a client that lost the
+        # saved version would be describing a bigger loss than the one that happened.
         if state.uncommitted:
             return SaveState(
                 app_id=app_id,

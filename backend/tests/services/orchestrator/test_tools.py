@@ -610,90 +610,63 @@ async def test_run_command_never_leaks_the_supervisor_token(sink: CollectingSink
     assert FAKE_SUPERVISOR_TOKEN not in captured["all_incoming"]
 
 
-# --- W1: the commit reminder on the write tool RESULT ---------------------------------
+# --- U19 / R25: the commit reminder that no longer exists ------------------------------
 #
-# The agent commits as it works so it can `git diff` what it changed and revert its own mistakes,
-# and so a future code-review agent inherits a history that reads as intent. The nudge rides the
-# TOOL RESULT rather than the system prompt, because that is what makes it land at the moment of
-# the edit. Each property below is one of the five that make such a reminder work — drop any and
-# it either becomes wallpaper or fragments the history it exists to produce.
+# THIS REPLACES FOUR TESTS that pinned the reminder's cadence and its reset — the reminder fires
+# on the third uncommitted write, names the exact action, stays non-binding, and a SUCCESSFUL
+# `git commit` zeroes the count while a failed one does not. All four were correct, and all four
+# enforced an instruction that no longer exists: the Write segment's COMMIT AS YOU WORK block is
+# deleted, because the platform commits the tree itself at every turn boundary.
+#
+# THE ENFORCER HAD TO GO WITH THE INSTRUCTION, and that is the whole point of testing it here.
+# `_note_write_and_maybe_remind` lived in `tools.py` — the toolset BOTH agents build from —
+# while the instruction it enforced lived only in the Write segment. Delete one and not the
+# other, and every third file write comes back carrying a `<system-reminder>` telling the model
+# to commit a slice nothing ever asked it to commit.
 
 
-async def test_the_commit_reminder_fires_on_the_third_write_not_the_first(
-    sink: CollectingSink,
-) -> None:
-    fake = FakeSandbox()
-    captured = await _run(
-        fake,
-        sink,
-        [
-            tool_turn("write_file", {"path": "app/one.tsx", "file_text": "a"}),
-            tool_turn("write_file", {"path": "app/two.tsx", "file_text": "b"}),
-            tool_turn("write_file", {"path": "app/three.tsx", "file_text": "c"}),
-            text_turn(),
-        ],
-    )
-    seen = captured["incoming"]
-    # The model's view AFTER the first write carries no reminder; after the third it does.
-    assert "<system-reminder>" not in seen[1]
-    assert "<system-reminder>" in seen[3]
+async def test_no_reminder_rides_a_write_result_any_more(sink: CollectingSink) -> None:
+    """★ Asserted at THREE writes — `COMMIT_REMINDER_AFTER_WRITES`, the count at which the
+    reminder used to fire — so this is a real observation rather than a test that never reached
+    the trigger. A fourth and fifth write follow, because the retired counter reset itself on
+    firing and a cadence bug could otherwise hide in the second cycle.
 
-
-async def test_the_reminder_names_the_action_stays_optional_and_forbids_quoting_itself(
-    sink: CollectingSink,
-) -> None:
+    Mutation check: restore `_note_write_and_maybe_remind` on `write_file` and this goes red."""
     fake = FakeSandbox()
     captured = await _run(
         fake,
         sink,
         [
             tool_turn("write_file", {"path": f"app/{n}.tsx", "file_text": "x"})
-            for n in ("one", "two", "three")
+            for n in ("one", "two", "three", "four", "five")
         ]
         + [text_turn()],
     )
-    reminder = captured["incoming"][3]
-    assert "commit them now with a message" in reminder  # the exact action, not "remember to"
-    assert "Ignore this if" in reminder  # non-binding, or it commits mid-slice
-    # N9's lesson, carried forward: the existing <system-note> was narrated to the citizen twice
-    # in one conversation, so a platform note leaking into the transcript is proven here.
-    assert "Do not mention this note" in reminder
+    for view in captured["incoming"]:
+        assert "<system-reminder>" not in view
+    assert "commit" not in captured["all_incoming"].lower()
+    # LIVENESS — the write results themselves still say what happened, so the absence above is
+    # the reminder being gone and not the tool returning nothing.
+    assert "Wrote `app/three.tsx`." in captured["all_incoming"]
 
 
-async def test_a_successful_commit_resets_the_count_so_the_next_slice_starts_clean(
+async def test_a_git_commit_through_run_command_is_still_an_ordinary_command(
     sink: CollectingSink,
 ) -> None:
+    """The agent is no longer TOLD to commit; `run_command` is still a real shell, so a commit it
+    chooses to run must behave like any other command. The retired `_is_git_commit` sniffer is
+    gone with the counter it reset, and nothing replaces it — no special-casing of `git` on the
+    exec path."""
     fake = FakeSandbox()
     captured = await _run(
         fake,
         sink,
         [
             tool_turn("write_file", {"path": "app/one.tsx", "file_text": "a"}),
+            tool_turn("run_command", {"command": ["git", "commit", "-m", "whatever"]}),
             tool_turn("write_file", {"path": "app/two.tsx", "file_text": "b"}),
-            tool_turn("run_command", {"command": ["git", "commit", "-m", "add two pages"]}),
-            tool_turn("write_file", {"path": "app/three.tsx", "file_text": "c"}),
             text_turn(),
         ],
     )
-    # Without the reset this third write would be the third UNCOMMITTED one and would nag —
-    # which is the difference between "uncommitted writes" and merely "recent writes".
-    assert "<system-reminder>" not in captured["incoming"][4]
-
-
-async def test_a_failed_commit_does_not_reset_the_count(sink: CollectingSink) -> None:
-    """The arm that would silently suppress the reminder exactly when it is most needed: a commit
-    that failed (nothing staged, a hook refusing) left the work uncommitted."""
-    fake = FakeSandbox()
-    fake.queue_commands(ExecResult(exit=1, stdout="", stderr="nothing added to commit"))
-    captured = await _run(
-        fake,
-        sink,
-        [
-            tool_turn("write_file", {"path": "app/one.tsx", "file_text": "a"}),
-            tool_turn("write_file", {"path": "app/two.tsx", "file_text": "b"}),
-            tool_turn("run_command", {"command": ["git", "commit", "-m", "nope"]}),
-            tool_turn("write_file", {"path": "app/three.tsx", "file_text": "c"}),
-            text_turn(),
-        ],
-    )
-    assert "<system-reminder>" in captured["incoming"][4]
+    assert "<system-reminder>" not in captured["all_incoming"]
+    assert ["git", "commit", "-m", "whatever"] in fake.command_calls

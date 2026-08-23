@@ -40,12 +40,12 @@ class SandboxSession:
     # ── Mutable per-run signals the tools set and the loop reads ──────────────────────────────
     done_requested: bool = False
     done_summary: str = ""
-    # W1 / KTD-5e — file mutations since the model's last `git commit`, so the commit reminder
-    # can fire on the CADENCE the requirement asks for ("after a coherent slice") rather than on
-    # every single write. An unconditional reminder becomes wallpaper and stops being read.
-    # Reset by `run_command` when it sees a commit go through, which is what makes the count mean
-    # *uncommitted* rather than merely *recent*.
-    uncommitted_writes: int = 0
+    # `uncommitted_writes` LIVED HERE and is gone with U19/R25. It counted file mutations since
+    # the model's last `git commit` so `tools._note_write_and_maybe_remind` could nag at a
+    # cadence — and the instruction it nagged about (the Write segment's COMMIT AS YOU WORK
+    # block) has been deleted, because the platform commits the tree itself at every turn
+    # boundary. A counter enforcing an instruction nobody gives is worse than no counter: it
+    # appends a reminder to tool results for a discipline the prompt no longer teaches.
     # Did this turn MUTATE the tree? Set by `write_file` / `edit_file` / `insert_lines` and by
     # `declare_done`, never reset mid-turn — "did anything change in this whole turn" is the
     # question. A Write turn that only read files is an ordinary chat turn and must not pay for a

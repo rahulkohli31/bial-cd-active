@@ -185,17 +185,70 @@ def test_plan_mode_keeps_its_own_contract_untouched() -> None:
     assert "present_plan_options" in composed
 
 
-def test_write_teaches_the_commit_discipline_as_a_capability() -> None:
-    """W1. The agent commits as it works so it can `git diff` its own changes and revert its own
-    mistakes — a capability, not bookkeeping. Pin both halves, including the anti-pattern: a
-    blanket `git add -A` produces one undifferentiated commit and destroys the granularity the
-    requirement exists to produce."""
+# --- U19 / R25: the version control the agent no longer does ---------------------------------
+#
+# THESE THREE REPLACE `test_write_teaches_the_commit_discipline_as_a_capability`, WHICH IS FLIPPED
+# RATHER THAN DELETED. It used to assert `COMMIT AS YOU WORK`, `git diff` and `git add -A` were
+# all present, because the Write segment taught the agent to stage and commit each coherent slice.
+# The platform commits the tree itself at every turn boundary
+# (`build_sessions/snapshot._COMMIT_SCRIPT`), so that instruction bought the user nothing and cost
+# them a shell round trip and a paragraph of narration per slice.
+#
+# TWO INERTNESS GUARDS AND ONE LIVENESS GUARD, and the third is not decoration: an inertness pair
+# on its own is greenest against a Write prompt somebody deleted outright, so one rule that must
+# SURVIVE every trim is asserted next to them.
+
+_RETIRED_GIT_INSTRUCTIONS = (
+    # The commit discipline itself.
+    "git add",
+    "git commit",
+    # THE UNDO HALF, and the reason this is a set rather than one assertion. The deleted block
+    # taught `git checkout` and `git revert` for backing out a bad edit; both — and `git reset`,
+    # and `git stash` — leave a HEAD that is NOT a descendant of the copy on record, over a
+    # perfectly good tree. That is precisely the input the workspace-integrity verdict has to
+    # reason about before it may call a workspace REVERTED. The verdict closes the hazard on its
+    # own (it requires the CONTENT to disagree as well as the lineage); this stops a future
+    # prompt edit from feeding it self-inflicted non-descendant HEADs, and reintroducing ANY ONE
+    # of the five turns it red.
+    "git checkout",
+    "git revert",
+    "git reset",
+    "git stash",
+)
+
+
+@pytest.mark.parametrize(
+    "prompt_name", ["write_mode_segment", "build_system_prompt"], ids=["write_mode", "build"]
+)
+def test_neither_write_prompt_instructs_the_agent_in_git(prompt_name: str) -> None:
+    """★ THE INERTNESS GUARD (U19 / R25, cross-plan constraint 9). Asserted as a SET so the
+    failure names every instruction that crept back, and asserted on BOTH Write prompts because
+    they compose from shared blocks and either composition site could grow one.
+
+    Mutation check: put any of the six back into `BUILD_WORKING_RULES_HEAD` and this goes red."""
+    prompt = (
+        compose_mode_prompt(ConversationMode.WRITE, _CONTEXT)
+        if prompt_name == "write_mode_segment"
+        else BUILD_SYSTEM_PROMPT
+    )
+    lowered = prompt.lower()
+    found = {phrase for phrase in _RETIRED_GIT_INSTRUCTIONS if phrase in lowered}
+    assert found == set(), f"{prompt_name} instructs the agent in git again: {sorted(found)}"
+    # The header of the deleted block, named separately so a reworded revival still trips.
+    assert "commit as you work" not in lowered
+
+
+def test_the_write_prompt_still_says_not_to_restart_the_dev_server() -> None:
+    """★ THE LIVENESS GUARD, and the one rule this unit must not take with it.
+
+    The agent can start a dev server of its own through `run_command` — the supervisor's child
+    env carries no marker that would tell the harness's flag apart from the real one — so this
+    sentence is the whole of what stops a second `next dev` racing the one the harness reads to
+    verify the build. It survives every prompt trim in this plan."""
     composed = compose_mode_prompt(ConversationMode.WRITE, _CONTEXT)
-    assert "COMMIT AS YOU WORK" in composed
-    assert "git diff" in composed
-    assert "git add -A" in composed  # named, as the thing NOT to do by habit
-    # Committing is explicitly not the same as the user keeping the work (KTD-5e / W2).
-    assert "does not save the user's work" in composed
+    lowered = composed.lower()
+    assert "the dev server (`next dev`) is already running" in lowered
+    assert "do not start, restart, or kill it" in lowered
 
 
 @pytest.mark.parametrize("mode", list(ConversationMode))

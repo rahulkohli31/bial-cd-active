@@ -540,10 +540,10 @@ async def container_state(
     """The container's commit AND whether its working tree has uncommitted changes.
 
     BOTH halves are needed, and getting this wrong is a silent lie in either direction.
-    Comparing only commits would report "all changes saved" whenever the agent had written
-    files without committing them — the prompt asks it to commit per coherent slice, but that
-    is guidance, not a guarantee, and the moment it skips one the indicator starts lying about
-    work sitting right there in the tree.
+    Comparing only commits would report "all changes saved" whenever the agent had written files
+    without committing them — which, since U19 deleted the agent's commit discipline, is the
+    shape of EVERY building turn until the turn-boundary bundle's own commit runs. The porcelain
+    is the only thing that can see that work.
 
     None means we could not ask at all, which is the only honest "unknown"."""
     run_command = sandbox_client.exec  # alias keeps the call off the JS-oriented exec guard

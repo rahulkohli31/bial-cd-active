@@ -173,6 +173,52 @@ def test_completion_promises_no_round_trip_after_declare_done() -> None:
     assert "Do not declare done prematurely" in completion
 
 
+def test_the_type_check_is_prohibited_not_merely_unnecessary() -> None:
+    """★ U19 / R25 — THE INVITATION IS NOW A PROHIBITION.
+
+    The line used to end "That is your verification signal — you do not need to run `tsc`
+    yourself, though you may." That is an invitation wearing a reassurance, and the model took it:
+    it spent a slow command and a screenful of output per turn re-deriving the exact diagnostic
+    the harness hands it for free the moment the turn ends. The agent does not do work the
+    platform already does.
+
+    THREE PARTS, and the third is why this is not one `not in`. The retired permission must be
+    gone; the replacement must actually FORBID rather than merely omit (a block someone deleted
+    passes an inertness check just as happily); and the TRUE half — the harness really does
+    type-check between turns — must survive, or the model is left with no verification story at
+    all and starts inventing one."""
+    prompt = BUILD_SYSTEM_PROMPT
+    lowered = prompt.lower()
+
+    # INERTNESS — the permission, in either of its halves.
+    assert "you do not need to run `tsc` yourself" not in lowered
+    assert "though you may" not in lowered
+
+    # THE PROHIBITION, plus the stand-in a model reaches for once `tsc` is closed off.
+    assert "do not run `tsc` yourself" in lowered
+    assert "do not reach for `npm run build` as a stand-in" in lowered
+
+    # LIVENESS — the harness's own check is still described, because it is still what happens.
+    assert "the harness type-checks the app (`tsc --noemit`)" in lowered
+
+
+def test_completion_never_makes_type_checking_the_agents_job() -> None:
+    """U19 / R25, the other half of the same rule: the closing guidance must not hand the
+    verification back to the model at the last moment.
+
+    Sliced to the COMPLETION block on purpose (see `_completion_block`): "type-check" is
+    legitimate copy elsewhere in this prompt — DATA INTEGRITY prescribes verifying by
+    type-checking and rendering rather than by mutating rows, and ENVIRONMENT describes what the
+    harness does — so a prompt-wide search would either be permanently red or have to be watered
+    down until it proved nothing."""
+    completion = _completion_block(BUILD_SYSTEM_PROMPT).lower()
+    assert "type-check" not in completion
+    assert "tsc" not in completion
+    # LIVENESS beside it — the block still says what ends the turn and what the summary must be.
+    assert "declare_done" in completion
+    assert "ends the turn" in completion
+
+
 def test_prompt_has_no_stale_app_records_demo_reference() -> None:
     """U11/R16 — the `app/records` demo route was removed from the template (commit d51ebfa), so
     the prompt must no longer tell the model to hunt for and delete it. Only the stale REMOVE
