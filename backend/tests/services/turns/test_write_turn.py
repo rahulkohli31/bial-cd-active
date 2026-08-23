@@ -1716,3 +1716,66 @@ async def test_an_unanswerable_verdict_is_never_narrated_as_a_defect(
     assert state.error_message == COULD_NOT_CONFIRM_TEXT
     # …and no completion claim. Unanswerable is not green.
     assert "complete" not in (state.error_message or "").lower()
+
+
+async def test_an_unanswerable_verdict_does_not_wear_the_failure_label_in_the_live_loop(
+    _fresh_engine,
+    db_session,
+    session_factory,
+    fake_redis: aioredis.Redis,
+    fake_storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ The plan's "does not produce a 'Not green yet' failure label either" scenario, in THIS
+    loop — the legacy harness has its own test and the two spinners are separate code.
+
+    "Not green yet" over a check that could not be REACHED tells the citizen their app is broken
+    on the strength of our own timeout: the platform blaming the app for its own silence, which is
+    the same shape of untruth as claiming a build finished when it did not. The spinner resolves
+    neutrally instead.
+
+    Mutation check: delete the INDETERMINATE arm of `_emit_verify_step`'s three-arm block and this
+    goes red on both the label and the state."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt-label@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+    monkeypatch.setattr(engine_module, "SELF_HEAL_MAX_RETRIES", 2)
+
+    async def _cannot_tell(*_a: object, **_k: object) -> tuple[VerifyOutcome, int]:
+        return (
+            VerifyOutcome(
+                state=HealthState.INDETERMINATE,
+                dev_ready=True,
+                error=None,
+                preview_url="https://app-xyz.example/",
+            ),
+            0,
+        )
+
+    monkeypatch.setattr(engine_module, "verify", _cannot_tell)
+    model, _ = _scripted([[_WROTE_A_FILE, _DECLARED_DONE]])
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+    )
+
+    verify_steps = [
+        f.item
+        for f in state.ring
+        if getattr(f, "type", None) == "step" and getattr(f.item, "tool", None) == "verify"
+    ]
+    finished = [s for s in verify_steps if s.state != "pending"]
+    # LIVENESS: the spinner really was resolved, so the assertions below are about WHICH arm ran
+    # rather than about a step that never landed.
+    assert finished, "the verify spinner must resolve, or this proves nothing"
+    assert all("Not green yet" not in s.label for s in finished)
+    assert all(s.state != "failed" for s in finished)
+    assert any("Still checking" in s.label for s in finished)
