@@ -172,7 +172,14 @@ def test_a_manufactured_tty_is_refused_before_it_can_hang(monkeypatch: pytest.Mo
         # The message must name the way OUT, not just say no — a refusal the model cannot act
         # on just becomes another workaround attempt.
         assert "non-interactively" in body["stderr"], cmd
-        assert "--name" in body["stderr"], cmd
+        # ...and the way out it names must be one that WORKS. This assertion used to require
+        # `--name` here. U20 measured drizzle-kit 0.31.10 and found that flag answers nothing:
+        # the rename resolver is an interactive select no flag can satisfy. Pointing the model at
+        # a flag that cannot work is what sent the observed build hunting for a longer flag list.
+        # So this is flipped to an inertness guard — the refusal must NOT prescribe a flag as the
+        # answer — paired with the liveness half, that it still prescribes the real escape.
+        assert "--name" not in body["stderr"], cmd
+        assert "ONE kind of schema change per generate" in body["stderr"], cmd
 
     assert spawned == [], "a refused command must never reach subprocess.run"
 

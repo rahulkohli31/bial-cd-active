@@ -777,9 +777,17 @@ _INLINE_PROGRAM_FLAGS = frozenset({"-c", "-e", "--eval", "--exec", "-p", "-E"})
 _TTY_REFUSAL = (
     "This command allocates a terminal, which is not available here — nothing is watching it, "
     "so an interactive prompt would hang until the timeout. Run the command non-interactively "
-    "instead: pass the flag that supplies the answer (for example `--name <what_changed>` for a "
-    "migration), or set the tool's non-interactive/CI option."
+    "instead, and make the question unnecessary rather than trying to answer it: split the work "
+    "so the tool has nothing ambiguous to ask about (for a migration, make ONE kind of schema "
+    "change per generate), or set the tool's non-interactive/CI option."
 )
+"""U20 correction: this used to say "pass the flag that supplies the answer (for example
+`--name <what_changed>`)". Measured against the pinned drizzle-kit 0.31.10, that is false —
+`--name` names the output file and answers nothing. The rename resolver is an interactive select
+NO flag answers, and under this sandbox's own conditions (stdin=DEVNULL, no TTY) it does not even
+hang: it prints "Interactive prompts require a TTY terminal", writes no migration, and exits 0.
+Teaching the agent a flag that cannot work sends it hunting for a longer flag list; teaching it to
+avoid the ambiguity is the instruction that actually resolves the situation."""
 
 
 def _refuse_a_manufactured_tty(cmd: list[str]) -> str | None:
