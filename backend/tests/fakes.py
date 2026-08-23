@@ -60,20 +60,14 @@ from src.services.storage.errors import StorageNotFoundError
 # — answering the generic empty result, which parses as `UNANSWERABLE`.
 _BASELINE_MARKER = "git rev-list --max-parents=0"
 
-BASELINE_ROOT_SHA = "0" * 40
-"""The root commit a fake container reports — the `bial: golden template baseline`."""
-
-BASELINE_TEMPLATE_BLOB = "1" * 40
-"""The blob the root commit stored at `app/page.tsx`."""
-
-BASELINE_DIVERGED_STDOUT = f"{BASELINE_ROOT_SHA}@@{BASELINE_TEMPLATE_BLOB}@@{'2' * 40}"
-"""A BUILT app: one root commit, and a root route the agent has since rewritten."""
-
-BASELINE_UNTOUCHED_STDOUT = (
-    f"{BASELINE_ROOT_SHA}@@{BASELINE_TEMPLATE_BLOB}@@{BASELINE_TEMPLATE_BLOB}"
+_BASELINE_STDOUT = (
+    # A BUILT app, in the four-field shape `_BASELINE_SCRIPT` emits: one root commit whose
+    # SUBJECT is the seeded template's, the blob it stored at `app/page.tsx`, and a different
+    # blob there now. The named constants for the other shapes live in
+    # `tests/services/orchestrator/fake_sandbox.py`, beside the tests that drive them — a second
+    # copy here was an unused duplicate of a subtle literal, which is how the two drift.
+    f"{'0' * 40}@@{'1' * 40}@@{'2' * 40}@@bial: golden template baseline"
 )
-"""THE 2026-08-18 SHAPE: every server-side check green, and `app/page.tsx` byte-identical to the
-golden template the workspace was born with."""
 
 
 def a_git_bundle(sha: str = "a" * 40) -> bytes:
@@ -353,7 +347,7 @@ class FakeSandboxClient(SandboxClient):
             # scripting `exec` would silently start exercising the INDETERMINATE retry path —
             # slow, and asserting something other than what it says. A test that wants the app to
             # still be the starter page says so by overriding `exec_handler`.
-            return ExecResult(stdout=BASELINE_DIVERGED_STDOUT, stderr="", exit=0)
+            return ExecResult(stdout=_BASELINE_STDOUT, stderr="", exit=0)
         if cmd[:1] == ["base64"]:
             # `write_snapshot` reads its bundle back through `base64 <file>` and now validates
             # the bytes before uploading them, so an empty default stdout would decode to b""

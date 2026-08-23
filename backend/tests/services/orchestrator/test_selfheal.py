@@ -9,17 +9,18 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus, ErrorSource
 from src.core.integrity_types import BaselineIdentity
 from src.services.orchestrator import constants, selfheal
+from src.services.orchestrator.client_errors import forget_all_client_errors, park_client_error
 from src.services.orchestrator.selfheal import (
     HealthState,
     Readiness,
     VerifyOutcome,
-    are_we_there_yet,
     detect_server_crash,
     verify,
     where_are_we,
@@ -36,6 +37,17 @@ from tests.services.orchestrator.conftest import make_orchestrator
 from tests.services.orchestrator.fake_sandbox import BASELINE_UNTOUCHED_STDOUT, FakeSandbox
 from tests.services.orchestrator.model_harness import scripted_model, text_turn, tool_turn
 
+
+@pytest.fixture(autouse=True)
+def _empty_client_error_store():
+    """The report store is a module-global that outlives a test. Emptying it on BOTH sides means
+    neither a leftover from an earlier test nor a leak into a later one can make an assertion in
+    this file (or anywhere else in the suite) pass for the wrong reason."""
+    forget_all_client_errors()
+    yield
+    forget_all_client_errors()
+
+
 _APP_ID = uuid.UUID("0198f2c0-0000-7000-8000-000000000006")
 
 
@@ -46,7 +58,6 @@ async def _verify(
     max_polls: int = 3,
     had_prior_building_turns: bool = False,
     indeterminate_retries: int = 0,
-    recheck_stale_log_evidence: bool = True,
 ) -> tuple[VerifyOutcome, int]:
     """`verify` with this file's defaults, and ONE default that is a decision rather than
     convenience: `indeterminate_retries=0`.
@@ -68,7 +79,6 @@ async def _verify(
         had_prior_building_turns=had_prior_building_turns,
         indeterminate_retries=indeterminate_retries,
         indeterminate_backoff_s=0.0,
-        recheck_stale_log_evidence=recheck_stale_log_evidence,
     )
 
 
@@ -83,19 +93,19 @@ def test_detect_server_crash_matches_markers_not_benign_lines() -> None:
     assert crash is not None and "boom" in crash
 
 
-async def test_are_we_there_yet_ready_after_polls() -> None:
+async def test_where_are_we_ready_after_polls() -> None:
     fake = FakeSandbox()
     await fake.dev_start(fake.handle())
     fake.become_ready_after(2)
-    assert await are_we_there_yet(fake, fake.handle(), max_polls=5, poll_s=0.0) is True
+    assert await where_are_we(fake, fake.handle(), max_polls=5, poll_s=0.0) is Readiness.READY
 
 
-async def test_are_we_there_yet_dead_process_is_not_slow() -> None:
+async def test_where_are_we_dead_process_is_not_slow() -> None:
     fake = FakeSandbox()  # dev_running False, never started
-    assert await are_we_there_yet(fake, fake.handle(), max_polls=5, poll_s=0.0) is False
+    assert await where_are_we(fake, fake.handle(), max_polls=5, poll_s=0.0) is Readiness.DIED
 
 
-async def test_are_we_there_yet_believes_ready_over_a_dead_child() -> None:
+async def test_where_are_we_believes_ready_over_a_dead_child() -> None:
     """U1's new `/dev/status` row (`running=False, ready=True`): the supervisor's child is dead
     but an agent-relaunched server answers the dev port — observed truth says serving. The
     `ready` check runs FIRST, so this is "there", never the dead-process fast-fail. Pins that
@@ -103,7 +113,7 @@ async def test_are_we_there_yet_believes_ready_over_a_dead_child() -> None:
     fake = FakeSandbox()
     fake.dev_running = False
     fake.dev_ready = True
-    assert await are_we_there_yet(fake, fake.handle(), max_polls=5, poll_s=0.0) is True
+    assert await where_are_we(fake, fake.handle(), max_polls=5, poll_s=0.0) is Readiness.READY
 
 
 async def test_verify_green_when_tsc_clean_and_dev_ready() -> None:
@@ -231,13 +241,16 @@ async def test_verify_dead_server_failed_restart_reports_honestly(monkeypatch) -
 
 
 async def test_verify_slow_but_running_server_is_never_restarted() -> None:
-    # A LIVE child that has not reported ready is the slow-startup case (open-Q F): no rescue,
-    # no error from verify — the harness's dev_not_ready fallback owns that diagnosis.
+    """A LIVE child that has not reported ready is the slow-startup case (open-Q F): no rescue.
+
+    The diagnosis moved but the RESCUE rule did not, which is what this pins. Before U6 the
+    verdict here was red-with-no-error and the loop synthesized one; now `verify` names it itself
+    once its patience is spent. Either way nothing restarts a child that is merely slow."""
     fake = FakeSandbox()
     await fake.dev_start(fake.handle())  # the session-start launch
     outcome, _ = await _verify(fake, log_cursor=0, max_polls=2)
     assert fake.dev_start_calls == 1  # only the session-start call — a live child is left alone
-    assert outcome.green is False and outcome.error is None
+    assert outcome.green is False
 
 
 async def test_verify_unowned_serving_server_is_not_restarted() -> None:
@@ -583,20 +596,58 @@ async def test_where_are_we_tells_a_dead_process_from_a_slow_one() -> None:
     )
 
 
-async def test_a_readiness_budget_that_ran_out_is_indeterminate_not_a_defect() -> None:
+async def test_a_readiness_budget_that_ran_out_is_asked_again_not_reported() -> None:
     """★ COVERS AE8. The dev server is still `running` — we stopped waiting, it did not stop
-    starting. Before U6 this was red and carried `dev_not_ready_error()`, so the model spent a
-    repair run, and the citizen's tokens, on a startup hang that may not exist.
+    starting. Before U6 that was red and carried `dev_not_ready_error()`, so the model spent a
+    repair run, and the citizen's tokens, on a startup hang that did not exist.
 
-    Mutation check: map `STILL_TRYING` to UNHEALTHY and both the state and the error go red."""
+    THE WIN IS THE SECOND LOOK, not a permanent verdict: an app that comes up while we were
+    deciding is healthy, and costs nothing.
+
+    Mutation check: map `STILL_TRYING` to UNHEALTHY and this goes red."""
     fake = FakeSandbox()
-    await fake.dev_start(fake.handle())  # running, never ready inside the budget
+    await fake.dev_start(fake.handle())
+    fake.become_ready_after(3)  # not inside the first budget of 2; comfortably inside the retry
 
-    outcome, _ = await _verify(fake, log_cursor=0, max_polls=2)
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=2, indeterminate_retries=2)
+
+    assert outcome.state is HealthState.HEALTHY
+    assert outcome.error is None
+
+
+async def test_a_readiness_budget_that_never_answers_becomes_an_honest_defect() -> None:
+    """★ THE BOUND ON THE TEST ABOVE, and the distinction that cost this unit a round of review.
+
+    The three unanswerable checks are not the same kind of silence. A serving probe that never
+    came back, or a baseline with no root commit to compare against, describes an app that is up
+    and answering. A READINESS budget that ran out describes an app that is not serving at all —
+    and once patience is spent, a full budget several times over has stopped being our impatience
+    and become a fact about the app. Telling that citizen their app "looks like it's running"
+    would be a new false claim in the plan whose whole purpose is removing one.
+
+    Mutation check: drop the `Unanswered.READINESS` conversion and this goes red on the state."""
+    fake = FakeSandbox()
+    await fake.dev_start(fake.handle())  # running, and it never becomes ready
+
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=2, indeterminate_retries=2)
+
+    assert outcome.state is HealthState.UNHEALTHY
+    assert outcome.error is not None and "did not report ready" in outcome.error.title
+    assert outcome.dev_ready is False
+
+
+async def test_an_unanswered_probe_does_not_become_a_startup_defect() -> None:
+    """The companion bound, and the one that keeps the conversion narrow. This app IS serving —
+    it answered readiness — and only our own request came back empty. Converting that into "the
+    dev server did not report ready" would be the fabricated diagnosis all over again."""
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.warm_status = None
+
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=2, indeterminate_retries=1)
 
     assert outcome.state is HealthState.INDETERMINATE
-    assert outcome.error is None, "we learned nothing, so there is nothing to diagnose"
-    assert outcome.dev_ready is False
+    assert outcome.error is None
 
 
 async def test_a_dev_process_that_is_down_is_still_a_defect() -> None:
@@ -968,3 +1019,132 @@ async def test_a_dev_server_that_never_came_up_is_not_asked_for_a_page() -> None
 
     assert outcome.dev_ready is False
     assert fake.warm_calls == 0, "nothing to ask, so we do not spend the budget asking"
+
+
+async def test_a_root_route_that_redirects_counts_as_serving() -> None:
+    """The plan's redirect scenario, asserted on the VERDICT rather than only on the failure copy.
+
+    An agent that replaces the root with a redirect has built something: the route compiled and
+    answered, which is the whole question the serving half asks. Reading 3xx as "not serving"
+    would fail every app whose home page sends the citizen somewhere else — a perfectly ordinary
+    shape — and the content half would never even be consulted.
+
+    Mutation check: narrow the accepted range to `200 <= status < 300` and this goes red."""
+    for status in (301, 302, 307, 308):
+        fake = FakeSandbox()
+        fake.dev_ready = True
+        fake.warm_status = status
+
+        outcome, _ = await _verify(fake, log_cursor=0, max_polls=3, had_prior_building_turns=True)
+
+        assert outcome.state is HealthState.HEALTHY, f"{status} answered — the route compiled"
+        assert outcome.error is None
+
+
+async def test_an_indeterminate_verdict_never_reaches_a_teardown_or_a_restore(
+    db_session, billing_factory, sink
+) -> None:
+    """★ The plan's directly-asserted safety property: no ambiguous verdict may reach a
+    destructive branch.
+
+    Asserted on the CONTAINER rather than on a code path, because that is what actually matters —
+    `teardown_calls` counts every delete this build could have caused, and the fake records one
+    whether the caller was the loop, the funnel or a compensation."""
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.warm_status = None  # the serving probe never comes back: INDETERMINATE, forever
+    turns = [
+        t for _ in range(4) for t in (tool_turn("declare_done", {"summary": "x"}), text_turn())
+    ]
+    orchestrator, _ = make_orchestrator(scripted_model(turns), billing_factory)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    assert result.status == BuildSessionStatus.FAILED  # liveness: the build really did run
+    assert fake.teardown_calls == 0, "an unanswerable verdict may not destroy a container"
+    # …nor provision over one. `provision_new` is what a restore lands through on this fake, and
+    # a build that re-provisioned mid-loop would have replaced the workspace it was judging.
+    assert fake.dev_start_calls >= 1, "liveness: the loop really did drive the container"
+
+
+async def test_an_unanswerable_verdict_does_not_wear_the_failure_label(
+    db_session, billing_factory, sink
+) -> None:
+    """★ The plan's "does not produce a 'Not green yet' failure label either" scenario.
+
+    "Not green yet" over a check that could not be REACHED tells the citizen their app is broken
+    on the strength of our own timeout — the platform blaming the app for its own silence, which
+    is the same shape of untruth as claiming a build finished when it did not.
+
+    Mutation check: delete the INDETERMINATE arm of the three-arm label block and this goes red."""
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.warm_status = None
+    turns = [tool_turn("declare_done", {"summary": "x"}), text_turn()]
+    orchestrator, _ = make_orchestrator(scripted_model(turns), billing_factory)
+
+    await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    steps = [e for e in sink.events if e.type == "step" and e.name == "declare_done"]
+    assert steps, "the declare_done spinner must be resolved, or this proves nothing"
+    assert not any("Not green yet" in (e.label or "") for e in steps)
+    assert not any(e.state == "failed" for e in steps)
+
+
+async def test_a_re_check_that_comes_back_unanswerable_is_retried_not_charged() -> None:
+    """★ The plan's "the authoritative re-check itself returns INDETERMINATE → retry, do not spend
+    a repair" scenario.
+
+    The two mechanisms compose rather than colliding: the re-check runs because the evidence could
+    be stale, and when the fresh pass cannot answer either, patience takes over. What must NOT
+    happen is the pair resolving into a defect the citizen is charged for — the crash marker is
+    behind the cursor by then, so calling it red would be reporting evidence nobody re-read.
+
+    Mutation check: return on the first INDETERMINATE and the pass count goes red."""
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.push_dev_logs("⨯ unhandledRejection Error: from before the fix")
+    fake.changed_since_watermark = True  # the agent wrote: the marker may be stale
+    fake.warm_status = None  # …and the fresh pass cannot reach the app either
+
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=2, indeterminate_retries=2)
+
+    assert outcome.state is HealthState.INDETERMINATE
+    assert outcome.error is None, "no defect was established, so none is reported"
+    # One pass, one re-check, then the patience budget — never a verdict on the first silence.
+    assert fake.command_calls.count(["npx", "tsc", "--noEmit"]) == 4
+
+
+async def test_the_re_check_does_not_carry_a_browser_crash_out_of_the_verdict() -> None:
+    """★ A FALSE GREEN THE FIX FOR U9 WOULD OTHERWISE HAVE CREATED.
+
+    `drain_client_errors` is destructive: it takes the parked reports and forgets them. The
+    ordered chain ranks a dev-log crash marker ABOVE the browser reports, so a pass can come back
+    UNHEALTHY-on-log-evidence having already consumed a real browser crash — and then U9 throws
+    that whole pass away and looks again. Pass two drains an empty queue, sees a clean log window,
+    and calls the app healthy. A crash the browser positively observed disappears between two
+    looks at the same app, which is exactly the class of lie this plan exists to remove, created
+    by the fix for a different one.
+
+    "A report counts against exactly one verdict" is a statement about `verify`'s ANSWER, never
+    about each attempt at it.
+
+    Mutation check: drop `carried_reports` from the drain and this goes green — verified."""
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.push_dev_logs("⨯ unhandledRejection Error: printed before the agent's edit")
+    fake.changed_since_watermark = True  # so the re-check fires
+    park_client_error(
+        fake.handle().app_name,
+        source="window.onerror",
+        title="Cannot read properties of undefined (reading 'map')",
+        stack="at RecordsTable (app/records/page.tsx:41:19)",
+    )
+
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3)
+
+    assert fake.command_calls.count(["npx", "tsc", "--noEmit"]) == 2, "the re-check really ran"
+    assert outcome.state is HealthState.UNHEALTHY, "the browser crash survived the re-check"
+    assert outcome.error is not None and outcome.error.source is ErrorSource.CLIENT

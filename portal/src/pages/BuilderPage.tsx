@@ -2438,11 +2438,17 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                (the preview probe above). Gating it would blank the signal the moment the user
                opened a sibling chat, and blanking it is what leaves an error screen uncovered. */
             compileState={turnCompile}
-            /* Which of the cover's two sentences is true — see `turnRunning` on the pane. Read
-               off the same per-chat generating flag the composer uses, because "a turn is
-               running" is the fact both are asking about; a second source for it would be a
-               second thing to keep in step. */
-            turnRunning={generatingChatId !== null}
+            /* Which of the cover's sentences is true — see `turnRunning` on the pane.
+               SCOPED TO THIS PROJECT, not merely to "some turn somewhere". One BuilderPage
+               instance survives a project switch and `generatingChatId` is cleared only by the
+               finishing chat's own handler, so the bare `!== null` form kept project B's pane
+               claiming "putting the latest change together" about a turn running on project A.
+               `builds` is this project's conversations; the open chat is checked separately
+               because a brand-new one is not in that list yet. */
+            turnRunning={
+              generatingChatId !== null &&
+              (generatingChatId === buildId || builds.some((b) => b.id === generatingChatId))
+            }
             onFrameMessage={handleFrameMessage}
           />
         </div>

@@ -39,7 +39,7 @@ import asyncio
 import enum
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Final
 
 import structlog
@@ -276,6 +276,21 @@ class VerifyOutcome:
     # check was not consulted at all — a brand-new app with no prior building turns is SUPPOSED to
     # be showing the template, so asking would only produce a false accusation.
     baseline: BaselineIdentity | None = None
+    # WHICH check could not be answered, on an INDETERMINATE verdict — `None` on every other.
+    #
+    # THE THREE ARE NOT THE SAME KIND OF SILENCE, and collapsing them cost this a round of
+    # review. A serving probe that never came back, or a baseline with no root commit to compare
+    # against, describes an app that is up and answering: "we could not confirm this change went
+    # in" is true of it. A READINESS budget that ran out describes an app that is not serving at
+    # all — and once patience is spent, thirty seconds of not coming up, three times over, has
+    # stopped being our impatience and become a fact about the app. Telling that citizen their
+    # app "looks like it's running" would be a new false claim, in the plan whose entire purpose
+    # is removing one.
+    unanswered: Unanswered | None = None
+    # The browser crash reports this pass consumed. Carried on the outcome so `verify` can hand
+    # them to a later pass rather than letting a discarded one take them to the grave — see
+    # `_verify_once`'s `carried_reports`.
+    client_reports: tuple[ClientErrorReport, ...] = ()
     # U9 — does this red verdict rest on the DEV LOG, as opposed to something derived fresh in
     # this pass? Only log evidence can be older than the agent's last edit: a type-check, a
     # serving status and a baseline comparison are all produced during the pass that reads them,
@@ -322,6 +337,24 @@ async def _try_try_again[T](step: Callable[[], Awaitable[T]]) -> T:
             await asyncio.sleep(VERIFY_RETRY_BACKOFF_S)
 
 
+_LATER_PASS_POLL_DIVISOR: Final = 3
+"""How much of the readiness budget a SECOND look at the same app gets.
+
+Not a tuning knob so much as a statement about what the second look is for: the first pass already
+waited the full budget, so re-paying it wholesale is asking the same question again rather than a
+smaller one. A third is enough to catch an app that came up moments after we stopped watching, and
+small enough that patience cannot turn one 30-second verify into a minute and a half."""
+
+
+class Unanswered(enum.StrEnum):
+    """Which check came back with no answer. See `VerifyOutcome.unanswered` for why it matters
+    which one — only `READINESS` becomes a defect once the patience budget is spent."""
+
+    READINESS = "readiness"
+    SERVING = "serving"
+    BASELINE = "baseline"
+
+
 class Readiness(enum.StrEnum):
     """How a bounded readiness poll ENDED, which is not the same question as whether it succeeded.
 
@@ -354,19 +387,6 @@ async def where_are_we(
     return Readiness.STILL_TRYING
 
 
-async def are_we_there_yet(
-    sandbox_client: SandboxClient, handle: SandboxHandle, *, max_polls: int, poll_s: float
-) -> bool:
-    """Did the dev server become ready inside the budget? The boolean read of `where_are_we`.
-
-    Kept as its own name because "is it up" is a question several callers genuinely have and none
-    of them should have to remember which of the two negative outcomes to compare against."""
-    return (
-        await where_are_we(sandbox_client, handle, max_polls=max_polls, poll_s=poll_s)
-        is Readiness.READY
-    )
-
-
 async def verify(
     sandbox_client: SandboxClient,
     handle: SandboxHandle,
@@ -378,7 +398,6 @@ async def verify(
     had_prior_building_turns: bool,
     indeterminate_retries: int = VERIFY_INDETERMINATE_RETRIES,
     indeterminate_backoff_s: float = VERIFY_INDETERMINATE_BACKOFF_S,
-    recheck_stale_log_evidence: bool = True,
 ) -> tuple[VerifyOutcome, int]:
     """The health verdict, asked with patience: run `_verify_once`, and when it comes back
     INDETERMINATE ask again rather than reporting a defect (U6, R10, AE8).
@@ -390,22 +409,39 @@ async def verify(
     inside `_verify_once`, which has to stay a single honest pass so a test can observe one.
 
     `log_cursor` is threaded through every attempt, so a retry reads only what is genuinely new
-    and a crash printed during the first pass is not re-reported by the second.
+    and a crash printed during the first pass is not re-reported by the second — and the browser
+    crash reports a discarded pass consumed are carried into the next one, or a pass that is
+    thrown away would take a real crash with it.
 
-    At exhaustion the INDETERMINATE verdict is returned AS INDETERMINATE. The loops decide what an
-    unanswerable verdict costs; nothing here converts it into a red one behind their backs."""
+    ONE CONVERSION HAPPENS AT EXHAUSTION and it is narrow: a readiness budget that has now run out
+    several times over has stopped being our impatience and become a fact about the app, so it
+    becomes the diagnosis this loop has always given for it. The other two unanswerable checks
+    describe an app that IS serving and are returned as they are — inventing a startup fault for
+    one of those is the misdiagnosis U6 exists to remove."""
     attempts_left = indeterminate_retries
     rechecked = False
+    first_pass = True
+    # Reports an earlier pass already took out of the store, so a discarded pass cannot carry a
+    # browser crash out of the verdict with it.
+    carried: tuple[ClientErrorReport, ...] = ()
     while True:
         outcome, log_cursor = await _verify_once(
             sandbox_client,
             handle,
             log_cursor=log_cursor,
-            max_polls=max_polls,
+            # A LATER PASS DOES NOT RE-PAY THE WHOLE READINESS BUDGET. The commonest reason to be
+            # on one is that the budget just ran out, so spending it again in full turns a 30s
+            # wait into 90 — measured at 93 `dev_status` calls for one `verify`. A later pass asks
+            # "has it come up in the last few seconds", which is a far smaller question than the
+            # first one asked, and `max(1, …)` keeps it a question rather than a formality.
+            max_polls=max_polls if first_pass else max(1, max_polls // _LATER_PASS_POLL_DIVISOR),
             poll_s=poll_s,
             app_id=app_id,
             had_prior_building_turns=had_prior_building_turns,
+            carried_reports=carried,
         )
+        first_pass = False
+        carried = outcome.client_reports
         # U9 / R15 — ONE AUTHORITATIVE RE-CHECK BEFORE A REPAIR ROUND-TRIP IS BOUGHT. Three of the
         # four repair cycles in the 2026-08-18 demo were the platform re-reporting errors it had
         # already fixed, and the mechanism is structural: `log_cursor` bounds the read by log
@@ -413,17 +449,18 @@ async def verify(
         # and a dead child's last words are deliberately carried forward. So a crash printed before
         # the agent's edit can be read after it and charged as a fresh defect.
         #
-        # Gated on the EVIDENCE, not on the verdict, and that gate is what keeps this cheap: a
-        # failed type-check, a 500 from the root route and a baseline comparison are all produced
-        # during the pass that reads them and cannot be stale, so they never buy a second pass.
-        # Only the log tail can be older than the edit.
+        # Gated on the EVIDENCE, not on the verdict, and that gate is what keeps this both cheap
+        # and safe: a failed type-check, a 500 from the root route and a baseline comparison are
+        # all produced during the pass that reads them and cannot be stale, so they never buy a
+        # second pass — and a dead child's last words, which nothing re-emits, are excluded for
+        # the opposite reason (a second look at them would read an empty window and call the
+        # death fixed).
         #
         # `changed is True`, never a truthiness test: `None` means the container could not answer,
         # and the honest response to that is today's behaviour rather than a re-check we cannot
         # justify. Once per call, so a container that keeps changing cannot loop this.
         if (
-            recheck_stale_log_evidence
-            and not rechecked
+            not rechecked
             and outcome.state is HealthState.UNHEALTHY
             and outcome.rests_on_log_evidence
         ):
@@ -435,7 +472,14 @@ async def verify(
                     app_id=str(app_id),
                 )
                 continue
-        if outcome.state is not HealthState.INDETERMINATE or attempts_left <= 0:
+        if outcome.state is not HealthState.INDETERMINATE:
+            return outcome, log_cursor
+        if attempts_left <= 0:
+            # PATIENCE SPENT. See the docstring: only the readiness arm converts, and only here.
+            if outcome.unanswered is Unanswered.READINESS:
+                return replace(
+                    outcome, state=HealthState.UNHEALTHY, error=dev_not_ready_error()
+                ), log_cursor
             return outcome, log_cursor
         attempts_left -= 1
         logger.info(
@@ -443,6 +487,7 @@ async def verify(
             app=handle.app_name,
             app_id=str(app_id),
             attempts_left=attempts_left,
+            unanswered=outcome.unanswered,
             served_status=outcome.served.status if outcome.served else None,
             baseline=outcome.baseline,
         )
@@ -491,9 +536,14 @@ async def _verify_once(
     poll_s: float,
     app_id: uuid.UUID,
     had_prior_building_turns: bool,
+    carried_reports: tuple[ClientErrorReport, ...] = (),
 ) -> tuple[VerifyOutcome, int]:
     """One pass of the cheap harness verify, returning `(outcome, new_log_cursor)`. Reads only the
-    NEW dev logs since `log_cursor` so a crash from an earlier run is never re-reported."""
+    NEW dev logs since `log_cursor` so a crash from an earlier run is never re-reported.
+
+    `carried_reports` are the browser crash reports an EARLIER pass of the same `verify` call
+    already drained out of the store. A tuple, so the shared default cannot be mutated by anything
+    and the usual mutable-default hazard does not arise."""
     run_command = sandbox_client.exec  # aliased to keep the call off the JS-oriented exec guard
     # Every sandbox hop gets the bounded transient-retry (`_try_try_again`): a blip here would
     # otherwise escalate the whole build as a hard internal_error.
@@ -605,7 +655,14 @@ async def _verify_once(
     # every remaining verify of the build and burn the whole self-heal budget re-reporting itself
     # while the agent fixed it on the first pass. If the crash is still there after the repair,
     # the browser is still framing the app and says so again.
-    client_reports = drain_client_errors(handle.app_name)
+    # CARRIED, not merely drained. `drain_client_errors` is destructive and `verify` may run this
+    # more than once — for its INDETERMINATE patience and for U9's re-check — so a report consumed
+    # by a pass that is then discarded is gone from the pass that actually decides. That is a
+    # browser crash flipping the verdict from UNHEALTHY to HEALTHY between two looks at the same
+    # app: the false green this plan exists to remove, reintroduced by the fix for a different
+    # one. "A report counts against exactly one verdict" is a statement about `verify`'s ANSWER,
+    # never about each attempt at it.
+    client_reports = [*carried_reports, *drain_client_errors(handle.app_name)]
     # Only a CRASH gates the verdict — see `NON_FATAL_CLIENT_SOURCES`. Both lists are kept: the
     # fatal ones decide, the full set is what the agent gets to read when they decide red.
     fatal_reports = [r for r in client_reports if r.source not in NON_FATAL_CLIENT_SOURCES]
@@ -621,16 +678,24 @@ async def _verify_once(
     error: BuildError | None = None
     state = HealthState.HEALTHY
     rests_on_log_evidence = False
+    unanswered: Unanswered | None = None
     if not tsc_ok:
         state = HealthState.UNHEALTHY
         error = from_tsc(f"{typecheck.stdout}\n{typecheck.stderr}")
     elif server_crash is not None:
         state = HealthState.UNHEALTHY
         error = from_server(server_crash)
-        rests_on_log_evidence = True
+        # RE-CHECKABLE ONLY WHILE THE APP IS ANSWERING. Next re-emits its diagnostic on every
+        # request, so a second pass that requests the route either reproduces the marker or
+        # proves it stale. Against a server that is not serving there is nothing to ask, and a
+        # clean empty window would mean "we did not look", not "it is fixed".
+        rests_on_log_evidence = dev_ready
     elif dev_died and not dev_ready:
+        # NOT re-checkable, and the distinction is the whole safety of U9. A crash MARKER is
+        # re-produced by requesting the route again, so a second pass can tell a stale one from a
+        # current one. A dead child's last words cannot be: nothing re-emits them, so a re-check
+        # would read an empty window and call the death fixed.
         state = HealthState.UNHEALTHY
-        rests_on_log_evidence = True
         error = dev_died_error(
             exit_code=status.exit_code,
             restarted=restarted,
@@ -649,6 +714,7 @@ async def _verify_once(
         # stopped waiting, the app did not stop starting. This was red before U6 and cost a
         # repair run, a diagnostic the agent could not act on, and the user's tokens (AE8).
         state = HealthState.INDETERMINATE
+        unanswered = Unanswered.READINESS
     elif not dev_ready:
         # Not ready, not still-trying and not caught by the died arm above: the process is down
         # and the restart did not take. A real defect with nothing else to say about it.
@@ -658,6 +724,7 @@ async def _verify_once(
         # THE APP MAY WELL BE SERVING; OUR REQUEST DID NOT COME BACK. Calling that broken is how
         # a working app gets told it did not come together, so it is a re-check, not a verdict.
         state = HealthState.INDETERMINATE
+        unanswered = Unanswered.SERVING
     elif not (200 <= served.status < 400):
         # R9's serving half. A 3xx counts as serving: the route compiled and answered, which is
         # the whole question — an agent that replaced the root with a redirect built something.
@@ -668,6 +735,7 @@ async def _verify_once(
         # and never HEALTHY: an app cannot be convicted of showing the template by a check that
         # could not find the template, and it cannot be cleared by one either.
         state = HealthState.INDETERMINATE
+        unanswered = Unanswered.BASELINE
     elif baseline is BaselineIdentity.STILL_THE_BASELINE:
         # R9's content half, and the 2026-08-18 headline. Every server-side check above came back
         # clean and the citizen is looking at the golden template.
@@ -700,4 +768,6 @@ async def _verify_once(
         served=served,
         baseline=baseline,
         rests_on_log_evidence=rests_on_log_evidence,
+        client_reports=tuple(client_reports),
+        unanswered=unanswered,
     ), logs.next_cursor

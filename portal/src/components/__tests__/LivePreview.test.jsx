@@ -989,8 +989,11 @@ const HOLDING_SLOW = /taking longer than usual — it will appear here/i
 const ESCALATE_MS = 20000
 
 // …and what the cover says when no turn is running, so the holding wording cannot outlive the
-// work it describes (U7/R13).
-const STOPPED = /Your app stopped running and needs to be brought back/i
+// work it describes (U7/R13). TWO sentences, because the cover's two idle causes are opposites:
+// `failed` means the app is not usable, `building` means it is compiling a route right now —
+// which a perfectly healthy completed app does on demand.
+const IDLE_BROKEN = /Your app isn.t running right now/i
+const IDLE_BUSY = /Getting your app ready/i
 
 /** The cover is an opaque, full-bleed element over the frame. Identified by what makes it a
  *  cover rather than by a test id, so a refactor that stops covering fails here — and matched
@@ -1004,7 +1007,8 @@ function coverEl(container) {
       el.textContent &&
       (HOLDING.test(el.textContent) ||
         HOLDING_SLOW.test(el.textContent) ||
-        STOPPED.test(el.textContent)),
+        IDLE_BROKEN.test(el.textContent) ||
+        IDLE_BUSY.test(el.textContent)),
   )
 }
 
@@ -1246,7 +1250,7 @@ function loadTheFrame(container) {
 }
 
 describe('LivePreview — the holding state stops when the turn does (U7/R13)', () => {
-  it('says the app stopped running once no turn is in flight, and stops claiming progress', () => {
+  it('says the app is not running once no turn is in flight, and stops claiming progress', () => {
     // THE FAILURE THIS CLOSES. "Putting the latest change together…" is true for exactly as long
     // as a turn is running. Left up after one ends it becomes a progress state that never
     // resolves — the citizen's only way to learn the build was over is to wait long enough to
@@ -1255,8 +1259,20 @@ describe('LivePreview — the holding state stops when the turn does (U7/R13)', 
 
     const cover = coverEl(container)
     expect(cover).toBeTruthy() // LIVENESS: still covering; what is behind it is still an error
-    expect(cover.textContent).toMatch(STOPPED)
+    expect(cover.textContent).toMatch(IDLE_BROKEN)
     expect(cover.textContent).not.toMatch(HOLDING)
+  })
+
+  it('does NOT tell a healthy idle app that it stopped — `building` is not `failed`', () => {
+    // ★ The two idle causes are opposites. `building` is published for any on-demand route
+    // compile inside a running app, so a single "your app isn't running" sentence would be shown
+    // over a working, completed build every time the citizen clicked through to a new page.
+    const { container } = setup({ compileState: 'building', turnRunning: false })
+
+    const cover = coverEl(container)
+    expect(cover).toBeTruthy() // LIVENESS
+    expect(cover.textContent).toMatch(IDLE_BUSY)
+    expect(cover.textContent).not.toMatch(IDLE_BROKEN)
   })
 
   it('switches wording when a running turn ends, without uncovering the error screen', () => {
@@ -1267,7 +1283,7 @@ describe('LivePreview — the holding state stops when the turn does (U7/R13)', 
       <LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="failed" turnRunning={false} />,
     )
 
-    expect(coverEl(container).textContent).toMatch(STOPPED)
+    expect(coverEl(container).textContent).toMatch(IDLE_BROKEN)
     // The cover STAYS. Clearing it would trade a lie about progress for a lie about the app —
     // behind it is the framework's error screen today and a blank page once that is suppressed.
     expect(container.querySelector('iframe')).toBeTruthy()
@@ -1278,7 +1294,7 @@ describe('LivePreview — the holding state stops when the turn does (U7/R13)', 
     try {
       const { container } = setup({ compileState: 'building', turnRunning: false })
       act(() => vi.advanceTimersByTime(ESCALATE_MS * 2))
-      expect(coverEl(container).textContent).toMatch(STOPPED)
+      expect(coverEl(container).textContent).toMatch(IDLE_BUSY)
       expect(coverEl(container).textContent).not.toMatch(HOLDING_SLOW)
     } finally {
       vi.useRealTimers()
@@ -1289,7 +1305,34 @@ describe('LivePreview — the holding state stops when the turn does (U7/R13)', 
     const { container } = setup({ compileState: 'failed', turnRunning: false })
     const regions = container.querySelectorAll('[role="status"]')
     expect(regions).toHaveLength(1) // still no second live region
-    expect(regions[0].textContent).toMatch(STOPPED)
+    expect(regions[0].textContent).toMatch(IDLE_BROKEN)
+  })
+
+  it('re-arms the escalation for a NEW turn rather than opening in a stale complaint', () => {
+    // ★ The escalated wording is a claim about how long THIS change has been coming together,
+    // and `covered` does not fall between turns: a failed turn leaves the compile state at
+    // `failed`. Armed off `covered` alone, a cover raised twenty seconds into turn 1 was still
+    // armed when turn 2 began, so the new turn opened by telling the citizen it was already
+    // taking longer than usual.
+    vi.useFakeTimers()
+    try {
+      const { container, rerender } = setup({ compileState: 'building', turnRunning: true })
+      act(() => vi.advanceTimersByTime(ESCALATE_MS))
+      expect(coverEl(container).textContent).toMatch(HOLDING_SLOW)
+
+      // The turn ends, then a new one starts — the compile state never left `building`.
+      rerender(
+        <LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="building" turnRunning={false} />,
+      )
+      rerender(
+        <LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="building" turnRunning />,
+      )
+
+      expect(coverEl(container).textContent).toMatch(HOLDING)
+      expect(coverEl(container).textContent).not.toMatch(HOLDING_SLOW)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 
@@ -1368,10 +1411,25 @@ describe('LivePreview — the reveal is earned twice over (U10/R11)', () => {
     )
   })
 
-  it('keeps the announcement honest: an unrevealed frame is not "your app preview is live"', () => {
-    const { container } = setup({ compileState: 'failed', turnRunning: false })
-    loadTheFrame(container)
-    expect(container.querySelector('[role="status"]').textContent).not.toMatch(/preview is live/i)
+  it('documents the null/unknown concession rather than leaving it to be discovered', () => {
+    // ★ WHAT THIS UNIT DOES NOT CLOSE, pinned so it cannot drift silently. `covered` moves on
+    // building/failed/clean and HOLDS on `unknown` and `null` — so with no compile verdict ever
+    // reported, the load still reveals on its own, exactly as it did before this unit. That is
+    // every container on an image older than the compile endpoint, and the opening moments of
+    // every turn.
+    //
+    // It is a deliberate compatibility concession: gating on a POSITIVE verdict would leave the
+    // whole existing fleet's preview permanently blank, which is worse than the failure being
+    // fixed. If someone later decides to close it, this test is what tells them they are
+    // changing a decision rather than fixing an oversight.
+    for (const compileState of [null, 'unknown']) {
+      const view = render(
+        <LivePreview previewUrl={SANDBOX_URL} status="ready" compileState={compileState} />,
+      )
+      loadTheFrame(view.container)
+      expect(deviceCard(view.container).className).toMatch(/opacity-100/)
+      cleanup()
+    }
   })
 })
 

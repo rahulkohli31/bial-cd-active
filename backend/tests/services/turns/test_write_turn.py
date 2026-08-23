@@ -63,6 +63,7 @@ from src.services.storage import snapshot_key
 from src.services.turns import copy as copy_module
 from src.services.turns import engine as engine_module
 from src.services.turns.copy import (
+    COULD_NOT_CONFIRM_TEXT,
     DID_NOT_COME_TOGETHER_TEXT,
     STILL_SHOWING_EARLIER,
     STILL_SHOWING_NOTHING,
@@ -1407,7 +1408,7 @@ def test_each_showing_arm_is_read_off_the_verdict() -> None:
     nothing = VerifyOutcome(
         state=HealthState.UNHEALTHY, dev_ready=False, error=None, preview_url=None
     )
-    assert _what_it_is_showing(nothing) == STILL_SHOWING_NOTHING
+    assert _what_it_is_showing(nothing, ever_built=True) == STILL_SHOWING_NOTHING
 
     a_500 = VerifyOutcome(
         state=HealthState.UNHEALTHY,
@@ -1416,7 +1417,9 @@ def test_each_showing_arm_is_read_off_the_verdict() -> None:
         preview_url=None,
         served=ServedPage(status=500, head=""),
     )
-    assert _what_it_is_showing(a_500) == STILL_SHOWING_NOTHING, "answering 500 is not a version"
+    assert _what_it_is_showing(a_500, ever_built=True) == STILL_SHOWING_NOTHING, (
+        "answering 500 is not a version"
+    )
 
     template = VerifyOutcome(
         state=HealthState.UNHEALTHY,
@@ -1426,7 +1429,7 @@ def test_each_showing_arm_is_read_off_the_verdict() -> None:
         served=ServedPage(status=200, head="<html>"),
         baseline=BaselineIdentity.STILL_THE_BASELINE,
     )
-    assert _what_it_is_showing(template) == STILL_SHOWING_TEMPLATE
+    assert _what_it_is_showing(template, ever_built=True) == STILL_SHOWING_TEMPLATE
 
     earlier = VerifyOutcome(
         state=HealthState.UNHEALTHY,
@@ -1436,7 +1439,7 @@ def test_each_showing_arm_is_read_off_the_verdict() -> None:
         served=ServedPage(status=200, head="<html>"),
         baseline=BaselineIdentity.DIVERGED,
     )
-    assert _what_it_is_showing(earlier) == STILL_SHOWING_EARLIER
+    assert _what_it_is_showing(earlier, ever_built=True) == STILL_SHOWING_EARLIER
 
     unasked = VerifyOutcome(
         state=HealthState.UNHEALTHY,
@@ -1445,7 +1448,22 @@ def test_each_showing_arm_is_read_off_the_verdict() -> None:
         preview_url=None,
         served=ServedPage(status=307, head=""),
     )
-    assert _what_it_is_showing(unasked) == STILL_SHOWING_EARLIER, "a redirect served something"
+    assert _what_it_is_showing(unasked, ever_built=True) == STILL_SHOWING_EARLIER, (
+        "a redirect served something"
+    )
+
+    # THE FIRST BUILD, and the likeliest way this sentence is ever read. The content check is not
+    # asked of an app nobody has built yet, so `baseline` is None — and the residual arm would
+    # tell the citizen their app is showing "an earlier version of itself" while they are looking
+    # at the starting template. There is no earlier version. This is it.
+    first_build = VerifyOutcome(
+        state=HealthState.UNHEALTHY,
+        dev_ready=True,
+        error=None,
+        preview_url=None,
+        served=ServedPage(status=200, head="<html>"),
+    )
+    assert _what_it_is_showing(first_build, ever_built=False) == STILL_SHOWING_TEMPLATE
 
 
 def test_no_sentence_this_plan_shows_a_citizen_carries_developer_jargon() -> None:
@@ -1636,25 +1654,31 @@ async def test_an_unanswerable_verdict_is_never_narrated_as_a_defect(
     fake_storage,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A verdict the platform could not reach carries no diagnostic, and the loop must not
-    invent one on its way past.
+    """★ A verdict the platform could not reach carries no diagnostic, buys no repair run, and
+    makes no completion claim.
 
-    THE TRAP THIS PINS is ten lines of `_run_write`: a red outcome with no error synthesizes
-    `dev_not_ready_error()`, so an INDETERMINATE verdict flowing through that line would hand
-    the model a SERVER diagnosis that is both rendered and wrong — the citizen reading "the dev
-    server did not report ready" about an app that is serving perfectly well, and the agent
-    spending a repair run chasing it. That is the exact misdiagnosis the third state exists to
-    end, reappearing one arm downstream of where it was fixed.
+    RUN AT THE REAL BUDGET, and that is the whole point of the fixture. An earlier version of
+    this test forced `SELF_HEAL_MAX_RETRIES` to 0, which short-circuits into the budget-exhausted
+    raise before either line it claims to pin is reached — so its absence assertion could not fail
+    for ANY implementation, and it passed while production did exactly the thing it forbids.
 
-    `verify`'s own patience is what makes this rare — it asks again before reporting anything —
-    and this is what happens when the answer never comes. Mutation check: emit the diagnostic
-    frame for every source and this goes red."""
+    THE TRAP IT PINS is ten lines of `_run_write`: a red outcome with no error synthesizes
+    `dev_not_ready_error()`, so an INDETERMINATE verdict flowing through that line hands the
+    citizen a SERVER diagnosis that is both rendered and wrong — "the dev server did not report
+    ready" about an app that reported ready — and re-seeds the model to repair a fault that does
+    not exist. That is the misdiagnosis the third state exists to end, reappearing one arm
+    downstream of where it was fixed.
+
+    Mutation check: change the guard back to `if error is None and not outcome.green` and this
+    goes red on the diagnostic, the reason and the verify count."""
     engine = _fresh_engine
     user, project, conv = await _write_conversation(db_session, "wt-indet@rvaiglobal.com")
     manager, client = SessionManager(), FakeSandboxClient()
-    monkeypatch.setattr(engine_module, "SELF_HEAL_MAX_RETRIES", 0)
+    monkeypatch.setattr(engine_module, "SELF_HEAL_MAX_RETRIES", 3)  # the production budget
+    calls = {"verify": 0}
 
     async def _cannot_tell(*_a: object, **_k: object) -> tuple[VerifyOutcome, int]:
+        calls["verify"] += 1
         return (
             VerifyOutcome(
                 state=HealthState.INDETERMINATE,
@@ -1680,11 +1704,15 @@ async def test_an_unanswerable_verdict_is_never_narrated_as_a_defect(
         client=client,
     )
 
-    # LIVENESS: the turn really did run and really did reach a terminal, so the absence below
-    # is about the diagnostic and not about a turn that never happened.
-    assert state.status in {"failed", "completed"}
-    assert state.verdict is HealthState.INDETERMINATE
+    # LIVENESS: the turn really ran and really reached a verdict, so the absences below are about
+    # the diagnostic rather than about a turn that never happened.
+    assert calls["verify"] == 1, "one verify, and no repair round-trip bought on the back of it"
+    assert state.status == "failed"
+
     # ABSENCE: nothing was narrated as a defect. There was no defect — there was no answer.
     assert _diagnostic_frames(state) == []
-    # …and no completion claim either. Unanswerable is not green.
-    assert state.status == "failed"
+    # …and the ending says what actually happened, in the citizen's words.
+    assert state.end_reason == "verdict_unanswerable"
+    assert state.error_message == COULD_NOT_CONFIRM_TEXT
+    # …and no completion claim. Unanswerable is not green.
+    assert "complete" not in (state.error_message or "").lower()
