@@ -112,11 +112,25 @@ const HOLDING_ESCALATE_MS = 20000
 // NEITHER CLEARS THE COVER. Behind it is the framework's error screen today and a blank page once
 // that is suppressed, so clearing would trade a lie about progress for a lie about the app.
 //
-// Deliberately NOT the retraction sentence a later unit adds. That one means the workspace was
-// lost and a restore is coming; promising a restore for a compile error would be a third lie.
+// Deliberately NOT the retraction sentence below. That one means the workspace was lost and a
+// restore is coming; promising a restore for a compile error would be a third lie.
 const IDLE_BUSY_TEXT = 'Getting your app ready…'
 const IDLE_BROKEN_TEXT =
   'Your app isn\u2019t running right now. Send a message describing what you\u2019d like and we\u2019ll get it working.'
+
+// U4/R7 — THE RETRACTION, and it goes on the PANE rather than in the chat because no turn is
+// running. Nobody is looking at the transcript; they are looking at what they believe is their
+// app, above a message that says it is finished.
+//
+// IT PROMISES A RESTORE, and unlike every other sentence in this file it is entitled to: the next
+// turn's integrity gate finds the same reversion, puts the app back from the last durable copy,
+// and says so. That is why the promise is here and not on `IDLE_BROKEN_TEXT`, which describes a
+// compile failure that no restore would fix.
+//
+// It OUTRANKS both idle sentences. "Getting your app ready" over a workspace that has been wiped
+// is the exact false-progress claim this whole plan exists to remove.
+const STOPPED_RUNNING_TEXT =
+  'Your app stopped running and needs to be brought back. Send a message and we\u2019ll restore it.'
 
 /** The headline for a pane whose container is not serving this project — C3 §8.3.
  *
@@ -335,6 +349,10 @@ export interface LivePreviewProps {
   // an app that is broken is just as broken between turns, and the error screen behind the cover
   // does not become safe to show because the build stopped.
   turnRunning?: boolean
+  // U4/R7 — the idle probe found this app's workspace reverted. It outranks every other cover
+  // sentence because it is the only one that is a fact about the WORKSPACE rather than about a
+  // compile: the others all describe an app that is still there.
+  workspaceLost?: boolean
   // `slot_taken` only — the sibling project standing in the way, so the copy can name it.
   occupyingProjectName?: string | null
   saveDirty?: boolean | null
@@ -373,6 +391,7 @@ export default function LivePreview({
   // is quietly in flight costs them one message. The reverse — claiming work is in progress when
   // none is — is the failure this prop exists to prevent.
   turnRunning = false,
+  workspaceLost = false,
   occupyingProjectName = null,
   // The save model (KTD-5e). `saveDirty` is TRI-STATE: true = unsaved work, false = saved,
   // null = UNKNOWN (no live workspace, or the server could not compare). Unknown must not
@@ -531,7 +550,12 @@ export default function LivePreview({
   // (restoring / terminal / reconnecting / unavailable) already replaces the frame entirely, and
   // `showFrame` is false in every one of those states — so this single conjunction expresses the
   // whole of `showRestoring > showTerminal > showReconnecting > showUnavailable > cover`.
-  const showCover = showFrame && covered
+  //
+  // U4 — AND A CONFIRMED REVERSION COVERS UNCONDITIONALLY. Every other reason to cover is a fact
+  // about a COMPILE, so it is right that they defer to a compile signal that says clean. This one
+  // is a fact about the workspace: the app behind the frame is not the citizen's app, and a clean
+  // compile of the starter template is exactly the state that would otherwise leave it revealed.
+  const showCover = showFrame && (covered || workspaceLost)
 
   // …and the escalation, exactly once.
   //
@@ -565,13 +589,19 @@ export default function LivePreview({
   //
   // The escalation is inside the running arm rather than beside it, because "taking longer than
   // usual" is the same claim with more emphasis — if the first sentence has expired, so has this.
-  const coverText = turnRunning
-    ? holdingSlow
-      ? HOLDING_SLOW_TEXT
-      : HOLDING_TEXT
-    : compileState === 'failed'
-      ? IDLE_BROKEN_TEXT
-      : IDLE_BUSY_TEXT
+  //
+  // AND A CONFIRMED REVERSION OUTRANKS EVERYTHING, running turn or not. It is the only one of
+  // these that is a fact about the WORKSPACE rather than about a compile; the others all describe
+  // an app that is still there.
+  const coverText = workspaceLost
+    ? STOPPED_RUNNING_TEXT
+    : turnRunning
+      ? holdingSlow
+        ? HOLDING_SLOW_TEXT
+        : HOLDING_TEXT
+      : compileState === 'failed'
+        ? IDLE_BROKEN_TEXT
+        : IDLE_BUSY_TEXT
 
   const [loadedUrl, setLoadedUrl] = useState<string | null>(null)
   const [stalledUrl, setStalledUrl] = useState<string | null>(null)

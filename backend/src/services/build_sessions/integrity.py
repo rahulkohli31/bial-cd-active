@@ -56,6 +56,7 @@ from typing import Final
 import structlog
 
 from src.core.integrity_types import BaselineIdentity
+from src.core.integrity_types import WorkspaceState as WorkspaceState
 from src.services.sandbox import SandboxClient, SandboxError, SandboxHandle
 from src.services.storage import (
     StorageError,
@@ -574,25 +575,6 @@ async def container_state(
 # handling, and collapsing them is how a user gets locked out of their own project by a
 # supervisor blip.
 # ─────────────────────────────────────────────────────────────────────────────────────────
-
-
-class WorkspaceState(enum.StrEnum):
-    """Whether this container still holds the app it is supposed to hold."""
-
-    #: The workspace holds this app's work — or there was never any to hold. The turn proceeds
-    #: exactly as it does today.
-    INTACT = "intact"
-    #: Positively confirmed loss: the lineage is broken, the tree is empty, AND this app has
-    #: been built before. The ONLY state that may restore.
-    REVERTED = "reverted"
-    #: Transient — an exec error, a timeout, a storage blip. Retryable, and capped: after two
-    #: consecutive unreadable answers for one app the third is `UNVERIFIABLE`, so no run of bad
-    #: luck can wedge a user out of their project.
-    UNREADABLE = "unreadable"
-    #: Structural — retrying cannot help. Proceed under alarm with one plain sentence, never
-    #: restore, and U3 refuses this turn's recovery write so an unexplained tree cannot become
-    #: the newest copy of the user's work.
-    UNVERIFIABLE = "unverifiable"
 
 
 @dataclass(frozen=True)

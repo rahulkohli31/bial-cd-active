@@ -27,12 +27,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
 from src.db.models.user import User
+from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions import snapshot as snapshot_module
-from src.services.build_sessions.integrity import reset_integrity_streaks_for_tests
+from src.services.build_sessions.alarms import WORKSPACE_LOST_WHILE_IDLE_EVENT
+from src.services.build_sessions.integrity import (
+    WorkspaceState,
+    reset_integrity_streaks_for_tests,
+)
 from src.services.build_sessions.manager import (
     RecoveryNews,
     SessionManager,
     WorkspaceUnreadableError,
+    reset_idle_checks_for_tests,
 )
 from src.services.build_sessions.snapshot import reset_divert_streaks_for_tests
 from src.services.sandbox import SandboxError
@@ -67,6 +73,7 @@ def _sandbox_configured(monkeypatch: pytest.MonkeyPatch) -> None:
 def _no_leaked_streaks() -> None:
     reset_integrity_streaks_for_tests()
     reset_divert_streaks_for_tests()
+    reset_idle_checks_for_tests()
 
 
 async def _mk(db: AsyncSession, email: str) -> tuple[User, uuid.UUID]:
@@ -499,3 +506,133 @@ async def test_the_slot_is_freed_even_when_the_gate_refuses(
     )
 
     assert session.restored is False
+
+
+# =============================================================================
+# U4 — the reversion that happens while nobody is sending messages
+# =============================================================================
+
+
+async def test_an_idle_reversion_is_caught_at_the_poll_and_alarmed(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ R4/R7 — THE TURN MAY NEVER COME. Every other check in this system runs at the start of a
+    turn; a citizen who is reading, or in another tab, or at lunch gets none of them, and the
+    completion claim above their preview goes on being displayed over a dead app for as long as
+    the page stays open.
+
+    Mutation check: return INTACT unconditionally from `project_workspace_check` and this goes
+    red."""
+    user, project_id = await _mk(db_session, "u4a@rvaiglobal.com")
+    manager = SessionManager()
+    client, app_id = await _attached(db_session, manager, user, project_id)
+    await _seed_recovery(fake_storage, app_id)
+    client.exec_handler = _answers(None, commits=0, ancestry="")
+    raised: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        manager_module._log, "error", lambda event, **kw: raised.append((event, kw))
+    )
+
+    state = await manager.project_workspace_check(
+        db_session, user, project_id, sandbox_client=client
+    )
+
+    assert state is WorkspaceState.REVERTED
+    assert [event for event, _ in raised] == [WORKSPACE_LOST_WHILE_IDLE_EVENT]
+    payload = raised[0][1]
+    assert payload["app_id"] == str(app_id)
+    assert payload["recovery_copy_available"] is True
+    assert payload["verdict"] == WorkspaceState.REVERTED.value
+
+
+async def test_the_idle_check_restores_nothing_and_destroys_nothing(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """★ IT ONLY REPORTS. The restore belongs to the next turn, where the citizen is present, has
+    been told, and can confirm — recovering somebody's app behind their back while they are
+    looking at another tab is not a kindness, and it would run a full teardown-and-restore under
+    a preview they are staring at."""
+    user, project_id = await _mk(db_session, "u4b@rvaiglobal.com")
+    manager = SessionManager()
+    client, app_id = await _attached(db_session, manager, user, project_id)
+    await _seed_recovery(fake_storage, app_id)
+    client.exec_handler = _answers(None, commits=0, ancestry="")
+
+    await manager.project_workspace_check(db_session, user, project_id, sandbox_client=client)
+
+    assert client.restored == []
+    assert client.torn_down == []
+    assert [k for k in fake_storage.objects if k.startswith(quarantine_prefix(app_id))] == []
+
+
+async def test_repeated_polls_inside_the_window_make_one_container_call(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """★ THE RATE LIMIT IS NOT POLITENESS. A tab left open overnight polls every 45 seconds; with
+    no window that is a container exec every 45 seconds, forever, for an answer that changes at
+    most once.
+
+    Mutation check: drop the memo and the second assertion goes red."""
+    user, project_id = await _mk(db_session, "u4c@rvaiglobal.com")
+    manager = SessionManager()
+    client, app_id = await _attached(db_session, manager, user, project_id)
+    await _seed_recovery(fake_storage, app_id)
+    asked: list[list[str]] = []
+    inner = _answers("b" * 40)
+
+    def counting(cmd: list[str]) -> ExecResult:
+        asked.append(cmd)
+        return inner(cmd)
+
+    client.exec_handler = counting
+
+    first = await manager.project_workspace_check(
+        db_session, user, project_id, sandbox_client=client
+    )
+    after_one = len(asked)
+    second = await manager.project_workspace_check(
+        db_session, user, project_id, sandbox_client=client
+    )
+
+    assert first is second is WorkspaceState.INTACT
+    assert after_one > 0, "the first ask must actually reach the container"
+    assert len(asked) == after_one, "the second must not"
+
+
+@pytest.mark.parametrize(
+    ("ancestry", "head", "commits", "expected"),
+    [
+        ("0 1", "rewound", 12, WorkspaceState.UNVERIFIABLE),
+        ("", "b" * 40, 4, WorkspaceState.UNREADABLE),
+    ],
+)
+async def test_an_unanswerable_check_does_not_retract_a_standing_claim(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+    ancestry: str,
+    head: str,
+    commits: int,
+    expected: WorkspaceState,
+) -> None:
+    """★ Neither way of not knowing may strike through a completion claim or alarm as a reversion.
+    A claim retracted because a supervisor blipped is a new false statement, made by the code that
+    exists to stop false statements."""
+    user, project_id = await _mk(db_session, f"u4d-{expected.value}@rvaiglobal.com")
+    manager = SessionManager()
+    client, app_id = await _attached(db_session, manager, user, project_id)
+    await _seed_recovery(fake_storage, app_id)
+    client.exec_handler = _answers(head, commits=commits, ancestry=ancestry)
+    raised: list[str] = []
+    monkeypatch.setattr(manager_module._log, "error", lambda event, **kw: raised.append(event))
+
+    state = await manager.project_workspace_check(
+        db_session, user, project_id, sandbox_client=client
+    )
+
+    assert state is expected
+    assert WORKSPACE_LOST_WHILE_IDLE_EVENT not in raised

@@ -352,3 +352,56 @@ describe('LivePreview — one persistent status region announces every state', (
     expect(screen.getByRole('status').textContent).toMatch(/preview is live/i)
   })
 })
+
+
+// U4/R7 — the retraction, on the surface the citizen is actually looking at.
+describe('a workspace found reverted while the tab sat idle', () => {
+  // ★ IT OUTRANKS EVERY OTHER COVER SENTENCE, running turn or not. It is the only one that is a
+  // fact about the WORKSPACE rather than about a compile; the others all describe an app that is
+  // still there. "Getting your app ready" over a workspace that has been wiped is the exact
+  // false-progress claim this plan exists to remove.
+  //
+  // Mutation check: move `workspaceLost` below `turnRunning` in the cover's ternary and the
+  // during-a-turn case goes red.
+  it.each([
+    ['idle', false],
+    ['during a turn', true],
+  ])('says the app stopped running and promises the restore (%s)', (_when, turnRunning) => {
+    render(
+      <LivePreview
+        previewUrl="https://app.example.test/"
+        status="ended"
+        completedLive
+        previewState="alive"
+        compileState="clean"
+        turnRunning={turnRunning}
+        workspaceLost
+      />,
+    )
+
+    // TWO NODES, DELIBERATELY: the visible cover and the pane's permanent live region, which
+    // announces the same sentence. `getAllBy` rather than `getBy` for that reason — and asserting
+    // on BOTH is the point, because a cover nobody hears is half the retraction.
+    expect(screen.getAllByText(/stopped running and needs to be brought back/i)).toHaveLength(2)
+    // IT PROMISES A RESTORE, and unlike every other sentence in this component it is entitled to:
+    // the next turn's integrity gate puts the app back from the last durable copy.
+    expect(screen.getAllByText(/we\u2019ll restore it/i).length).toBeGreaterThan(0)
+  })
+
+  it('leaves the ordinary idle wording alone when the workspace is fine', () => {
+    render(
+      <LivePreview
+        previewUrl="https://app.example.test/"
+        status="ended"
+        completedLive
+        previewState="alive"
+        compileState="building"
+      />,
+    )
+
+    expect(screen.queryByText(/stopped running/i)).toBeNull()
+    // LIVENESS: the cover really is up, so the absence above is a choice of wording rather than
+    // a component that rendered nothing at all.
+    expect(screen.getAllByText(/Getting your app ready/i).length).toBeGreaterThan(0)
+  })
+})

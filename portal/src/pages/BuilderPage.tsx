@@ -36,7 +36,7 @@ import { makeClientErrorRelay } from '../utils/clientErrorRelay'
 import type { TurnFrame, PlanOptionsItem, StepItem, ConversationMode, DiagnosticFrame, StreamOutcome, BuildFromPlanOutcome } from '../utils/turnStreamApi'
 import { narrativeEnvelopes, narrativeStatus } from '../utils/turnNarrative'
 import type { TurnNarrative } from '../utils/turnNarrative'
-import { fetchSaveState, saveProject, releaseProject, stopActiveBuild, asReclaimBlocked, fetchPreviewState, fetchCompileState } from '../utils/buildSessionApi'
+import { fetchSaveState, saveProject, releaseProject, stopActiveBuild, asReclaimBlocked, fetchPreviewState, fetchCompileState, checkWorkspace } from '../utils/buildSessionApi'
 import type { ReclaimBlocked, PreviewState, PreviewLifeState } from '../utils/buildSessionApi'
 import ReclaimWorkspaceDialog from '../components/projects/ReclaimWorkspaceDialog'
 import { PlanOptionsCard } from '../components/chat/PlanOptionsCard'
@@ -174,6 +174,9 @@ interface ChatMessageRowProps {
   applyPlanOverride: (item: PlanOptionsItem) => PlanOptionsItem
   onBuildIt: (toolCallId: string) => void
   onRefined: (toolCallId: string) => void
+  /** U4 — this message's claim about the app is no longer true: the workspace was found reverted
+   *  while the tab sat idle. Primitive, so the memo above still skips every other row. */
+  retracted: boolean
 }
 
 /**
@@ -195,6 +198,7 @@ const ChatMessageRow = memo(function ChatMessageRow({
   applyPlanOverride,
   onBuildIt,
   onRefined,
+  retracted,
 }: ChatMessageRowProps) {
   const buildPart = (msg.parts || []).find((p): p is BuildPart => p?.type === 'build')
   const planPart = (msg.parts || []).find(
@@ -220,7 +224,21 @@ const ChatMessageRow = memo(function ChatMessageRow({
                 ? 'bg-tertiary text-white rounded-tr-sm'
                 : 'bg-bial-bg text-tertiary rounded-tl-sm'
             }`}>
-              <MessageContent parts={bodyParts} isUser={msg.role === 'user'} compact isStreaming={isStreaming} />
+              {/* U4 — THE STANDING CLAIM IS ANNOTATED IN PLACE, NOT DELETED. The app stopped
+                  running after this message, so the message is no longer true — but it is still
+                  what happened, and rewriting history would leave a citizen scrolling a
+                  transcript that reads like a working app with no explanation of why it isn't.
+                  Struck through and dimmed says "this was true then"; the line under it says
+                  what changed. Deliberately content-agnostic: it renders over whatever the
+                  completion message happens to say, model prose or otherwise. */}
+              <div className={retracted ? 'line-through opacity-50' : undefined}>
+                <MessageContent parts={bodyParts} isUser={msg.role === 'user'} compact isStreaming={isStreaming} />
+              </div>
+              {retracted && (
+                <p data-testid="claim-retracted" className="text-[10px] mt-1.5 text-danger">
+                  Your app stopped running after this message.
+                </p>
+              )}
               <p className="text-[10px] mt-1 opacity-40">
                 {msg.createdAt ? new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
               </p>
@@ -537,6 +555,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     turnNarrativeChatRef.current = buildIdRef.current
     setTurnSteps({})
     setWorkspaceSays(null)
+    // U4 — THE NEXT TURN OWNS THE ANSWER. Once the citizen sends anything, U2's gate is the
+    // authority: it will find the same reversion, restore, and say so. Leaving the poll's
+    // older card up would stack a second, staler sentence over that one.
+    setWorkspaceLost(false)
     setTurnDiagnostics([])
     setTurnQuota(null)
     setTurnWorkspace(null)
@@ -764,6 +786,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     setPlanErrors({})
     setTurnError(null)
     setWorkspaceSays(null)
+    setWorkspaceLost(false)
 
     getBuild(buildId)
       .then((saved) => {
@@ -1812,6 +1835,34 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // `!state.alive` — which meant a Redis blip, a sleeping workspace, a sibling project holding
   // the slot and a project nobody ever built all arrived as the same "your preview is gone".
   // The whole verdict is kept now, and `unknown` deliberately changes NOTHING on screen.
+  // U4 — the app stopped running while nobody was sending messages. A REVERSION FOUND AT THE
+  // PREVIEW POLL, which is the only place it can be found: the turn that would otherwise catch it
+  // may never come, and until then the standing completion claim goes on being displayed above a
+  // dead app for as long as the tab stays open.
+  //
+  // Cleared by the next turn, never by the poll: once the citizen sends anything, U2's gate is the
+  // authority and it will restore and say so. Leaving this set would stack a second, older card
+  // over that one.
+  const [workspaceLost, setWorkspaceLost] = useState(false)
+  // WHICH message is making the claim. The newest assistant message, whatever it says — the
+  // annotation is deliberately content-agnostic, because the completion sentence is model prose
+  // today and a rendered summary tomorrow, and an annotation that pattern-matched either would
+  // go silently inert the day it changed.
+  const standingClaimId = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const msg = messages[i]
+      if (msg.role === 'assistant' && !msg.ephemeral) return msg.id
+    }
+    return null
+  }, [messages])
+  // MIRRORED INTO REFS because the poll effect must not re-subscribe when either changes. Its
+  // deps are the things that INVALIDATE a workspace verdict; a new assistant message and a
+  // retraction we just set are not among them, and listing them would tear down and rebuild the
+  // 45-second timer every time the transcript grew.
+  const standingClaimRef = useRef<string | null>(null)
+  const workspaceLostRef = useRef(false)
+  standingClaimRef.current = standingClaimId
+  workspaceLostRef.current = workspaceLost
   const [previewState, setPreviewState] = useState<PreviewState | null>(null)
   // U22 — WHAT MAKES A VERDICT STALE, written as a dependency list rather than left implicit.
   //
@@ -1917,6 +1968,27 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
           // Still no live turn: one may have started while this was in flight, and the stream
           // is the better authority the moment it exists.
           if (liveTurnIdRef.current === null) setTurnCompile(compiling)
+        }
+        // U4 — AND IS THE APP STILL THEIRS? A container can revert while the citizen is reading,
+        // in another tab, or at lunch, and the turn that would catch it may never come. Same tick,
+        // same visibility rule, same generation guard as the compile probe above.
+        //
+        // GATED ON A STANDING CLAIM, not just on a live container. This costs a container exec and
+        // it can raise an operational alarm, so it only runs when there is something to retract:
+        // an app the platform has told this citizen is finished. A project with no assistant
+        // message yet has made no claim, so there is nothing to be wrong about.
+        //
+        // Once set it stays set until the next turn clears it — re-asking a question whose answer
+        // is already on screen would spend a container call to learn nothing.
+        if (
+          state.state === 'alive' &&
+          liveTurnIdRef.current === null &&
+          standingClaimRef.current !== null &&
+          !workspaceLostRef.current
+        ) {
+          const lost = await checkWorkspace(projectId)
+          if (!live || generation !== latestProbe) return
+          if (lost && liveTurnIdRef.current === null) setWorkspaceLost(true)
         }
         if (SETTLED_GONE.has(state.state) && state.restorable !== null) stopAsking()
         else keepAsking()
@@ -2152,6 +2224,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                   applyPlanOverride={applyPlanOverride}
                   onBuildIt={handleBuildIt}
                   onRefined={handleRefined}
+                  retracted={workspaceLost && msg.id === standingClaimId}
                 />
               )
             })}
@@ -2465,6 +2538,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                claiming "putting the latest change together" about a turn running on project A.
                `builds` is this project's conversations; the open chat is checked separately
                because a brand-new one is not in that list yet. */
+            workspaceLost={workspaceLost}
             turnRunning={
               generatingChatId !== null &&
               (generatingChatId === buildId || builds.some((b) => b.id === generatingChatId))

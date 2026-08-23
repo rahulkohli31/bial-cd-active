@@ -31,7 +31,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Final, Literal
 
 import redis.asyncio as aioredis
@@ -55,7 +55,10 @@ from src.db.base import async_session_factory
 from src.db.models.app_registry import AppRegistry
 from src.db.models.project import Project
 from src.db.models.user import User
-from src.services.build_sessions.alarms import RECOVERY_WRITE_DID_NOT_LAND_EVENT
+from src.services.build_sessions.alarms import (
+    RECOVERY_WRITE_DID_NOT_LAND_EVENT,
+    WORKSPACE_LOST_WHILE_IDLE_EVENT,
+)
 from src.services.build_sessions.appdata import build_app_env, resolve_app_for_project
 from src.services.build_sessions.appdb_env import provision_app_database
 from src.services.build_sessions.appstorage import provision_app_storage
@@ -371,6 +374,33 @@ async def _say(announce: RecoveryAnnouncer | None, news: RecoveryNews) -> None:
     `None`, and the gate still does its work — it simply says nothing."""
     if announce is not None:
         await announce(news)
+
+
+@dataclass(frozen=True)
+class _IdleCheck:
+    """The last answer an idle tab got about one app, and when."""
+
+    asked_at: datetime
+    verdict: WorkspaceState
+
+
+# HOW LONG ONE ANSWER STANDS FOR AN IDLE TAB.
+#
+# Without a window, a tab left open overnight is a container exec every 45 seconds — forever — for
+# an answer that changes at most once. Sized well above the poll interval and well below any
+# reasonable reading session: long enough that a tab cannot spin the container, short enough that a
+# citizen who walks away and comes back learns the truth within a minute of looking again.
+#
+# Process-local, matching the single-replica deploy contract `reaper.py` already depends on. Not
+# pruned on a timer: one small entry per app that has ever been idle-checked, overwritten in place.
+_IDLE_CHECK_WINDOW: Final = timedelta(seconds=60)
+_idle_checks: dict[uuid.UUID, _IdleCheck] = {}
+
+
+def reset_idle_checks_for_tests() -> None:
+    """Drop the per-app idle-check memo. Process-local, so a remembered answer must not leak into
+    the next test and silently make its container call disappear."""
+    _idle_checks.clear()
 
 
 class _Quarantine(enum.StrEnum):
@@ -1299,6 +1329,68 @@ class SessionManager:
             return CompileState.UNKNOWN
         report = await sandbox_client.compile_state(handle)
         return report.state
+
+    async def project_workspace_check(
+        self,
+        db: AsyncSession,
+        user: User,
+        project_id: uuid.UUID,
+        *,
+        sandbox_client: SandboxClient,
+    ) -> WorkspaceState:
+        """Is the app the citizen is looking at still the app? — asked by an IDLE tab (U4, R4/R7).
+
+        THE TURN MAY NEVER COME. U2 asks this question at the start of every turn, which catches
+        every reversion that happens between one message and the next — and catches nothing at all
+        for a citizen who is reading, or in another tab, or at lunch. The completion claim above
+        their preview goes on saying "your app is live below" for as long as they leave the page
+        open. That is the 2026-08-18 shape with the clock running.
+
+        DELIBERATELY NOT FOLDED INTO `project_preview_state`, whose budget is frozen in C3 §8.3 at
+        NO container call of any kind because it is a browser tab on a 45-second timer. This is
+        its own call, and the caller fires it only when the preview already reports alive AND a
+        completion claim is standing — so the two never both run on a dark pane.
+
+        RATE-LIMITED PER APP, and the limit is the point rather than politeness: without it a tab
+        left open overnight is a container exec every 45 seconds, forever, for an answer that
+        changes at most once. Repeated asks inside the window return the last answer and make no
+        container call.
+
+        NEVER RESTORES AND NEVER DESTROYS. It only reports. The restore belongs to the next turn,
+        where the citizen is present, has been told, and can confirm — recovering an app behind
+        somebody's back while they are looking at a different tab is not a kindness."""
+        app_id = await _existing_app_id(db, user.id, project_id)
+        if app_id is None:
+            return WorkspaceState.INTACT  # nothing built yet: nothing to have lost
+        remembered = _idle_checks.get(app_id)
+        now = datetime.now(UTC)
+        if remembered is not None and (now - remembered.asked_at) < _IDLE_CHECK_WINDOW:
+            return remembered.verdict
+        try:
+            handle = await self._attach_for_read(user.id, app_id, sandbox_client)
+        except NoLiveSandboxError:
+            # Nothing is serving this project at all. The pane has its own vocabulary for that
+            # (`previewState`), and a container that is GONE is a different fact from one that is
+            # running and empty — conflating them would retract a completion claim every time a
+            # workspace merely went to sleep.
+            return WorkspaceState.UNREADABLE
+        verdict = await workspace_integrity(
+            sandbox_client,
+            handle,
+            app_id,
+            restore_source_key=await self._restore_source_for_the_gate(app_id),
+        )
+        _idle_checks[app_id] = _IdleCheck(asked_at=now, verdict=verdict.state)
+        if verdict.state is WorkspaceState.REVERTED:
+            _log.error(
+                WORKSPACE_LOST_WHILE_IDLE_EVENT,
+                app_id=str(app_id),
+                app_name=handle.app_name,
+                last_known_head=verdict.head,
+                recovery_copy_available=verdict.durable_copy_exists,
+                verdict=verdict.state.value,
+            )
+        return verdict.state
 
     async def project_save_state(
         self,

@@ -36,6 +36,9 @@ _MUTATING_POSTS = [
     # auto-discovered from the route tree, so a new mutating POST is only covered here
     # because the change that added it added this row too.
     "/v1/build-sessions/projects/{project_id}/client-error",
+    # U4 — the idle-tab workspace check. A POST rather than a GET because it costs a container
+    # exec and can raise an operational alarm, which is exactly the kind of thing CSRF is for.
+    "/v1/build-sessions/projects/{project_id}/workspace-check",
 ]
 
 

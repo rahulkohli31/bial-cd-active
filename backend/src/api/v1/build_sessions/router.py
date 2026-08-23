@@ -50,10 +50,12 @@ from src.api.v1.build_sessions.schemas import (
     StartBuildResponse,
     StopBuildRequest,
     StopBuildResponse,
+    WorkspaceCheckResponse,
 )
 from src.api.v1.build_sessions.sse import build_sse_response
 from src.api.v1.live_build import ReclaimBlockedError, reclaim_blocked_response
 from src.core.errors import AppApiError
+from src.core.integrity_types import WorkspaceState
 from src.db.models.app_registry import AppRegistry
 from src.schemas import AUTH_401, CamelModel, ErrorEnvelope, error_responses
 from src.services.audit.log import append_audit
@@ -900,6 +902,49 @@ async def preview_state(
         occupying_project_name=state.occupying_project_name,
         restorable=state.restorable,
     )
+
+
+@router.post(
+    "/projects/{project_id}/workspace-check",
+    response_model=WorkspaceCheckResponse,
+    dependencies=[RequireCsrf],
+    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Project not found")),
+)
+async def workspace_check(
+    project_id: uuid.UUID,
+    user: CurrentUser,
+    db: DbSession,
+    manager: SessionManagerDep,
+    sandbox: OptionalSandbox,
+) -> WorkspaceCheckResponse:
+    """Is the app this tab is framing still the citizen's app? (U4, R4/R7.)
+
+    THE TURN MAY NEVER COME. Every other integrity check in this system runs at the start of a
+    turn, which catches every reversion between one message and the next — and catches nothing at
+    all for someone who is reading, or in another tab, or at lunch. The "Build complete — your app
+    is live below" claim above their preview goes on being displayed for as long as the page stays
+    open. That is 2026-08-18 with the clock running, and it is what this route exists to end.
+
+    A POST, WITH CSRF, because it is not a free read: it costs a container exec and it can raise
+    an operational alarm. It follows this file's pattern exactly — `RequireCsrf`, `CurrentUser`,
+    owned-or-404 — and its path is in `_MUTATING_POSTS` so the CSRF matrix actually exercises it.
+
+    DELIBERATELY NOT FOLDED INTO `preview-state`, whose budget is frozen in C3 §8.3 at NO
+    container call of any kind because a browser tab drives it on a 45-second timer. The client
+    calls this one only when preview-state already reports alive AND a completion claim is
+    standing, so the two never both fire on a dark pane — and the manager rate-limits per app on
+    top of that, so a tab left open overnight cannot spin the container.
+
+    IT ONLY REPORTS. Nothing is restored and nothing is destroyed here: the restore belongs to the
+    next turn, where the citizen is present, has been told, and can confirm. Recovering somebody's
+    app behind their back while they are looking at another tab is not a kindness."""
+    await owned_project_or_404(db, user.id, project_id)
+    if sandbox is None:
+        # No sandbox service configured (KTD-2). Nothing can be checked and nothing is claimed —
+        # `UNREADABLE` is the honest answer, and the client holds its claim on it.
+        return WorkspaceCheckResponse(state=WorkspaceState.UNREADABLE, reverted=False)
+    state = await manager.project_workspace_check(db, user, project_id, sandbox_client=sandbox)
+    return WorkspaceCheckResponse(state=state, reverted=state is WorkspaceState.REVERTED)
 
 
 @router.get(

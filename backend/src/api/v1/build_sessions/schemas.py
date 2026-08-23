@@ -35,6 +35,7 @@ from typing import Annotated, Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from src.core.integrity_types import WorkspaceState
 from src.schemas import CamelModel
 from src.services.sandbox import SandboxClient
 from src.services.sandbox.base import CompileState
@@ -310,6 +311,24 @@ CLIENT_ERROR_STACK_MAX_CHARS = 20_000
 real one short would cost the agent the frame that names the faulty file — but finite, because the
 writer is a crashing browser inside an app whose code we did not author. Anything past this is a
 422; `declutter` then truncates what IS accepted to `CLEANED_STACK_MAX_CHARS` anyway."""
+
+
+class WorkspaceCheckResponse(CamelModel):
+    """`POST /v1/build-sessions/projects/{projectId}/workspace-check` → 200 (U4, R4/R7).
+
+    Does the container still hold this app? — asked by an IDLE tab, so a reversion that happens
+    while nobody is sending messages is caught at the preview poll rather than at a turn that may
+    never come.
+
+    `reverted` IS THE WHOLE ANSWER for the client, and it is a separate field from `state` rather
+    than something the client derives. Only one of the four states may be acted on, and leaving
+    the client to write `state !== "intact"` is leaving it to retract a completion claim on the
+    two states that mean "we could not tell" — which is the mistake the server side of this
+    verdict is built to make impossible. The state is carried for the operator surface and for
+    diagnosis; the client reads the boolean."""
+
+    state: WorkspaceState
+    reverted: bool
 
 
 class CompileStateResponse(CamelModel):

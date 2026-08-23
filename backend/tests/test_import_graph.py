@@ -192,12 +192,14 @@ def test_the_app_still_builds_with_its_full_route_surface() -> None:
     paths = list(app.openapi().get("paths", {}))
     build_session_paths = [p for p in paths if "build-session" in p]
 
-    # 18 since U13 added `projects/{project_id}/client-error` (the app's own in-browser report)
-    # and U11 added `projects/{project_id}/compile-state` (the compile signal for a tab with no
-    # live turn — the turn stream's producer stops at the terminal). Both recorded in C3 §9 in
-    # the same change that added the route.
-    assert len(build_session_paths) == 18, (
-        f"the C3 build-session route surface changed: expected 18 paths, found "
+    # 19 since U13 added `projects/{project_id}/client-error` (the app's own in-browser report),
+    # U11 added `projects/{project_id}/compile-state` (the compile signal for a tab with no live
+    # turn — the turn stream's producer stops at the terminal), and U4 added
+    # `projects/{project_id}/workspace-check` (the idle-tab integrity probe, for the reversion
+    # that happens while nobody is sending messages). Each recorded in C3 §9 in the same change
+    # that added the route.
+    assert len(build_session_paths) == 19, (
+        f"the C3 build-session route surface changed: expected 19 paths, found "
         f"{len(build_session_paths)}. If a route was deliberately added or removed, amend C3 "
         f"and update this number in the same change.\n{sorted(build_session_paths)}"
     )
