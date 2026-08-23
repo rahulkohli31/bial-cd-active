@@ -30,11 +30,14 @@ decides.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import uuid
 from dataclasses import dataclass
+from typing import Protocol
 
 import sqlalchemy as sa
+import structlog
 from fastapi import status
 from fastapi.responses import JSONResponse
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -43,6 +46,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.config import settings
 from src.db.models.token_usage import TokenUsage, TokenUsageKind
 from src.db.models.user_limit import UserLimit
+from src.services.sandbox import SandboxClient, SandboxHandle
+
+_log = structlog.get_logger()
 
 # IST is a fixed offset with no daylight saving, so a constant tzinfo is always correct.
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
@@ -247,3 +253,150 @@ async def record_usage(
         )
     )
     await db.execute(stmt)
+
+
+# See `at_limit_ending` for why the write is bounded at all; the number matches the one
+# `manager.py` gives the turn-boundary autosave, so the two exit paths degrade alike.
+_AT_LIMIT_SNAPSHOT_TIMEOUT_SECONDS: float = 60.0
+
+
+class SecurableWorkspace(Protocol):
+    """The three things securing a citizen's work needs, and nothing else.
+
+    A PROTOCOL RATHER THAN AN IMPORT of the orchestrator's `SandboxSession`, because the shape
+    is all this module wants and the import is not free: `src.services.orchestrator` pulls the
+    whole agent stack in behind it, and this module is loaded by four routers that have no
+    business waking pydantic-ai. Structural typing gets the same guarantee from all four type
+    gates with none of the weight."""
+
+    sandbox_client: SandboxClient
+    handle: SandboxHandle
+    app_id: uuid.UUID
+
+
+@dataclass(frozen=True)
+class AtLimitEnding:
+    """What a citizen is told when their daily budget runs out, and whether the platform managed
+    to secure their work before saying it.
+
+    `work_is_secured` is separate from the message rather than inferred from it, because the two
+    have different audiences: the sentence is for the person, the boolean is for the caller and
+    for the test that pins the ordering. Reading the flag back out of the prose would be a
+    string comparison against copy that is expected to change."""
+
+    message: str
+    work_is_secured: bool
+
+
+async def at_limit_ending(workspace: SecurableWorkspace | None) -> AtLimitEnding:
+    """Make the citizen's work durable, THEN tell them their budget is gone (R31, AE18).
+
+    THE ORDER IS THE POINT. What this replaces told the user "your changes are still in the
+    workspace — click Save to keep them", which secured nothing and asserted something nobody
+    had checked. Whether the work actually survived depended entirely on the turn's exit path
+    getting round to its best-effort autosave — an autosave that is deliberately swallowed, so
+    on the day it failed the citizen had already been told it had not. Between that sentence and
+    the reaper there is nothing but the citizen noticing the word "Save" in a paragraph they had
+    every reason to skim.
+
+    So the copy is taken HERE, on the way out of the model loop, and it is confirmed before the
+    turn's `finally` pardons the container and hands it to the reclamation path. The write goes
+    through `write_recovery_copy` rather than a raw `put`, which means it inherits U3's guard:
+    a tree that is not a descendant of the copy on record is diverted rather than promoted, so
+    the one path that MOST wants to be helpful can still never overwrite good work with bad.
+
+    A FAILURE CHANGES THE SENTENCE AND RAISES AN ALARM — it does not raise an exception. The
+    citizen is at their limit either way and still has to be told; swallowing the failure
+    silently is what made the 2026-08-18 reframe unfalsifiable, and failing the turn over a
+    safety net would turn a budget message into a crash. Both halves of that trade are what
+    `RECOVERY_WRITE_DID_NOT_LAND_EVENT` exists for.
+
+    `workspace` is `None` for a turn that never took a container — an Ask or Plan turn can reach
+    the cap too, and it has nothing to secure. That is the one case where the reassurance is
+    withheld without anything having gone wrong, which is why the wording of
+    `COULD_NOT_KEEP_A_COPY` asks the reader to save rather than announcing a fault.
+    """
+    # FUNCTION-SCOPED FOR THE PACKAGE CYCLE, exactly as `orchestrator/selfheal.py` documents its
+    # own. `src.services.build_sessions.__init__` reaches `manager` → `appdata` →
+    # `services.projects` → `describe`, which imports THIS module at its top; and
+    # `src.services.turns.__init__` reaches `engine`, which imports this module too. Either one
+    # at module level here fails at interpreter start rather than at call time, and it fails in
+    # whichever router happens to import the gate first — a boot failure whose traceback points
+    # nowhere near the line that caused it.
+    from src.services.build_sessions.alarms import RECOVERY_WRITE_DID_NOT_LAND_EVENT
+    from src.services.build_sessions.snapshot import RecoveryOutcome, write_recovery_copy
+    from src.services.turns.copy import AT_LIMIT_TEXT, COULD_NOT_KEEP_A_COPY, KEPT_A_COPY
+
+    def _say(*, secured: bool) -> AtLimitEnding:
+        return AtLimitEnding(
+            message=AT_LIMIT_TEXT.format(
+                kept=KEPT_A_COPY if secured else COULD_NOT_KEEP_A_COPY,
+                # A PLAIN ADDRESS, not a `mailto:` URI. This sentence is read as text in the
+                # banner above the composer, and a URI scheme printed mid-sentence is the exact
+                # register `services/turns/copy.py` exists to keep out. The clickable link is
+                # the renderer's job — `BuildProgress` finds the address in this sentence and
+                # wraps it in a real `mailto:` anchor.
+                contact=settings.SUPPORT_CONTACT_EMAIL,
+            ),
+            work_is_secured=secured,
+        )
+
+    if workspace is None:
+        # No container was ever taken, so there is nothing to have failed to copy. Not counted:
+        # this is not a missed recovery write, it is a turn that had no workspace.
+        return _say(secured=False)
+
+    try:
+        # BOUNDED AS A WHOLE, because this runs on a turn's exit path. Every exec inside the
+        # write is already bounded individually — 120s each for the four in `snapshot.py`, 30s for
+        # the ancestry probe — but FIVE of them in sequence is minutes, on the one path whose job
+        # is to end. A container that has stopped answering must not be able to hold a citizen's
+        # ending open while they look at a screen that says nothing. The same 60s `manager.py`
+        # gives the turn-boundary autosave, for the same reason.
+        #
+        # `TimeoutError` is an ordinary `Exception`, so the arm below is
+        # already its handler: a write that ran out of time did not land, which is exactly what
+        # the alarm means.
+        async with asyncio.timeout(_AT_LIMIT_SNAPSHOT_TIMEOUT_SECONDS):
+            written = await write_recovery_copy(
+                workspace.sandbox_client,
+                workspace.handle,
+                workspace.app_id,
+                taken_at=datetime.datetime.now(datetime.UTC),
+            )
+    except Exception:
+        # The bundle, the base64 read back, or the upload itself did not complete. This is the
+        # `failed` arm the alarm's docstring names, and it is raised from a CALL SITE because
+        # the call site is the only place that knows the write threw.
+        _log.error(
+            RECOVERY_WRITE_DID_NOT_LAND_EVENT,
+            app_id=str(workspace.app_id),
+            reason="failed",
+            exc_info=True,
+        )
+        await _count_a_missed_copy(workspace.app_id)
+        return _say(secured=False)
+
+    # DIVERTED is the guard refusing to promote this tree. It already alarmed on its way past,
+    # with the two heads that explain the refusal attached, so re-raising the event here would
+    # double-count the one outcome an operator counts. What it must NOT do is claim safety: the
+    # bytes are preserved under the divert prefix, but the copy a restore would hand back is
+    # still the older one, and telling the citizen otherwise is the false reassurance this whole
+    # unit exists to remove.
+    secured = written.outcome in (RecoveryOutcome.WRITTEN, RecoveryOutcome.SKIPPED)
+    if not secured:
+        await _count_a_missed_copy(workspace.app_id)
+    return _say(secured=secured)
+
+
+async def _count_a_missed_copy(app_id: uuid.UUID) -> None:
+    """Record that a turn's work did not reach the recovery slot (U25).
+
+    THE SAME RECORD `manager.py` WRITES at the turn boundary, and it has to be written here too or
+    the counter that exists to settle "did the platform fail to CHECK the workspace or fail to make
+    it DURABLE" systematically omits every at-limit failure — while the structlog event says
+    otherwise. Two sources disagreeing is worse than one being absent."""
+    from src.db.models.harness_counter import HarnessCounter
+    from src.services.build_sessions.counters import count
+
+    await count(HarnessCounter.RECOVERY_WRITE_MISSED, app_id=app_id)

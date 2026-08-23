@@ -35,6 +35,7 @@ from typing import Annotated, Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from src.core.integrity_types import WorkspaceState
 from src.schemas import CamelModel
 from src.services.sandbox import SandboxClient
 from src.services.sandbox.base import CompileState
@@ -312,6 +313,24 @@ writer is a crashing browser inside an app whose code we did not author. Anythin
 422; `declutter` then truncates what IS accepted to `CLEANED_STACK_MAX_CHARS` anyway."""
 
 
+class WorkspaceCheckResponse(CamelModel):
+    """`POST /v1/build-sessions/projects/{projectId}/workspace-check` → 200 (U4, R4/R7).
+
+    Does the container still hold this app? — asked by an IDLE tab, so a reversion that happens
+    while nobody is sending messages is caught at the preview poll rather than at a turn that may
+    never come.
+
+    `reverted` IS THE WHOLE ANSWER for the client, and it is a separate field from `state` rather
+    than something the client derives. Only one of the four states may be acted on, and leaving
+    the client to write `state !== "intact"` is leaving it to retract a completion claim on the
+    two states that mean "we could not tell" — which is the mistake the server side of this
+    verdict is built to make impossible. The state is carried for the operator surface and for
+    diagnosis; the client reads the boolean."""
+
+    state: WorkspaceState
+    reverted: bool
+
+
 class CompileStateResponse(CamelModel):
     """`GET /v1/build-sessions/projects/{projectId}/compile-state` → 200 (R17/R18).
 
@@ -573,3 +592,43 @@ commit, and there is no request-scoped `get_db` on a background task. Tests bind
 the rolled-back test session (the exact substitution `claude/router.py` makes via
 `dependency_overrides` on its `billing_session_factory`). Same shape as the chat relay.
 """
+
+
+class ParkedTree(CamelModel):
+    """One tree this plan set aside — a U2 quarantine or a U3 divert."""
+
+    key: str
+    kind: Literal["quarantine", "divert"]
+    head_sha: str | None
+    size_bytes: int
+    taken_at: datetime | None
+
+
+class ParkedTreesResponse(CamelModel):
+    """`POST /v1/build-sessions/internal/apps/{app_id}/parked` → 200 (U25).
+
+    THE TREES THIS PLAN SETS ASIDE WOULD OTHERWISE BE WRITE-ONLY: no reader, no retention, no
+    runbook. In a false-`REVERTED` case those objects hold the only copy of a citizen's newest
+    work, and this plan names exactly that shape as a defect elsewhere — so it must not reproduce
+    it. Newest first, because the useful one is almost always the last one."""
+
+    trees: list[ParkedTree]
+
+
+class PromoteParkedRequest(CamelModel):
+    """`POST /v1/build-sessions/internal/apps/{app_id}/promote` — put one parked tree back.
+
+    The key is named explicitly rather than "the newest": an operator promoting the wrong tree
+    over somebody's recovery slot is the failure this whole plan is about, and a request that
+    cannot name what it means is one that can be misread."""
+
+    key: str
+
+
+class PromoteParkedResponse(CamelModel):
+    """What the promotion did. `promoted` is False when the guard refused it — which is not an
+    error and must not read as one: it means the tree is not a descendant of what the slot holds,
+    and forcing it would be the data loss the guard exists to prevent."""
+
+    promoted: bool
+    detail: str

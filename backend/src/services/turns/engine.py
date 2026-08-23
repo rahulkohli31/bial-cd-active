@@ -83,6 +83,7 @@ from src.api.v1.conversations.schemas import (
 from src.core.integrity_types import BaselineIdentity
 from src.core.redaction import redact_secrets
 from src.db.models.conversation import Conversation, ConversationMode
+from src.db.models.harness_counter import HarnessCounter
 from src.db.models.message import MessageEntryKind, MessageVisibility
 from src.db.models.user import User
 from src.services.agent.agent import ChatDeps, chat_agent
@@ -95,6 +96,7 @@ from src.services.agent.read_tools import (
 )
 from src.services.agent.toolsets import plan_options_only_toolset, toolsets_for_mode
 from src.services.build_sessions.alarms import HMR_PROTOCOL_DRIFT_EVENT
+from src.services.build_sessions.counters import count
 from src.services.build_sessions.integrity import (
     baseline_identity,
     has_ever_been_built,
@@ -104,9 +106,11 @@ from src.services.build_sessions.locks import release_liveness_lease, renew_live
 from src.services.build_sessions.manager import (
     BuildSession,
     BuildSessionConflictError,
+    RecoveryNews,
     SandboxReclaimBlockedError,
     SessionManager,
     SnapshotUnavailableError,
+    WorkspaceUnreadableError,
 )
 from src.services.build_sessions.outcome import STOPPED_BY_USER
 from src.services.messages.projection import (
@@ -147,16 +151,21 @@ from src.services.sandbox import SandboxClient, SandboxError
 from src.services.sandbox.base import CompileState
 from src.services.storage.snapshot_read import NoAppYet, extract_snapshot
 from src.services.turns.copy import (
+    COULD_NOT_CHECK_TEXT,
     COULD_NOT_CONFIRM_TEXT,
     DID_NOT_COME_TOGETHER_TEXT,
+    NOT_RECOVERED_TEXT,
+    RECOVERED_TEXT,
     STILL_SHOWING_EARLIER,
     STILL_SHOWING_NOTHING,
     STILL_SHOWING_TEMPLATE,
+    UNVERIFIED_TEXT,
 )
 from src.services.turns.guard import claim_conversation, release_conversation
 from src.services.turns.plan_options import META_PENDING
 from src.services.usage.gate import (
     DailyTokenLimitExceededError,
+    at_limit_ending,
     enforce_daily_limit,
     next_ist_midnight_iso,
     record_usage,
@@ -528,6 +537,10 @@ class _TurnState:
     # check: a brand-new project is SUPPOSED to be showing the starter template, and checking it
     # would manufacture an accusation rather than catch one.
     had_prior_building_turns: bool = False
+    # U2 — `UNVERIFIED_TEXT` describes the state of the app, not an event, so it is said once
+    # and then not again. Repeating it would train the reader to skip the one sentence most
+    # likely to matter.
+    said_it_could_not_check: bool = False
     # WRITE only, and the whole difference between the two zero-mutation endings. A Write
     # turn the citizen typed into may legitimately touch nothing (they asked a question);
     # a turn started from a Build-it click was ASKED to build, so touching nothing is a
@@ -1155,6 +1168,30 @@ class TurnEngine:
 
     # -- the WRITE run -------------------------------------------------------------------
 
+    async def _say_what_the_workspace_did(self, state: _TurnState, news: RecoveryNews) -> None:
+        """Turn the integrity gate's finding into the one sentence the citizen reads (U2).
+
+        THE MANAGER KNOWS WHAT HAPPENED; THIS KNOWS HOW TO SAY IT. The gate cannot import these
+        strings — `services.turns` reaches `build_sessions`, so an import back would close the
+        cycle — and it should not want to: which words a citizen sees is a product decision that
+        belongs beside the rest of them.
+
+        `UNVERIFIED` IS SAID ONCE PER TURN AND THEN NOT AGAIN. It describes the state of the app
+        rather than an event, so repeating it would train the reader to skip the one sentence
+        most likely to matter."""
+        if news is RecoveryNews.UNVERIFIED:
+            if state.said_it_could_not_check:
+                return
+            state.said_it_could_not_check = True
+        message = {
+            RecoveryNews.RESTORING: RECOVERED_TEXT,
+            RecoveryNews.UNRECOVERABLE: NOT_RECOVERED_TEXT,
+            RecoveryNews.UNVERIFIED: UNVERIFIED_TEXT,
+        }[news]
+        # A NOTICE, NOT A MESSAGE. `message` narrates the phase and is replaced by the next
+        # one; this is a statement about the app that has to survive the phase passing.
+        self._emit(state, lambda seq: WorkspaceFrame(seq=seq, state="preparing", notice=message))
+
     async def _attach_sandbox(
         self,
         state: _TurnState,
@@ -1207,7 +1244,27 @@ class TurnEngine:
                     # container identically — and reading it as "always writing" made a read-
                     # only question refuse the Save button and claim the app was being built.
                     may_write=state.mode is ConversationMode.WRITE,
+                    # U2 — THE SENTENCE HAS TO ARRIVE BEFORE THE SLOW WORK, not after it. The
+                    # recovery path adds tens of seconds of otherwise-silent latency, and the
+                    # gate calls this the moment it knows, from inside the attach.
+                    announce=partial(self._say_what_the_workspace_did, state),
                 )
+        except WorkspaceUnreadableError as exc:
+            # RETRYABLE, and deliberately not a verdict about the app. The container is still
+            # running and still attached, so the retry has something to attach to.
+            _log.warning(
+                "workspace_integrity_unreadable",
+                conversation_id=str(state.conversation_id),
+                app_id=str(exc.app_id),
+            )
+            state.workspace_state = "unavailable"
+            self._emit(
+                state,
+                lambda seq: WorkspaceFrame(
+                    seq=seq, state="unavailable", notice=COULD_NOT_CHECK_TEXT
+                ),
+            )
+            raise _WriteEndedError("workspace_unreadable", COULD_NOT_CHECK_TEXT) from exc
         except _WriteEndedError:
             raise
         except Exception as exc:
@@ -1222,6 +1279,18 @@ class TurnEngine:
                 state, lambda seq: WorkspaceFrame(seq=seq, state="unavailable", message=message)
             )
             raise _WriteEndedError("sandbox_unavailable", message) from exc
+
+        if session.news is RecoveryNews.UNRECOVERABLE:
+            # AE3. Nothing was put back, and the container is showing a template. The one thing
+            # that must not happen is the agent building on it and the turn-end copy making that
+            # permanent, so the turn ends here.
+            raise _WriteEndedError("workspace_unrecoverable", NOT_RECOVERED_TEXT)
+        if session.restored:
+            # THE HELD MESSAGE (R5). The instruction was written against a workspace that no
+            # longer exists; running it now would execute an instruction whose premise was true
+            # when it was typed and false when it ran. The citizen re-sends when they have looked
+            # at what came back.
+            raise _WriteEndedError("workspace_restored", RECOVERED_TEXT)
 
         state.write_session = session
         state.sandbox = SandboxSession(
@@ -1446,6 +1515,21 @@ class TurnEngine:
                 # claimed to be finished: it gates the COMPLETION CLAIM, so with no claim
                 # outstanding there is nothing for it to gate and the loop carries on as
                 # before. Nothing here spends a repair attempt on it.
+                if not outcome.green and outcome.state is not HealthState.INDETERMINATE:
+                    # U25/R32 — THE HEADLINE NUMBER: how often the platform would have told a
+                    # citizen their app was finished when it was not. Counted only on a POSITIVE
+                    # verdict of "not finished" — an unanswerable one blocked nothing, it merely
+                    # asked again, and folding the two together would make the number that
+                    # measures this plan's whole point unreadable.
+                    #
+                    # Fire-and-forget by construction (`count` owns its own session and swallows
+                    # everything), because a counter that can fail the turn it is counting is
+                    # worse than no counter.
+                    await count(
+                        HarnessCounter.CLAIM_BLOCKED,
+                        app_id=state.write_session.app_id if state.write_session else None,
+                        served_head=outcome.served.head if outcome.served else None,
+                    )
                 if outcome.state is HealthState.INDETERMINATE:
                     # BOUNDED HERE, because this arm `continue`s past the budget guard below and
                     # an unanswerable verdict that repeats would otherwise spin against the wall
@@ -1585,29 +1669,34 @@ class TurnEngine:
             node = run.next_node
             while not Agent.is_end_node(node):
                 if Agent.is_model_request_node(node):
-                    async with session_factory() as gate_db:
-                        try:
+                    # THE SESSION CLOSES BEFORE THE ENDING IS BUILT, which is why the `try`
+                    # is on the outside now (U24). `at_limit_ending` bundles and uploads the
+                    # citizen's tree, and doing that inside the `async with` would pin a
+                    # pooled connection for the duration of a container round trip — on the
+                    # one path where every user who hits their cap in the same hour arrives
+                    # at once. Nothing else about this block moved.
+                    try:
+                        async with session_factory() as gate_db:
                             await enforce_daily_limit(gate_db, state.user_id)
-                        except DailyTokenLimitExceededError as exc:
-                            # The request never fires. Graceful, not a crash: the work so
-                            # far is real and the finalize will save it.
-                            limit, used = exc.limit, exc.used
-                            resets_at = next_ist_midnight_iso()
-                            self._emit(
-                                state,
-                                lambda seq: QuotaFrame(
-                                    seq=seq,
-                                    limit=limit,
-                                    used=used,
-                                    resets_at=resets_at,
-                                ),
-                            )
-                            raise _WriteEndedError(
-                                "quota_exceeded",
-                                "You have used today's token budget. Your changes are still "
-                                "in the workspace — click Save to keep them; this picks back "
-                                "up after midnight IST.",
-                            ) from exc
+                    except DailyTokenLimitExceededError as exc:
+                        # The request never fires. Graceful, not a crash: the work so
+                        # far is real, and U24 makes it DURABLE here rather than leaving it
+                        # to whether the exit path's best-effort autosave happens to succeed.
+                        limit, used = exc.limit, exc.used
+                        resets_at = next_ist_midnight_iso()
+                        self._emit(
+                            state,
+                            lambda seq: QuotaFrame(
+                                seq=seq,
+                                limit=limit,
+                                used=used,
+                                resets_at=resets_at,
+                            ),
+                        )
+                        raise _WriteEndedError(
+                            "quota_exceeded",
+                            (await at_limit_ending(state.sandbox)).message,
+                        ) from exc
                     async with node.stream(run.ctx) as stream:
                         async for event in stream:
                             self._on_event(state, event)

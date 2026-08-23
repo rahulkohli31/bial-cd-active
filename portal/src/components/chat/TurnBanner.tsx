@@ -17,11 +17,23 @@
  * citizen is being asked to do, and a message that scrolls away takes its own next action with
  * it. The transcript is the record of the conversation; this is the state of the app.
  *
+ * ADDRESSES IN THESE SENTENCES ARE CLICKABLE. One of the five ends in "ask <someone>" and names
+ * a configured support address; printed as plain text that is a string the citizen has to select
+ * and retype, which is not a next action — it is homework. `withMailtoLinks` turns it into a real
+ * anchor and leaves every other sentence byte-identical, so the slot stays a plain-text slot for
+ * the four that carry no address.
+ *
+ * THE LINKIFYING LIVES HERE rather than in the copy, deliberately: `AT_LIMIT_TEXT` is written
+ * server-side and also reaches surfaces with no DOM at all, so a `mailto:` URI embedded in the
+ * sentence would be jargon printed mid-paragraph exactly where `copy.py` exists to prevent it.
+ *
  * ANNOUNCED POLITELY, never assertively. These are endings with an action attached, not alarms —
  * `assertive` is reserved on this page for the two things that genuinely interrupt (a failed
  * relaunch, a failed save), and spending it here would make those stop cutting through. The
  * region is permanent and only its text changes, for the reason the render comment gives.
  */
+import { withMailtoLinks } from './BuildProgress'
+
 interface TurnBannerProps {
   /** The sentence to show, or `null` for nothing. One value: newest wins by construction. */
   text: string | null
@@ -46,7 +58,7 @@ export default function TurnBanner({ text }: TurnBannerProps) {
           data-testid="turn-banner"
           className="text-[11px] text-danger bg-danger/5 border border-danger/20 rounded-lg px-2.5 py-1.5"
         >
-          {text}
+          {withMailtoLinks(text)}
         </div>
       ) : null}
     </div>

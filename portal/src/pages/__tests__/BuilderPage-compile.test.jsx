@@ -15,7 +15,7 @@ import { render, screen, fireEvent, waitFor, cleanup, act } from '@testing-libra
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import {
   FakeEventSource, makeClient, primeClient, primeTurn,
-  waitForGateOpen, scriptBuildTurn, BUILD_TURN_ID, T_STEP, T_PREVIEW, T_BUILD_END, PREVIEW_URL,
+  waitForGateOpen, scriptBuildTurn, BUILD_TURN_ID, T_STEP, T_PREVIEW, T_BUILD_END, T_DELTA, PREVIEW_URL,
 } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
@@ -27,10 +27,13 @@ const h = vi.hoisted(() => ({
   start: vi.fn(), relaunchPreview: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
   acquireLock: vi.fn(), releaseLock: vi.fn(),
   fetchPreviewState: vi.fn(), fetchCompileState: vi.fn(), fetchSaveState: vi.fn(),
+  checkWorkspace: vi.fn(),
 }))
 
 /** Every `compileState` the pane has been handed, in order. */
 const seen = []
+/** Every `workspaceLost` the pane has been handed, in order (U4). */
+const lostSeen = []
 
 vi.mock('../../utils/builderHistory', () => ({
   loadBuilds: h.loadBuilds, newBuild: h.newBuild, createBuild: h.createBuild,
@@ -42,6 +45,9 @@ vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../components/LivePreview', () => ({
   default: (props) => {
     seen.push(props.compileState)
+    // U4 — the retraction reaches the pane as its own prop, so a test can watch it arrive without
+    // rendering the real component's whole cover machinery.
+    lostSeen.push(props.workspaceLost)
     return null
   },
 }))
@@ -55,6 +61,7 @@ vi.mock('../../utils/buildSessionApi', async (orig) => ({
   fetchPreviewState: (...a) => h.fetchPreviewState(...a),
   fetchCompileState: (...a) => h.fetchCompileState(...a),
   fetchSaveState: (...a) => h.fetchSaveState(...a),
+  checkWorkspace: (...a) => h.checkWorkspace(...a),
 }))
 vi.mock('../../utils/turnStreamApi', async (orig) => ({
   ...(await orig()),
@@ -102,6 +109,7 @@ const COMPILE = (state, seq = 5) => ({ type: 'compile', seq, state })
 
 beforeEach(() => {
   seen.length = 0
+  lostSeen.length = 0
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
   primeClient(h)
@@ -111,6 +119,7 @@ beforeEach(() => {
   h.listProjectConversations.mockResolvedValue([])
   h.buildUserParts.mockImplementation(async (text) => [{ type: 'text', text }])
   h.fetchCompileState.mockResolvedValue('unknown')
+  h.checkWorkspace.mockResolvedValue(false)
   h.fetchSaveState.mockResolvedValue({ appId: null, dirty: null, containerHead: null, savedHead: null, recoveryAt: null })
   h.fetchPreviewState.mockResolvedValue({
     state: 'unknown', alive: false, previewUrl: null, occupyingProjectName: null, restorable: null,
@@ -252,5 +261,89 @@ describe('BuilderPage — the compile signal reaches the preview pane', () => {
     })
 
     expect(seen.at(-1)).toBe('failed')
+  })
+})
+
+
+// U4/R7 — the reversion that happens while nobody is sending messages.
+describe('BuilderPage — a workspace lost while the tab sat idle', () => {
+  /** A framed preview, no live turn, and a standing completion claim in the transcript.
+   *
+   *  THE CLAIM IS WHAT GATES THE PROBE, and it has to be a real one. This costs a container exec
+   *  and can raise an operational alarm, so a project that has never been told its app is
+   *  finished has nothing to be wrong about and is not worth asking. Loaded from the stored
+   *  transcript rather than produced by a live turn, because the case being tested is precisely
+   *  the tab that is NOT running one. */
+  async function idleOverAFinishedBuild() {
+    h.fetchPreviewState.mockResolvedValue({
+      state: 'alive', alive: true, previewUrl: PREVIEW_URL,
+      occupyingProjectName: null, restorable: true,
+    })
+    const turn = scriptBuildTurn()
+    h.readTurnStream.mockImplementation(turn.impl)
+    renderThread()
+    await runBuild(turn)
+    // A framed preview (which is what arms the poll at all) and an assistant message claiming the
+    // app is finished (which is what makes the check worth its container exec).
+    await turn.frame(T_PREVIEW(), T_DELTA('Build complete — your app is live below.', 6), T_BUILD_END())
+    await turn.end()
+    await screen.findByText(/Build complete/i)
+  }
+
+  /** One probe cycle, driven the way a returning tab drives one.
+   *
+   *  The mount probe fires before the stored transcript has loaded, so at that moment there is no
+   *  standing claim yet and the check is correctly skipped. A real tab gets its next look from the
+   *  45-second interval or from coming back to the foreground; this is the second of those, and it
+   *  is the one a test can drive without owning the clock. */
+  async function lookAgain() {
+    await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
+    await act(async () => { await Promise.resolve() })
+  }
+
+  // ★ THE TURN MAY NEVER COME. Every other integrity check runs at the start of a turn; a citizen
+  // who is reading, or in another tab, or at lunch gets none of them, and the completion claim
+  // above their preview goes on being displayed over a dead app until they happen to send
+  // something. The preview poll is the only place this can be caught.
+  //
+  // Mutation check: drop the `checkWorkspace` call from the probe and this goes red.
+  it('tells the pane, so the cover can retract the claim', async () => {
+    h.checkWorkspace.mockResolvedValue(true)
+    await idleOverAFinishedBuild()
+
+    await lookAgain()
+
+    await waitFor(() => expect(h.checkWorkspace).toHaveBeenCalled())
+    await waitFor(() => expect(lostSeen.at(-1)).toBe(true))
+  })
+
+  // It costs a container exec and can raise an operational alarm, so it must not fire while the
+  // turn stream is already the authority — and it must not fire twice for one answer.
+  it('asks once and then stops asking', async () => {
+    h.checkWorkspace.mockResolvedValue(true)
+    await idleOverAFinishedBuild()
+
+    await lookAgain()
+    await waitFor(() => expect(h.checkWorkspace).toHaveBeenCalled())
+    await waitFor(() => expect(lostSeen.at(-1)).toBe(true))
+    const afterFirst = h.checkWorkspace.mock.calls.length
+    await lookAgain()
+    await lookAgain()
+
+    expect(afterFirst).toBeGreaterThan(0)
+    expect(h.checkWorkspace.mock.calls.length).toBe(afterFirst)
+  })
+
+  // The ordinary case stays quiet. A pane that retracted on every poll would train the citizen to
+  // ignore the one retraction that mattered.
+  it('says nothing about a healthy workspace', async () => {
+    h.checkWorkspace.mockResolvedValue(false)
+    await idleOverAFinishedBuild()
+
+    await lookAgain()
+    await waitFor(() => expect(h.checkWorkspace).toHaveBeenCalled())
+
+    // LIVENESS: the probe really ran, so the `false` below is an answer rather than a no-op.
+    expect(lostSeen.every((v) => v !== true)).toBe(true)
   })
 })

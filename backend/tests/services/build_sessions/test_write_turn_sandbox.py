@@ -46,6 +46,8 @@ from src.api.v1.build_sessions.schemas import BuildSessionStatus
 from src.config import settings
 from src.db.models.app_registry import AppRegistry
 from src.db.models.user import User
+from src.services.build_sessions import manager as manager_module
+from src.services.build_sessions.alarms import RECOVERY_WRITE_DID_NOT_LAND_EVENT
 from src.services.build_sessions.locks import (
     heartbeat_is_alive,
     lock_is_held,
@@ -69,7 +71,7 @@ from src.services.sandbox import (
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import StorageError, recovery_key, snapshot_key
 from tests.factories import ProjectFactory, UserFactory
-from tests.fakes import FakeBrain, FakeSandboxClient, FakeStorage
+from tests.fakes import FakeBrain, FakeSandboxClient, FakeStorage, a_git_bundle
 
 
 @pytest.fixture(autouse=True)
@@ -196,11 +198,18 @@ def _with_head(client: FakeSandboxClient, sha: str) -> FakeSandboxClient:
     def handler(cmd: list[str]) -> ExecResult:
         # The state probe: `<head>@@<porcelain>`. A clean tree at `sha`.
         if cmd[0] == "sh" and "rev-parse" in cmd[-1]:
-            # `<head>@@<porcelain>@@<commit count>`. The count is 3, not 1: 1 is the
+            # `<head>@@<porcelain>@@<commit count>@@<ancestry>`. The count is 3, not 1: 1 is the
             # `bial: golden template baseline` every fresh provision seeds, and a container
             # sitting on the baseline alone is deliberately reclaimable. A test that means
             # "this workspace holds work" has to say so.
-            return ExecResult(stdout=f"{sha}\n@@@@3", stderr="", exit=0)
+            #
+            # The ancestry field answers only when the probe ASKED (U1) — `0 0`, "the reference
+            # is in this repository and HEAD is below it", which is the shape of a container
+            # that moved forward normally. Answering it unconditionally would be worse than
+            # useless: an unasked probe returning a judgement is exactly the confusion
+            # `Ancestry.NOT_ASKED` exists to prevent.
+            answered = "0 0" if "merge-base" in cmd[-1] else ""
+            return ExecResult(stdout=f"{sha}\n@@@@3@@{answered}", stderr="", exit=0)
         if cmd[0] == "base64":
             return ExecResult(stdout=bundle, stderr="", exit=0)
         return ExecResult(stdout="", stderr="", exit=0)
@@ -315,11 +324,16 @@ async def test_a_brand_new_project_offers_a_save_rather_than_reading_unknown(
     builds their first app and has no way to keep it."""
     user, project_id = await _mk(db_session, "w6f@rvaiglobal.com")
     manager = SessionManager()
-    client = FakeSandboxClient()  # default exec: exit 0, empty stdout -> no head, clean tree
+    client = FakeSandboxClient()
     session = await manager.ensure_sandbox(
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
     client.attach_handle = session.handle
+    # SAID EXPLICITLY, because the fake's default is now a container that HOLDS work (U2). It has
+    # to be: read as "no head at exit 0", the old empty default made every turn test with a
+    # recovery bundle exercise the confirmed-reversion branch while asserting something else.
+    # A test that means "this container has no repository" says so.
+    client.exec_handler = lambda cmd: ExecResult(stdout="", stderr="", exit=0)
 
     state = await manager.project_save_state(db_session, user, project_id, sandbox_client=client)
 
@@ -667,7 +681,7 @@ async def test_a_plan_only_project_does_not_block_a_real_one(
     held their actual app, to protect an empty template.
 
     Flip any of the four conditions and this must go red: a commit BEYOND the seeded baseline,
-    a tree dirty with anything outside `_FRAMEWORK_CHURN`, a saved bundle, or a recovery
+    a tree dirty with anything outside `FRAMEWORK_CHURN`, a saved bundle, or a recovery
     snapshot each mean there IS something to lose. Note it is not "no commits" — the sandbox
     client seeds `bial: golden template baseline` at birth, so a pristine container has exactly
     one and a no-commits check would never fire."""
@@ -1510,10 +1524,16 @@ async def test_a_same_second_tie_resumes_the_newer_work_not_the_save(
 async def test_an_unchanged_tree_is_not_offered_however_new_its_bundle_is(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    """`touched` means "a mutating tool ran", not "the tree changed", so a read-only-ish turn
-    rewrites the recovery bundle from an unchanged worktree with a newer stamp. Ordering by
-    time alone then claims work that does not exist — permanently, and while `dirty` is False.
-    The stamped HEAD is what settles it."""
+    """`touched` means "a mutating tool ran", not "the tree changed". Ordering by time alone then
+    claims work that does not exist — permanently, and while `dirty` is False. The stamped HEAD is
+    what settles it.
+
+    THE NEWER BUNDLE IS PLACED DIRECTLY NOW, and that is a consequence of U3 rather than a
+    weakening of the test. `finish_turn_sandbox` used to produce this shape by rewriting the
+    recovery bundle from an unchanged worktree on every mutating turn; the guarded write skips
+    that outright (see `test_finish_turn.py`). But `recoverable_work`'s guard still has to hold,
+    because the recovery slot has other writers — the U25 operator promote among them — and a
+    newer object over an identical tree is still not work to recover."""
     user, project_id = await _mk(db_session, "wsame@rvaiglobal.com")
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "a" * 40)
@@ -1524,10 +1544,10 @@ async def test_an_unchanged_tree_is_not_offered_however_new_its_bundle_is(
     await manager.finish_turn_sandbox(session, client, touched=True)
 
     await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
-    second = await manager.ensure_sandbox(
-        db_session, user, project_id, sandbox_client=client, may_write=True
+    # A later write of the SAME tree into the recovery slot: a newer object, no new work.
+    await fake_storage.put(
+        recovery_key(session.app_id), a_git_bundle("a" * 40), metadata={"head_sha": "a" * 40}
     )
-    await manager.finish_turn_sandbox(second, client, touched=True)  # same tree, later stamp
 
     saved = await fake_storage.head(snapshot_key(session.app_id))
     recovery = await fake_storage.head(recovery_key(session.app_id))
@@ -1537,3 +1557,43 @@ async def test_an_unchanged_tree_is_not_offered_however_new_its_bundle_is(
 
     assert await manager.recoverable_work(session.app_id) is None
     assert await manager.newest_restore_source(session.app_id) is None
+
+
+async def test_a_recovery_write_that_fails_outright_is_alarmed_not_swallowed_silently(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ U3 — the third way a turn's work fails to reach a durable copy, and the only one the
+    call site can see.
+
+    The swallow stays: a safety net that can fail a turn is not a safety net. What changes is
+    that it is no longer SILENT. That silence is exactly what made the 2026-08-18 reframe
+    unfalsifiable — nobody could say afterwards whether the platform had failed to CHECK the
+    workspace or failed to make it DURABLE, because a write that never landed left no trace an
+    operator would ever look for.
+
+    Mutation check: drop the event back to a `warning` with a prose message and this goes red."""
+    user, project_id = await _mk(db_session, "wboom@rvaiglobal.com")
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "f" * 40)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
+
+    async def boom(*args: object, **kwargs: object) -> None:
+        raise StorageError("the upload did not complete")
+
+    monkeypatch.setattr(manager_module, "write_recovery_copy", boom)
+    raised: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        manager_module._log, "error", lambda event, **kw: raised.append((event, kw))
+    )
+
+    # The turn still ends cleanly — that is the half that must not regress.
+    await manager.finish_turn_sandbox(session, client, touched=True)
+
+    assert [event for event, _ in raised] == [RECOVERY_WRITE_DID_NOT_LAND_EVENT]
+    assert raised[0][1]["reason"] == "failed"
+    assert raised[0][1]["app_id"] == str(session.app_id)

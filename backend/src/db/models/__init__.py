@@ -14,6 +14,8 @@ from src.db.models.classification_review import (
 from src.db.models.conversation import Conversation as Conversation
 from src.db.models.deployment import Deployment as Deployment
 from src.db.models.feedback import Feedback as Feedback
+from src.db.models.harness_counter import HarnessCount as HarnessCount
+from src.db.models.harness_counter import HarnessCounter as HarnessCounter
 from src.db.models.message import Message as Message
 from src.db.models.project import Project as Project
 from src.db.models.project_database import ProjectDatabase as ProjectDatabase

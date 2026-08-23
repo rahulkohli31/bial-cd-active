@@ -43,17 +43,23 @@ from src.api.v1.build_sessions.schemas import (
     HeartbeatResponse,
     LockReleaseResponse,
     LockStateResponse,
+    ParkedTree,
+    ParkedTreesResponse,
     PreviewLifeState,
+    PromoteParkedRequest,
+    PromoteParkedResponse,
     RelaunchPreviewRequest,
     RelaunchPreviewResponse,
     StartBuildRequest,
     StartBuildResponse,
     StopBuildRequest,
     StopBuildResponse,
+    WorkspaceCheckResponse,
 )
 from src.api.v1.build_sessions.sse import build_sse_response
 from src.api.v1.live_build import ReclaimBlockedError, reclaim_blocked_response
 from src.core.errors import AppApiError
+from src.core.integrity_types import WorkspaceState
 from src.db.models.app_registry import AppRegistry
 from src.schemas import AUTH_401, CamelModel, ErrorEnvelope, error_responses
 from src.services.audit.log import append_audit
@@ -73,6 +79,11 @@ from src.services.build_sessions import (
     renew_lock,
     sweep_all,
     write_heartbeat,
+)
+from src.services.build_sessions.snapshot import (
+    ParkedTreeNotOursError,
+    list_parked_trees,
+    promote_parked,
 )
 from src.services.orchestrator.client_errors import (
     park_client_error,
@@ -176,6 +187,87 @@ def _coordination_is_gone() -> AppApiError:
 
 
 # --- internal/reap (registered FIRST so `internal` is never parsed as a session id) ---
+
+
+@router.post(
+    "/internal/apps/{app_id}/parked",
+    dependencies=[RequireCsrf],
+    responses=error_responses(AUTH_401, (403, ErrorEnvelope, "CSRF check failed")),
+)
+async def parked_trees(
+    app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
+) -> ParkedTreesResponse:
+    """The trees this plan set aside for one app — U2 quarantines and U3 diverts (U25).
+
+    WITHOUT THIS THEY ARE WRITE-ONLY: no reader, no retention, no runbook. In a false-`REVERTED`
+    case those objects hold the only copy of a citizen's newest work, and this plan names exactly
+    that shape as a defect elsewhere, so it must not reproduce it.
+
+    `CurrentSuperadmin`, and mounted beside `internal/reap` deliberately: this is an operator
+    action in the same category as the reaper, not the user-facing viewing surface the plan's
+    Scope Boundaries exclude. Audited, like every gated action (ADR-0005)."""
+    trees = await list_parked_trees(app_id)
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="harness:parked:list",
+        resource_type="app",
+        resource_id=str(app_id),
+        detail={"found": len(trees)},
+    )
+    await db.commit()
+    return ParkedTreesResponse(
+        trees=[
+            ParkedTree(
+                key=tree.key,
+                kind=tree.kind,
+                head_sha=tree.head_sha,
+                size_bytes=tree.size_bytes,
+                taken_at=tree.taken_at,
+            )
+            for tree in trees
+        ]
+    )
+
+
+@router.post(
+    "/internal/apps/{app_id}/promote",
+    dependencies=[RequireCsrf],
+    responses=error_responses(AUTH_401, (403, ErrorEnvelope, "CSRF check failed")),
+)
+async def promote_parked_tree(
+    app_id: uuid.UUID,
+    body: PromoteParkedRequest,
+    admin: CurrentSuperadmin,
+    db: DbSession,
+) -> PromoteParkedResponse:
+    """Put one parked tree back into the recovery slot (U25).
+
+    THROUGH U3'S GUARD, never around it. A promotion whose tree is not a descendant of what the
+    slot already holds is REFUSED and alarmed rather than forced — an operator recovering the
+    wrong tree over somebody's newest work is the precise failure this plan exists to stop, and
+    "an operator asked for it" is not evidence that the tree is the right one.
+
+    The key is named explicitly rather than "the newest": a request that cannot say what it means
+    is one that can be misread."""
+    try:
+        outcome = await promote_parked(app_id, key=body.key)
+    except ParkedTreeNotOursError as exc:
+        # A 400, not a 500: pasting the wrong key is an ordinary operator mistake, and rendering
+        # it as an internal fault sends them looking for a broken store instead of at the key.
+        raise AppApiError(
+            status.HTTP_400_BAD_REQUEST, "That parked tree belongs to a different app."
+        ) from exc
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="harness:parked:promote",
+        resource_type="app",
+        resource_id=str(app_id),
+        detail={"key": body.key, "promoted": outcome.promoted},
+    )
+    await db.commit()
+    return PromoteParkedResponse(promoted=outcome.promoted, detail=outcome.detail)
 
 
 @router.post(
@@ -900,6 +992,49 @@ async def preview_state(
         occupying_project_name=state.occupying_project_name,
         restorable=state.restorable,
     )
+
+
+@router.post(
+    "/projects/{project_id}/workspace-check",
+    response_model=WorkspaceCheckResponse,
+    dependencies=[RequireCsrf],
+    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Project not found")),
+)
+async def workspace_check(
+    project_id: uuid.UUID,
+    user: CurrentUser,
+    db: DbSession,
+    manager: SessionManagerDep,
+    sandbox: OptionalSandbox,
+) -> WorkspaceCheckResponse:
+    """Is the app this tab is framing still the citizen's app? (U4, R4/R7.)
+
+    THE TURN MAY NEVER COME. Every other integrity check in this system runs at the start of a
+    turn, which catches every reversion between one message and the next — and catches nothing at
+    all for someone who is reading, or in another tab, or at lunch. The "Build complete — your app
+    is live below" claim above their preview goes on being displayed for as long as the page stays
+    open. That is 2026-08-18 with the clock running, and it is what this route exists to end.
+
+    A POST, WITH CSRF, because it is not a free read: it costs a container exec and it can raise
+    an operational alarm. It follows this file's pattern exactly — `RequireCsrf`, `CurrentUser`,
+    owned-or-404 — and its path is in `_MUTATING_POSTS` so the CSRF matrix actually exercises it.
+
+    DELIBERATELY NOT FOLDED INTO `preview-state`, whose budget is frozen in C3 §8.3 at NO
+    container call of any kind because a browser tab drives it on a 45-second timer. The client
+    calls this one only when preview-state already reports alive AND a completion claim is
+    standing, so the two never both fire on a dark pane — and the manager rate-limits per app on
+    top of that, so a tab left open overnight cannot spin the container.
+
+    IT ONLY REPORTS. Nothing is restored and nothing is destroyed here: the restore belongs to the
+    next turn, where the citizen is present, has been told, and can confirm. Recovering somebody's
+    app behind their back while they are looking at another tab is not a kindness."""
+    await owned_project_or_404(db, user.id, project_id)
+    if sandbox is None:
+        # No sandbox service configured (KTD-2). Nothing can be checked and nothing is claimed —
+        # `UNREADABLE` is the honest answer, and the client holds its claim on it.
+        return WorkspaceCheckResponse(state=WorkspaceState.UNREADABLE, reverted=False)
+    state = await manager.project_workspace_check(db, user, project_id, sandbox_client=sandbox)
+    return WorkspaceCheckResponse(state=state, reverted=state is WorkspaceState.REVERTED)
 
 
 @router.get(

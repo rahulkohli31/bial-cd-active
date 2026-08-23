@@ -168,7 +168,7 @@ def test_the_watermark_question_refuses_to_run_without_its_marker() -> None:
 
 def test_the_watermark_ignores_the_files_the_toolchain_rewrites_by_itself() -> None:
     """★ `next dev` regenerates `next-env.d.ts` and normalises `tsconfig.json` on every boot —
-    that is why `_FRAMEWORK_CHURN` exists at all. Left in, "the agent changed something" is true
+    that is why `FRAMEWORK_CHURN` exists at all. Left in, "the agent changed something" is true
     on essentially every pass whether it did or not, and a watermark that is always true is not a
     watermark: U9's re-check would fire on every red verdict rather than on the stale ones.
 

@@ -34,9 +34,13 @@ from src.services.storage.keys import app_file_key as app_file_key
 from src.services.storage.keys import assert_owned as assert_owned
 from src.services.storage.keys import attachment_key as attachment_key
 from src.services.storage.keys import container_name as container_name
+from src.services.storage.keys import divert_key as divert_key
+from src.services.storage.keys import divert_prefix as divert_prefix
 from src.services.storage.keys import head_sha_from_metadata as head_sha_from_metadata
 from src.services.storage.keys import normalize_metadata as normalize_metadata
 from src.services.storage.keys import owner_prefix as owner_prefix
+from src.services.storage.keys import quarantine_key as quarantine_key
+from src.services.storage.keys import quarantine_prefix as quarantine_prefix
 from src.services.storage.keys import recovery_key as recovery_key
 from src.services.storage.keys import snapshot_key as snapshot_key
 from src.services.storage.keys import submission_key as submission_key

@@ -26,11 +26,12 @@ resolved inline, so `app.dependency_overrides` reach them in tests.
 from __future__ import annotations
 
 import asyncio
+import enum
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Final, Literal
 
 import redis.asyncio as aioredis
@@ -52,12 +53,25 @@ from src.api.v1.build_sessions.schemas import (
 )
 from src.db.base import async_session_factory
 from src.db.models.app_registry import AppRegistry
+from src.db.models.harness_counter import HarnessCounter
 from src.db.models.project import Project
 from src.db.models.user import User
+from src.services.build_sessions.alarms import (
+    RECOVERY_WRITE_DID_NOT_LAND_EVENT,
+    WORKSPACE_LOST_WHILE_IDLE_EVENT,
+)
 from src.services.build_sessions.appdata import build_app_env, resolve_app_for_project
 from src.services.build_sessions.appdb_env import provision_app_database
 from src.services.build_sessions.appstorage import provision_app_storage
 from src.services.build_sessions.attachments import resolve_build_attachments
+from src.services.build_sessions.counters import count
+from src.services.build_sessions.integrity import (
+    IntegrityVerdict,
+    WorkspaceState,
+    clean_but_for_churn,
+    container_state,
+    workspace_integrity,
+)
 from src.services.build_sessions.liveness import flag_liveness_overpromise
 from src.services.build_sessions.locks import (
     DeadlineWriter,
@@ -80,7 +94,13 @@ from src.services.build_sessions.outcome import (
     write_build_started,
 )
 from src.services.build_sessions.reaper import reap_user, reconcile_user
-from src.services.build_sessions.snapshot import write_snapshot
+from src.services.build_sessions.snapshot import (
+    Destination,
+    RecoveryOutcome,
+    consecutive_diverts,
+    write_recovery_copy,
+    write_snapshot,
+)
 from src.services.redis import RedisNotConfiguredError, get_redis
 from src.services.redis.keys import (
     REGISTRY_FIELD_APP_NAME,
@@ -292,9 +312,10 @@ _OUTCOME_WRITE_TIMEOUT_SECONDS: float = 10.0
 # into a fast one; it only makes the citizen stare at a spinner before we hand back the very
 # same URL. 15s is comfortably above a warm attach (measured at ~380ms end to end) and low
 # enough that a slow app degrades promptly instead of two minutes later.
-# The autosave runs on a turn's exit path, so it gets an explicit bound: `SandboxClient.exec`
-# defaults to 900s, and a wedged container must not hold the turn's ending open. Generous enough
-# for a real bundle over the supervisor, short enough that failing is quicker than hanging.
+# The autosave runs on a turn's exit path, so the whole SEQUENCE gets one bound. Each exec in it
+# is already capped individually, but five of them in a row is minutes, and a wedged container must
+# not hold the turn's ending open. Generous enough for a real bundle over the supervisor, short
+# enough that failing is quicker than hanging.
 _RECOVERY_SNAPSHOT_TIMEOUT_SECONDS: float = 60.0
 
 # How long "stop the build so I can switch projects" waits for the turn to actually unwind
@@ -336,6 +357,93 @@ class SnapshotUnavailableError(Exception):
     the user's good bundle, permanently. Aborting leaves the bundle byte-for-byte intact for
     the next start. Raised from `_resolve_sandbox`, so it lands inside `_start_locked`'s
     compensation block (lock released, any container torn down); the router maps it to a 503.
+    """
+
+    def __init__(self, message: str, *, app_id: uuid.UUID) -> None:
+        super().__init__(message)
+        self.app_id = app_id
+
+
+#: How the integrity gate tells the turn what it found, BEFORE it acts on it. A coroutine rather
+#: than a return value because the sentence has to reach the citizen while the slow work runs.
+RecoveryAnnouncer = Callable[["RecoveryNews"], Awaitable[None]]
+
+#: Consecutive U3 refusals after which U2 stops trusting the recovery slot (see
+#: `_source_that_is_not_poisoned`).
+_POISONED_SLOT_REFUSALS: Final = 2
+
+
+async def _say(announce: RecoveryAnnouncer | None, news: RecoveryNews) -> None:
+    """Tell the turn, if anyone is listening. Callers without a turn (a relaunch, a test) pass
+    `None`, and the gate still does its work — it simply says nothing."""
+    if announce is not None:
+        await announce(news)
+
+
+@dataclass(frozen=True)
+class _IdleCheck:
+    """The last answer an idle tab got about one app, and when."""
+
+    asked_at: datetime
+    verdict: WorkspaceState
+
+
+# HOW LONG ONE ANSWER STANDS FOR AN IDLE TAB.
+#
+# Without a window, a tab left open overnight is a container exec every 45 seconds — forever — for
+# an answer that changes at most once. Sized well above the poll interval and well below any
+# reasonable reading session: long enough that a tab cannot spin the container, short enough that a
+# citizen who walks away and comes back learns the truth within a minute of looking again.
+#
+# Process-local, matching the single-replica deploy contract `reaper.py` already depends on. Not
+# pruned on a timer: one small entry per app that has ever been idle-checked, overwritten in place.
+_IDLE_CHECK_WINDOW: Final = timedelta(seconds=60)
+_idle_checks: dict[uuid.UUID, _IdleCheck] = {}
+
+
+def reset_idle_checks_for_tests() -> None:
+    """Drop the per-app idle-check memo. Process-local, so a remembered answer must not leak into
+    the next test and silently make its container call disappear."""
+    _idle_checks.clear()
+
+
+class _Quarantine(enum.StrEnum):
+    """What happened to the tree U2 was about to restore over."""
+
+    WRITTEN = "written"
+    #: Provably nothing in it — the baked template. Skipped on purpose; see the writer below.
+    SKIPPED_AS_EMPTY = "skipped_as_empty"
+    #: Could not be set aside. The restore does NOT proceed.
+    FAILED = "failed"
+
+
+class RecoveryNews(enum.StrEnum):
+    """What the pre-turn integrity gate (U2) has to tell the citizen.
+
+    A SMALL ENUM RATHER THAN THE SENTENCE ITSELF, because the sentences live in
+    `services/turns/copy.py` and this module must not import them: `services.turns` reaches
+    `build_sessions` and an import back would close the cycle. The manager knows what happened;
+    the turn knows how to say it."""
+
+    #: Confirmed loss, and a durable copy exists. Said BEFORE the restore runs — see
+    #: `_still_theirs_or_put_it_back` for why the ordering is not cosmetic.
+    RESTORING = "restoring"
+    #: Confirmed loss and nothing to put back, or the restore itself failed. There is exactly one
+    #: honest next action and the citizen has to be given it.
+    UNRECOVERABLE = "unrecoverable"
+    #: The check could not be answered and no retry will change that. The turn proceeds under
+    #: alarm with one plain sentence; nothing is restored and nothing is destroyed.
+    UNVERIFIED = "unverified"
+
+
+class WorkspaceUnreadableError(Exception):
+    """The integrity gate could not reach the container to ask whether it still holds the app.
+
+    RETRYABLE, and deliberately NOT a verdict. `_resolve_sandbox` raises rather than proceeding,
+    because proceeding would let the agent build on a workspace nobody has checked — which is
+    exactly the 2026-08-18 shape — and because the alternative failure (telling a user to retry)
+    is one they can act on. The container is left running, attached and untouched, so the retry
+    has something to attach to; `integrity.py`'s streak cap is what stops this repeating forever.
     """
 
     def __init__(self, message: str, *, app_id: uuid.UUID) -> None:
@@ -571,127 +679,6 @@ async def _occupying_project(
     return None
 
 
-# One round trip for both halves of the question. `|| true` keeps a repo-less tree from
-# failing the whole script.
-#
-# The porcelain read is capped: the caller needs to know whether the tree is empty and, when
-# it is not, WHICH files changed — and a listing long enough to hit this cap has already
-# answered the only question the cap could interfere with (a tree this dirty is real work, not
-# two files of framework churn). Hitting it therefore sets `porcelain_truncated` and short-
-# circuits the comparison rather than reasoning about a half-read list.
-#
-# ONE constant feeds both the shell cap and the truncation test. They were 200 and 400 in the
-# first cut, which made `porcelain_truncated` unreachable and quietly deleted the backstop
-# (#83 review, finding 6).
-_PORCELAIN_CAP_BYTES: Final = 200
-# Files the FRAMEWORK rewrites on its own, with no user or agent involved. `next dev`
-# regenerates `next-env.d.ts` and normalises `tsconfig.json` on every boot, so a container that
-# has merely STARTED reports a dirty tree — observed live on a workspace whose only history was
-# one Plan question. Treating that as "unsaved changes" is what let an empty template lock a
-# user out of the project holding their real app.
-#
-# Scoped deliberately tight. This set is ONLY consulted when deciding whether a workspace is
-# empty enough to reclaim; it never suppresses anything the user is shown, and the Save button
-# still offers to save these (they are legitimately part of the tree). Add to it only for files
-# the toolchain writes unprompted — never for anything a person or the agent would edit.
-_FRAMEWORK_CHURN: Final = frozenset({"next-env.d.ts", "tsconfig.json"})
-
-
-_STATE_SCRIPT = (
-    'git rev-parse HEAD 2>/dev/null || true; echo "@@"; '
-    f'git status --porcelain 2>/dev/null | head -c {_PORCELAIN_CAP_BYTES}; echo "@@"; '
-    "git rev-list --count HEAD 2>/dev/null || true"
-)
-
-
-@dataclass(frozen=True)
-class _ContainerState:
-    """What the container says about itself. `head is None` means no commit yet — a fresh
-    template has no `.git` at all (`write_snapshot` runs `git init` itself), so this is the
-    NORMAL state of a project nobody has saved, not an error."""
-
-    head: str | None
-    uncommitted: bool
-    # The paths git reports as changed, parsed out of the porcelain. `uncommitted` answers
-    # "is anything different?"; this answers "different HOW", which is what tells framework
-    # churn apart from the user's work. Empty when the tree is clean OR when the porcelain
-    # was truncated (see `porcelain_truncated`).
-    changed_paths: tuple[str, ...]
-    # The porcelain is capped, so a very dirty tree comes back cut off. That is not a state
-    # to reason about — it is unambiguous evidence of real work.
-    porcelain_truncated: bool
-    # How many commits deep HEAD is. A FRESH PROVISION IS ALWAYS 1, never 0: the sandbox
-    # client seeds `bial: golden template baseline` so the agent's own commits never fail on
-    # "not a git repository" (`client.py`). So "no commit yet" is not a state that occurs on a
-    # provisioned container, and anything asking "is there work in here?" has to compare
-    # against the baseline rather than against nothing. 0 means we could not count.
-    commits: int
-
-
-def _parse_state(stdout: str) -> _ContainerState:
-    """Pure parse of `_STATE_SCRIPT`'s three `@@`-separated fields, split out so it is testable
-    without a container — the offset bug it now pins was invisible to every fake."""
-    head_text, _, rest = stdout.partition("@@")
-    porcelain, _, count_text = rest.partition("@@")
-    try:
-        commits = int(count_text.strip() or 0)
-    except ValueError:
-        commits = 0
-    # `XY path` per line; a rename is `XY old -> new` and the destination is the one that
-    # matters. Anything unparseable is kept verbatim rather than dropped — a path we cannot
-    # read must never silently shrink the change set.
-    # `XY path`, two status columns then the path. Split on WHITESPACE rather than slicing a
-    # fixed offset: the block gets stripped before it reaches here, so the first line has
-    # already lost its leading status space and a `line[3:]` silently ate the first character
-    # of its filename (`next-env.d.ts` -> `ext-env.d.ts`, which then matched nothing). A
-    # one-shot split is also correct for paths containing spaces, which a fixed offset is not.
-    paths: list[str] = []
-    for line in porcelain.splitlines():
-        parts = line.strip().split(None, 1)
-        if len(parts) != 2:
-            continue
-        entry = parts[1].strip()
-        if "->" in entry:  # a rename: the destination is the file that now exists
-            entry = entry.split("->")[-1].strip()
-        if entry:
-            paths.append(entry.strip('"'))
-    # BYTES, because `head -c` counts bytes and a non-ASCII filename would make the character
-    # count read short. `>=` rather than `>`: output that lands exactly on the cap is
-    # indistinguishable from output that was cut there, and "assume truncated" is the arm that
-    # refuses a reclaim rather than the one that permits it.
-    trimmed = porcelain.strip()
-    return _ContainerState(
-        head=head_text.strip() or None,
-        uncommitted=bool(trimmed),
-        changed_paths=tuple(paths),
-        commits=commits,
-        porcelain_truncated=len(trimmed.encode("utf-8", "surrogateescape"))
-        >= _PORCELAIN_CAP_BYTES,
-    )
-
-
-async def _container_state(
-    sandbox_client: SandboxClient, handle: SandboxHandle
-) -> _ContainerState | None:
-    """The container's commit AND whether its working tree has uncommitted changes.
-
-    BOTH halves are needed, and getting this wrong is a silent lie in either direction.
-    Comparing only commits would report "all changes saved" whenever the agent had written
-    files without committing them — the prompt asks it to commit per coherent slice, but that
-    is guidance, not a guarantee, and the moment it skips one the indicator starts lying about
-    work sitting right there in the tree.
-
-    None means we could not ask at all, which is the only honest "unknown"."""
-    run_command = sandbox_client.exec  # alias keeps the call off the JS-oriented exec guard
-    try:
-        result = await run_command(handle, ["sh", "-c", _STATE_SCRIPT], timeout_s=30)
-    except SandboxError:
-        return None
-    if result.exit != 0:
-        return None
-    return _parse_state(result.stdout)
-
-
 async def _saved_head(app_id: uuid.UUID) -> str | None:
     """The commit the saved bundle is at, or None when nothing was ever saved."""
     try:
@@ -833,6 +820,13 @@ class _ResolvedSandbox:
 
     handle: SandboxHandle
     attached: bool
+    #: What the pre-turn integrity gate (U2) found, or `None` when it had nothing to say. The
+    #: turn reads it to decide what to tell the citizen and whether to run the agent at all.
+    news: RecoveryNews | None = None
+    #: Whether this turn actually put an older tree back. `True` is what holds the in-flight
+    #: message: the instruction the user typed was written against a workspace that no longer
+    #: exists.
+    restored: bool = False
 
 
 @dataclass
@@ -910,6 +904,11 @@ class BuildSession:
     # a session that never said it writes is not treated as one that does, and the two
     # affected callers both fail toward LESS interruption rather than more.
     may_write: bool = False
+    # U2 — what the pre-turn integrity gate found, and whether it restored. Both are facts about
+    # THIS turn's attach, not about the app, so they live on the session rather than anywhere
+    # durable: the next message asks the question again.
+    news: RecoveryNews | None = None
+    restored: bool = False
     # The thread this build belongs to, carried past `start` so `_do_finalize` can record the
     # outcome in it (003-U5). None when the start named no conversation — an API-only caller,
     # which has no transcript to write to.
@@ -1297,7 +1296,7 @@ class SessionManager:
         # Read the head AFTER the save: `write_snapshot` runs `git init` + commit itself, so on
         # a first save this is the commit it just created — the value the client needs to
         # settle its indicator, and one that did not exist a moment ago.
-        saved = await _container_state(sandbox_client, handle)
+        saved = await container_state(sandbox_client, handle)
         return SaveOutcome(app_id=app_id, head_sha=saved.head if saved else None)
 
     async def project_compile_state(
@@ -1334,6 +1333,68 @@ class SessionManager:
             return CompileState.UNKNOWN
         report = await sandbox_client.compile_state(handle)
         return report.state
+
+    async def project_workspace_check(
+        self,
+        db: AsyncSession,
+        user: User,
+        project_id: uuid.UUID,
+        *,
+        sandbox_client: SandboxClient,
+    ) -> WorkspaceState:
+        """Is the app the citizen is looking at still the app? — asked by an IDLE tab (U4, R4/R7).
+
+        THE TURN MAY NEVER COME. U2 asks this question at the start of every turn, which catches
+        every reversion that happens between one message and the next — and catches nothing at all
+        for a citizen who is reading, or in another tab, or at lunch. The completion claim above
+        their preview goes on saying "your app is live below" for as long as they leave the page
+        open. That is the 2026-08-18 shape with the clock running.
+
+        DELIBERATELY NOT FOLDED INTO `project_preview_state`, whose budget is frozen in C3 §8.3 at
+        NO container call of any kind because it is a browser tab on a 45-second timer. This is
+        its own call, and the caller fires it only when the preview already reports alive AND a
+        completion claim is standing — so the two never both run on a dark pane.
+
+        RATE-LIMITED PER APP, and the limit is the point rather than politeness: without it a tab
+        left open overnight is a container exec every 45 seconds, forever, for an answer that
+        changes at most once. Repeated asks inside the window return the last answer and make no
+        container call.
+
+        NEVER RESTORES AND NEVER DESTROYS. It only reports. The restore belongs to the next turn,
+        where the citizen is present, has been told, and can confirm — recovering an app behind
+        somebody's back while they are looking at a different tab is not a kindness."""
+        app_id = await _existing_app_id(db, user.id, project_id)
+        if app_id is None:
+            return WorkspaceState.INTACT  # nothing built yet: nothing to have lost
+        remembered = _idle_checks.get(app_id)
+        now = datetime.now(UTC)
+        if remembered is not None and (now - remembered.asked_at) < _IDLE_CHECK_WINDOW:
+            return remembered.verdict
+        try:
+            handle = await self._attach_for_read(user.id, app_id, sandbox_client)
+        except NoLiveSandboxError:
+            # Nothing is serving this project at all. The pane has its own vocabulary for that
+            # (`previewState`), and a container that is GONE is a different fact from one that is
+            # running and empty — conflating them would retract a completion claim every time a
+            # workspace merely went to sleep.
+            return WorkspaceState.UNREADABLE
+        verdict = await workspace_integrity(
+            sandbox_client,
+            handle,
+            app_id,
+            restore_source_key=await self._restore_source_for_the_gate(app_id),
+        )
+        _idle_checks[app_id] = _IdleCheck(asked_at=now, verdict=verdict.state)
+        if verdict.state is WorkspaceState.REVERTED:
+            _log.error(
+                WORKSPACE_LOST_WHILE_IDLE_EVENT,
+                app_id=str(app_id),
+                app_name=handle.app_name,
+                last_known_head=verdict.head,
+                recovery_copy_available=verdict.durable_copy_exists,
+                verdict=verdict.state.value,
+            )
+        return verdict.state
 
     async def project_save_state(
         self,
@@ -1373,7 +1434,7 @@ class SessionManager:
         will not answer (unknown — ask), and `_attach_for_read` collapses both into
         `NoLiveSandboxError`.
         """
-        state = await _container_state(sandbox_client, handle)
+        state = await container_state(sandbox_client, handle)
         if state is None:
             # Could not ask the container — the only honest unknown.
             return SaveState(app_id=app_id, dirty=None, container_head=None, saved_head=None)
@@ -1535,12 +1596,15 @@ class SessionManager:
         """
         if state.saved_head is not None or state.recovery_at is not None:
             return False
-        container = await _container_state(sandbox_client, handle)
+        container = await container_state(sandbox_client, handle)
         if container is None or container.commits == 0:
             return False  # could not tell — ambiguity denies
-        if container.commits > 1 or container.porcelain_truncated:
-            return False  # work beyond the baseline, or too much of it to enumerate
-        return all(path in _FRAMEWORK_CHURN for path in container.changed_paths)
+        if container.commits > 1:
+            return False  # work beyond the baseline
+        # ONE spelling of "is this tree empty", shared with the integrity verdict. Two subtly
+        # different ones is how the reclaim gate and the reversion gate would drift into
+        # disagreeing about whether a container may be destroyed.
+        return clean_but_for_churn(container)
 
     async def _refuse_if_reclaim_would_destroy_work(
         self,
@@ -2425,6 +2489,7 @@ class SessionManager:
         *,
         sandbox_client: SandboxClient,
         may_write: bool,
+        announce: RecoveryAnnouncer | None = None,
     ) -> BuildSession:
         """Attach a live sandbox for a turn — everything `start` allocates, minus the build
         (U5's convergence).
@@ -2498,9 +2563,10 @@ class SessionManager:
                 # reuses the running container, so without the spare a `write_heartbeat` blip
                 # or a Stop pressed in the wrong millisecond deleted the app the user was
                 # looking at, with every unsaved change in it (#90).
-                handle = scope.take(
-                    await self._resolve_sandbox(sandbox_client, user_id, app_id, env)
+                resolved = await self._resolve_sandbox(
+                    sandbox_client, user_id, app_id, env, announce=announce
                 )
+                handle = scope.take(resolved)
                 # Inside the protected region, before adopt: a `write_heartbeat` RedisError
                 # out here would orphan `_active_by_user[user_id]` forever and leak the
                 # container. In here it is caught by `_holding_user_lock`'s compensation.
@@ -2518,6 +2584,8 @@ class SessionManager:
             lock_token=scope.token,
             handle=handle,
             may_write=may_write,
+            news=resolved.news,
+            restored=resolved.restored,
         )
         self._sessions[session.session_id] = session
         self._active_by_user[user_id] = session.session_id
@@ -2529,6 +2597,8 @@ class SessionManager:
         user_id: uuid.UUID,
         app_id: uuid.UUID,
         env: dict[str, str],
+        *,
+        announce: RecoveryAnnouncer | None = None,
     ) -> _ResolvedSandbox:
         """The one-per-user rehydrate resolution: live registry → attach; otherwise (no
         registry — which a CLEAN end always leaves behind, since finalize deletes it — or
@@ -2555,14 +2625,182 @@ class SessionManager:
                 attached=False,
             )
         try:
-            return _ResolvedSandbox(
-                await sandbox_client.attach_existing(str(user_id)), attached=True
-            )
+            handle = await sandbox_client.attach_existing(str(user_id))
         except SandboxGoneError:
             return _ResolvedSandbox(
                 await self._restore_or_provision(sandbox_client, user_id, app_name, app_id, env),
                 attached=False,
             )
+        # U2 — THE ONE ARM WHERE THE TREE IS OLDER THAN THIS REQUEST. The other two have just
+        # built the workspace from a bundle or a template, so there is nothing to have lost. This
+        # one hands back a container that has been running unattended, and until this unit
+        # nothing ever asked whether it still held the app.
+        return await self._still_theirs_or_put_it_back(
+            sandbox_client, user_id, app_name, app_id, env, handle, announce=announce
+        )
+
+    async def _still_theirs_or_put_it_back(
+        self,
+        sandbox_client: SandboxClient,
+        user_id: uuid.UUID,
+        app_name: str,
+        app_id: uuid.UUID,
+        env: dict[str, str],
+        handle: SandboxHandle,
+        *,
+        announce: RecoveryAnnouncer | None,
+    ) -> _ResolvedSandbox:
+        """Confirm the attached container still holds this app; on confirmed loss, put it back.
+
+        THE SENTENCE COMES BEFORE THE RESTORE, and that ordering is the unit rather than a
+        nicety. The recovery path adds tens of seconds of otherwise-silent latency — a full
+        bundle of the reverted tree plus a complete restore — during which the citizen is looking
+        at a screen that says nothing at all. `announce` is called first, and then the slow work
+        happens behind a sentence that explains it.
+
+        NOTHING BUT `REVERTED` REACHES A TEARDOWN. That is not defensive coding, it is the
+        entire safety property: `REVERTED` requires three independent facts to agree (see
+        `judge_workspace`), and the two unanswerable states leave the container running,
+        attached and untouched."""
+        source = await self._restore_source_for_the_gate(app_id)
+        verdict = await workspace_integrity(
+            sandbox_client, handle, app_id, restore_source_key=source
+        )
+        if verdict.state is WorkspaceState.INTACT:
+            return _ResolvedSandbox(handle, attached=True)
+        if verdict.state is WorkspaceState.UNREADABLE:
+            raise WorkspaceUnreadableError(verdict.reason, app_id=app_id)
+        if verdict.state is WorkspaceState.UNVERIFIABLE:
+            _log.warning(
+                "workspace_integrity_unverifiable",
+                app_id=str(app_id),
+                detail=verdict.reason,
+                head=verdict.head,
+            )
+            await _say(announce, RecoveryNews.UNVERIFIED)
+            return _ResolvedSandbox(handle, attached=True, news=RecoveryNews.UNVERIFIED)
+
+        # --- REVERTED ------------------------------------------------------------------------
+        if not verdict.durable_copy_exists:
+            # AE3. Nothing to put back. The one thing that must NOT happen here is presenting the
+            # empty template as their app and letting the agent build on it, so the news carries
+            # the honest sentence and the turn holds.
+            _log.error(
+                "workspace_reverted_unrecoverable",
+                app_id=str(app_id),
+                detail=verdict.reason,
+                head=verdict.head,
+            )
+            await _say(announce, RecoveryNews.UNRECOVERABLE)
+            return _ResolvedSandbox(handle, attached=True, news=RecoveryNews.UNRECOVERABLE)
+
+        await _say(announce, RecoveryNews.RESTORING)
+        taken_at = datetime.now(UTC)
+        quarantined = await self._park_the_tree_aside(
+            sandbox_client, handle, app_id, verdict, taken_at=taken_at
+        )
+        if quarantined is _Quarantine.FAILED:
+            # NEVER DESTROY THE ONLY COPY TO MAKE A RECOVERY SUCCEED. If the tree could not be
+            # set aside, the restore does not run — the container keeps whatever it has.
+            await _say(announce, RecoveryNews.UNRECOVERABLE)
+            return _ResolvedSandbox(handle, attached=True, news=RecoveryNews.UNRECOVERABLE)
+        try:
+            restored = await self._restore_or_bust(
+                sandbox_client,
+                user_id,
+                app_name,
+                app_id,
+                env,
+                source_key=self._source_that_is_not_poisoned(app_id, source),
+            )
+        except StorageError, SandboxError, SnapshotUnavailableError:
+            # `restore_from_snapshot` fetches BEFORE it destroys anything and self-cleans on the
+            # way out (ASM7), so a failure here leaves the container either untouched or gone —
+            # never half-restored. Either way the citizen has to be told, because the alternative
+            # is a preview that quietly shows a template.
+            _log.exception("workspace restore failed after quarantine", app_id=str(app_id))
+            await _say(announce, RecoveryNews.UNRECOVERABLE)
+            return _ResolvedSandbox(handle, attached=True, news=RecoveryNews.UNRECOVERABLE)
+        await count(HarnessCounter.RESTORE_PERFORMED, app_id=app_id)
+        _log.warning(
+            "workspace_restored_after_reversion",
+            app_id=str(app_id),
+            detail=verdict.reason,
+            quarantined=quarantined.value,
+        )
+        return _ResolvedSandbox(
+            restored, attached=False, news=RecoveryNews.RESTORING, restored=True
+        )
+
+    async def _restore_source_for_the_gate(self, app_id: uuid.UUID) -> str | None:
+        """Which bundle would a restore hand back? — asked so the verdict compares against it.
+
+        `newest_restore_source` RAISES when the store will not answer, and on this path that is
+        the same fact as a container that will not answer: we cannot tell, so we must not judge.
+        Mapped to `None` here and left for `workspace_integrity`'s own store read to surface as
+        `UNREADABLE`, rather than aborting the turn with a different error shape."""
+        try:
+            return await self.newest_restore_source(app_id)
+        except SnapshotUnavailableError:
+            return None
+
+    def _source_that_is_not_poisoned(self, app_id: uuid.UUID, source: str | None) -> str | None:
+        """Which bundle to actually restore, when the recovery slot may itself be the problem.
+
+        THE SLOT CAN BE POISONED, and `recoverable_work` cannot tell. It ranks the two bundles by
+        `last_modified`, never by ancestry, so a recovery copy that was overwritten with a bad
+        tree outranks a perfectly good saved one — and every restore afterwards hands back the
+        poison. Two consecutive refusals by U3's guard is the signal that the slot rather than the
+        turn is the problem: fall back to the user's own Save, which no platform write ever
+        touches, and escalate."""
+        if source is None or consecutive_diverts(app_id) < _POISONED_SLOT_REFUSALS:
+            return source
+        _log.error(
+            "recovery_slot_looks_poisoned",
+            app_id=str(app_id),
+            consecutive_refusals=consecutive_diverts(app_id),
+            detail="restoring the user's saved bundle instead of the recovery slot",
+        )
+        return None
+
+    async def _park_the_tree_aside(
+        self,
+        sandbox_client: SandboxClient,
+        handle: SandboxHandle,
+        app_id: uuid.UUID,
+        verdict: IntegrityVerdict,
+        *,
+        taken_at: datetime,
+    ) -> _Quarantine:
+        """Bundle the tree we are about to restore over, unless there is provably nothing in it.
+
+        SKIPPED ONLY WHEN WE CAN SEE THAT THERE IS NOTHING TO KEEP. In the headline factory-reset
+        case the tree being quarantined IS the baked template, so the write would be a full
+        `git bundle` + base64 + upload on the slowest path in the system to preserve nothing.
+
+        THE GUARD IS `provably_bare`, NOT `content_empty`, and the difference is the whole point.
+        The plan specified `content_empty` — but `REVERTED` requires `content_empty` by
+        construction, so that guard would skip EVERY quarantine and the write would be dead code.
+        Worse, `content_empty` is true whenever there is no repository at all, which is exactly
+        the case where the working directory may hold the user's entire app with only its `.git`
+        missing. Skip when we positively know the tree is the starter template; quarantine when we
+        cannot tell."""
+        if verdict.provably_bare:
+            return _Quarantine.SKIPPED_AS_EMPTY
+        try:
+            await write_snapshot(
+                sandbox_client,
+                handle,
+                app_id,
+                destination=Destination.quarantine(app_id, taken_at),
+            )
+        except SandboxError, StorageError:
+            _log.exception(
+                "could not quarantine the workspace; refusing to restore over it",
+                app_id=str(app_id),
+            )
+            return _Quarantine.FAILED
+        return _Quarantine.WRITTEN
 
     async def _restore_or_provision(
         self,
@@ -3129,21 +3367,44 @@ class SessionManager:
         #     laptop, the idle reaper) from costing the whole session.
         #
         #     Best-effort and swallowed, deliberately: a safety net that can fail a turn is
-        #     not a safety net. The bounded timeout matters too — `exec` defaults to 900s and
-        #     this runs on the turn's exit path.
+        #     not a safety net. The bounded timeout matters too: each exec inside the write is
+        #     already capped (120s in `snapshot.py`, 30s for the ancestry probe), but five in
+        #     sequence is minutes on a path whose job is to end.
         if session.handle is not None and touched:
             try:
                 async with asyncio.timeout(_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS):
-                    await write_snapshot(
-                        sandbox_client, session.handle, session.app_id, recovery=True
+                    written = await write_recovery_copy(
+                        sandbox_client,
+                        session.handle,
+                        session.app_id,
+                        taken_at=datetime.now(UTC),
                     )
-            except TimeoutError, Exception:
-                _log.warning(
-                    "recovery snapshot failed; the turn is unaffected",
+                if written.outcome is RecoveryOutcome.DIVERTED:
+                    # THE NUMBER THAT SETTLES 2026-08-18 the next time it happens: the difference
+                    # between "the platform failed to CHECK the workspace" and "the platform
+                    # failed to make it DURABLE", which nobody could answer on the day.
+                    await count(HarnessCounter.RECOVERY_WRITE_MISSED, app_id=session.app_id)
+                _log.info(
+                    "recovery copy",
                     app_id=str(session.app_id),
                     session_id=str(session.session_id),
+                    outcome=written.outcome.value,
+                    detail=written.reason,
+                )
+            except TimeoutError, Exception:  # fmt: skip  # ruff py314 strips the parens
+                # STILL SWALLOWED — a safety net that can fail a turn is not a safety net — but
+                # no longer SILENT. The swallow is exactly what made the 2026-08-18 reframe
+                # unfalsifiable: nobody could say afterwards whether the platform had failed to
+                # check the workspace or failed to make it durable, because a write that never
+                # landed left no trace an operator would ever look for.
+                _log.error(
+                    RECOVERY_WRITE_DID_NOT_LAND_EVENT,
+                    app_id=str(session.app_id),
+                    session_id=str(session.session_id),
+                    reason="failed",
                     exc_info=True,
                 )
+                await count(HarnessCounter.RECOVERY_WRITE_MISSED, app_id=session.app_id)
 
         # 2/3. Pardon: grant the stay while the lock is STILL HELD, then release. The order
         #      is load-bearing (see `_pardon_the_container`) — releasing first opens a window

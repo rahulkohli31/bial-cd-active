@@ -792,3 +792,61 @@ describe('a build that dies before its first step shows no empty bubble (2026-07
     await waitFor(() => expect(screen.queryByTestId('build-bubble')).toBeNull())
   })
 })
+
+// U2 — the platform's own sentences about the workspace, and the slot they share.
+describe('what the platform says about the workspace itself (U2)', () => {
+  function scriptReadTurn() {
+    const live = { emit: null, close: null }
+    h.readTurnStream.mockImplementation(async ({ onFrame }) => {
+      live.emit = onFrame
+      onFrame(T_WORKSPACE('preparing', 1, 'Getting your workspace ready…'))
+      return new Promise((resolve) => { live.close = resolve })
+    })
+    return {
+      frame: async (...frames) => { await act(async () => { for (const f of frames) live.emit?.(f) }) },
+      end: async () => { await act(async () => { live.close?.('completed'); await Promise.resolve() }) },
+    }
+  }
+
+  // ★ THE BANNER IS THE ONLY PLACE THIS SENTENCE CAN LIVE. Putting an app back takes tens of
+  // seconds, and a bubble that scrolls away takes its own next action with it — this one ends in
+  // "send your message again", which the citizen has to still be able to see when it comes back.
+  it('shows a recovery sentence above the composer, not in the transcript', async () => {
+    h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'builder', mode: 'ask', messages: [] })
+    const turn = scriptReadTurn()
+    renderBuilder({ deps: deps().deps })
+    await send('Add a column for the gate number.')
+    // Wait for the turn to be genuinely under way: `resetTurnNarrative` clears the banner at the
+    // start of every turn, so a notice framed before that lands would be wiped by the setup
+    // rather than by anything this test is about.
+    await screen.findByTestId('build-bubble')
+
+    await turn.frame(T_WORKSPACE('preparing', 2, null, 'Your workspace had been reset, so we are putting your app back.'))
+
+    const banner = await screen.findByTestId('turn-banner')
+    expect(banner.textContent).toMatch(/putting your app back/i)
+  })
+
+  // The ordinary phase machine ticks `preparing` -> `ready` on EVERY turn and carries no message.
+  // Reading those as platform speech would post an empty banner on every message — and worse,
+  // `ready` would wipe a sentence that is still true the moment the container came up.
+  it('is not posted or cleared by the ordinary lifecycle frames', async () => {
+    h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'builder', mode: 'ask', messages: [] })
+    const turn = scriptReadTurn()
+    renderBuilder({ deps: deps().deps })
+    await send('Add a column for the gate number.')
+    await screen.findByTestId('build-bubble')
+
+    expect(screen.queryByTestId('turn-banner')).toBeNull()
+
+    await turn.frame(T_WORKSPACE('preparing', 2, null, 'We could not check whether your workspace is intact.'))
+    await screen.findByTestId('turn-banner')
+
+    await turn.frame(T_WORKSPACE('ready', 3))
+
+    // LIVENESS: the turn really did move on, so the surviving banner is a decision rather than a
+    // component that never re-rendered.
+    await waitFor(() => expect(screen.queryByTestId('build-bubble')).toBeNull())
+    expect(screen.getByTestId('turn-banner').textContent).toMatch(/could not check/i)
+  })
+})

@@ -122,7 +122,14 @@ export interface WorkspaceFrame {
   type: 'workspace'
   seq: number
   state: 'preparing' | 'ready' | 'unavailable'
+  /** What is happening RIGHT NOW, narrated — replaced by whatever the next phase says. */
   message?: string | null
+  /** U2 — something the platform needs the citizen to SEE, as distinct from `message`.
+   *  A statement about the app (it was reset and is being put back, it was reset and cannot be,
+   *  we could not check it) rather than about the phase, so it outlives the phase that carried
+   *  it and belongs in the banner slot rather than in the build bubble. Sharing one field made
+   *  every ordinary turn post "Getting your workspace ready…" above the composer. */
+  notice?: string | null
 }
 
 /** The live preview. A NEW url remounts the iframe; `reconnecting` says the dev process died
@@ -404,6 +411,7 @@ function toTurnFrame(parsed: unknown): TurnFrame | null {
         seq,
         state,
         message: typeof parsed.message === 'string' ? parsed.message : null,
+        notice: typeof parsed.notice === 'string' ? parsed.notice : null,
       }
     }
     case 'preview': {

@@ -71,6 +71,9 @@ _AUTH: dict[str, str] = {
     "AUTH__REDIRECT_URI": "http://localhost:8000/api/v1/auth/callback",
 }
 _ADMINS: dict[str, str] = {"SUPERADMIN_EMAILS": "admin@bial.com"}
+# U24 — required of the API with no default, so every API profile built here needs it or
+# the "boots with X" tests would fail for a reason that has nothing to do with X.
+_SUPPORT: dict[str, str] = {"SUPPORT_CONTACT_EMAIL": "help@bial.com"}
 _APP_DB: dict[str, str] = {
     "APP_DB__MAINTENANCE_DSN": "postgresql+asyncpg://maint:p@localhost:5432/postgres",
     # Fernet wants 32 url-safe-base64-encoded bytes; any well-formed key satisfies construction.
@@ -78,7 +81,7 @@ _APP_DB: dict[str, str] = {
 }
 
 _WORKER_ENV = {**_CORE, **_STORE, **_REDIS, **_SANDBOX}
-_API_ENV = {**_CORE, **_AUTH, **_ADMINS}
+_API_ENV = {**_CORE, **_AUTH, **_ADMINS, **_SUPPORT}
 
 
 @contextmanager

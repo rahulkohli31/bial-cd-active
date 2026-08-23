@@ -1,4 +1,4 @@
-"""Is the scheduled worker alive? (U11, R20.)
+"""Is the scheduled worker alive, and did the reap it performed secure anything? (U11, R20; U5.)
 
 THE ONLY HONEST DETECTOR OF A DEAD WORKER IS SILENCE. Every alarm the reclamation pass raises is
 emitted *by the pass* — the fleet-count warning, the store-fault error, the candidate lines. A
@@ -9,17 +9,30 @@ record on every outcome and why this module reads the ABSENCE of one as the alar
 Read from Postgres, never Redis: under any eviction policy a Redis marker is evictable, so a
 staleness alarm keyed on one would fire spuriously *and* its absence would be indistinguishable
 from a real outage.
+
+WHY A WRITER LIVES HERE TOO. U5 taught the reaper to take a durable copy before it reclaims, and
+the failure mode it inherits is the same epistemic one: a container whose copy cannot be taken is
+SPARED, and a spared container is indistinguishable from a fleet with nothing in it. It bills
+forever and nothing says so — which is the state ASM30 found the platform already in, at the two
+`confirm_durable_copy` call sites that only ever logged. So the attempt writes a `worker_passes`
+row on every outcome, exactly as the pass above does, and for exactly the same reason: the row is
+the only thing an operator can look for that does not depend on the failing component to speak up.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import enum
+from typing import Final
 
 import sqlalchemy as sa
+import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.db.models.worker_pass import WorkerPass
+from src.db.models.worker_pass import PassOutcome, WorkerPass
 from src.workers.reclamation import RECLAMATION_CRON, RECLAMATION_TASK_NAME
+
+_log = structlog.get_logger()
 
 #: How many scheduled intervals may pass before silence counts as a fault. Three, matching the
 #: head-room every other liveness signal in this system uses (`HEARTBEAT_TTL` over
@@ -81,3 +94,145 @@ async def reclamation_pass_freshness(db: AsyncSession) -> tuple[dt.datetime | No
     if last.tzinfo is None:  # a naive column value; compare in UTC rather than crash
         last = last.replace(tzinfo=dt.UTC)
     return last, (dt.datetime.now(dt.UTC) - last) > STALE_AFTER
+
+
+# ─────────────────────────────────────────────────────────────────────────────────────────
+# U5 — the copy the reaper takes before it reclaims (ADR-0029 §7).
+# ─────────────────────────────────────────────────────────────────────────────────────────
+
+#: The `task_name` a copy-before-reclaim row carries, and it is DELIBERATELY NOT
+#: `RECLAMATION_TASK_NAME`. `reclamation_pass_freshness` above reads the single newest row for
+#: that name and pronounces the scheduler alive on the strength of it — so filing a per-container
+#: copy attempt under the pass's own name would let a worker that died hours ago go on looking
+#: healthy for as long as anything else kept reaping. Two questions, two names.
+DURABLE_COPY_TASK_NAME: Final = "sandbox_durable_copy"
+
+
+class CopyAttempt(enum.StrEnum):
+    """What one reap's attempt to secure a container's work before destroying it came to.
+
+    Five outcomes rather than a bare success/failure pair, because the three sparing arms fail
+    for reasons an operator has to act on DIFFERENTLY: an unreachable container needs somebody to
+    look at the container, a refused promotion needs somebody to look at the diverted bundle, and
+    a raised write needs somebody to look at the store. Collapsing them would produce a row that
+    says a container was spared and nothing about what to do next.
+    """
+
+    #: The gate was already satisfied — the durable copy is current, so there was nothing to take
+    #: before reclaiming. The zero-candidate case, and it is recorded for the same reason a
+    #: zero-candidate pass is: a quiet fleet and a dead process are otherwise one observation.
+    NOTHING_TO_COPY = "nothing_to_copy"
+    #: ADR-0029 §7 kept: a fresh copy landed in the recovery slot, and the container may go.
+    COPIED = "copied"
+    #: There was nothing to copy FROM. The container would not attach, or the record no longer
+    #: names the container we are judging — in which case the tree we could reach belongs to
+    #: somebody else's build and must never be bundled into this app's slot.
+    UNREACHABLE = "unreachable"
+    #: U3's guard would not promote this tree over the copy on record: the lineage is broken or
+    #: unreadable. The bundle is preserved under `divert_key`, the existing copy is untouched,
+    #: and the container is spared — a refusal is never a licence to destroy.
+    REFUSED = "refused"
+    #: The bundle, the read-back or the upload itself raised. Nothing was established, so nothing
+    #: is destroyed.
+    FAILED = "failed"
+    #: A copy landed, but it is THE FIRST ONE — there was nothing on record to compare it against,
+    #: so U3's lineage guard never ran. Fine at a turn boundary, where the container is alive and
+    #: the tree is the citizen's; NOT a licence to destroy, because a reverted container has
+    #: exactly this shape and the copy we just took would be the reverted tree.
+    UNGUARDED = "unguarded"
+    #: The gate was satisfied by its unreadable-container FALLBACK — a parseable bundle stood in
+    #: because the container could not answer — so the destroy proceeded without any comparison
+    #: having run. Recorded distinctly because "already current" would be a claim nobody made.
+    UNVERIFIED_FALLBACK = "unverified_fallback"
+
+
+#: How each outcome reads to the operator endpoint: the native enum it stores under, and the one
+#: sentence the `detail` column carries. Kept as a table rather than as branches at the write, so
+#: adding an outcome cannot ship a row with no explanation in it.
+#:
+#: NOT ONE OF THESE SENTENCES NAMES A CONTAINER OR AN APP, and that is the `WorkerPass.detail`
+#: contract rather than an oversight: a sandbox name embeds 28 hex characters of its app's uuid,
+#: this column is read by an admin endpoint, and the identity belongs in the structlog line the
+#: reaper emits beside the row (C10 §3.6). What the row is for is "this is happening, it is not
+#: getting better, and here is which half to look at".
+_ATTEMPT_MEANING: Final[dict[CopyAttempt, tuple[PassOutcome, str]]] = {
+    CopyAttempt.NOTHING_TO_COPY: (
+        PassOutcome.OK,
+        "the durable copy was already current; nothing to take before reclaiming",
+    ),
+    CopyAttempt.COPIED: (
+        PassOutcome.OK,
+        "a recovery copy was taken before the container was reclaimed",
+    ),
+    CopyAttempt.UNREACHABLE: (
+        PassOutcome.DECLINED,
+        "the container we judged could not be reached, so no copy could be taken; spared",
+    ),
+    CopyAttempt.REFUSED: (
+        PassOutcome.DECLINED,
+        "the working tree is not a descendant of the copy on record; diverted and spared",
+    ),
+    CopyAttempt.FAILED: (
+        PassOutcome.FAILED,
+        "the recovery write raised; see the traceback on the reaper's log line. Spared",
+    ),
+    CopyAttempt.UNVERIFIED_FALLBACK: (
+        PassOutcome.DECLINED,
+        "the container could not be read, so a standing bundle stood in for the comparison; "
+        "reclaimed without verifying currency",
+    ),
+    CopyAttempt.UNGUARDED: (
+        PassOutcome.DECLINED,
+        "the copy taken was the first on record, so no lineage guard ran; spared rather than "
+        "destroyed on the strength of an unverified tree",
+    ),
+}
+
+#: The arms that leave a container standing. Read once here rather than re-derived at the write,
+#: because "which outcomes spared something" is the only question this row is ever asked.
+_SPARED: Final = frozenset({CopyAttempt.UNREACHABLE, CopyAttempt.REFUSED, CopyAttempt.FAILED})
+
+
+async def record_durable_copy_attempt(attempt: CopyAttempt) -> None:
+    """Write the row for ONE container's copy-before-reclaim attempt. Never raises.
+
+    ON EVERY OUTCOME, including the boring one. A reap that found the copy already current writes
+    too — otherwise the only rows in the table are the unhappy ones, and an operator reading an
+    empty result cannot tell "nothing went wrong" from "nothing ran at all". That is the same
+    inference `workers/reclamation._record_pass` protects, one level down.
+
+    ITS OWN SESSION, and the factory is imported INSIDE the function rather than at module scope.
+    That is not style: `tests/conftest.py` REBINDS `src.db.base.async_session_factory` onto a
+    NullPool engine before any consumer can bind it by value, because pytest-asyncio runs each
+    test on its own loop and a pooled asyncpg connection belongs to the loop that opened it. A
+    module-level `from ... import async_session_factory` captures the pooled original and hands
+    every test a connection from the wrong loop.
+
+    BOOKKEEPING NEVER FAILS THE REAP. A reap that correctly spared a container must not raise
+    because its record could not be written — but it is logged with a traceback rather than
+    swallowed, because the whole value of this table is that its silence means something, and a
+    quiet write failure would make a working reaper look like one that stopped."""
+    from src.db.base import async_session_factory
+
+    try:
+        # INSIDE the try, so the docstring's "never raises" is literally true. An
+        # unmapped member is a bug, but a bug that aborts a REAP is worse than one that loses
+        # a row — and this sits on a destroy path where an escaping exception ends the whole
+        # user's sweep.
+        outcome, detail = _ATTEMPT_MEANING[attempt]
+        async with async_session_factory() as db:
+            db.add(
+                WorkerPass(
+                    task_name=DURABLE_COPY_TASK_NAME,
+                    outcome=outcome,
+                    finished_at=dt.datetime.now(dt.UTC),
+                    counts={
+                        "copied": 1 if attempt is CopyAttempt.COPIED else 0,
+                        "spared": 1 if attempt in _SPARED else 0,
+                    },
+                    detail=detail,
+                )
+            )
+            await db.commit()
+    except Exception:
+        _log.exception("durable_copy_attempt_record_failed", attempt=attempt.value)

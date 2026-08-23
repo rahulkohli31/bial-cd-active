@@ -770,8 +770,8 @@ async def _mark_now_in_the_container(sandbox_client: SandboxClient, handle: Sand
 async def _has_this_app_ever_been_built(app_id: uuid.UUID) -> bool:
     """`integrity.has_ever_been_built`, reached through a function-scoped import.
 
-    Same cycle, same answer, same precedent as `selfheal._ask_the_container_what_it_is_showing`
-    and `reaper`'s `_container_state`: `src.services.build_sessions.__init__` reaches
+    Same cycle, same answer, same precedent as `selfheal._ask_the_container_what_it_is_showing`:
+    `src.services.build_sessions.__init__` reaches
     `services.orchestrator.__init__` by way of `appdata` → `services.projects` → `agent.agent`, so
     a module-level import here fails at interpreter start rather than at call time."""
     from src.services.build_sessions.integrity import has_ever_been_built

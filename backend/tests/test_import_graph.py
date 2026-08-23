@@ -57,6 +57,48 @@ def test_the_reaper_imports_without_the_fastapi_app() -> None:
     assert "ok" in result.stdout
 
 
+def test_the_integrity_verdict_carries_nothing_heavy_of_its_own() -> None:
+    """U1 — `manager.py` AND `reaper.py` both import this module at module level, so it must not
+    reach back into either of them, or into the orchestrator.
+
+    LOADED BY FILE PATH, DELIBERATELY, and this is the honest version of the claim. Importing
+    `src.services.build_sessions.integrity` by name runs the PACKAGE `__init__`, which imports
+    `manager` -> `appdata` -> `services.projects` -> `agent.agent` and therefore `pydantic_ai` —
+    that is already true of `reaper` today and is not this module's doing. What this test pins is
+    the property that IS this module's doing: its own module-level imports stay cheap, so it can
+    never become the reason a worker loads the agent stack, and it can never close the
+    `build_sessions` <-> `orchestrator` cycle that forced `selfheal` and `harness` to defer
+    theirs.
+
+    NOT ASSERTED, because it would be a false claim: `fastapi` still arrives, pulled in by
+    `src.services.sandbox` and `src.services.storage`, which every module in this area already
+    loads. The three names below are the ones this module could plausibly grow and must not.
+
+    Mutation check: add `from src.services.build_sessions.manager import SessionManager` (or any
+    `src.services.orchestrator` import) at the top of `integrity.py` and this goes red."""
+    result = _import_in_fresh_interpreter(
+        "import importlib.util, sys;"
+        " spec = importlib.util.spec_from_file_location("
+        "'bial_integrity_probe', 'src/services/build_sessions/integrity.py');"
+        " assert spec and spec.loader;"
+        " module = importlib.util.module_from_spec(spec);"
+        # Registered before exec: `from __future__ import annotations` makes dataclasses
+        # resolve field types by looking the defining module up in `sys.modules`.
+        " sys.modules['bial_integrity_probe'] = module;"
+        " spec.loader.exec_module(module);"
+        " heavy = [name for name in sys.modules"
+        "   if name.startswith(('pydantic_ai', 'src.services.orchestrator'))"
+        "   or name in ('src.main', 'src.services.build_sessions.manager')];"
+        " assert not heavy, heavy;"
+        " print('ok')"
+    )
+    assert result.returncode == 0, (
+        f"the integrity verdict grew a heavy import.\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "ok" in result.stdout
+
+
 def test_the_environment_accessor_stays_outside_the_settings_cycle() -> None:
     """THE CYCLE IS THE WHOLE REASON `src/core/runtime_env.py` EXISTS.
 
@@ -150,12 +192,16 @@ def test_the_app_still_builds_with_its_full_route_surface() -> None:
     paths = list(app.openapi().get("paths", {}))
     build_session_paths = [p for p in paths if "build-session" in p]
 
-    # 18 since U13 added `projects/{project_id}/client-error` (the app's own in-browser report)
-    # and U11 added `projects/{project_id}/compile-state` (the compile signal for a tab with no
-    # live turn — the turn stream's producer stops at the terminal). Both recorded in C3 §9 in
-    # the same change that added the route.
-    assert len(build_session_paths) == 18, (
-        f"the C3 build-session route surface changed: expected 18 paths, found "
+    # 19 since U13 added `projects/{project_id}/client-error` (the app's own in-browser report),
+    # U11 added `projects/{project_id}/compile-state` (the compile signal for a tab with no live
+    # turn — the turn stream's producer stops at the terminal), and U4 added
+    # `projects/{project_id}/workspace-check` (the idle-tab integrity probe, for the reversion
+    # that happens while nobody is sending messages), and U25 added the two superadmin operator
+    # routes for the trees U2 and U3 park (`internal/apps/{app_id}/parked` and `.../promote`) —
+    # without a reader those objects would be write-only, and in a false-reversion they hold the
+    # only copy of somebody's work. Each recorded in C3 §9 in the same change that added it.
+    assert len(build_session_paths) == 21, (
+        f"the C3 build-session route surface changed: expected 21 paths, found "
         f"{len(build_session_paths)}. If a route was deliberately added or removed, amend C3 "
         f"and update this number in the same change.\n{sorted(build_session_paths)}"
     )

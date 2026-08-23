@@ -580,6 +580,41 @@ export async function fetchCompileState(
   }
 }
 
+/**
+ * Is the app this tab is framing still the citizen's app? (U4, R4/R7.)
+ *
+ * THE TURN MAY NEVER COME. Every other integrity check runs at the start of a turn, which catches
+ * every reversion between one message and the next — and nothing at all for someone who is
+ * reading, or in another tab, or at lunch. The "Build complete — your app is live below" claim
+ * goes on being displayed for as long as the page stays open.
+ *
+ * ONLY A POSITIVE `reverted` MEANS ANYTHING, and it is the server's boolean rather than something
+ * derived here. Four states can come back and only one of them may retract a completion claim;
+ * writing `state !== 'intact'` on this side would retract on the two that mean "we could not
+ * tell", which is the mistake the whole verdict is shaped to prevent.
+ *
+ * NEVER THROWS, and answers `false` on anything unreadable. This runs on a background timer
+ * beside a preview the citizen is looking at: a probe that could fail the page would be a second
+ * failure caused by the check for the first one.
+ */
+export async function checkWorkspace(
+  projectId: string,
+  deps: AuthFetchDeps = {},
+): Promise<boolean> {
+  try {
+    const res = await authFetch(
+      `${BASE}/projects/${encodeURIComponent(projectId)}/workspace-check`,
+      { method: 'POST' },
+      deps,
+    )
+    if (!res.ok) return false
+    const body: unknown = await res.json().catch(() => null)
+    return isRecord(body) && body.reverted === true
+  } catch {
+    return false
+  }
+}
+
 export async function fetchSaveState(
   projectId: string,
   deps: AuthFetchDeps = {},

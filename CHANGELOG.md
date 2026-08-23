@@ -4,14 +4,44 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.6.17] - 2026-08-23
+## [1.6.16] - 2026-08-23
 
-**"Build complete" only appears when your app is actually your app.** On the demo that started
-this work, "Build complete — your app is live below" sat above the untouched starting template for
-nine minutes. Every check the platform had came back green, because every one of them was asking
+Everything below comes from one demo. On 18 August the platform destroyed a finished app twice,
+told a client the build was complete while the untouched starting template sat on screen for nine
+minutes, and filled the preview with a full-screen error page in each of three builds. This
+release is the answer to all three.
+
+### Your app cannot be quietly replaced by an empty one
+
+A workspace that had reset itself to a blank template looked, to every check the platform had,
+exactly like a project nobody had built yet. So the assistant built on the blank template, and the
+automatic backup then saved the blank template over the real one.
+
+Before anything runs now, the platform checks whether your workspace still holds your app. If it
+finds it has been wiped, it tells you, sets the current state aside, puts your app back from the
+last copy it kept, and asks you to send your message again — because what you typed was written
+about an app that is no longer there.
+
+**It only acts when it is sure.** Three separate things have to agree before the platform will
+replace a workspace, and "we could not check" is never one of them. If a check cannot be answered,
+your app is left exactly as it is and you are told plainly — and if the check keeps failing, the
+platform stops asking rather than locking you out of your own project.
+
+**A backup can no longer overwrite good work with bad.** The automatic copy taken at the end of
+every message asks one question first: was this built on top of the copy it is about to replace?
+If not, it keeps both and tells an administrator, instead of overwriting.
+
+**If your app stops running while you are reading, you find out.** Until now that was only caught
+the next time you sent a message — which might be never. The preview checks on its own, says your
+app stopped running and will be brought back, and strikes through the "your app is finished"
+message that is no longer true, rather than deleting it as if it had never been said.
+
+### "Build complete" only appears when your app is actually your app
+
+Every check the platform had came back green on that demo, because every one of them was asking
 "is an app running here" and none of them was asking "is it theirs".
 
-Two questions now decide it. The platform loads your app's home page the way your browser would,
+Two questions decide it now. The platform loads your app's home page the way your browser would,
 so a page that answers with an error can no longer pass. And it compares that home page against
 the one your workspace was created with — if they are still identical, nothing you asked for is on
 the page you actually look at, and the build is not finished. This works on every app that already
@@ -20,31 +50,17 @@ exists: it is a fact about your app's own history, not a marker the platform had
 **A change that cannot be finished now ends, and says what you are looking at.** It used to end by
 saying your app "still has an error" and leaving you to work out what was on screen — or worse, to
 leave the preview saying "putting the latest change together…" for as long as you left the tab
-open, so the only way to learn it had stopped was to wait long enough to stop believing it.
+open, so the only way to learn it had stopped was to wait long enough to stop believing it. It now
+tells you which of three things your app is currently showing: the starting template, an earlier
+version of itself, or nothing yet. Those are different situations and they change what you would
+do next.
 
-It now tells you the change did not come together and which of three things your app is currently
-showing: the starting template, an earlier version of itself, or nothing yet. Those are different
-situations and they change what you would do next. The preview stops claiming progress at the same
-moment.
+**If your app breaks in the browser, the platform notices.** An app can answer every check the
+platform makes and still die the moment it renders. Your app's own errors now reach the platform,
+and a build that crashes in the browser is not reported as finished. Ordinary browser warnings do
+not count as a crash — a missing key in a list is not a broken app.
 
-**Fewer wasted rebuilds, and a shorter wait.** Two of the demo's four repair rounds were the
-platform re-reporting problems the assistant had already fixed, because it was reading a log that
-outlived the fix. It now checks whether anything changed since the error was recorded and, if so,
-looks again before spending another rebuild on it.
-
-Related: the platform used to treat "I could not check" and "it is broken" as the same answer, so a
-slow-starting app was reported to the assistant as a fault and cost you a rebuild chasing it. It
-now asks again instead, and only says something is wrong when it actually found something wrong.
-
-**The assistant is told what your app is doing before it answers you.** If you said your app was
-broken, it used to answer from the conversation — where your app had been working — because that
-was the only account of your app it had. It is now handed the current state of your workspace on
-every message, so answering from a stale memory is not something it has to remember to avoid.
-
-## [1.6.16] - 2026-08-23
-
-**The preview stops lying about your app.** Three things changed, and all three were things the
-platform used to get wrong in front of you.
+### The preview stops lying about your app
 
 **The red error screen is gone.** When a change does not compile, the preview used to fill with the
 framework's own full-screen error page — file paths, stack frames, the lot. It now shows a calm
@@ -54,20 +70,41 @@ outside, so nothing about your app has to change.
 
 The card only ever comes down when the platform has actually confirmed your app compiles. If it
 cannot tell — the workspace is still starting, the connection dropped, anything at all — it keeps
-the card up rather than guessing. Guessing wrong is how you end up looking at an error screen.
+the card up rather than guessing. Reloading the page after a change that did not come together
+used to bring the error screen straight back, labelled as though the app were running fine. It no
+longer does.
 
-**If your app breaks in the browser, the platform now notices.** An app can answer every check the
-platform makes and still die the moment it renders, and until now nothing caught that: you could be
-told the build finished while looking at a blank page. Your app's own errors now reach the
-platform, and a build that crashes in the browser is not reported as finished. What you see is
-simply that the "build complete" message does not appear — the technical detail goes to the
-assistant, which is the one that can act on it.
+### Fewer wasted rebuilds, and a shorter wait
 
-Ordinary browser warnings do not count as a crash. A missing key in a list is not a broken app, and
-treating it as one would have failed almost every build.
+Two of the demo's four repair rounds were the platform re-reporting problems the assistant had
+already fixed, because it was reading a log that outlived the fix. It now checks whether anything
+changed since the error was recorded and, if so, looks again before spending another rebuild on it.
 
-**One quieter fix.** Reloading the page after a change that did not come together used to bring the
-error screen straight back, labelled as though the app were running fine. It no longer does.
+The platform also used to treat "I could not check" and "it is broken" as the same answer, so a
+slow-starting app was reported to the assistant as a fault and cost you a rebuild chasing it. It
+now asks again instead, and only says something is wrong when it actually found something wrong.
+
+**The assistant is told what your app is doing before it answers you.** If you said your app was
+broken, it used to answer from the conversation — where your app had been working — because that
+was the only account of your app it had. It is now handed the current state of your workspace on
+every message.
+
+### When your daily budget runs out, your app is secured first
+
+The old message told you to click Save and secured nothing itself. It now keeps a copy before it
+tells you, says whether that worked, says when you can carry on, and gives you a real address to
+write to if you need more before then. Your draft stays in the box.
+
+### For administrators
+
+The outcomes this work is judged on are counted where you can read them — completion claims
+blocked, restores performed, and backups that did not land. Any workspace the platform sets aside
+is listed and can be put back by a named procedure, rather than sitting in storage with nothing
+able to reach it.
+
+**Before deploying this release**, set `SUPPORT_CONTACT_EMAIL` in the App Service configuration.
+It has no default and the app will refuse to start without it — deliberately, so the at-limit
+message can never name a contact nobody reads.
 
 ## [1.6.15] - 2026-08-21
 
