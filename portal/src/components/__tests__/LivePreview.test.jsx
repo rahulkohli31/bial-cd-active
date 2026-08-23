@@ -179,6 +179,55 @@ describe('LivePreview — the pardoned preview: completed builds stay framed (#1
     expect(container.querySelector('iframe')).toBeNull()
     expect(container.textContent).toMatch(/restoring/i)
   })
+
+  // ★ U18 — THE RETRACTION REGRESSION, and the reason it belongs to this unit rather than to
+  // plan one's U4. U18 changes what the completion message IS (the harness now renders the
+  // agent's `done_summary` instead of its trailing prose) and this pane's chip is the other
+  // half of that claim: the frame plus "Build complete — your app is live below". Plan one's
+  // retraction is deliberately content-agnostic, so it survives the rendering change on its
+  // own — but only if the claim it retracts actually goes quiet, which is a fact about THIS
+  // file and nothing tested it.
+  //
+  // ASSERT-ABSENCE, PAIRED WITH LIVENESS. "The chip is gone" is also true of a pane that threw
+  // on render, or of a `completedLive` prop that stopped arriving — so the retraction sentence
+  // has to be found on screen in the same breath, in both of its nodes (the visible cover and
+  // the live region), or the absence proves nothing.
+  //
+  // Mutation check: drop the `!showCover` guard on the chip and the first expectation goes red
+  // with both sentences on screen at once — which is what a screen reader used to be told.
+  it('a retracted claim silences the build-complete chip while the retraction stays readable', () => {
+    render(
+      <LivePreview
+        previewUrl={SANDBOX_URL}
+        status="ended"
+        completedLive
+        previewState="alive"
+        compileState="clean"
+        workspaceLost
+      />,
+    )
+
+    // ABSENCE: the completion claim is not made over a workspace that has been wiped.
+    expect(screen.queryByText(/build complete/i)).toBeNull()
+    // LIVENESS: …because the retraction is standing in its place, in both nodes — the visible
+    // cover and the pane's permanent live region.
+    expect(screen.getAllByText(/stopped running and needs to be brought back/i)).toHaveLength(2)
+    expect(screen.getAllByText(/we\u2019ll restore it/i).length).toBeGreaterThan(0)
+  })
+
+  it('a clean, un-retracted completed build still gets its chip (the guard is not a deletion)', () => {
+    const { container } = render(
+      <LivePreview
+        previewUrl={SANDBOX_URL}
+        status="ended"
+        completedLive
+        previewState="alive"
+        compileState="clean"
+      />,
+    )
+    expect(container.querySelector('iframe')).toBeTruthy()
+    expect(screen.getByText(/build complete/i)).toBeTruthy()
+  })
 })
 
 describe('LivePreview — relaunch a torn-down preview (#43)', () => {

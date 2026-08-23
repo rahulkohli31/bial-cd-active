@@ -119,6 +119,60 @@ def test_system_prompt_tells_the_agent_who_is_reading() -> None:
     assert "when something goes wrong" in lowered
 
 
+def _completion_block(prompt: str) -> str:
+    """The COMPLETION paragraph, sliced out of the composed prompt.
+
+    SLICED RATHER THAN SEARCHED WHOLE-PROMPT, because the retired phrasing this unit removes
+    ("type-check the app") is legitimate copy elsewhere: `BUILD_WORKING_RULES_HEAD` still tells
+    the model the harness type-checks after every turn, which is TRUE and must stay. A
+    prompt-wide `not in` would either go permanently red on that true sentence or have to be
+    weakened until it proved nothing."""
+    return prompt[prompt.index("COMPLETION \u2014") :].split("\n\n", 1)[0]
+
+
+def test_completion_promises_no_round_trip_after_declare_done() -> None:
+    """★ U18 / R30 — THE PROMPT MOVED WITH THE BEHAVIOUR, WHICH IS THE WHOLE POINT.
+
+    `declare_done` is terminal on a passing check now. A model still told "the harness then
+    verifies … if it is not green yet you will receive the diagnostic" reads that as an
+    invitation to write its closing message in the reply that follows — a reply this unit has
+    just stopped buying. It would then withhold that message from `summary`, the harness would
+    render the fallback, and the citizen would end a working build on a generic sentence while
+    the good one was thrown away with the round-trip. The stale instruction does not merely
+    mislead here; it defeats the feature.
+
+    TWO HALVES, DELIBERATELY. The inertness half searches for the retired phrasing and requires
+    zero hits. The liveness half requires the repair arm's promise to still be there, because it
+    is still TRUE (ASM14) — and an inertness guard alone would pass just as happily against a
+    COMPLETION block someone had deleted outright.
+
+    Asserted on the COMPOSED prompt rather than on `prompt_blocks`, so a composition site that
+    stopped including the block would be caught here too. The Write mode segment composes the
+    same single source (`BUILD_WORKING_RULES_TAIL`), which is what makes one assertion enough."""
+    completion = _completion_block(BUILD_SYSTEM_PROMPT)
+
+    # INERTNESS — the retired round-trip promise, gone.
+    for retired in (
+        "The harness then verifies",
+        "if it is not green yet",
+        "type-check",
+    ):
+        assert retired not in completion, f"{retired!r} still promises a follow-up round-trip"
+
+    # THE TERMINAL CONDITION, said out loud and said conditionally (the verdict still decides).
+    assert "ENDS THE TURN" in completion
+    assert "passing check" in completion
+
+    # R22/AE13 — and what the summary must BE, since it is now the last thing the user reads.
+    assert "the last thing the user reads" in completion
+    assert "what they can now do" in completion
+    assert "no file names, commands, libraries or frameworks" in completion
+
+    # LIVENESS — the repair arm's promise is unchanged and still made.
+    assert "does NOT check out you will receive the diagnostic" in completion
+    assert "Do not declare done prematurely" in completion
+
+
 def test_prompt_has_no_stale_app_records_demo_reference() -> None:
     """U11/R16 — the `app/records` demo route was removed from the template (commit d51ebfa), so
     the prompt must no longer tell the model to hunt for and delete it. Only the stale REMOVE

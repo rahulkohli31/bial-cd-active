@@ -194,6 +194,22 @@ _PERSIST_FAILED_MESSAGE = (
     "The reply could not be saved, so this turn was stopped. Try sending the message again."
 )
 
+# U18/R22 — WHAT A FINISHED BUILD SAYS WHEN THE AGENT HANDED US NOTHING TO SAY.
+#
+# `declare_done` is terminal now, so the summary it carries is the whole of the completion
+# message — and a model that calls it with an empty string would otherwise end a working build
+# in silence. The fallback is never the model's own text: the alternative to a summary is a
+# sentence the harness wrote, not a scrape of whatever prose happened to precede the tool call,
+# because that prose is exactly the register this plan removes.
+#
+# It says the two things a completion has to: the app is ready, and what the reader can do next.
+# Checked against the same no-jargon bar as `services/turns/copy.py` — no file, no command, no
+# library, no framework.
+_BUILD_FINISHED_FALLBACK = (
+    "Your app is ready. Open the preview and try it out, and send another message if you'd "
+    "like anything changed."
+)
+
 # The row-meta kind stamping a pending options card (real or synthesized). IMPORTED, not
 # re-spelled: `plan_options._scan` reads rows by this exact string, so two literals meant a
 # typo in either one would silently stop every card from being found.
@@ -1371,7 +1387,16 @@ class TurnEngine:
         Both halves of that gate are load-bearing. `declare_done` alone is the model's
         opinion, and a model that has just written a type error is not a reliable witness;
         `green` alone would end the turn mid-thought the first time the tree happened to
-        compile. Only the conjunction means finished."""
+        compile. Only the conjunction means finished.
+
+        U18/R30 CHANGES WHAT HAPPENS ON THE PASSING SIDE OF THAT GATE, AND NOTHING ELSE ABOUT
+        IT. The conjunction is untouched — a failing verdict after `declare_done` still sends
+        the turn into repair exactly as before. What is gone is the round-trip the passing side
+        used to buy: the model called the tool, was told to stand by, and was then asked for one
+        more full request whose entire product was a closing paragraph. That paragraph is the
+        message the 2026-08-18 build wrote in 2,397 words of file paths and framework names.
+        The summary the tool already carries says the same thing in the register the reader
+        actually has, so the harness renders THAT and ends the turn on it."""
         sandbox = state.sandbox
         if sandbox is None:  # `_pin_workspace` sets it or raises; belt for the impossible
             raise _WriteEndedError("sandbox_unavailable", _TURN_FAILED_MESSAGE)
@@ -1404,7 +1429,13 @@ class TurnEngine:
                     # between them. `load_history` ignores visibility so the model still
                     # reads it; the projection skips hidden rows so the citizen never does.
                     await self._persist_write_reprompt(state, turn_prompt, session_factory)
-                sandbox.done_requested = False  # per-iteration; the flag means "this run"
+                # Per-iteration; the flag means "this run". THE SUMMARY IS RESET WITH IT (U18),
+                # because the two are one fact: a summary written before a verdict that came
+                # back red describes a build that then failed, and leaving it standing would let
+                # a later `declare_done` with an empty summary end the turn on stale praise for
+                # work that had to be repaired.
+                sandbox.done_requested = False
+                sandbox.done_summary = ""
                 # U9 / R15 — MARK "NOW" IN THE CONTAINER BEFORE THE AGENT RUNS. Everything the
                 # dev server prints after this point is about a tree the agent is currently
                 # changing; everything before it may be about one it has already fixed. The
@@ -1499,6 +1530,7 @@ class TurnEngine:
 
                 if outcome.green and sandbox.done_requested:
                     state.snapshot_committed = None  # the finalize answers this, not us
+                    await self._render_completion(state, sandbox, session_factory)
                     return
 
                 # UNANSWERABLE IS NOT A DEFECT, and this is the line where that stops
@@ -1667,6 +1699,8 @@ class TurnEngine:
             # passing the turn accumulator as well would bill every token twice.
         ) as run:
             node = run.next_node
+            cut_short = False
+            pending_answers: ModelRequest | None = None
             while not Agent.is_end_node(node):
                 if Agent.is_model_request_node(node):
                     # THE SESSION CLOSES BEFORE THE ENDING IS BUILT, which is why the `try`
@@ -1721,6 +1755,25 @@ class TurnEngine:
                         persisted_from=persisted_from,
                         session_factory=session_factory,
                     )
+                    # U18/R30 — AND THIS IS WHERE `declare_done` STOPS BUYING A ROUND-TRIP.
+                    # `node` is already the NEXT model request; walking into it spends a full
+                    # request whose only product is a closing paragraph the harness has just
+                    # stopped rendering. Cut here instead — the verdict still decides whether
+                    # the turn is over (`_run_write`'s conjunction is untouched), and a red one
+                    # re-enters this run with the repair prompt exactly as before.
+                    #
+                    # THE PENDING REQUEST IS TAKEN OFF THE NODE ON THE WAY OUT, and it has to
+                    # be. A `ModelRequestNode` carries the tool ANSWERS and only appends them to
+                    # the history when it runs — which is the thing we are declining to do — so
+                    # `run.all_messages()` here ends on a `ModelResponse` whose tool calls look
+                    # unanswered. Left that way, the repair pass hands pydantic-ai a new user
+                    # prompt over unprocessed tool calls (it refuses outright), and the
+                    # `declare_done` return never reaches a row.
+                    if state.sandbox is not None and state.sandbox.done_requested:
+                        if Agent.is_model_request_node(node):
+                            pending_answers = node.request
+                        cut_short = True
+                        break
                 else:
                     # The user-prompt node: no model call, no tools, nothing to stream.
                     node = await run.next(node)
@@ -1736,6 +1789,21 @@ class TurnEngine:
             result = run.result
             if result is not None:
                 messages = result.all_messages()
+                await self._persist_write_step(
+                    state,
+                    history=messages,
+                    persisted_from=persisted_from,
+                    session_factory=session_factory,
+                )
+            elif cut_short:
+                # `run.result` is set by the END node, which a cut-short run never reaches — so
+                # the accumulated history has to be read off the run itself, with the tool
+                # answers the node above was holding put back on the end. Without this the
+                # caller would keep the PRE-RUN history and a repair pass would re-ask the model
+                # to build from scratch, having thrown away everything it just wrote.
+                messages = list(run.all_messages())
+                if pending_answers is not None:
+                    messages.append(pending_answers)
                 await self._persist_write_step(
                     state,
                     history=messages,
@@ -1801,6 +1869,48 @@ class TurnEngine:
         except Exception as exc:
             raise _PersistFailedError from exc
         return len(history)
+
+    async def _render_completion(
+        self,
+        state: _TurnState,
+        sandbox: SandboxSession,
+        session_factory: SessionFactory,
+    ) -> None:
+        """THE COMPLETION MESSAGE, WRITTEN FROM `done_summary` (U18/R22).
+
+        THE FIELD WAS ALWAYS WRITTEN AND NEVER READ. `declare_done` has stored its `summary`
+        since the tool existed and three model-facing prompts have asked for it; the reader is
+        what was missing, so what the citizen actually read at the end of a build was whatever
+        free-form paragraph the model produced on one more round-trip. On 2026-08-18 that
+        paragraph was file paths and framework names. Rendering the field instead is the whole
+        of this change: same fact, a bounded field the prompt shapes, and no request bought to
+        obtain it.
+
+        BOTH FRAMES AND THE ROW, because the completion has to survive a reload. `_push_text`
+        puts it on the live stream and into `text_so_far` for a mid-turn re-snapshot; the row
+        is what the transcript projects tomorrow. Persisting it also closes the exchange
+        honestly — cutting the run at the tool leaves a tool return with no response after it,
+        and this is that response.
+
+        THE PERSIST MAY FAIL THE TURN, deliberately, and it is the same rule the rest of Write
+        already keeps: a reply that was not stored has not been given. Silently swallowing it
+        would end a build with a completion on screen that vanishes on the next reload."""
+        text = sandbox.done_summary.strip() or _BUILD_FINISHED_FALLBACK
+        self._push_text(state, text)
+        try:
+            async with session_factory() as db:
+                await append_batch(
+                    db,
+                    user_id=state.user_id,
+                    conversation_id=state.conversation_id,
+                    messages=[ModelResponse(parts=[TextPart(content=text)])],
+                    entry_kind=MessageEntryKind.STEP,
+                    mode=ConversationMode.WRITE,
+                    meta={"kind": "write_completion", "turnId": str(state.turn_id)},
+                )
+                await db.commit()
+        except Exception as exc:
+            raise _PersistFailedError from exc
 
     async def _persist_write_reprompt(
         self,

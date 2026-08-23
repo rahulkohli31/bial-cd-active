@@ -303,9 +303,15 @@ def sandbox_toolset[DepsT](
         return _note_write_and_maybe_remind(session, f"Inserted into `{path}`.")
 
     async def declare_done(ctx: RunContext[Any], summary: str) -> str:
-        """Declare the build finished, with a one-line `summary` of what you built. This does NOT
-        end the build on its own — the harness then verifies the app type-checks and renders live;
-        if it is not green you will receive the diagnostic to fix (KD-6)."""
+        """Declare the build finished, and put your closing message to the user in `summary`.
+
+        On a passing check this call ENDS THE TURN, so `summary` is the last thing the user
+        reads. Write it for them rather than about the work: a short list of what they can now
+        do with their app, a handful of plain sentences in the everyday words they used to ask
+        for it, with no file names, commands, libraries or frameworks in it. Do not hold that
+        message back for a reply afterwards — on the passing path there is no reply to write it
+        in. If the app does NOT check out you receive the diagnostic and carry on fixing it
+        (KD-6)."""
         session = sandbox_of(ctx)
         session.done_requested = True
         session.done_summary = summary
@@ -315,8 +321,9 @@ def sandbox_toolset[DepsT](
         # live below" over an untouched template. The write tools above set it when they write.
         await _step(session, name="declare_done", label="Verifying the build…", state="started")
         return (
-            "Acknowledged. The harness will now type-check the app and confirm it renders. If it "
-            "is not green, you will get the diagnostic to fix."
+            "Acknowledged — that summary is now the closing message the user reads. The harness "
+            "is checking the app: if it checks out, this turn ends here and nothing further is "
+            "asked of you. If it does not, you will get the diagnostic to fix."
         )
 
     async def run_command(ctx: RunContext[Any], command: list[str]) -> str:

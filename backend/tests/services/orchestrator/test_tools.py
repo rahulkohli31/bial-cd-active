@@ -58,6 +58,10 @@ def _capturing_model(turns: list[ModelResponse], captured: dict[str, Any]) -> Fu
 
     def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         captured["tool_names"] = {t.name for t in info.function_tools}
+        # THE DESCRIPTIONS AS THE MODEL RECEIVES THEM, not the docstrings as written. The
+        # framework builds one from the other, so a test that read `declare_done.__doc__`
+        # would be asserting on a string the model never sees (U18).
+        captured["tool_descriptions"] = {t.name: t.description or "" for t in info.function_tools}
         captured.setdefault("incoming", []).append(_all_text(messages))
         return next(iterator, text_turn("done"))
 
@@ -268,6 +272,81 @@ async def test_declare_done_sets_the_signal_and_emits_a_step(sink: CollectingSin
     assert deps.sandbox.done_requested is True
     assert deps.sandbox.done_summary == "built it"
     assert any(getattr(e, "name", None) == "declare_done" for e in sink.events)
+
+
+async def test_the_declare_done_description_the_model_reads_says_the_turn_ends(
+    sink: CollectingSink,
+) -> None:
+    """★ U18/R30 — THE TOOL'S OWN DESCRIPTION IS HALF THE BEHAVIOUR.
+
+    `declare_done` used to promise the opposite of what it now does ("This does NOT end the
+    build on its own"), and a model that believes it gets one more turn keeps its closing
+    message OUT of `summary` and saves it for prose the harness has just stopped rendering.
+    That is the exact failure this unit exists to prevent, so the description is asserted with
+    the same seriousness as the code.
+
+    Asserted on the description the TOOLSET REGISTERS — the text pydantic-ai actually sends —
+    rather than on `__doc__`, because the framework composes one from the other and only one of
+    them reaches the model.
+
+    Mutation check: restore either retired sentence and the two absence asserts go red; drop
+    the diagnostic clause and the liveness assert does."""
+    fake = FakeSandbox()
+    captured = await _run(fake, sink, [text_turn("nothing to do")])
+    description = captured["tool_descriptions"]["declare_done"]
+    # Wrapped at 96 columns in the source, so every assertion below is made against the text
+    # with its line breaks collapsed — otherwise a phrase straddling a wrap silently misses.
+    lowered = " ".join(description.lower().split())
+
+    # THE TERMINAL CONDITION, STATED — and stated as conditional on the check, which is what
+    # keeps it true (ASM14: the conjunction with the verdict is untouched).
+    assert "ends the turn" in lowered
+    assert "passing check" in lowered
+    # …and the summary is named as what the user reads, not as a note for the record.
+    assert "summary" in lowered and "the user reads" in lowered
+
+    # THE RETIRED PROMISES OF A FOLLOW-UP ROUND-TRIP — zero hits.
+    assert "does not end the build" not in lowered
+    assert "type-check the app" not in lowered
+
+    # THE REPAIR ARM'S PROMISE IS STILL TRUE AND MUST STILL BE MADE (the liveness half): a red
+    # verdict really does hand the model the diagnostic and carry on.
+    assert "diagnostic" in lowered
+
+    # U20 GENERATES THE PROMPT'S TOOL-SURFACE LINE FROM THE FIRST SENTENCE, so the first
+    # sentence has to stand alone as user-visible prompt copy.
+    first_sentence = lowered.split(".")[0]
+    assert "declare the build finished" in first_sentence
+    assert "summary" in first_sentence
+
+
+async def test_declare_done_tells_the_model_its_summary_is_the_last_word(
+    sink: CollectingSink,
+) -> None:
+    """★ U18 — THE RETURN STRING MOVED WITH THE BEHAVIOUR TOO.
+
+    It used to say "The harness will now type-check the app and confirm it renders", which
+    reads as an invitation to stand by for a second act. It now says which of the two arms is
+    terminal and which is not — both truthfully.
+
+    Asserted on what the MODEL received back (the tool return in its next input), not on the
+    function's return value, for the same reason as the description test above."""
+    fake = FakeSandbox()
+    deps = _deps(fake, sink)
+    captured: dict[str, Any] = {}
+    model = _capturing_model(
+        [tool_turn("declare_done", {"summary": "You can add visitors and check them in."})],
+        captured,
+    )
+    await build_agent.run("build", deps=deps, model=model)
+    returned = "\n".join(captured["incoming"]).lower()
+
+    assert "this turn ends here" in returned
+    assert "nothing further is asked of you" in returned
+    # The repair arm survives verbatim — a red check still hands over the diagnostic.
+    assert "you will get the diagnostic to fix" in returned
+    # The retired stand-by phrasing is gone.
+    assert "will now type-check the app" not in returned
 
 
 async def test_write_emits_a_step(sink: CollectingSink) -> None:

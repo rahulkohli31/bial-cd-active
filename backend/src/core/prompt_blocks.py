@@ -241,10 +241,15 @@ so the match is unambiguous.
 - `insert_lines` — add lines at a specific position.
 - `run_command` — run a shell command (e.g. `["npm","install","zod"]`, \
 `["npx","drizzle-kit","generate"]`, `["npm","run","db:migrate"]`).
-- `declare_done` — declare the build finished (see COMPLETION).
+- `declare_done` — declare the build finished, carrying the closing message the user reads \
+(see COMPLETION).
 
-COMPLETION — call `declare_done` with a short summary once the app type-checks and renders. The \
-harness then verifies (type-check clean AND the dev server live AND the logs clean); if it is not \
-green yet you will receive the diagnostic and should fix it. Do not declare done prematurely.
+COMPLETION — call `declare_done` once the app is working, and put your closing message to the \
+user in its `summary`. On a passing check that call ENDS THE TURN: the summary is the last thing \
+the user reads, so make it a short list of what they can now do with their app — a handful of \
+plain sentences in their everyday words, with no file names, commands, libraries or frameworks \
+in it. Do not hold that message back for a reply afterwards; on that path there is no reply to \
+write it in. If the app does NOT check out you will receive the diagnostic and should fix it, \
+then declare done again. Do not declare done prematurely.
 
 {_GOLDEN_TEMPLATE_MANIFEST}"""

@@ -73,6 +73,7 @@ from src.services.turns.copy import (
     STILL_SHOWING_TEMPLATE,
 )
 from src.services.turns.engine import (
+    _BUILD_FINISHED_FALLBACK,
     TurnEngine,
     _TurnState,
     _what_it_is_showing,
@@ -1478,6 +1479,35 @@ def test_each_showing_arm_is_read_off_the_verdict() -> None:
     assert _what_it_is_showing(first_build, ever_built=False) == STILL_SHOWING_TEMPLATE
 
 
+# THE VOCABULARY BAR, hoisted to module scope so more than one guard can hold a sentence to it.
+# The bar is the citizen's vocabulary, not a spell-checker's: `.tsx`, `npm`, `git`, `Next.js` and
+# their friends all name things the person who asked for a visitor log has never heard of, and
+# every one of them appeared in the 2,397 words that went to a non-technical user on 2026-08-18.
+_FORBIDDEN_IN_CITIZEN_COPY = (
+    ".tsx",
+    ".ts",
+    ".json",
+    "app/",
+    "src/",
+    "npm",
+    "npx",
+    "git ",
+    "tsc",
+    "Next.js",
+    "next dev",
+    "React",
+    "typescript",
+    "TypeScript",
+    "localhost",
+    "http://",
+    "https://",
+    "stack trace",
+    "console",
+    "compile",
+    "typecheck",
+)
+
+
 def test_no_sentence_this_plan_shows_a_citizen_carries_developer_jargon() -> None:
     """R13's testable half, and the reason `services/turns/copy.py` exists as a module rather
     than as strings at their call sites: a promise about a CLASS of text can only be kept if the
@@ -1488,29 +1518,6 @@ def test_no_sentence_this_plan_shows_a_citizen_carries_developer_jargon() -> Non
     every one of them appeared in the 2,397 words that went to a non-technical user on
     2026-08-18. The agent's own narration is NOT covered by this — that is the companion plan —
     and this file is deliberately the whole of what this plan changes about voice."""
-    forbidden = (
-        ".tsx",
-        ".ts",
-        ".json",
-        "app/",
-        "src/",
-        "npm",
-        "npx",
-        "git ",
-        "tsc",
-        "Next.js",
-        "next dev",
-        "React",
-        "typescript",
-        "TypeScript",
-        "localhost",
-        "http://",
-        "https://",
-        "stack trace",
-        "console",
-        "compile",
-        "typecheck",
-    )
     sentences = [
         value
         for name, value in vars(copy_module).items()
@@ -1518,7 +1525,7 @@ def test_no_sentence_this_plan_shows_a_citizen_carries_developer_jargon() -> Non
     ]
     assert sentences, "the module must expose sentences, or this guard proves nothing"
     for sentence in sentences:
-        for term in forbidden:
+        for term in _FORBIDDEN_IN_CITIZEN_COPY:
             assert term not in sentence, f"{term!r} reached a citizen in {sentence!r}"
 
 
@@ -1792,3 +1799,250 @@ async def test_an_unanswerable_verdict_does_not_wear_the_failure_label_in_the_li
     assert all("Not green yet" not in s.label for s in finished)
     assert all(s.state != "failed" for s in finished)
     assert any("Still checking" in s.label for s in finished)
+
+
+# =============================================================================
+# U18 / R22 / R30 — `declare_done` is terminal, and the harness renders the summary
+# =============================================================================
+
+# A summary in the register the rewritten COMPLETION block now asks for: what the reader can
+# DO, in their words.
+_DONE_WITH_A_SUMMARY = [
+    ("declare_done", '{"summary": "You can add a visitor, mark them arrived, and see the list."}')
+]
+_DONE_WITH_NO_SUMMARY = [("declare_done", '{"summary": "   "}')]
+# What the model used to be asked for on the round-trip this unit deletes — and what it wrote.
+_THE_CLOSING_PARAGRAPH = (
+    "Build complete! I created app/page.tsx and the API route, ran npm install zod, and the "
+    "Next.js dev server compiles cleanly."
+)
+
+
+def _assistant_texts(rows: list[Message]) -> list[str]:
+    """Every assistant sentence a reload would project out of these rows."""
+    out: list[str] = []
+    for row in rows:
+        for message in row.payload:
+            if not isinstance(message, dict) or message.get("kind") != "response":
+                continue
+            for part in message.get("parts", []):
+                if isinstance(part, dict) and part.get("part_kind") == "text":
+                    out.append(str(part.get("content", "")))
+    return out
+
+
+def _answered_tools(rows: list[Message]) -> set[str]:
+    """Which tools have a stored ANSWER — the returns that pair with the calls."""
+    return {
+        str(part.get("tool_name"))
+        for row in rows
+        for message in row.payload
+        if isinstance(message, dict)
+        for part in message.get("parts", [])
+        if isinstance(part, dict) and part.get("part_kind") == "tool-return"
+    }
+
+
+async def test_a_green_declare_done_ends_the_turn_and_renders_the_summary(
+    _fresh_engine, db_session, session_factory, fake_redis: aioredis.Redis, fake_storage
+) -> None:
+    """★ U18 / R30 / R22 — THE WHOLE UNIT, IN ONE RUN.
+
+    `declare_done` used to be a request for permission: the tool returned "stand by", the
+    harness verified, and then it bought ONE MORE full model request whose entire product was a
+    closing paragraph. That paragraph is the surface the 2026-08-18 demo filled with file paths,
+    package installs and framework names, and the platform paid for the request that produced
+    it. The summary the tool already carries says the same thing in the register the reader
+    actually has, so the harness renders THAT and the turn ends on it.
+
+    ASSERTED ON THE REQUEST COUNT, NOT ON ELAPSED BEHAVIOUR. "The model said nothing afterwards"
+    is also satisfied by a model that WAS asked and happened to return nothing; the claim here
+    is that it was never asked. `counts["requests"]` is how many model requests actually fired:
+    one for the write, one for the `declare_done` call, and no third.
+
+    Mutation check: delete the `break` in `_run_write_once` and the third request fires, the
+    closing paragraph lands in the transcript, and both halves of this go red."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt-u18-green@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+    model, counts = _scripted([[_WROTE_A_FILE, _DONE_WITH_A_SUMMARY, _THE_CLOSING_PARAGRAPH]])
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+    )
+
+    assert state.status == "completed"
+    # NO FURTHER MODEL REQUEST: the write, then the declare_done. The scripted closing paragraph
+    # is never reached because nothing ever asked for it.
+    assert counts["requests"] == 2, "a third request means declare_done still buys a round-trip"
+
+    # THE RENDERED COMPLETION IS THE SUMMARY — the whole of what the citizen reads at the end.
+    rendered = state.text_so_far()
+    assert rendered == "You can add a visitor, mark them arrived, and see the list."
+    # …and the model's own closing prose is nowhere, because it was never written. AE13, on the
+    # one message that used to carry the worst of it: the whole completion, swept term by term.
+    for term in _FORBIDDEN_IN_CITIZEN_COPY:
+        assert term not in rendered, f"{term!r} reached a citizen in the completion message"
+
+    # DURABLE, not merely streamed. Without the row the completion vanishes the moment the
+    # citizen refreshes the tab — and plan one's retraction annotates a message that is gone.
+    rows = await _all_rows(db_session, conv)
+    texts = _assistant_texts(rows)
+    assert any("You can add a visitor" in text for text in texts)
+    assert not any(_THE_CLOSING_PARAGRAPH in text for text in texts)
+
+    # …AND THE `declare_done` CALL IS ANSWERED IN THOSE ROWS. A cut-short run leaves the tool
+    # answers on the node it declined to run, so carrying them across the cut is not tidiness:
+    # without it the stored history ends on an unanswered tool call, the reload's dangling-call
+    # repair replaces a real successful result with a synthesized "interrupted" one, and every
+    # later turn on this conversation is sent to Anthropic malformed.
+    assert _flattened_pairing_violations(rows) == []
+    assert "declare_done" in _answered_tools(rows)
+
+
+async def test_an_empty_summary_falls_back_to_a_plain_completion_never_to_silence(
+    _fresh_engine, db_session, session_factory, fake_redis: aioredis.Redis, fake_storage
+) -> None:
+    """★ THE ONE PATH THAT COULD END A WORKING BUILD IN SILENCE.
+
+    `summary` is a plain string the model fills in and nothing stops it being blank. With the
+    tool terminal, a blank one used to be recoverable — the model still had a turn left to write
+    something — and now is not, so the harness owns the sentence.
+
+    TWO THINGS IT MUST NOT FALL BACK TO, which is why this is not a bare "non-empty" assert. Not
+    an EMPTY message, which ends a green build with the screen still showing whatever the last
+    progress line said. And not the model's own prose scraped from elsewhere in the run: that
+    prose is exactly the register this plan removes, so reaching for it as a substitute would
+    reintroduce the defect on the fallback path.
+
+    Mutation check: return `sandbox.done_summary` unconditionally and the message goes empty;
+    fall back to the run's trailing text and the `app/page.tsx` assert goes red."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt-u18-empty@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+    model, _ = _scripted([[_WROTE_A_FILE, _DONE_WITH_NO_SUMMARY, _THE_CLOSING_PARAGRAPH]])
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+    )
+
+    assert state.status == "completed"
+    rendered = state.text_so_far()
+    assert rendered == _BUILD_FINISHED_FALLBACK
+    assert rendered.strip(), "a green build must never end on an empty message"
+    assert "app/page.tsx" not in rendered  # never the model's prose, on any path
+    # …and it is durable, exactly like a real summary would be.
+    assert any(
+        _BUILD_FINISHED_FALLBACK in text
+        for text in _assistant_texts(await _all_rows(db_session, conv))
+    )
+
+
+def test_the_harness_written_completion_carries_no_developer_jargon() -> None:
+    """★ AE13 for the one completion sentence the harness writes itself.
+
+    The summary is the model's words shaped by the prompt; this sentence is ours, on the path
+    where the model supplied nothing — and it is the one a citizen reads when everything else
+    has gone quiet. Held to the same list as `services/turns/copy.py`, so the two cannot drift
+    into different standards for the same reader."""
+    for term in _FORBIDDEN_IN_CITIZEN_COPY:
+        assert term not in _BUILD_FINISHED_FALLBACK, (
+            f"{term!r} reached a citizen in {_BUILD_FINISHED_FALLBACK!r}"
+        )
+    # LIVENESS: it says the two things a completion owes its reader — that the app is done, and
+    # one thing they can do next. An empty string would pass every absence assert above.
+    assert "ready" in _BUILD_FINISHED_FALLBACK.lower()
+    assert "preview" in _BUILD_FINISHED_FALLBACK.lower()
+
+
+async def test_a_red_verdict_after_declare_done_still_goes_to_repair(
+    _fresh_engine,
+    db_session,
+    session_factory,
+    fake_redis: aioredis.Redis,
+    fake_storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ ASM14 — THE CONJUNCTION IS UNTOUCHED, and this is the half of it that a unit called
+    "make declare_done terminal" is likeliest to break.
+
+    `declare_done` ends the turn on a PASSING verdict. On a failing one it ends nothing: the
+    claim is still only the model's opinion, and a model that has this moment written a type
+    error is not a reliable witness to its own build. The repair arm's promise — restated by
+    this unit in both the tool return and the COMPLETION block — is that a red check hands the
+    diagnostic back, and it has to stay true or the rewritten documentation simply lies in the
+    other direction.
+
+    IT ALSO PINS THE HISTORY THE CUT HANDS BACK. The repair pass seeds a new user prompt onto
+    the run's messages, and pydantic-ai refuses one outright over unprocessed tool calls — so a
+    cut that dropped the tool answers it was holding takes the SECOND run down with a framework
+    error. `end_reason` is what tells that apart from an honest ending: a turn that genuinely
+    repaired and ran out of budget names itself, while a crashed one names nothing at all.
+
+    Mutation check: end the turn on `done_requested` alone and the repair run never happens
+    (`runs` stays 1), the completion is rendered over a broken app, and the status flips."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt-u18-red@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+    monkeypatch.setattr(engine_module, "SELF_HEAL_MAX_RETRIES", 1)
+
+    async def _tsc_red(*_a: object, **_k: object) -> tuple[VerifyOutcome, int]:
+        return (
+            VerifyOutcome(
+                state=HealthState.UNHEALTHY,
+                dev_ready=True,
+                error=from_tsc("app/page.tsx(4,10): error TS2304: Cannot find name 'Foo'."),
+                preview_url="https://app-xyz.example/",
+            ),
+            0,
+        )
+
+    monkeypatch.setattr(engine_module, "verify", _tsc_red)
+    # The repair prompt is RECORDED rather than counted off the model script, so this assertion
+    # is about the conjunction itself and not about how many requests the run happened to spend.
+    repairs: list[str] = []
+
+    def _record_repair(error: BuildError) -> str:
+        repairs.append(error.source.value)
+        return "fix it"
+
+    monkeypatch.setattr(engine_module, "build_repair_prompt", _record_repair)
+    model, _ = _scripted(
+        [[_WROTE_A_FILE, _DONE_WITH_A_SUMMARY], [_WROTE_A_FILE, _DONE_WITH_A_SUMMARY]]
+    )
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+    )
+
+    # THE TURN DID NOT END ON THE CLAIM: the diagnostic really was handed back, which is the
+    # promise both rewritten texts still make.
+    assert repairs == ["tsc"]
+    # …and it ended on the verdict rather than the claim — no completion was ever rendered.
+    assert state.status == "failed"
+    assert state.end_reason == "self_heal_budget_exhausted"
+    assert "You can add a visitor" not in state.text_so_far()
