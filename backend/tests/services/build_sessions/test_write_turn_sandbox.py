@@ -667,7 +667,7 @@ async def test_a_plan_only_project_does_not_block_a_real_one(
     held their actual app, to protect an empty template.
 
     Flip any of the four conditions and this must go red: a commit BEYOND the seeded baseline,
-    a tree dirty with anything outside `_FRAMEWORK_CHURN`, a saved bundle, or a recovery
+    a tree dirty with anything outside `FRAMEWORK_CHURN`, a saved bundle, or a recovery
     snapshot each mean there IS something to lose. Note it is not "no commits" — the sandbox
     client seeds `bial: golden template baseline` at birth, so a pristine container has exactly
     one and a no-commits check would never fire."""

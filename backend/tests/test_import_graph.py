@@ -57,6 +57,48 @@ def test_the_reaper_imports_without_the_fastapi_app() -> None:
     assert "ok" in result.stdout
 
 
+def test_the_integrity_verdict_carries_nothing_heavy_of_its_own() -> None:
+    """U1 — `manager.py` AND `reaper.py` both import this module at module level, so it must not
+    reach back into either of them, or into the orchestrator.
+
+    LOADED BY FILE PATH, DELIBERATELY, and this is the honest version of the claim. Importing
+    `src.services.build_sessions.integrity` by name runs the PACKAGE `__init__`, which imports
+    `manager` -> `appdata` -> `services.projects` -> `agent.agent` and therefore `pydantic_ai` —
+    that is already true of `reaper` today and is not this module's doing. What this test pins is
+    the property that IS this module's doing: its own module-level imports stay cheap, so it can
+    never become the reason a worker loads the agent stack, and it can never close the
+    `build_sessions` <-> `orchestrator` cycle that forced `selfheal` and `harness` to defer
+    theirs.
+
+    NOT ASSERTED, because it would be a false claim: `fastapi` still arrives, pulled in by
+    `src.services.sandbox` and `src.services.storage`, which every module in this area already
+    loads. The three names below are the ones this module could plausibly grow and must not.
+
+    Mutation check: add `from src.services.build_sessions.manager import SessionManager` (or any
+    `src.services.orchestrator` import) at the top of `integrity.py` and this goes red."""
+    result = _import_in_fresh_interpreter(
+        "import importlib.util, sys;"
+        " spec = importlib.util.spec_from_file_location("
+        "'bial_integrity_probe', 'src/services/build_sessions/integrity.py');"
+        " assert spec and spec.loader;"
+        " module = importlib.util.module_from_spec(spec);"
+        # Registered before exec: `from __future__ import annotations` makes dataclasses
+        # resolve field types by looking the defining module up in `sys.modules`.
+        " sys.modules['bial_integrity_probe'] = module;"
+        " spec.loader.exec_module(module);"
+        " heavy = [name for name in sys.modules"
+        "   if name.startswith(('pydantic_ai', 'src.services.orchestrator'))"
+        "   or name in ('src.main', 'src.services.build_sessions.manager')];"
+        " assert not heavy, heavy;"
+        " print('ok')"
+    )
+    assert result.returncode == 0, (
+        f"the integrity verdict grew a heavy import.\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "ok" in result.stdout
+
+
 def test_the_environment_accessor_stays_outside_the_settings_cycle() -> None:
     """THE CYCLE IS THE WHOLE REASON `src/core/runtime_env.py` EXISTS.
 

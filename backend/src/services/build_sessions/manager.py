@@ -31,7 +31,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Final, Literal
+from typing import Literal
 
 import redis.asyncio as aioredis
 import sqlalchemy as sa
@@ -58,6 +58,10 @@ from src.services.build_sessions.appdata import build_app_env, resolve_app_for_p
 from src.services.build_sessions.appdb_env import provision_app_database
 from src.services.build_sessions.appstorage import provision_app_storage
 from src.services.build_sessions.attachments import resolve_build_attachments
+from src.services.build_sessions.integrity import (
+    clean_but_for_churn,
+    container_state,
+)
 from src.services.build_sessions.liveness import flag_liveness_overpromise
 from src.services.build_sessions.locks import (
     DeadlineWriter,
@@ -569,127 +573,6 @@ async def _occupying_project(
                 app_id=app_id, project_id=project_id, project_name=project_name
             )
     return None
-
-
-# One round trip for both halves of the question. `|| true` keeps a repo-less tree from
-# failing the whole script.
-#
-# The porcelain read is capped: the caller needs to know whether the tree is empty and, when
-# it is not, WHICH files changed — and a listing long enough to hit this cap has already
-# answered the only question the cap could interfere with (a tree this dirty is real work, not
-# two files of framework churn). Hitting it therefore sets `porcelain_truncated` and short-
-# circuits the comparison rather than reasoning about a half-read list.
-#
-# ONE constant feeds both the shell cap and the truncation test. They were 200 and 400 in the
-# first cut, which made `porcelain_truncated` unreachable and quietly deleted the backstop
-# (#83 review, finding 6).
-_PORCELAIN_CAP_BYTES: Final = 200
-# Files the FRAMEWORK rewrites on its own, with no user or agent involved. `next dev`
-# regenerates `next-env.d.ts` and normalises `tsconfig.json` on every boot, so a container that
-# has merely STARTED reports a dirty tree — observed live on a workspace whose only history was
-# one Plan question. Treating that as "unsaved changes" is what let an empty template lock a
-# user out of the project holding their real app.
-#
-# Scoped deliberately tight. This set is ONLY consulted when deciding whether a workspace is
-# empty enough to reclaim; it never suppresses anything the user is shown, and the Save button
-# still offers to save these (they are legitimately part of the tree). Add to it only for files
-# the toolchain writes unprompted — never for anything a person or the agent would edit.
-_FRAMEWORK_CHURN: Final = frozenset({"next-env.d.ts", "tsconfig.json"})
-
-
-_STATE_SCRIPT = (
-    'git rev-parse HEAD 2>/dev/null || true; echo "@@"; '
-    f'git status --porcelain 2>/dev/null | head -c {_PORCELAIN_CAP_BYTES}; echo "@@"; '
-    "git rev-list --count HEAD 2>/dev/null || true"
-)
-
-
-@dataclass(frozen=True)
-class _ContainerState:
-    """What the container says about itself. `head is None` means no commit yet — a fresh
-    template has no `.git` at all (`write_snapshot` runs `git init` itself), so this is the
-    NORMAL state of a project nobody has saved, not an error."""
-
-    head: str | None
-    uncommitted: bool
-    # The paths git reports as changed, parsed out of the porcelain. `uncommitted` answers
-    # "is anything different?"; this answers "different HOW", which is what tells framework
-    # churn apart from the user's work. Empty when the tree is clean OR when the porcelain
-    # was truncated (see `porcelain_truncated`).
-    changed_paths: tuple[str, ...]
-    # The porcelain is capped, so a very dirty tree comes back cut off. That is not a state
-    # to reason about — it is unambiguous evidence of real work.
-    porcelain_truncated: bool
-    # How many commits deep HEAD is. A FRESH PROVISION IS ALWAYS 1, never 0: the sandbox
-    # client seeds `bial: golden template baseline` so the agent's own commits never fail on
-    # "not a git repository" (`client.py`). So "no commit yet" is not a state that occurs on a
-    # provisioned container, and anything asking "is there work in here?" has to compare
-    # against the baseline rather than against nothing. 0 means we could not count.
-    commits: int
-
-
-def _parse_state(stdout: str) -> _ContainerState:
-    """Pure parse of `_STATE_SCRIPT`'s three `@@`-separated fields, split out so it is testable
-    without a container — the offset bug it now pins was invisible to every fake."""
-    head_text, _, rest = stdout.partition("@@")
-    porcelain, _, count_text = rest.partition("@@")
-    try:
-        commits = int(count_text.strip() or 0)
-    except ValueError:
-        commits = 0
-    # `XY path` per line; a rename is `XY old -> new` and the destination is the one that
-    # matters. Anything unparseable is kept verbatim rather than dropped — a path we cannot
-    # read must never silently shrink the change set.
-    # `XY path`, two status columns then the path. Split on WHITESPACE rather than slicing a
-    # fixed offset: the block gets stripped before it reaches here, so the first line has
-    # already lost its leading status space and a `line[3:]` silently ate the first character
-    # of its filename (`next-env.d.ts` -> `ext-env.d.ts`, which then matched nothing). A
-    # one-shot split is also correct for paths containing spaces, which a fixed offset is not.
-    paths: list[str] = []
-    for line in porcelain.splitlines():
-        parts = line.strip().split(None, 1)
-        if len(parts) != 2:
-            continue
-        entry = parts[1].strip()
-        if "->" in entry:  # a rename: the destination is the file that now exists
-            entry = entry.split("->")[-1].strip()
-        if entry:
-            paths.append(entry.strip('"'))
-    # BYTES, because `head -c` counts bytes and a non-ASCII filename would make the character
-    # count read short. `>=` rather than `>`: output that lands exactly on the cap is
-    # indistinguishable from output that was cut there, and "assume truncated" is the arm that
-    # refuses a reclaim rather than the one that permits it.
-    trimmed = porcelain.strip()
-    return _ContainerState(
-        head=head_text.strip() or None,
-        uncommitted=bool(trimmed),
-        changed_paths=tuple(paths),
-        commits=commits,
-        porcelain_truncated=len(trimmed.encode("utf-8", "surrogateescape"))
-        >= _PORCELAIN_CAP_BYTES,
-    )
-
-
-async def _container_state(
-    sandbox_client: SandboxClient, handle: SandboxHandle
-) -> _ContainerState | None:
-    """The container's commit AND whether its working tree has uncommitted changes.
-
-    BOTH halves are needed, and getting this wrong is a silent lie in either direction.
-    Comparing only commits would report "all changes saved" whenever the agent had written
-    files without committing them — the prompt asks it to commit per coherent slice, but that
-    is guidance, not a guarantee, and the moment it skips one the indicator starts lying about
-    work sitting right there in the tree.
-
-    None means we could not ask at all, which is the only honest "unknown"."""
-    run_command = sandbox_client.exec  # alias keeps the call off the JS-oriented exec guard
-    try:
-        result = await run_command(handle, ["sh", "-c", _STATE_SCRIPT], timeout_s=30)
-    except SandboxError:
-        return None
-    if result.exit != 0:
-        return None
-    return _parse_state(result.stdout)
 
 
 async def _saved_head(app_id: uuid.UUID) -> str | None:
@@ -1297,7 +1180,7 @@ class SessionManager:
         # Read the head AFTER the save: `write_snapshot` runs `git init` + commit itself, so on
         # a first save this is the commit it just created — the value the client needs to
         # settle its indicator, and one that did not exist a moment ago.
-        saved = await _container_state(sandbox_client, handle)
+        saved = await container_state(sandbox_client, handle)
         return SaveOutcome(app_id=app_id, head_sha=saved.head if saved else None)
 
     async def project_compile_state(
@@ -1373,7 +1256,7 @@ class SessionManager:
         will not answer (unknown — ask), and `_attach_for_read` collapses both into
         `NoLiveSandboxError`.
         """
-        state = await _container_state(sandbox_client, handle)
+        state = await container_state(sandbox_client, handle)
         if state is None:
             # Could not ask the container — the only honest unknown.
             return SaveState(app_id=app_id, dirty=None, container_head=None, saved_head=None)
@@ -1535,12 +1418,15 @@ class SessionManager:
         """
         if state.saved_head is not None or state.recovery_at is not None:
             return False
-        container = await _container_state(sandbox_client, handle)
+        container = await container_state(sandbox_client, handle)
         if container is None or container.commits == 0:
             return False  # could not tell — ambiguity denies
-        if container.commits > 1 or container.porcelain_truncated:
-            return False  # work beyond the baseline, or too much of it to enumerate
-        return all(path in _FRAMEWORK_CHURN for path in container.changed_paths)
+        if container.commits > 1:
+            return False  # work beyond the baseline
+        # ONE spelling of "is this tree empty", shared with the integrity verdict. Two subtly
+        # different ones is how the reclaim gate and the reversion gate would drift into
+        # disagreeing about whether a container may be destroyed.
+        return clean_but_for_churn(container)
 
     async def _refuse_if_reclaim_would_destroy_work(
         self,

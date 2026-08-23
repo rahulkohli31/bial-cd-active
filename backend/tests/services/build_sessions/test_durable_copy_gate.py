@@ -259,7 +259,7 @@ def _reachable(client: FakeSandboxClient, *, head: str) -> None:
         preview_url=f"https://{a_sandbox_name('x')}.example.io/",
         ready=True,
     )
-    # `_STATE_SCRIPT`'s three `@@`-separated fields: HEAD, a clean porcelain, the commit count.
+    # `state_script`'s four `@@`-separated fields: HEAD, a clean porcelain, the commit count.
     client.exec_handler = lambda _cmd: ExecResult(stdout=f"{head}\n@@\n@@\n1\n", stderr="", exit=0)
 
 

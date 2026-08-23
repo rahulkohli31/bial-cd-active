@@ -65,6 +65,7 @@ import redis.asyncio as aioredis
 import structlog
 
 from src.services.build_sessions.durable_copy import confirm_durable_copy
+from src.services.build_sessions.integrity import container_state
 from src.services.build_sessions.locks import (
     delete_registry,
     heartbeat_is_alive,
@@ -166,23 +167,18 @@ async def _container_head(sandbox_client: SandboxClient, user_uuid: uuid.UUID) -
 
     ATTACH, THEN ASK THE SAME LADDER THE SAVE INDICATOR ASKS. `attach_existing` is the one path
     that recovers the supervisor bearer (its durable home is the container's own ACA env, not this
-    process's memory), and `_container_state` is exactly what `project_save_state` answers with. A
+    process's memory), and `container_state` is exactly what `project_save_state` answers with. A
     reaper must not hold a second opinion about what HEAD means.
 
     EVERY FAILURE IS `None`, and that is honest rather than permissive: the branch it feeds still
     demands a parseable recovery bundle before anything is destroyed."""
-    # In-function because `manager` imports THIS module at module level — and because it drags in
-    # the api schema package and pydantic_ai, which the out-of-process worker has no business
-    # loading merely to reap.
-    from src.services.build_sessions.manager import _container_state
-
     try:
         handle = await sandbox_client.attach_existing(str(user_uuid))
     except SandboxError:
         # Gone, ending, unreachable, or its bearer unrecoverable — every one of them means "this
         # container cannot be asked anything", which is precisely the case the fallback is for.
         return None
-    state = await _container_state(sandbox_client, handle)
+    state = await container_state(sandbox_client, handle)
     return state.head if state is not None else None
 
 

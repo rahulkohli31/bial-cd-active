@@ -87,7 +87,7 @@ async def test_save_returns_a_null_head_sha_when_the_state_read_failed(
     client: AsyncClient, db_session: AsyncSession, wire
 ) -> None:
     """`head_sha=None` is a REAL return, not a defensive default: `save_project_snapshot`
-    builds `SaveOutcome(head_sha=saved.head if saved else None)`, and `_container_state`
+    builds `SaveOutcome(head_sha=saved.head if saved else None)`, and `container_state`
     answers `None` whenever the post-save `git` exec raises or exits non-zero. The save
     itself succeeded — only the read-back of where it landed did not.
 
@@ -266,7 +266,7 @@ async def test_save_state_passes_an_unknown_dirty_through_as_null(
 
     Not a hypothetical arm: `project_save_state` returns `dirty=None` on three paths with a
     sandbox configured — no app yet, `NoLiveSandboxError` from `_attach_for_read` (the
-    ordinary "container isn't running" case), and `_container_state` returning `None`.
+    ordinary "container isn't running" case), and `container_state` returning `None`.
 
     Note the asymmetry that makes this worth a test of its own: the DANGEROUS direction is
     already caught, because hardcoding `dirty=False` fails the happy path above. It is the

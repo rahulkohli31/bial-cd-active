@@ -516,9 +516,9 @@ async def _ask_the_container_what_it_is_showing(
     THE IMPORT IS IN HERE BECAUSE THE PACKAGES ARE CIRCULAR, and the cycle is real rather than
     incidental: `src.services.build_sessions.__init__` reaches `appdata` → `services.projects` →
     `agent.agent` → `services.orchestrator.__init__` → this module. A module-level import here
-    therefore fails at interpreter start, not at call time. `reaper.py` documents and solves the
-    same cycle the same way for `_container_state`, and this follows it deliberately rather than
-    inventing a second answer to one problem.
+    therefore fails at interpreter start, not at call time. It is the ONE direction that is
+    circular: `build_sessions` may import from here-adjacent leaves freely, and does — `manager`
+    and `reaper` both import `integrity` at module level.
 
     The type comes from `integrity_types`, a leaf module with no imports of its own, so the
     signature is honest at import time and only the CALL is deferred."""
