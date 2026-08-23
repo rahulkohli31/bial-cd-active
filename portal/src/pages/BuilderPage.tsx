@@ -976,6 +976,9 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         // second REST round-trip, and from an empty preview pane over a running app.
         if (frame.turnId) liveTurnIdRef.current = frame.turnId
         if (frame.workspaceState) setTurnWorkspace({ state: frame.workspaceState, message: null })
+        // Only when the server actually said something. A snapshot with no compile fact must
+        // leave whatever the live tail already established alone.
+        if (frame.compileState) setTurnCompile(frame.compileState)
         if (frame.previewUrl || frame.previewState) {
           setTurnPreview((prev) => ({
             url: frame.previewUrl ?? prev.url,

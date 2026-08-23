@@ -2066,6 +2066,7 @@ class TurnEngine:
             workspace_state=state.workspace_state,
             preview_url=state.preview_url,
             preview_state=state.preview_state,
+            compile_state=state.compile_state,
         )
 
 

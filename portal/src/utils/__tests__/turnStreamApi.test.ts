@@ -134,6 +134,27 @@ describe('the compile frame (R17/R18) — an absent signal is never good news', 
     ])
   })
 
+  it('rides the catch-up snapshot, so a refresh mid-build lands covered', () => {
+    // THE REFRESH CASE. Compile frames are emitted on CHANGE, so a tab that reloads while the
+    // app is sitting broken learns nothing until the next change — and would show an uncovered
+    // framework error screen for the whole gap. The snapshot is what closes it.
+    const [frame] = parseOne(
+      '{"type":"snapshot","seq":3,"turnId":"t1","turnStatus":"running","items":[],' +
+        '"textSoFar":"","steps":[],"compileState":"failed"}',
+    )
+    expect(frame).toMatchObject({ type: 'snapshot', compileState: 'failed' })
+  })
+
+  it('reads a snapshot with no compile fact as null, not as clean', () => {
+    // A chat turn, or a Write turn before the container reported. Claiming `clean` here would
+    // uncover a pane on the strength of a field the server never sent.
+    const [frame] = parseOne(
+      '{"type":"snapshot","seq":3,"turnId":"t1","turnStatus":"running","items":[],' +
+        '"textSoFar":"","steps":[]}',
+    )
+    expect(frame).toMatchObject({ type: 'snapshot', compileState: null })
+  })
+
   it('is a KNOWN frame, so it is not swallowed by the forward-compat escape hatch', () => {
     // The both-places trap: a type listed in the union but missing from KNOWN_FRAME_TYPES
     // still parses — as an unknown frame — and the consumer's `isKnownFrame` guard drops it

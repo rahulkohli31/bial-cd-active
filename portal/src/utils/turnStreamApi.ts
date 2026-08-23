@@ -69,6 +69,10 @@ export interface SnapshotFrame {
   workspaceState?: 'preparing' | 'ready' | 'unavailable' | null
   previewUrl?: string | null
   previewState?: 'ready' | 'reconnecting' | null
+  /** R17/R18. Compile frames are emitted ON CHANGE, so a tab that reloads while the app is
+   *  sitting broken would learn nothing until the next change — and would show an uncovered
+   *  error screen until then. This is what makes a refresh mid-build land covered. */
+  compileState?: CompileState | null
 }
 
 export interface TextDeltaFrame {
@@ -346,6 +350,9 @@ function toTurnFrame(parsed: unknown): TurnFrame | null {
         workspaceState: asWorkspaceState(parsed.workspaceState),
         previewUrl: typeof parsed.previewUrl === 'string' ? parsed.previewUrl : null,
         previewState: asPreviewState(parsed.previewState),
+        // `null` when the server said nothing, `'unknown'` when it said it could not tell.
+        // Both HOLD the pane's cover; only a stated value moves it.
+        compileState: parsed.compileState == null ? null : asCompileState(parsed.compileState),
       }
     }
     case 'text_delta':

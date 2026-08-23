@@ -114,7 +114,13 @@ class SnapshotFrame(CamelModel):
     `preview` frame that fired BEFORE the client connected lives only in the ring, so a
     mid-Write reconnect would otherwise have to re-read the sandbox over REST to learn the
     url it already missed. Carrying the three facts here makes the snapshot self-sufficient.
-    All three are optional and default to None — a chat turn has no workspace to describe."""
+    `compile_state` is the fourth fact and it is carried for a sharper version of the same
+    reason: compile frames are emitted ON CHANGE, so a tab that reloads while the app is sitting
+    broken would learn nothing until the NEXT change — and until then its preview cover would be
+    down over the error screen the cover exists to hide. The snapshot is what makes a refresh
+    mid-build land covered.
+
+    All four are optional and default to None — a chat turn has no workspace to describe."""
 
     type: Literal["snapshot"] = "snapshot"
     seq: int
@@ -127,6 +133,7 @@ class SnapshotFrame(CamelModel):
     workspace_state: Literal["preparing", "ready", "unavailable"] | None = None
     preview_url: str | None = None
     preview_state: Literal["ready", "reconnecting"] | None = None
+    compile_state: CompileState | None = None
 
 
 class TextDeltaFrame(CamelModel):
