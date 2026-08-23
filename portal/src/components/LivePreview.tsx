@@ -343,7 +343,17 @@ export default function LivePreview({
       if (!previewOriginRef.current || e.origin !== previewOriginRef.current) return
       if (e.data?.type !== IDENTITY_REQUEST_TYPE) return
       const currentAppId = appIdRef.current
-      if (!currentAppId) return // no app to mint for yet
+      if (!currentAppId) {
+        // EVERY arm below says WHY, and this one exists because it silently ate the whole
+        // feature once (#92): `session.appId` is only set by a start/attach in this page load,
+        // so a reload left it null while the framed app went on asking. From the outside that
+        // is indistinguishable from an app that never asked — no request reaches the server,
+        // no error reaches the console, and the app just reads as signed-out for ever. The
+        // fallback that fixed it (`previewState.appId`) can regress the same silent way, so
+        // the diagnosis has to be one console line rather than three sessions of bisecting.
+        console.warn('[bial identity] request dropped: no appId for the framed preview yet')
+        return
+      }
 
       let assertion
       try {
@@ -357,10 +367,16 @@ export default function LivePreview({
           },
           body: JSON.stringify({ app_id: currentAppId }),
         })
-        if (!resp.ok) return // fail closed — the framed app simply never receives an assertion
+        if (!resp.ok) {
+          // Still fail closed — the framed app receives nothing — but a 401 (portal session
+          // expired) and a 404 (app not ours) are different problems with the same symptom.
+          console.warn(`[bial identity] mint refused (${resp.status}) for app ${currentAppId}`)
+          return
+        }
         ;({ assertion } = await resp.json())
-      } catch {
-        return // network/parse failure — same fail-closed non-response
+      } catch (err) {
+        console.warn('[bial identity] mint failed (network or parse)', err)
+        return // same fail-closed non-response
       }
 
       // Reply to the EXACT frame that asked, at ITS origin — never a broadcast, never '*'. Cast
