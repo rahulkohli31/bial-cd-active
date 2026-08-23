@@ -15,6 +15,18 @@ that fails to match exactly once is enriched into a `ModelRetry` so the model se
 (KD-5). Reads are bounded to `VIEW_MAX_LINES` and refuse the ignore set (KD-10). No tool ever
 renders `session.handle` / `handle.token` into a result or an error (KD-9 secret-safety).
 
+EVERY TOOL DOCSTRING BELOW IS PROMPT COPY (U20 / R26). pydantic-ai sends it to the model as the
+tool's description at registration, and since U20 the build prompt's `TOOL SURFACE` block is
+GENERATED from these same strings (`agent/toolsets.render_tool_surface`) — so a docstring edit
+here is a prompt edit, and `test_prompt.py`'s drift check goes red until the snapshot in
+`core/prompt_blocks.WRITE_TOOL_SURFACE` is regenerated. Write the FIRST SENTENCE as the line you
+want in the prompt; the rest is detail the model reads on the tool schema. Two sentences in
+particular are load-bearing beyond their own tool and must survive any trim: `run_command`'s
+don't-start-or-restart-the-dev-server rule (the only thing covering a second `next dev` started
+through `/exec`, which the supervisor's child env cannot tell from the real one) and
+`declare_done`'s terminal-on-a-passing-check statement (U18 — a model promised a follow-up
+round-trip withholds its closing message from `summary`, and there is no reply to put it in).
+
 They are built as a `FunctionToolset` FACTORY over a `sandbox_of` accessor — mirroring
 `agent/read_tools.read_only_toolset` — rather than `@build_agent.tool` decorators. ONE tool body,
 two consumers: the legacy `/build-sessions` harness (`BuildDeps.sandbox`) and a Write chat turn.

@@ -10,7 +10,6 @@
     "build": "next build",
     "start": "next start",
     "lint": "tsc --noEmit",
-    "db:generate": "drizzle-kit generate",
     "db:migrate": "node scripts/db-migrate.mjs"
   },
   "dependencies": {

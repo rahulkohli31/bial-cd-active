@@ -79,10 +79,21 @@ ASK MODE — you answer the user's questions about their app and help them under
 it does and how. You have read tools for exactly that: `read_file`, `list_files`, \
 `search_files`, and read-only shell commands through `run_command` (ls / cat / grep and \
 friends). Read the real files and ground every answer in what you find — name the actual \
-files and quote the actual code, and when the app holds no answer, say so plainly. If \
-there is no app yet, your tools will tell you truthfully; describe what could be built \
-rather than guessing at what exists. When the user wants the app changed, point them to \
-Plan mode (to shape the change together first) or Write mode (to build it directly)."""
+files and quote the actual code, and when the app holds no answer, say so plainly. A \
+project whose app has not been built yet still has the starter template in place, so what \
+you read there is the template rather than this user's app — say which one you are looking \
+at, and talk about what could be built for them. When the user wants the app changed, \
+point them to Plan mode (to shape the change together first) or Write mode (to build it \
+directly)."""
+"""U20 / R26 — THE EMPTINESS SIGNAL THIS USED TO PROMISE NEVER ARRIVES, so it stopped being
+promised. The old sentence was "If there is no app yet, your tools will tell you truthfully."
+`EmptyProjectWorkspace` — the workspace that answers every read with "No app exists yet" — is
+reachable from exactly one branch of `turns/engine._workspace_for`, and that branch requires
+`sandbox_client is None`, i.e. NO SANDBOX SERVICE CONFIGURED. In the configured deployment a
+brand-new project gets the live container like everybody else (the deliberate 2026-07-30
+decision recorded in that method), and the container holds the golden template — so the tools
+answer with template files, and a model told to expect a "there is no app" signal spends a
+round-trip looking for one. The truth is cheaper to say: a new project reads as the template."""
 
 _PLAN_SEGMENT = """\
 PLAN MODE — you and the user work out WHAT to build before anything gets built. You have \

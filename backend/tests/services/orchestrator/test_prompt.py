@@ -5,11 +5,36 @@ assertions stay loose to avoid brittleness."""
 
 from __future__ import annotations
 
+import json
 import re
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
+
+import pytest
+from pydantic_ai import RunContext
+from pydantic_ai.toolsets.function import FunctionToolset
 
 from src.api.v1.build_sessions.schemas import BuildError, ErrorSource
+from src.core.prompt_blocks import WRITE_TOOL_SURFACE
+from src.db.models.conversation import ConversationMode
+from src.services.agent.toolsets import (
+    first_sentence,
+    registered_tool_definitions,
+    render_tool_surface,
+)
+from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.prompt import BUILD_SYSTEM_PROMPT, build_repair_prompt
+from src.services.orchestrator.tools import sandbox_toolset
+
+_THE_SANDBOX_FACTORY = "src.services.agent.toolsets.sandbox_toolset"
+"""The name `toolsets_for_mode` reaches the sandbox six through — the seam the two
+deliberate mutations below swap out. Patched by dotted path so the test never has to
+reach through the registry module for a name it only re-imports."""
+
+_SandboxOf = Callable[[RunContext[Any]], SandboxSession]
+"""The accessor shape `sandbox_toolset` takes — spelled once so the mutation wrappers below
+can wrap the real factory without a type suppression."""
 
 # Repo-root/sandbox/template — the hand-maintained golden template the manifest mirrors (KD-10).
 # test file: backend/tests/services/orchestrator/test_prompt.py → parents[4] is the repo root.
@@ -355,6 +380,14 @@ def test_repair_prompt_embeds_the_redacted_diagnostic() -> None:
 # this file's assertion exists to make impossible.
 
 
+def _database_block(prompt: str) -> str:
+    """The DATABASE paragraph, sliced out of the composed prompt — the one place the migration
+    loop is taught. Sliced for the same reason `_completion_block` is: `--name`, `generate` and
+    `rename` are legitimate copy elsewhere (the sentinel's refusal quotes the whole command),
+    so a prompt-wide search would prove nothing about the sentence under test."""
+    return prompt[prompt.index("DATABASE \u2014") :].split("\n\n", 1)[0]
+
+
 def test_both_model_facing_sources_prescribe_the_same_named_generate() -> None:
     from src.core.prompt_blocks import MIGRATION_GENERATE_CMD
     from src.services.orchestrator.sql_guard import _refusal
@@ -364,14 +397,235 @@ def test_both_model_facing_sources_prescribe_the_same_named_generate() -> None:
     assert "--name" in MIGRATION_GENERATE_CMD
     # The build prompt teaches the same flag, in its own argv spelling.
     assert '"--name"' in BUILD_SYSTEM_PROMPT
-    # Neither source may still prescribe the BARE generate, which is what prompts and hangs.
+    # Neither source may prescribe the BARE generate — not because it hangs (it does not; see
+    # the test below), but because it names the file at random and the two voices must match.
     assert "`npx drizzle-kit generate`" not in refusal
 
 
+_A_GENERATE_SPELLING = re.compile(r"drizzle-kit[\"\',\s]+generate(.{0,24})")
+
+
+def test_every_generate_the_model_reads_carries_the_name_flag() -> None:
+    """★ U20 / ASM28 — ONE SPELLING, EVERYWHERE THE MODEL LOOKS.
+
+    The TOOL SURFACE block used to carry `["npx","drizzle-kit","generate"]` as its `run_command`
+    example — the bare spelling the DATABASE block forbids two blocks earlier, in the same
+    prompt. The block is generated from the tools' own docstrings now, so the contradicting
+    example is gone rather than corrected; this pins that no future edit re-adds one."""
+    spellings = _A_GENERATE_SPELLING.findall(BUILD_SYSTEM_PROMPT)
+    assert spellings, "the prompt stopped teaching the generate command at all"
+    for tail in spellings:
+        assert "--name" in tail, f"a bare `drizzle-kit generate` survives in the prompt: {tail!r}"
+
+
+def test_the_template_offers_no_second_spelling_of_the_generate_command() -> None:
+    """★ U20 / ASM28, the template half. `package.json` shipped `"db:generate": "drizzle-kit
+    generate"` — the bare spelling again, this time as a script the model could reach for by
+    name. It cannot be repaired in place (`--name <what_changed>` needs a value per invocation,
+    which no fixed npm script can carry), so the script is gone and
+    `MIGRATION_GENERATE_CMD` is the single spelling. Written as a rule rather than an absence
+    so re-adding it correctly would pass and re-adding it bare would not."""
+    scripts = json.loads((_TEMPLATE_ROOT / "package.json").read_text(encoding="utf-8"))["scripts"]
+    for name, script in scripts.items():
+        if "drizzle-kit generate" in script:
+            assert "--name" in script, f"`{name}` ships the bare generate the prompt forbids"
+    # LIVENESS beside it — the script the prompt DOES name must still be there.
+    assert "db:migrate" in scripts
+
+
+def test_the_name_flag_claims_only_what_the_flag_actually_does() -> None:
+    """★ U20 / R26 / ASM28 — THE FLIPPED CLAIM.
+
+    This sentence used to read "ALWAYS pass `--name`: without it the command PROMPTS when the
+    diff is ambiguous ... so it hangs until it is killed." A smoke against the template's pinned
+    `drizzle-kit@0.31.10` says otherwise: a bare generate over an unambiguous diff exits 0 and
+    writes `drizzle/0001_special_fantastic_four.sql` — a RANDOM NAME, not a hang. The flag stays
+    (a migration history nobody can read is a real cost) but it may only claim what it buys, or
+    the model reasons from a mechanism that does not exist."""
+    database = _database_block(BUILD_SYSTEM_PROMPT)
+    name_rule = database[database.index("ALWAYS pass") :].split("\n", 1)[0]
+
+    # INERTNESS — the hang, and the ambiguity mechanism, are not this sentence's business.
+    assert "hang" not in name_rule.lower()
+    assert "prompts" not in name_rule.lower()
+
+    # THE REAL COST, stated concretely enough to be checkable.
+    assert "named at random" in name_rule
+    assert "--name" in name_rule
+
+
 def test_the_prompt_teaches_the_split_that_actually_unblocked_the_wedged_build() -> None:
-    # The agent recovered, after four minutes, by splitting a rename and a create into two named
-    # migrations. Teaching that is the fix; rediscovering it per build at ~4.5 minutes is not.
+    """★ U20 / ASM28 — the one-change-per-generate rule now owns the REAL reason.
+
+    Verified by smoke, both ways round: under a TTY the rename resolver ("is `label` created, or
+    renamed from `title`?") waits forever — that is the 4m09s stall — and `--name` does not
+    answer it. Under the sandbox's real `stdin=DEVNULL` it is worse: drizzle-kit prints
+    "Interactive prompts require a TTY terminal" to stderr, writes no migration, and EXITS 0. A
+    model taught only "it hangs" reads that zero exit as success and builds on a schema change
+    that never happened, so the zero exit is the half that must be said out loud."""
+    database = _database_block(BUILD_SYSTEM_PROMPT).lower()
+    assert "one kind of change per generate" in database
+    assert "rename" in database
+    # The mechanism: an interactive question, and no flag answers it.
+    assert "asks" in database
+    assert "no flag answers" in database
+    # …and the failure MODE, which is the part that actually costs a build.
+    assert "no migration file" in database
+    assert "zero exit code" in database
+
+
+def test_the_drizzle_artifacts_instruction_is_emitted_exactly_once() -> None:
+    """U20 — the same rule was printed twice in one prompt: once in the golden-template manifest
+    (`drizzle/*.sql … versioned artifacts that must stay in the workspace`) and once in the
+    DATABASE block. Counting is the point — an `in` assertion is green at one copy and at two."""
     lowered = BUILD_SYSTEM_PROMPT.lower()
-    assert "one kind of change per generate" in lowered
-    assert "rename" in lowered
-    assert "prompts" in lowered  # the reason, so the model can generalise it
+    assert lowered.count("versioned artifacts") == 1
+    assert lowered.count("travel with the snapshot") == 1
+    # LIVENESS — the surviving copy is the DATABASE one, which carries the extra rule.
+    assert "never hand-edit one that has already been applied" in lowered
+
+
+# --- U20 / R26: the TOOL SURFACE block is GENERATED, and this is the check that keeps it so ---
+#
+# R26 asks for a check that fails when a DESCRIBED behaviour and the actual behaviour diverge.
+# A name-set comparison cannot make that promise, and U18 is the proof: it changed what
+# `declare_done` does while the sentence describing it still promised a follow-up round-trip, and
+# every name-based assertion in this repo stayed green. So the block is rendered from the tool
+# definitions pydantic-ai hands the model at registration, and the drift check is a snapshot
+# assertion over that rendering plus a per-mode membership assertion against `toolsets_for_mode`.
+
+
+def _tool_surface_block(prompt: str) -> str:
+    """The TOOL SURFACE block, sliced out of the composed prompt."""
+    return prompt[prompt.index("TOOL SURFACE:") :].split("\n\n", 1)[0]
+
+
+async def _the_drift_check() -> None:
+    """THE DRIFT CHECK ITSELF, factored out so the mutation tests can require it to go RED.
+
+    An equality assertion proves the snapshot is right today; it does not prove the assertion
+    would notice if it stopped being — which is exactly the property that failed under U18. The
+    two mutation tests below run THIS function against a deliberately-mutated registry."""
+    generated = await render_tool_surface(ConversationMode.WRITE)
+    assert WRITE_TOOL_SURFACE == generated, (
+        "the TOOL SURFACE block in `core/prompt_blocks.py` no longer matches the tools the Write "
+        "arm registers. Regenerate it with the one-liner in `services/agent/toolsets.py`'s U20 "
+        f"comment and paste the result over `WRITE_TOOL_SURFACE`.\n\ngenerated:\n{generated}"
+    )
+
+
+async def test_the_tool_surface_is_generated_from_the_tools_the_write_arm_registers() -> None:
+    """★ The snapshot half. Counted in the composed prompt as well, because a block that reached
+    zero composition sites would satisfy the equality assertion perfectly well."""
+    await _the_drift_check()
+    assert BUILD_SYSTEM_PROMPT.count(WRITE_TOOL_SURFACE) == 1
+
+
+async def test_the_prompts_tool_list_is_exactly_what_the_write_arm_registers() -> None:
+    """★ THE MEMBERSHIP HALF, asserted against `toolsets_for_mode` rather than a hand-kept list.
+
+    The hand-written block named six tools while the Write arm handed the model eight: the two
+    structured reads it borrows off `read_only_toolset` (`_WRITE_STRUCTURED_READS`) were absent
+    from the prompt for their entire life, so the model was never told it could list or search
+    the tree and paid for that in `run_command` round-trips."""
+    registered = set(await registered_tool_definitions(ConversationMode.WRITE))
+    named = set(re.findall(r"^- `(\w+)` \u2014 ", _tool_surface_block(BUILD_SYSTEM_PROMPT), re.M))
+    assert named == registered
+    # The two the old prose omitted, named explicitly so the failure reads as itself.
+    assert {"list_files", "search_files"} <= named
+    # …and nothing from a mode Write is not: Plan's confirmation tool is uncallable here.
+    assert "present_plan_options" not in named
+
+
+async def test_every_tool_line_is_its_registered_descriptions_first_sentence() -> None:
+    """★ THE DESCRIPTION HALF — the one a name-set comparison cannot make.
+
+    Each line must be the tool's OWN words, not a paraphrase of them, so the prompt and the tool
+    schema cannot say different things about the same tool."""
+    for name, definition in (await registered_tool_definitions(ConversationMode.WRITE)).items():
+        assert definition.description, f"`{name}` reaches the model with no description"
+        line = f"- `{name}` \u2014 {first_sentence(definition.description)}"
+        assert line in BUILD_SYSTEM_PROMPT, f"the prompt paraphrases `{name}`; expected {line!r}"
+
+
+async def test_the_drift_check_fails_when_a_tool_joins_a_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ DELIBERATE MUTATION 1 — a tool is added to Write and nobody regenerates the block.
+
+    Verified by mutating, not by reading: the check has to be shown failing, or "it would catch
+    that" is a claim about code nobody ran."""
+    registers_the_six = sandbox_toolset
+
+    def registers_a_seventh(sandbox_of: _SandboxOf) -> FunctionToolset[Any]:
+        toolset = registers_the_six(sandbox_of)
+
+        async def summon_a_pony(_ctx: RunContext[Any]) -> str:
+            """Summon a pony into the workspace."""
+            return "neigh"
+
+        toolset.add_function(summon_a_pony)
+        return toolset
+
+    monkeypatch.setattr(_THE_SANDBOX_FACTORY, registers_a_seventh)
+    assert "summon_a_pony" in await render_tool_surface(ConversationMode.WRITE)
+    with pytest.raises(AssertionError, match="no longer matches the tools"):
+        await _the_drift_check()
+
+
+async def test_the_drift_check_fails_when_a_tools_docstring_is_reworded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ DELIBERATE MUTATION 2 — the same tools, one of them described differently. THIS is the
+    assertion U18 proves is necessary, so the mutation is U18's own regression put back: a
+    `declare_done` that promises the follow-up round-trip the harness stopped buying. Every
+    name-based check in this repo is green against it; this one is not."""
+    registers_the_six = sandbox_toolset
+
+    def describes_declare_done_the_old_way(sandbox_of: _SandboxOf) -> FunctionToolset[Any]:
+        toolset = registers_the_six(sandbox_of)
+        toolset.tools["declare_done"].description = (
+            "Declare the build finished. The harness then verifies the app, and if it is not "
+            "green yet you will receive the diagnostic and can carry on."
+        )
+        return toolset
+
+    monkeypatch.setattr(_THE_SANDBOX_FACTORY, describes_declare_done_the_old_way)
+    reworded = await render_tool_surface(ConversationMode.WRITE)
+    # Same eight tools — a membership check sees nothing at all here.
+    assert set(re.findall(r"^- `(\w+)`", reworded, re.M)) == set(
+        re.findall(r"^- `(\w+)`", WRITE_TOOL_SURFACE, re.M)
+    )
+    with pytest.raises(AssertionError, match="no longer matches the tools"):
+        await _the_drift_check()
+
+
+async def test_a_tool_without_a_docstring_fails_the_render_rather_than_shipping_blank() -> None:
+    """Fail-first: a tool registered with no description would otherwise reach the prompt as
+    `- \u0060thing\u0060 \u2014 ` and reach the model with no explanation either."""
+    registers_the_six = sandbox_toolset
+
+    def registers_a_mute_tool(sandbox_of: _SandboxOf) -> FunctionToolset[Any]:
+        toolset = registers_the_six(sandbox_of)
+        toolset.tools["declare_done"].description = None
+        return toolset
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(_THE_SANDBOX_FACTORY, registers_a_mute_tool)
+        with pytest.raises(ValueError, match="registered with no description"):
+            await render_tool_surface(ConversationMode.WRITE)
+
+
+async def test_run_commands_dev_server_rule_is_registered_copy_as_well_as_prompt_copy() -> None:
+    """★ THE LIVENESS GUARD ON THE DOCSTRINGS THEMSELVES (U14 / U19 carried into U20).
+
+    The docstrings are prompt text now, so trimming one is a prompt edit. This sentence is what
+    covers the agent starting a dev server through `/exec` without U14's marker — the supervisor's
+    child env carries nothing that would tell a second `next dev` apart from the real one — so it
+    must survive in BOTH voices: the tool's own description, and the ENVIRONMENT block."""
+    definitions = await registered_tool_definitions(ConversationMode.WRITE)
+    described = (definitions["run_command"].description or "").lower()
+    assert "do not start or restart the dev server" in described
+    assert "already running" in described
+    # And the prompt's own wording (U19's guard, restated here because the two travel together).
+    assert "do not start, restart, or kill it" in BUILD_SYSTEM_PROMPT.lower()

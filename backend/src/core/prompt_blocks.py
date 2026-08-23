@@ -24,8 +24,8 @@ no file is frozen:
                             extend it, or delete it and write the tables your app needs
   db/index.ts               the SERVER-ONLY Drizzle client with a pinned pool — do not widen it
   drizzle.config.ts         drizzle-kit config; reads the connection string from the environment
-  drizzle/*.sql             generated migrations (plus drizzle/meta) — versioned artifacts that
-                            must stay in the workspace so they travel with the snapshot
+  drizzle/*.sql             generated migrations, plus drizzle/meta (see DATABASE above for
+                            how they are made and why they stay)
   scripts/db-migrate.mjs    the non-fatal migrate step `npm run dev` runs before `next dev`
   lib/bial-config.ts        the injected-config type + the window.__BIAL_CONFIG declaration
   lib/utils.ts              the cn() class helper
@@ -41,11 +41,22 @@ Add routes, components, libraries, and dependencies as your app needs them."""
 MIGRATION_GENERATE_CMD = "npx drizzle-kit generate --name <what_changed>"
 """The ONE spelling of the migration-generate command (F4).
 
-A BARE `npx drizzle-kit generate` PROMPTS INTERACTIVELY when the diff is ambiguous — most often
-"is this a rename or a drop-and-create?" — and the sandbox has no TTY, so the command simply
-hangs until its timeout. That is the 4m09s stall the walkthrough caught: the agent escalated
-through workarounds, eventually manufacturing its own pty, and finally recovered by doing what
-this instruction now teaches. `--name` supplies the answer up front.
+WHAT `--name` ACTUALLY BUYS, corrected (U20 / ASM28). This instruction used to say a bare
+`npx drizzle-kit generate` hangs, and that `--name` "supplies the answer up front". Both halves
+were wrong, and a smoke against the template's pinned `drizzle-kit@0.31.10` says so:
+
+- WITHOUT `--name`, an unambiguous diff generates fine and exits 0 — it just names the file at
+  random (`drizzle/0001_special_fantastic_four.sql`). So the flag buys a READABLE migration
+  history, not a working command, and it is kept for that.
+- WHAT STOPS THE COMMAND is the rename resolver — "is `label` created, or renamed from `title`?"
+  — an interactive select that NO CLI flag answers, `--name` included. Under a TTY it waits
+  forever (the 4m09s stall the walkthrough caught, after the agent manufactured its own pty —
+  now refused by the supervisor's `_refuse_a_manufactured_tty`). Under the sandbox's real
+  `stdin=DEVNULL` it is worse than a hang: drizzle-kit prints "Interactive prompts require a TTY
+  terminal" to stderr, writes NO migration, and STILL EXITS 0 — a failure wearing a success.
+
+That is why the ONE-KIND-OF-CHANGE-PER-GENERATE rule in the DATABASE block owns the real reason:
+it is the only thing that keeps the diff out of the resolver at all.
 
 Shared with `orchestrator/sql_guard.py`'s refusal, which is the OTHER place the model is told how
 to change the schema. Two copies is how the last fix half-landed: the re-test patched the prompt
@@ -194,12 +205,14 @@ and a `drizzle/` directory of generated migration SQL. The loop:
 rename them, or delete them and write your app's real tables.
 - Run `run_command(["npx","drizzle-kit","generate","--name","<what_changed>"])` — that writes a \
 new versioned `.sql` file under `drizzle/` describing exactly what changed. ALWAYS pass \
-`--name`: without it the command PROMPTS when the diff is ambiguous, and there is no terminal \
-here to answer it, so it hangs until it is killed.
+`--name`: without it the file is named at random (`0001_special_fantastic_four.sql`), and a \
+migration history nobody can read is one nobody can check.
 - Make ONE kind of change per generate. Renaming a column and adding another in the same step is \
-exactly the ambiguity that stops the command: drizzle-kit cannot tell a rename from a drop plus a \
-create, and it asks. Rename first and generate; then add, and generate again. Two small named \
-migrations always beat one that never finishes.
+the ambiguity that stops the command: drizzle-kit cannot tell a rename from a drop plus a create, \
+so it stops and ASKS — an interactive question that no flag answers, `--name` included. There is \
+no terminal here to answer it, so the command gives up, writes no migration file, and still \
+reports a zero exit code: it looks like it worked. Rename first and generate; then add, and \
+generate again. Two small named migrations always beat one that silently did nothing.
 - Run `run_command(["npm","run","db:migrate"])` to apply the pending migrations. `npm run dev` \
 also applies them at boot, and never fails the app if it cannot.
 - Never reach for drizzle-kit's `push` command: it edits the database in place and writes no \
@@ -213,6 +226,40 @@ A Client Component reaches data through a Route Handler or a Server Action — i
 client into browser code would ship the connection string to the browser.
 - The pool size in `db/index.ts` is pinned small on purpose: every app on the platform shares one \
 PostgreSQL server's connection budget. Leave it alone; fix slow queries with an index instead."""
+
+WRITE_TOOL_SURFACE = """\
+TOOL SURFACE:
+- `read_file` — Read a file's contents (line-numbered).
+- `write_file` — Create or overwrite a file with `file_text`.
+- `edit_file` — Replace the single exact occurrence of `old_str` with `new_str` in `path`.
+- `insert_lines` — Insert `insert_text` into `path` after line `insert_line` (0-based; \
+0 inserts at the top).
+- `declare_done` — Declare the build finished, and put your closing message to the user in \
+`summary`.
+- `run_command` — Run a shell command in the app workspace and get its output back.
+- `list_files` — List every file in the app (relative paths; heavy dirs like node_modules \
+excluded).
+- `search_files` — Search the app's files for a regex `pattern` (grep-like; case-sensitive)."""
+"""GENERATED, NOT WRITTEN (U20 / R26) — a checked-in snapshot of
+`services/agent/toolsets.render_tool_surface(ConversationMode.WRITE)`, which renders one line per
+tool from the tool definitions pydantic-ai hands the model at registration.
+
+It is pasted here rather than computed because THIS MODULE IS A LEAF (see the file docstring): a
+`services.*` import from `core/` closes the cycle the whole file exists to avoid. So the guarantee
+is enforced by test instead — `test_prompt.py`'s drift check recomputes it and fails on any
+difference, including one that is only in the WORDING. Regenerate and re-paste with the one-liner
+in `toolsets.py`'s U20 comment.
+
+WHY IT HAD TO STOP BEING PROSE. The hand-written block named six tools while the Write arm handed
+the model eight — `list_files` and `search_files` were absent from the prompt for their whole
+life. Worse, U18 changed what `declare_done` DOES while the sentence describing it still promised
+a follow-up round-trip; a name-set comparison is structurally blind to that, and the generated
+line is not, because it IS the tool's description.
+
+The line breaks above are `\\`-continued so the constant stays one line per tool no matter how the
+source is wrapped — `render_tool_surface` emits exactly one `\\n` between entries, and a real
+newline inside an entry would fail the drift check for a reason that has nothing to do with the
+tools."""
 
 BUILD_WORKING_RULES_TAIL = f"""\
 AFTER A WRITE — the browser is showing the data as of its last fetch, so a create, edit, or \
@@ -242,17 +289,7 @@ from it, into your own route.
 
 {NARRATION_VOICE}
 
-TOOL SURFACE:
-- `read_file` — read a file (line-numbered) before editing it. Do not read `node_modules`, \
-`.next`, or lockfiles.
-- `write_file` — create a new file or rewrite a file wholesale.
-- `edit_file` — an exact string replace; include at least 3 lines of unique surrounding context \
-so the match is unambiguous.
-- `insert_lines` — add lines at a specific position.
-- `run_command` — run a shell command (e.g. `["npm","install","zod"]`, \
-`["npx","drizzle-kit","generate"]`, `["npm","run","db:migrate"]`).
-- `declare_done` — declare the build finished, carrying the closing message the user reads \
-(see COMPLETION).
+{WRITE_TOOL_SURFACE}
 
 COMPLETION — call `declare_done` once the app is working, and put your closing message to the \
 user in its `summary`. On a passing check that call ENDS THE TURN: the summary is the last thing \

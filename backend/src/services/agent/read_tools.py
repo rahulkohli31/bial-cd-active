@@ -27,10 +27,19 @@ Containment model for `run_command`, layered fail-closed:
   output`; reimplemented here so this module never imports the build agent's tool module,
   whose import registers tools on `build_agent`).
 
+THE FOUR TOOL DOCSTRINGS IN `read_only_toolset` ARE PROMPT COPY (U20 / R26). pydantic-ai
+sends each as the tool's description at registration, and `list_files`/`search_files` are
+additionally rendered into the Write prompt's generated `TOOL SURFACE` block
+(`agent/toolsets.render_tool_surface`), so editing one is editing a prompt and
+`test_prompt.py`'s drift check says so until the snapshot is regenerated. Write the FIRST
+SENTENCE as the line you want in the prompt.
+
 Refusals are teaching `ModelRetry`s in the U1 sentinel's voice — they say WHY and what to
 do instead, so the model self-corrects rather than retrying blind. "No app exists yet" is
 NOT a refusal: `EmptyProjectWorkspace` makes every tool answer it as a truthful normal
-result (the inverse of the #9 lesson).
+result (the inverse of the #9 lesson) — but note it is reachable ONLY when no sandbox
+service is configured (`turns/engine._workspace_for`), which is why the Ask segment stopped
+promising the model an emptiness signal (U20).
 
 `psql` is never on a read-mode allowlist (plan, locked).
 """

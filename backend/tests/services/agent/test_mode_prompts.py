@@ -374,3 +374,29 @@ async def test_mode_without_context_fails_first(db_session) -> None:
     deps = ChatDeps(db=db_session, user_id=uuid.uuid4(), mode=ConversationMode.PLAN)
     with pytest.raises(ValueError, match="composed without a PromptContext"):
         await chat_agent.run("hi", deps=deps, model=_capturing_model({}))
+
+
+def test_ask_no_longer_promises_an_emptiness_signal_that_never_arrives() -> None:
+    """★ U20 / R26 — THE PROMISE IS GONE BECAUSE THE SIGNAL NEVER ARRIVES.
+
+    Ask used to tell the model "If there is no app yet, your tools will tell you truthfully."
+    `EmptyProjectWorkspace` — the only workspace that answers that way — is reachable from one
+    branch of `turns/engine._workspace_for`, and that branch requires `sandbox_client is None`:
+    NO SANDBOX SERVICE CONFIGURED. In the configured deployment a brand-new project gets the
+    live container like every other project (the deliberate 2026-07-30 decision recorded in that
+    method), and the container holds the golden template — so the reads come back FULL, of
+    template files, and a model waiting for an emptiness signal spends round-trips looking for
+    one that is not coming.
+
+    Inertness plus liveness, because deleting the sentence outright would pass an inertness
+    check while leaving the model with no account at all of what a fresh project looks like."""
+    composed = compose_mode_prompt(ConversationMode.ASK, _CONTEXT)
+    lowered = composed.lower()
+
+    # INERTNESS — the promise, in the wording that made it.
+    assert "your tools will tell you truthfully" not in lowered
+    assert "if there is no app yet" not in lowered
+
+    # LIVENESS — what a fresh project ACTUALLY reads as, so the model is not left guessing.
+    assert "starter template" in lowered
+    assert "what could be built" in lowered
