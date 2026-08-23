@@ -233,10 +233,12 @@ function BouncingWait({ children, className = '' }: { children: ReactNode; class
  *   - `status`     — the C3 lifecycle; drives loading / framed / terminal visuals.
  *   - `iterating`  — true while the loop keeps emitting step/log envelopes AFTER the preview
  *                    went live (a refine turn holding at `ready`); shows a subtle overlay.
- *   - `onFrameMessage` — the FUTURE Wave-1 client-error receiver seam. The inbound `message`
- *                    listener still validates `e.origin` against the sandbox origin (the C8 §3
- *                    security assertion, pinned by the skeleton) and forwards ONLY origin-valid
- *                    messages here. No relay is wired yet (C7 §7 is deferred); the gate stands.
+ *   - `onFrameMessage` — the client-error receiver seam, LIVE as of U13. The inbound `message`
+ *                    listener validates `e.origin` against the sandbox origin (the C8 §3 security
+ *                    assertion, pinned by the skeleton) and forwards ONLY origin-valid messages
+ *                    here; `BuilderPage` relays them to the harness, where a reported browser
+ *                    crash makes the health verdict not-green. Origin proves PROVENANCE, not
+ *                    content — the shape check lives on the receiving side.
  *
  *   - `onRelaunch` — when set, the terminal (ended/failed) placeholder offers a "Relaunch preview"
  *                    button (#43): restore the torn-down app from its snapshot into a fresh sandbox.
@@ -375,8 +377,8 @@ export default function LivePreview({
   // preview origin — the only trusted sender — BEFORE trusting the payload. A null previewOrigin
   // (preview dark) rejects everything. This is a security assertion, not a nicety; the walking
   // skeleton (scripts/skeleton) pins the reject path for real. The forwarded payload feeds the
-  // future Wave-1 browser client-error self-heal arm — the seam exists now so nothing is
-  // retrofitted later, but nothing consumes it yet.
+  // browser client-error arm of self-heal (U13), which is wired: passing this gate proves only
+  // WHERE the bytes came from, so the receiver narrows their shape before forwarding them on.
   useEffect(() => {
     const onMsg = (e: MessageEvent) => {
       if (!previewOriginRef.current || e.origin !== previewOriginRef.current) return
@@ -469,6 +471,56 @@ export default function LivePreview({
   }, [iterating, previewUrl])
   const frameKey = previewUrl ? `${previewUrl}#${reloadNonce}` : null
 
+  const [covered, setCovered] = useState(false)
+  // Which app the current verdict describes. A ref rather than state because it must not itself
+  // cause a render — it exists only to tell "a new verdict about the same app" from "the same
+  // verdict about a new app".
+  const coveredUrlRef = useRef<string | null>(null)
+  // ONE effect over BOTH inputs, and it must stay one.
+  //
+  // This was two effects — reset-on-url, then apply-on-verdict — and that shape had a hole the
+  // signal's own vocabulary walks straight into. There are only four possible values, so "a new
+  // app" and "the same verdict as the last app" routinely coincide: a relaunch onto a container
+  // that is still failing carries `failed` -> `failed` across the url change with NO delta. React
+  // skips an effect whose deps did not change, so the verdict effect never ran, the reset won
+  // uncontested, and the pane uncovered itself over a broken app — the precise failure this
+  // mechanism exists to prevent. Depending on the two effects' declaration order was the tell.
+  //
+  // Re-deriving from scratch on either input closes it, and the hold still holds: `unknown` and
+  // `null` change nothing for an app we are already covering. They only uncover on a genuinely
+  // NEW app, which we have learned nothing about yet — and nothing is exposed in that gap, since
+  // a new url remounts the frame and the frame-load wait owns the screen until the first report.
+  useEffect(() => {
+    const sameApp = coveredUrlRef.current === previewUrl
+    coveredUrlRef.current = previewUrl
+    if (compileState === 'building' || compileState === 'failed') setCovered(true)
+    else if (compileState === 'clean') setCovered(false)
+    else if (!sameApp) setCovered(false)
+  }, [previewUrl, compileState])
+
+  // The cover only exists over a frame. Everything above it in the precedence chain
+  // (restoring / terminal / reconnecting / unavailable) already replaces the frame entirely, and
+  // `showFrame` is false in every one of those states — so this single conjunction expresses the
+  // whole of `showRestoring > showTerminal > showReconnecting > showUnavailable > cover`.
+  const showCover = showFrame && covered
+
+  // …and the escalation, exactly once.
+  //
+  // Armed off `covered` — the VERDICT — rather than off `showCover`, which folds in the frame and
+  // reconnect context. The citizen is being told how long their CHANGE has been coming together,
+  // and that clock does not restart because a dev-server blip briefly put the reconnecting card
+  // in front of the cover. Off `showCover` it did: a flicker reset the countdown mid-wait, so a
+  // genuinely slow build could keep resetting to the shorter wording forever.
+  const [holdingSlow, setHoldingSlow] = useState(false)
+  useEffect(() => {
+    if (!covered) {
+      setHoldingSlow(false)
+      return
+    }
+    const t = setTimeout(() => setHoldingSlow(true), HOLDING_ESCALATE_MS)
+    return () => clearTimeout(t)
+  }, [covered])
+
   const [loadedUrl, setLoadedUrl] = useState<string | null>(null)
   const [stalledUrl, setStalledUrl] = useState<string | null>(null)
   // Both verdicts track the FRAME KEY, not the URL. Keyed on the URL they survived a remount, so
@@ -485,9 +537,19 @@ export default function LivePreview({
       return
     }
     if (frameLoaded) return
+    // Do not count the wait while the cover is up. The cap exists to label a frame that never
+    // loaded for no visible reason; under the cover we know exactly why it has not loaded, and
+    // the card this timer arms tells the citizen to relaunch — advice that is wrong mid-build.
+    // Worse, a timer left running lands the instant the cover clears, so the pane would answer a
+    // successful recovery with "your app is taking longer than usual". Any verdict earned while
+    // covered is dropped, and the wait restarts from the uncover.
+    if (showCover) {
+      setStalledUrl(null)
+      return
+    }
     const t = setTimeout(() => setStalledUrl(frameKey), FRAME_LOAD_CAP_MS)
     return () => clearTimeout(t)
-  }, [showFrame, frameKey, frameLoaded])
+  }, [showFrame, frameKey, frameLoaded, showCover])
 
   // U5 — ONE honest wait, running from "no URL yet" all the way to the framed document's own
   // `load`. It used to be destroyed the instant `previewUrl` arrived, which is precisely when the
@@ -521,40 +583,6 @@ export default function LivePreview({
   // Deliberately NOT tied to the frame's lifecycle. A remount does not reset this: the container
   // re-reports within a poll, and clearing on remount would mean a frame swap silently uncovers
   // a broken app for a second. The verdict is about the APP, not about this DOM node.
-  const [covered, setCovered] = useState(false)
-  // …with ONE exception to the hold, and it is not a hole in it: a DIFFERENT running app. Holding
-  // is fail-closed because an absent signal says nothing about the app we are covering; a new
-  // `previewUrl` means we are no longer covering that app at all, and keeping the cover up would
-  // be a claim about code this container has never seen. Nothing is uncovered in the gap either —
-  // a new url remounts the frame, so the frame-load wait owns the screen until the first report
-  // lands a poll later. Declared BEFORE the signal effect so a simultaneous change applies the
-  // reset first and the new verdict second.
-  useEffect(() => {
-    setCovered(false)
-  }, [previewUrl])
-  useEffect(() => {
-    if (compileState === 'building' || compileState === 'failed') setCovered(true)
-    else if (compileState === 'clean') setCovered(false)
-    // 'unknown' and null: hold. See above — this is the fail-closed arm, not an oversight.
-  }, [compileState])
-
-  // The cover only exists over a frame. Everything above it in the precedence chain
-  // (restoring / terminal / reconnecting / unavailable) already replaces the frame entirely, and
-  // `showFrame` is false in every one of those states — so this single conjunction expresses the
-  // whole of `showRestoring > showTerminal > showReconnecting > showUnavailable > cover`.
-  const showCover = showFrame && covered
-
-  // …and the escalation, exactly once. The timer is armed off `showCover` alone, so it restarts
-  // when a NEW cover goes up and never re-fires while one stays up.
-  const [holdingSlow, setHoldingSlow] = useState(false)
-  useEffect(() => {
-    if (!showCover) {
-      setHoldingSlow(false)
-      return
-    }
-    const t = setTimeout(() => setHoldingSlow(true), HOLDING_ESCALATE_MS)
-    return () => clearTimeout(t)
-  }, [showCover])
 
   const framePending = showFrame && !frameLoaded && !frameStalled
   const showLoading =

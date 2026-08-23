@@ -112,6 +112,7 @@ from src.services.messages.projection import (
     step_detail,
 )
 from src.services.messages.store import append_batch
+from src.services.orchestrator.client_errors import discard_client_errors
 from src.services.orchestrator.constants import (
     CACHE_TTL,
     CRASH_EDGE_CONSECUTIVE_POLLS,
@@ -1165,6 +1166,20 @@ class TurnEngine:
             # and a second feed would draw every step twice.
             emitter=None,
         )
+        # U13 — FENCE OFF ANY BROWSER CRASH REPORT THAT PREDATES THIS TURN. A report describes
+        # the tree the browser was rendering when it crashed, and this turn is about to change
+        # that tree; draining it at the end would fail a verify on a fault the agent may have
+        # just fixed. The gap between turns is not even a quiet one: the pane reloads its frame
+        # at every terminal, so it actively manufactures reports about the OLD tree. Discarded
+        # once, here, where "the agent has not started yet" is still true.
+        discarded = discard_client_errors(session.handle.app_name)
+        if discarded:
+            _log.info(
+                "client_error_reports_fenced",
+                conversation_id=str(state.conversation_id),
+                app_name=session.handle.app_name,
+                discarded=discarded,
+            )
         state.workspace_state = "ready"
         self._emit(state, lambda seq: WorkspaceFrame(seq=seq, state="ready"))
         # BOOT THE DEV SERVER THE MOMENT WE HOLD THE CONTAINER, not after the whole model run
@@ -1396,6 +1411,9 @@ class TurnEngine:
             # frame that lands after `turn_ended` arrives after the transport has already
             # sent `[DONE]`, so it is not late — it is lost.
             await self._stop_preview_watcher(state)
+            # …and only then settle a compile state left mid-build, for the same reason in
+            # reverse: after the watcher is down, nothing else will ever report on this app.
+            await self._settle_compile_state(state)
 
     async def _run_write_once(
         self,
@@ -1758,6 +1776,23 @@ class TurnEngine:
                     state.preview_state = "reconnecting"
                     self._emit(state, lambda seq: PreviewFrame(seq=seq, state="reconnecting"))
             await asyncio.sleep(READINESS_POLL_S)
+
+    async def _settle_compile_state(self, state: _TurnState) -> None:
+        """One last compile poll when the turn ends mid-build, so the pane is not left holding a
+        cover nothing will ever lower.
+
+        `building` cannot outlive the turn that caused it, but the watcher that reports it is
+        cancelled at the terminal — so a turn that ends in the second between "compiling" and
+        "compiled" strands the preview under "Putting the latest change together…" with no
+        remaining producer. One poll usually settles it to `clean` or `failed`, either of which
+        resolves the pane correctly.
+
+        ONLY on `building`, so the common path pays nothing. If it is STILL building afterwards
+        the cover stays up, which is at least honest — and the next turn resolves it."""
+        sandbox = state.sandbox
+        if sandbox is None or state.compile_state is not CompileState.BUILDING:
+            return
+        await self._poll_compile_state(state, sandbox)
 
     async def _stop_preview_watcher(self, state: _TurnState) -> None:
         task = state.preview_task

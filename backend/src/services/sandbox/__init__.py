@@ -15,6 +15,12 @@ from src.services.sandbox.base import (
     SANDBOX_NAME_PREFIX as SANDBOX_NAME_PREFIX,
 )
 from src.services.sandbox.base import (
+    CompileReport as CompileReport,
+)
+from src.services.sandbox.base import (
+    CompileState as CompileState,
+)
+from src.services.sandbox.base import (
     DevLogs as DevLogs,
 )
 from src.services.sandbox.base import (

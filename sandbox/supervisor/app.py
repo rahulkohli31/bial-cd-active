@@ -538,8 +538,12 @@ dead-child rescue, and by the agent's own shell — so this thread reconnects fo
 being wired to any one of those events."""
 
 _HMR_CANARY_S = 5.0
-"""How long a SUCCESSFUL connect may stay silent before it is called protocol drift. The server
-sends `sync` on connect within milliseconds; five seconds of nothing is not slowness."""
+"""How long we may be owed a frame we understand before calling it protocol drift.
+
+Armed at connect (the server sends `sync` within milliseconds, so five seconds of nothing there
+is not slowness) and re-armed by any frame we do NOT recognise — traffic we cannot read is the
+signal that the vocabulary moved. Never armed by quiet alone: an idle dev server sends nothing
+for minutes and is perfectly healthy."""
 
 _COMPILE_DEBOUNCE_S = 0.4
 """How long `clean` must hold before it is published. One edit produces several `built` frames
@@ -687,16 +691,30 @@ def _consume_hmr() -> None:
                 with _Compile.lock:
                     _Compile.connect_generation += 1
                     _publish_locked("unknown", (), "connected_no_frame_yet")
-                deadline = time.monotonic() + _HMR_CANARY_S
-                canary_spent = False
+                # The canary is ARMED WHENEVER WE ARE OWED AN ANSWER, not just at connect.
+                #
+                # A one-shot latch was the obvious shape and it disarms the alarm for every case
+                # except connect-time drift: one recognised frame set the timeout to None forever,
+                # so a rename that lands mid-session — or a PARTIAL rename, where `sync` still
+                # parses and `built` stops — would pin the state at whatever was last understood
+                # and never fire. That is precisely the silent failure the alarm exists for.
+                #
+                # SILENCE ALONE IS NOT DRIFT. An idle dev server sends nothing for minutes and is
+                # perfectly healthy, so the window is armed only while UNRECOGNISED frames have
+                # arrived since the last recognised one. Traffic we cannot read is the signal;
+                # quiet is not.
+                owed_since: float | None = time.monotonic()
                 while True:
-                    timeout = None if canary_spent else max(0.0, deadline - time.monotonic())
+                    timeout = (
+                        None
+                        if owed_since is None
+                        else max(0.0, owed_since + _HMR_CANARY_S - time.monotonic())
+                    )
                     try:
                         raw = ws.recv(timeout=timeout)
                     except TimeoutError:
-                        # A successful connect that said nothing recognisable. Fires once per
-                        # connect; a frame arriving later still publishes and clears the reason.
-                        canary_spent = True
+                        # We were owed an answer and did not get one we understand.
+                        owed_since = None
                         _forget_compile("no_recognised_frame")
                         continue
                     text = raw if isinstance(raw, str) else bytes(raw).decode("utf-8", "replace")
@@ -706,8 +724,12 @@ def _consume_hmr() -> None:
                         continue
                     derived = _derive_compile(msg)
                     if derived is None:
+                        # Traffic we cannot read. Start owing an answer again (unless we already
+                        # are), so a vocabulary that moves mid-session still trips the alarm.
+                        if owed_since is None:
+                            owed_since = time.monotonic()
                         continue
-                    canary_spent = True
+                    owed_since = None
                     _note_frame(*derived)
         except Exception:  # noqa: BLE001 - every transport failure is the same answer: unknown
             _forget_compile("disconnected")

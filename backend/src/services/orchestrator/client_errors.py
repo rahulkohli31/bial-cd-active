@@ -114,9 +114,13 @@ class ClientErrorStore:
             # happen AFTER the insert or a store already at MAX_APPS would drop the new entry.
             while len(self._parked) > MAX_APPS:
                 self._parked.popitem(last=False)
-        self._parked.move_to_end(app_name)
         if len(parked) >= MAX_REPORTS_PER_APP:
+            # NOT refreshed on the drop path. An app sitting at its cap is, by definition, one
+            # whose reports nobody has drained — and a crash loop hammering it would otherwise
+            # keep renewing its lease forever, so it could never be evicted by MAX_APPS while
+            # quieter apps were. Only a report we actually keep counts as activity.
             return False
+        self._parked.move_to_end(app_name)
         parked.append(ClientErrorReport(source=source, title=title, stack=stack, parked_at=now))
         return True
 
@@ -129,6 +133,20 @@ class ClientErrorStore:
         itself while the agent fixed it on the first pass."""
         self._expire(self._clock())
         return self._parked.pop(app_name, [])
+
+    def discard(self, app_name: str) -> int:
+        """Throw away everything parked for this app; returns how many were dropped.
+
+        THE TURN FENCE. A report describes the tree the browser was rendering when it crashed,
+        and the turn that is about to start is going to change that tree. Draining it at the end
+        of that turn would fail a verify on a fault the agent may have just fixed — and worse,
+        the pane reloads its frame at every turn terminal, so the gap between turns is a moment
+        that actively MANUFACTURES reports. Anything parked before the agent started is history.
+
+        Distinct from `drain` on purpose: `drain` hands the reports to a verdict, this one is a
+        deliberate discard, and reading a call site should say which of the two it meant."""
+        dropped = self._parked.pop(app_name, [])
+        return len(dropped)
 
     def forget_everything(self) -> None:
         """Empty the store. Nothing in production calls this — it exists so a test can start from
@@ -168,6 +186,12 @@ def park_client_error(app_name: str, *, source: str, title: str, stack: str) -> 
 def drain_client_errors(app_name: str) -> list[ClientErrorReport]:
     """Take (and forget) every fresh report parked for this app — see `ClientErrorStore.drain`."""
     return _STORE.drain(app_name)
+
+
+def discard_client_errors(app_name: str) -> int:
+    """Fence off every report parked for this app before a turn starts — see
+    `ClientErrorStore.discard`."""
+    return _STORE.discard(app_name)
 
 
 def forget_all_client_errors() -> None:

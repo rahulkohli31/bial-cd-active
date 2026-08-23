@@ -353,7 +353,7 @@ class ErrorSource(enum.StrEnum):
     TSC = "tsc"  # `tsc` typecheck failure, read over C1 /exec.
     NEXT_BUILD = "next_build"  # `next build` failure, read over C1 /exec.
     SERVER = "server"  # dev-server stderr, read over C1 /dev/logs.
-    CLIENT = "client"  # RESERVED — the browser client-error arm. NOT emitted in Stage 0 (C7 §7).
+    CLIENT = "client"  # the browser client-error arm — LIVE as of U13; agent-only, never rendered.
 
 
 class BuildError(BaseModel):

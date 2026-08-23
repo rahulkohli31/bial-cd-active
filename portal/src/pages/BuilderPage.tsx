@@ -531,6 +531,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // about compilation yet, and starting it at clean would uncover a preview whose app may
     // still be broken from the turn before.
     setTurnCompile(null)
+    // A FRESH CRASH-REPORT BUDGET FOR THIS TURN. The relay's scope key is the framed url, which
+    // is byte-identical across repair turns on the attach arm — so without this the budget was
+    // effectively per page-load: eight crashes into a session the relay went quiet for good, and
+    // every later verify came back green on silence the platform itself had caused.
+    clientErrorRelayRef.current?.reset()
     setTurnTerminal(null)
     setTurnStartedAt(Date.now())
     setStoppingTurn(false)
@@ -1744,7 +1749,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       if (!projectId) return
       // Scoped to the FRAMED URL, not to the project: a rebuild or a restore gives the app a new
       // container, and the crash loop that silenced the relay belonged to the old one.
-      void clientErrorRelayRef.current?.(projectId, framedPreviewUrl ?? '', data)
+      void clientErrorRelayRef.current?.relay(projectId, framedPreviewUrl ?? '', data)
     },
     [projectId, framedPreviewUrl],
   )

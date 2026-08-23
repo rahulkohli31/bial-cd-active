@@ -71,7 +71,7 @@ describe('asClientErrorPayload — a valid origin is not a valid payload', () =>
 
 describe('makeClientErrorRelay — the harness hears it, the citizen does not', () => {
   it('POSTs a report to the project-scoped ingest route', async () => {
-    await makeClientErrorRelay()('proj-1', 'https://app-a.example/', A_REPORT)
+    await makeClientErrorRelay().relay('proj-1', 'https://app-a.example/', A_REPORT)
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
     const [url, opts] = fetchMock.mock.calls[0]
@@ -87,7 +87,7 @@ describe('makeClientErrorRelay — the harness hears it, the citizen does not', 
   })
 
   it('sends nothing for a message that is not a report', async () => {
-    const relay = makeClientErrorRelay()
+    const { relay } = makeClientErrorRelay()
     await relay('proj-1', 'https://app-a.example/', { type: 'something-else' })
     expect(fetchMock).not.toHaveBeenCalled()
     // LIVENESS: the relay is genuinely working — a real report on the same instance does send.
@@ -99,7 +99,7 @@ describe('makeClientErrorRelay — the harness hears it, the citizen does not', 
     // A component that throws on render throws again on every re-render, hundreds of times a
     // second. The server caps what it KEEPS; without this cap the user's own browser still fires
     // hundreds of requests a second at it.
-    const relay = makeClientErrorRelay()
+    const { relay } = makeClientErrorRelay()
     for (let i = 0; i < MAX_REPORTS_PER_APP + 20; i += 1) {
       await relay('proj-1', 'https://app-a.example/', A_REPORT)
     }
@@ -107,7 +107,7 @@ describe('makeClientErrorRelay — the harness hears it, the citizen does not', 
   })
 
   it('starts fresh for a new container — one bad build must not silence the next', async () => {
-    const relay = makeClientErrorRelay()
+    const { relay } = makeClientErrorRelay()
     for (let i = 0; i < MAX_REPORTS_PER_APP + 5; i += 1) {
       await relay('proj-1', 'https://app-a.example/', A_REPORT)
     }
@@ -119,18 +119,62 @@ describe('makeClientErrorRelay — the harness hears it, the citizen does not', 
     expect(fetchMock).toHaveBeenCalledTimes(MAX_REPORTS_PER_APP + 1)
   })
 
+  it('counts PER SCOPE, so flapping between two apps cannot reset an exhausted budget', () => {
+    // A single "which app am I counting" pointer is reset by every switch, so alternating
+    // reports bypass the cap entirely — which is the shape a crash loop in a page that frames
+    // two apps actually takes.
+    const { relay } = makeClientErrorRelay()
+    return (async () => {
+      for (let i = 0; i < MAX_REPORTS_PER_APP; i += 1) {
+        await relay('proj-1', 'https://app-a.example/', A_REPORT)
+      }
+      fetchMock.mockClear()
+      // Flap away and back. App B gets its own budget; app A's is still spent.
+      await relay('proj-1', 'https://app-b.example/', A_REPORT)
+      await relay('proj-1', 'https://app-a.example/', A_REPORT)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+    })()
+  })
+
+  it('starts a fresh budget on reset, so one turn cannot silence the next', async () => {
+    // ★ The scope key is the framed url, and on the attach arm that url is byte-identical across
+    // repair turns. Without a per-turn reset the budget was effectively per page-load: eight
+    // crashes in and the relay went quiet for good, so every later verify came back green on
+    // silence the platform itself had caused. Absence that we manufactured reads exactly like
+    // health, which is the failure class this whole feature exists to remove.
+    const { relay, reset } = makeClientErrorRelay()
+    for (let i = 0; i < MAX_REPORTS_PER_APP + 3; i += 1) {
+      await relay('proj-1', 'https://app-a.example/', A_REPORT)
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(MAX_REPORTS_PER_APP)
+
+    reset()
+    await relay('proj-1', 'https://app-a.example/', A_REPORT)
+    expect(fetchMock).toHaveBeenCalledTimes(MAX_REPORTS_PER_APP + 1)
+  })
+
+  it('caps the size of every string it forwards', () => {
+    // The server caps these too, but its cap only rejects a body it has already buffered. These
+    // strings are written by code inside the generated app.
+    const huge = 'x'.repeat(50_000)
+    const payload = asClientErrorPayload({ ...A_REPORT, title: huge, stack: huge, source: huge })
+    expect(payload?.title.length).toBe(1000)
+    expect(payload?.stack.length).toBe(20_000)
+    expect(payload?.source.length).toBe(64)
+  })
+
   it('swallows a failed report — a diagnostic must never become a second failure', async () => {
     // This is a side-channel about an app that is ALREADY broken. An unhandled rejection here
     // would land in the citizen's console; a thrown error would reach the frame-message handler,
     // which is called from a window listener.
     fetchMock.mockRejectedValue(new Error('network down'))
     await expect(
-      makeClientErrorRelay()('proj-1', 'https://app-a.example/', A_REPORT),
+      makeClientErrorRelay().relay('proj-1', 'https://app-a.example/', A_REPORT),
     ).resolves.toBeUndefined()
 
     fetchMock.mockResolvedValue(new Response('nope', { status: 500 }))
     await expect(
-      makeClientErrorRelay()('proj-1', 'https://app-a.example/', A_REPORT),
+      makeClientErrorRelay().relay('proj-1', 'https://app-a.example/', A_REPORT),
     ).resolves.toBeUndefined()
   })
 })

@@ -1073,6 +1073,36 @@ describe('LivePreview — the cover (R16/R18): the framework error screen is nev
     expect(container.querySelector('iframe')).toBeTruthy() // liveness
   })
 
+  it('re-derives the verdict for a new app even when the signal REPEATS the old value', () => {
+    // ★ THE FOUR-VALUE TRAP. The signal has only four possible values, so "a new app" and "the
+    // same verdict as the previous app" routinely coincide — a relaunch onto a container that is
+    // still failing carries `failed` -> `failed` across the url change with no delta at all.
+    // Reset-on-url and apply-on-verdict as two effects meant React skipped the verdict effect on
+    // that path (its dep did not change), and the reset won uncontested: the pane uncovered
+    // itself over a broken app, which is the exact failure this whole mechanism exists to stop.
+    const { container, rerender } = setup({ compileState: 'failed' })
+    expect(coverEl(container)).toBeTruthy()
+
+    rerender(<LivePreview previewUrl={SANDBOX_URL_2} status="ready" compileState="failed" />)
+    expect(coverEl(container)).toBeTruthy()
+    expect(container.querySelector('iframe')).toBeTruthy() // liveness
+  })
+
+  it('starts a new app uncovered even when the signal is byte-identical to the old app’s', () => {
+    // Pins `previewUrl` in the effect's dependency list. Reached by holding a cover through an
+    // `unknown` (app A broke, then its signal went quiet) and then switching apps while the
+    // signal is still `unknown`: app B has reported nothing, so covering it would be a claim
+    // about code nothing has looked at. Without the url dep the effect never re-runs here and
+    // app B inherits app A's cover.
+    const { container, rerender } = setup({ compileState: 'failed' })
+    rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="unknown" />)
+    expect(coverEl(container)).toBeTruthy() // held through the unknown, same app
+
+    rerender(<LivePreview previewUrl={SANDBOX_URL_2} status="ready" compileState="unknown" />)
+    expect(coverEl(container)).toBeFalsy()
+    expect(container.querySelector('iframe')).toBeTruthy() // liveness
+  })
+
   it('applies the new app’s own verdict when the url and the signal change together', () => {
     const { container, rerender } = setup({ compileState: 'clean' })
     expect(coverEl(container)).toBeFalsy()

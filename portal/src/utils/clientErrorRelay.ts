@@ -28,6 +28,13 @@ import { isRecord } from './apiError'
 /** The postMessage discriminator the app's capture component stamps on every report. */
 const CLIENT_ERROR_TYPE = 'bial:client-error'
 
+/* Mirrors the server's own caps (`CLIENT_ERROR_*_MAX_CHARS` in
+ * `backend/src/api/v1/build_sessions/schemas.py`). Kept in step by value, not by import — there
+ * is no shared-constants mechanism across Python and TypeScript in this repo. */
+const MAX_SOURCE = 64
+const MAX_TITLE = 1000
+const MAX_STACK = 20000
+
 /**
  * How many reports one page may relay before it stops talking.
  *
@@ -48,11 +55,8 @@ const CLIENT_ERROR_TYPE = 'bial:client-error'
  * before the server has to start refusing. */
 export const MAX_REPORTS_PER_APP = 8
 
-interface RelayState {
-  /** Which app the counter belongs to; a change resets it. */
-  scope: string | null
-  sent: number
-}
+/** How many distinct scopes one relay tracks before it starts forgetting the oldest. */
+const MAX_TRACKED_SCOPES = 8
 
 /** A report as the app sends it, once we have decided it is one. */
 export interface ClientErrorPayload {
@@ -77,16 +81,32 @@ export function asClientErrorPayload(data: unknown): ClientErrorPayload | null {
   const title = typeof record.title === 'string' ? record.title : ''
   if (title === '') return null
   return {
-    source: typeof record.source === 'string' ? record.source : 'unknown',
-    title,
+    // Capped HERE, not left to the server's own `max_length`. Every one of these strings is
+    // written by code inside the generated app, and a server-side cap only rejects the body
+    // AFTER it has been buffered — so an app that wanted to could drive the citizen's own
+    // authenticated browser into posting arbitrarily large bodies at the control plane. The
+    // limits mirror the server's; anything past them is noise in a diagnostic anyway.
+    source: (typeof record.source === 'string' ? record.source : 'unknown').slice(0, MAX_SOURCE),
+    title: title.slice(0, MAX_TITLE),
     // Absent on the `console.error` / `console.warn` arms, which are the commonest reports of
     // all — an empty stack is a normal report, not a malformed one.
-    stack: typeof record.stack === 'string' ? record.stack : '',
+    stack: (typeof record.stack === 'string' ? record.stack : '').slice(0, MAX_STACK),
   }
 }
 
 /**
- * Make a relay bound to one project. The returned function is what a frame-message handler calls.
+ * Make a relay. The returned object's `relay` is what a frame-message handler calls; `reset`
+ * starts a fresh budget and belongs at the start of a turn.
+ *
+ * THE BUDGET IS PER TURN, NOT PER PAGE, and that is a correctness property rather than a policy
+ * one. The scope key is the framed url, which is byte-identical across repair turns on the attach
+ * arm — same container, same app, same url. A page-lifetime counter therefore never reset: eight
+ * crashes into a session, the relay went quiet for good, and every later verify came back green
+ * by manufactured absence. Silence that the platform itself caused reads exactly like health.
+ *
+ * COUNTED PER SCOPE, NOT AGAINST A LAST-SEEN POINTER. A single "which app was I counting"
+ * pointer is reset by flapping between two apps, so alternating reports bypass the cap entirely.
+ * A small bounded map costs nothing and cannot be flapped.
  *
  * Errors are SWALLOWED, and that is the requirement rather than an oversight: this is a
  * diagnostic side-channel about an app that is already broken. A failed report must cost the
@@ -94,17 +114,20 @@ export function asClientErrorPayload(data: unknown): ClientErrorPayload | null {
  * all not the preview they are looking at.
  */
 export function makeClientErrorRelay(deps: AuthFetchDeps = {}) {
-  const state: RelayState = { scope: null, sent: 0 }
+  let sentByScope = new Map<string, number>()
 
-  return async function relay(projectId: string, appScope: string, data: unknown): Promise<void> {
+  async function relay(projectId: string, appScope: string, data: unknown): Promise<void> {
     const payload = asClientErrorPayload(data)
     if (payload === null) return
-    if (state.scope !== appScope) {
-      state.scope = appScope
-      state.sent = 0
+    const sent = sentByScope.get(appScope) ?? 0
+    if (sent >= MAX_REPORTS_PER_APP) return
+    sentByScope.set(appScope, sent + 1)
+    // Bounded: a page that framed many apps must not accumulate a counter per app forever.
+    // Insertion-ordered, so the first key is the least recently FIRST-seen.
+    if (sentByScope.size > MAX_TRACKED_SCOPES) {
+      const oldest = sentByScope.keys().next().value
+      if (oldest !== undefined) sentByScope.delete(oldest)
     }
-    if (state.sent >= MAX_REPORTS_PER_APP) return
-    state.sent += 1
     try {
       await authFetch(
         `/api/build-sessions/projects/${encodeURIComponent(projectId)}/client-error`,
@@ -119,4 +142,11 @@ export function makeClientErrorRelay(deps: AuthFetchDeps = {}) {
       // See the note above: a diagnostic about a broken app may not become a second failure.
     }
   }
+
+  /** Start a fresh budget. Called when a turn begins — see the per-turn note above. */
+  function reset(): void {
+    sentByScope = new Map()
+  }
+
+  return { relay, reset }
 }

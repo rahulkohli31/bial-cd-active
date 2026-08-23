@@ -422,9 +422,17 @@ class CompileState(enum.StrEnum):
 class CompileReport:
     """Mirrors C1 `GET /dev/compile`.
 
-    `errors` is the de-coloured compile output, bounded in the container — it feeds the agent
-    and the health verdict, never the user. `reason` says WHY the state is `UNKNOWN` and is
-    None when it is not. `connect_generation` counts the supervisor's successful socket
+    `errors` is the de-coloured, secret-redacted compile output, bounded in the container.
+    NOTHING READS IT YET, and the docstring says so rather than describing an intention: the
+    only consumer today is the preview cover, which needs `state` alone. The field is carried
+    because the container is the only place the text exists in structured form and re-deriving
+    it later would mean re-reading a log tail — but a reader looking for where the agent gets
+    compile detail will find it on the `tsc` / dev-server-tail path, not here.
+
+    When it does get a consumer it is AGENT INPUT, never user output — it is app-authored text.
+    `reason` says WHY the state is `UNKNOWN` and is None when it is not.
+
+    `connect_generation` counts the supervisor's successful socket
     connects, so the control plane raises the protocol-drift alarm once per connect rather
     than once per poll."""
 
