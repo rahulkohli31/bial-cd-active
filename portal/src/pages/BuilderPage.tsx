@@ -401,7 +401,12 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   //
   // A ref so the relay's own throttle counter survives re-renders: rebuilding it every render
   // would reset the count on every keystroke and defeat the cap entirely.
-  const clientErrorRelayRef = useRef(makeClientErrorRelay())
+  // Lazy, not `useRef(makeClientErrorRelay())`: an argument to `useRef` is evaluated on every
+  // render and then thrown away on all but the first, so the eager form allocates a fresh relay
+  // (and its throttle counter) on every streamed frame of a build. The counter surviving is the
+  // whole point of holding it in a ref.
+  const clientErrorRelayRef = useRef<ReturnType<typeof makeClientErrorRelay> | null>(null)
+  if (clientErrorRelayRef.current === null) clientErrorRelayRef.current = makeClientErrorRelay()
   const [turnDiagnostics, setTurnDiagnostics] = useState<DiagnosticFrame[]>([])
   // Read inside async callbacks that outlive their render (the build watcher's terminal),
   // where the closed-over state value would be whatever it was when the build STARTED.
@@ -1739,7 +1744,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       if (!projectId) return
       // Scoped to the FRAMED URL, not to the project: a rebuild or a restore gives the app a new
       // container, and the crash loop that silenced the relay belonged to the old one.
-      void clientErrorRelayRef.current(projectId, framedPreviewUrl ?? '', data)
+      void clientErrorRelayRef.current?.(projectId, framedPreviewUrl ?? '', data)
     },
     [projectId, framedPreviewUrl],
   )

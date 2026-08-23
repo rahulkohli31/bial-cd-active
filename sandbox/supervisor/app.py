@@ -587,10 +587,18 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
 
-def _error_text(item: Any) -> str:
-    """One HMR error entry as plain text. The wire form is normally a preformatted string, but
-    webpack-shaped object entries are a documented variant, so both are handled and anything
-    else degrades to its repr rather than throwing inside the consumer thread."""
+def _error_text(item: Any, secrets: tuple[str, ...]) -> str:
+    """One HMR error entry as plain text, REDACTED. The wire form is normally a preformatted
+    string, but webpack-shaped object entries are a documented variant, so both are handled and
+    anything else degrades to its repr rather than throwing inside the consumer thread.
+
+    THE REDACTION IS NOT OPTIONAL, and it is the same rule `/exec`, `/dev/logs` and `/files`
+    already follow (see this module's header): a compile error is dev-server output, and dev-server
+    output is exactly as credential-shaped as a log line. A Next error that echoes a bad
+    `BIAL_DATABASE_URL` — an unparseable DSN is a compile-time failure, not an exotic one — would
+    otherwise carry the per-project database password out of the container, into the control
+    plane, and on into a model prompt. The scrub is a substring replace of known values, so it
+    catches the whole DSN and its parsed password sub-token both (C9 §6.4)."""
     if isinstance(item, str):
         text = item
     elif isinstance(item, dict):
@@ -598,7 +606,7 @@ def _error_text(item: Any) -> str:
         text = "\n".join(parts) if parts else json.dumps(item, default=str)
     else:
         text = str(item)
-    return _strip_ansi(text)[:_COMPILE_MAX_ERROR_CHARS]
+    return _redact(_strip_ansi(text), secrets)[:_COMPILE_MAX_ERROR_CHARS]
 
 
 def _derive_compile(msg: Any) -> tuple[str, tuple[str, ...]] | None:
@@ -620,8 +628,10 @@ def _derive_compile(msg: Any) -> tuple[str, tuple[str, ...]] | None:
         return ("building", ())
     if verb in ("built", "sync"):
         raw = msg.get("errors")
+        # Secrets resolved ONCE per frame rather than per error, exactly as `/dev/logs` does it.
+        secrets = _redaction_secrets() if isinstance(raw, list) and raw else ()
         errors = (
-            tuple(_error_text(e) for e in raw[:_COMPILE_MAX_ERRORS])
+            tuple(_error_text(e, secrets) for e in raw[:_COMPILE_MAX_ERRORS])
             if isinstance(raw, list)
             else ()
         )

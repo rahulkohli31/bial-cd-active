@@ -150,7 +150,7 @@ def test_the_app_still_builds_with_its_full_route_surface() -> None:
     paths = list(app.openapi().get("paths", {}))
     build_session_paths = [p for p in paths if "build-session" in p]
 
-    # 17 since U13 added `apps/{app_id}/client-error` — the app's own in-browser error report,
+    # 17 since U13 added `projects/{project_id}/client-error` — the app's own in-browser report,
     # recorded in C3 §9 in the same change that added the route.
     assert len(build_session_paths) == 17, (
         f"the C3 build-session route surface changed: expected 17 paths, found "

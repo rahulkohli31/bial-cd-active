@@ -510,7 +510,7 @@ class AcaSandboxClient(SandboxClient):
                 reason=None if raw_reason is None else str(raw_reason),
                 connect_generation=int(data.get("connect_generation") or 0),
             )
-        except KeyError, TypeError, ValueError:
+        except (KeyError, TypeError, ValueError):  # fmt: skip  # ruff py314 strips parens
             return CompileReport(state=CompileState.UNKNOWN, reason="malformed_body")
 
     async def someone_has_to_go_first(self, handle: SandboxHandle) -> int | None:

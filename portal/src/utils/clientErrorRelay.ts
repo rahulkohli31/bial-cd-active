@@ -23,6 +23,7 @@
 
 import { authFetch } from './api'
 import type { AuthFetchDeps } from './api'
+import { isRecord } from './apiError'
 
 /** The postMessage discriminator the app's capture component stamps on every report. */
 const CLIENT_ERROR_TYPE = 'bial:client-error'
@@ -40,6 +41,11 @@ const CLIENT_ERROR_TYPE = 'bial:client-error'
  * or the same one after a rebuild — starts fresh. Otherwise one bad build would silence the
  * reporting for every app the user looked at afterwards.
  */
+/* NB: the server keeps its own, LARGER cap under the same name
+ * (`MAX_REPORTS_PER_APP = 10` in `backend/src/services/orchestrator/client_errors.py`). They are
+ * not meant to match — this one bounds requests LEAVING the browser, that one bounds reports the
+ * store KEEPS — and the client cap is the smaller of the two on purpose, so the throttle bites
+ * before the server has to start refusing. */
 export const MAX_REPORTS_PER_APP = 8
 
 interface RelayState {
@@ -63,8 +69,10 @@ export interface ClientErrorPayload {
  * report — or a report with no title, which is nothing to act on — returns null and is dropped.
  */
 export function asClientErrorPayload(data: unknown): ClientErrorPayload | null {
-  if (typeof data !== 'object' || data === null) return null
-  const record = data as Record<string, unknown>
+  // `isRecord` rather than a hand-rolled `typeof === 'object'` check: it also excludes arrays,
+  // which the naive form lets through as a record with numeric keys.
+  if (!isRecord(data)) return null
+  const record = data
   if (record.type !== CLIENT_ERROR_TYPE) return null
   const title = typeof record.title === 'string' ? record.title : ''
   if (title === '') return null

@@ -1362,6 +1362,30 @@ def test_error_payloads_are_bounded_in_count_and_size() -> None:
     assert all(len(e) == _COMPILE_MAX_ERROR_CHARS for e in errors)
 
 
+def test_an_injected_secret_is_redacted_out_of_a_compile_error() -> None:
+    """★ The same rule `/exec`, `/dev/logs` and `/files` already follow, applied to the newest
+    output surface. A compile error is dev-server output, and an unparseable `BIAL_DATABASE_URL`
+    is a COMPILE-TIME failure, not an exotic one — so without this the per-project database
+    password rides an error frame out of the container and into a model prompt."""
+    import os
+
+    import app as sup
+
+    dsn = "postgres://bialrole_x:s3cr3t-pa55word@db.example:5432/bialapp_x"
+    os.environ["BIAL_DATABASE_URL"] = dsn
+    try:
+        _, errors = sup._derive_compile({"action": "built", "errors": [f"Invalid URL: {dsn}"]})
+    finally:
+        os.environ.pop("BIAL_DATABASE_URL", None)
+
+    assert errors, "guard the premise: the frame really did carry an error"
+    # Both halves: the whole value AND the parsed password sub-token, which is what the scrub
+    # registers separately and what a naive whole-value-only redaction would leak.
+    assert dsn not in errors[0]
+    assert "s3cr3t-pa55word" not in errors[0]
+    assert "Invalid URL:" in errors[0], "the diagnostic itself must survive the redaction"
+
+
 def test_a_webpack_shaped_error_object_still_yields_text() -> None:
     from app import _derive_compile
 

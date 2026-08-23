@@ -312,7 +312,7 @@ writer is a crashing browser inside an app whose code we did not author. Anythin
 
 
 class ClientErrorReportRequest(CamelModel):
-    """`POST /v1/build-sessions/apps/{appId}/client-error` body (U13).
+    """`POST /v1/build-sessions/projects/{projectId}/client-error` body (U13).
 
     Mirrors the payload the app's capture component posts to the portal, minus two fields the
     portal must NOT forward: `type` (the postMessage discriminator — it has done its job by the
@@ -327,7 +327,7 @@ class ClientErrorReportRequest(CamelModel):
 
 
 class ClientErrorReportResponse(CamelModel):
-    """`POST /v1/build-sessions/apps/{appId}/client-error` → 202 (U13).
+    """`POST /v1/build-sessions/projects/{projectId}/client-error` → 202 (U13).
 
     `recorded: false` is a SUCCESS, and it is the one thing worth saying here: this app already
     has as many reports waiting for the next health verdict as the store keeps, so this one was

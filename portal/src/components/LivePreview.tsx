@@ -185,6 +185,39 @@ function RelaunchAffordance({ onRelaunch, relaunchError, label }: RelaunchAfford
 }
 
 /**
+ * The calm wait: an opaque full-bleed card with the pane's bouncing dots and one sentence.
+ *
+ * ONE component for both waits on this pane — the frame-load wait and the compile cover — because
+ * their visual identity is the point, not a coincidence: the citizen is in one situation ("my app
+ * has not opened yet") and two subtly different cards would be the pane talking about itself. It
+ * was two verbatim copies of this markup, kept in step by a comment; this keeps them in step by
+ * construction. Deliberately NOT shared with the frame-stall card below, which uses the
+ * spinner-plus-warning tint reserved for a dev server that is genuinely down — that one means
+ * something different and must stay able to diverge.
+ *
+ * The two call sites keep their own guards. Only the chrome is shared, never the condition.
+ */
+function BouncingWait({ children, className = '' }: { children: ReactNode; className?: string }) {
+  return (
+    <div
+      className="absolute inset-0 z-20 bg-[#e8edf2] flex flex-col items-center justify-center gap-4"
+      aria-busy="true"
+    >
+      <div className="flex gap-2">
+        {[0, 1, 2].map((i) => (
+          <div
+            key={i}
+            className="w-3 h-3 bg-primary rounded-full animate-bounce"
+            style={{ animationDelay: `${i * 0.2}s` }}
+          />
+        ))}
+      </div>
+      <p className={`text-sm text-neutral font-medium ${className}`}>{children}</p>
+    </div>
+  )
+}
+
+/**
  * The live-preview pane.
  *
  * Phase-2 model: the agent builds a REAL running Next.js app inside a per-user sandbox, and
@@ -935,43 +968,15 @@ export default function LivePreview({
             unit adds the retraction card into this same cover, ABOVE this content and never
             alongside it — the cover shows exactly one thing. */}
         {showCover && (
-          <div
-            className="absolute inset-0 z-20 bg-[#e8edf2] flex flex-col items-center justify-center gap-4"
-            aria-busy="true"
-          >
-            <div className="flex gap-2">
-              {[0, 1, 2].map((i) => (
-                <div
-                  key={i}
-                  className="w-3 h-3 bg-primary rounded-full animate-bounce"
-                  style={{ animationDelay: `${i * 0.2}s` }}
-                />
-              ))}
-            </div>
-            <p className="text-sm text-neutral font-medium text-center px-6 max-w-sm">
-              {holdingSlow ? HOLDING_SLOW_TEXT : HOLDING_TEXT}
-            </p>
-          </div>
+          <BouncingWait className="text-center px-6 max-w-sm">
+            {holdingSlow ? HOLDING_SLOW_TEXT : HOLDING_TEXT}
+          </BouncingWait>
         )}
 
         {showLoading && !showCover && (
-          <div
-            className="absolute inset-0 z-20 bg-[#e8edf2] flex flex-col items-center justify-center gap-4"
-            aria-busy="true"
-          >
-            <div className="flex gap-2">
-              {[0, 1, 2].map((i) => (
-                <div
-                  key={i}
-                  className="w-3 h-3 bg-primary rounded-full animate-bounce"
-                  style={{ animationDelay: `${i * 0.2}s` }}
-                />
-              ))}
-            </div>
-            <p className="text-sm text-neutral font-medium">
-              {framePending ? FRAMING_TEXT : ((status && LOADING_TEXT[status]) ?? 'Building your app…')}
-            </p>
-          </div>
+          <BouncingWait>
+            {framePending ? FRAMING_TEXT : ((status && LOADING_TEXT[status]) ?? 'Building your app…')}
+          </BouncingWait>
         )}
 
         {/* U5 — the bounded degradation: the frame never loaded, so say so and offer a way out,
