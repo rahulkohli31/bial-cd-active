@@ -54,6 +54,7 @@ from src.db.base import async_session_factory
 from src.db.models.app_registry import AppRegistry
 from src.db.models.project import Project
 from src.db.models.user import User
+from src.services.build_sessions.alarms import RECOVERY_WRITE_DID_NOT_LAND_EVENT
 from src.services.build_sessions.appdata import build_app_env, resolve_app_for_project
 from src.services.build_sessions.appdb_env import provision_app_database
 from src.services.build_sessions.appstorage import provision_app_storage
@@ -84,7 +85,7 @@ from src.services.build_sessions.outcome import (
     write_build_started,
 )
 from src.services.build_sessions.reaper import reap_user, reconcile_user
-from src.services.build_sessions.snapshot import write_snapshot
+from src.services.build_sessions.snapshot import write_recovery_copy, write_snapshot
 from src.services.redis import RedisNotConfiguredError, get_redis
 from src.services.redis.keys import (
     REGISTRY_FIELD_APP_NAME,
@@ -3020,14 +3021,30 @@ class SessionManager:
         if session.handle is not None and touched:
             try:
                 async with asyncio.timeout(_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS):
-                    await write_snapshot(
-                        sandbox_client, session.handle, session.app_id, recovery=True
+                    written = await write_recovery_copy(
+                        sandbox_client,
+                        session.handle,
+                        session.app_id,
+                        taken_at=datetime.now(UTC),
                     )
-            except TimeoutError, Exception:
-                _log.warning(
-                    "recovery snapshot failed; the turn is unaffected",
+                _log.info(
+                    "recovery copy",
                     app_id=str(session.app_id),
                     session_id=str(session.session_id),
+                    outcome=written.outcome.value,
+                    detail=written.reason,
+                )
+            except TimeoutError, Exception:  # fmt: skip  # ruff py314 strips the parens
+                # STILL SWALLOWED — a safety net that can fail a turn is not a safety net — but
+                # no longer SILENT. The swallow is exactly what made the 2026-08-18 reframe
+                # unfalsifiable: nobody could say afterwards whether the platform had failed to
+                # check the workspace or failed to make it durable, because a write that never
+                # landed left no trace an operator would ever look for.
+                _log.error(
+                    RECOVERY_WRITE_DID_NOT_LAND_EVENT,
+                    app_id=str(session.app_id),
+                    session_id=str(session.session_id),
+                    reason="failed",
                     exc_info=True,
                 )
 

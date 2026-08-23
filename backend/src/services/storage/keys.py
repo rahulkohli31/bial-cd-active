@@ -22,6 +22,7 @@ from __future__ import annotations
 import re
 import uuid
 from collections.abc import Mapping
+from datetime import UTC, datetime
 
 from src.services.storage.errors import StorageError
 
@@ -101,6 +102,54 @@ def recovery_key(app_id: uuid.UUID) -> str:
 
     Overwrite-latest like its sibling — this is a safety net, not a history."""
     return f"recovery/{app_id}/app.bundle"
+
+
+def quarantine_prefix(app_id: uuid.UUID) -> str:
+    """The `quarantine/{app_id}/` base for the trees U2 sets aside before a restore."""
+    return f"quarantine/{app_id}/"
+
+
+def quarantine_key(app_id: uuid.UUID, taken_at: datetime) -> str:
+    """One tree U2 parked aside before restoring over it: `quarantine/{app_id}/{stamp}.bundle`.
+
+    PER-OCCURRENCE, unlike its two overwrite-latest siblings, and that is the whole point. A
+    quarantine object is forensic evidence — in a false-`REVERTED` case it holds the only copy of
+    the user's newest work — so a second reversion must not be able to destroy the first one's
+    record. `recovery_key` and `snapshot_key` are safety nets and may overwrite; this is not.
+
+    SORTABLE, because the operator surface (U25) lists these and the useful order is
+    chronological. Microsecond precision is enough to be collision-free HERE and the reason is
+    structural rather than probabilistic: writes for one app are serialized by
+    `snapshot._serialized_per_app`, and a user holds one build slot at a time, so two quarantine
+    writes for one app cannot be in flight together."""
+    return f"{quarantine_prefix(app_id)}{_stamp(taken_at)}.bundle"
+
+
+def divert_prefix(app_id: uuid.UUID) -> str:
+    """The `divert/{app_id}/` base for the trees U3 refused to promote into the recovery slot."""
+    return f"divert/{app_id}/"
+
+
+def divert_key(app_id: uuid.UUID, taken_at: datetime) -> str:
+    """One tree U3 refused to write over a good recovery copy:
+    `divert/{app_id}/{stamp}.bundle`.
+
+    Mirrors `quarantine_key`, including the per-occurrence rule and for the same reason: a shared
+    overwrite-latest key means a second refusal destroys the forensic evidence the alarm exists to
+    preserve."""
+    return f"{divert_prefix(app_id)}{_stamp(taken_at)}.bundle"
+
+
+def _stamp(taken_at: datetime) -> str:
+    """A sortable, path-safe UTC instant: `20260823T134500123456Z`.
+
+    NORMALIZED TO UTC rather than trusting the caller's tzinfo, because two objects stamped from
+    different offsets would sort by wall clock rather than by when they happened — and a naive
+    datetime raises rather than being silently read as UTC, which is the one reading that would
+    quietly reorder an operator's evidence."""
+    if taken_at.tzinfo is None:
+        raise StorageError("a quarantine or divert stamp needs an aware datetime")
+    return taken_at.astimezone(UTC).strftime("%Y%m%dT%H%M%S%fZ")
 
 
 def submissions_prefix(app_id: uuid.UUID) -> str:

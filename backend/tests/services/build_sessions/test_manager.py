@@ -57,7 +57,7 @@ from src.services.build_sessions.manager import (
 )
 from src.services.build_sessions.outcome import write_build_outcome
 from src.services.build_sessions.reaper import sweep_all
-from src.services.build_sessions.snapshot import write_snapshot
+from src.services.build_sessions.snapshot import Destination, write_snapshot
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
@@ -1173,13 +1173,13 @@ async def test_start_awaits_a_still_finalizing_terminal_session_then_starts_fres
         handle: SandboxHandle,
         app_id: uuid.UUID,
         *,
-        recovery: bool = False,
+        destination: Destination | None = None,
     ) -> str:
         entered.set()
         await gate.wait()
-        # Forward the caller's key rather than recomputing one: the stub must not quietly
-        # redirect a write the code under test aimed somewhere specific.
-        return await write_snapshot(sandbox_client, handle, app_id, recovery=recovery)
+        # Forward the caller's destination rather than recomputing one: the stub must not
+        # quietly redirect a write the code under test aimed somewhere specific.
+        return await write_snapshot(sandbox_client, handle, app_id, destination=destination)
 
     monkeypatch.setattr("src.services.build_sessions.manager.write_snapshot", gated_snapshot)
 
@@ -1552,12 +1552,12 @@ def _spy_order(
         handle: SandboxHandle,
         app_id: uuid.UUID,
         *,
-        recovery: bool = False,
+        destination: Destination | None = None,
     ) -> str:
         order.append("snapshot")
         if snapshot_raises:
             raise StorageError("snapshot push failed")
-        return await write_snapshot(sandbox_client, handle, app_id, recovery=recovery)
+        return await write_snapshot(sandbox_client, handle, app_id, destination=destination)
 
     monkeypatch.setattr("src.services.build_sessions.manager.write_snapshot", spy_snapshot)
 

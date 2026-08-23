@@ -358,6 +358,17 @@ FRAMEWORK_CHURN: Final = frozenset({"next-env.d.ts", "tsconfig.json"})
 # a retry, so it is `UNVERIFIABLE` rather than `UNREADABLE`, and it never reaches the shell.
 _SHA_RE: Final = re.compile(r"^[0-9a-f]{7,40}$")
 
+
+def is_a_commit_sha(value: str | None) -> bool:
+    """May this value be interpolated into the probe's shell string? (See `_SHA_RE`.)
+
+    Exposed rather than kept private because U3's guarded recovery write asks the same question
+    of the same metadata before composing the same script — and a second, subtly different
+    spelling of "is this a sha" is how one of the two would eventually let something else
+    through."""
+    return value is not None and _SHA_RE.match(value) is not None
+
+
 _STATE_FIELDS: Final = (
     'git rev-parse HEAD 2>/dev/null || true; echo "@@"; '
     f'git status --porcelain 2>/dev/null | head -c {PORCELAIN_CAP_BYTES}; echo "@@"; '

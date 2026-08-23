@@ -1,10 +1,12 @@
-"""C4 snapshot write (KTD-7): commit the working tree → bundle the CURRENT tree only →
-base64 it over the C1 `/exec` endpoint → `put` to Blob at `snapshot_key(app_id)`.
+"""C4 snapshot write (KTD-7): commit the working tree → `git bundle` it →
+base64 it over the C1 `/exec` endpoint → `put` to Blob.
 
-The bundle is the current tree (HEAD), NOT `git bundle --all` full history: the POC only
-needs current code to survive teardown so the user can resume, and dropping history keeps
-the base64-over-`/exec` payload small (workspaces are source-only — node_modules is baked
-into the image). WRITTEN only by the session API (C4), but no longer session-API-only on
+`git bundle create <file> HEAD` CARRIES COMPLETE HISTORY, not just the current tree, and this
+docstring used to say the opposite. A bundle names HEAD as the ref to include and git walks its
+ancestry, so every commit reachable from HEAD is in the file — which `manager.py` already says
+from the other side. This matters beyond tidiness: the health verdict's baseline comparison (U6)
+identifies an app by its ROOT COMMIT, and that only survives a restore because the history does.
+WRITTEN only by the session API (C4), but no longer session-API-only on
 READ: `submit` (APPROVAL) copies the snapshot to an immutable per-submission key, which
 changes what a swallowed `write_snapshot` failure means — it is no longer just "you lose
 resume", it is "you cannot submit your latest build" (the citizen submits the PREVIOUS
@@ -22,22 +24,31 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import enum
 import secrets
 import uuid
 from collections import Counter
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Final
 
 import structlog
 
+from src.services.build_sessions.alarms import RECOVERY_WRITE_DID_NOT_LAND_EVENT
+from src.services.build_sessions.integrity import Ancestry, container_state, is_a_commit_sha
 from src.services.sandbox import SandboxClient, SandboxError, SandboxHandle
 from src.services.storage import (
     SNAPSHOT_HEAD_METADATA_KEY,
+    divert_key,
     get_storage,
+    head_sha_from_metadata,
+    quarantine_key,
     recovery_key,
     snapshot_key,
 )
+from src.services.storage.base import ObjectStorage
 from src.services.storage.bundle import BUNDLE_CONTENT_TYPE, parse_bundle_head_sha
 
 _log = structlog.get_logger()
@@ -108,41 +119,230 @@ async def _serialized_per_app(app_id: uuid.UUID) -> AsyncIterator[None]:
             _app_locks.pop(app_id, None)
 
 
+@dataclass(frozen=True)
+class Destination:
+    """WHERE a bundle goes. Four of them, and they are not interchangeable.
+
+    A VALUE OBJECT RATHER THAN AN ENUM, because two of the four are per-occurrence: a quarantine
+    or divert key carries the instant it was taken, so it cannot be a bare constant. Keeping the
+    key-building here (rather than exposing `_write_snapshot_locked`, which is private for a
+    reason) means every writer in the system names its destination in the same vocabulary, and
+    nothing outside this module has to know that a key is a string at all.
+
+    This replaces a two-way `recovery: bool`. That boolean was fine while there were two answers;
+    with four, the next reader of `write_snapshot(..., True)` would have had to guess which."""
+
+    key: str
+
+    @classmethod
+    def saved(cls, app_id: uuid.UUID) -> Destination:
+        """The user's explicit Save. The one key a platform-initiated write must never touch."""
+        return cls(snapshot_key(app_id))
+
+    @classmethod
+    def recovery(cls, app_id: uuid.UUID) -> Destination:
+        """The platform's autosave. Prefer `write_recovery_copy`, which guards the promotion —
+        this is the raw destination, for the operator promote path (U25) that has already
+        decided."""
+        return cls(recovery_key(app_id))
+
+    @classmethod
+    def quarantine(cls, app_id: uuid.UUID, taken_at: datetime) -> Destination:
+        """A tree U2 is about to restore over. Never overwritten by a later occurrence."""
+        return cls(quarantine_key(app_id, taken_at))
+
+    @classmethod
+    def divert(cls, app_id: uuid.UUID, taken_at: datetime) -> Destination:
+        """A tree U3 refused to promote. Never overwritten by a later occurrence."""
+        return cls(divert_key(app_id, taken_at))
+
+
+@dataclass(frozen=True)
+class _BundledTree:
+    """A tree already committed, bundled and read back out of the container."""
+
+    head_sha: str
+    data: bytes
+
+
+class RecoveryOutcome(enum.StrEnum):
+    """What happened to one turn's attempt to make its work durable."""
+
+    #: The recovery slot now holds this turn's tree.
+    WRITTEN = "written"
+    #: Nothing to write — the tree was clean and HEAD is where the copy already is. Normal, and
+    #: the only outcome that does not alarm.
+    SKIPPED = "skipped"
+    #: The guard would not promote this tree over the existing copy, and the bundle was preserved
+    #: under `divert_key` rather than thrown away.
+    DIVERTED = "diverted"
+
+
+@dataclass(frozen=True)
+class RecoveryWrite:
+    outcome: RecoveryOutcome
+    reason: str
+    #: The sha the recovery slot held before this turn, when it held one.
+    recorded_head: str | None = None
+    #: The sha this turn actually bundled.
+    bundled_head: str | None = None
+    #: Set on `DIVERTED` — where the refused tree went, so an operator can find it.
+    diverted_to: str | None = None
+
+
 async def write_snapshot(
     sandbox_client: SandboxClient,
     handle: SandboxHandle,
     app_id: uuid.UUID,
     *,
-    recovery: bool = False,
+    destination: Destination | None = None,
 ) -> str:
-    """Snapshot the sandbox's current tree to Blob (overwrite-latest) and return its HEAD sha.
+    """Snapshot the sandbox's current tree to Blob and return its HEAD sha.
     Step 1 of the ordered end (C4) — the caller runs teardown + release AFTER this returns.
 
-    `recovery=True` writes to `recovery_key` instead: the platform's autosave, which must
-    NEVER land on the saved bundle. See `recovery_key`'s docstring — that separation is what
-    lets the platform stop losing work without taking the decision of what counts as a saved
-    version away from the user (KTD-5e).
+    `destination` defaults to the user's SAVED bundle, which is what every caller of this
+    function means. The platform's own autosave does not come through here: it goes through
+    `write_recovery_copy`, which is the same write with a guard in front of it.
 
     RETURNS THE BUNDLED TREE'S HEAD SHA, which is also stamped into the object's metadata.
-    Callers compare that rather than `last_modified` to decide which of the two bundles is
-    newer: Azure stamps modification times in WHOLE SECONDS, so a Save and an autosave inside
-    one second are indistinguishable by time, and resolving that tie toward the saved bundle
-    silently restores an older tree over the user's newer work.
+    Callers compare that rather than `last_modified` to decide which of two bundles is newer:
+    Azure stamps modification times in WHOLE SECONDS, so a Save and an autosave inside one second
+    are indistinguishable by time, and resolving that tie toward the saved bundle silently
+    restores an older tree over the user's newer work.
 
     Serialized per app: concurrent callers queue rather than racing each other's bundle file
     and each other's git index (see `_serialized_per_app`)."""
-    key = recovery_key(app_id) if recovery else snapshot_key(app_id)
+    key = (destination or Destination.saved(app_id)).key
     async with _serialized_per_app(app_id):
-        return await _write_snapshot_locked(sandbox_client, handle, key)
+        store = _the_store_first()
+        tree = await _bundle_the_tree(sandbox_client, handle)
+        await _store_it(store, key, tree)
+        return tree.head_sha
 
 
-async def _write_snapshot_locked(
-    sandbox_client: SandboxClient, handle: SandboxHandle, key: str
-) -> str:
-    # Resolve the store BEFORE doing any work. On a storage-disabled deployment (KTD-2) this
-    # raises here, so the turn does not commit, bundle and base64 a whole tree over `/exec`
-    # only to discover at the upload that there is nowhere to put it.
-    store = get_storage()
+async def write_recovery_copy(
+    sandbox_client: SandboxClient,
+    handle: SandboxHandle,
+    app_id: uuid.UUID,
+    *,
+    taken_at: datetime,
+) -> RecoveryWrite:
+    """The turn-end autosave, with a guard that will not overwrite a good copy with a bad tree.
+
+    THE PROBLEM THIS CLOSES (U3, R8, AE4). The old write was gated on `touched` alone — "a
+    mutating tool ran", not "the tree changed" — and the `put` was unconditional. So a container
+    that reverted midway through a turn had its empty tree stamped in as the newest copy of the
+    user's work, over a perfectly good bundle, with nothing recorded anywhere. That is one half of
+    what happened on 2026-08-18, and the swallowed failure is why nobody could prove it afterwards.
+
+    THE NO-OP SKIP IS DECIDED ON THE BUNDLED SHA, AND THAT ORDERING IS THE WHOLE TRICK.
+    `_COMMIT_SCRIPT` runs `git add -A && git commit` as step ONE inside the bundle below, so by
+    the time there is a sha to compare, any uncommitted work has already become a commit. A naive
+    "skip when HEAD has not moved" reads the sha BEFORE that step, and today the agent's own
+    commits mask the difference — but once agent-side commits go away, "HEAD unchanged + dirty
+    tree" becomes the normal shape of EVERY building turn, and that version would silently discard
+    every turn's recovery copy. Data loss plus (per ASM24) containers nothing would ever reclaim,
+    both reading green to every health check. `test_a_dirty_tree_at_unchanged_head_still_writes_a_
+    recovery_copy` is the standing contract across that plan boundary.
+
+    NEVER RAISES FOR A REFUSAL, and never fails the turn. A caller still has to catch the bundle
+    or upload failing — that case is `failed`, and it is raised from the call site because only
+    the call site knows the write threw."""
+    async with _serialized_per_app(app_id):
+        store = _the_store_first()
+        meta = await store.head(recovery_key(app_id))
+        recorded = head_sha_from_metadata(meta.metadata if meta else None)
+        tree = await _bundle_the_tree(sandbox_client, handle)
+
+        if recorded is None:
+            # No copy yet, or one written before the head stamp existed. There is nothing to
+            # overwrite and nothing to compare against, so the first write simply proceeds.
+            await _store_it(store, recovery_key(app_id), tree)
+            return RecoveryWrite(
+                RecoveryOutcome.WRITTEN, "no previous copy to protect", bundled_head=tree.head_sha
+            )
+
+        if tree.head_sha == recorded:
+            # The commit step found nothing to commit AND the tree is where the copy already is.
+            # Normal, and it must NOT alarm: this is every read-only turn.
+            return RecoveryWrite(
+                RecoveryOutcome.SKIPPED,
+                "the tree has not moved since the last copy",
+                recorded_head=recorded,
+                bundled_head=tree.head_sha,
+            )
+
+        ancestry = await _where_head_sits_relative_to(sandbox_client, handle, recorded)
+        if ancestry is Ancestry.DESCENDANT:
+            await _store_it(store, recovery_key(app_id), tree)
+            return RecoveryWrite(
+                RecoveryOutcome.WRITTEN,
+                "this turn built on the copy it is replacing",
+                recorded_head=recorded,
+                bundled_head=tree.head_sha,
+            )
+
+        # EVERYTHING ELSE DIVERTS. The tree in hand is not a descendant of the copy on record —
+        # or we could not establish that it is — so promoting it would replace a known-good bundle
+        # with one whose relationship to the user's work is unknown. The bytes are kept rather
+        # than dropped: in a false refusal they are the newest copy of somebody's afternoon.
+        where = divert_key(app_id, taken_at)
+        await _store_it(store, where, tree)
+        _log.error(
+            RECOVERY_WRITE_DID_NOT_LAND_EVENT,
+            app_id=str(app_id),
+            reason=RecoveryOutcome.DIVERTED.value,
+            recorded_head=recorded,
+            bundled_head=tree.head_sha,
+            ancestry=ancestry.value,
+            diverted_to=where,
+        )
+        return RecoveryWrite(
+            RecoveryOutcome.DIVERTED,
+            f"the tree is {ancestry.value} of the copy on record",
+            recorded_head=recorded,
+            bundled_head=tree.head_sha,
+            diverted_to=where,
+        )
+
+
+async def _where_head_sits_relative_to(
+    sandbox_client: SandboxClient, handle: SandboxHandle, recorded: str
+) -> Ancestry:
+    """One exec: was this tree built on top of the one the recovery slot holds?
+
+    A `recorded` sha that is not sha-shaped never reaches the shell, and comes back
+    `REFERENCE_ABSENT` — which diverts, exactly as it should: metadata naming a tree we cannot
+    ask about is not a licence to overwrite the object that metadata belongs to."""
+    if not is_a_commit_sha(recorded):
+        return Ancestry.REFERENCE_ABSENT
+    state = await container_state(sandbox_client, handle, reference_sha=recorded)
+    return state.ancestry if state is not None else Ancestry.UNREADABLE
+
+
+def _the_store_first() -> ObjectStorage:
+    """Resolve the store BEFORE doing any work. On a storage-disabled deployment (KTD-2) this
+    raises here, so the turn does not commit, bundle and base64 a whole tree over `/exec` only to
+    discover at the upload that there is nowhere to put it."""
+    return get_storage()
+
+
+async def _store_it(store: ObjectStorage, key: str, tree: _BundledTree) -> None:
+    """STAMP THE TREE, not just the bytes. `last_modified` is whole seconds on Azure, so a Save
+    and a turn-boundary write inside one second are indistinguishable by time — and the restore
+    path picks the newer of the two. Recording which tree each bundle holds is what lets a reader
+    answer "same content?" and "which is newer?" without a download, and without a tie silently
+    resolving to the older tree."""
+    await store.put(
+        key,
+        tree.data,
+        content_type=BUNDLE_CONTENT_TYPE,
+        metadata={SNAPSHOT_HEAD_METADATA_KEY: tree.head_sha},
+    )
+
+
+async def _bundle_the_tree(sandbox_client: SandboxClient, handle: SandboxHandle) -> _BundledTree:
+    """Commit whatever is in the worktree, bundle it, and read it back out of the container."""
     bundle_name = f"{_BUNDLE_PREFIX}.{secrets.token_hex(8)}"
     run_command = sandbox_client.exec  # aliased to keep the call off the JS-oriented exec guard
     # Every step's exit code is checked (a non-zero exit is a NORMAL ExecResult, C1): a failed
@@ -172,19 +372,7 @@ async def _write_snapshot_locked(
         # Parse before the upload, not after: this both validates what we are about to store
         # and gives the caller the HEAD sha, which is what lets a reader compare two bundles
         # for "which of these is the newer tree" without downloading both.
-        head_sha = parse_bundle_head_sha(data)
-        # STAMP THE TREE, not just the bytes. `last_modified` is whole seconds on Azure, so a
-        # Save and a turn-boundary write inside one second are indistinguishable by time — and
-        # the restore path picks the newer of the two. Recording which tree each bundle holds
-        # is what lets a reader answer "same content?" and "which is newer?" without a
-        # download, and without a tie silently resolving to the older tree.
-        await store.put(
-            key,
-            data,
-            content_type=BUNDLE_CONTENT_TYPE,
-            metadata={SNAPSHOT_HEAD_METADATA_KEY: head_sha},
-        )
-        return head_sha
+        return _BundledTree(head_sha=parse_bundle_head_sha(data), data=data)
     finally:
         # Cleanup runs on the FAILURE path too, which the success-only version did not: a bundle
         # left behind is multi-MB of binary sitting in the worktree that the next snapshot's
