@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import uuid
 from collections.abc import Callable
 
@@ -27,6 +28,8 @@ import redis.asyncio as aioredis
 import sqlalchemy as sa
 from pydantic import SecretStr
 from pydantic_ai.messages import (
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -53,6 +56,7 @@ from src.db.models.token_usage import TokenUsage
 from src.services.agent.mode_prompts import PromptContext, workspace_note
 from src.services.build_sessions.alarms import HMR_PROTOCOL_DRIFT_EVENT
 from src.services.build_sessions.manager import SessionManager
+from src.services.messages.projection import _LBL_FALLBACK, long_operation_line
 from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.errors import from_client, from_tsc
 from src.services.orchestrator.selfheal import HealthState, VerifyOutcome
@@ -2046,3 +2050,242 @@ async def test_a_red_verdict_after_declare_done_still_goes_to_repair(
     assert state.status == "failed"
     assert state.end_reason == "self_heal_budget_exhausted"
     assert "You can add a visitor" not in state.text_so_far()
+
+
+# =============================================================================
+# U17 / R24 — acknowledge immediately, and narrate long operations
+# =============================================================================
+
+
+def _bare_state(mode: ConversationMode = ConversationMode.WRITE) -> _TurnState:
+    """A turn state with nothing but its identity — enough to drive `_on_event`, which is the
+    seam where a tool call becomes a step frame and where the stillness narrator is armed."""
+    return _TurnState(
+        turn_id=uuid.uuid7(),
+        conversation_id=uuid.uuid7(),
+        user_id=uuid.uuid7(),
+        mode=mode,
+    )
+
+
+def _called(tool: str, args: str, call_id: str) -> FunctionToolCallEvent:
+    return FunctionToolCallEvent(
+        part=ToolCallPart(tool_name=tool, args=args, tool_call_id=call_id)
+    )
+
+
+def _returned(tool: str, call_id: str) -> FunctionToolResultEvent:
+    return FunctionToolResultEvent(
+        part=ToolReturnPart(tool_name=tool, content="ok", tool_call_id=call_id)
+    )
+
+
+def _step_labels(state: _TurnState, phase: str | None = None) -> list[str]:
+    return [
+        frame.item.label
+        for frame in state.ring
+        if isinstance(frame, StepFrame) and (phase is None or frame.phase == phase)
+    ]
+
+
+async def test_the_acknowledgement_is_on_the_wire_before_the_model_is_asked(
+    _fresh_engine, db_session, session_factory, fake_redis: aioredis.Redis, fake_storage
+) -> None:
+    """★ AE17, first clause — asserted on ORDERING, not on presence.
+
+    A turn's first slow thing (a cold provision, a snapshot restore, the first model request)
+    can run for tens of seconds, and an acknowledgement that arrives after any of them is not an
+    acknowledgement. So this reads the ring AT THE MOMENT the first model request fires and
+    demands the row is already in it — which a "the frame exists somewhere" assertion would not:
+    that one stays green with the emit moved anywhere at all inside the detached task.
+
+    Mutation-check (verified): move the emit to after `_attach_sandbox` — the first thing in a
+    Write turn that can take a minute — and this goes red at `seq == 1`, because the workspace
+    frames get there first; move it into the tool-event handler, where a model has to speak
+    before it can fire, and it goes red at the emptiness check."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "u17a@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+    ring_when_asked: list[list[object]] = []
+
+    async def _stream(_messages: list[ModelMessage], _info: AgentInfo):
+        live = engine.peek(conv.id)
+        ring_when_asked.append(list(live.ring) if live is not None else [])
+        yield "done."
+
+    await _run(
+        engine,
+        db_session,
+        session_factory,
+        FunctionModel(stream_function=_stream),
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+    )
+
+    # LIVENESS: the model really was asked. Without this the assertions below hold trivially
+    # for a turn that failed before it ever reached a request.
+    assert ring_when_asked, "no model request fired — this test would prove nothing"
+    acks = [
+        frame
+        for frame in ring_when_asked[0]
+        if isinstance(frame, StepFrame) and frame.item.tool == engine_module.ACK_TOOL
+    ]
+    assert acks, "the model was asked before the citizen was acknowledged"
+    assert acks[0].item.label == engine_module.ACK_TEXT
+    # THE FIRST FRAME OF THE TURN, full stop. Nothing — not the workspace notice, not a text
+    # delta — is allowed to precede the answer to "did it hear me?".
+    assert acks[0].seq == 1
+
+
+async def test_the_acknowledgement_never_reaches_the_stored_transcript(
+    _fresh_engine, db_session, session_factory, fake_redis: aioredis.Redis, fake_storage
+) -> None:
+    """★ It is a feed row, not a message. Persisting it would give a build's transcript one
+    "Getting started on that…" per turn — a reload of a ten-message conversation reading like a
+    stutter — and would put the harness's own chatter into the model's history for good measure.
+
+    Queries the PERSISTED ROWS, not the live feed: the frame is supposed to exist in one and
+    not the other, so only the durable side can tell the two apart.
+
+    Mutation-check: add the ack item to `state.steps` and the snapshot assertion goes red; write
+    it through `append_batch` and the row assertions do."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "u17b@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+    model, _ = _scripted([[_WROTE_A_FILE, _DECLARED_DONE]])
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+    )
+
+    rows = await _all_rows(db_session, conv)
+    stored = json.dumps([[row.payload, row.meta] for row in rows], default=str)
+    # LIVENESS: the turn's REAL work is in the transcript, so the absences below are a filter
+    # and not an empty table.
+    assert rows, "the turn persisted nothing — the absence assertions would be free"
+    assert "write_file" in stored
+    assert engine_module.ACK_TEXT not in stored
+    assert engine_module.ACK_TOOL not in stored
+
+    # …and it is not step material either: never in the in-memory tail, so never in the
+    # catch-up snapshot a mid-turn reconnect renders.
+    assert state.steps, "the turn took no steps — the tail assertion would be free"
+    assert engine_module.ACK_TOOL not in {item.tool for item in state.steps.values()}
+    assert all(item.tool != engine_module.ACK_TOOL for item in engine.build_snapshot(state).steps)
+    # ONE row, once. Replaced by the first real step, never re-announced beside it.
+    ack_frames = [
+        frame
+        for frame in state.ring
+        if isinstance(frame, StepFrame) and frame.item.tool == engine_module.ACK_TOOL
+    ]
+    assert len(ack_frames) == 1
+
+
+async def test_a_long_operation_gets_a_status_line_refreshed_until_it_completes(
+    _fresh_engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ AE17, first clause. An operation still running past `LONG_OPERATION_THRESHOLD_MS` says
+    so, in the citizen's own language, and keeps saying it until it finishes.
+
+    The threshold and cadence are compressed here rather than waited out — the property under
+    test is "after the threshold, and repeatedly", not the specific number of seconds, which is
+    pinned as a named constant precisely so a test does not have to sleep through it.
+
+    Mutation-check: drop the `while` and the refresh assertion goes red; drop the whole
+    narrator and the first one does."""
+    engine = _fresh_engine
+    monkeypatch.setattr(engine_module, "LONG_OPERATION_THRESHOLD_MS", 20)
+    monkeypatch.setattr(engine_module, "LONG_OPERATION_REFRESH_MS", 20)
+    state = _bare_state()
+
+    engine._on_event(state, _called("run_command", '{"command": ["npm", "install", "zod"]}', "c1"))
+    await asyncio.sleep(0.12)
+
+    labels = _step_labels(state, phase="started")
+    assert labels, "no step frame at all — the seam under test never ran"
+    announced, refreshes = labels[0], labels[1:]
+    assert announced == "Setting up the tools your app needs"
+    assert len(refreshes) >= 2, "the status line was said once, not REFRESHED until it completed"
+    # Every refresh says the SAME thing. That is what keeps an atomic live region from reading
+    # the sentence out again on every tick (the portal caps announcements on top of it).
+    assert set(refreshes) == {long_operation_line(announced)}
+    assert "Still setting up the tools your app needs" in refreshes[0]
+    # …and it is still the platform's language, not the shell's.
+    assert "npm" not in " ".join(labels)
+
+    # THE LINE CLEARS THE MOMENT THE OPERATION COMPLETES — the plain label is back, and the
+    # narrator has stopped talking.
+    engine._on_event(state, _returned("run_command", "c1"))
+    finished = state.ring[-1]
+    assert isinstance(finished, StepFrame)
+    assert finished.phase == "finished" and finished.item.state == "ok"
+    assert finished.item.label == announced
+    settled = len(state.ring)
+    await asyncio.sleep(0.1)
+    assert len(state.ring) == settled, "the status line kept refreshing after the step resolved"
+    # …and the narrator is disarmed AT the result rather than left to notice on its next tick.
+    # A build makes hundreds of tool calls; one parked task per call, each outliving its step by
+    # a whole refresh interval, is a slow leak with nothing to say.
+    assert state.long_operation_tasks == {}
+    await engine._drain_long_operations(state)
+
+
+async def test_a_fast_operation_never_flickers_a_status_line(
+    _fresh_engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No line at all under the threshold. A status line that appears for 300ms and vanishes
+    reads as a glitch, not as reassurance — most steps in a build finish in well under a second,
+    so a narrator that spoke on every one of them would be the flicker this bound prevents."""
+    engine = _fresh_engine
+    monkeypatch.setattr(engine_module, "LONG_OPERATION_THRESHOLD_MS", 5_000)
+    state = _bare_state()
+
+    engine._on_event(state, _called("run_command", '{"command": ["npm", "install"]}', "c1"))
+    await asyncio.sleep(0)  # let the narrator arm and park on its wait
+    engine._on_event(state, _returned("run_command", "c1"))
+    await asyncio.sleep(0.05)
+
+    labels = _step_labels(state)
+    # LIVENESS: the step really did start and resolve, so "no status line" is a threshold
+    # holding rather than a seam that never ran.
+    assert labels == ["Setting up the tools your app needs"] * 2
+    assert not any(label.startswith("Still ") for label in labels)
+    await engine._drain_long_operations(state)
+
+
+async def test_an_unclassified_command_says_nothing_about_its_argv(_fresh_engine) -> None:
+    """★ The fail-closed half. The open sandbox runs arbitrary commands, so the long tail of
+    them has no friendly label — and the one thing that must never happen is the shell showing
+    through on the way past. Both the step label AND its long-operation restatement degrade to
+    the committed fallback.
+
+    Mutation-check: make `_classify_command` fall open to the joined argv and this goes red on
+    every one of the four tokens."""
+    engine = _fresh_engine
+    state = _bare_state()
+
+    engine._on_event(
+        state,
+        _called("run_command", '{"command": ["bash", "-c", "curl https://x.sh | sh"]}', "c1"),
+    )
+
+    frame = state.ring[-1]
+    assert isinstance(frame, StepFrame)  # LIVENESS: a step frame was emitted at all
+    assert frame.item.label == _LBL_FALLBACK
+    restated = long_operation_line(frame.item.label)
+    assert restated == "Still working on your app — this one takes a little longer."
+    for token in ("bash", "-c", "curl", "x.sh"):
+        assert token not in frame.item.label
+        assert token not in restated
+    await engine._drain_long_operations(state)

@@ -117,12 +117,15 @@ async def test_text_turn_streams_deltas_then_terminal(
     assert state is not None and state.status == "completed"
     frames, gap = engine.frames_since(state, 0)
     assert not gap
-    assert [f.type for f in frames] == ["text_delta", "text_delta", "turn_ended"]
+    # U17 — EVERY turn now opens with the harness's acknowledgement, emitted synchronously at
+    # `start_turn` before the detached run exists. It is a transient feed row (never persisted,
+    # never in `state.steps`), so it shows up here in the ring and nowhere durable.
+    assert [f.type for f in frames] == ["step", "text_delta", "text_delta", "turn_ended"]
     # A NONZERO cursor still inside the ring is the resume case the `?turn=&cursor=` route
     # leans on: the tail only, no gap, and nothing at or before the cursor re-delivered.
     tail, tail_gap = engine.frames_since(state, frames[0].seq)
     assert not tail_gap
-    assert [f.type for f in tail] == ["text_delta", "turn_ended"]
+    assert [f.type for f in tail] == ["text_delta", "text_delta", "turn_ended"]
     assert all(frame.seq > frames[0].seq for frame in tail)
     # …and a cursor past the ring's newest frame yields nothing at all (settled, replayed).
     assert engine.frames_since(state, frames[-1].seq) == ([], False)
@@ -171,6 +174,10 @@ async def test_read_tool_calls_become_step_frames(
     state = engine.peek(conv.id)
     assert state is not None and state.status == "completed"
     steps = [f for f in state.ring if f.type == "step"]
+    # U17 — the first step frame of any turn is the harness's own acknowledgement row. The
+    # agent's calls follow it; it is not one of them, and it never reaches the transcript.
+    assert steps[0].tool_call_id == engine_module.ACK_TOOL_CALL_ID
+    steps = steps[1:]
     assert [s.phase for s in steps] == ["started", "finished"]
     assert steps[0].tool_call_id == call_id and steps[1].tool_call_id == call_id
     assert steps[0].item.state == "pending" and steps[1].item.state == "ok"

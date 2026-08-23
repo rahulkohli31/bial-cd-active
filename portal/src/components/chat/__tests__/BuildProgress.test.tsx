@@ -13,8 +13,10 @@
  *  - error / escalation / quota alerts stay visible, styled by kind.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, cleanup, fireEvent, screen } from '@testing-library/react'
+import { render, cleanup, fireEvent, screen, act } from '@testing-library/react'
 import BuildProgress, {
+  ACK_STEP_NAME,
+  ANNOUNCE_MIN_INTERVAL_MS,
   ERROR_FALLBACK_ACTION,
   ERROR_FALLBACK_MESSAGE,
   atLimitSendState,
@@ -112,12 +114,17 @@ describe('the live view shows exactly one step at a time', () => {
   })
 
   it('the current step lives in a polite live region (role=status) that does not steal focus', () => {
+    // U17 moved the region off the visible node and onto a dedicated sr-only MIRROR of it, so
+    // the row can update at build speed while announcements stay at listening speed. What the
+    // region says is still the current step, and it is still atomic — both asserted here so a
+    // regression that silently empties the mirror cannot pass as "the region is present".
     const envelopes: FeedEnvelope[] = [
       { type: 'step', seq: 1, name: 's', label: 'Working', state: 'started' },
     ]
     draw({ envelopes })
     const status = screen.getByRole('status', { name: /build activity/i })
     expect(status.getAttribute('aria-atomic')).toBe('true')
+    expect(status.textContent).toBe('Working')
   })
 
   it('once a later step resolves, an earlier still-"started" step degrades to the generic "Working…" placeholder — indistinguishable from a permanent orphan otherwise (fix 2)', () => {
@@ -864,5 +871,183 @@ describe('U16: every error status is a sentence plus a next action', () => {
     expect(history).toContain('Setting up the tools your app needs')
     const historyHits = DEVELOPER_VOCABULARY.filter((word) => history.toLowerCase().includes(word))
     expect(historyHits, `the step history leaks ${historyHits.join(', ')}`).toEqual([])
+  })
+})
+
+// =============================================================================
+// U17 / R24 — the screen never sits still without explanation
+// =============================================================================
+
+/** The harness's own turn-start row, exactly as the engine emits it (`ACK_TEXT` / `ACK_TOOL`
+ *  in `services/turns/engine.py`, mapped to an envelope by `narrativeEnvelopes`). */
+const ACK_TEXT = 'Getting started on that…'
+const ackRow = (seq: number): FeedEnvelope => ({
+  type: 'step',
+  seq,
+  name: ACK_STEP_NAME,
+  label: ACK_TEXT,
+  state: 'started',
+})
+
+function paint(envelopes: FeedEnvelope[], status: 'building' | 'ended' = 'building') {
+  return (
+    <BuildProgress
+      envelopes={envelopes}
+      status={status}
+      startedAt={null}
+      stopping={false}
+      onStop={noop}
+      onForceEnd={noop}
+    />
+  )
+}
+
+describe('U17: the acknowledgement is transient, never a step of the build', () => {
+  it('pins the reserved name the engine emits it under — a rename on one side only is a leak', () => {
+    // The row is identified across the wire by this exact string. Drift it here and the
+    // acknowledgement silently becomes a permanent entry in every build's step history.
+    expect(ACK_STEP_NAME).toBe('__ack__')
+  })
+
+  it('holds the live row while there is nothing else to show', () => {
+    const { container } = draw({ envelopes: [ackRow(1)] })
+    expect(container.textContent).toContain(ACK_TEXT)
+  })
+
+  it('is REPLACED by the first real step rather than accumulating beside it', () => {
+    const { container, rerender } = draw({ envelopes: [ackRow(1)] })
+    expect(container.textContent).toContain(ACK_TEXT)
+
+    rerender(
+      paint([
+        ackRow(1),
+        { type: 'step', seq: 2, name: 'run', label: 'Setting up the tools your app needs', state: 'started' },
+      ]),
+    )
+    // LIVENESS first: the real step is what took the row, so the absence below is a
+    // replacement and not a component that threw on its way to rendering nothing.
+    expect(container.textContent).toContain('Setting up the tools your app needs')
+    expect(container.querySelectorAll('[data-kind="tool-activity"]')).toHaveLength(1)
+    expect(container.textContent).not.toContain(ACK_TEXT)
+  })
+
+  it('never survives into the finished build’s step history', () => {
+    const { container } = draw({
+      envelopes: [
+        ackRow(1),
+        { type: 'step', seq: 2, name: 'run', label: 'Setting up the tools your app needs', state: 'ok' },
+      ],
+      status: 'ended',
+    })
+    fireEvent.click(container.querySelector('button[aria-expanded]') as HTMLButtonElement)
+    // LIVENESS: the history really did render, so "no acknowledgement" is a filter and not a
+    // collapsed dropdown that never opened.
+    expect(container.querySelectorAll('[data-kind="step"]')).toHaveLength(1)
+    expect(container.textContent).toContain('Setting up the tools your app needs')
+    expect(container.textContent).not.toContain(ACK_TEXT)
+  })
+
+  it('is not, on its own, a reason to draw a build bubble around a chat turn', () => {
+    // `hasBuildNarrative` is what BuilderPage asks before rendering the bubble's chrome.
+    // Counting the acknowledgement here would leave an empty grey wrapper behind every Ask
+    // turn — the row itself never reaches the history, so there would be nothing inside it.
+    expect(hasBuildNarrative(null, [ackRow(1)])).toBe(false)
+    expect(
+      hasBuildNarrative(null, [
+        ackRow(1),
+        { type: 'step', seq: 2, name: 'run', label: 'Setting up the tools your app needs', state: 'started' },
+      ]),
+    ).toBe(true)
+  })
+})
+
+describe('U17: the live region announces on change, and at most once per 10s', () => {
+  const RUNNING = 'Setting up the tools your app needs'
+  // What the harness restates a long-running operation as (`long_operation_line`, backend).
+  const STILL_RUNNING = 'Still setting up the tools your app needs — this one takes a little longer.'
+
+  const running = (label: string): FeedEnvelope[] => [
+    { type: 'step', seq: 1, name: 'run', label, state: 'started' },
+  ]
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('a status line refreshed with UNCHANGED text is announced exactly once', () => {
+    vi.useFakeTimers()
+    const { rerender } = draw({ envelopes: running(RUNNING) })
+    const region = screen.getByRole('status', { name: /build activity/i })
+    // LIVENESS: the region is here and it is saying the thing. Every "no second announcement"
+    // assertion below also passes against a region that rendered nothing at all.
+    expect(region.textContent).toBe(RUNNING)
+
+    // A screen reader speaks on DOM mutation, so that is what "an announcement" is measured as.
+    // `takeRecords` is read synchronously — no callback timing to get wrong.
+    const spoken = new MutationObserver(() => {})
+    spoken.observe(region, { childList: true, subtree: true, characterData: true })
+
+    for (let refresh = 0; refresh < 3; refresh += 1) {
+      act(() => {
+        vi.advanceTimersByTime(1000)
+      })
+      rerender(paint(running(RUNNING)))
+    }
+
+    expect(spoken.takeRecords()).toHaveLength(0)
+    expect(region.textContent).toBe(RUNNING)
+    spoken.disconnect()
+  })
+
+  it('a CHANGE in the text is announced — the throttle must not swallow the news', () => {
+    vi.useFakeTimers()
+    const { rerender } = draw({ envelopes: running(RUNNING) })
+    const region = screen.getByRole('status', { name: /build activity/i })
+    expect(region.textContent).toBe(RUNNING)
+
+    act(() => {
+      vi.advanceTimersByTime(8000)
+    })
+    rerender(paint(running(STILL_RUNNING)))
+    expect(region.textContent).toBe(STILL_RUNNING)
+  })
+
+  it('a second change inside the window is HELD, then spoken when the window elapses', () => {
+    vi.useFakeTimers()
+    const { rerender } = draw({ envelopes: running(RUNNING) })
+    const region = screen.getByRole('status', { name: /build activity/i })
+
+    rerender(paint(running(STILL_RUNNING)))
+    expect(region.textContent).toBe(STILL_RUNNING)
+
+    // …and now a third line, one second later. The cap is 10s, so it waits.
+    act(() => {
+      vi.advanceTimersByTime(1000)
+    })
+    rerender(paint(running('Making sure everything fits together')))
+    expect(region.textContent).toBe(STILL_RUNNING)
+
+    act(() => {
+      vi.advanceTimersByTime(ANNOUNCE_MIN_INTERVAL_MS)
+    })
+    // TRAILING EDGE: held back, never dropped. The last thing that happened is what gets said.
+    expect(region.textContent).toBe('Making sure everything fits together')
+  })
+
+  it('goes quiet at the terminal instead of leaving "Working…" hanging over a finished build', () => {
+    const { container, rerender } = draw({ envelopes: running(RUNNING) })
+    expect(screen.getByRole('status', { name: /build activity/i }).textContent).toBe(RUNNING)
+
+    rerender(
+      paint(
+        [{ type: 'step', seq: 1, name: 'run', label: RUNNING, state: 'ok' }],
+        'ended',
+      ),
+    )
+    // LIVENESS: the bubble is still here, now showing the collapsed history — the region went
+    // away because the build ended, not because the component fell over.
+    expect(container.querySelector('[data-testid="build-progress"]')).toBeTruthy()
+    expect(container.querySelector('button[aria-expanded]')).toBeTruthy()
+    expect(screen.queryByRole('status', { name: /build activity/i })).toBeNull()
   })
 })

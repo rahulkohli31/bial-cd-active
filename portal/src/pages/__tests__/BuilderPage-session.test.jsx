@@ -141,8 +141,12 @@ describe('BuilderPage — the build-turn flow (ORIG-§3-d/f)', () => {
     // The rows are actually in the DOM (not just props) — no remount needed. Only the MOST
     // RECENT step is visible live — it replaces the previous one in the same spot rather
     // than both accumulating.
-    expect(await screen.findByText(/Installing dependencies/i)).toBeTruthy()
-    expect(screen.queryByText(/Scaffolding your app/i)).toBeNull()
+    // SCOPED TO THE VISIBLE ROW (U17): the sr-only live region carries a second, deliberately
+    // PACED copy of the label, so both queries have to name which of the two they mean. The
+    // property under test — one row, replaced in place — is about the one a person looks at.
+    const liveRow = within(await screen.findByTestId('build-activity'))
+    expect(await liveRow.findByText(/Installing dependencies/i)).toBeTruthy()
+    expect(liveRow.queryByText(/Scaffolding your app/i)).toBeNull()
 
     await turn.frame(T_PREVIEW())
     await waitFor(() => expect(document.querySelector('iframe')?.getAttribute('src')).toBe(PREVIEW_URL))

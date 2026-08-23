@@ -67,6 +67,17 @@ _LBL_PREVIEW: Final = "Getting your preview ready"
 # commands, so a recognized-only allowlist that leaked argv on the long tail is the bug we refuse.
 _LBL_FALLBACK: Final = "Working on your app"
 
+# U17/R24 — WHAT A LONG OPERATION SAYS WHILE IT IS STILL RUNNING.
+#
+# EXTENDS the table above rather than adding a second one, and that is the whole design. Every
+# label this module produces — the command classes, `_LBL_FALLBACK`, and the file-area labels
+# from `_friendly_area` — is already a present-participle phrase in the citizen's register
+# ("Setting up the tools your app needs"), so "Still …" turns ANY of them into a truthful
+# progress sentence. A label added tomorrow is narrated for free; a parallel table would be a
+# second place to forget, and the first label anyone forgot would show a citizen raw argv.
+_LONG_OPERATION_TAIL: Final = " — this one takes a little longer."
+_STILL: Final = "Still "
+
 # Friendly file-area copy (`_friendly_area`): the citizen sees an app AREA, never a filename.
 _AREA_MAIN_PAGE: Final = "your app's main page"
 _AREA_LAYOUT: Final = "your app's overall look"
@@ -330,6 +341,27 @@ def command_needs_the_long_timeout(argv: list[str]) -> bool:
     thing to do is kill it and tell the model."""
     label, _ = _classify_command(argv)
     return label in {_LBL_INSTALL, _LBL_CHECKS}
+
+
+def long_operation_line(label: str) -> str:
+    """A step's friendly label, restated for an operation that has outrun the stillness
+    threshold (U17/R24) — the harness's own words for "this is still running".
+
+    FAILS CLOSED THE SAME WAY THE TABLE DOES. The input is always a label this module already
+    produced, so it is already free of argv and file paths; an empty one degrades to
+    `_LBL_FALLBACK` rather than to nothing, because a blank status line is a still screen with
+    extra steps.
+
+    IDEMPOTENT ON PURPOSE. The line is REFRESHED for as long as the operation runs, and it is
+    re-derived from the step's own label each time. Re-deriving must produce byte-identical
+    text: an unchanged sentence is what makes the refresh invisible to a screen reader (the
+    portal's atomic live region re-announces on change, never on a re-render of the same
+    string)."""
+    base = label.strip() or _LBL_FALLBACK
+    if base.endswith(_LONG_OPERATION_TAIL):
+        return base
+    opener = base if base.startswith(_STILL) else f"{_STILL}{base[0].lower()}{base[1:]}"
+    return f"{opener}{_LONG_OPERATION_TAIL}"
 
 
 def classify_file_step(tool_name: str, path: str | None) -> tuple[str, bool]:

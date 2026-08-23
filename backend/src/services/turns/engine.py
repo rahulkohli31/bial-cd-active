@@ -119,6 +119,7 @@ from src.services.messages.projection import (
     PlanOptionsItem,
     StepItem,
     classify_tool_call,
+    long_operation_line,
     step_detail,
 )
 from src.services.messages.store import append_batch
@@ -193,6 +194,39 @@ _TURN_FAILED_MESSAGE = "The assistant hit a problem and this turn was stopped."
 _PERSIST_FAILED_MESSAGE = (
     "The reply could not be saved, so this turn was stopped. Try sending the message again."
 )
+
+# =====================================================================================
+# U17/R24 — THE TWO THINGS THE HARNESS SAYS WHEN NOTHING ELSE IS SPEAKING
+# =====================================================================================
+#
+# Both are the PLATFORM's words, never the agent's, and both are pinned here rather than asked
+# for in a prompt. An acknowledgement the model has to remember to write is an acknowledgement
+# that arrives AFTER the first model request — which is exactly the silence it exists to cover.
+#
+# THE ACKNOWLEDGEMENT is a transient feed row, not a transcript message. It is emitted
+# synchronously inside `start_turn`, before the detached task is even created, so "before any
+# model work" is a structural fact rather than a timing hope. It is deliberately never written
+# into `state.steps`, which is what keeps it out of the catch-up snapshot AND out of the
+# persisted rows: a build's transcript must not accumulate one "Getting started" per turn.
+ACK_TEXT = "Getting started on that…"
+# The reserved tool name the acknowledgement rides under, so it is identifiable as the
+# harness's own row rather than a step the agent took. The portal keys on the same string
+# (`ACK_STEP_NAME` in `BuildProgress.tsx`) to keep it out of the finished build's step history
+# — it is REPLACED by the first real step, never listed beside it.
+ACK_TOOL = "__ack__"
+ACK_TOOL_CALL_ID = "__ack__"
+
+# THE STILLNESS THRESHOLD (R24). An operation still running after this long earns a
+# plain-language status line of its own, refreshed until it completes. Stated as a number
+# rather than as "a stated threshold": eight seconds is the point at which a screen with
+# nothing moving on it stops reading as "fast" and starts reading as "stuck", and it is
+# comfortably longer than every ordinary file write, so a normal step never flickers one on.
+LONG_OPERATION_THRESHOLD_MS = 8_000
+# How often that line is re-emitted while the operation runs. The TEXT is stable by
+# construction — `long_operation_line` re-derives it from the step's own label, never from a
+# clock — so a refresh that changes nothing changes no pixels, and therefore produces no second
+# screen-reader announcement. The portal caps announcements at one per 10s on top of that.
+LONG_OPERATION_REFRESH_MS = 5_000
 
 # U18/R22 — WHAT A FINISHED BUILD SAYS WHEN THE AGENT HANDED US NOTHING TO SAY.
 #
@@ -498,6 +532,11 @@ class _TurnState:
     steps: dict[str, StepItem] = field(default_factory=dict)  # tool_call_id → newest item
     subscribers: set[asyncio.Queue[None]] = field(default_factory=set)
     task: asyncio.Task[None] | None = None
+    # U17 — the per-tool-call "this is still running" narrators, keyed by tool call id.
+    # Cancelled the moment the call resolves (and again, synchronously, in `_finish`), then
+    # AWAITED in the turn's `finally`: a narrator left running past the terminal would land a
+    # step frame after the transport sent `[DONE]`.
+    long_operation_tasks: dict[str, asyncio.Task[None]] = field(default_factory=dict)
     ended_monotonic: float | None = None
     # A stop has been asked for. Set BEFORE `task.cancel()`, so a second Stop landing while
     # the first is still unwinding answers "already asked" instead of firing a second cancel
@@ -709,6 +748,29 @@ class TurnEngine:
                 expects_mutation=expects_mutation,
             )
             self._by_conversation[conversation.id] = state
+            # U17/R24 — ANSWER THE SCREEN BEFORE ANYTHING CAN BE SLOW.
+            #
+            # HERE, and not one line later, is the whole point: this runs before
+            # `asyncio.create_task`, so there is no ordering to get wrong and no window in which
+            # a cold provision, a snapshot restore, or a first model request can leave the
+            # citizen looking at a still screen. It is the first frame of every turn (`seq == 1`)
+            # and it is never persisted — `state.steps` is untouched, so neither the catch-up
+            # snapshot nor `append_batch` ever sees it.
+            ack = StepItem(
+                seq=0,  # transient: no row, so no row seq
+                mode=state.mode.value,
+                tool=ACK_TOOL,
+                label=ACK_TEXT,
+                state="pending",
+                hidden=False,
+                detail=step_detail(None, None),
+            )
+            self._emit(
+                state,
+                lambda seq: StepFrame(
+                    seq=seq, tool_call_id=ACK_TOOL_CALL_ID, phase="started", item=ack
+                ),
+            )
             state.task = asyncio.create_task(
                 self._run_turn(
                     state,
@@ -1062,6 +1124,10 @@ class TurnEngine:
             # Idempotent by construction: the Write path's stop leaves `preview_task` None
             # and this backstop finds nothing to do.
             await self._stop_preview_watcher(state)
+            # U17 — and the status-line narrators with it, for the same reason and on every
+            # arm. `_finish` already cancelled them; this is where they are actually awaited,
+            # so none is still unwinding when the transport closes.
+            await self._drain_long_operations(state)
             # THE RELEASE, on every single terminal arm — completed, stopped, persist-failed,
             # named-end, or a genuine bug. NO SAVE happens here (KTD-5e): the bundle reaches
             # Blob only on the user's Save click (`save_project_snapshot`). What
@@ -2373,7 +2439,11 @@ class TurnEngine:
                     seq=seq, tool_call_id=event.part.tool_call_id, phase="started", item=item
                 ),
             )
+            self._start_long_operation(state, event.part.tool_call_id, hidden=item.hidden)
         elif isinstance(event, FunctionToolResultEvent):
+            # BEFORE the resolved frame, so the status line is gone from the row the instant
+            # the operation completes rather than one refresh later.
+            self._stop_long_operation(state, event.tool_call_id)
             resolved = self._resolve_step(state, event)
             if resolved is not None:
                 self._emit(
@@ -2384,6 +2454,92 @@ class TurnEngine:
                         phase="finished",
                         item=resolved,
                     ),
+                )
+
+    # -- the long-operation status line (U17 / R24) --------------------------------------
+
+    def _start_long_operation(self, state: _TurnState, tool_call_id: str, *, hidden: bool) -> None:
+        """Arm the stillness narrator for one tool call.
+
+        HIDDEN STEPS ARE NOT NARRATED, and that is a correctness point rather than a taste one:
+        a hidden step renders nowhere, so refreshing it would change no pixels while still
+        burning a frame every few seconds — narration that cannot be seen is noise by
+        definition. The visible row shows the neutral "Working…" placeholder for that window,
+        which is the honest thing to say about work the citizen was never shown."""
+        if hidden:
+            return
+        state.long_operation_tasks[tool_call_id] = asyncio.create_task(
+            self._narrate_long_operation(state, tool_call_id)
+        )
+
+    def _stop_long_operation(self, state: _TurnState, tool_call_id: str) -> None:
+        """Disarm one narrator — the operation finished. Synchronous, so no await sits between
+        the operation completing and the status line being unable to speak again."""
+        task = state.long_operation_tasks.pop(tool_call_id, None)
+        if task is not None:
+            task.cancel()
+
+    async def _narrate_long_operation(self, state: _TurnState, tool_call_id: str) -> None:
+        """One live status row for an operation that has outrun `LONG_OPERATION_THRESHOLD_MS`.
+
+        THE HARNESS SAYS THIS, NOT THE AGENT — which is why it lives here and not in a prompt.
+        The composite operations U21 and U23 introduce are precisely the ones that REMOVE the
+        per-step narration filling these gaps today, so a citizen watching a three-minute
+        install would otherwise watch a row that stopped changing several minutes ago.
+
+        It re-emits the SAME step (same `tool_call_id`, still `phase="started"`) with the
+        restated label, so it replaces the row in place — one live line, never a second one
+        accumulating beside it — and the ordinary `finished` frame clears it. The base label is
+        deliberately left untouched in `state.steps`: re-deriving from it keeps the text
+        byte-identical across refreshes, and keeps a mid-turn reconnect's snapshot clean.
+
+        Under the threshold nothing is emitted at all. A fast turn must not flicker a status
+        line on and off — a line that appears for 300ms reads as a glitch, not as reassurance."""
+        try:
+            await asyncio.sleep(LONG_OPERATION_THRESHOLD_MS / 1000)
+            while True:
+                pending = state.steps.get(tool_call_id)
+                if pending is None or pending.state != "pending":
+                    return  # resolved out from under us — nothing left to narrate
+                still = pending.model_copy(update={"label": long_operation_line(pending.label)})
+                self._emit(
+                    state,
+                    lambda seq: StepFrame(
+                        seq=seq, tool_call_id=tool_call_id, phase="started", item=still
+                    ),
+                )
+                await asyncio.sleep(LONG_OPERATION_REFRESH_MS / 1000)
+        except Exception:
+            # Never the turn's problem. Reassurance failing is a cosmetic loss; a narrator
+            # taking a build down with it would be the unit causing the outage it prevents.
+            # `CancelledError` is a BaseException and so passes straight through — the ordinary
+            # way this ends.
+            _log.warning(
+                "long_operation_narration_failed",
+                conversation_id=str(state.conversation_id),
+                turn_id=str(state.turn_id),
+                exc_info=True,
+            )
+
+    async def _drain_long_operations(self, state: _TurnState) -> None:
+        """Cancel and AWAIT every remaining narrator, on every terminal arm.
+
+        The same lesson as `_stop_preview_watcher`: cancelling without awaiting leaves a task
+        that may be mid-`_emit`, and the frame it lands arrives after the transport closed."""
+        tasks = list(state.long_operation_tasks.values())
+        state.long_operation_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                _log.exception(
+                    "long_operation_narrator_failed",
+                    conversation_id=str(state.conversation_id),
+                    turn_id=str(state.turn_id),
                 )
 
     def _push_text(self, state: _TurnState, text: str) -> None:
@@ -2443,6 +2599,13 @@ class TurnEngine:
     def _finish(
         self, state: _TurnState, status: Literal["completed", "failed", "stopped"]
     ) -> None:
+        # U17 — the status-line narrators are silenced BEFORE the terminal frame, synchronously.
+        # A narrator is always parked on a sleep, so cancelling here means the CancelledError
+        # lands at that sleep and it can never reach `_emit` again: no status row after the
+        # terminal, with no await in between for one to slip through. The `finally` then awaits
+        # them (`_drain_long_operations`) — this only makes the ordering unloseable.
+        for task in state.long_operation_tasks.values():
+            task.cancel()
         state.status = status
         state.ended_monotonic = time.monotonic()
         self._emit(
