@@ -35,7 +35,7 @@ from typing import Literal
 import structlog
 from pydantic_ai import Agent, BinaryContent
 from pydantic_ai.exceptions import UsageLimitExceeded
-from pydantic_ai.messages import ModelMessage
+from pydantic_ai.messages import ModelMessage, ModelRequest
 from pydantic_ai.models import Model
 from pydantic_ai.models.anthropic import AnthropicModelSettings
 from pydantic_ai.usage import RequestUsage, UsageLimits
@@ -380,7 +380,7 @@ class BuildOrchestrator:
 
             if deps.sandbox.done_requested:  # resolve the spinner `declare_done` opened (C7 §3.1)
                 # THREE ARMS, because the verdict has three values (U6). An INDETERMINATE
-                # verdict is not a failure and must not be labelled as one: "Not green yet"
+                # verdict is not a failure and must not be labelled as one: "Not working yet"
                 # over a check that could not be reached tells the citizen their app is broken
                 # on the strength of our own timeout. It resolves the spinner with a neutral
                 # word and a neutral state instead.
@@ -391,7 +391,7 @@ class BuildOrchestrator:
                 elif outcome.green:
                     label, step_state = "Build verified.", "ok"
                 else:
-                    label, step_state = "Not green yet — continuing.", "failed"
+                    label, step_state = "Not working yet — fixing it.", "failed"
                 await emitter.step(name="declare_done", label=label, state=step_state)
 
             if outcome.green and deps.sandbox.done_requested:  # objective done-gate (KD-6)
@@ -475,6 +475,8 @@ class BuildOrchestrator:
         orphaned calls. The delta cursor starts at `len(messages)` — the prior runs' history
         was persisted by the runs that produced it."""
         quota_hit: _QuotaHit | None = None
+        cut_short = False
+        pending_answers: ModelRequest | None = None
         persisted_from = len(messages)
         async with build_agent.iter(
             turn_prompt,
@@ -530,12 +532,52 @@ class BuildOrchestrator:
                         history=run.all_messages(),
                         persisted_from=persisted_from,
                     )
+                    # U18/R30 — AND `declare_done` STOPS BUYING A ROUND-TRIP HERE TOO. `node` is
+                    # already the NEXT model request; walking into it spends a full request whose
+                    # only product is a closing paragraph nothing renders. The tool's own return
+                    # text tells the model "this turn ends here and nothing further is asked of
+                    # you" — and that text is SHARED, one tool body serving this harness and the
+                    # Write engine both, so a cut in only one of them made the tool lie to every
+                    # legacy-harness build and then charge it for the sentence it had just
+                    # promised not to ask for. The verdict still decides whether the build is
+                    # over (`_run_loop`'s done-gate is untouched), and a red one re-enters with
+                    # the repair prompt exactly as before.
+                    #
+                    # THE PENDING REQUEST IS TAKEN OFF THE NODE ON THE WAY OUT, and it has to be.
+                    # A `ModelRequestNode` carries the tool ANSWERS and only appends them to the
+                    # history when it runs — which is the thing we are declining to do — so
+                    # `run.all_messages()` here ends on a `ModelResponse` whose tool calls look
+                    # unanswered. Left that way, the next self-heal run hands pydantic-ai a new
+                    # user prompt over unprocessed tool calls (it refuses outright), and the
+                    # `declare_done` return never reaches a persisted row.
+                    if deps.sandbox.done_requested:
+                        if Agent.is_model_request_node(node):
+                            pending_answers = node.request
+                        cut_short = True
+                        break
             result = run.result
             if quota_hit is None and result is not None:
                 messages = result.all_messages()  # thread history into the next run (KD-1)
                 # White-box trace (opt-in): the full, durable message history for this run.
                 record_run_messages(deps.sandbox.app_id, messages)
                 # U5 — the run-ending response (and anything since the last complete step).
+                await self._persist_step(
+                    deps.user_id,
+                    session_id=session_id,
+                    conversation_id=conversation_id,
+                    history=messages,
+                    persisted_from=persisted_from,
+                )
+            elif cut_short:
+                # `run.result` is set by the END node, which a cut-short run never reaches — so
+                # the accumulated history has to be read off the run itself, with the tool answers
+                # the node above was holding put back on the end. Without this the loop would keep
+                # the PRE-RUN history and a repair pass would re-ask the model to build from
+                # scratch, having thrown away everything it just wrote.
+                messages = list(run.all_messages())
+                if pending_answers is not None:
+                    messages.append(pending_answers)
+                record_run_messages(deps.sandbox.app_id, messages)
                 await self._persist_step(
                     deps.user_id,
                     session_id=session_id,

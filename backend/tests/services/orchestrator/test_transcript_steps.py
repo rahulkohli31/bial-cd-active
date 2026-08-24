@@ -12,7 +12,7 @@ from __future__ import annotations
 import uuid
 
 import sqlalchemy as sa
-from pydantic_ai.messages import ModelMessage, ModelResponse
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus
@@ -67,8 +67,14 @@ async def _thread(db_session):
 async def test_three_step_build_persists_incremental_batches(
     db_session, billing_factory, sink
 ) -> None:
-    """Plan U5 scenario: a 3-model-step FunctionModel build persists 3 incremental batches in
-    order — one `[request, response]` pair per step (returns ride in the next step's request)."""
+    """Plan U5 scenario: a multi-model-step FunctionModel build persists incremental batches in
+    order — one `[request, response]` pair per step (returns ride in the next step's request).
+
+    THE LAST BATCH IS THE TOOL ANSWERS, NOT A THIRD PAIR (U18/R30). A passing `declare_done` ends
+    the run without a further model request, so the run's final delta is the request holding the
+    `declare_done` RETURN — the one the cut-short arm puts back on the history deliberately. Left
+    off, the transcript would end on a `ModelResponse` whose tool call nothing ever answered, and
+    every later turn over that thread would be refused."""
     user, conversation = await _thread(db_session)
     fake = FakeSandbox()
     fake.dev_ready = True
@@ -76,7 +82,6 @@ async def test_three_step_build_persists_incremental_batches(
         [
             tool_turn("write_file", {"path": "app/page.tsx", "file_text": "export {}\n"}),
             tool_turn("declare_done", {"summary": "done"}),
-            text_turn("done"),
         ]
     )
     orchestrator, _ = _threaded_orchestrator(model, billing_factory, conversation.id)
@@ -88,7 +93,7 @@ async def test_three_step_build_persists_incremental_batches(
     rows = await _step_rows(db_session, conversation.id)
     assert [row.entry_kind for row in rows] == [MessageEntryKind.STEP] * 3
     assert [row.seq for row in rows] == [0, 1, 2]
-    assert [len(row.payload) for row in rows] == [2, 2, 2]
+    assert [len(row.payload) for row in rows] == [2, 2, 1]
     assert all(row.meta == {"kind": "build_step", "sessionId": str(session_id)} for row in rows)
 
     # The concatenated rows replay as one coherent native history.
@@ -98,8 +103,10 @@ async def test_three_step_build_persists_incremental_batches(
     history = await load_history(
         db_session, user_id=user.id, conversation_id=conversation.id, rehydrate=_no_refs
     )
-    assert len(history) == 6  # req, resp, returns, resp, returns, resp
-    assert isinstance(history[-1], ModelResponse)
+    assert len(history) == 5  # req, resp, returns, resp, returns
+    # …and it ends ANSWERED: the `declare_done` call has its return, so the thread is replayable.
+    assert isinstance(history[-1], ModelRequest)
+    assert any(isinstance(part, ToolReturnPart) for part in history[-1].parts)
 
 
 async def test_crash_between_steps_keeps_prior_steps_durable(
