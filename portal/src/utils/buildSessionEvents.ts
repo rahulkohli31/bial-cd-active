@@ -146,14 +146,6 @@ export function toProgressEnvelope(value: unknown): ProgressEnvelope | null {
         // no-op (undefined) and read-only/housekeeping steps render live but not on reload.
         hidden: value.hidden === true,
       }
-    case 'log':
-      return {
-        type: 'log',
-        seq,
-        source: asString(value.source),
-        stream: value.stream === 'stderr' ? 'stderr' : 'stdout',
-        text: asString(value.text),
-      }
     case 'error':
       return { type: 'error', seq, source: toErrorSource(value.source), title: asString(value.title), cleaned_stack: asString(value.cleaned_stack) }
     case 'preview_ready':
@@ -178,7 +170,7 @@ export function toProgressEnvelope(value: unknown): ProgressEnvelope | null {
 
 /**
  * True when an envelope is a terminal boundary that must close the feed. Written as
- * a TOTAL `switch` so adding a 9th C7 member becomes a compile error right here
+ * a TOTAL `switch` so adding an 8th C7 member becomes a compile error right here
  * (`assertNever`) — forcing a deliberate terminal / non-terminal decision instead of
  * a silent default. Only `ended` is terminal (C3 §1: it is the single absorbing
  * envelope; `escalation` is informational, its terminal boundary is the `ended` that
@@ -189,7 +181,6 @@ export function isTerminalEnvelope(env: ProgressEnvelope): boolean {
     case 'ended':
       return true
     case 'step':
-    case 'log':
     case 'error':
     case 'preview_ready':
     case 'preview_reconnecting':

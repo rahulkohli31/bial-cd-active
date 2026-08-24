@@ -25,7 +25,6 @@ function setup(depsOverride: { maxReconnects?: number } = {}) {
 }
 
 const STEP: ProgressEnvelope = { type: 'step', seq: 1, name: 'scaffold', label: 'Scaffolding…', state: 'started', hidden: false }
-const LOG: ProgressEnvelope = { type: 'log', seq: 2, source: 'exec', stream: 'stderr', text: 'warn: x' }
 const ERROR: ProgressEnvelope = { type: 'error', seq: 3, source: 'tsc', title: 'Type error', cleaned_stack: 'app/page.tsx(1,1)' }
 const PREVIEW: ProgressEnvelope = { type: 'preview_ready', seq: 4, preview_url: 'https://app.example.azurecontainerapps.io/' }
 const ESCALATION: ProgressEnvelope = { type: 'escalation', seq: 5, reason: 'self_heal_budget_exhausted', detail: 'gave up', last_error: null }
@@ -33,15 +32,15 @@ const QUOTA: ProgressEnvelope = { type: 'quota_exceeded', seq: 6, limit: 100, us
 const ENDED: ProgressEnvelope = { type: 'ended', seq: 7, status: 'ended', preview_url: null, snapshot_committed: true, reason: 'completed' }
 
 describe('buildSessionEvents — dispatch (C7 §3)', () => {
-  it('produces the correct typed object for each of the 7 envelope types', () => {
+  it('produces the correct typed object for each of the 6 envelope types', () => {
     const { fake, envelopes } = setup()
     fake.open()
-    ;[STEP, LOG, ERROR, PREVIEW, ESCALATION, QUOTA].forEach((e) => fake.emitEnvelope(e))
-    expect(envelopes).toEqual([STEP, LOG, ERROR, PREVIEW, ESCALATION, QUOTA])
+    ;[STEP, ERROR, PREVIEW, ESCALATION, QUOTA].forEach((e) => fake.emitEnvelope(e))
+    expect(envelopes).toEqual([STEP, ERROR, PREVIEW, ESCALATION, QUOTA])
 
-    fake.emitEnvelope(ENDED) // terminal — the 7th type
-    expect(envelopes).toHaveLength(7)
-    expect(envelopes[6]).toEqual(ENDED)
+    fake.emitEnvelope(ENDED) // terminal — the 6th type
+    expect(envelopes).toHaveLength(6)
+    expect(envelopes[5]).toEqual(ENDED)
     expect(fake.closeCalls).toBe(1) // ended closes the feed
   })
 
@@ -50,6 +49,22 @@ describe('buildSessionEvents — dispatch (C7 §3)', () => {
     fake.open()
     expect(() => fake.emit(JSON.stringify({ type: 'nonsense', seq: 1 }))).not.toThrow()
     expect(envelopes).toHaveLength(0)
+    expect(errors).toHaveLength(0)
+  })
+
+  it('drops a retired `log` frame (U29 — the server can no longer emit one) without throwing, and a known frame still lands right after it (liveness)', () => {
+    // FLIPPED: `log` used to be a recognized C7 member; U29 removed it end to end because no
+    // production BRAIN path had ever emitted one. The wire-level consumer must now treat it
+    // exactly like any other unrecognized `type` — dropped defensively, never a throw — and a
+    // frame arriving right after it must still dispatch normally (this is not a dead transport).
+    const { fake, envelopes, errors } = setup()
+    fake.open()
+    expect(() =>
+      fake.emit(JSON.stringify({ type: 'log', seq: 2, source: 'exec', stream: 'stderr', text: 'warn: x' })),
+    ).not.toThrow()
+    expect(envelopes).toHaveLength(0)
+    fake.emitEnvelope(STEP)
+    expect(envelopes).toEqual([STEP]) // liveness: a known frame still renders
     expect(errors).toHaveLength(0)
   })
 
@@ -157,7 +172,7 @@ describe('buildSessionEvents — quota + resume (C7 §8, C3 §4.2)', () => {
     const { fake, envelopes, sub } = setup()
     fake.open()
     fake.emitEnvelope(STEP) // seq 1
-    fake.emitEnvelope(LOG) // seq 2
+    fake.emitEnvelope({ type: 'step', seq: 2, name: 'install_deps', label: 'Installing…', state: 'started', hidden: false }) // seq 2
     expect(sub.lastSeq()).toBe(2)
 
     // …a transient drop, then the server replays seq > 2, with one torn line among them.

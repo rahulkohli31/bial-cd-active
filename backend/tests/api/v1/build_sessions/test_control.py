@@ -131,7 +131,7 @@ async def test_status_after_completion_carries_preview_and_last_seq(
     body = s.json()
     assert body["status"] == "ended"
     assert body["previewUrl"] == "https://preview.example/"
-    assert body["lastSeq"] == 4
+    assert body["lastSeq"] == 3
 
 
 async def test_status_of_another_users_session_is_404(

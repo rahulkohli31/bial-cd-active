@@ -7,7 +7,6 @@ from pydantic import TypeAdapter, ValidationError
 
 from src.api.v1.build_sessions.schemas import (
     EndedEvent,
-    LogEvent,
     PreviewReconnectingEvent,
     ProgressEnvelope,
     StepEvent,
@@ -30,12 +29,11 @@ def _collecting_sink() -> tuple[list[ProgressEnvelope], ProgressEmitter]:
 async def test_seq_is_strictly_increasing_gap_free() -> None:
     captured, emitter = _collecting_sink()
     await emitter.step(name="scaffold", label="Scaffolding…", state="started")
-    await emitter.log(source="exec", stream="stdout", text="hello")
     await emitter.preview_ready(preview_url="https://x/")
     await emitter.escalation(reason="self_heal_budget_exhausted", detail="gave up")
     seqs = [env.seq for env in captured]
-    assert seqs == [1, 2, 3, 4]
-    assert emitter.last_seq == 4
+    assert seqs == [1, 2, 3]
+    assert emitter.last_seq == 3
 
 
 def test_emitter_has_no_terminal_helper_so_brain_cannot_emit_ended() -> None:
@@ -63,7 +61,7 @@ async def test_last_seq_hands_the_baton_to_the_session_api_terminal() -> None:
 async def test_every_envelope_validates_against_the_union() -> None:
     captured, emitter = _collecting_sink()
     await emitter.step(name="s", label="l", state="ok")
-    await emitter.log(source="dev", stream="stderr", text="t")
+    await emitter.preview_ready(preview_url="https://x/")
     for env in captured:
         # round-trips through the discriminated union (extra="forbid" rejects stray keys)
         assert _ENVELOPE.validate_python(env.model_dump())
@@ -75,19 +73,6 @@ async def test_ended_rejects_a_non_terminal_status() -> None:
         EndedEvent.model_validate(
             {"seq": 1, "status": "building", "reason": "nope", "snapshot_committed": False}
         )
-
-
-async def test_log_text_is_redacted_at_emit() -> None:
-    captured, emitter = _collecting_sink()
-    await emitter.log(
-        source="dev",
-        stream="stderr",
-        text="cfg APP_LABEL=bial_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6 loaded",
-    )
-    log = captured[0]
-    assert isinstance(log, LogEvent)
-    assert "bial_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6" not in log.text
-    assert "***" in log.text
 
 
 async def test_error_egress_is_redacted() -> None:

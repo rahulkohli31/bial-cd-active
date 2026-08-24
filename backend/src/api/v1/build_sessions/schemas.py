@@ -429,15 +429,6 @@ class StepEvent(_ProgressEventBase):
     hidden: bool = False
 
 
-class LogEvent(_ProgressEventBase):
-    """`log` — a raw log line (build/install output, dev-server tail) (C7 §3.2)."""
-
-    type: Literal["log"] = "log"
-    source: str  # "exec" (a C1 /exec run) or "dev" (a C1 /dev/logs tail).
-    stream: Literal["stdout", "stderr"]
-    text: str  # one LF-normalized line.
-
-
 class ErrorEvent(_ProgressEventBase):
     """`error` — the structured error BRAIN reacts to; carries `{source, title,
     cleaned_stack}` (C7 §3.3). Stage 0 emits only tsc | next_build | server."""
@@ -510,7 +501,6 @@ class EndedEvent(_ProgressEventBase):
 
 ProgressEnvelope = Annotated[
     StepEvent
-    | LogEvent
     | ErrorEvent
     | PreviewReadyEvent
     | PreviewReconnectingEvent
@@ -519,9 +509,13 @@ ProgressEnvelope = Annotated[
     | EndedEvent,
     Field(discriminator="type"),
 ]
-"""The C7 tagged-union progress envelope — eight members, discriminated on `type`
+"""The C7 tagged-union progress envelope — seven members, discriminated on `type`
 (C7 §3; `preview_reconnecting` added by F8/U5). BRAIN emits one per `await on_progress(env)`;
-SESSION-API relays each over the C3 SSE feed verbatim (snake_case, `seq` preserved)."""
+SESSION-API relays each over the C3 SSE feed verbatim (snake_case, `seq` preserved).
+
+U29 retired the `log` member: no production BRAIN path had ever called the emitter's `log`
+helper (a dead-code audit finding, not a behavior change), so removing it drops the portal's
+unreachable raw-output consumer arm along with it."""
 
 
 class BuildResult(BaseModel):

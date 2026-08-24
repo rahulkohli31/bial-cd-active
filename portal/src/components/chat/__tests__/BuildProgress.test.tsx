@@ -248,29 +248,6 @@ describe('after the build ends, the full step history is a collapsed dropdown', 
   })
 })
 
-describe('U16: the raw-output expander is gone, not merely quieter', () => {
-  it('log envelopes render NOTHING — no expander, no lines, not even behind a click', () => {
-    // FLIPPED, NOT DELETED. This block used to pin the expander as the CORRECT home for raw
-    // shell output ("log lines render ONLY inside the expander"), which made a developer
-    // surface one disclosure click away from every citizen. The lines are still produced and
-    // still relayed to the model; the bubble simply has nowhere to put them.
-    const envelopes: FeedEnvelope[] = [
-      { type: 'step', seq: 1, name: 's', label: 'Setting up the tools your app needs', state: 'started' },
-      { type: 'log', seq: 2, source: 'exec', stream: 'stdout', text: 'added 10 packages' },
-      { type: 'log', seq: 3, source: 'dev', stream: 'stderr', text: 'Error: EADDRINUSE :::3000' },
-    ]
-    const { container } = draw({ envelopes })
-    // LIVENESS FIRST: the bubble rendered, so the absences below are absences and not a crash.
-    expect(container.querySelector('[data-testid="build-progress"]')).toBeTruthy()
-    expect(container.textContent).toContain('Setting up the tools your app needs')
-
-    expect(container.querySelector('details')).toBeNull()
-    expect(container.querySelector('[data-kind="log"]')).toBeNull()
-    expect(container.textContent).not.toContain('added 10 packages')
-    expect(container.textContent).not.toContain('EADDRINUSE')
-  })
-})
-
 describe('the headline transitions', () => {
   it('building shows the working line with the elapsed-time reassurance', () => {
     const { container } = draw({ startedAt: Date.now() - 90_000 })
@@ -802,10 +779,12 @@ describe('U16: every error status is a sentence plus a next action', () => {
     )
   })
 
-  it('AE13: nothing in a whole build — steps, logs, errors, escalation — is addressed to a developer', () => {
+  it('AE13: nothing in a whole build — steps, errors, escalation — is addressed to a developer', () => {
     // THE COMPLETE RENDERED SET, which is the part that makes this AE13 rather than a narration
     // check: the platform's own error surfaces are scanned alongside the agent's steps, because
     // those surfaces were the worst offenders. U15 and U18 assert against this same list.
+    // `log` frames no longer exist (U29 — no production path had ever emitted one), so the
+    // developer-vocabulary-in-raw-output case they used to cover here is gone with them.
     const DEVELOPER_VOCABULARY = [
       '/', '.tsx', '.ts', '.css', '.json', 'app/', 'components/', 'workspace', 'node_modules',
       'npm', 'npx', 'pnpm', 'yarn', 'bash', 'tsc', 'eslint', 'drizzle-kit', '$ ',
@@ -816,8 +795,6 @@ describe('U16: every error status is a sentence plus a next action', () => {
       { type: 'step', seq: 1, name: 'read_file', label: "Looking at your app's main page", state: 'ok', hidden: true },
       { type: 'step', seq: 2, name: 'write_file', label: "Building your app's main page", state: 'ok' },
       { type: 'step', seq: 3, name: 'run_command', label: 'Setting up the tools your app needs', state: 'started' },
-      { type: 'log', seq: 4, source: 'exec', stream: 'stdout', text: 'npm WARN deprecated glob@7' },
-      { type: 'log', seq: 5, source: 'dev', stream: 'stderr', text: 'app/page.tsx(12,5): error TS2307' },
       {
         type: 'error',
         seq: 6,

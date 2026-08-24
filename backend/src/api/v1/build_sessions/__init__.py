@@ -29,7 +29,6 @@ from src.api.v1.build_sessions.schemas import ErrorEvent as ErrorEvent
 from src.api.v1.build_sessions.schemas import ErrorSource as ErrorSource
 from src.api.v1.build_sessions.schemas import EscalationEvent as EscalationEvent
 from src.api.v1.build_sessions.schemas import ForceEndResponse as ForceEndResponse
-from src.api.v1.build_sessions.schemas import LogEvent as LogEvent
 from src.api.v1.build_sessions.schemas import PreviewReadyEvent as PreviewReadyEvent
 from src.api.v1.build_sessions.schemas import (
     PreviewReconnectingEvent as PreviewReconnectingEvent,

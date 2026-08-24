@@ -18,7 +18,6 @@ Endpoints:
   GET  /dev/status                                -> {"running","ready","port","exit_code"}
   GET  /dev/logs?since=N                          -> {"lines":[..], "next": M}
   GET  /dev/compile   -> {"state","errors","reason","connect_generation"}   (R17/R18)
-  GET  /env/manifest              -> {"vars":[{name,description}]}  (names only, no values)
   GET  /served                                    -> {"served": N, "truncated": bool}   (R14)
 
 Injected secret values (the Blob SAS, the app credential, the per-project database DSN) are
@@ -60,7 +59,8 @@ APP_USER = os.environ.get("APP_USER", "appuser")
 #
 # `_Dev.ready` is therefore write-only, and that is deliberate rather than leftover: it is the
 # handle the tests use to PROVE the marker cannot decide readiness (set it True, watch
-# `/dev/status` still answer False — `test_dev_status_is_not_ready_while_the_route_is_still_compiling`).
+# `/dev/status` still answer False —
+# `test_dev_status_is_not_ready_while_the_route_is_still_compiling`).
 # Delete the field and you delete the guard against the single most dangerous regression here,
 # which is someone restoring the marker as a precondition and pinning `ready` False forever over
 # a dev server the agent started itself. The marker LINE is still appended to `_Dev.lines`, so
@@ -78,12 +78,16 @@ APP_UID, APP_GID, APP_HOME = _pw.pw_uid, _pw.pw_gid, _pw.pw_dir
 # string sails straight through), so an allowlist is the only safe scrub for an untrusted child.
 _ENV_ALLOW_NAMES = frozenset({"PATH", "HOME", "USER", "LOGNAME", "LANG", "TZ", "TERM", "PWD"})
 _ENV_ALLOW_PREFIXES = ("LC_", "NODE_", "NEXT_", "CHOKIDAR_", "WATCHPACK_", "npm_")
+
+
 # The SINGLE source of truth for the injected-env contract: (name, description, secret?). ACA
-# injects these BIAL_* vars at provision — the ONLY BIAL_* the child may read. The three views below
-# (child-env allowlist, /env/manifest, redaction set) are DERIVED from this table so they can't
-# drift. Listed EXPLICITLY (not via a suffix rule) because several end in `_URL`, which a denylist
-# would wrongly drop; the SAS is a bearer CAPABILITY, not an identity label (C9 §6). Add a row here
-# or the child never sees the var (fail closed).
+# injects these BIAL_* vars at provision — the ONLY BIAL_* the child may read. The two views below
+# (child-env allowlist, redaction set) are DERIVED from this table so they can't drift.
+# `description` stays even though `/env/manifest` — its one reader — is gone (U29, dead code:
+# nothing ever called it): the table remains the documented contract surface. Listed EXPLICITLY
+# (not via a suffix rule) because several end in `_URL`, which a denylist would wrongly drop; the
+# SAS is a bearer CAPABILITY, not an identity label (C9 §6). Add a row here or the child never
+# sees the var (fail closed).
 class InjectedEnvVar(NamedTuple):
     name: str
     description: str
@@ -92,7 +96,9 @@ class InjectedEnvVar(NamedTuple):
 
 _INJECTED_ENV: tuple[InjectedEnvVar, ...] = (
     InjectedEnvVar("BIAL_APP_ID", "the app's id", False),
-    InjectedEnvVar("BIAL_PORTAL_ORIGIN", "the portal origin (preview framing / error relay)", False),
+    InjectedEnvVar(
+        "BIAL_PORTAL_ORIGIN", "the portal origin (preview framing / error relay)", False
+    ),
     InjectedEnvVar("BIAL_BLOB_CONTAINER_URL", "the app's per-app Blob container URL", False),
     InjectedEnvVar("BIAL_BLOB_SAS", "the container-scoped SAS (secret — never printed)", True),
     InjectedEnvVar(
@@ -1070,14 +1076,6 @@ def dev_compile() -> dict[str, Any]:
             "reason": _Compile.reason,
             "connect_generation": _Compile.connect_generation,
         }
-
-
-@app.get("/env/manifest", dependencies=[Depends(_auth)])
-def env_manifest() -> dict[str, Any]:
-    # NAMES + descriptions only — NEVER values (the SAS value is redacted everywhere else, and is
-    # absent here by construction). Derived from _INJECTED_ENV so it can never drift from the
-    # allowlist. Documents the contract surface, so a name appears whether or not it is set.
-    return {"vars": [{"name": v.name, "description": v.description} for v in _INJECTED_ENV]}
 
 
 # --- R14: what the generated app actually served -----------------------------------------

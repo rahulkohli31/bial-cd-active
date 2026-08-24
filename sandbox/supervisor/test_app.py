@@ -33,7 +33,7 @@ atexit.register(shutil.rmtree, _WS, ignore_errors=True)  # don't leak the temp w
 
 from urllib.parse import unquote  # noqa: E402
 
-from app import _BIAL_INJECTED_KEYS, APP_HOME, WORKSPACE, _child_env, _redact, app  # noqa: E402
+from app import APP_HOME, WORKSPACE, _child_env, _redact, app  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402  (must follow the env seeding above)
 
 TOKEN = os.environ["SUPERVISOR_TOKEN"]
@@ -401,28 +401,16 @@ def test_child_env_admits_the_blob_vars() -> None:
     assert "SUPERVISOR_TOKEN" not in env  # the real token is never carried into the child env
 
 
-# --- U8: GET /env/manifest — names + descriptions, NEVER values -------------------------------
-def test_env_manifest_requires_auth() -> None:
-    assert client.get("/env/manifest").status_code == 401
-
-
-def test_env_manifest_returns_names_with_descriptions_and_no_values() -> None:
-    os.environ["BIAL_BLOB_SAS"] = "sv=2021&sr=c&sig=SUPERSECRETSIGVALUE"
-    try:
-        r = client.get("/env/manifest", headers=AUTH)
-    finally:
-        os.environ.pop("BIAL_BLOB_SAS", None)
-    assert r.status_code == 200
-    body = r.json()
-    names = [v["name"] for v in body["vars"]]
-    # The manifest is DERIVED from the same table as the child-env allowlist, so assert they match
-    # EXACTLY — a var can never be advertised-but-not-injected (or injected-but-not-advertised).
-    assert names == list(_BIAL_INJECTED_KEYS)
-    assert {"BIAL_APP_ID", "BIAL_BLOB_CONTAINER_URL", "BIAL_BLOB_SAS"} <= set(names)
-    # Every entry is exactly {name, description} — a description present, no value field anywhere.
-    assert all(set(v.keys()) == {"name", "description"} and v["description"] for v in body["vars"])
-    # The SAS VALUE never appears in the manifest response (names only).
-    assert "SUPERSECRETSIGVALUE" not in r.text
+# --- U29: GET /env/manifest is retired — nothing in the platform had ever called it -----------
+def test_env_manifest_is_gone() -> None:
+    # Dead-code removal, not a behavior change: the backend never called this route (grep across
+    # `backend/` turns up nothing), so nothing loses a capability it was actually using. FastAPI
+    # answers an unregistered path with a plain 404 — verified here at the TestClient/app level.
+    # This proves the ROUTE is gone from the code; it does NOT prove a deployed container answers
+    # 404 today; that fact ships only once this image is rebuilt.
+    assert client.get("/env/manifest", headers=AUTH).status_code == 404
+    # Even unauthenticated, it's a 404 — there is no route left for `_auth` to guard.
+    assert client.get("/env/manifest").status_code == 404
 
 
 # --- U8: the pure redactor — raw (already-encoded) AND URL-decoded forms, min-length guard -----

@@ -203,15 +203,6 @@ export interface StepEvent {
   hidden?: boolean
 }
 
-/** `log` — one LF-normalized build/install/dev-server line (C7 §3.2). */
-export interface LogEvent {
-  type: 'log'
-  seq: number
-  source: string
-  stream: 'stdout' | 'stderr'
-  text: string
-}
-
 /** `error` — the structured, self-heal-relevant error BRAIN reacts to (C7 §3.3). */
 export interface ErrorEvent {
   type: 'error'
@@ -299,12 +290,14 @@ export interface EndedEvent {
 }
 
 /**
- * The full 8-member C7 union (discriminated on `type`). A `switch` over `.type`
+ * The full 7-member C7 union (discriminated on `type`). A `switch` over `.type`
  * ending in `assertNever` is a compile error until every arm is handled.
+ *
+ * U29 retired `LogEvent`: no production BRAIN path had ever emitted a `log` frame, so this was
+ * a consumer arm the server could never actually feed. Removing it drops the count from 8 to 7.
  */
 export type ProgressEnvelope =
   | StepEvent
-  | LogEvent
   | ErrorEvent
   | PreviewReadyEvent
   | PreviewReconnectingEvent
@@ -313,10 +306,10 @@ export type ProgressEnvelope =
   | EndedEvent
 
 /**
- * The 6-member SUBSET the activity feed renders (U3). BOTH preview signals are excluded:
+ * The 5-member SUBSET the activity feed renders (U3). BOTH preview signals are excluded:
  * the owning hook (U4/U5) routes `preview_ready` and `preview_reconnecting` to preview STATUS
  * only (frame reload / reconnecting flag), never to a feed row — so the feed's `switch` +
- * `assertNever` stays over SIX members, and an `assertNever` over the full 8-member union would
+ * `assertNever` stays over FIVE members, and an `assertNever` over the full 7-member union would
  * (correctly) fail to compile without those two arms (C7 §3.4).
  */
 export type FeedEnvelope = Exclude<ProgressEnvelope, PreviewReadyEvent | PreviewReconnectingEvent>

@@ -2,12 +2,13 @@
 
 One `ProgressEmitter` per run owns one counter behind one `_emit` coroutine: every envelope's
 `seq` is assigned there and nowhere else, so the stream is strictly `+1` and gap-free (KD-12).
-Nothing calls `on_progress` directly. Typed helpers construct the SEVEN C7 members BRAIN may emit;
-the `log` helper redacts raw stdout/stderr before it egresses (C7 §3.2 relays it to the portal
-verbatim — the same egress `error.cleaned_stack` is redacted for, KD-5), and `error` carries a
-`BuildError` already de-noised + redacted by `errors.declutter`.
+Nothing calls `on_progress` directly. Typed helpers construct the FIVE C7 members BRAIN may emit
+(step, error, preview_ready, escalation, quota_exceeded) plus the non-C7 `preview_reconnecting`
+signal (F8/U5); `error` carries a `BuildError` already de-noised + redacted by `errors.declutter`.
+U29 retired the `log` C7 member and its helper — no production path had ever called it, so the
+raw stdout/stderr egress it once redacted before relaying (C7 §3.2) never actually shipped.
 
-There is deliberately NO `ended` helper — the seventh member is SESSION-API's alone (R7). It emits
+There is deliberately NO `ended` helper — the sixth member is SESSION-API's alone (R7). It emits
 the single terminal frame from `_do_finalize`, AFTER its C4 snapshot, continuing this run's stream
 at `last_seq + 1` (the emitter's final `last_seq` is handed over on `BuildResult.last_seq`), so the
 `seq` chain stays gap-free ACROSS the handoff. Withholding the helper is what makes "BRAIN cannot
@@ -39,7 +40,6 @@ from src.api.v1.build_sessions.schemas import (
     BuildError,
     ErrorEvent,
     EscalationEvent,
-    LogEvent,
     PreviewReadyEvent,
     PreviewReconnectingEvent,
     ProgressEnvelope,
@@ -47,7 +47,6 @@ from src.api.v1.build_sessions.schemas import (
     QuotaExceededEvent,
     StepEvent,
 )
-from src.services.orchestrator.errors import redact_secrets
 
 logger = structlog.get_logger()
 
@@ -86,14 +85,6 @@ class ProgressEmitter:
         # False so every existing caller keeps emitting a visible step unchanged.
         return await self._emit(
             lambda seq: StepEvent(seq=seq, name=name, label=label, state=state, hidden=hidden)
-        )
-
-    async def log(self, *, source: str, stream: Literal["stdout", "stderr"], text: str) -> int:
-        # Redact BEFORE wrapping — raw exec/dev output can carry app-env credentials and this
-        # text is relayed to the portal verbatim (KD-5).
-        clean = redact_secrets(text)
-        return await self._emit(
-            lambda seq: LogEvent(seq=seq, source=source, stream=stream, text=clean)
         )
 
     async def error(self, error: BuildError) -> int:

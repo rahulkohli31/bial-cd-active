@@ -31,20 +31,22 @@ addopts = "-m 'not integration' --strict-markers"
 # sandbox/ Python). Mirrors backend's rule set + line-length.
 #
 # py313 because the image now ships Python 3.13 (the Debian 13 base's python3, up from 3.11 on
-# bookworm). Note what this target does NOT cover: `supervisor/app.py` is `extend-exclude`d below,
-# so the file that actually runs on the image's Python is the one file ruff never lints. This
-# target governs `test_app.py` and `tests/` — which run under the backend's 3.14 env, a superset.
-# Verified zero delta when moving py311 -> py313: `ruff check` and `ruff format --check` are clean
-# on both.
+# bookworm). This target governs `test_app.py` AND `supervisor/app.py` (U29 dropped the
+# `extend-exclude` below — see that unit for why) — which run under the backend's 3.14 env, a
+# superset. Verified zero delta when moving py311 -> py313: `ruff check` and `ruff format --check`
+# are clean on both.
 [tool.ruff]
 target-version = "py313"
 line-length = 99
-# `supervisor/app.py` is the FROZEN C1 supervisor, forked VERBATIM from the proven spike. Track
-# SANDBOX pins its behavior with tests but does NOT rewrite it (plan Output Structure: "unchanged";
-# C1 change-control couples app.py ↔ the C1 doc — they move together, so a lone formatter wrap here
-# has no doc counterpart). It carries one pre-existing 100-char line (Stage-0 debt); we neither
-# reformat nor re-lint it under Track SANDBOX. `test_app.py` (which we DO own) stays linted.
-extend-exclude = ["supervisor/app.py"]
+# U29 REMOVED the `extend-exclude = ["supervisor/app.py"]` that used to sit here. Its "frozen,
+# forked verbatim from the proven spike" rationale had gone stale: the file had grown to ~1150
+# lines against the spike's 228, and it is the one file that runs on the shipped image ruff had
+# never linted (ASM33). The fix here was DELIBERATELY CAPPED to `ruff format` plus non-behavioural
+# lint fixes (imports, unused names, style) — any change to control flow, exception handling, or a
+# subprocess invocation was left alone for its own follow-up with its own review, because this file
+# spawns the dev server and builds the fail-closed child environment and no CI covers a bad autofix
+# here before it ships. `supervisor/test_app.py` staying green after the format pass is what proves
+# the changes made were the non-behavioural kind they claimed to be.
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
