@@ -185,11 +185,6 @@ async def lock_is_held(redis: aioredis.Redis, user_uuid: uuid.UUID) -> bool:
     return bool(await redis.exists(lock_key(user_uuid)))
 
 
-def lock_expires_at(anchor: datetime | None = None) -> datetime:
-    """The UTC instant a just-set lock lapses if not renewed (`LOCK_TTL_SECONDS` out)."""
-    return (anchor or datetime.now(UTC)) + timedelta(seconds=LOCK_TTL_SECONDS)
-
-
 # --- the idle heartbeat (C5) -------------------------------------------------
 
 
