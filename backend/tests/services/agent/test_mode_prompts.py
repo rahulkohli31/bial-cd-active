@@ -15,7 +15,7 @@ import pytest
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from src.core.prompt_blocks import PORTAL_SURFACES, WRITE_IDENTITY
+from src.core.prompt_blocks import NARRATION_VOICE, PORTAL_SURFACES, WRITE_IDENTITY
 from src.db.models.conversation import ConversationMode
 from src.services.agent.agent import ChatDeps, chat_agent
 from src.services.agent.mode_prompts import (
@@ -113,6 +113,10 @@ def test_the_write_segment_and_the_build_prompt_come_from_one_source() -> None:
     assert WRITE_IDENTITY in composed
     assert WRITE_IDENTITY in BUILD_SYSTEM_PROMPT
     assert BUILD_WORKING_RULES_HEAD in BUILD_SYSTEM_PROMPT
+    # U15's audience block is shared the same way — one constant, reached by both Write prompts
+    # through the TAIL they already share, so neither can grow a voice the other does not have.
+    assert NARRATION_VOICE in composed
+    assert NARRATION_VOICE in BUILD_SYSTEM_PROMPT
 
 
 def test_write_states_the_data_integrity_rules_exactly_once() -> None:
@@ -123,17 +127,128 @@ def test_write_states_the_data_integrity_rules_exactly_once() -> None:
     assert composed.count(DATA_INTEGRITY_RULES) == 1
 
 
-def test_write_teaches_the_commit_discipline_as_a_capability() -> None:
-    """W1. The agent commits as it works so it can `git diff` its own changes and revert its own
-    mistakes — a capability, not bookkeeping. Pin both halves, including the anti-pattern: a
-    blanket `git add -A` produces one undifferentiated commit and destroys the granularity the
-    requirement exists to produce."""
+def test_write_speaks_to_the_person_who_asked_for_the_app() -> None:
+    """U15 / R20 / R22. Write mode carried NO audience instruction at all — Plan carried a full
+    plain-language contract and Ask deliberately pushes the other way — and the demo build spent
+    2,397 words of paths, commands, and framework nouns on a citizen. The composed Write prompt now
+    carries the audience block, and the assertions pin the bar CONCRETELY (the length, the plain
+    register, what stays behind the scenes, and that the failure turns are covered too) rather than
+    just proving some voice text exists."""
     composed = compose_mode_prompt(ConversationMode.WRITE, _CONTEXT)
-    assert "COMMIT AS YOU WORK" in composed
-    assert "git diff" in composed
-    assert "git add -A" in composed  # named, as the thing NOT to do by habit
-    # Committing is explicitly not the same as the user keeping the work (KTD-5e / W2).
-    assert "does not save the user's work" in composed
+    assert NARRATION_VOICE in composed
+    lowered = composed.lower()
+    assert "talking to the user" in lowered
+    assert "a couple of lines at each milestone" in lowered  # R22's length bar
+    # The SAME register Plan already speaks — U15 matched a voice rather than inventing a second.
+    assert "plain, everyday words" in lowered
+    assert "keep the how-it's-built details behind the scenes" in lowered
+    assert "the file and folder names, the commands you run" in lowered
+    # R20 covers the hard turns as well: a failure and its recovery stay in product language.
+    assert "when something goes wrong" in lowered
+    # R23: the technical record is untouched, which is what lets the narration be short.
+    assert "recorded step by step" in lowered
+
+
+def test_the_audience_block_is_emitted_exactly_once() -> None:
+    """The DATA_INTEGRITY_RULES trap, one block over. The audience wording rides
+    `BUILD_WORKING_RULES_TAIL`, which `_WRITE_SEGMENT` already composes — so "adding" it to the
+    segment's block list (the obvious move) would print the whole voice rule twice in every Write
+    prompt while the build prompt printed it once. Counting is the point: an `in` assertion is
+    green at one copy and at five."""
+    composed = compose_mode_prompt(ConversationMode.WRITE, _CONTEXT)
+    assert composed.count(NARRATION_VOICE) == 1
+    assert composed.count("A couple of lines at each milestone") == 1
+    assert composed.count("TALKING TO THE USER") == 1
+    assert BUILD_SYSTEM_PROMPT.count(NARRATION_VOICE) == 1
+
+
+def test_ask_mode_still_names_the_actual_files() -> None:
+    """The audience block belongs to Write, not to every mode. Ask answers a question ABOUT the
+    code to someone reading about code, so "name the actual files and quote the actual code" is
+    correct there and must survive this unit — a future author harmonising Ask with Write would
+    make its answers useless."""
+    composed = compose_mode_prompt(ConversationMode.ASK, _CONTEXT)
+    assert "name the actual files and quote the actual code" in _ASK_SEGMENT
+    assert "name the actual files and quote the actual code" in composed
+    assert NARRATION_VOICE not in composed
+
+
+def test_plan_mode_keeps_its_own_contract_untouched() -> None:
+    """Plan's plain-language contract is what U15 MATCHED, not what it replaced. It stays exactly
+    where it was, and Plan does not inherit the Write block — which would drag build-mode framing
+    ("what you are building right now") into a turn where nothing is being built yet."""
+    composed = compose_mode_prompt(ConversationMode.PLAN, _CONTEXT)
+    assert NARRATION_VOICE not in composed
+    lowered = _PLAN_SEGMENT.lower()
+    assert "plain, everyday words" in lowered
+    assert "keep the how-it's-built details behind the scenes" in lowered
+    assert "present_plan_options" in composed
+
+
+# --- U19 / R25: the version control the agent no longer does ---------------------------------
+#
+# THESE THREE REPLACE `test_write_teaches_the_commit_discipline_as_a_capability`, WHICH IS FLIPPED
+# RATHER THAN DELETED. It used to assert `COMMIT AS YOU WORK`, `git diff` and `git add -A` were
+# all present, because the Write segment taught the agent to stage and commit each coherent slice.
+# The platform commits the tree itself at every turn boundary
+# (`build_sessions/snapshot._COMMIT_SCRIPT`), so that instruction bought the user nothing and cost
+# them a shell round trip and a paragraph of narration per slice.
+#
+# TWO INERTNESS GUARDS AND ONE LIVENESS GUARD, and the third is not decoration: an inertness pair
+# on its own is greenest against a Write prompt somebody deleted outright, so one rule that must
+# SURVIVE every trim is asserted next to them.
+
+_RETIRED_GIT_INSTRUCTIONS = (
+    # The commit discipline itself.
+    "git add",
+    "git commit",
+    # THE UNDO HALF, and the reason this is a set rather than one assertion. The deleted block
+    # taught `git checkout` and `git revert` for backing out a bad edit; both — and `git reset`,
+    # and `git stash` — leave a HEAD that is NOT a descendant of the copy on record, over a
+    # perfectly good tree. That is precisely the input the workspace-integrity verdict has to
+    # reason about before it may call a workspace REVERTED. The verdict closes the hazard on its
+    # own (it requires the CONTENT to disagree as well as the lineage); this stops a future
+    # prompt edit from feeding it self-inflicted non-descendant HEADs, and reintroducing ANY ONE
+    # of the five turns it red.
+    "git checkout",
+    "git revert",
+    "git reset",
+    "git stash",
+)
+
+
+@pytest.mark.parametrize(
+    "prompt_name", ["write_mode_segment", "build_system_prompt"], ids=["write_mode", "build"]
+)
+def test_neither_write_prompt_instructs_the_agent_in_git(prompt_name: str) -> None:
+    """★ THE INERTNESS GUARD (U19 / R25, cross-plan constraint 9). Asserted as a SET so the
+    failure names every instruction that crept back, and asserted on BOTH Write prompts because
+    they compose from shared blocks and either composition site could grow one.
+
+    Mutation check: put any of the six back into `BUILD_WORKING_RULES_HEAD` and this goes red."""
+    prompt = (
+        compose_mode_prompt(ConversationMode.WRITE, _CONTEXT)
+        if prompt_name == "write_mode_segment"
+        else BUILD_SYSTEM_PROMPT
+    )
+    lowered = prompt.lower()
+    found = {phrase for phrase in _RETIRED_GIT_INSTRUCTIONS if phrase in lowered}
+    assert found == set(), f"{prompt_name} instructs the agent in git again: {sorted(found)}"
+    # The header of the deleted block, named separately so a reworded revival still trips.
+    assert "commit as you work" not in lowered
+
+
+def test_the_write_prompt_still_says_not_to_restart_the_dev_server() -> None:
+    """★ THE LIVENESS GUARD, and the one rule this unit must not take with it.
+
+    The agent can start a dev server of its own through `run_command` — the supervisor's child
+    env carries no marker that would tell the harness's flag apart from the real one — so this
+    sentence is the whole of what stops a second `next dev` racing the one the harness reads to
+    verify the build. It survives every prompt trim in this plan."""
+    composed = compose_mode_prompt(ConversationMode.WRITE, _CONTEXT)
+    lowered = composed.lower()
+    assert "the dev server (`next dev`) is already running" in lowered
+    assert "do not start, restart, or kill it" in lowered
 
 
 @pytest.mark.parametrize("mode", list(ConversationMode))
@@ -259,3 +374,29 @@ async def test_mode_without_context_fails_first(db_session) -> None:
     deps = ChatDeps(db=db_session, user_id=uuid.uuid4(), mode=ConversationMode.PLAN)
     with pytest.raises(ValueError, match="composed without a PromptContext"):
         await chat_agent.run("hi", deps=deps, model=_capturing_model({}))
+
+
+def test_ask_no_longer_promises_an_emptiness_signal_that_never_arrives() -> None:
+    """★ U20 / R26 — THE PROMISE IS GONE BECAUSE THE SIGNAL NEVER ARRIVES.
+
+    Ask used to tell the model "If there is no app yet, your tools will tell you truthfully."
+    `EmptyProjectWorkspace` — the only workspace that answers that way — is reachable from one
+    branch of `turns/engine._workspace_for`, and that branch requires `sandbox_client is None`:
+    NO SANDBOX SERVICE CONFIGURED. In the configured deployment a brand-new project gets the
+    live container like every other project (the deliberate 2026-07-30 decision recorded in that
+    method), and the container holds the golden template — so the reads come back FULL, of
+    template files, and a model waiting for an emptiness signal spends round-trips looking for
+    one that is not coming.
+
+    Inertness plus liveness, because deleting the sentence outright would pass an inertness
+    check while leaving the model with no account at all of what a fresh project looks like."""
+    composed = compose_mode_prompt(ConversationMode.ASK, _CONTEXT)
+    lowered = composed.lower()
+
+    # INERTNESS — the promise, in the wording that made it.
+    assert "your tools will tell you truthfully" not in lowered
+    assert "if there is no app yet" not in lowered
+
+    # LIVENESS — what a fresh project ACTUALLY reads as, so the model is not left guessing.
+    assert "starter template" in lowered
+    assert "what could be built" in lowered

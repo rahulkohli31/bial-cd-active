@@ -1,10 +1,15 @@
 /**
  * The chat-native build narrative (U15): ONE assistant bubble that carries the whole
- * live build — friendly steps, a working indicator with elapsed-time reassurance, the
- * Stop / Force-end controls, and a Details expander holding the raw (server-redacted)
- * output. It replaces the cockpit's ActivityFeed pane and SessionControls row: the
- * right pane frames only the app, and the build can never look "dead" — this bubble is
- * visibly alive for exactly as long as the session is.
+ * live build — friendly steps, a working indicator with elapsed-time reassurance, and the
+ * Stop / Force-end controls. It replaces the cockpit's ActivityFeed pane and SessionControls
+ * row: the right pane frames only the app, and the build can never look "dead" — this bubble
+ * is visibly alive for exactly as long as the session is.
+ *
+ * NOTHING IN THIS BUBBLE IS ADDRESSED TO A DEVELOPER (U16). The raw-output expander is gone —
+ * it was the last place a citizen could open and find shell lines — and an error status renders
+ * the platform's product sentence plus a next action, never the compiler's own title and never
+ * a <pre> stack. The developer detail still exists and still travels; it goes to the agent,
+ * which is the party that can act on it.
  *
  * Input is the same C7 envelope stream the feed consumed (pushed into visible React
  * state up front by `useBuildSession` — never a remount). `preview_ready` stays routed
@@ -27,14 +32,13 @@ import {
   XCircle,
 } from 'lucide-react'
 import type { ReactElement } from 'react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { cn } from '@/lib/utils'
 import type {
   BuildSessionStatus,
   ErrorEvent,
   EscalationEvent,
   FeedEnvelope,
-  LogEvent,
   QuotaExceededEvent,
   StepEvent,
 } from '../../utils/buildSessionTypes'
@@ -71,6 +75,125 @@ export interface BuildProgressProps {
    *  pass it; the row below falls back to the client-side quota copy rather than rendering
    *  nothing, so a missing prop degrades the message instead of losing it. */
   atLimitText?: string | null
+}
+
+/**
+ * THE COMMITTED FALLBACK (U16), for a failure with no product-language equivalent.
+ *
+ * Named constants because every copy decision in this codebase is one — `LivePreview.tsx` sets
+ * the convention with `FRAMING_TEXT` / `SLOW_TEXT` / `GONE_TITLE` — and it lives HERE, in the
+ * feed's own module, rather than being imported across from the preview pane: the two surfaces
+ * answer different questions and should be free to move apart.
+ *
+ * THE ACTION HALF IS NOT DECORATION. Deleting a stack trace and leaving a bare apology trades a
+ * dead end the reader cannot act on for a quieter one; a rendered error status without a next
+ * step is still a rendered error status the reader cannot act on. Both halves render, always —
+ * for the legacy C7 feed, which carries neither field, and for any error class the server has
+ * no sentence for. The server's own last-resort copy is word-for-word identical, so which side
+ * supplied it is invisible to the reader.
+ */
+export const ERROR_FALLBACK_MESSAGE = 'We hit a problem finishing that change.'
+export const ERROR_FALLBACK_ACTION =
+  'Try describing what you want again, or ask for something simpler.'
+
+/** The citizen-facing pair for one error status — the server's when it sent one, the committed
+ *  fallback when it did not. Never returns an empty half. */
+function userFacingError(env: ErrorEvent): { message: string; action: string } {
+  return {
+    message: env.user_message || ERROR_FALLBACK_MESSAGE,
+    action: env.user_action || ERROR_FALLBACK_ACTION,
+  }
+}
+
+/**
+ * THE HARNESS'S OWN TURN-START ROW (U17), told apart from the agent's real steps by a reserved
+ * tool name it emits under (`ACK_TOOL` in `services/turns/engine.py` — keep the two in step).
+ *
+ * It needs a name at all because it is the one step envelope that must never be treated as
+ * work: it is REPLACED by the first real step rather than listed beside it, it never reaches
+ * the finished build's step history, and on its own it is not a build narrative — an
+ * acknowledgement is not a reason to draw an empty bubble around a chat turn that has nothing
+ * else to say.
+ */
+export const ACK_STEP_NAME = '__ack__'
+
+/**
+ * THE ANNOUNCEMENT CADENCE (U17) — how often the live region below is allowed to speak.
+ *
+ * A CORRECTNESS DETAIL, NOT POLISH. The region is `aria-atomic`, so any change to it
+ * re-announces the WHOLE line; a long-operation status line that is "refreshed until it
+ * completes" would otherwise be a screen reader repeating the same sentence every few seconds
+ * for the length of an npm install. Two rules, and the second is what makes the first enough:
+ * announce only when the text actually CHANGES (an identical refresh mutates no DOM, so it is
+ * silent by construction), and at most once per this interval — a burst of steps arriving
+ * faster than anyone can listen coalesces to its newest line rather than queueing six.
+ *
+ * Trailing-edge, never dropping: a change held back by the window is announced when the window
+ * elapses — or immediately, flushed rather than discarded, if the build ends first. See the
+ * FLUSH branch in `useAnnouncement`: without it, a step held inside the window when the build
+ * ends would be overwritten by the terminal `''` sentinel and never spoken at all.
+ */
+export const ANNOUNCE_MIN_INTERVAL_MS = 10_000
+
+/** The neutral live-row copy for "the agent is busy with something you were not shown". */
+const WORKING_PLACEHOLDER = 'Working…'
+
+/**
+ * The text the live region is currently allowed to be announcing — `text`, rate-limited to one
+ * change per `ANNOUNCE_MIN_INTERVAL_MS`.
+ *
+ * The visible row is deliberately NOT throttled with it: a failed step has to appear the
+ * instant it arrives (the live row is the fastest signal something went wrong), and only the
+ * SPEAKING of it is worth pacing.
+ *
+ * FLUSHES rather than drops a held change when the build ends. The call site passes `''` the
+ * instant the build stops being active — that is the ONE way `text` ever becomes the empty
+ * sentinel — so if a real change was still sitting in `pending` (held inside the window, not yet
+ * announced) when that happens, it is the build's last meaningful step and is spoken now instead
+ * of being silently overwritten by the sentinel.
+ */
+function useAnnouncement(text: string): string {
+  const [announced, setAnnounced] = useState(text)
+  // 0, not `Date.now()`: content present when a live region is inserted is not announced, so
+  // the first real change after mount has no earlier announcement to be spaced away from and
+  // must not be delayed behind a window that never spoke.
+  const lastAnnouncedAt = useRef(0)
+  const pending = useRef(text)
+  // Set once the flush below has delivered a held change. From then on `text` stays `''` for
+  // the life of this hook (the build is over), so there is nothing left to throttle — and
+  // running the throttle again would schedule a second pass that eventually overwrites the
+  // just-flushed announcement with `''`, quietly reintroducing the same drop one step later.
+  const flushed = useRef(false)
+  useEffect(() => {
+    if (flushed.current) return undefined
+    // THE FLUSH (fixes the regression: a held change silently dropped when the build ends
+    // before its window elapses). `pending.current` still holds whatever change was held —
+    // the cleanup below only cancels the timer, it never touches `pending` — so if that held
+    // value hasn't reached `announced` yet, it is spoken now, once, instead of being lost when
+    // the line below overwrites `pending.current` with the terminal `''`.
+    if (text === '' && pending.current !== '' && pending.current !== announced) {
+      flushed.current = true
+      setAnnounced(pending.current)
+      return undefined
+    }
+    pending.current = text
+    if (text === announced) return undefined
+    const wait = ANNOUNCE_MIN_INTERVAL_MS - (Date.now() - lastAnnouncedAt.current)
+    if (wait <= 0) {
+      lastAnnouncedAt.current = Date.now()
+      setAnnounced(text)
+      return undefined
+    }
+    // Re-armed on every further change while the window runs, and always against the SAME
+    // absolute deadline (`wait` is recomputed from the last announcement, not from now), so a
+    // stream of changes cannot push the announcement out indefinitely.
+    const timer = setTimeout(() => {
+      lastAnnouncedAt.current = Date.now()
+      setAnnounced(pending.current)
+    }, wait)
+    return () => clearTimeout(timer)
+  }, [text, announced])
+  return announced
 }
 
 /** An email address inside otherwise-plain prose. Deliberately CONSERVATIVE — it must not match
@@ -291,9 +414,13 @@ export function hasBuildNarrative(
   // terminal, where the render below would show nothing and the chrome would be an empty
   // grey bubble.
   const terminal = status === 'ended' || status === 'failed'
+  // U17 — the acknowledgement is explicitly NOT a narrative. It rides inside a bubble that
+  // exists for some other reason (a headline, a step, an alert); counting it here would draw
+  // the build bubble around every Ask turn in the product and leave an empty grey wrapper
+  // behind each answer, since the row itself never survives into the step history.
   return envelopes.some(
     (env) =>
-      (env.type === 'step' && !env.hidden) ||
+      (env.type === 'step' && !env.hidden && env.name !== ACK_STEP_NAME) ||
       (env.type === 'error' && !(env.recovering && terminal)) ||
       env.type === 'escalation' ||
       env.type === 'quota_exceeded',
@@ -340,24 +467,24 @@ export default function BuildProgress({
   // F3/U3: read-only + housekeeping steps are dropped from the VISIBLE feed (the raw command still
   // reaches the model). Everything below the fold renders the FRIENDLY label only — no raw shell.
   const visibleSteps = steps.filter((env) => !env.hidden)
-  const logs = rows.filter((env): env is LogEvent => env.type === 'log')
+  // `log` envelopes are deliberately NOT read here any more (U16). The Details expander that
+  // rendered them was the last surface in the chat where a citizen could open a disclosure and
+  // find raw, redacted-but-still-raw shell output — a developer surface behind one click. The
+  // lines are still produced and still relayed; nothing in this bubble renders them.
   const alerts = rows.filter(
     (env): env is AlertEnvelope =>
       env.type === 'error' || env.type === 'escalation' || env.type === 'quota_exceeded',
   )
   const line = headline(status)
-  if (!hasBuildNarrative(status, envelopes)) return null
+  // U17 — the harness's acknowledgement is not one of the agent's steps. It NEVER reaches the
+  // finished build's history (a transcript that accumulated one "Getting started on that…" per
+  // turn is the thing it must not become) and it holds the live row only until there is real
+  // work to show, which is what "replaced by the first real step" means concretely.
+  const realSteps = visibleSteps.filter((env) => env.name !== ACK_STEP_NAME)
+  const liveSteps = realSteps.length > 0 ? realSteps : visibleSteps
 
   // The LIVE view is ONE row, in one fixed spot: the most recent step replaces the
   // previous one in place rather than the transcript growing a line per step.
-  // `role="status" aria-atomic="true"` — NOT `role="log"`, which describes an
-  // APPENDING region where old entries persist; this node's one child is replaced
-  // in place, and `status` (with its implicit `aria-live="polite"`) is the role for
-  // a single live-updating value, `aria-atomic` making the whole line announce
-  // coherently rather than as a partial diff. Under a burst of steps arriving
-  // faster than a screen reader can speak them, only the newest one is ever
-  // announced — that's an accepted trade, not a bug: the newest step is the only
-  // authoritative one.
   //
   // Picked by WHAT'S ACTUALLY RUNNING, not by array/seq (= call) order — with one
   // deliberate exception: once anything AFTER a `started` step has resolved (ok/failed),
@@ -368,13 +495,13 @@ export default function BuildProgress({
   // otherwise pin a stale step on the row forever and mask a genuinely newer `failed` step
   // behind it. A still-running parallel sibling degrades to the generic "Working…"
   // placeholder instead of losing the failure-masking guarantee.
-  const lastResolvedIndex = visibleSteps.reduce(
+  const lastResolvedIndex = liveSteps.reduce(
     (idx, s, i) => (s.state === 'ok' || s.state === 'failed' ? i : idx),
     -1,
   )
   const inFlightStep =
-    [...visibleSteps.slice(lastResolvedIndex + 1)].reverse().find((s) => s.state === 'started') ?? null
-  const lastStep = visibleSteps.length > 0 ? visibleSteps[visibleSteps.length - 1] : null
+    [...liveSteps.slice(lastResolvedIndex + 1)].reverse().find((s) => s.state === 'started') ?? null
+  const lastStep = liveSteps.length > 0 ? liveSteps[liveSteps.length - 1] : null
   const currentStep = inFlightStep ?? lastStep
   // Once every visible step has resolved OK but the session is still active (the agent
   // continues into hidden work, or is simply between calls), a resolved tick is never
@@ -383,11 +510,26 @@ export default function BuildProgress({
   // exception: it stays visible immediately rather than being masked behind a neutral
   // placeholder — the live row is the fastest signal something went wrong, and finding
   // 7's fail-open collapse below exists for exactly this "never hide a failure" reason.
-  const showWorkingPlaceholder = inFlightStep === null && lastStep !== null && lastStep.state !== 'failed'
+  const showWorkingPlaceholder =
+    inFlightStep === null && lastStep !== null && lastStep.state !== 'failed'
+  const activityLabel = currentStep
+    ? showWorkingPlaceholder
+      ? WORKING_PLACEHOLDER
+      : currentStep.label || currentStep.name
+    : ''
+  // NOTHING TO ANNOUNCE ONCE THE SESSION IS TERMINAL, which is what silences the region there:
+  // the outcome message owns the ending, and a live region still saying "Working…" under a
+  // finished build is the same lie the spinner used to tell.
+  //
+  // Called BEFORE the early return below — a hook that runs on some renders and not others is
+  // a hook-order crash, not a subtle bug.
+  const announcement = useAnnouncement(working ? activityLabel : '')
+  if (!hasBuildNarrative(status, envelopes)) return null
+
   const currentStepRow = currentStep ? (
-    <div role="status" aria-atomic="true" aria-label="Build activity">
+    <div data-testid="build-activity">
       <ToolActivityLine
-        label={showWorkingPlaceholder ? 'Working…' : currentStep.label || currentStep.name}
+        label={activityLabel}
         state={showWorkingPlaceholder ? 'started' : currentStep.state}
       />
     </div>
@@ -407,7 +549,44 @@ export default function BuildProgress({
           the one-row collapsed trigger doesn't visibly shrink the bubble in the same frame
           BuildOutcome appends below it — a cosmetic jump the reviewer flagged, not a functional
           one, but cheap to steady. */}
-      <div className={currentStepRow || visibleSteps.length > 0 ? 'min-h-[2.75rem]' : undefined}>
+      <div className={currentStepRow || liveSteps.length > 0 ? 'min-h-[2.75rem]' : undefined}>
+        {/* WHAT THE BUILD SAYS OUT LOUD — one line, spoken politely, never stealing focus.
+            `role="status" aria-atomic="true"` — NOT `role="log"`, which describes an APPENDING
+            region where old entries persist; this node's one child is replaced in place, and
+            `status` (with its implicit `aria-live="polite"`) is the role for a single
+            live-updating value, `aria-atomic` making the whole line announce coherently rather
+            than as a partial diff. Under a burst of steps arriving faster than a screen reader
+            can speak them, only the newest one is ever announced — that's an accepted trade, not
+            a bug: the newest step is the only authoritative one.
+
+            U17 EXTENDS THAT, it does not undo it. The atomic region is now a dedicated MIRROR of
+            the visible row rather than the visible row itself, because the two want different
+            clocks: the row has to update at the speed of the build (a failure must appear the
+            moment it lands), while the region — which re-announces its whole contents on every
+            change — has to update at the speed of a person listening. A long-operation status
+            line "refreshed until it completes" inside the visible node would be the same
+            sentence read aloud every few seconds. `useAnnouncement` is the pacing; `aria-atomic`
+            is still why the line is spoken whole.
+
+            RENDERED OUTSIDE the working/terminal split (not nested inside the live arm) for
+            exactly one reason: the regression fix. `useAnnouncement` FLUSHES a step that was
+            still held inside the throttle window when the build ends — that flush lands in
+            `announcement` on the SAME render that flips `working` to false, and a region gated
+            on `working` alone would unmount before that flushed text ever reached the DOM,
+            recreating the drop one layer up. Gating on `announcement !== ''` instead means the
+            ordinary terminal case (nothing was held) stays silent and absent exactly as before —
+            only a genuinely flushed announcement keeps it around for one more beat. */}
+        {(working || announcement !== '') && (
+          <div
+            role="status"
+            aria-atomic="true"
+            aria-label="Build activity"
+            className="sr-only"
+            data-testid="build-activity-announcement"
+          >
+            {announcement}
+          </div>
+        )}
         {working ? (
           <div className="space-y-2">
             {line && (
@@ -420,20 +599,20 @@ export default function BuildProgress({
             {currentStepRow}
           </div>
         ) : (
-          <StepHistoryCollapsible
-            steps={visibleSteps.map((s) => ({ ...s, id: String(s.seq) }))}
-          />
+          <StepHistoryCollapsible steps={realSteps.map((s) => ({ ...s, id: String(s.seq) }))} />
         )}
       </div>
 
       {alerts.map((env) => {
         if (env.type === 'error') {
+          // ONE PAIR, BOTH ARMS. Whether a failure reads as a retry or as the terminal red
+          // block changes the framing around it, never what the reader is told about their app
+          // or what they can do next.
+          const { message, action } = userFacingError(env)
           if (env.recovering) {
-            // A self-heal in progress, not a failure. The detail renders ONCE — the
-            // word-boundary-sliced title, no <pre> — so the old double render (prose +
-            // monospace, both clipped mid-word) cannot come back through the stack copy.
-            // At a terminal this envelope renders nothing: the outcome message owns the
-            // ending, and exactly one failure presentation may be visible there.
+            // A self-heal in progress, not a failure. At a terminal this envelope renders
+            // nothing: the outcome message owns the ending, and exactly one failure
+            // presentation may be visible there.
             if (!working) return null
             return (
               <div
@@ -446,9 +625,12 @@ export default function BuildProgress({
                   <RotateCw size={13} className="flex-shrink-0" />
                   <span>That didn’t work — trying another way</span>
                 </div>
-                {env.title && (
-                  <p className="mt-1 text-[11px] leading-relaxed text-neutral">{env.title}</p>
-                )}
+                <p className="mt-1 text-[11px] leading-relaxed text-neutral" data-part="message">
+                  {message}
+                </p>
+                <p className="mt-0.5 text-[11px] leading-relaxed text-neutral/80" data-part="action">
+                  {action}
+                </p>
               </div>
             )
           }
@@ -461,13 +643,15 @@ export default function BuildProgress({
             >
               <div className="flex items-center gap-1.5 text-xs font-semibold text-danger">
                 <XCircle size={13} className="flex-shrink-0" />
-                <span>{env.title}</span>
+                <span data-part="message">{message}</span>
               </div>
-              {env.cleaned_stack && (
-                <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-all text-[11px] leading-relaxed text-danger/80">
-                  {env.cleaned_stack}
-                </pre>
-              )}
+              {/* No <pre>, and no `title`. `cleaned_stack` is the de-noised compiler log and
+                  `title` its first meaningful line — both are built for the repair run, both
+                  still travel on the envelope, and neither is a thing to hand a citizen. What
+                  replaces them is the one line that tells the reader what to do next. */}
+              <p className="mt-1 text-[11px] leading-relaxed text-danger/80" data-part="action">
+                {action}
+              </p>
             </div>
           )
         }
@@ -481,11 +665,15 @@ export default function BuildProgress({
             >
               <div className="flex items-center gap-1.5 text-xs font-semibold text-tertiary">
                 <AlertTriangle size={13} className="flex-shrink-0 text-warning" />
-                <span>{env.detail || env.reason}</span>
+                <span data-part="message">{env.detail || env.reason}</span>
               </div>
-              {env.last_error && (
-                <p className="mt-1 text-[11px] text-neutral">{env.last_error.title}</p>
-              )}
+              {/* `last_error.title` used to render here. It is the SAME compiler-authored line
+                  the error arm above stopped showing, so leaving it on this row would have kept
+                  the developer surface alive one branch over. An escalation is an error status
+                  like any other, so it carries an action clause too. */}
+              <p className="mt-1 text-[11px] leading-relaxed text-neutral" data-part="action">
+                {ERROR_FALLBACK_ACTION}
+              </p>
             </div>
           )
         }
@@ -514,28 +702,6 @@ export default function BuildProgress({
           </div>
         )
       })}
-
-      {logs.length > 0 && (
-        // The raw output stays available, never ambient: server-redacted log lines live
-        // behind this expander only — the chat shows zero raw shell lines otherwise.
-        <details className="text-[11px]">
-          <summary className="cursor-pointer select-none text-neutral/70 hover:text-tertiary">
-            Details
-          </summary>
-          <div className="mt-1 max-h-48 space-y-0.5 overflow-auto rounded-lg bg-tertiary/5 p-2 font-mono">
-            {logs.map((env) => (
-              <div key={env.seq} className="flex items-start gap-2" data-kind="log" data-stream={env.stream}>
-                <span className="flex-shrink-0 select-none text-neutral/50">{env.source}</span>
-                <span
-                  className={`whitespace-pre-wrap break-all ${env.stream === 'stderr' ? 'text-danger/90' : 'text-neutral'}`}
-                >
-                  {env.text}
-                </span>
-              </div>
-            ))}
-          </div>
-        </details>
-      )}
 
       {active && !confirmingForceEnd && (
         <div className="flex items-center gap-2 pt-0.5">

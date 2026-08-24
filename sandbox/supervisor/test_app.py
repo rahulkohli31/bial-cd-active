@@ -33,7 +33,7 @@ atexit.register(shutil.rmtree, _WS, ignore_errors=True)  # don't leak the temp w
 
 from urllib.parse import unquote  # noqa: E402
 
-from app import _BIAL_INJECTED_KEYS, APP_HOME, WORKSPACE, _child_env, _redact, app  # noqa: E402
+from app import APP_HOME, WORKSPACE, _child_env, _redact, app  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402  (must follow the env seeding above)
 
 TOKEN = os.environ["SUPERVISOR_TOKEN"]
@@ -172,7 +172,14 @@ def test_a_manufactured_tty_is_refused_before_it_can_hang(monkeypatch: pytest.Mo
         # The message must name the way OUT, not just say no — a refusal the model cannot act
         # on just becomes another workaround attempt.
         assert "non-interactively" in body["stderr"], cmd
-        assert "--name" in body["stderr"], cmd
+        # ...and the way out it names must be one that WORKS. This assertion used to require
+        # `--name` here. U20 measured drizzle-kit 0.31.10 and found that flag answers nothing:
+        # the rename resolver is an interactive select no flag can satisfy. Pointing the model at
+        # a flag that cannot work is what sent the observed build hunting for a longer flag list.
+        # So this is flipped to an inertness guard — the refusal must NOT prescribe a flag as the
+        # answer — paired with the liveness half, that it still prescribes the real escape.
+        assert "--name" not in body["stderr"], cmd
+        assert "ONE kind of schema change per generate" in body["stderr"], cmd
 
     assert spawned == [], "a refused command must never reach subprocess.run"
 
@@ -394,28 +401,16 @@ def test_child_env_admits_the_blob_vars() -> None:
     assert "SUPERVISOR_TOKEN" not in env  # the real token is never carried into the child env
 
 
-# --- U8: GET /env/manifest — names + descriptions, NEVER values -------------------------------
-def test_env_manifest_requires_auth() -> None:
-    assert client.get("/env/manifest").status_code == 401
-
-
-def test_env_manifest_returns_names_with_descriptions_and_no_values() -> None:
-    os.environ["BIAL_BLOB_SAS"] = "sv=2021&sr=c&sig=SUPERSECRETSIGVALUE"
-    try:
-        r = client.get("/env/manifest", headers=AUTH)
-    finally:
-        os.environ.pop("BIAL_BLOB_SAS", None)
-    assert r.status_code == 200
-    body = r.json()
-    names = [v["name"] for v in body["vars"]]
-    # The manifest is DERIVED from the same table as the child-env allowlist, so assert they match
-    # EXACTLY — a var can never be advertised-but-not-injected (or injected-but-not-advertised).
-    assert names == list(_BIAL_INJECTED_KEYS)
-    assert {"BIAL_APP_ID", "BIAL_BLOB_CONTAINER_URL", "BIAL_BLOB_SAS"} <= set(names)
-    # Every entry is exactly {name, description} — a description present, no value field anywhere.
-    assert all(set(v.keys()) == {"name", "description"} and v["description"] for v in body["vars"])
-    # The SAS VALUE never appears in the manifest response (names only).
-    assert "SUPERSECRETSIGVALUE" not in r.text
+# --- U29: GET /env/manifest is retired — nothing in the platform had ever called it -----------
+def test_env_manifest_is_gone() -> None:
+    # Dead-code removal, not a behavior change: the backend never called this route (grep across
+    # `backend/` turns up nothing), so nothing loses a capability it was actually using. FastAPI
+    # answers an unregistered path with a plain 404 — verified here at the TestClient/app level.
+    # This proves the ROUTE is gone from the code; it does NOT prove a deployed container answers
+    # 404 today; that fact ships only once this image is rebuilt.
+    assert client.get("/env/manifest", headers=AUTH).status_code == 404
+    # Even unauthenticated, it's a 404 — there is no route left for `_auth` to guard.
+    assert client.get("/env/manifest").status_code == 404
 
 
 # --- U8: the pure redactor — raw (already-encoded) AND URL-decoded forms, min-length guard -----
@@ -983,6 +978,79 @@ def test_dev_start_with_a_free_port_still_spawns(monkeypatch: pytest.MonkeyPatch
     r = client.post("/dev/start", json={}, headers=AUTH)
     assert r.status_code == 200
     assert spawned == [["npm", "run", "dev"]]
+
+
+# --- U14: the overlay kill switch is baked into dev_start, outside /workspace/app -------------
+def test_dev_start_spawns_with_the_overlay_kill_switch_in_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`NEXT_PRIVATE_DISABLE_DEV_OVERLAY_UX=1` (Next 16.3+, PR #94346) must reach the ACTUAL
+    spawned child's environment — asserted on the `Popen` call itself, not merely on `_child_env`
+    as a pure function, so a mutation that drops it from `dev_start`'s literal `extra` (while
+    leaving `_child_env` untouched) still fails this test. It suppresses BOTH the compile and the
+    runtime overlay (ASM15) — defence in depth behind plan one's portal cover (U12) and
+    client-error arm (U13).
+
+    The allowlist's fail-closed behaviour is unchanged by adding this one literal: a real secret
+    seeded on the parent still does not reach the child on this same spawn.
+    """
+    monkeypatch.setattr(sup._Dev, "proc", None)
+    monkeypatch.setattr(sup._Dev, "ready", False)
+    monkeypatch.setattr(sup, "_dev_port_bound", lambda *a: False)
+    monkeypatch.setenv("SUPERVISOR_TOKEN_DECOY", "should-never-leak")  # not on the allowlist
+    captured: dict[str, object] = {}
+
+    def fake_popen(cmd: list[str], **kwargs: object) -> _FakeProc:
+        captured.update(kwargs)
+        return _FakeProc(None)
+
+    monkeypatch.setattr(sup.subprocess, "Popen", fake_popen)
+    r = client.post("/dev/start", json={}, headers=AUTH)
+    assert r.status_code == 200
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["NEXT_PRIVATE_DISABLE_DEV_OVERLAY_UX"] == "1"
+    assert env["PORT"] == "3000"
+    assert env["HOST"] == "0.0.0.0"
+    assert "SUPERVISOR_TOKEN_DECOY" not in env  # the allowlist still fails closed for the rest
+
+
+def test_overlay_kill_switch_reaches_no_tracked_template_file() -> None:
+    """R19's second clause, pinned as an assertion rather than a hope: the flag must be settable
+    ONLY from `dev_start`'s hard-coded `extra` literal, baked into the image outside
+    `/workspace/app` — never from the golden template that seeds the workspace. If it ever leaked
+    into a tracked template file, a restore (which replays tracked files) or the agent's own write
+    surface could override or remove it; `git grep` over the tracked tree is what proves it can't.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        ["git", "grep", "-Il", "NEXT_PRIVATE_DISABLE_DEV_OVERLAY_UX", "--", "sandbox/template"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    # git grep: 0 = match found, 1 = no match in any tracked file, >1 = a real error.
+    assert result.returncode == 1, f"leaked into: {result.stdout!r} stderr={result.stderr!r}"
+    assert result.stdout == ""
+
+
+def test_next_cache_stays_gitignored_and_untracked() -> None:
+    """The persistent build cache (`.next/cache`) is on by default from 16.3 — verified, not
+    assumed, that the template's existing `/.next` .gitignore entry already covers it and that
+    nothing under `.next/` has ever been tracked, so the bump does not newly leak a multi-MB cache
+    into a future C4 git-bundle snapshot."""
+    repo_root = Path(__file__).resolve().parents[2]
+    gitignore = (repo_root / "sandbox" / "template" / ".gitignore").read_text(encoding="utf-8")
+    assert "/.next" in gitignore.splitlines()
+
+    tracked = subprocess.run(
+        ["git", "ls-files", "sandbox/template"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    assert [p for p in tracked if p.startswith("sandbox/template/.next/")] == []
 
 
 def test_dev_start_refuses_a_bound_but_silent_port_without_spawning(

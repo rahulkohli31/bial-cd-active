@@ -44,9 +44,7 @@ other one lets it propagate raw, and that is a decision, not an omission:
        call sits inside the protected region whose `except BaseException` spawns the
        compensation that tears the container down (the `_holding_user_lock` docstring says so
        outright). A swallow returns normally, compensation never runs, and the container is
-       left ALIVE behind a lock nobody releases. And at the two lock/heartbeat ENDPOINTS it
-       would turn a Redis outage into `200 {"released": true}` / `200 {"alive": true}` — a
-       lie in a response body.
+       left ALIVE behind a lock nobody releases.
 
 So a Redis error from this module surfaces to its caller, and the HTTP layer maps it:
 `services/redis/errors.py` turns it into a 503 with user-facing copy (U3).
@@ -185,11 +183,6 @@ async def reap_lock(redis: aioredis.Redis, user_uuid: uuid.UUID) -> bool:
 
 async def lock_is_held(redis: aioredis.Redis, user_uuid: uuid.UUID) -> bool:
     return bool(await redis.exists(lock_key(user_uuid)))
-
-
-def lock_expires_at(anchor: datetime | None = None) -> datetime:
-    """The UTC instant a just-set lock lapses if not renewed (`LOCK_TTL_SECONDS` out)."""
-    return (anchor or datetime.now(UTC)) + timedelta(seconds=LOCK_TTL_SECONDS)
 
 
 # --- the idle heartbeat (C5) -------------------------------------------------

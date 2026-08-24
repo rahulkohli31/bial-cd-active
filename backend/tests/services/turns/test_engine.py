@@ -117,12 +117,15 @@ async def test_text_turn_streams_deltas_then_terminal(
     assert state is not None and state.status == "completed"
     frames, gap = engine.frames_since(state, 0)
     assert not gap
-    assert [f.type for f in frames] == ["text_delta", "text_delta", "turn_ended"]
+    # U17 — EVERY turn now opens with the harness's acknowledgement, emitted synchronously at
+    # `start_turn` before the detached run exists. It is a transient feed row (never persisted,
+    # never in `state.steps`), so it shows up here in the ring and nowhere durable.
+    assert [f.type for f in frames] == ["step", "text_delta", "text_delta", "turn_ended"]
     # A NONZERO cursor still inside the ring is the resume case the `?turn=&cursor=` route
     # leans on: the tail only, no gap, and nothing at or before the cursor re-delivered.
     tail, tail_gap = engine.frames_since(state, frames[0].seq)
     assert not tail_gap
-    assert [f.type for f in tail] == ["text_delta", "turn_ended"]
+    assert [f.type for f in tail] == ["text_delta", "text_delta", "turn_ended"]
     assert all(frame.seq > frames[0].seq for frame in tail)
     # …and a cursor past the ring's newest frame yields nothing at all (settled, replayed).
     assert engine.frames_since(state, frames[-1].seq) == ([], False)
@@ -171,17 +174,28 @@ async def test_read_tool_calls_become_step_frames(
     state = engine.peek(conv.id)
     assert state is not None and state.status == "completed"
     steps = [f for f in state.ring if f.type == "step"]
+    # U17 — the first step frame of any turn is the harness's own acknowledgement row. The
+    # agent's calls follow it; it is not one of them, and it never reaches the transcript.
+    assert steps[0].tool_call_id == engine_module.ACK_TOOL_CALL_ID
+    steps = steps[1:]
     assert [s.phase for s in steps] == ["started", "finished"]
     assert steps[0].tool_call_id == call_id and steps[1].tool_call_id == call_id
     assert steps[0].item.state == "pending" and steps[1].item.state == "ok"
     assert steps[1].item.hidden is True  # reads are hidden by default
-    assert steps[1].item.label == "Read app/page.tsx"
+    # U16 — BOTH OF THESE PINNED THE LEAK (`== "Read app/page.tsx"`), on the LIVE feed and on
+    # the resume snapshot. Flipped, not deleted, and each paired with its liveness half: the
+    # path is absent AND the friendly area still renders, so a label that collapsed to an empty
+    # string could not pass. The two are asserted against the same literal on purpose — live and
+    # reload read one translator, and a drift between them is the failure this pair catches.
+    assert "app/page.tsx" not in steps[1].item.label
+    assert steps[1].item.label == "Looking at your app's main page"
     assert "No app exists yet" in (steps[1].item.detail.result or "")
     # A RESUME must not lose them: `hidden` is a render hint the client applies, not a payload
     # filter. Dropping hidden steps here meant a mid-turn reconnect saw fewer steps than a tab
     # that stayed connected, and fewer than the same turn shows on reload.
     snapshot = engine.build_snapshot(state)
-    assert [item.label for item in snapshot.steps] == ["Read app/page.tsx"]
+    assert all("app/page.tsx" not in item.label for item in snapshot.steps)
+    assert [item.label for item in snapshot.steps] == ["Looking at your app's main page"]
     assert snapshot.steps[0].hidden is True
 
 
@@ -659,3 +673,126 @@ async def test_stop_user_turn_and_wait_is_safe_to_repeat(
     # The turn has settled, so the repeat finds nothing running — and the terminal survives.
     assert await engine.stop_user_turn_and_wait(user.id, timeout_s=10) is False
     assert state.ring[-1].type == "turn_ended" and state.ring[-1].status == "stopped"
+
+
+# --- U16: the split audience -------------------------------------------------------------
+#
+# `BuildError` feeds two readers with opposite needs. These pin the split from both ends: the
+# model's half must not have moved, and the citizen's half must exist for every error class.
+
+
+_RAW_TSC = (
+    "\x1b[31mapp/page.tsx\x1b[0m(12,5): error TS2307: Cannot find module "
+    "'@/components/VisitorTable' or its corresponding type declarations.\n"
+    "app/api/visitors/route.ts(4,1): error TS1005: ';' expected.\n"
+)
+
+
+def test_the_model_still_gets_the_whole_diagnostic_unchanged() -> None:
+    """THE OTHER HALF OF U16, and the one that is easy to break by accident.
+
+    The unit removes developer text from the CITIZEN's surfaces. If it also softened `title` or
+    trimmed `cleaned_stack`, the self-heal loop would be repairing from prose instead of from a
+    compiler diagnostic — a much worse regression than the one being fixed, and an invisible one
+    (the build would simply get worse at fixing itself).
+
+    Pinned on a FIXED raw input against literal expected values rather than against
+    `declutter`'s own output, so the assertion cannot follow the code it is guarding: the ANSI
+    strip, the redaction pass, the `/workspace/` relativization and the `error TS` title scan all
+    have to keep producing exactly these bytes, and the repair prompt has to keep carrying them.
+    """
+    from src.api.v1.build_sessions.schemas import ErrorSource
+    from src.services.orchestrator.errors import from_tsc
+    from src.services.orchestrator.prompt import build_repair_prompt
+
+    error = from_tsc(_RAW_TSC)
+
+    assert error.source is ErrorSource.TSC
+    assert error.title == (
+        "app/page.tsx(12,5): error TS2307: Cannot find module '@/components/VisitorTable' "
+        "or its corresponding type declarations."
+    )
+    assert error.cleaned_stack == (
+        "app/page.tsx(12,5): error TS2307: Cannot find module "
+        "'@/components/VisitorTable' or its corresponding type declarations.\n"
+        "app/api/visitors/route.ts(4,1): error TS1005: ';' expected.\n"
+    )
+
+    prompt = build_repair_prompt(error)
+    assert error.title in prompt
+    assert error.cleaned_stack in prompt
+    # The line numbers, the module specifier and the second diagnostic all survive into the
+    # prompt — the model is handed the same evidence it always was.
+    assert "TS2307" in prompt and "TS1005" in prompt
+
+
+def test_every_error_class_reaches_the_citizen_with_a_sentence_and_an_action() -> None:
+    """TABLE-DRIVEN OVER `ErrorSource`, deliberately — including `CLIENT`.
+
+    A per-source mapping is exactly the kind of table that grows a member with no row, and the
+    failure mode is silent: the frame serializes, the portal renders, and the citizen reads a
+    blank error. Iterating the enum rather than a hand-written list means a new member fails
+    HERE, on the day it is added.
+
+    Both halves are asserted non-empty, not just the sentence. An error status with no next step
+    is the failure this unit exists to close; a nicer sentence that still dead-ends is the same
+    dead end in a quieter voice."""
+    from src.api.v1.build_sessions.schemas import ErrorSource
+    from src.api.v1.conversations.schemas import DiagnosticFrame
+    from src.services.orchestrator.errors import user_facing
+
+    assert len(list(ErrorSource)) == 4  # the table below is exhaustive, and stays that way
+
+    for source in ErrorSource:
+        copy = user_facing(source)
+        assert copy.message.strip(), source
+        assert copy.action.strip(), source
+
+        # A producer that knows only the model's half — every producer today — still emits a
+        # frame carrying both citizen-facing fields, filled from the class.
+        frame = DiagnosticFrame(seq=1, source=source, title="raw", cleaned_stack="raw")
+        assert frame.user_message == copy.message
+        assert frame.user_action == copy.action
+
+        # …and the pair survives the camelCase wire hop the portal parses.
+        wire = frame.model_dump(by_alias=True)
+        assert wire["userMessage"] == copy.message
+        assert wire["userAction"] == copy.action
+
+
+def test_a_producer_may_speak_for_itself_without_losing_the_action() -> None:
+    """The derivation is a floor, not a ceiling: a caller with a better sentence keeps it, and
+    the half it did NOT supply is still filled rather than left blank."""
+    from src.api.v1.build_sessions.schemas import ErrorSource
+    from src.api.v1.conversations.schemas import DiagnosticFrame
+    from src.services.orchestrator.errors import user_facing
+
+    frame = DiagnosticFrame(
+        seq=1,
+        source=ErrorSource.SERVER,
+        title="raw",
+        cleaned_stack="raw",
+        user_message="Your visitor list couldn't load.",
+    )
+    assert frame.user_message == "Your visitor list couldn't load."
+    assert frame.user_action == user_facing(ErrorSource.SERVER).action
+
+
+def test_the_client_report_never_rides_out_on_the_frame() -> None:
+    """U13's `exclude=True` is what structurally stops a browser stack reaching a person, and
+    U16 renders the CLIENT class rather than skipping it — so the guard matters more, not less.
+    Pinned on the SERIALIZATION, because that is the only thing egress actually looks at."""
+    from src.api.v1.build_sessions.schemas import ErrorSource
+    from src.services.orchestrator.errors import from_client
+
+    error = from_client(
+        "TypeError: undefined is not a function\n  at Visitors (page-8f2.js:1:920)"
+    )
+
+    assert error.agent_only_detail is not None
+    assert "page-8f2.js" in error.agent_only_detail  # the agent still gets everything
+    assert error.source is ErrorSource.CLIENT
+    assert error.cleaned_stack == ""
+    dumped = error.model_dump()
+    assert "agent_only_detail" not in dumped
+    assert "page-8f2.js" not in json.dumps(dumped)

@@ -59,6 +59,29 @@ class HarnessCounter(enum.StrEnum):
     #: the companion plan's starting line.
     BUILD_WORDS = "build_words"
     BUILD_TOKENS = "build_tokens"
+    #: ── The companion plan's tool-boundary adoption counters (U22 / R28) ─────────────────────
+    #: Added as NAMES ONLY, with no migration, which is the property this table was shaped for.
+    #: A command's output was too long for its budget and was cut to head + tail (U22).
+    OUTPUT_TRUNCATED = "output_truncated"
+    #: The model followed a truncation notice's handle and read the elided middle (U22). Read
+    #: AGAINST `command_rerun_in_turn`: the pair is the adoption question — did the handle
+    #: actually replace the re-run it exists to save, or is the model still paying for both?
+    OUTPUT_SLICE_FETCHED = "output_slice_fetched"
+    #: An identical command ran a second time inside ONE turn (U22) — the cost the slice handle
+    #: exists to remove, counted so "it got better" is a number rather than an impression.
+    COMMAND_RERUN_IN_TURN = "command_rerun_in_turn"
+    #: ── U23's adoption pair (R29) ───────────────────────────────────────────────────────────
+    #: A PAIR, for the same reason U22's is: neither number means anything alone. "The composite
+    #: was called 40 times" is a fact about traffic; "40 composite calls against 2 hand-rolled
+    #: sequences" is the answer to the behavioural bet R29 actually makes.
+    #: `apply_schema_change` ran — the one call that replaces generate-then-migrate (U23).
+    SCHEMA_CHANGE_COMPOSED = "schema_change_composed"
+    #: A raw `drizzle-kit generate` went through `run_command` instead (U23) — the HEAD of the
+    #: two-step sequence the composite replaces, and deliberately the only half counted: a lone
+    #: `npm run db:migrate` legitimately re-applies a migration that already exists, which is not
+    #: the sequence. So one hand-rolled sequence scores one, exactly as one composite call does,
+    #: and the two numbers can be read against each other without a correction factor.
+    SCHEMA_CHANGE_BY_HAND = "schema_change_by_hand"
 
 
 class HarnessCount(Base, UUIDv7PrimaryKeyMixin, TimestampMixin):

@@ -45,8 +45,6 @@ const h = vi.hoisted(() => ({
   stop: vi.fn(),
   getStatus: vi.fn(),
   forceEnd: vi.fn(),
-  acquireLock: vi.fn(),
-  releaseLock: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
@@ -141,8 +139,12 @@ describe('BuilderPage — the build-turn flow (ORIG-§3-d/f)', () => {
     // The rows are actually in the DOM (not just props) — no remount needed. Only the MOST
     // RECENT step is visible live — it replaces the previous one in the same spot rather
     // than both accumulating.
-    expect(await screen.findByText(/Installing dependencies/i)).toBeTruthy()
-    expect(screen.queryByText(/Scaffolding your app/i)).toBeNull()
+    // SCOPED TO THE VISIBLE ROW (U17): the sr-only live region carries a second, deliberately
+    // PACED copy of the label, so both queries have to name which of the two they mean. The
+    // property under test — one row, replaced in place — is about the one a person looks at.
+    const liveRow = within(await screen.findByTestId('build-activity'))
+    expect(await liveRow.findByText(/Installing dependencies/i)).toBeTruthy()
+    expect(liveRow.queryByText(/Scaffolding your app/i)).toBeNull()
 
     await turn.frame(T_PREVIEW())
     await waitFor(() => expect(document.querySelector('iframe')?.getAttribute('src')).toBe(PREVIEW_URL))
@@ -223,9 +225,21 @@ describe('BuilderPage — the build-turn flow (ORIG-§3-d/f)', () => {
     expect(await screen.findByText(/trying another way/i)).toBeTruthy()
     expect(document.querySelector('[data-kind="retry"]')).toBeTruthy()
     expect(document.querySelector('[data-kind="error"]')).toBeNull()
-    // The detail renders ONCE — the title line, no monospace copy of the same string.
+    // U16 — FLIPPED. This used to require the compiler's own title to render exactly once. The
+    // title is built FOR THE MODEL (it is the first meaningful line of a `tsc` diagnostic), so
+    // rendering it at all was the developer surface U16 removes. The retry row now carries the
+    // platform's sentence plus a next action; the title still rides on the frame, unrendered.
+    // This assertion is the END-TO-END half — server frame → parse → narrative → render — that
+    // BuildProgress's own unit tests cannot reach.
     expect(document.querySelector('[data-kind="retry"] pre')).toBeNull()
-    expect(screen.getAllByText(/Type error in app\/page\.tsx/i)).toHaveLength(1)
+    expect(screen.queryAllByText(/Type error in app\/page\.tsx/i)).toHaveLength(0)
+    // Liveness, so the absence above is an absence and not a row that failed to render: this
+    // frame carries no citizen-facing pair (the fixture predates it), so the feed's committed
+    // fallback is what a citizen reads — both halves of it.
+    expect(screen.getByText(/We hit a problem finishing that change\./i)).toBeTruthy()
+    expect(
+      screen.getByText(/Try describing what you want again, or ask for something simpler\./i),
+    ).toBeTruthy()
 
     // The repair succeeds and the turn completes: no residual failure presentation.
     await turn.frame(T_BUILD_END())

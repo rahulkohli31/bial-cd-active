@@ -19,7 +19,6 @@ from typing import Literal
 from src.api.v1.build_sessions.schemas import (
     BuildResult,
     BuildSessionStatus,
-    LogEvent,
     PreviewReadyEvent,
     ProgressEnvelope,
     StepEvent,
@@ -433,7 +432,7 @@ ProgressSinkFn = Callable[[ProgressEnvelope], Awaitable[None]]
 
 
 class FakeBrain:
-    """A scripted mock C7 `run_build`: emits step → log → preview_ready via `on_progress`,
+    """A scripted mock C7 `run_build`: emits step → preview_ready via `on_progress`,
     then RETURNS its verdict as a `BuildResult`.
 
     It emits no terminal `ended` because real BRAIN cannot (R7): the frame is SESSION-API's,
@@ -470,10 +469,7 @@ class FakeBrain:
         await on_progress(
             StepEvent(seq=1, name="scaffold", label="Scaffolding the app", state="started")
         )
-        await on_progress(
-            LogEvent(seq=2, source="exec", stream="stdout", text="installing dependencies")
-        )
-        await on_progress(PreviewReadyEvent(seq=3, preview_url=self.preview_url))
+        await on_progress(PreviewReadyEvent(seq=2, preview_url=self.preview_url))
         if self.raise_before_ended:
             raise RuntimeError("brain blew up mid-build")
         return BuildResult(
@@ -481,6 +477,6 @@ class FakeBrain:
             reason=self.reason,
             app_id=self.app_id,
             preview_url=self.preview_url,
-            last_seq=3,
+            last_seq=2,
             snapshot_committed=False,
         )

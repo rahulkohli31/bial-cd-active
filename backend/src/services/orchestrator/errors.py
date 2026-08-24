@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import re
 import secrets
+from typing import Final, NamedTuple
 
 from src.api.v1.build_sessions.schemas import BuildError, ErrorSource
 from src.core.redaction import redact_secrets as redact_secrets
@@ -320,3 +321,79 @@ def from_client(raw: str) -> BuildError:
         cleaned_stack="",
         agent_only_detail=_frame_as_data(reported.cleaned_stack),
     )
+
+
+# --- the USER-facing half of the split (U16 / R20, R21) ----------------------
+#
+# A `BuildError` has always had two readers with opposite needs, and until now only one of them
+# was served. `title` and `cleaned_stack` are built FOR THE MODEL — `title` is designed to be the
+# compiler's own first meaningful line, which is exactly what makes it useful to a repair run and
+# exactly what makes it the most developer-looking thing a citizen reads. Rendering it was the
+# defect; deleting it would break the repair loop.
+#
+# So the audiences split rather than one being edited into the other: everything above stays
+# byte-identical for the same raw input, and the pair below is what egresses to a person. It is a
+# pure function of the error CLASS — the class is the only thing about a failure a citizen can act
+# on, and deriving it means no producer can ship a diagnostic that has no sentence and no next
+# step (`DiagnosticFrame` fills the pair from here when its producer supplies none).
+
+
+class UserFacingError(NamedTuple):
+    """What a citizen reads about one failure: a plain sentence, and something they can DO.
+
+    Both halves are mandatory, and the action half is the point. Stripping the stack trace and
+    the file-path title without putting an action in their place trades a dead end the reader
+    cannot act on for a quieter one — a nicer sentence they still cannot act on."""
+
+    message: str
+    action: str
+
+
+# THE ONE ACTION, shared by every class today, and honestly so: a diagnostic is emitted only on a
+# path where a repair run follows, so the true next step is "wait, and if it keeps happening ask
+# for less". The mapping is still keyed per source rather than collapsed to a constant, because a
+# class that earns different guidance (a data failure a citizen could resolve themselves, say)
+# should be able to get it without re-shaping the frame.
+_RETRY_ACTION: Final = (
+    "Nothing to do right now — we're working on it. "
+    "If it keeps happening, try asking for something simpler."
+)
+
+_USER_FACING: Final[dict[ErrorSource, UserFacingError]] = {
+    ErrorSource.TSC: UserFacingError(
+        message="Part of your app didn't fit together.",
+        action=_RETRY_ACTION,
+    ),
+    ErrorSource.NEXT_BUILD: UserFacingError(
+        message="Your app couldn't be packaged up for use.",
+        action=_RETRY_ACTION,
+    ),
+    ErrorSource.SERVER: UserFacingError(
+        message="Your app ran into a problem while it was starting up.",
+        action=_RETRY_ACTION,
+    ),
+    # The one class whose report text may never egress at all — its whole user-facing
+    # contribution is this sentence, which `from_client` also uses as the (never-rendered)
+    # `title`. One sentence, one definition.
+    ErrorSource.CLIENT: UserFacingError(
+        message=CLIENT_ERROR_TITLE,
+        action=_RETRY_ACTION,
+    ),
+}
+
+# The last resort, for a source this table has not been taught yet. It matches the portal's own
+# fallback constant word for word ON PURPOSE: a citizen must read the same sentence whether the
+# server had copy for their failure or the browser had to supply it, and a member added to
+# `ErrorSource` without a row here degrades to product language rather than to nothing.
+_UNCLASSIFIED: Final = UserFacingError(
+    message="We hit a problem finishing that change.",
+    action="Try describing what you want again, or ask for something simpler.",
+)
+
+
+def user_facing(source: ErrorSource) -> UserFacingError:
+    """The citizen-facing sentence + next action for one error class.
+
+    Never raises and never returns an empty half — an unmapped source degrades to
+    `_UNCLASSIFIED`, which is a real sentence with a real action rather than a blank row."""
+    return _USER_FACING.get(source, _UNCLASSIFIED)

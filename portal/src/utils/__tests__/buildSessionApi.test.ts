@@ -4,9 +4,8 @@ import {
   relaunchPreview,
   stop,
   getStatus,
-  acquireLock,
-  releaseLock,
   forceEnd,
+  buildSessionClient,
   BuildSessionAlreadyActiveError,
   asReclaimBlocked,
   releaseProject,
@@ -44,6 +43,21 @@ function optsOf(m: ReturnType<typeof jsonFetch>, call = 0): RequestInit {
 function headerOf(m: ReturnType<typeof jsonFetch>, name: string, call = 0): string | undefined {
   return (optsOf(m, call).headers as Record<string, string> | undefined)?.[name]
 }
+
+// The frozen `buildSessionClient` member set — the portal's mirror of the backend's
+// `test_abstractmethod_set_equals_the_c2_contract` (`test_base.py`). A drifted mock bag is
+// what this guards: the client interface trimmed to five members here, but one call site
+// (`BuilderPage-memo.test.jsx`) went on mocking `acquireLock` / `renewLock` / `releaseLock` /
+// `heartbeat` anyway, because nothing forced its stale keys to be read against the real
+// surface. This test fails LOUDLY the moment `buildSessionClient` gains or loses a member,
+// so the next removal cannot leave the same kind of residue behind unnoticed.
+const _CLIENT_MEMBERS = new Set(['start', 'relaunchPreview', 'stop', 'getStatus', 'forceEnd'])
+
+describe('buildSessionApi — buildSessionClient member set (inertness guard)', () => {
+  it('exposes exactly the five surviving C3 client operations', () => {
+    expect(new Set(Object.keys(buildSessionClient))).toEqual(_CLIENT_MEMBERS)
+  })
+})
 
 describe('buildSessionApi — control operations (C3 §2)', () => {
   it('start: 201 maps {sessionId, projectId, appId, status:provisioning, previewUrl:null, createdAt} (C3 §2.1)', async () => {
@@ -195,15 +209,13 @@ describe('buildSessionApi — control operations (C3 §2)', () => {
 })
 
 describe('buildSessionApi — CSRF discipline (C3 §3, KTD-2)', () => {
-  it('attaches X-CSRF-Token on every mutating POST (start / stop / lock ops)', async () => {
+  it('attaches X-CSRF-Token on every mutating POST (start / stop / forceEnd)', async () => {
     const stopImpl = jsonFetch(200, { sessionId: 's', status: 'ended' })
     await stop('s', {}, { fetchImpl: stopImpl })
     expect(headerOf(stopImpl, 'X-CSRF-Token')).toBe(CSRF)
 
-    const lockBody = { sessionId: 's', held: true, ownerUserId: 'u', ttlSeconds: 900, expiresAt: 'e' }
+    // `acquireLock` / `releaseLock` are gone (U28) — `forceEnd` is the one lock op left.
     const cases: Array<[(id: string, deps: { fetchImpl: FetchImpl }) => Promise<unknown>, unknown]> = [
-      [acquireLock, lockBody],
-      [releaseLock, { sessionId: 's', released: true }],
       [forceEnd, { sessionId: 's', status: 'ended' }],
     ]
     for (const [fn, body] of cases) {
@@ -236,9 +248,12 @@ describe('buildSessionApi — lock ops + fail-closed errors (C3 §3)', () => {
     expect(JSON.parse(optsOf(noReason).body as string)).toEqual({})
   })
 
-  it('lock ops take NO request body (C3 §3) — release sends neither body nor Content-Type', async () => {
-    const impl = jsonFetch(200, { sessionId: 's', released: true })
-    await releaseLock('s', { fetchImpl: impl })
+  // Re-anchored onto `forceEnd` (U28): `acquireLock` / `releaseLock`, which this assertion
+  // used to run against, are gone — nothing called them. `forceEnd` is the surviving bodyless
+  // lock POST, and the "lock ops take no request body" contract still holds for it.
+  it('lock ops take NO request body (C3 §3) — forceEnd sends neither body nor Content-Type', async () => {
+    const impl = jsonFetch(200, { sessionId: 's', status: 'ended' })
+    await forceEnd('s', { fetchImpl: impl })
     expect(optsOf(impl).body).toBeUndefined()
     expect(headerOf(impl, 'Content-Type')).toBeUndefined()
   })

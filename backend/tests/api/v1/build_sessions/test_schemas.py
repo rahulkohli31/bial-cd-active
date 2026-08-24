@@ -30,10 +30,6 @@ from src.api.v1.build_sessions.schemas import (
     ErrorSource,
     EscalationEvent,
     ForceEndResponse,
-    HeartbeatResponse,
-    LockReleaseResponse,
-    LockStateResponse,
-    LogEvent,
     PreviewReadyEvent,
     PreviewReconnectingEvent,
     ProgressEnvelope,
@@ -139,38 +135,18 @@ def test_start_response_requires_its_fields() -> None:
         StartBuildResponse.model_validate({"session_id": str(uuid.uuid4())})
 
 
-# --- C3: lock-op response models ----------------------------------------------
+# --- C3: lock-op response models ------------------------------------------------
+# U28 retired `LockStateResponse` / `LockReleaseResponse` / `HeartbeatResponse` along with the
+# `acquire` / `renew` / `release` / `heartbeat` routes they served — nothing called them (the
+# portal's keep-alive loop that was their only caller was itself deleted back in U13).
+# `ForceEndResponse` is the one lock-op model still live.
 
 
-def test_lock_state_response_validates_required_fields() -> None:
-    resp = LockStateResponse(
-        session_id=uuid.uuid4(),
-        held=True,
-        owner_user_id=uuid.uuid4(),
-        ttl_seconds=900,
-        expires_at=_NOW,
-    )
-    assert resp.held is True
-    assert resp.ttl_seconds == 900
-
-
-def test_lock_state_response_rejects_missing_owner() -> None:
-    with pytest.raises(ValidationError):
-        LockStateResponse.model_validate(
-            {"session_id": str(uuid.uuid4()), "held": True, "ttl_seconds": 900}
-        )
-
-
-def test_release_force_end_heartbeat_responses_validate() -> None:
+def test_force_end_response_validates() -> None:
     sid = uuid.uuid4()
-    assert LockReleaseResponse(session_id=sid, released=True).released is True
     assert ForceEndResponse(session_id=sid, status=BuildSessionStatus.ENDED).status is (
         BuildSessionStatus.ENDED
     )
-    hb = HeartbeatResponse(
-        session_id=sid, alive=True, cadence_seconds=30, heartbeat_expires_at=_NOW
-    )
-    assert hb.alive is True and hb.cadence_seconds == 30
 
 
 def test_stop_response_carries_terminal_status() -> None:
@@ -182,18 +158,19 @@ def test_stop_response_carries_terminal_status() -> None:
 
 _ENVELOPE: TypeAdapter[ProgressEnvelope] = TypeAdapter(ProgressEnvelope)
 
-_C7_TYPES = {"step", "log", "error", "preview_ready", "escalation", "quota_exceeded", "ended"}
+_C7_TYPES = {"step", "error", "preview_ready", "escalation", "quota_exceeded", "ended"}
 
 
-def test_envelope_union_is_the_seven_c7_members_plus_the_reconnecting_signal() -> None:
+def test_envelope_union_is_the_six_c7_members_plus_the_reconnecting_signal() -> None:
     # `ProgressEnvelope` is `Annotated[Union[...], Field(discriminator="type")]`: get_args()[0]
-    # is the Union. Its args are the seven C7 variant classes PLUS the U5 `preview_reconnecting`
+    # is the Union. Its args are the six LIVE C7 variant classes PLUS the U5 `preview_reconnecting`
     # feed-only signal (F8) — a member that does NOT change the frozen 5-member BuildSessionStatus.
-    # This is the exact-membership guard: an accidental addition/removal turns it red.
+    # This is the exact-membership guard: an accidental addition/removal turns it red. U29 retired
+    # `log` (nothing in production had ever emitted it), so the count dropped from eight to seven
+    # — recounted against the LIVE union, not the plan's pre-split arithmetic (constraint 11).
     union = get_args(ProgressEnvelope)[0]
     assert set(get_args(union)) == {
         StepEvent,
-        LogEvent,
         ErrorEvent,
         PreviewReadyEvent,
         EscalationEvent,
@@ -203,7 +180,7 @@ def test_envelope_union_is_the_seven_c7_members_plus_the_reconnecting_signal() -
     }
 
 
-def test_each_of_the_seven_types_validates_its_own_payload() -> None:
+def test_each_of_the_six_types_validates_its_own_payload() -> None:
     payloads: dict[str, dict[str, object]] = {
         "step": {
             "type": "step",
@@ -212,32 +189,31 @@ def test_each_of_the_seven_types_validates_its_own_payload() -> None:
             "label": "Scaffolding…",
             "state": "started",
         },
-        "log": {"type": "log", "seq": 2, "source": "exec", "stream": "stdout", "text": "hi"},
         "error": {
             "type": "error",
-            "seq": 3,
+            "seq": 2,
             "source": "tsc",
             "title": "Type error",
             "cleaned_stack": "app/page.tsx:1",
         },
-        "preview_ready": {"type": "preview_ready", "seq": 4, "preview_url": "https://x/"},
+        "preview_ready": {"type": "preview_ready", "seq": 3, "preview_url": "https://x/"},
         "escalation": {
             "type": "escalation",
-            "seq": 5,
+            "seq": 4,
             "reason": "self_heal_budget_exhausted",
             "detail": "gave up",
             "last_error": None,
         },
         "quota_exceeded": {
             "type": "quota_exceeded",
-            "seq": 6,
+            "seq": 5,
             "limit": 100,
             "used": 100,
             "resets_at": "2026-07-14T18:30:00Z",
         },
         "ended": {
             "type": "ended",
-            "seq": 7,
+            "seq": 6,
             "status": "ended",
             "preview_url": None,
             "snapshot_committed": True,
@@ -246,14 +222,13 @@ def test_each_of_the_seven_types_validates_its_own_payload() -> None:
     }
     expected = {
         "step": StepEvent,
-        "log": LogEvent,
         "error": ErrorEvent,
         "preview_ready": PreviewReadyEvent,
         "escalation": EscalationEvent,
         "quota_exceeded": QuotaExceededEvent,
         "ended": EndedEvent,
     }
-    assert set(payloads) == _C7_TYPES  # the fixture itself covers all seven
+    assert set(payloads) == _C7_TYPES  # the fixture itself covers all six
     for type_name, payload in payloads.items():
         parsed = _ENVELOPE.validate_python(payload)
         assert isinstance(parsed, expected[type_name])

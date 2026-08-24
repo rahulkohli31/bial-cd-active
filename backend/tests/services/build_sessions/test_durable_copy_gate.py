@@ -112,7 +112,7 @@ async def _put_recovery(store: FakeStorage, sha: str | None) -> None:
 async def test_a_recovery_copy_matching_head_is_confirmed(store: FakeStorage) -> None:
     await _put_recovery(store, HEAD)
 
-    verdict = await confirm_durable_copy(APP, container_head=HEAD)
+    verdict = await confirm_durable_copy(APP, container_head=HEAD, container_dirty=False)
 
     assert verdict.state is CopyState.CONFIRMED_CURRENT
     assert verdict.may_destroy is True
@@ -123,10 +123,67 @@ async def test_a_recovery_copy_behind_head_is_stale_not_destroyable(store: FakeS
     must be taken first; until one is, this container is not eligible for anything."""
     await _put_recovery(store, OLDER)
 
-    verdict = await confirm_durable_copy(APP, container_head=HEAD)
+    verdict = await confirm_durable_copy(APP, container_head=HEAD, container_dirty=False)
 
     assert verdict.state is CopyState.STALE
     assert verdict.may_destroy is False
+
+
+async def test_a_matching_head_over_a_dirty_tree_is_not_destroyable(store: FakeStorage) -> None:
+    """★ THE U19 REGRESSION. A HEAD match stopped meaning "preserved" when the agent stopped
+    committing.
+
+    Before U19 the build agent committed as it worked, so a turn that wrote files MOVED `HEAD` and
+    a copy from the previous turn was detectably behind it — this gate's whole comparison rested on
+    that. U19 deleted the commit discipline, so "HEAD unchanged + dirty tree" is now the shape of
+    every building turn. A turn that dies before its finalizer (process death, OOM, a deploy
+    restart) leaves `HEAD` exactly where the LAST turn's copy was stamped.
+
+    So this is the shape that used to read CONFIRMED_CURRENT and destroy a whole turn's work while
+    writing an audit row saying it was safe. The copy is not behind HEAD — it is behind the WORKING
+    TREE, which is why STALE (a known state with a known remedy: copy first, then reclaim) rather
+    than UNCONFIRMED.
+
+    Mutation check: drop `container_dirty` from the head-match arm in `durable_copy.py` and this
+    goes red while every other test in this file stays green — which is exactly how the defect
+    shipped."""
+    await _put_recovery(store, HEAD)
+
+    verdict = await confirm_durable_copy(APP, container_head=HEAD, container_dirty=True)
+
+    assert verdict.state is CopyState.STALE
+    assert verdict.may_destroy is False
+    # The reason must name the TREE, not the head — an operator reading "behind HEAD" over a
+    # matching head would reasonably conclude the gate was broken.
+    assert "uncommitted" in verdict.reason
+
+
+async def test_a_matching_head_on_an_unread_tree_spares_rather_than_guesses(
+    store: FakeStorage,
+) -> None:
+    """We reached the container and read its HEAD, but the tree probe did not answer. That is an
+    unestablished fact on a path that authorises destruction, and this module's governing rule is
+    that every such branch spares. `None` is deliberately NOT collapsed into `False`: a default
+    that reads "clean" is precisely the permissive shape the regression above came from."""
+    await _put_recovery(store, HEAD)
+
+    verdict = await confirm_durable_copy(APP, container_head=HEAD, container_dirty=None)
+
+    assert verdict.state is CopyState.UNCONFIRMED
+    assert verdict.may_destroy is False
+
+
+async def test_a_clean_tree_at_a_matching_head_is_still_collected(store: FakeStorage) -> None:
+    """THE OTHER HALF, and the reason the fix is not just "never confirm". A gate that spares
+    everything forever is as broken as one that destroys live work — it collects nothing and the
+    fleet bills forever, which is the failure the reaper exists to prevent. The benign case must
+    still authorise."""
+    await _put_recovery(store, HEAD)
+
+    verdict = await confirm_durable_copy(APP, container_head=HEAD, container_dirty=False)
+
+    assert verdict.state is CopyState.CONFIRMED_CURRENT
+    assert verdict.may_destroy is True
 
 
 async def test_currency_is_the_sha_not_the_timestamp(store: FakeStorage) -> None:
@@ -138,7 +195,9 @@ async def test_currency_is_the_sha_not_the_timestamp(store: FakeStorage) -> None
     # As freshly written as anything can be; the clock says current, the content does not.
     assert store.mtimes[recovery_key(APP)] is not None
 
-    assert (await confirm_durable_copy(APP, container_head=HEAD)).state is CopyState.STALE
+    assert (
+        await confirm_durable_copy(APP, container_head=HEAD, container_dirty=False)
+    ).state is CopyState.STALE
 
 
 async def test_the_saved_bundle_is_not_a_substitute_for_the_recovery_slot(
@@ -150,7 +209,7 @@ async def test_the_saved_bundle_is_not_a_substitute_for_the_recovery_slot(
     reclaimed, so reading the wrong slot would lose exactly the work it was written to protect."""
     await store.put(snapshot_key(APP), a_git_bundle(HEAD), metadata={"head_sha": HEAD})
 
-    verdict = await confirm_durable_copy(APP, container_head=HEAD)
+    verdict = await confirm_durable_copy(APP, container_head=HEAD, container_dirty=False)
 
     assert verdict.state is CopyState.UNCONFIRMED
     assert verdict.may_destroy is False
@@ -178,7 +237,7 @@ async def test_a_storage_off_deployment_cannot_authorise_a_single_delete(
 
     monkeypatch.setattr(durable_copy, "get_storage", _no_store)
 
-    verdict = await confirm_durable_copy(APP, container_head=HEAD)
+    verdict = await confirm_durable_copy(APP, container_head=HEAD, container_dirty=False)
 
     assert verdict.state is CopyState.UNCONFIRMED
     assert verdict.may_destroy is False
@@ -195,7 +254,9 @@ async def test_an_unreachable_store_spares_rather_than_destroys(
 
     monkeypatch.setattr(store, "head", _boom)
 
-    assert (await confirm_durable_copy(APP, container_head=HEAD)).may_destroy is False
+    assert (
+        await confirm_durable_copy(APP, container_head=HEAD, container_dirty=False)
+    ).may_destroy is False
 
 
 async def test_a_bundle_with_no_stamped_sha_cannot_be_compared(store: FakeStorage) -> None:
@@ -203,13 +264,17 @@ async def test_a_bundle_with_no_stamped_sha_cannot_be_compared(store: FakeStorag
     could not be read, and R4 sends every one of those to escalate."""
     await store.put(recovery_key(APP), a_git_bundle(HEAD), metadata={})
 
-    assert (await confirm_durable_copy(APP, container_head=HEAD)).state is CopyState.UNCONFIRMED
+    assert (
+        await confirm_durable_copy(APP, container_head=HEAD, container_dirty=False)
+    ).state is CopyState.UNCONFIRMED
 
 
 async def test_no_recovery_copy_at_all_is_unconfirmed_not_permission(store: FakeStorage) -> None:
     """The most tempting wrong answer in the whole unit: "there is no copy, so there is nothing to
     preserve". There is no copy, so there is nothing to preserve it WITH."""
-    assert (await confirm_durable_copy(APP, container_head=HEAD)).may_destroy is False
+    assert (
+        await confirm_durable_copy(APP, container_head=HEAD, container_dirty=False)
+    ).may_destroy is False
 
 
 # --- the unreachable-container fallback -------------------------------------------
@@ -225,7 +290,7 @@ async def test_an_unreachable_container_falls_back_to_a_parseable_bundle(
     A present, parseable bundle stands in. The real comparison still happens in the normal case."""
     await _put_recovery(store, HEAD)
 
-    verdict = await confirm_durable_copy(APP, container_head=None)
+    verdict = await confirm_durable_copy(APP, container_head=None, container_dirty=None)
 
     assert verdict.state is CopyState.CONFIRMED_CURRENT
 
@@ -235,7 +300,9 @@ async def test_an_unreachable_container_with_no_bundle_still_escalates(
 ) -> None:
     """The fallback is a fallback, not a bypass: no bundle and no container means nothing was
     established, and nothing established never authorises a delete."""
-    assert (await confirm_durable_copy(APP, container_head=None)).may_destroy is False
+    assert (
+        await confirm_durable_copy(APP, container_head=None, container_dirty=None)
+    ).may_destroy is False
 
 
 def test_a_bundle_header_is_checked_against_itself_not_its_metadata() -> None:

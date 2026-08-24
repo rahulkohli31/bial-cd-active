@@ -4,7 +4,7 @@
  *
  * The one structural change from Sandbox: there is no `ProjectPicker`. Sandbox had no
  * project, so it gated every handoff behind "pick a project first". Here the project is
- * a required prop, so Generate App / Start Planning mint a chat and hand off directly —
+ * a required prop, so `startChat` mints a chat in the selected mode and hands off directly —
  * mirroring the exact router-state shape `BuilderPage` / `ChatPage` already read
  * (`{ prompt, theme, pendingAttachments }` for a build, `{ initialMessage }` for a plan).
  *
@@ -102,7 +102,7 @@ export default function ProjectBuilder({ projectId }: ProjectBuilderProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   // Shared chat-attachment composer — same allowlist + validation as Plan/Builder
-  // chat, so the Generate-App step accepts images, PDF, Word, Excel, and (flag on)
+  // chat, so the Start Chat step accepts images, PDF, Word, Excel, and (flag on)
   // PowerPoint, not just spreadsheets. The picked files ride to the builder as
   // pending attachments and feed the FIRST generation turn via buildUserParts.
   const { pendingAttachments, handleFileSelect, removePending, attachToast } = usePendingAttachments()

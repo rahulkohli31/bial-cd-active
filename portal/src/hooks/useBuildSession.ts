@@ -125,7 +125,6 @@ export interface UseBuildSessionResult {
   forceEnd: (targetSessionId?: string) => Promise<void>
   reconnect: () => void
   reset: () => void
-  clearBlocked: () => void
 }
 
 /**
@@ -528,8 +527,6 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     )
   }, [client, closeFeed, subscribe, setPhase, finishSession])
 
-  const clearBlocked = useCallback(() => setBlocked(null), [])
-
   // Own timer + feed teardown on unmount — no leaked intervals, no zombie SSE. `mountedRef` also
   // trips here so an in-flight start()/reattach() bails instead of wiring resources we can't reach.
   // Re-set `true` on (re)mount: StrictMode double-invokes this effect (mount→cleanup→remount), so a
@@ -568,6 +565,5 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     forceEnd,
     reconnect,
     reset,
-    clearBlocked,
   }
 }

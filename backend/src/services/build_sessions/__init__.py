@@ -26,7 +26,6 @@ from src.services.build_sessions.locks import LockUnavailableError as LockUnavai
 from src.services.build_sessions.locks import acquire_lock as acquire_lock
 from src.services.build_sessions.locks import delete_registry as delete_registry
 from src.services.build_sessions.locks import heartbeat_is_alive as heartbeat_is_alive
-from src.services.build_sessions.locks import lock_expires_at as lock_expires_at
 from src.services.build_sessions.locks import lock_is_held as lock_is_held
 from src.services.build_sessions.locks import mark_registry_ending as mark_registry_ending
 from src.services.build_sessions.locks import read_registry as read_registry

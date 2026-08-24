@@ -10,11 +10,10 @@
     "build": "next build",
     "start": "next start",
     "lint": "tsc --noEmit",
-    "db:generate": "drizzle-kit generate",
     "db:migrate": "node scripts/db-migrate.mjs"
   },
   "dependencies": {
-    "next": "16.2.12",
+    "next": "16.3.1",
     "react": "19.2.7",
     "react-dom": "19.2.7",
     "@hookform/resolvers": "5.4.0",

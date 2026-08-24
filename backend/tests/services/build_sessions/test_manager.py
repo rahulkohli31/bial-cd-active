@@ -197,8 +197,8 @@ async def test_happy_start_provisions_launches_and_ends(
     assert await read_registry(fake_redis, user.id) is not None  # the sweep can still find it
     assert await stay_of_execution_is_current(fake_redis, user.id) is True
     assert await lock_is_held(fake_redis, user.id) is False  # the build slot is free
-    assert session.last_seq == 4
-    assert [e.seq for e in session.envelopes] == [1, 2, 3, 4]  # gap-free
+    assert session.last_seq == 3
+    assert [e.seq for e in session.envelopes] == [1, 2, 3]  # gap-free
 
 
 async def test_finalize_runs_the_liveness_detector_while_the_container_is_up(
@@ -477,14 +477,14 @@ async def test_abnormal_completion_synthesizes_failed_ended(
         sandbox_client=client,
     )
     assert session.task is not None
-    await session.task  # the brain raises after preview_ready (seq 3)
+    await session.task  # the brain raises after preview_ready (seq 2)
 
     assert session.status == BuildSessionStatus.FAILED  # derived from the synthetic ended
     terminal = session.envelopes[-1]
     assert isinstance(terminal, EndedEvent)
     assert terminal.status == BuildSessionStatus.FAILED
     assert terminal.reason == "build_failed"
-    assert terminal.seq == 4  # strictly last_seq+1 (preview_ready was seq 3), gap-free
+    assert terminal.seq == 3  # strictly last_seq+1 (preview_ready was seq 2), gap-free
     assert app_name_for(session.app_id) in client.torn_down  # container reclaimed
     assert await lock_is_held(fake_redis, user.id) is False  # lock reclaimed
 
@@ -1606,9 +1606,9 @@ async def test_completed_build_emits_one_ended_after_the_snapshot_with_the_true_
     assert order == ["snapshot", "ended"]
     assert app_name_for(session.app_id) not in client.torn_down
     # seq continues BRAIN's stream at last_seq + 1 — gap-free across the handoff.
-    assert ended[0].seq == 4
-    assert [e.seq for e in session.envelopes] == [1, 2, 3, 4]
-    assert session.last_seq == 4
+    assert ended[0].seq == 3
+    assert [e.seq for e in session.envelopes] == [1, 2, 3]
+    assert session.last_seq == 3
 
 
 async def test_snapshot_failure_emits_one_ended_that_admits_the_work_was_not_saved(
@@ -1798,7 +1798,7 @@ async def test_a_raised_run_build_still_emits_exactly_one_failed_ended(
     assert ended[0].reason == "build_failed"
     assert ended[0].snapshot_committed is True  # crashed, but the work was still saved
     assert order == ["snapshot", "teardown", "ended"]
-    assert ended[0].seq == 4  # the 3 envelopes it emitted before dying, + 1
+    assert ended[0].seq == 3  # the 2 envelopes it emitted before dying, + 1
 
 
 async def test_stop_racing_a_natural_completion_still_emits_exactly_one_ended(
@@ -1825,7 +1825,7 @@ async def test_stop_racing_a_natural_completion_still_emits_exactly_one_ended(
     assert len(_endeds(session)) == 1
     assert session.terminal_emitted is True
     assert session.status in (BuildSessionStatus.ENDED, BuildSessionStatus.FAILED)
-    assert [e.seq for e in session.envelopes] == [1, 2, 3, 4]  # still gap-free
+    assert [e.seq for e in session.envelopes] == [1, 2, 3]  # still gap-free
 
 
 # --- R3: the attachment resolution the manager performs at start ------------

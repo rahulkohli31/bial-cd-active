@@ -63,8 +63,10 @@ class BuildSessionStatus(enum.StrEnum):
 
 # --- Frozen lock TTL + cadence constants (C3 §3) -----------------------------
 # The Redis key namespace + TTLs are owned by C5; C3 freezes the client-facing
-# cadence. SESSION-API's Wave-1 lock ops set these; the portal keep-alive loop
-# renews/heartbeats to them.
+# cadence. SESSION-API's Wave-1 lock ops set these. There is no portal keep-alive
+# loop anymore (deleted in U13) and no HTTP surface to renew them from a browser
+# (the `lock/renew` / `heartbeat` routes were retired in U28) — the server itself
+# is the only renewer now, in-process, via `locks.py`/`manager.py`/`reaper.py`.
 
 LOCK_TTL_SECONDS = 900  # 15 min — lock auto-expires if not renewed (C5 reaper reconciles).
 LOCK_RENEW_CADENCE_SECONDS = 300  # 5 min — client renews at ⅓ TTL (two renews of head-room).
@@ -250,25 +252,12 @@ class BuildSessionStatusResponse(CamelModel):
     updated_at: datetime
 
 
-# --- Lock operations: acquire / renew / release / force-end / heartbeat (C3 §3) ---
-# The lock ops carry no request body; only the response bodies are typed.
-
-
-class LockStateResponse(CamelModel):
-    """`.../lock/acquire` and `.../lock/renew` → 200 (C3 §3.1, §3.2)."""
-
-    session_id: uuid.UUID
-    held: bool  # true when the caller now holds the lock.
-    owner_user_id: uuid.UUID  # the current holder (always the caller when held).
-    ttl_seconds: int  # the TTL just (re)set — LOCK_TTL_SECONDS.
-    expires_at: datetime  # UTC instant the lock lapses if not renewed.
-
-
-class LockReleaseResponse(CamelModel):
-    """`.../lock/release` → 200 (C3 §3.3). Idempotent."""
-
-    session_id: uuid.UUID
-    released: bool  # true if the lock was held-and-released or already free.
+# --- Lock operations: force-end (C3 §3) ---------------------------------------
+# U28 retired `acquire` / `renew` / `release` / `heartbeat` along with their response models
+# (`LockStateResponse`, `LockReleaseResponse`, `HeartbeatResponse`) — the portal's keep-alive
+# loop that was their only caller was itself deleted back in U13, and nothing else ever called
+# these routes. `force-end` is the sole survivor of this section, and it carries no request
+# body, same as its four retired neighbours.
 
 
 class ForceEndResponse(CamelModel):
@@ -276,15 +265,6 @@ class ForceEndResponse(CamelModel):
 
     session_id: uuid.UUID
     status: BuildSessionStatus  # `ended`.
-
-
-class HeartbeatResponse(CamelModel):
-    """`.../heartbeat` → 200 (C3 §3.5). The portal's liveness ping."""
-
-    session_id: uuid.UUID
-    alive: bool  # true — the session is live and the heartbeat was recorded.
-    cadence_seconds: int  # HEARTBEAT_CADENCE_SECONDS — the client's next-beat interval.
-    heartbeat_expires_at: datetime  # UTC instant the reaper considers the session idle.
 
 
 # --- the app's own client-error report (U13, R17 runtime half) ----------------
@@ -387,13 +367,30 @@ class ErrorSource(enum.StrEnum):
     TSC = "tsc"  # `tsc` typecheck failure, read over C1 /exec.
     NEXT_BUILD = "next_build"  # `next build` failure, read over C1 /exec.
     SERVER = "server"  # dev-server stderr, read over C1 /dev/logs.
-    CLIENT = "client"  # the browser client-error arm — LIVE as of U13; agent-only, never rendered.
+    # The browser client-error arm — LIVE as of U13. Its REPORT stays agent-only (see
+    # `agent_only_detail`): it still reaches the agent channel (`build_repair_prompt` acts on
+    # it, a repair run follows) and the health verdict (`outcome.error` carries it unchanged),
+    # but both current emit sites — `turns/engine.py` and `orchestrator/harness.py` — skip the
+    # `DiagnosticFrame` emit for this source on purpose, so it is NOT rendered to the citizen
+    # today. U16 still gave it a real citizen-facing sentence + action in `errors.user_facing`
+    # (not a placeholder) so that if a later plan decides to render it, the copy already
+    # speaks product language rather than a JS stack trace.
+    CLIENT = "client"
 
 
 class BuildError(BaseModel):
     """The structured, self-heal-relevant error shape (C7 §3) — `{source, title,
     cleaned_stack}`, reused by the `error` envelope, `escalation.last_error`, and
-    `BuildResult.error`."""
+    `BuildResult.error`.
+
+    THIS SHAPE IS THE MODEL'S, and U16 deliberately left it alone. `title` is BUILT to be the
+    compiler's own first meaningful line — that is what makes it useful to a repair run, and
+    what made rendering it the most developer-looking thing a citizen ever read. The fix was to
+    stop rendering it, not to soften it: the citizen-facing sentence + next action live in
+    `errors.user_facing` and travel on `DiagnosticFrame`, so `title` and `cleaned_stack` stay
+    byte-identical for a given raw input and the self-heal loop reads exactly what it always
+    did. Anyone tempted to make these two fields friendlier is about to break the repair prompt.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -435,15 +432,6 @@ class StepEvent(_ProgressEventBase):
     # F3/U3 — read-only + housekeeping steps are dropped from the VISIBLE feed (the raw command
     # still reaches the model). Additive + defaulted, so pre-U3 emitters stay wire-valid.
     hidden: bool = False
-
-
-class LogEvent(_ProgressEventBase):
-    """`log` — a raw log line (build/install output, dev-server tail) (C7 §3.2)."""
-
-    type: Literal["log"] = "log"
-    source: str  # "exec" (a C1 /exec run) or "dev" (a C1 /dev/logs tail).
-    stream: Literal["stdout", "stderr"]
-    text: str  # one LF-normalized line.
 
 
 class ErrorEvent(_ProgressEventBase):
@@ -518,7 +506,6 @@ class EndedEvent(_ProgressEventBase):
 
 ProgressEnvelope = Annotated[
     StepEvent
-    | LogEvent
     | ErrorEvent
     | PreviewReadyEvent
     | PreviewReconnectingEvent
@@ -527,9 +514,13 @@ ProgressEnvelope = Annotated[
     | EndedEvent,
     Field(discriminator="type"),
 ]
-"""The C7 tagged-union progress envelope — eight members, discriminated on `type`
+"""The C7 tagged-union progress envelope — seven members, discriminated on `type`
 (C7 §3; `preview_reconnecting` added by F8/U5). BRAIN emits one per `await on_progress(env)`;
-SESSION-API relays each over the C3 SSE feed verbatim (snake_case, `seq` preserved)."""
+SESSION-API relays each over the C3 SSE feed verbatim (snake_case, `seq` preserved).
+
+U29 retired the `log` member: no production BRAIN path had ever called the emitter's `log`
+helper (a dead-code audit finding, not a behavior change), so removing it drops the portal's
+unreachable raw-output consumer arm along with it."""
 
 
 class BuildResult(BaseModel):

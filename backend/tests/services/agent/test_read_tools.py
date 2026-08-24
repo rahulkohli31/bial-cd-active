@@ -11,6 +11,7 @@ truthful NORMAL result, redacted command output).
 from __future__ import annotations
 
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,10 @@ from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
+from src.core.redaction import (
+    CREDENTIAL_OPEN_SCAN_MAX_CHARS,
+    leaves_a_credential_value_open,
+)
 from src.db.models.conversation import ConversationMode
 from src.services.agent import read_tools
 from src.services.agent.read_tools import (
@@ -29,6 +34,11 @@ from src.services.agent.read_tools import (
     check_the_guest_list,
 )
 from src.services.agent.toolsets import ReadDeps, toolsets_for_mode, workspace_from_read_deps
+from src.services.orchestrator.constants import (
+    REDACT_INPUT_MAX_CHARS,
+    RUN_COMMAND_OUTPUT_MAX_CHARS,
+)
+from src.services.orchestrator.tools import _redact_command_output
 from tests.services.orchestrator.model_harness import text_turn, tool_turn
 
 _SECRET_DSN = "postgresql://appuser:sup3rs3cretpw@db.example/appdb"
@@ -500,3 +510,346 @@ async def test_search_files_tool_rejects_a_bad_regex_with_teaching(
         toolsets=toolsets_for_mode(ConversationMode.ASK, workspace_from_read_deps),
     )
     assert "not a valid regular expression" in captured["incoming"][1]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# U22 / R28 — the two mirrored output caps, proved identical from ONE table
+# ═══════════════════════════════════════════════════════════════════════════════════════
+#
+# `orchestrator/tools._redact_command_output` and `read_tools._cap_redact_cap` are the same
+# algorithm written twice, on purpose: the read surface adds NO runtime edge into the orchestrator
+# package (both module docstrings say why), so the copy cannot be replaced by an import. What a
+# copy CAN be replaced by is a test — and it has to be ONE test over BOTH, not two tests that
+# happen to agree today. Every case below runs through both functions and asserts, first, that
+# they returned the same string; the behavioural assertions come after and are therefore
+# assertions about both.
+
+_MIDDLE_SECRET = "DATABASE_PASSWORD=hunter2-super-secret"
+_TOP = "FATAL: the migration runner refused to start"
+_BOTTOM = "error TS2322: Type 'string' is not assignable to type 'number'."
+
+
+def _long_capture(middle: str | None = None) -> str:
+    body = [f"  at frame {n:03d} of a long and tedious stack ({'x' * 30})" for n in range(140)]
+    if middle is not None:
+        body[len(body) // 2] = middle
+    return "\n".join([_TOP, *body, _BOTTOM])
+
+
+_CAP_CASES: list[tuple[str, str, int, str | None, list[str], list[str]]] = [
+    (
+        "short output is returned whole and unmarked",
+        "exit fine\nnothing to see",
+        4_000,
+        "out_abc12345",
+        ["exit fine", "nothing to see"],
+        ["elided", "fetch_output_slice"],
+    ),
+    (
+        "a long capture keeps head AND tail and states the loss",
+        _long_capture(),
+        4_000,
+        "out_abc12345",
+        [_TOP, _BOTTOM, "elided", 'fetch_output_slice(handle="out_abc12345"'],
+        ["  at frame 070 "],
+    ),
+    (
+        "with no handle the notice names no tool the mode does not have",
+        _long_capture(),
+        4_000,
+        None,
+        [_TOP, _BOTTOM, "elided", "re-run a narrower command"],
+        ["fetch_output_slice"],
+    ),
+    (
+        "a secret in the elided middle is masked before anything is cut",
+        _long_capture(middle=_MIDDLE_SECRET),
+        4_000,
+        "out_abc12345",
+        [_TOP, _BOTTOM],
+        ["hunter2"],
+    ),
+    (
+        # A FIRST LINE BIGGER THAN THE HEAD BUDGET is hard-capped mid-line, so it is only PARTLY
+        # shown — and a slice addresses whole lines, so the range has to name it or the rest of
+        # that line is unreachable in any number of calls. It used to start the range at line 2.
+        "a head line cut mid-way is named in the range that recovers it",
+        "X" * 20_000 + "\n" + "\n".join(f"ordinary line {i}" for i in range(200)),
+        4_000,
+        "out_abc12345",
+        ["lines 1-", "start_line=1,", "only partly shown"],
+        ["lines 2-"],
+    ),
+    (
+        "a secret straddling the cut is not re-exposed as a fragment",
+        ("A" * 1_969) + f" {_MIDDLE_SECRET} " + ("B" * 5_000),
+        4_000,
+        None,
+        ["DATABASE_PASSWORD=***"],
+        ["hunter2", "hunter2-sup"],
+    ),
+]
+
+
+#: A multi-line quoted credential whose opening `KEY="` lands in the DROPPED MIDDLE of a capture
+#: and whose body runs into the retained TAIL. `_SECRET_ASSIGN_RE`'s quoted arms span newlines on
+#: purpose (a PEM, a passphrase), so the tail carries the VALUE with no key to identify it — which
+#: is why cutting on line boundaries does not save it.
+_PEM_BODY_SECRET = "hunter2NeverMaskedWithoutItsKey"
+
+
+def _credential_straddling_the_dropped_middle(*, separator: str = '="') -> str:
+    """A capture over the redactor's input cap, shaped so the credential's key is dropped and its
+    body survives into the tail. The old head-only cap never rendered this text at all, which is
+    what made retaining the tail a REGRESSION rather than an improvement.
+
+    `separator` is what sits between the key and the opening quote, and it is a parameter because
+    a COLOUR BYTE is a legitimate thing to find there — see the escape test below."""
+    lead = "".join(f"ordinary build line {i}\n" for i in range(4_000))
+    pem = "".join(
+        f"MIIEowIBAAKCAQEA{i:04d}aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n" for i in range(1_200)
+    )
+    return (
+        lead
+        + f"PRIVATE_KEY{separator}-----BEGIN RSA PRIVATE KEY-----\n"
+        + pem
+        + f'{_PEM_BODY_SECRET}\n-----END RSA PRIVATE KEY-----"\n'
+        + "".join(f"trailing line {i}\n" for i in range(50))
+    )
+
+
+#: The marker sitting in the FIRST body line of a credential that opens inside the HEAD of an
+#: over-cap capture — the half of the cut the tail guard never looked at.
+_HEAD_BODY_SECRET = "hunter2InTheHeadWithNoClosingQuote"
+
+
+def _credential_opened_inside_the_head() -> str:
+    """A capture over the input cap whose credential opens EARLY — inside the head — and whose
+    closing quote falls far past the head's cut point.
+
+    The masker cannot touch this: `_SECRET_ASSIGN_RE`'s quoted arms need the closing delimiter and
+    its bare arm excludes quote characters, so the assignment matches nothing at all and the
+    body renders verbatim. The head is not "masked with its key present"; it is unmatched."""
+    lead = "".join(f"ordinary build line {i}\n" for i in range(100))
+    pem = "".join(
+        f"MIIEowIBAAKCAQEA{i:04d}aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n" for i in range(1_200)
+    )
+    return (
+        lead
+        + 'PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\n'
+        + f"{_HEAD_BODY_SECRET}\n"
+        + pem
+        + '-----END RSA PRIVATE KEY-----"\n'
+        + "".join(f"trailing line {i}\n" for i in range(50))
+    )
+
+
+# The noise case is deliberately NOT in the table above: it is the ONE dimension on which the two
+# copies are designed to differ, so asserting byte-equality on it would pin a bug as correct.
+# It is pinned per-copy instead, immediately below.
+_NOISY_CAPTURE = (
+    "npm notice New major version of npm available!\n"
+    "12 packages are looking for funding\n"
+    "  run `npm fund` for details\n"
+    "npm warn deprecated request@2.88.2: request has been deprecated\n"
+    "3 vulnerabilities (1 moderate, 2 high)"
+)
+
+
+@pytest.mark.parametrize(
+    ("text", "budget", "handle", "present", "absent"),
+    [case[1:] for case in _CAP_CASES],
+    ids=[case[0] for case in _CAP_CASES],
+)
+def test_the_two_mirrored_output_caps_behave_identically(
+    text: str, budget: int, handle: str | None, present: list[str], absent: list[str]
+) -> None:
+    """★ THE ANTI-DRIFT TEST. Mutation check: change either copy's head/tail split, budget
+    handling or redaction ordering and the equality assertion goes red before any of the
+    behavioural ones do — which is the point, because a drift that keeps both copies
+    self-consistent is exactly the one no per-module test would catch.
+
+    Compared against `denoise=False` because that is the ACTUAL parity claim: the two pipelines are
+    identical *modulo the noise arm*, which the read copy does not have and is not supposed to have
+    (see the block comment in `read_tools`). Comparing against the default `denoise=True` would
+    assert a design difference away, and the only way to make it pass would be to teach the read
+    surface to drop lines out of file content — the exact silent edit that comment forbids."""
+    read_mode = read_tools._cap_redact_cap(text, budget=budget, handle=handle)
+    write_mode = _redact_command_output(text, budget=budget, handle=handle, denoise=False)
+    assert read_mode == write_mode, "the mirrored output caps have drifted apart"
+    for expected in present:
+        assert expected in read_mode
+    for unwanted in absent:
+        assert unwanted not in read_mode
+
+
+def test_a_credential_body_in_the_tail_is_withheld_not_egressed() -> None:
+    """★ THE U22 REGRESSION, and the one case where this branch was WORSE than what it replaced.
+
+    `_SECRET_ASSIGN_RE`'s quoted arms deliberately span newlines, so "a credential is a shape on
+    ONE line" — the assumption the line-boundary capture cut rests on — is false for those arms.
+    When the opening `KEY="` falls in the dropped middle, the retained tail is the inside of a
+    private key with nothing left to identify it: it matches none of the redactor's shapes and
+    egressed in the clear, into the model's context AND into the slice buffer behind
+    `fetch_output_slice`.
+
+    The old head-only cap discarded the tail entirely, so this text never left the container. That
+    is what makes it a regression and not a pre-existing gap.
+
+    Both copies are asserted, because both cut captures the same way."""
+    raw = _credential_straddling_the_dropped_middle()
+
+    write_mode = _redact_command_output(raw, budget=RUN_COMMAND_OUTPUT_MAX_CHARS)
+    read_mode = read_tools._cap_redact_cap(raw, budget=RUN_COMMAND_OUTPUT_MAX_CHARS)
+
+    assert _PEM_BODY_SECRET not in write_mode
+    assert _PEM_BODY_SECRET not in read_mode
+    # Withheld, and SAID so — a silently missing tail is the failure mode the capture marker
+    # exists to prevent, and the model needs a next action rather than a gap.
+    assert "withheld" in write_mode
+    assert "withheld" in read_mode
+    assert "re-run a narrower command" in write_mode
+
+
+def test_a_truncated_capture_with_no_credential_still_keeps_its_tail() -> None:
+    """THE OTHER HALF. A guard that withholds every truncated tail would undo the whole reason the
+    tail is rendered — `Failed to compile.` and the failing assertion live at the END, and getting
+    them there is what stopped the agent re-running the command. So the withholding must be rare
+    and conditional, not the default."""
+    lead = "".join(f"ordinary build line {i}\n" for i in range(4_000))
+    raw = lead + "Failed to compile.\nerror TS2304: Cannot find name 'foo'.\n"
+    # A budget wider than the capture window so this isolates the CAPTURE layer (where the guard
+    # lives) rather than the render layer, which does its own head/tail cut and can legitimately
+    # drop the capture marker to fit.
+    budget = REDACT_INPUT_MAX_CHARS * 2
+
+    write_mode = _redact_command_output(raw, budget=budget)
+    read_mode = read_tools._cap_redact_cap(raw, budget=budget)
+
+    for rendered in (write_mode, read_mode):
+        assert "dropped at capture" in rendered  # it really was truncated
+        assert "Failed to compile." in rendered  # ...and the tail survived anyway
+        assert "withheld" not in rendered
+
+
+def test_a_credential_body_in_the_head_is_withheld_not_egressed() -> None:
+    """★ THE OTHER HALF OF THE SAME CUT, and the one the tail guard did not cover.
+
+    A value that opens INSIDE the head and closes past it is unmaskable for exactly the reason a
+    tail beginning inside one is: the redactor's quoted arms need their closing delimiter, and its
+    bare arm excludes quote characters, so the assignment matches NOTHING. The head was rendered
+    unconditionally — so the visible prefix of a real bearer credential went into the model's
+    context and into the persisted step row, in the clear.
+
+    Mutation check: drop the `cut_before_an_open_credential` call from either copy's
+    `_redacted_lines` and the secret assertion goes red while everything else stays green.
+
+    Both copies are asserted, because both cut captures the same way."""
+    raw = _credential_opened_inside_the_head()
+
+    write_mode = _redact_command_output(raw, budget=RUN_COMMAND_OUTPUT_MAX_CHARS)
+    read_mode = read_tools._cap_redact_cap(raw, budget=RUN_COMMAND_OUTPUT_MAX_CHARS)
+
+    for rendered in (write_mode, read_mode):
+        assert _HEAD_BODY_SECRET not in rendered
+        assert "MIIEowIBAAKCAQEA0000" not in rendered  # nor the body lines after it
+        # Withheld, and SAID so — the same courtesy the tail gets.
+        assert "withheld" in rendered
+        # LIVENESS: the cut is to the credential's own line, not to the whole capture. Everything
+        # that came before it is still there, or a guard that answered "yes" to everything would
+        # pass this test while deleting every build log the tool ever returned.
+        assert "ordinary build line 3" in rendered
+
+
+@pytest.mark.parametrize(
+    "separator",
+    ['\x1b[39m="', '\x1b[0m="', '\u200b="', '\ufeff="'],
+    ids=["sgr-reset", "sgr-plain", "zero-width-space", "byte-order-mark"],
+)
+def test_an_escape_between_the_key_and_its_quote_does_not_unlock_the_tail(separator: str) -> None:
+    """★ THE GUARD AND THE MASKER MUST READ THE SAME BYTES.
+
+    `scrub_untrusted` masks DE-ESCAPED text, so a guard that scanned the RAW text disagreed with
+    it about the same input: neither ESC nor U+200B is `\\s`, so one colour byte between the key
+    and its opening quote answered "nothing is open" and the tail — the inside of the private key
+    — shipped in the clear. Colourised CLI output puts an SGR reset in exactly that position as a
+    matter of routine, so this is not only an adversarial shape.
+
+    Mutation check: drop `strip_control_sequences` from `leaves_a_credential_value_open` and every
+    row here goes red while the plain-separator test above stays green."""
+    raw = _credential_straddling_the_dropped_middle(separator=separator)
+
+    write_mode = _redact_command_output(raw, budget=RUN_COMMAND_OUTPUT_MAX_CHARS)
+    read_mode = read_tools._cap_redact_cap(raw, budget=RUN_COMMAND_OUTPUT_MAX_CHARS)
+
+    for rendered in (write_mode, read_mode):
+        assert _PEM_BODY_SECRET not in rendered
+        assert "-----END RSA PRIVATE KEY-----" not in rendered
+        assert "withheld" in rendered
+        # LIVENESS: the head is still rendered in full — this withholds a tail, not a capture.
+        assert "ordinary build line 3" in rendered
+
+
+def test_the_capture_guard_stays_inside_its_wall_clock_budget() -> None:
+    """★ THE MUTATION TARGET for the input bound: raise `CREDENTIAL_OPEN_SCAN_MAX_CHARS` back
+    toward its old 8,000,000 and this goes red, because the scan below stops being bounded by the
+    ceiling and starts being bounded by whatever the app printed.
+
+    WHY WALL-CLOCK AND NOT A CONCURRENCY PROBE. The cost is paid ON the event loop and cannot be
+    moved off it: `re` does not release the GIL, so a non-matching scan — one C call — blocks
+    every other request in the process for its whole duration no matter which thread it runs in
+    (measured: a 1 ms ticker gets 0 ticks across a 304 ms `to_thread` scan of this pattern). The
+    only lever is how much text the scan may ever see, which is what this pins. 1s never flakes on
+    a bounded linear scan — the ceiling measures ~80 ms, and the capture below is 25x past it, so
+    the margin is the bound rather than the machine — and it fails loudly on either a raised bound
+    or a superlinear regression, the pair the ReDoS learning says to guard together."""
+    # Well past the scan ceiling: what is asserted is that the BOUND decides the cost, not the
+    # input. Identifier-shaped bytes, because that is what makes this pattern work hardest. Built
+    # OUTSIDE the stopwatch — 6 MB of string concatenation is not what is being measured.
+    raw = ("A" * 79 + "\n") * 80_000
+    started = time.perf_counter()
+    rendered = _redact_command_output(raw, budget=4_000)
+    elapsed = time.perf_counter() - started
+
+    assert "elided" in rendered  # LIVENESS: it really rendered the capture, it did not bail
+    assert elapsed < 1.0, f"the open-credential scan took {elapsed:.2f}s"
+
+
+def test_the_open_credential_detector_answers_both_ways() -> None:
+    """The detector itself, at the unit level — the two answers the guard above turns on, plus the
+    fail-toward-withholding case. An earlier opener that CLOSED must not poison the answer, or
+    every build log containing one quoted credential would lose its tail forever."""
+    assert leaves_a_credential_value_open('PRIVATE_KEY="-----BEGIN\nstill going') is True
+    assert leaves_a_credential_value_open('PRIVATE_KEY="closed"\nmore output') is False
+    assert leaves_a_credential_value_open("no credential here at all\n") is False
+    # Unscannably large input is not a licence: it answers "assume open".
+    assert leaves_a_credential_value_open("x" * (CREDENTIAL_OPEN_SCAN_MAX_CHARS + 1)) is True
+
+
+def test_the_write_copy_drops_predictable_noise_but_keeps_the_signal() -> None:
+    """The noise arm, pinned on the copy that HAS one. A dependency-manager solicitation and a
+    vulnerability advisory arrive on the same stream, so the filter earns its keep only if it can
+    tell them apart — dropping an advisory to save four lines of chatter is a bad trade."""
+    kept = _redact_command_output(_NOISY_CAPTURE, budget=4_000, denoise=True)
+
+    assert "deprecated" in kept
+    assert "vulnerabilities" in kept
+    assert "npm notice" not in kept
+    assert "looking for funding" not in kept
+    assert "npm fund" not in kept
+
+
+def test_the_read_copy_never_drops_a_line_of_what_it_was_asked_to_read() -> None:
+    """The other half, and the reason the copies differ. Everything reaching the read surface is
+    FILE CONTENT — `check_the_guest_list` admits only `ls, cat, head, tail, grep, sed, find, wc`,
+    and `search_files` renders hits out of files. Dropping a line there is not a saving, it is a
+    silent edit: a `sed -n '40,80p'` that answers 40 of the 41 lines it was asked for, and an
+    `edit_file` composed from that read failing to match with nothing on screen to explain why.
+
+    Written over the same capture the Write copy de-noises, so the two tests read as the pair they
+    are. These are PRESENCE assertions throughout: an absence assertion here would pass by vacuity
+    against a function that returned "", which is exactly the false green to avoid."""
+    read = read_tools._cap_redact_cap(_NOISY_CAPTURE, budget=4_000)
+
+    for line in _NOISY_CAPTURE.splitlines():
+        assert line.strip() in read, f"the read surface silently dropped: {line!r}"

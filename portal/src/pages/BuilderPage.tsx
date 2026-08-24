@@ -817,7 +817,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         // `build_in_progress` part — that is all a reattach needs.
         reattachToLiveBuild(buildId, restored, () => alive)
         // A HANDED-OFF PROMPT FIRES EITHER WAY. The thread is canonical and permanent now
-        // (003-U1), so it is empty exactly once in its life — every "Generate App" after the
+        // (003-U1), so it is empty exactly once in its life — every "Start Chat" after the
         // first arrives at a thread with turns. Consuming the prompt only on the empty branch
         // meant the second build onward silently swallowed the user's typed prompt AND their
         // attachments: the composer was already cleared above, and nothing else reads

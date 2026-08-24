@@ -15,8 +15,7 @@ uv.lock
 .pytest_cache/
 .mypy_cache/
 
-# Node install for the acceptance-(a) Playwright driver (tests/acceptance_a/) — never committed.
-# Anchor the lockfile to that dir so it can never shadow the tracked, build-critical
-# template/package-lock.json (Dockerfile.sandbox's `npm ci` depends on it).
+# Node install artifacts anywhere under this tree — never committed. Untracked so they can
+# never shadow the tracked, build-critical template/package-lock.json (Dockerfile.sandbox's
+# `npm ci` depends on it).
 node_modules/
-/tests/acceptance_a/package-lock.json

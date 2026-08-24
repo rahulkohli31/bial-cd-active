@@ -73,12 +73,34 @@ class CopyVerdict:
         return self.state is CopyState.CONFIRMED_CURRENT
 
 
-async def confirm_durable_copy(app_id: uuid.UUID, *, container_head: str | None) -> CopyVerdict:
+async def confirm_durable_copy(
+    app_id: uuid.UUID, *, container_head: str | None, container_dirty: bool | None
+) -> CopyVerdict:
     """Is this container's work provably preserved? (R9, R11.)
 
     `container_head` is the container's current `HEAD`, or `None` when it could not be read —
     which is the ordinary case for the population this gate exists to judge, since an orphan has
     no registry record and may not be reachable at all.
+
+    `container_dirty` is whether that container's working tree has uncommitted changes, and it is
+    KEYWORD-REQUIRED WITH NO DEFAULT on purpose. A permissive default on a gate that authorises
+    destruction is how the bug below shipped; a caller that does not know must say `None` and be
+    refused, not stay silent and be believed. `None` means the probe did not answer.
+
+    A HEAD MATCH ALONE STOPPED MEANING "PRESERVED" WHEN THE AGENT STOPPED COMMITTING (U19).
+    The comparison below was written when the build agent committed as it worked, so a turn that
+    wrote files MOVED `HEAD` and a copy from the previous turn was detectably behind it. U19
+    deleted that commit discipline — the platform now commits only at the turn boundary — so
+    "HEAD unchanged + dirty tree" is the normal shape of every building turn. A turn that dies
+    before its finalizer (process death, OOM, a deploy restart, eviction) therefore leaves `HEAD`
+    exactly where the LAST turn's recovery copy was stamped, and a HEAD-only comparison reads that
+    as provably preserved and destroys a whole turn's uncommitted work — writing an audit row
+    saying it was safe. The dirty flag is what closes that, and it is why this signature changed
+    rather than the call sites quietly passing `head` alone.
+
+    The plan that removed the commits guards the recovery-copy WRITE path against the same new
+    normal (`test_a_dirty_tree_at_unchanged_head_still_writes_a_recovery_copy`). This is the same
+    lesson applied to the DESTROY path, which that test does not reach.
 
     FAILS TOWARD SPARING, ALWAYS. Every branch that could not establish a fact returns
     `UNCONFIRMED`, and `UNCONFIRMED` never authorises a delete. A timeout is not a death
@@ -122,9 +144,28 @@ async def confirm_durable_copy(app_id: uuid.UUID, *, container_head: str | None)
             "the container could not be read; a parseable recovery copy stands in",
         )
 
-    if stamped == container_head:
-        return CopyVerdict(CopyState.CONFIRMED_CURRENT, "the recovery copy matches HEAD")
-    return CopyVerdict(CopyState.STALE, "the recovery copy is behind HEAD")
+    if stamped != container_head:
+        return CopyVerdict(CopyState.STALE, "the recovery copy is behind HEAD")
+
+    # HEAD MATCHES — now ask the question a HEAD comparison cannot answer (see the docstring).
+    if container_dirty is None:
+        # We reached the container and read its HEAD, but not its tree. That is an unestablished
+        # fact on a path that authorises destruction, so it spares rather than confirms.
+        return CopyVerdict(
+            CopyState.UNCONFIRMED,
+            "the recovery copy matches HEAD, but the working tree could not be read",
+        )
+    if container_dirty:
+        # The copy is not behind HEAD — it is behind the WORKING TREE, which is the shape every
+        # building turn now has. STALE rather than UNCONFIRMED because this is a known state with
+        # a known remedy: take a copy first, then reclaim.
+        return CopyVerdict(
+            CopyState.STALE,
+            "the recovery copy matches HEAD but the working tree has uncommitted work",
+        )
+    return CopyVerdict(
+        CopyState.CONFIRMED_CURRENT, "the recovery copy matches HEAD on a clean tree"
+    )
 
 
 def head_of_bundle(data: bytes) -> str | None:

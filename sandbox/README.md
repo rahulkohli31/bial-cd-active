@@ -37,7 +37,7 @@ Resolved to the newest stable at authoring (2026-07-13) and pinned into `package
 | Layer            | Pinned version            |
 |------------------|---------------------------|
 | Node (image)     | **24 LTS** (`node:24-bookworm-slim`) |
-| Next.js          | **16.2.10** (App Router)  |
+| Next.js          | **16.3.1** (App Router)   |
 | React / react-dom| **19.2.7**                |
 | TypeScript       | **5.9.3**  (the `5.x` line C6/D11 froze — TS 7.x is out but the contract pins the 5.x line) |
 | Tailwind CSS     | **4.3.2** (+ `@tailwindcss/postcss` 4.3.2, `tw-animate-css` 1.4.0) |

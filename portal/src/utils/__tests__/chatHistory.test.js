@@ -1,28 +1,21 @@
 import { describe, it, expect } from 'vitest'
-import { buildPromptFromHistory, relativeTime, deriveTitle, newConversation } from '../chatHistory'
+import * as chatHistory from '../chatHistory'
+import { relativeTime, deriveTitle, newConversation } from '../chatHistory'
 
-describe('buildPromptFromHistory (parts model)', () => {
-  it('renders an attachment turn as its prose, not [object Object]', () => {
-    const prompt = buildPromptFromHistory([
-      {
-        role: 'user',
-        parts: [
-          { type: 'file', attachmentId: 'a1', kind: 'image', mediaType: 'image/png', name: 's.png' },
-          { type: 'text', text: 'analyze this screenshot' },
-        ],
-      },
-      { role: 'assistant', parts: [{ type: 'text', text: 'Sure, here is the plan.' }] },
-    ])
-    expect(prompt).toContain('analyze this screenshot')
-    expect(prompt).not.toContain('[object Object]')
-  })
-
-  it('uses the first user message as the goal', () => {
-    const prompt = buildPromptFromHistory([
-      { role: 'user', parts: [{ type: 'text', text: 'build a gate tracker' }] },
-      { role: 'assistant', parts: [{ type: 'text', text: 'ok' }] },
-    ])
-    expect(prompt).toContain("User's goal: build a gate tracker")
+// U27: `buildPromptFromHistory` wrapped a planning transcript into the prompt for the old
+// client-driven single-file build. The open-sandbox orchestrator builds from the conversation
+// it already owns server-side, so the client never assembles this prompt itself any more — a
+// zero-reference export. Inert guard against it silently returning, paired with a liveness
+// check (same shape as the sibling in `buildSystemPrompt.test.js`) so the guard cannot
+// false-green on a broken import.
+describe('buildPromptFromHistory is retired (U27)', () => {
+  it('no longer exports buildPromptFromHistory, while the rest of the module still works', () => {
+    expect(chatHistory.buildPromptFromHistory).toBeUndefined()
+    const a = newConversation()
+    const b = newConversation()
+    expect(a).not.toBe(b)
+    expect(a).toMatch(/^[0-9a-f-]{36}$/i)
+    expect(deriveTitle('  trimmed  ')).toBe('trimmed')
   })
 })
 

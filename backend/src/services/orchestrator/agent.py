@@ -3,9 +3,9 @@
 ONE `Agent`, built WITHOUT a bound model — the Foundry model is passed per-run
 (`agent.iter(..., model=…)`) so import never needs a configured Foundry (dev/test boot without
 it) and tests inject a `FunctionModel`. Mirrors `services/agent/agent.py`. The tool surface is
-the `sandbox_toolset` FACTORY from `tools.py` (five file tools + `run_command`), constructed here
-over the `BuildDeps` accessor — the same toolset a Write chat turn builds over its own deps, so
-there is exactly one tool body in the tree.
+the `sandbox_toolset` FACTORY from `tools.py` (the generated `WRITE_TOOL_SURFACE`), constructed
+here over the `BuildDeps` accessor — the same toolset a Write chat turn builds over its own deps,
+so there is exactly one tool body in the tree.
 """
 
 from __future__ import annotations

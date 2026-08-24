@@ -50,7 +50,7 @@ class ChatDeps:
 
     `workspace` is the turn-pinned read surface a mode-gated run's toolsets resolve
     through (U10 sets it; the relay path never does — its runs carry no tools).
-    `sandbox` is set on a WRITE turn only — the live session the six sandbox tools act
+    `sandbox` is set on a WRITE turn only — the live session the eight sandbox tools act
     through. Both are `None` off their paths, and both accessors fail-first rather than
     degrade.
     """

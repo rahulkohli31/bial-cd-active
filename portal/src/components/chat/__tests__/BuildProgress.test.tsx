@@ -5,21 +5,31 @@
  *    fixed spot, replacing itself as new steps arrive rather than accumulating a list;
  *  - AFTER the build ends: the full step history (all steps, in seq order, deduped
  *    last-wins by seq) becomes available behind a dropdown that is COLLAPSED by default;
- *  - raw log lines render ONLY inside the Details expander — never ambient in the bubble;
+ *  - NOTHING developer-facing renders anywhere: no raw log expander, no <pre> stack, no
+ *    compiler-authored title — every error status is a product sentence plus a next action (U16);
  *  - the headline transitions: working (with elapsed reassurance) → "Your app is ready";
  *  - `ended` renders nothing here (the persisted BuildOutcome message is the record);
  *  - Stop fires directly; Force-end CONFIRMS first (it kills in-progress work);
  *  - error / escalation / quota alerts stay visible, styled by kind.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, cleanup, fireEvent, screen } from '@testing-library/react'
+import { render, cleanup, fireEvent, screen, act } from '@testing-library/react'
 import BuildProgress, {
+  ACK_STEP_NAME,
+  ANNOUNCE_MIN_INTERVAL_MS,
+  ERROR_FALLBACK_ACTION,
+  ERROR_FALLBACK_MESSAGE,
   atLimitSendState,
   formatResetTime,
   hasBuildNarrative,
   withMailtoLinks,
 } from '../BuildProgress'
-import type { FeedEnvelope, QuotaExceededEvent } from '../../../utils/buildSessionTypes'
+import type {
+  ErrorSource,
+  FeedEnvelope,
+  QuotaExceededEvent,
+} from '../../../utils/buildSessionTypes'
+import { narrativeEnvelopes } from '../../../utils/turnNarrative'
 
 afterEach(cleanup)
 
@@ -104,12 +114,17 @@ describe('the live view shows exactly one step at a time', () => {
   })
 
   it('the current step lives in a polite live region (role=status) that does not steal focus', () => {
+    // U17 moved the region off the visible node and onto a dedicated sr-only MIRROR of it, so
+    // the row can update at build speed while announcements stay at listening speed. What the
+    // region says is still the current step, and it is still atomic — both asserted here so a
+    // regression that silently empties the mirror cannot pass as "the region is present".
     const envelopes: FeedEnvelope[] = [
       { type: 'step', seq: 1, name: 's', label: 'Working', state: 'started' },
     ]
     draw({ envelopes })
     const status = screen.getByRole('status', { name: /build activity/i })
     expect(status.getAttribute('aria-atomic')).toBe('true')
+    expect(status.textContent).toBe('Working')
   })
 
   it('once a later step resolves, an earlier still-"started" step degrades to the generic "Working…" placeholder — indistinguishable from a permanent orphan otherwise (fix 2)', () => {
@@ -233,31 +248,6 @@ describe('after the build ends, the full step history is a collapsed dropdown', 
   })
 })
 
-describe('raw output stays behind Details (zero ambient shell lines)', () => {
-  it('log lines render ONLY inside the expander, stderr styled distinctly', () => {
-    const envelopes: FeedEnvelope[] = [
-      { type: 'log', seq: 1, source: 'exec', stream: 'stdout', text: 'added 10 packages' },
-      { type: 'log', seq: 2, source: 'dev', stream: 'stderr', text: 'warning: something' },
-    ]
-    const { container } = draw({ envelopes })
-    const details = container.querySelector('details')
-    expect(details).toBeTruthy()
-    // The raw lines are INSIDE the expander — nothing mono leaks into the bubble body.
-    expect(details?.textContent).toContain('added 10 packages')
-    const outside = container.textContent?.replace(details?.textContent ?? '', '')
-    expect(outside).not.toContain('added 10 packages')
-    expect(details?.querySelector('[data-stream="stderr"] .text-danger\\/90')).toBeTruthy()
-    expect(details?.querySelector('[data-stream="stdout"] .text-danger\\/90')).toBeNull()
-  })
-
-  it('no logs → no Details expander at all', () => {
-    const { container } = draw({
-      envelopes: [{ type: 'step', seq: 1, name: 's', label: 'Working', state: 'ok' }],
-    })
-    expect(container.querySelector('details')).toBeNull()
-  })
-})
-
 describe('the headline transitions', () => {
   it('building shows the working line with the elapsed-time reassurance', () => {
     const { container } = draw({ startedAt: Date.now() - 90_000 })
@@ -361,9 +351,41 @@ describe('alerts stay visible', () => {
       { type: 'quota_exceeded', seq: 3, limit: 1000000, used: 1000001, resets_at: 'x' },
     ]
     const { container } = draw({ envelopes })
-    expect(container.querySelector('[data-kind="error"]')?.textContent).toContain('Type error in app/page.tsx')
+    const error = container.querySelector('[data-kind="error"]')
+    // FLIPPED (U16): this used to assert the compiler's own title WAS the error row's headline.
+    // The row is still here and still red — it now speaks about the app instead of about a file.
+    expect(error).toBeTruthy()
+    expect(error?.textContent).toContain(ERROR_FALLBACK_MESSAGE)
+    expect(error?.textContent).not.toContain('Type error in app/page.tsx')
+    expect(error?.textContent).not.toContain('app/page.tsx(12,5)')
     expect(container.querySelector('[data-kind="escalation"]')?.textContent).toContain('gave up')
     expect(container.querySelector('[data-kind="quota_exceeded"]')?.textContent).toMatch(/daily limit/i)
+  })
+
+  it('an escalation stops carrying the compiler-authored last-error title', () => {
+    // The same developer line the error arm dropped was still rendering one branch over, so
+    // stripping only the error arm would have moved the leak rather than closed it.
+    const envelopes: FeedEnvelope[] = [
+      {
+        type: 'escalation',
+        seq: 1,
+        reason: 'max_retries',
+        detail: 'We could not get that working.',
+        last_error: {
+          source: 'tsc',
+          title: "app/page.tsx(12,5): error TS2307: Cannot find module '@/components/X'",
+          cleaned_stack: 'app/page.tsx(12,5): error TS2307',
+        },
+      },
+    ]
+    const { container } = draw({ envelopes })
+    const row = container.querySelector('[data-kind="escalation"]')
+    expect(row).toBeTruthy()
+    expect(row?.textContent).toContain('We could not get that working.')
+    expect(row?.textContent).not.toContain('app/page.tsx')
+    expect(row?.textContent).not.toContain('TS2307')
+    // An escalation is an error status like any other, so it carries a next step too.
+    expect(row?.textContent).toContain(ERROR_FALLBACK_ACTION)
   })
 })
 
@@ -414,6 +436,8 @@ describe('F3/U3: friendly labels only, hidden steps dropped, zero raw shell', ()
 })
 
 describe('a self-healed failure reads as a retry, once, whole (U4)', () => {
+  // The MODEL's half is present on both fixtures on purpose: the point of the split is that it
+  // rides along on the envelope and is simply never rendered.
   const recovering: FeedEnvelope = {
     type: 'error',
     seq: 4,
@@ -421,6 +445,8 @@ describe('a self-healed failure reads as a retry, once, whole (U4)', () => {
     title: 'Type error in app/page.tsx — the About page imports a component that does not…',
     cleaned_stack: 'Type error in app/page.tsx — the About page imports a component that does not…',
     recovering: true,
+    user_message: "Part of your app didn't fit together.",
+    user_action: "Nothing to do right now — we're working on it. If it keeps happening, try asking for something simpler.",
   }
   const terminalError: FeedEnvelope = {
     type: 'error',
@@ -428,6 +454,8 @@ describe('a self-healed failure reads as a retry, once, whole (U4)', () => {
     source: 'server',
     title: 'The dev server crashed',
     cleaned_stack: 'Error: boom\n  at Server.listen',
+    user_message: 'Your app ran into a problem while it was starting up.',
+    user_action: "Nothing to do right now — we're working on it. If it keeps happening, try asking for something simpler.",
   }
 
   it('a diagnostic renders the retry framing while a genuine error stays red (mutation: restore the diagnostic→error collapse and this goes red)', () => {
@@ -435,23 +463,40 @@ describe('a self-healed failure reads as a retry, once, whole (U4)', () => {
     const retry = container.querySelector('[data-kind="retry"]')
     const error = container.querySelector('[data-kind="error"]')
     expect(retry?.textContent).toContain('trying another way')
-    expect(retry?.textContent).not.toContain('The dev server crashed')
-    expect(error?.textContent).toContain('The dev server crashed')
+    // The two rows still tell DIFFERENT stories — they just tell them in product language now.
+    expect(retry?.textContent).toContain("Part of your app didn't fit together.")
+    expect(retry?.textContent).not.toContain('starting up')
+    expect(error?.textContent).toContain('Your app ran into a problem while it was starting up.')
+    expect(error?.textContent).not.toContain('The dev server crashed')
   })
 
-  it('the diagnostic detail renders exactly ONCE — the title, no monospace copy', () => {
+  it('the retry framing renders the product sentence, never the compiler title', () => {
     const { container } = draw({ envelopes: [recovering] })
     const retry = container.querySelector('[data-kind="retry"]')
+    // LIVENESS: the row rendered. A row that threw also has no <pre> and no title.
     expect(retry).toBeTruthy()
-    // Today's double render was prose + <pre> of the SAME string, both clipped mid-word.
-    const hits = retry?.textContent?.split('Type error in app/page.tsx').length ?? 0
-    expect(hits - 1).toBe(1)
+    expect(retry?.textContent).toContain('trying another way')
+    expect(retry?.textContent).toContain("Part of your app didn't fit together.")
+    expect(retry?.textContent).toContain('try asking for something simpler')
+
+    expect(retry?.textContent).not.toContain('Type error in app/page.tsx')
     expect(retry?.querySelector('pre')).toBeNull()
   })
 
-  it('a terminal error keeps its <pre> stack — only diagnostics drop the monospace block', () => {
+  it('FLIPPED: a terminal error no longer keeps its <pre> stack either', () => {
+    // This test used to pin the <pre> as CORRECT for the terminal arm ("only diagnostics drop
+    // the monospace block"). The stack is the single most developer-looking thing a citizen
+    // reads, and the terminal arm is where they are most likely to read it.
     const { container } = draw({ envelopes: [terminalError] })
-    expect(container.querySelector('[data-kind="error"] pre')).toBeTruthy()
+    const error = container.querySelector('[data-kind="error"]')
+    // LIVENESS before absence — a crashed row has no <pre> either.
+    expect(error).toBeTruthy()
+    expect(error?.textContent).toContain('Your app ran into a problem while it was starting up.')
+
+    expect(container.querySelector('[data-kind="error"] pre')).toBeNull()
+    expect(container.querySelector('pre')).toBeNull()
+    expect(error?.textContent).not.toContain('The dev server crashed')
+    expect(error?.textContent).not.toContain('at Server.listen')
   })
 
   it('a diagnostic-only narrative still counts as narrative while the build runs (the 2b00ce3 chrome gate)', () => {
@@ -603,5 +648,433 @@ describe('U24: what a citizen sees when their budget is gone', () => {
 
   it('leaves a sentence with no address exactly as it was', () => {
     expect(withMailtoLinks('Nothing to link here.')).toEqual(['Nothing to link here.'])
+  })
+})
+
+/**
+ * U16 — the platform's own surfaces speak product language.
+ *
+ * `BuildError` is deliberately dual-purpose: `title` is BUILT to be the compiler's own first
+ * meaningful line, because that is what the repair run needs. Rendering it was the defect. What
+ * this block pins is the split — the model's half still rides on the envelope, and none of it
+ * reaches the screen — plus the rule that replaced it: every rendered error status carries a
+ * plain sentence AND a next action.
+ */
+describe('U16: every error status is a sentence plus a next action', () => {
+  const ALL_SOURCES: ErrorSource[] = ['tsc', 'next_build', 'server', 'client']
+
+  it('a diagnostic renders NO <pre> and NO compiler title — with the row proven alive', () => {
+    // ASSERT-ABSENCE IS HALF A TEST. A row that threw inside its own render has no <pre> and no
+    // title either, and would pass every negative below on its own. So the row is located and
+    // its product sentence read back FIRST; only then does the absence mean anything.
+    const envelopes: FeedEnvelope[] = [
+      {
+        type: 'error',
+        seq: 1,
+        source: 'tsc',
+        title: "app/page.tsx(12,5): error TS2307: Cannot find module '@/components/VisitorTable'",
+        cleaned_stack:
+          "app/page.tsx(12,5): error TS2307: Cannot find module '@/components/VisitorTable'\n" +
+          '  at Object.<anonymous> (/workspace/app/node_modules/next/dist/build/index.js:1:9)',
+        user_message: "Part of your app didn't fit together.",
+        user_action: 'Try describing what you want again, or ask for something simpler.',
+      },
+    ]
+    const { container } = draw({ envelopes })
+    const row = container.querySelector('[data-kind="error"]')
+    expect(row).toBeTruthy()
+    expect(row?.querySelector('[data-part="message"]')?.textContent).toBe(
+      "Part of your app didn't fit together.",
+    )
+
+    expect(container.querySelector('pre')).toBeNull()
+    expect(container.textContent).not.toContain('app/page.tsx')
+    expect(container.textContent).not.toContain('TS2307')
+    expect(container.textContent).not.toContain('node_modules')
+    expect(container.textContent).not.toContain('workspace')
+  })
+
+  it('an error with no product-language equivalent renders BOTH halves of the committed fallback', () => {
+    // The legacy C7 feed carries neither field. Asserting only the absence of the stack would
+    // pass against a row that renders an empty box — which is a quieter dead end, not a fix.
+    const envelopes: FeedEnvelope[] = [
+      { type: 'error', seq: 1, source: 'server', title: 'ECONNREFUSED 127.0.0.1:3000', cleaned_stack: 'at Socket.emit' },
+    ]
+    const { container } = draw({ envelopes })
+    const row = container.querySelector('[data-kind="error"]')
+    expect(row).toBeTruthy()
+    expect(row?.textContent).toContain(ERROR_FALLBACK_MESSAGE)
+    expect(row?.textContent).toContain(ERROR_FALLBACK_ACTION)
+    // Both halves are separately locatable, so a render that concatenated one into the other
+    // (or dropped the action) cannot pass on the combined string alone.
+    expect(row?.querySelector('[data-part="message"]')?.textContent).toBe(ERROR_FALLBACK_MESSAGE)
+    expect(row?.querySelector('[data-part="action"]')?.textContent).toBe(ERROR_FALLBACK_ACTION)
+    expect(row?.textContent).not.toContain('ECONNREFUSED')
+  })
+
+  it('TABLE-DRIVEN over every ErrorSource, including client: each renders a non-empty action', () => {
+    // A per-source table is exactly the kind of thing that grows a member with no row, and the
+    // failure is silent. Both arms are covered — a class that only renders its action while
+    // recovering still dead-ends the citizen at the terminal, which is when they read it.
+    for (const source of ALL_SOURCES) {
+      for (const recovering of [true, false]) {
+        const env: FeedEnvelope = {
+          type: 'error',
+          seq: 1,
+          source,
+          title: 'app/page.tsx(1,1): error TS1005',
+          cleaned_stack: 'app/page.tsx(1,1): error TS1005',
+          ...(recovering ? { recovering: true } : {}),
+        }
+        const { container, unmount } = draw({ envelopes: [env], status: 'building' })
+        const row = container.querySelector(recovering ? '[data-kind="retry"]' : '[data-kind="error"]')
+        expect(row, `${source} / recovering=${recovering}`).toBeTruthy()
+        expect(row?.getAttribute('data-source')).toBe(source)
+        const action = row?.querySelector('[data-part="action"]')?.textContent ?? ''
+        expect(action.trim().length, `${source} / recovering=${recovering}`).toBeGreaterThan(0)
+        expect(row?.textContent).not.toContain('app/page.tsx')
+        unmount()
+      }
+    }
+  })
+
+  it('the pair survives the DiagnosticFrame → ErrorEvent mapping (the field-drops-here guard)', () => {
+    // THIS MAPPING IS WHERE A NEW FIELD SILENTLY DISAPPEARS. `ErrorEvent`'s citizen-facing
+    // fields are optional, so a `narrativeEnvelopes` that simply forgot to copy them would
+    // typecheck, render, and quietly serve every citizen the generic fallback forever.
+    const envelopes = narrativeEnvelopes({
+      steps: {},
+      diagnostics: [
+        {
+          source: 'client',
+          title: 'TypeError: undefined is not a function',
+          cleanedStack: '',
+          userMessage: 'The app opened but ran into a problem in the browser.',
+          userAction: "Nothing to do right now — we're working on it.",
+        },
+      ],
+      quota: null,
+      workspace: null,
+      preview: { url: null, state: null },
+    })
+
+    const error = envelopes.find((env) => env.type === 'error')
+    expect(error).toBeTruthy()
+    expect(error?.type === 'error' && error.user_message).toBe(
+      'The app opened but ran into a problem in the browser.',
+    )
+    expect(error?.type === 'error' && error.user_action).toBe(
+      "Nothing to do right now — we're working on it.",
+    )
+
+    // …and it survives all the way to the screen, which is the only place it matters.
+    const { container } = draw({ envelopes, status: 'building' })
+    const row = container.querySelector('[data-kind="retry"]')
+    expect(row).toBeTruthy()
+    expect(row?.querySelector('[data-part="message"]')?.textContent).toBe(
+      'The app opened but ran into a problem in the browser.',
+    )
+    expect(row?.querySelector('[data-part="action"]')?.textContent).toBe(
+      "Nothing to do right now — we're working on it.",
+    )
+  })
+
+  it('AE13: nothing in a whole build — steps, errors, escalation — is addressed to a developer', () => {
+    // THE COMPLETE RENDERED SET, which is the part that makes this AE13 rather than a narration
+    // check: the platform's own error surfaces are scanned alongside the agent's steps, because
+    // those surfaces were the worst offenders. U15 and U18 assert against this same list.
+    // `log` frames no longer exist (U29 — no production path had ever emitted one), so the
+    // developer-vocabulary-in-raw-output case they used to cover here is gone with them.
+    const DEVELOPER_VOCABULARY = [
+      '/', '.tsx', '.ts', '.css', '.json', 'app/', 'components/', 'workspace', 'node_modules',
+      'npm', 'npx', 'pnpm', 'yarn', 'bash', 'tsc', 'eslint', 'drizzle-kit', '$ ',
+      'next.js', 'nextjs', 'react', 'tailwind', 'shadcn', 'drizzle', 'typescript', 'webpack',
+      'stack trace', 'stderr', 'stdout', 'traceback', 'compiler', 'exit code', 'console',
+    ]
+    const envelopes: FeedEnvelope[] = [
+      { type: 'step', seq: 1, name: 'read_file', label: "Looking at your app's main page", state: 'ok', hidden: true },
+      { type: 'step', seq: 2, name: 'write_file', label: "Building your app's main page", state: 'ok' },
+      { type: 'step', seq: 3, name: 'run_command', label: 'Setting up the tools your app needs', state: 'started' },
+      {
+        type: 'error',
+        seq: 6,
+        source: 'tsc',
+        title: "app/page.tsx(12,5): error TS2307: Cannot find module '@/components/VisitorTable'",
+        cleaned_stack: 'at Object.<anonymous> (/workspace/app/node_modules/next/dist/x.js:1:9)',
+        user_message: "Part of your app didn't fit together.",
+        user_action: "Nothing to do right now — we're working on it.",
+        recovering: true,
+      },
+      {
+        type: 'error',
+        seq: 7,
+        source: 'client',
+        title: 'The app opened but ran into a problem in the browser.',
+        cleaned_stack: '',
+        user_message: 'The app opened but ran into a problem in the browser.',
+        user_action: 'Try describing what you want again, or ask for something simpler.',
+      },
+      {
+        type: 'escalation',
+        seq: 8,
+        reason: 'max_retries',
+        detail: 'We could not get that working.',
+        last_error: { source: 'tsc', title: 'app/page.tsx(12,5): error TS2307', cleaned_stack: 'x' },
+      },
+      { type: 'quota_exceeded', seq: 9, limit: 1000000, used: 1000001, resets_at: '2026-07-15T18:30:00.000Z' },
+    ]
+    const { container } = draw({ envelopes, status: 'building', startedAt: Date.now() - 5000 })
+
+    // LIVENESS: a build that rendered nothing would satisfy every absence below.
+    const rendered = container.textContent ?? ''
+    expect(container.querySelector('[data-testid="build-progress"]')).toBeTruthy()
+    expect(rendered).toContain('Setting up the tools your app needs')
+    expect(rendered).toContain("Part of your app didn't fit together.")
+    expect(rendered).toContain('The app opened but ran into a problem in the browser.')
+    expect(rendered).toContain('We could not get that working.')
+    expect(rendered.length).toBeGreaterThan(200)
+
+    const lowered = rendered.toLowerCase()
+    const hits = DEVELOPER_VOCABULARY.filter((word) => lowered.includes(word))
+    expect(hits, `the rendered build leaks ${hits.join(', ')}`).toEqual([])
+
+    // …AND THE FINISHED BUILD, expanded. The live view shows one step at a time, so a leak in
+    // an earlier label would simply not be on screen yet — the step history is where a citizen
+    // reads the whole run back, and it has to hold the same rule.
+    const ended = draw({ envelopes, status: 'ended' })
+    fireEvent.click(ended.container.querySelector('button[aria-expanded]') as HTMLButtonElement)
+    const history = ended.container.textContent ?? ''
+    expect(history).toContain("Building your app's main page")
+    expect(history).toContain('Setting up the tools your app needs')
+    const historyHits = DEVELOPER_VOCABULARY.filter((word) => history.toLowerCase().includes(word))
+    expect(historyHits, `the step history leaks ${historyHits.join(', ')}`).toEqual([])
+  })
+})
+
+// =============================================================================
+// U17 / R24 — the screen never sits still without explanation
+// =============================================================================
+
+/** The harness's own turn-start row, exactly as the engine emits it (`ACK_TEXT` / `ACK_TOOL`
+ *  in `services/turns/engine.py`, mapped to an envelope by `narrativeEnvelopes`). */
+const ACK_TEXT = 'Getting started on that…'
+const ackRow = (seq: number): FeedEnvelope => ({
+  type: 'step',
+  seq,
+  name: ACK_STEP_NAME,
+  label: ACK_TEXT,
+  state: 'started',
+})
+
+function paint(envelopes: FeedEnvelope[], status: 'building' | 'ended' = 'building') {
+  return (
+    <BuildProgress
+      envelopes={envelopes}
+      status={status}
+      startedAt={null}
+      stopping={false}
+      onStop={noop}
+      onForceEnd={noop}
+    />
+  )
+}
+
+describe('U17: the acknowledgement is transient, never a step of the build', () => {
+  it('pins the reserved name the engine emits it under — a rename on one side only is a leak', () => {
+    // The row is identified across the wire by this exact string. Drift it here and the
+    // acknowledgement silently becomes a permanent entry in every build's step history.
+    expect(ACK_STEP_NAME).toBe('__ack__')
+  })
+
+  it('holds the live row while there is nothing else to show', () => {
+    const { container } = draw({ envelopes: [ackRow(1)] })
+    expect(container.textContent).toContain(ACK_TEXT)
+  })
+
+  it('is REPLACED by the first real step rather than accumulating beside it', () => {
+    const { container, rerender } = draw({ envelopes: [ackRow(1)] })
+    expect(container.textContent).toContain(ACK_TEXT)
+
+    rerender(
+      paint([
+        ackRow(1),
+        { type: 'step', seq: 2, name: 'run', label: 'Setting up the tools your app needs', state: 'started' },
+      ]),
+    )
+    // LIVENESS first: the real step is what took the row, so the absence below is a
+    // replacement and not a component that threw on its way to rendering nothing.
+    expect(container.textContent).toContain('Setting up the tools your app needs')
+    expect(container.querySelectorAll('[data-kind="tool-activity"]')).toHaveLength(1)
+    expect(container.textContent).not.toContain(ACK_TEXT)
+  })
+
+  it('never survives into the finished build’s step history', () => {
+    const { container } = draw({
+      envelopes: [
+        ackRow(1),
+        { type: 'step', seq: 2, name: 'run', label: 'Setting up the tools your app needs', state: 'ok' },
+      ],
+      status: 'ended',
+    })
+    fireEvent.click(container.querySelector('button[aria-expanded]') as HTMLButtonElement)
+    // LIVENESS: the history really did render, so "no acknowledgement" is a filter and not a
+    // collapsed dropdown that never opened.
+    expect(container.querySelectorAll('[data-kind="step"]')).toHaveLength(1)
+    expect(container.textContent).toContain('Setting up the tools your app needs')
+    expect(container.textContent).not.toContain(ACK_TEXT)
+  })
+
+  it('is not, on its own, a reason to draw a build bubble around a chat turn', () => {
+    // `hasBuildNarrative` is what BuilderPage asks before rendering the bubble's chrome.
+    // Counting the acknowledgement here would leave an empty grey wrapper behind every Ask
+    // turn — the row itself never reaches the history, so there would be nothing inside it.
+    expect(hasBuildNarrative(null, [ackRow(1)])).toBe(false)
+    expect(
+      hasBuildNarrative(null, [
+        ackRow(1),
+        { type: 'step', seq: 2, name: 'run', label: 'Setting up the tools your app needs', state: 'started' },
+      ]),
+    ).toBe(true)
+  })
+})
+
+describe('U17: the live region announces on change, and at most once per 10s', () => {
+  const RUNNING = 'Setting up the tools your app needs'
+  // What the harness restates a long-running operation as (`long_operation_line`, backend).
+  const STILL_RUNNING = 'Still setting up the tools your app needs — this one takes a little longer.'
+
+  const running = (label: string): FeedEnvelope[] => [
+    { type: 'step', seq: 1, name: 'run', label, state: 'started' },
+  ]
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('a status line refreshed with UNCHANGED text is announced exactly once', () => {
+    vi.useFakeTimers()
+    const { rerender } = draw({ envelopes: running(RUNNING) })
+    const region = screen.getByRole('status', { name: /build activity/i })
+    // LIVENESS: the region is here and it is saying the thing. Every "no second announcement"
+    // assertion below also passes against a region that rendered nothing at all.
+    expect(region.textContent).toBe(RUNNING)
+
+    // A screen reader speaks on DOM mutation, so that is what "an announcement" is measured as.
+    // `takeRecords` is read synchronously — no callback timing to get wrong.
+    const spoken = new MutationObserver(() => {})
+    spoken.observe(region, { childList: true, subtree: true, characterData: true })
+
+    for (let refresh = 0; refresh < 3; refresh += 1) {
+      act(() => {
+        vi.advanceTimersByTime(1000)
+      })
+      rerender(paint(running(RUNNING)))
+    }
+
+    expect(spoken.takeRecords()).toHaveLength(0)
+    expect(region.textContent).toBe(RUNNING)
+    spoken.disconnect()
+  })
+
+  it('a CHANGE in the text is announced — the throttle must not swallow the news', () => {
+    vi.useFakeTimers()
+    const { rerender } = draw({ envelopes: running(RUNNING) })
+    const region = screen.getByRole('status', { name: /build activity/i })
+    expect(region.textContent).toBe(RUNNING)
+
+    act(() => {
+      vi.advanceTimersByTime(8000)
+    })
+    rerender(paint(running(STILL_RUNNING)))
+    expect(region.textContent).toBe(STILL_RUNNING)
+  })
+
+  it('a second change inside the window is HELD, then spoken when the window elapses', () => {
+    vi.useFakeTimers()
+    const { rerender } = draw({ envelopes: running(RUNNING) })
+    const region = screen.getByRole('status', { name: /build activity/i })
+
+    rerender(paint(running(STILL_RUNNING)))
+    expect(region.textContent).toBe(STILL_RUNNING)
+
+    // …and now a third line, one second later. The cap is 10s, so it waits.
+    act(() => {
+      vi.advanceTimersByTime(1000)
+    })
+    rerender(paint(running('Making sure everything fits together')))
+    expect(region.textContent).toBe(STILL_RUNNING)
+
+    act(() => {
+      vi.advanceTimersByTime(ANNOUNCE_MIN_INTERVAL_MS)
+    })
+    // TRAILING EDGE: held back, never dropped. The last thing that happened is what gets said.
+    expect(region.textContent).toBe('Making sure everything fits together')
+  })
+
+  it('goes quiet at the terminal instead of leaving "Working…" hanging over a finished build', () => {
+    const { container, rerender } = draw({ envelopes: running(RUNNING) })
+    expect(screen.getByRole('status', { name: /build activity/i }).textContent).toBe(RUNNING)
+
+    rerender(
+      paint(
+        [{ type: 'step', seq: 1, name: 'run', label: RUNNING, state: 'ok' }],
+        'ended',
+      ),
+    )
+    // LIVENESS: the bubble is still here, now showing the collapsed history — the region went
+    // away because the build ended, not because the component fell over.
+    expect(container.querySelector('[data-testid="build-progress"]')).toBeTruthy()
+    expect(container.querySelector('button[aria-expanded]')).toBeTruthy()
+    expect(screen.queryByRole('status', { name: /build activity/i })).toBeNull()
+  })
+
+  it('REGRESSION: a change held inside the window is still announced when the build ends before the window elapses', () => {
+    // The bug: `useAnnouncement`'s own comment claimed a held change is "never dropped" — true
+    // only while the build keeps running. If a real change is held inside the 10s window and
+    // the build ENDS before that window elapses, the effect's cleanup cancels the pending timer
+    // and the SAME run overwrites `pending.current` with the terminal `''` sentinel — the held
+    // step is never announced, not late, not ever. This reproduces exactly that shape: a change
+    // held only ~1s into the 10s window, then the build ends.
+    vi.useFakeTimers()
+    const { container, rerender } = draw({ envelopes: running(RUNNING) })
+    const region = screen.getByRole('status', { name: /build activity/i })
+    // LIVENESS: the region exists and says the first line before any throttling is exercised.
+    expect(region.textContent).toBe(RUNNING)
+
+    // First change: announced immediately (mirrors "a CHANGE in the text is announced" above).
+    rerender(paint(running(STILL_RUNNING)))
+    expect(region.textContent).toBe(STILL_RUNNING)
+
+    // Second change, 1s later — well inside the 10s window, so it is HELD rather than spoken
+    // (mirrors "a second change inside the window is HELD").
+    const HELD_TEXT = 'Making sure everything fits together'
+    act(() => {
+      vi.advanceTimersByTime(1000)
+    })
+    rerender(paint(running(HELD_TEXT)))
+    expect(region.textContent).toBe(STILL_RUNNING) // still held, not yet spoken
+
+    // THE REGRESSION TRIGGER: the build ends here — only ~1s into the 10s hold, nowhere near
+    // the window elapsing — before the held change was ever announced.
+    rerender(
+      paint(
+        [{ type: 'step', seq: 1, name: 'run', label: HELD_TEXT, state: 'ok' }],
+        'ended',
+      ),
+    )
+
+    // LIVENESS before the fix's own assertion: the bubble survived the transition and now shows
+    // the finished-build chrome, so what follows is a genuine flush and not a component that
+    // fell over on its way to rendering nothing.
+    expect(container.querySelector('[data-testid="build-progress"]')).toBeTruthy()
+    expect(container.querySelector('button[aria-expanded]')).toBeTruthy()
+
+    // THE FIX: the held step is still announced — flushed, not silently dropped, once the build
+    // ends. `getByRole` (not `queryByRole`) so a region that never flushed fails loudly here
+    // rather than the test degrading into an assert-absence check that a crash could also pass.
+    const finalRegion = screen.getByRole('status', { name: /build activity/i })
+    expect(finalRegion.textContent).toBe(HELD_TEXT)
+    expect(finalRegion.textContent).not.toBe('')
+    expect(finalRegion.textContent).not.toBe(STILL_RUNNING)
   })
 })

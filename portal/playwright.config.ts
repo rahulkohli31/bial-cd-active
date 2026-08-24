@@ -13,8 +13,12 @@ const dirname = path.dirname(fileURLToPath(import.meta.url))
 loadEnv({ path: path.join(dirname, '.env.e2e') })
 loadEnv({ path: path.join(dirname, '.env') })
 
-// E2E_BASE_URL UNSET  → dev pass: Playwright manages `npm run dev:full` at :5173.
-// E2E_BASE_URL SET    → external server (the built container) at :3001, no webServer.
+// E2E_BASE_URL UNSET  → dev pass: targets a dev server you already have running at :5173
+//                        (`npm run dev` + the backend started separately). Playwright does
+//                        not manage a dev server itself — `dev:full` (`concurrently npm run
+//                        dev + npm run server`) was retired with the Express backend in
+//                        fde58e8, so there is nothing left for it to spawn.
+// E2E_BASE_URL SET    → external server (the built container) at :3001.
 const E2E_BASE_URL = process.env.E2E_BASE_URL
 const baseURL = E2E_BASE_URL || 'http://localhost:5173'
 
@@ -63,14 +67,4 @@ export default defineConfig({
       dependencies: ['setup'],
     },
   ],
-  // Only manage the dev stack when no external target was given. reuseExisting
-  // means a dev stack already up (the usual local case) is left untouched.
-  webServer: E2E_BASE_URL
-    ? undefined
-    : {
-        command: 'npm run dev:full',
-        url: 'http://localhost:5173',
-        reuseExistingServer: true,
-        timeout: 120_000,
-      },
 })

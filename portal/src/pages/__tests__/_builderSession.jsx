@@ -35,18 +35,13 @@ export const PREVIEW_URL = 'https://app-xyz.example.azurecontainerapps.io/'
 // C3 response builders (camelCase). `over` lets a test tweak one field.
 export const startResp = (over = {}) => ({ sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'provisioning', previewUrl: null, createdAt: 'c', ...over })
 export const statusResp = (over = {}) => ({ sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'provisioning', previewUrl: null, lastSeq: null, createdAt: 'c', updatedAt: 'u', ...over })
-export const LOCK = { sessionId: 's1', held: true, ownerUserId: 'u', ttlSeconds: 900, expiresAt: 'e' }
-export const RELEASE = { sessionId: 's1', released: true }
 export const ENDED_RESP = { sessionId: 's1', status: 'ended' }
 
-// C7 envelope builders (snake_case).
-export const STEP = (seq = 1) => ({ type: 'step', seq, name: 'scaffold', label: 'Scaffolding your app…', state: 'started' })
-export const LOG = (seq = 2, text = 'added 10 packages') => ({ type: 'log', seq, source: 'exec', stream: 'stdout', text })
-export const PREVIEW = (seq = 3, url = PREVIEW_URL) => ({ type: 'preview_ready', seq, preview_url: url })
-export const ENDED = (seq = 9, status = 'ended', reason = 'completed') => ({ type: 'ended', seq, status, preview_url: null, snapshot_committed: true, reason })
-export const QUOTA = (seq = 3) => ({ type: 'quota_exceeded', seq, limit: 1_000_000, used: 1_000_000, resets_at: '2026-07-15T18:30:00Z' })
-
-/** Assemble a BuildSessionClient from a per-file `h` bag of vi.fn()s. */
+/** Assemble a BuildSessionClient from a per-file `h` bag of vi.fn()s.
+ *
+ *  `acquireLock` / `releaseLock` are GONE (U28): nothing called them — the portal's keep-alive
+ *  loop that was their only caller was itself deleted back in U13. `forceEnd` is the one lock
+ *  op still reachable from the UI. */
 export function makeClient(h) {
   return {
     start: h.start,
@@ -54,8 +49,6 @@ export function makeClient(h) {
     stop: h.stop,
     getStatus: h.getStatus,
     forceEnd: h.forceEnd,
-    acquireLock: h.acquireLock,
-    releaseLock: h.releaseLock,
   }
 }
 
@@ -65,8 +58,6 @@ export function primeClient(h) {
   h.stop.mockResolvedValue(ENDED_RESP)
   h.getStatus.mockResolvedValue(statusResp())
   h.forceEnd.mockResolvedValue(ENDED_RESP)
-  h.acquireLock.mockResolvedValue(LOCK)
-  h.releaseLock.mockResolvedValue(RELEASE)
 }
 
 // ─── U13: the turn half (streamed plan + the options card) ───────────────────

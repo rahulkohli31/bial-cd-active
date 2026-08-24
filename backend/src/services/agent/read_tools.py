@@ -22,15 +22,25 @@ Containment model for `run_command`, layered fail-closed:
   own timeout and secret redaction. On the snapshot fallback (only when no sandbox service
   is configured) it runs cwd-jailed on the control-plane server under `_minimal_env`, an
   explicit allowlist carrying no DSN and no tokens. The POLICY above is identical either
-  way; the surroundings are not, and the richer one is now the normal case. Output is
-  capped → secret-redacted → capped on both (mirrors `orchestrator/tools._redact_command_
-  output`; reimplemented here so this module never imports the build agent's tool module,
-  whose import registers tools on `build_agent`).
+  way; the surroundings are not, and the richer one is now the normal case. Output on both
+  is capped → de-escaped → secret-redacted → de-noised → cut to HEAD AND TAIL with the loss
+  stated (U22/R28; mirrors `orchestrator/tools._redact_command_output`, reimplemented here
+  so this module never imports the build agent's tool module, whose import registers tools
+  on `build_agent` — one table-driven test runs both copies and pins them identical).
+
+THE FOUR TOOL DOCSTRINGS IN `read_only_toolset` ARE PROMPT COPY (U20 / R26). pydantic-ai
+sends each as the tool's description at registration, and `list_files`/`search_files` are
+additionally rendered into the Write prompt's generated `TOOL SURFACE` block
+(`agent/toolsets.render_tool_surface`), so editing one is editing a prompt and
+`test_prompt.py`'s drift check says so until the snapshot is regenerated. Write the FIRST
+SENTENCE as the line you want in the prompt.
 
 Refusals are teaching `ModelRetry`s in the U1 sentinel's voice — they say WHY and what to
 do instead, so the model self-corrects rather than retrying blind. "No app exists yet" is
 NOT a refusal: `EmptyProjectWorkspace` makes every tool answer it as a truthful normal
-result (the inverse of the #9 lesson).
+result (the inverse of the #9 lesson) — but note it is reachable ONLY when no sandbox
+service is configured (`turns/engine._workspace_for`), which is why the Ask segment stopped
+promising the model an emptiness signal (U20).
 
 `psql` is never on a read-mode allowlist (plan, locked).
 """
@@ -50,7 +60,11 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.toolsets.function import FunctionToolset
 
-from src.core.redaction import redact_secrets
+from src.core.redaction import (
+    cut_before_an_open_credential,
+    leaves_a_credential_value_open,
+    scrub_untrusted,
+)
 
 if TYPE_CHECKING:
     # Annotation-only, deliberately: `LiveSandboxWorkspace` holds a `SandboxSession`, but this
@@ -86,7 +100,9 @@ READ_EXEC_TIMEOUT_S = 15.0
 
 _REDACT_INPUT_MAX_CHARS = 32_000
 _OUTPUT_MAX_CHARS = 16_000
-_OUTPUT_TRUNCATION_MARKER = "\n[... output truncated ...]"
+"""The dump budget, mirroring `orchestrator/constants.RUN_COMMAND_OUTPUT_MAX_CHARS`. Read mode
+renders under it on BOTH exit paths — see the U22 block below for why a success is not summarised
+on a surface that has no slice handle."""
 
 # Heavy or history dirs the read surface refuses everywhere (list, search, read): they are
 # build artifacts or plumbing, never app truth. `.git` also hides the extraction's plumbing.
@@ -745,13 +761,225 @@ def check_the_guest_list(argv: Sequence[str]) -> str | None:
     return None
 
 
-def _cap_redact_cap(text: str) -> str:
-    """Cap → redact → cap (mirrors `orchestrator/tools._redact_command_output` — see the
-    module docstring for why it is mirrored, not imported)."""
-    redacted = redact_secrets(text[:_REDACT_INPUT_MAX_CHARS])
-    if len(redacted) <= _OUTPUT_MAX_CHARS:
-        return redacted
-    return redacted[:_OUTPUT_MAX_CHARS] + _OUTPUT_TRUNCATION_MARKER
+# ---------------------------------------------------------------------------------------
+# U22 / R28: the MIRRORED output cap — head AND tail, with the truncation stated
+# ---------------------------------------------------------------------------------------
+#
+# THE MIRROR of `orchestrator/tools`'s block of the same shape (`_is_predictable_noise` /
+# `_redacted_lines` / `_render_output` / `_redact_command_output`) — see the module docstring for
+# why the read surface copies it instead of importing it (this module must add NO runtime edge
+# into the orchestrator package). The pair is held identical by ONE table-driven test,
+# `test_read_tools.py::test_the_two_mirrored_output_caps_behave_identically`, which runs the same
+# table through both functions rather than asserting each one separately.
+#
+# WHAT DIFFERS IS THE CALLERS, NOT THIS CODE. Read mode has no `fetch_output_slice` — the slice
+# tool is registered on `sandbox_toolset`, which only Write gets — so every call here passes
+# `handle=None` and the notice tells the model to narrow its command instead of naming a tool it
+# does not have. Read mode also renders under the FULL dump budget on success as well as failure:
+# in Ask/Plan the successful output IS the answer that was asked for, and with no handle to
+# recover an elided middle, summarising a success here would buy back exactly the re-run this
+# unit exists to remove.
+#
+# AND THERE IS NO NOISE FILTER HERE AT ALL — the one place this copy is deliberately SHORTER than
+# the Write one rather than merely called differently. De-noising exists to drop dependency-
+# manager chatter, and this surface cannot produce any: `check_the_guest_list` admits
+# `ls, cat, head, tail, grep, sed, find, wc` and nothing else, and `search_files` renders hits out
+# of files. Every string that reaches these functions is FILE CONTENT, where dropping a line is
+# not a saving but a silent edit — a `sed -n '40,80p'` answering 40 of the 41 lines it was asked
+# for, and an `edit_file` composed from that read failing to match with nothing on screen to
+# explain why. The Write copy asks its classifier the same question per command
+# (`command_only_inspects`); here the answer is a constant, so the machinery is absent rather than
+# always-off, and the noise policy has exactly one home and no second copy to drift.
+
+
+_WITHHELD_TAIL_NOTICE = (
+    "[... the end of this output was withheld: the part that was dropped opens a credential value "
+    "that never closes, so the remaining text may be the inside of one and cannot be masked "
+    "safely. Re-run a narrower command to see it ...]"
+)
+"""The MIRROR of the Write copy's notice — same words, same reason (see that one)."""
+
+
+_WITHHELD_HEAD_NOTICE = (
+    "[... the rest of this output was withheld: a credential value opens above and never closes "
+    "in what was captured, so everything after it may be the inside of one and cannot be masked "
+    "safely. Re-run a narrower command to see it ...]"
+)
+"""The MIRROR of the Write copy's head notice — the same guard at the other end of the cut."""
+
+
+def _capture_limit_marker(dropped: int) -> str:
+    """What a capture too big to scan lost, said out loud (the MIRROR of the Write copy)."""
+    return (
+        f"[... {dropped:,} characters dropped at capture — this command printed more than the "
+        f"{_REDACT_INPUT_MAX_CHARS:,}-character limit, so only its first and last "
+        f"{_REDACT_INPUT_MAX_CHARS // 2:,} characters were read. No handle holds the rest; "
+        "re-run a narrower command to see it ...]"
+    )
+
+
+def _within_the_capture_limit(text: str) -> tuple[str, str, int]:
+    """The head and the tail of a raw capture, cut ON LINE BOUNDARIES — and what that cost.
+
+    TWO PROPERTIES, and the older single `text[:cap]` slice got both wrong.
+
+    SECURITY: the redactor is never handed half a line. A credential is a shape on ONE line, so a
+    cut landing inside one leaves a fragment matching none of the redactor's shapes — which U22
+    turned from harmless into egressed, because the tail of the capture is now always rendered.
+    Whole lines in, whole lines out; a single line longer than the window is dropped rather than
+    truncated.
+
+    TRUTHFULNESS: a head-only cap silently deleted the END of every capture over the limit, and
+    the notice then reported the surviving line count as the total.
+
+    The two halves together stay inside `_REDACT_INPUT_MAX_CHARS` (the ReDoS guard)."""
+    if len(text) <= _REDACT_INPUT_MAX_CHARS:
+        return text, "", 0
+    half = _REDACT_INPUT_MAX_CHARS // 2
+    head = text[:half].rpartition("\n")[0]
+    tail = text[len(text) - half :].partition("\n")[2]
+    return head, tail, len(text) - len(head) - len(tail)
+
+
+def _redacted_lines(text: str) -> list[str]:
+    """The SAFE artifact, and the ONLY thing that is ever returned (U22 / R3).
+
+    `scrub_untrusted` is cap → de-escape → redact, in that order: the cap bounds the work an
+    app-controlled blob can make a synchronous scan do (ReDoS guard), the escape strip runs
+    BEFORE the mask because an ANSI sequence spliced into a credential splits the token and the
+    pattern stops matching, and the mask is what makes the text egressable at all.
+
+    REDACTION HAPPENS HERE, ONCE, ON EVERY CHARACTER THAT SURVIVES CAPTURE — before any slicing,
+    before the head/tail cut: cutting first would split a credential that straddles the cut into
+    two fragments that no longer match the redactor's shapes, which is exactly how a cap applied
+    after redaction re-exposes one. The capture cut above is the same rule one level up, which is
+    why it cuts on lines."""
+    head, tail, dropped = _within_the_capture_limit(text)
+    # THE HEAD IS CUT WHEN IT ENDS INSIDE A CREDENTIAL — the MIRROR of the Write copy's head
+    # guard, and the same reason: a value opened in the head and closed past it matches none of
+    # the redactor's shapes and renders verbatim. See the Write copy's guard.
+    safe_head = cut_before_an_open_credential(head)
+    scannable = head if safe_head is None else safe_head
+    lines = scrub_untrusted(scannable, limit=_REDACT_INPUT_MAX_CHARS).splitlines()
+    if safe_head is not None:
+        lines.append(_WITHHELD_HEAD_NOTICE)
+    if dropped:
+        lines.append(_capture_limit_marker(dropped))
+    # THE TAIL IS WITHHELD WHEN IT MIGHT BE A CREDENTIAL'S BODY — the MIRROR of the Write copy's
+    # guard, and the same reason: the redactor's quoted arms span newlines, so a tail beginning
+    # part-way through a value carries no key and masks to nothing. See the Write copy's guard.
+    if tail and leaves_a_credential_value_open(text[: len(text) - len(tail)]):
+        lines.append(_WITHHELD_TAIL_NOTICE)
+        return lines
+    if tail:
+        lines.extend(scrub_untrusted(tail, limit=_REDACT_INPUT_MAX_CHARS).splitlines())
+    return lines
+
+
+def _leading_lines_within(lines: list[str], budget: int) -> int:
+    """How many leading lines fit in `budget` characters (newline separators counted)."""
+    used = 0
+    for index, line in enumerate(lines):
+        used += len(line) + 1
+        if used > budget:
+            return index
+    return len(lines)
+
+
+def _elision_notice(
+    *,
+    elided_lines: int,
+    elided_chars: int,
+    first: int,
+    last: int,
+    total: int,
+    cut_line: int,
+    partly_shown: bool,
+    handle: str | None,
+) -> str:
+    """The truncation notice: WHAT was removed, and — inline — how to get it back.
+
+    NAMING THE TOOL AND THE HANDLE IN THE NOTICE ITSELF is the point. A capability described once
+    in a system prompt is a thing the model has to remember at the moment it is staring at a
+    truncated log; a call it can copy off the line in front of it is not.
+
+    `cut_line` IS PASSED RATHER THAN DERIVED (it used to be `first - 1`) — the MIRROR of the Write
+    copy's change, and the same reason: the caller now names the elided range from the first line
+    it did not show WHOLE, so the two numbers stopped being one apart."""
+    if elided_lines > 0:
+        edge = " (the ends of that range are only partly shown here)" if partly_shown else ""
+        what = (
+            f"{elided_lines:,} lines ({elided_chars:,} characters) elided — "
+            f"lines {first}-{last} of {total:,}{edge}"
+        )
+        how = (
+            f'read them with fetch_output_slice(handle="{handle}", '
+            f"start_line={first}, end_line={last})"
+            if handle is not None
+            else "re-run a narrower command to see them"
+        )
+    else:
+        what = f"{elided_chars:,} characters elided from the middle of line {cut_line:,}"
+        how = (
+            f'read that line with fetch_output_slice(handle="{handle}", '
+            f"start_line={cut_line}, end_line={cut_line})"
+            if handle is not None
+            else "re-run a narrower command to see them"
+        )
+    return f"\n[... {what}; {how} ...]\n"
+
+
+def _render_output(lines: list[str], *, budget: int, handle: str | None) -> str:
+    """Render redacted lines under `budget`, keeping the HEAD AND THE TAIL (ASM13).
+
+    Head-only was the defect: a stack trace puts its message at the top and the failing assertion
+    at the bottom, so a head cap loses the error and a tail cap loses the cause. The budget is
+    split down the middle and the two ends are joined by a notice that says what is missing.
+
+    NOTHING IS RE-REDACTED HERE. The input is already `_redacted_lines`' output, so this function
+    only ever cuts already-masked text — which is what makes a cut safe at all."""
+    joined = "\n".join(lines)
+    if len(joined) <= budget:
+        return joined
+    head_budget = budget // 2
+    tail_budget = budget - head_budget
+    # At least one line in the head even when that single line is longer than the whole budget;
+    # it is hard-capped below, and the `else` arm carves the tail out of the same line.
+    whole_lines_in_head = _leading_lines_within(lines, head_budget)
+    head_count = max(1, whole_lines_in_head)
+    remaining = lines[head_count:]
+    tail_count = _leading_lines_within(remaining[::-1], tail_budget)
+    head_text = "\n".join(lines[:head_count])[:head_budget]
+    if tail_count:
+        tail_text = "\n".join(lines[len(lines) - tail_count :])[-tail_budget:]
+    else:
+        # NO WHOLE LINE FITS THE TAIL BUDGET — carve the tail out of the last line instead, or a
+        # capture that is one enormous line (a minified bundle, a `--json` payload) renders
+        # head-only, and on this surface there is no handle to recover the rest with at all.
+        tail_text = lines[-1][-tail_budget:]
+    # A LINE SHOWN ONLY IN PART BELONGS IN THE ELIDED RANGE, at either end of it — the MIRROR of
+    # the Write copy's rule, and the same reason: `fetch_output_slice` addresses LINES, so a line
+    # the render hard-capped is only ever recoverable if the range names it. On this surface
+    # there is no handle at all, so the notice's honesty is the whole of what the model gets.
+    notice = _elision_notice(
+        elided_lines=len(lines) - head_count - tail_count,
+        elided_chars=len(joined) - len(head_text) - len(tail_text),
+        first=head_count + 1 if whole_lines_in_head else head_count,
+        last=len(lines) - tail_count,
+        total=len(lines),
+        cut_line=head_count,
+        partly_shown=not whole_lines_in_head or not tail_count,
+        handle=handle,
+    )
+    return head_text + notice + tail_text
+
+
+def _cap_redact_cap(text: str, *, budget: int, handle: str | None = None) -> str:
+    """Raw capture → the model-facing artifact: cap → de-escape → redact → head+tail.
+
+    The MIRROR of `orchestrator/tools._redact_command_output` called with `denoise=False`; the
+    shared table-driven test pins them identical."""
+    return _render_output(_redacted_lines(text), budget=budget, handle=handle)
 
 
 _NO_APP_YET_RESULT = (
@@ -845,7 +1073,7 @@ def read_only_toolset[DepsT](
         rendered = "\n".join(f"{hit.path}:{hit.line_no}: {hit.line}" for hit in hits)
         if len(hits) >= SEARCH_MAX_HITS:
             rendered += "\n[... more matches exist — narrow the pattern or path ...]"
-        return _cap_redact_cap(rendered)
+        return _cap_redact_cap(rendered, budget=_OUTPUT_MAX_CHARS)
 
     async def run_command(ctx: RunContext[Any], command: list[str]) -> str:
         """Run a read-only inspection command in the app root — pass argv tokens, e.g.
@@ -865,8 +1093,8 @@ def read_only_toolset[DepsT](
             # cannot see) — teach the model back toward the app's own files.
             raise ModelRetry(str(exc)) from exc
         sections = [f"exit code: {result.exit}"]
-        stdout = _cap_redact_cap(result.stdout).strip()
-        stderr = _cap_redact_cap(result.stderr).strip()
+        stdout = _cap_redact_cap(result.stdout, budget=_OUTPUT_MAX_CHARS).strip()
+        stderr = _cap_redact_cap(result.stderr, budget=_OUTPUT_MAX_CHARS).strip()
         if stdout:
             sections.append(f"stdout:\n{stdout}")
         if stderr:

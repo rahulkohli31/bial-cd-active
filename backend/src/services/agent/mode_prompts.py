@@ -79,10 +79,21 @@ ASK MODE — you answer the user's questions about their app and help them under
 it does and how. You have read tools for exactly that: `read_file`, `list_files`, \
 `search_files`, and read-only shell commands through `run_command` (ls / cat / grep and \
 friends). Read the real files and ground every answer in what you find — name the actual \
-files and quote the actual code, and when the app holds no answer, say so plainly. If \
-there is no app yet, your tools will tell you truthfully; describe what could be built \
-rather than guessing at what exists. When the user wants the app changed, point them to \
-Plan mode (to shape the change together first) or Write mode (to build it directly)."""
+files and quote the actual code, and when the app holds no answer, say so plainly. A \
+project whose app has not been built yet still has the starter template in place, so what \
+you read there is the template rather than this user's app — say which one you are looking \
+at, and talk about what could be built for them. When the user wants the app changed, \
+point them to Plan mode (to shape the change together first) or Write mode (to build it \
+directly)."""
+"""U20 / R26 — THE EMPTINESS SIGNAL THIS USED TO PROMISE NEVER ARRIVES, so it stopped being
+promised. The old sentence was "If there is no app yet, your tools will tell you truthfully."
+`EmptyProjectWorkspace` — the workspace that answers every read with "No app exists yet" — is
+reachable from exactly one branch of `turns/engine._workspace_for`, and that branch requires
+`sandbox_client is None`, i.e. NO SANDBOX SERVICE CONFIGURED. In the configured deployment a
+brand-new project gets the live container like everybody else (the deliberate 2026-07-30
+decision recorded in that method), and the container holds the golden template — so the tools
+answer with template files, and a model told to expect a "there is no app" signal spends a
+round-trip looking for one. The truth is cheaper to say: a new project reads as the template."""
 
 _PLAN_SEGMENT = """\
 PLAN MODE — you and the user work out WHAT to build before anything gets built. You have \
@@ -106,34 +117,29 @@ which puts the Build it / Keep refining buttons in front of the user. After call
 wait for their choice; the click on Build it is the only signal that building starts. If \
 they keep refining, revise the plan and present again."""
 
-# The commit discipline (W1 / KTD-5e). Stated as a CAPABILITY, which is what it is: the agent
-# that commits as it goes can `git diff` to see what it actually changed and can revert its own
-# mistake with git rather than trying to un-edit files by hand, and a future code-review agent
-# inherits a history that reads as intent. `run_command` is unrestricted in Write and the sandbox
-# image already installs git and bakes an identity + `safe.directory`
-# (`sandbox/Dockerfile.sandbox`), so this is prompt work and not a new tool.
+# NO COMMIT BLOCK LIVES HERE ANY MORE (U19 / R25), and re-adding one is a regression with two
+# separate costs. `_COMMIT_DISCIPLINE` used to sit at the end of this segment teaching the agent
+# to stage and commit each coherent slice.
 #
-# The blanket `git add -A` is deliberately NOT the shape taught here: it produces one
-# undifferentiated commit and destroys the granularity that makes the history useful.
-_COMMIT_DISCIPLINE = """\
-COMMIT AS YOU WORK — the workspace is a git repository and committing is part of building, not \
-bookkeeping. After each coherent slice of work — two or three related files, not every file and \
-not one commit at the end — stage exactly those files and commit them with a message that says \
-what the change does. This is for YOU: `git diff` and `git status` tell you what you have \
-actually changed since your last commit, and when an edit turns out wrong, `git checkout` or \
-`git revert` puts it back far more reliably than trying to un-edit a file by hand. Do not stage \
-the whole tree with `git add -A` as a habit — one undifferentiated commit tells nobody anything, \
-including you. Committing does not save the user's work to the platform and is not a substitute \
-for finishing the task; the user decides separately what gets kept."""
+# 1. THE PLATFORM ALREADY DOES IT. `snapshot._COMMIT_SCRIPT` runs `git add -A && git commit` as
+#    step ONE of every turn-boundary bundle, so the agent's commits bought the user nothing and
+#    cost them a shell round trip per slice plus the tokens to narrate it.
+# 2. IT TAUGHT GIT-UNDO — `git checkout` and `git revert` over a tree the agent had just decided
+#    it disliked. Both produce a HEAD that is NOT a descendant of the copy on record, which is
+#    exactly the input the workspace-integrity verdict has to reason about before it may declare
+#    a workspace REVERTED. That verdict closes the hazard on its own (it requires the CONTENT to
+#    disagree as well as the lineage), but nothing should be feeding it self-inflicted
+#    non-descendant HEADs. `test_the_write_prompt_teaches_no_git_undo` is the inertness guard.
+#
+# The reminder that enforced the deleted instruction went with it —
+# `orchestrator/tools._note_write_and_maybe_remind` and `SandboxSession.uncommitted_writes`.
 
 _WRITE_SEGMENT = f"""\
 {WRITE_IDENTITY}
 
 {BUILD_WORKING_RULES_HEAD}
 
-{BUILD_WORKING_RULES_TAIL}
-
-{_COMMIT_DISCIPLINE}"""
+{BUILD_WORKING_RULES_TAIL}"""
 """WRITE's segment — the same shared blocks `BUILD_SYSTEM_PROMPT` composes from, so the two can
 never drift (KTD-5a). The original objection to a Write segment here — "it could only ever drift
 from `orchestrator/prompt.py`" — is true of a COPY and false of a shared import, which is what
@@ -141,7 +147,13 @@ this is.
 
 `DATA_INTEGRITY_RULES` is deliberately ABSENT from this list even though the build prompt names
 it: `_base(context)` already appends it for every mode, so naming it again would emit the whole
-block twice in every Write prompt."""
+block twice in every Write prompt.
+
+`NARRATION_VOICE` (U15's audience block — R20/R22) is ABSENT for the same reason and must stay so:
+it rides inside `BUILD_WORKING_RULES_TAIL`, which is the single place both this segment and
+`BUILD_SYSTEM_PROMPT` pick it up. Adding it to this list would print the whole voice rule twice
+here while the build prompt printed it once — the two Write prompts drifting in the one dimension
+the shared blocks exist to keep identical. A test counts it in the composed prompt."""
 
 
 # --- U14 (D3): ephemeral mode reminders ---------------------------------------------

@@ -27,7 +27,17 @@ import type {
 export interface TurnNarrative {
   /** Live steps, keyed by tool-call id so the `finished` frame REPLACES its `started` one. */
   steps: Record<string, StepItem>
-  diagnostics: { source: string; title: string; cleanedStack: string }[]
+  /** Structurally a `DiagnosticFrame`. The citizen-facing pair is part of the shape ON
+   *  PURPOSE: this mapping is the seam a new field disappears at — everything not named
+   *  below is dropped silently, with a green typecheck, because the target `ErrorEvent`
+   *  fields are optional. Listing them here makes omitting them a compile error. */
+  diagnostics: {
+    source: string
+    title: string
+    cleanedStack: string
+    userMessage: string
+    userAction: string
+  }[]
   quota: { limit: number; used: number; resetsAt: string } | null
   workspace: { state: 'preparing' | 'ready' | 'unavailable'; message: string | null } | null
   preview: { url: string | null; state: 'ready' | 'reconnecting' | null }
@@ -66,6 +76,11 @@ export function narrativeEnvelopes(narrative: TurnNarrative): FeedEnvelope[] {
       source: (ERROR_SOURCES.has(diagnostic.source) ? diagnostic.source : 'server') as ErrorSource,
       title: diagnostic.title,
       cleaned_stack: diagnostic.cleanedStack,
+      // THE HALF THE USER ACTUALLY READS — carried across explicitly. `title`/`cleaned_stack`
+      // ride along for the model's sake and for the legacy feed's shape; the feed renders
+      // neither.
+      user_message: diagnostic.userMessage,
+      user_action: diagnostic.userAction,
       // A diagnostic is a recovery in progress, never a terminal failure (the wire says so:
       // "the turn is not failing — a repair run follows").
       recovering: true,

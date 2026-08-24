@@ -1038,9 +1038,18 @@ export default function LivePreview({
                   </div>
                 </div>
               )}
-              {keepFramed && (
+              {keepFramed && !showCover && (
                 // #13/R2 honesty chip: the build is DONE and this is the live result — without
                 // it, an ended status with a working frame reads as "is it still building?".
+                //
+                // U18 — AND IT SITS BENEATH THE OVERLAY CHAIN, which is not a z-index remark: the
+                // cover is `z-20` over this `z-10`, so the chip was already invisible under it
+                // and still in the DOM, which is where a screen reader lives. A pane covered by
+                // the retraction announced "your app stopped running" and "Build complete — your
+                // app is live below" in the same breath, and the reader who most needs the first
+                // sentence is the one who heard both. Every other overlay in this file already
+                // loses to `showCover` (the two waits, the stalled card); the completion claim is
+                // the one that must lose hardest, because it is the claim being retracted.
                 <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
                   <div className="bg-white/90 backdrop-blur border border-bial-border rounded-full px-3 py-1 shadow-sm">
                     <span className="text-[11px] font-semibold text-neutral">

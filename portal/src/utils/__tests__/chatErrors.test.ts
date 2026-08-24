@@ -11,6 +11,7 @@
  * So the load-bearing assertions here are the two 409s, and the ORDER they are checked in.
  */
 import { describe, it, expect } from 'vitest'
+import * as chatErrors from '../chatErrors'
 import { describeSaveFailure, describeModeSwitchFailure } from '../chatErrors'
 import { ApiError } from '../apiError'
 
@@ -97,5 +98,21 @@ describe('describeModeSwitchFailure (N12)', () => {
       expect(copy).toMatch(/could not switch modes/i)
       expect(copy).not.toMatch(/finish the current step/i)
     }
+  })
+})
+
+// U27: `describeAppFailure` was the copy for a failed single-file app write — the app-registry
+// save path it explained (a 409 owner conflict, a 422 create failure) died with the JSX-era
+// single-file build (U5/U11), leaving it a zero-reference export. Inert guard against it
+// silently returning, paired with a liveness check (same shape as the sibling in
+// `buildSystemPrompt.test.js`) so the guard cannot false-green on a broken import. The cast
+// (not `any`) mirrors `approvalApi.test.ts`'s retirement idiom: a namespace import types
+// a removed export as a compile error on plain property access, not as `undefined`.
+describe('describeAppFailure is retired (U27)', () => {
+  it('no longer exports describeAppFailure, while the sibling failure-copy functions still work', () => {
+    expect('describeAppFailure' in chatErrors).toBe(false)
+    expect((chatErrors as Record<string, unknown>).describeAppFailure).toBeUndefined()
+    expect(describeSaveFailure(new ApiError('gone', 404))).toMatch(/deleted/i)
+    expect(describeModeSwitchFailure(new ApiError('conflict', 409))).toMatch(/finish the current step/i)
   })
 })

@@ -38,7 +38,7 @@ from collections.abc import AsyncIterable, Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 import structlog
 from pydantic_ai import Agent, BinaryContent, RunContext
@@ -119,6 +119,7 @@ from src.services.messages.projection import (
     PlanOptionsItem,
     StepItem,
     classify_tool_call,
+    long_operation_line,
     step_detail,
 )
 from src.services.messages.store import append_batch
@@ -192,6 +193,61 @@ TurnStatus = Literal["running", "completed", "failed", "stopped"]
 _TURN_FAILED_MESSAGE = "The assistant hit a problem and this turn was stopped."
 _PERSIST_FAILED_MESSAGE = (
     "The reply could not be saved, so this turn was stopped. Try sending the message again."
+)
+
+# =====================================================================================
+# U17/R24 — THE TWO THINGS THE HARNESS SAYS WHEN NOTHING ELSE IS SPEAKING
+# =====================================================================================
+#
+# Both are the PLATFORM's words, never the agent's, and both are pinned here rather than asked
+# for in a prompt. An acknowledgement the model has to remember to write is an acknowledgement
+# that arrives AFTER the first model request — which is exactly the silence it exists to cover.
+#
+# THE ACKNOWLEDGEMENT is a transient feed row, not a transcript message. It is emitted
+# synchronously inside `start_turn`, before the detached task is even created, so "before any
+# model work" is a structural fact rather than a timing hope. It is deliberately never written
+# into `state.steps`, which is what keeps it out of the persisted rows: a build's transcript must
+# not accumulate one "Getting started" per turn. It IS carried on the catch-up snapshot (held in
+# `state.acknowledgement`, retired by the first real step) — a client that subscribes a moment
+# after the turn starts would otherwise get a still screen, which is the whole point of U17.
+# Between two `TextPart`s of one response. Blank, not nothing: concatenating them raw ran the
+# last sentence of a block into the first word of the next ("…the workspace.Now let me…").
+TEXT_BLOCK_SEPARATOR: Final = "\n\n"
+
+ACK_TEXT = "Getting started on that…"
+# The reserved tool name the acknowledgement rides under, so it is identifiable as the
+# harness's own row rather than a step the agent took. The portal keys on the same string
+# (`ACK_STEP_NAME` in `BuildProgress.tsx`) to keep it out of the finished build's step history
+# — it is REPLACED by the first real step, never listed beside it.
+ACK_TOOL = "__ack__"
+ACK_TOOL_CALL_ID = "__ack__"
+
+# THE STILLNESS THRESHOLD (R24). An operation still running after this long earns a
+# plain-language status line of its own, refreshed until it completes. Stated as a number
+# rather than as "a stated threshold": eight seconds is the point at which a screen with
+# nothing moving on it stops reading as "fast" and starts reading as "stuck", and it is
+# comfortably longer than every ordinary file write, so a normal step never flickers one on.
+LONG_OPERATION_THRESHOLD_MS = 8_000
+# How often that line is re-emitted while the operation runs. The TEXT is stable by
+# construction — `long_operation_line` re-derives it from the step's own label, never from a
+# clock — so a refresh that changes nothing changes no pixels, and therefore produces no second
+# screen-reader announcement. The portal caps announcements at one per 10s on top of that.
+LONG_OPERATION_REFRESH_MS = 5_000
+
+# U18/R22 — WHAT A FINISHED BUILD SAYS WHEN THE AGENT HANDED US NOTHING TO SAY.
+#
+# `declare_done` is terminal now, so the summary it carries is the whole of the completion
+# message — and a model that calls it with an empty string would otherwise end a working build
+# in silence. The fallback is never the model's own text: the alternative to a summary is a
+# sentence the harness wrote, not a scrape of whatever prose happened to precede the tool call,
+# because that prose is exactly the register this plan removes.
+#
+# It says the two things a completion has to: the app is ready, and what the reader can do next.
+# Checked against the same no-jargon bar as `services/turns/copy.py` — no file, no command, no
+# library, no framework.
+_BUILD_FINISHED_FALLBACK = (
+    "Your app is ready. Open the preview and try it out, and send another message if you'd "
+    "like anything changed."
 )
 
 # The row-meta kind stamping a pending options card (real or synthesized). IMPORTED, not
@@ -479,9 +535,28 @@ class _TurnState:
     seq: int = 0
     ring: deque[TurnStreamFrame] = field(default_factory=lambda: deque(maxlen=RING_MAXLEN))
     text_parts: list[str] = field(default_factory=list)
+    # U15/R20 — WRITE-mode prose, held until we know what it is. Text streams BEFORE the tool
+    # call that would mark it as narration-between-tools, so the decision cannot be made at
+    # delta time; one model response's prose accumulates here and is either dropped by
+    # `_discard_pending_text` (a tool call followed → it was narration) or committed by
+    # `_flush_pending_text` (the response ended with no tool call → it was the turn's answer).
+    # Never used in Ask/Plan, where the prose IS the deliverable and streams as it arrives.
+    pending_text: list[str] = field(default_factory=list)
     steps: dict[str, StepItem] = field(default_factory=dict)  # tool_call_id → newest item
+    # U17's acknowledgement, held OUT of `steps` and beside it. The distinction the original
+    # comment collapsed: `steps` is what gets PERSISTED, so the ack must stay out of it — but the
+    # catch-up SNAPSHOT is the only way a subscriber ever learns about a frame emitted before it
+    # connected, and every client connects after `start_turn` has already run. Keeping the ack out
+    # of both meant it reached nobody. Cleared by the first real step, which is what "replaced by
+    # the first real step" has to mean on a transport where the ring frame is unreachable.
+    acknowledgement: StepItem | None = None
     subscribers: set[asyncio.Queue[None]] = field(default_factory=set)
     task: asyncio.Task[None] | None = None
+    # U17 — the per-tool-call "this is still running" narrators, keyed by tool call id.
+    # Cancelled the moment the call resolves (and again, synchronously, in `_finish`), then
+    # AWAITED in the turn's `finally`: a narrator left running past the terminal would land a
+    # step frame after the transport sent `[DONE]`.
+    long_operation_tasks: dict[str, asyncio.Task[None]] = field(default_factory=dict)
     ended_monotonic: float | None = None
     # A stop has been asked for. Set BEFORE `task.cancel()`, so a second Stop landing while
     # the first is still unwinding answers "already asked" instead of firing a second cancel
@@ -693,6 +768,30 @@ class TurnEngine:
                 expects_mutation=expects_mutation,
             )
             self._by_conversation[conversation.id] = state
+            # U17/R24 — ANSWER THE SCREEN BEFORE ANYTHING CAN BE SLOW.
+            #
+            # HERE, and not one line later, is the whole point: this runs before
+            # `asyncio.create_task`, so there is no ordering to get wrong and no window in which
+            # a cold provision, a snapshot restore, or a first model request can leave the
+            # citizen looking at a still screen. It is the first frame of every turn (`seq == 1`)
+            # and it is never persisted — `state.steps` is untouched, so neither the catch-up
+            # snapshot nor `append_batch` ever sees it.
+            ack = StepItem(
+                seq=0,  # transient: no row, so no row seq
+                mode=state.mode.value,
+                tool=ACK_TOOL,
+                label=ACK_TEXT,
+                state="pending",
+                hidden=False,
+                detail=step_detail(None, None),
+            )
+            state.acknowledgement = ack
+            self._emit(
+                state,
+                lambda seq: StepFrame(
+                    seq=seq, tool_call_id=ACK_TOOL_CALL_ID, phase="started", item=ack
+                ),
+            )
             state.task = asyncio.create_task(
                 self._run_turn(
                     state,
@@ -1046,6 +1145,10 @@ class TurnEngine:
             # Idempotent by construction: the Write path's stop leaves `preview_task` None
             # and this backstop finds nothing to do.
             await self._stop_preview_watcher(state)
+            # U17 — and the status-line narrators with it, for the same reason and on every
+            # arm. `_finish` already cancelled them; this is where they are actually awaited,
+            # so none is still unwinding when the transport closes.
+            await self._drain_long_operations(state)
             # THE RELEASE, on every single terminal arm — completed, stopped, persist-failed,
             # named-end, or a genuine bug. NO SAVE happens here (KTD-5e): the bundle reaches
             # Blob only on the user's Save click (`save_project_snapshot`). What
@@ -1371,7 +1474,16 @@ class TurnEngine:
         Both halves of that gate are load-bearing. `declare_done` alone is the model's
         opinion, and a model that has just written a type error is not a reliable witness;
         `green` alone would end the turn mid-thought the first time the tree happened to
-        compile. Only the conjunction means finished."""
+        compile. Only the conjunction means finished.
+
+        U18/R30 CHANGES WHAT HAPPENS ON THE PASSING SIDE OF THAT GATE, AND NOTHING ELSE ABOUT
+        IT. The conjunction is untouched — a failing verdict after `declare_done` still sends
+        the turn into repair exactly as before. What is gone is the round-trip the passing side
+        used to buy: the model called the tool, was told to stand by, and was then asked for one
+        more full request whose entire product was a closing paragraph. That paragraph is the
+        message the 2026-08-18 build wrote in 2,397 words of file paths and framework names.
+        The summary the tool already carries says the same thing in the register the reader
+        actually has, so the harness renders THAT and ends the turn on it."""
         sandbox = state.sandbox
         if sandbox is None:  # `_pin_workspace` sets it or raises; belt for the impossible
             raise _WriteEndedError("sandbox_unavailable", _TURN_FAILED_MESSAGE)
@@ -1404,7 +1516,13 @@ class TurnEngine:
                     # between them. `load_history` ignores visibility so the model still
                     # reads it; the projection skips hidden rows so the citizen never does.
                     await self._persist_write_reprompt(state, turn_prompt, session_factory)
-                sandbox.done_requested = False  # per-iteration; the flag means "this run"
+                # Per-iteration; the flag means "this run". THE SUMMARY IS RESET WITH IT (U18),
+                # because the two are one fact: a summary written before a verdict that came
+                # back red describes a build that then failed, and leaving it standing would let
+                # a later `declare_done` with an empty summary end the turn on stale praise for
+                # work that had to be repaired.
+                sandbox.done_requested = False
+                sandbox.done_summary = ""
                 # U9 / R15 — MARK "NOW" IN THE CONTAINER BEFORE THE AGENT RUNS. Everything the
                 # dev server prints after this point is about a tree the agent is currently
                 # changing; everything before it may be about one it has already fixed. The
@@ -1499,6 +1617,7 @@ class TurnEngine:
 
                 if outcome.green and sandbox.done_requested:
                     state.snapshot_committed = None  # the finalize answers this, not us
+                    await self._render_completion(state, sandbox, session_factory)
                     return
 
                 # UNANSWERABLE IS NOT A DEFECT, and this is the line where that stops
@@ -1667,6 +1786,8 @@ class TurnEngine:
             # passing the turn accumulator as well would bill every token twice.
         ) as run:
             node = run.next_node
+            cut_short = False
+            pending_answers: ModelRequest | None = None
             while not Agent.is_end_node(node):
                 if Agent.is_model_request_node(node):
                     # THE SESSION CLOSES BEFORE THE ENDING IS BUILT, which is why the `try`
@@ -1712,6 +1833,15 @@ class TurnEngine:
                     async with node.stream(run.ctx) as tool_stream:
                         async for tool_event in tool_stream:
                             self._on_event(state, tool_event)
+                    # THE FLUSH BOUNDARY, and it has to be here rather than at the end of the
+                    # model-request stream above (U15/R20). pydantic-ai streams a response's
+                    # TEXT and its TOOL CALLS from two different nodes, text first, so at the
+                    # end of the text stream we do not yet know which kind of prose this was.
+                    # By this line the tool-call node has been drained: a response that called
+                    # tools has already emptied the buffer via `_discard_pending_text`, so this
+                    # is a no-op for it, and a response that called none still holds its prose —
+                    # which is the citizen's answer, and the only thing that will ever say it.
+                    self._flush_pending_text(state)
                     node = await run.next(node)
                     # The step's tools have executed and their returns are in the history,
                     # so the step is complete — persist before the next request fires.
@@ -1721,6 +1851,25 @@ class TurnEngine:
                         persisted_from=persisted_from,
                         session_factory=session_factory,
                     )
+                    # U18/R30 — AND THIS IS WHERE `declare_done` STOPS BUYING A ROUND-TRIP.
+                    # `node` is already the NEXT model request; walking into it spends a full
+                    # request whose only product is a closing paragraph the harness has just
+                    # stopped rendering. Cut here instead — the verdict still decides whether
+                    # the turn is over (`_run_write`'s conjunction is untouched), and a red one
+                    # re-enters this run with the repair prompt exactly as before.
+                    #
+                    # THE PENDING REQUEST IS TAKEN OFF THE NODE ON THE WAY OUT, and it has to
+                    # be. A `ModelRequestNode` carries the tool ANSWERS and only appends them to
+                    # the history when it runs — which is the thing we are declining to do — so
+                    # `run.all_messages()` here ends on a `ModelResponse` whose tool calls look
+                    # unanswered. Left that way, the repair pass hands pydantic-ai a new user
+                    # prompt over unprocessed tool calls (it refuses outright), and the
+                    # `declare_done` return never reaches a row.
+                    if state.sandbox is not None and state.sandbox.done_requested:
+                        if Agent.is_model_request_node(node):
+                            pending_answers = node.request
+                        cut_short = True
+                        break
                 else:
                     # The user-prompt node: no model call, no tools, nothing to stream.
                     node = await run.next(node)
@@ -1736,6 +1885,21 @@ class TurnEngine:
             result = run.result
             if result is not None:
                 messages = result.all_messages()
+                await self._persist_write_step(
+                    state,
+                    history=messages,
+                    persisted_from=persisted_from,
+                    session_factory=session_factory,
+                )
+            elif cut_short:
+                # `run.result` is set by the END node, which a cut-short run never reaches — so
+                # the accumulated history has to be read off the run itself, with the tool
+                # answers the node above was holding put back on the end. Without this the
+                # caller would keep the PRE-RUN history and a repair pass would re-ask the model
+                # to build from scratch, having thrown away everything it just wrote.
+                messages = list(run.all_messages())
+                if pending_answers is not None:
+                    messages.append(pending_answers)
                 await self._persist_write_step(
                     state,
                     history=messages,
@@ -1801,6 +1965,54 @@ class TurnEngine:
         except Exception as exc:
             raise _PersistFailedError from exc
         return len(history)
+
+    async def _render_completion(
+        self,
+        state: _TurnState,
+        sandbox: SandboxSession,
+        session_factory: SessionFactory,
+    ) -> None:
+        """THE COMPLETION MESSAGE, WRITTEN FROM `done_summary` (U18/R22).
+
+        THE FIELD WAS ALWAYS WRITTEN AND NEVER READ. `declare_done` has stored its `summary`
+        since the tool existed and three model-facing prompts have asked for it; the reader is
+        what was missing, so what the citizen actually read at the end of a build was whatever
+        free-form paragraph the model produced on one more round-trip. On 2026-08-18 that
+        paragraph was file paths and framework names. Rendering the field instead is the whole
+        of this change: same fact, a bounded field the prompt shapes, and no request bought to
+        obtain it.
+
+        BOTH FRAMES AND THE ROW, because the completion has to survive a reload. `_push_text`
+        puts it on the live stream and into `text_so_far` for a mid-turn re-snapshot; the row
+        is what the transcript projects tomorrow. Persisting it also closes the exchange
+        honestly — cutting the run at the tool leaves a tool return with no response after it,
+        and this is that response.
+
+        THE PERSIST MAY FAIL THE TURN, deliberately, and it is the same rule the rest of Write
+        already keeps: a reply that was not stored has not been given. Silently swallowing it
+        would end a build with a completion on screen that vanishes on the next reload."""
+        text = sandbox.done_summary.strip() or _BUILD_FINISHED_FALLBACK
+        # An earlier iteration of this same turn can have flushed prose of its own (a response
+        # that called no tool — see `_flush_pending_text`), and `text_parts` is joined with
+        # nothing between entries. Without this the closing message runs into that prose's last
+        # sentence, which is the defect `TEXT_BLOCK_SEPARATOR` exists to prevent.
+        if state.text_parts:
+            self._push_text(state, TEXT_BLOCK_SEPARATOR)
+        self._push_text(state, text)
+        try:
+            async with session_factory() as db:
+                await append_batch(
+                    db,
+                    user_id=state.user_id,
+                    conversation_id=state.conversation_id,
+                    messages=[ModelResponse(parts=[TextPart(content=text)])],
+                    entry_kind=MessageEntryKind.STEP,
+                    mode=ConversationMode.WRITE,
+                    meta={"kind": "write_completion", "turnId": str(state.turn_id)},
+                )
+                await db.commit()
+        except Exception as exc:
+            raise _PersistFailedError from exc
 
     async def _persist_write_reprompt(
         self,
@@ -1892,7 +2104,7 @@ class TurnEngine:
         reload.
 
         THREE FINISHED ARMS, not two, and the third is why this takes the verdict rather than a
-        bool (U6). "Not green yet" over a check that could not be REACHED tells the citizen their
+        bool (U6). "Not working yet" over a check that could not be REACHED tells the citizen their
         app is broken on the strength of our own timeout — the platform blaming the app for its
         own silence, which is the same shape of untruth as claiming a build finished when it did
         not. An unreachable verdict resolves the spinner neutrally and says so."""
@@ -1906,7 +2118,7 @@ class TurnEngine:
         elif verdict is HealthState.HEALTHY:
             label, step_state = "Build verified.", "ok"
         else:
-            label, step_state = "Not green yet — continuing.", "failed"
+            label, step_state = "Not working yet — fixing it.", "failed"
         item = StepItem(
             seq=0,
             mode=ConversationMode.WRITE.value,
@@ -2232,7 +2444,15 @@ class TurnEngine:
     def _event_handler(
         self, state: _TurnState
     ) -> Callable[[RunContext[ChatDeps], AsyncIterable[AgentStreamEvent]], Awaitable[None]]:
-        """The pydantic-ai event_stream_handler: model/tool events → typed frames."""
+        """The pydantic-ai event_stream_handler: model/tool events → typed frames.
+
+        ASK/PLAN ONLY — Write drives its own node loop (`_run_write_once`) and calls
+        `_on_event` directly. No flush here on purpose: pydantic-ai invokes this handler once
+        per NODE, and a response's text and its tool calls arrive from two different nodes,
+        text first. Flushing at the end of this iteration would therefore commit prose before
+        the tool call that classifies it has been seen — which is the leak, restated. Ask/Plan
+        never hold anything anyway (`_stream_text` commits immediately outside Write).
+        """
 
         async def handle(
             _ctx: RunContext[ChatDeps], events: AsyncIterable[AgentStreamEvent]
@@ -2245,17 +2465,24 @@ class TurnEngine:
     def _on_event(self, state: _TurnState, event: AgentStreamEvent) -> None:
         if isinstance(event, PartStartEvent):
             if isinstance(event.part, TextPart) and event.part.content:
-                self._push_text(state, event.part.content)
+                self._stream_text(state, event.part.content, new_block=True)
         elif isinstance(event, PartDeltaEvent):
             if isinstance(event.delta, TextPartDelta) and event.delta.content_delta:
-                self._push_text(state, event.delta.content_delta)
+                self._stream_text(state, event.delta.content_delta, new_block=False)
         elif isinstance(event, FunctionToolCallEvent):
+            # This response is DOING something, so any prose it opened with was the model
+            # narrating its way to the tool — not a message to the citizen. Dropped before
+            # it can reach the wire, which is why the live feed and a later reload agree.
+            self._discard_pending_text(state)
             if event.part.tool_name == PLAN_OPTIONS_TOOL:
                 # The options card, not a step: the call defers (the user's click is the
                 # result), so there is no 'finished' counterpart to wait for.
                 self._emit_plan_options(state, event.part.tool_call_id)
                 return
             item = self._step_item(state, event.part.tool_name, event.part.args_as_json_str())
+            # REPLACED, not accumulated beside: the first real step retires the ack from the
+            # snapshot, so a client that subscribes later never sees both.
+            state.acknowledgement = None
             state.steps[event.part.tool_call_id] = item
             self._emit(
                 state,
@@ -2263,7 +2490,11 @@ class TurnEngine:
                     seq=seq, tool_call_id=event.part.tool_call_id, phase="started", item=item
                 ),
             )
+            self._start_long_operation(state, event.part.tool_call_id, hidden=item.hidden)
         elif isinstance(event, FunctionToolResultEvent):
+            # BEFORE the resolved frame, so the status line is gone from the row the instant
+            # the operation completes rather than one refresh later.
+            self._stop_long_operation(state, event.tool_call_id)
             resolved = self._resolve_step(state, event)
             if resolved is not None:
                 self._emit(
@@ -2276,9 +2507,137 @@ class TurnEngine:
                     ),
                 )
 
+    # -- the long-operation status line (U17 / R24) --------------------------------------
+
+    def _start_long_operation(self, state: _TurnState, tool_call_id: str, *, hidden: bool) -> None:
+        """Arm the stillness narrator for one tool call.
+
+        HIDDEN STEPS ARE NOT NARRATED, and that is a correctness point rather than a taste one:
+        a hidden step renders nowhere, so refreshing it would change no pixels while still
+        burning a frame every few seconds — narration that cannot be seen is noise by
+        definition. The visible row shows the neutral "Working…" placeholder for that window,
+        which is the honest thing to say about work the citizen was never shown."""
+        if hidden:
+            return
+        state.long_operation_tasks[tool_call_id] = asyncio.create_task(
+            self._narrate_long_operation(state, tool_call_id)
+        )
+
+    def _stop_long_operation(self, state: _TurnState, tool_call_id: str) -> None:
+        """Disarm one narrator — the operation finished. Synchronous, so no await sits between
+        the operation completing and the status line being unable to speak again."""
+        task = state.long_operation_tasks.pop(tool_call_id, None)
+        if task is not None:
+            task.cancel()
+
+    async def _narrate_long_operation(self, state: _TurnState, tool_call_id: str) -> None:
+        """One live status row for an operation that has outrun `LONG_OPERATION_THRESHOLD_MS`.
+
+        THE HARNESS SAYS THIS, NOT THE AGENT — which is why it lives here and not in a prompt.
+        The composite operations U21 and U23 introduce are precisely the ones that REMOVE the
+        per-step narration filling these gaps today, so a citizen watching a three-minute
+        install would otherwise watch a row that stopped changing several minutes ago.
+
+        It re-emits the SAME step (same `tool_call_id`, still `phase="started"`) with the
+        restated label, so it replaces the row in place — one live line, never a second one
+        accumulating beside it — and the ordinary `finished` frame clears it. The base label is
+        deliberately left untouched in `state.steps`: re-deriving from it keeps the text
+        byte-identical across refreshes, and keeps a mid-turn reconnect's snapshot clean.
+
+        Under the threshold nothing is emitted at all. A fast turn must not flicker a status
+        line on and off — a line that appears for 300ms reads as a glitch, not as reassurance."""
+        try:
+            await asyncio.sleep(LONG_OPERATION_THRESHOLD_MS / 1000)
+            while True:
+                pending = state.steps.get(tool_call_id)
+                if pending is None or pending.state != "pending":
+                    return  # resolved out from under us — nothing left to narrate
+                still = pending.model_copy(update={"label": long_operation_line(pending.label)})
+                self._emit(
+                    state,
+                    lambda seq: StepFrame(
+                        seq=seq, tool_call_id=tool_call_id, phase="started", item=still
+                    ),
+                )
+                await asyncio.sleep(LONG_OPERATION_REFRESH_MS / 1000)
+        except Exception:
+            # Never the turn's problem. Reassurance failing is a cosmetic loss; a narrator
+            # taking a build down with it would be the unit causing the outage it prevents.
+            # `CancelledError` is a BaseException and so passes straight through — the ordinary
+            # way this ends.
+            _log.warning(
+                "long_operation_narration_failed",
+                conversation_id=str(state.conversation_id),
+                turn_id=str(state.turn_id),
+                exc_info=True,
+            )
+
+    async def _drain_long_operations(self, state: _TurnState) -> None:
+        """Cancel and AWAIT every remaining narrator, on every terminal arm.
+
+        The same lesson as `_stop_preview_watcher`: cancelling without awaiting leaves a task
+        that may be mid-`_emit`, and the frame it lands arrives after the transport closed."""
+        tasks = list(state.long_operation_tasks.values())
+        state.long_operation_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                _log.exception(
+                    "long_operation_narrator_failed",
+                    conversation_id=str(state.conversation_id),
+                    turn_id=str(state.turn_id),
+                )
+
     def _push_text(self, state: _TurnState, text: str) -> None:
+        """Commit prose to the citizen: onto the snapshot tail AND onto the wire.
+
+        DELIBERATELY UNGATED, and `_render_completion` is why — the completion message is
+        delivered through this same call (U18). A gate here rather than at the streaming
+        call site would silence the one message the U15 drop is relying on to survive.
+        """
         state.text_parts.append(text)
         self._emit(state, lambda seq: TextDeltaFrame(seq=seq, text=text))
+
+    def _stream_text(self, state: _TurnState, text: str, *, new_block: bool) -> None:
+        """Prose arriving mid-response, before we know whether a tool call follows it.
+
+        Ask/Plan commit immediately — there the prose IS the deliverable and a held stream
+        would be a dead screen. WRITE holds it: see `_TurnState.pending_text`.
+
+        `new_block` marks a fresh `TextPart` rather than a delta continuing the current one.
+        Blocks were previously concatenated with nothing between them, which ran the last
+        sentence of one into the first word of the next ("…the workspace.Now let me…") on
+        the live feed only — reload always kept them as separate items.
+        """
+        if state.mode is not ConversationMode.WRITE:
+            if new_block and state.text_parts:
+                self._push_text(state, TEXT_BLOCK_SEPARATOR)
+            self._push_text(state, text)
+            return
+        if new_block and state.pending_text:
+            state.pending_text.append(TEXT_BLOCK_SEPARATOR)
+        state.pending_text.append(text)
+
+    def _discard_pending_text(self, state: _TurnState) -> None:
+        """Drop held prose — a tool call proved it was narration between tools (U15/R20)."""
+        state.pending_text.clear()
+
+    def _flush_pending_text(self, state: _TurnState) -> None:
+        """Commit held prose — the response ended without calling a tool, so this is the
+        turn's own answer. The zero-mutation Write ending depends on this: that turn never
+        calls `declare_done`, so nothing else would ever say anything."""
+        held = "".join(state.pending_text)
+        state.pending_text.clear()
+        if not held.strip():
+            return
+        if state.text_parts:
+            self._push_text(state, TEXT_BLOCK_SEPARATOR)
+        self._push_text(state, held)
 
     def _step_item(self, state: _TurnState, tool_name: str, args_json: str) -> StepItem:
         label, hidden = classify_tool_call(tool_name, args_json)
@@ -2333,6 +2692,13 @@ class TurnEngine:
     def _finish(
         self, state: _TurnState, status: Literal["completed", "failed", "stopped"]
     ) -> None:
+        # U17 — the status-line narrators are silenced BEFORE the terminal frame, synchronously.
+        # A narrator is always parked on a sleep, so cancelling here means the CancelledError
+        # lands at that sleep and it can never reach `_emit` again: no status row after the
+        # terminal, with no await in between for one to slip through. The `finally` then awaits
+        # them (`_drain_long_operations`) — this only makes the ordering unloseable.
+        for task in state.long_operation_tasks.values():
+            task.cancel()
         state.status = status
         state.ended_monotonic = time.monotonic()
         self._emit(
@@ -2380,7 +2746,14 @@ class TurnEngine:
             # tail and the reload projection both ship hidden steps with full detail); making
             # it a payload filter HERE meant a client that reconnected mid-turn silently lost
             # steps the other two paths kept.
-            steps=list(state.steps.values()),
+            # THE ACK RIDES HERE, and this is the only place it can. It is emitted at `seq == 1`
+            # before any client can subscribe, and the route sets `last_sent = snapshot.seq`, so
+            # the ring frame is already behind every subscriber's cursor. Same reasoning the
+            # preview/compile/error_message fields above are carried for — a frame that fired
+            # before the client connected lives only in the ring, and the snapshot is what makes
+            # a subscription self-sufficient. Ordered FIRST so it reads as the oldest row.
+            steps=([state.acknowledgement] if state.acknowledgement else [])
+            + list(state.steps.values()),
             error_message=state.error_message,
             workspace_state=state.workspace_state,
             preview_url=state.preview_url,

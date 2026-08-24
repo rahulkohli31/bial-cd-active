@@ -1,10 +1,11 @@
 """Build-sessions HTTP router — the C3 control surface (Wave 1).
 
-`start` / `stop` / `status` + the five lock ops + the superadmin `internal/reap`, all
-owner-scoped by `user.id` (ADR-0004): every not-found-or-other-user case is a non-leaking
-404 EXCEPT the one owner-asserted 403 on `force-end` (C3). The mutating POSTs carry the
-reusable `RequireCsrf` dependency (KTD-4); the `status` GET and the GET-SSE progress feed
-(`sse.py`, `Last-Event-ID`-resumable) are exempt.
+`start` / `stop` / `status` + `force-end` (the one surviving lock op — U28 retired
+`acquire`/`renew`/`release`/`heartbeat`, which nothing called) + the superadmin
+`internal/reap`, all owner-scoped by `user.id` (ADR-0004): every not-found-or-other-user
+case is a non-leaking 404 EXCEPT the one owner-asserted 403 on `force-end` (C3). The
+mutating POSTs carry the reusable `RequireCsrf` dependency (KTD-4); the `status` GET and
+the GET-SSE progress feed (`sse.py`, `Last-Event-ID`-resumable) are exempt.
 
 U13 adds one inbound route that is not a control op at all — `projects/{project_id}/client-error`,
 where the app's own in-browser error reporter's findings arrive by way of the portal. It follows
@@ -16,7 +17,7 @@ health verdict.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Request, status
@@ -32,17 +33,12 @@ from src.api.v1.build_sessions.deps import (
     SessionManagerDep,
 )
 from src.api.v1.build_sessions.schemas import (
-    HEARTBEAT_CADENCE_SECONDS,
-    LOCK_TTL_SECONDS,
     BuildSessionStatus,
     BuildSessionStatusResponse,
     ClientErrorReportRequest,
     ClientErrorReportResponse,
     CompileStateResponse,
     ForceEndResponse,
-    HeartbeatResponse,
-    LockReleaseResponse,
-    LockStateResponse,
     ParkedTree,
     ParkedTreesResponse,
     PreviewLifeState,
@@ -74,11 +70,7 @@ from src.services.build_sessions import (
     SessionManager,
     SnapshotUnavailableError,
     app_name_for,
-    lock_expires_at,
-    release_lock_as_holder,
-    renew_lock,
     sweep_all,
-    write_heartbeat,
 )
 from src.services.build_sessions.snapshot import (
     ParkedTreeNotOursError,
@@ -117,9 +109,9 @@ class ReapResponse(CamelModel):
 
 
 class _ConflictError(CamelModel):
-    """The inner error object of a build-session 409 (`start` already-active, or `lock/acquire`
-    while another session holds the lock): the plain `{message, code}` envelope PLUS the
-    existing session's id, which `_conflict_response` carries but `ErrorEnvelope` omits."""
+    """The inner error object of a build-session 409 (`start` or `relaunch` already-active):
+    the plain `{message, code}` envelope PLUS the existing session's id, which
+    `_conflict_response` carries but `ErrorEnvelope` omits."""
 
     message: str
     code: str
@@ -556,110 +548,17 @@ async def build_events(
     return build_sse_response(session, _parse_last_event_id(request.headers.get("last-event-id")))
 
 
-# --- lock ops: acquire / renew / release / force-end / heartbeat --------------
-
-
-async def _renew_and_state(session: BuildSession, user_id: uuid.UUID) -> LockStateResponse:
-    """Re-assert the session's lock (extend the TTL if the caller still owns it); a lost
-    lock → 409 `build_session_lock_lost`.
-
-    U3 — `renew_lock` is bare by policy (`locks.py`), and its `False` means one specific
-    thing: the token no longer matches, i.e. the lock really was lost. A Redis error must
-    therefore NOT reach the 409 below (it would end a healthy build on a phantom "lock
-    lost") and must not fall through to a 500 either — the seam maps it to the retryable
-    503, exactly as on `start`. Redis is resolved LAZILY inside the seam (never an eager Redis
-    dependency — the `RedisDep` alias that caused this has been deleted, KTD-9): a Redis-off
-    deployment raises `RedisNotConfiguredError` here and the
-    trailing `_coordination_is_gone()` returns 503, not the solve-time 500 the eager dep gave."""
-    with build_coordination_or_503():
-        redis = get_redis()
-        if not await renew_lock(redis, user_id, session.lock_token):
-            raise AppApiError(
-                status.HTTP_409_CONFLICT,
-                "The build session lock was lost.",
-                code="build_session_lock_lost",
-            )
-        return LockStateResponse(
-            session_id=session.session_id,
-            held=True,
-            owner_user_id=user_id,
-            ttl_seconds=LOCK_TTL_SECONDS,
-            expires_at=lock_expires_at(datetime.now(UTC)),
-        )
-    raise _coordination_is_gone()
-
-
-@router.post(
-    "/{session_id}/lock/acquire",
-    response_model=LockStateResponse,  # the union return needs an explicit success model
-    dependencies=[RequireCsrf],
-    responses=error_responses(
-        (403, ErrorEnvelope, "CSRF check failed"),
-        AUTH_401,
-        (404, ErrorEnvelope, "Build session not found"),
-        (409, ConflictEnvelope, "Another session is already active, or the lock was lost"),
-        (503, ErrorEnvelope, "Build coordination is temporarily unavailable"),
-    ),
-)
-async def lock_acquire(
-    session_id: uuid.UUID, user: CurrentUser, manager: SessionManagerDep
-) -> LockStateResponse | JSONResponse:
-    session = _owned_or_404(manager, session_id, user.id)
-    # C3 §3.1: acquiring while ANOTHER of the caller's sessions holds the one-per-user lock
-    # → 409 `build_session_already_active` (carrying that session), distinct from the
-    # `lock_lost` 409 `_renew_and_state` raises when the caller's OWN lock has lapsed. Both
-    # the 404 above and this in-process conflict check run BEFORE Redis is ever touched
-    # (`_renew_and_state` resolves it lazily inside its seam).
-    active = manager.active_session_for(user.id)
-    if active is not None and active.session_id != session.session_id:
-        return _conflict_response(BuildSessionConflictError(active.session_id))
-    return await _renew_and_state(session, user.id)
-
-
-@router.post(
-    "/{session_id}/lock/renew",
-    dependencies=[RequireCsrf],
-    responses=error_responses(
-        (403, ErrorEnvelope, "CSRF check failed"),
-        AUTH_401,
-        (404, ErrorEnvelope, "Build session not found"),
-        (409, ErrorEnvelope, "The build session lock was lost"),
-        (503, ErrorEnvelope, "Build coordination is temporarily unavailable"),
-    ),
-)
-async def lock_renew(
-    session_id: uuid.UUID, user: CurrentUser, manager: SessionManagerDep
-) -> LockStateResponse:
-    session = _owned_or_404(manager, session_id, user.id)
-    return await _renew_and_state(session, user.id)
-
-
-@router.post(
-    "/{session_id}/lock/release",
-    dependencies=[RequireCsrf],
-    responses=error_responses(
-        (403, ErrorEnvelope, "CSRF check failed"),
-        AUTH_401,
-        (404, ErrorEnvelope, "Build session not found"),
-        (503, ErrorEnvelope, "Build coordination is temporarily unavailable"),
-    ),
-)
-async def lock_release(
-    session_id: uuid.UUID, user: CurrentUser, manager: SessionManagerDep
-) -> LockReleaseResponse:
-    session = _owned_or_404(manager, session_id, user.id)  # 404 runs BEFORE Redis is touched
-    # U3 — `{"released": true}` is a claim about Redis, so it may only be made when Redis
-    # answered. Without the seam a `RedisError` here is a 500; with a guard inside the
-    # primitive it would be a 200 asserting a release that never happened (the lie the
-    # `locks.py` REDIS-ERROR POLICY calls out by name). 503 is the only honest answer. Redis
-    # is resolved LAZILY inside the seam (never an eager Redis dependency — the `RedisDep` alias
-    # that caused this has been deleted, KTD-9) so a Redis-off deployment lands on the trailing
-    # 503, not a solve-time 500.
-    with build_coordination_or_503():
-        redis = get_redis()
-        await release_lock_as_holder(redis, user.id, session.lock_token)  # idempotent
-        return LockReleaseResponse(session_id=session_id, released=True)
-    raise _coordination_is_gone()
+# --- lock ops: force-end (the operator/owner kill switch) ---------------------
+#
+# U28 retired `acquire` / `renew` / `release` / `heartbeat`, along with their shared
+# `_renew_and_state` helper: the portal's keep-alive loop that was their only caller was
+# itself deleted back in U13 (`buildSessionApi.ts` says so), and a route with no caller is
+# not neutral — it reads as a supported way to hold the lock, and the next person needing
+# one would have wired the loop straight back. What holds a turn open now is the R10
+# wall-clock lease the SERVER renews (U12), legible to a sweep in another process, which a
+# browser timer never was. `force-end` is the one lock op still reachable from the UI (fed
+# by relaunch's 409) and it CARRIES NO REQUEST BODY, same as its four retired neighbours —
+# the surviving proof that this section's routes take none.
 
 
 @router.post(
@@ -687,37 +586,6 @@ async def lock_force_end(
         )
     ended = await manager.force_end(session, sandbox)
     return ForceEndResponse(session_id=ended.session_id, status=ended.status)
-
-
-@router.post(
-    "/{session_id}/heartbeat",
-    dependencies=[RequireCsrf],
-    responses=error_responses(
-        (403, ErrorEnvelope, "CSRF check failed"),
-        AUTH_401,
-        (404, ErrorEnvelope, "Build session not found"),
-        (503, ErrorEnvelope, "Build coordination is temporarily unavailable"),
-    ),
-)
-async def heartbeat(
-    session_id: uuid.UUID, user: CurrentUser, manager: SessionManagerDep
-) -> HeartbeatResponse:
-    session = _owned_or_404(manager, session_id, user.id)  # 404 runs BEFORE Redis is touched
-    # U3 — same reasoning as `lock_release`: `{"alive": true}` plus an expiry instant is a
-    # claim that the beat landed, and the portal schedules its next beat off it. Redis is
-    # resolved LAZILY inside the seam (never an eager Redis dependency — the `RedisDep` alias
-    # that caused this has been deleted, KTD-9) so a Redis-off deployment lands on the trailing
-    # 503, not a solve-time 500.
-    with build_coordination_or_503():
-        redis = get_redis()
-        expires_at = await write_heartbeat(redis, user.id)
-        return HeartbeatResponse(
-            session_id=session.session_id,
-            alive=True,
-            cadence_seconds=HEARTBEAT_CADENCE_SECONDS,
-            heartbeat_expires_at=expires_at,
-        )
-    raise _coordination_is_gone()
 
 
 # --- the save model (U5b / KTD-5e) ---------------------------------------------------------

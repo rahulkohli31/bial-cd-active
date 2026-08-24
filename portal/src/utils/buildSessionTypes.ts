@@ -160,22 +160,12 @@ export interface BuildSessionStatusResponse {
   updatedAt: string
 }
 
-// ─── C3: lock operations — acquire / renew / release / force-end / heartbeat (§3) ─
-
-/** `…/lock/acquire` and `…/lock/renew` → 200. */
-export interface LockStateResponse {
-  sessionId: string
-  held: boolean
-  ownerUserId: string
-  ttlSeconds: number
-  expiresAt: string
-}
-
-/** `…/lock/release` → 200. Idempotent — true if the lock was held-and-released or already free. */
-export interface LockReleaseResponse {
-  sessionId: string
-  released: boolean
-}
+// ─── C3: lock operations — force-end (§3) ─────────────────────────────────────
+//
+// `LockStateResponse` / `LockReleaseResponse` / `HeartbeatResponse` are GONE (U28): they typed
+// `acquire` / `renew` / `release` / `heartbeat`, and nothing called those routes — the portal's
+// keep-alive loop that was their only caller was itself deleted back in U13. `ForceEndResponse`
+// is the one lock-op response shape still live.
 
 /** `…/lock/force-end` → 200. The owner-only kill switch; `status` is `ended`. */
 export interface ForceEndResponse {
@@ -183,20 +173,12 @@ export interface ForceEndResponse {
   status: BuildSessionStatus
 }
 
-/** `…/heartbeat` → 200. The portal's liveness ping. */
-export interface HeartbeatResponse {
-  sessionId: string
-  alive: boolean
-  cadenceSeconds: number
-  heartbeatExpiresAt: string
-}
-
 // ─── C7: the tagged-union progress envelope (snake_case surface) ─────────────
 
 /**
- * Where a self-heal-relevant error came from (C7 §3). `client` is RESERVED for the
- * Wave-1 browser client-error arm and is not emitted in Stage 0 — it stays in the
- * union so the type is future-proof, but nothing produces it yet.
+ * Where a self-heal-relevant error came from (C7 §3). `client` is the browser client-error
+ * arm — LIVE, and rendered through the same split-audience path as every other class: its
+ * report text stays agent-only, the citizen reads the platform's sentence for the class.
  */
 export type ErrorSource = 'tsc' | 'next_build' | 'server' | 'client'
 
@@ -221,15 +203,6 @@ export interface StepEvent {
   hidden?: boolean
 }
 
-/** `log` — one LF-normalized build/install/dev-server line (C7 §3.2). */
-export interface LogEvent {
-  type: 'log'
-  seq: number
-  source: string
-  stream: 'stdout' | 'stderr'
-  text: string
-}
-
 /** `error` — the structured, self-heal-relevant error BRAIN reacts to (C7 §3.3). */
 export interface ErrorEvent {
   type: 'error'
@@ -241,6 +214,18 @@ export interface ErrorEvent {
    *  repair run follows — so it renders as a retry, never as the terminal red block. Absent
    *  on the legacy C7 feed, which keeps its historical red rendering. */
   recovering?: boolean
+  /**
+   * U16 — the CITIZEN-facing half of the split. `title` and `cleaned_stack` above are the
+   * model's: `title` is built to be the compiler's own first meaningful line, so it names a
+   * file and a framework construct by design. These two are what the feed renders instead —
+   * a plain sentence about the app, and something the reader can actually do.
+   *
+   * OPTIONAL, because the legacy C7 feed emits neither. `BuildProgress` supplies its own
+   * committed fallback pair when they are missing, so an error status is never rendered
+   * without an action clause — that is the invariant, not the presence of these fields.
+   */
+  user_message?: string
+  user_action?: string
 }
 
 /** `preview_ready` — the dev server is live and framable. Flips status → `ready` and triggers the iframe (re)load (C7 §3.4). */
@@ -305,12 +290,14 @@ export interface EndedEvent {
 }
 
 /**
- * The full 8-member C7 union (discriminated on `type`). A `switch` over `.type`
+ * The full 7-member C7 union (discriminated on `type`). A `switch` over `.type`
  * ending in `assertNever` is a compile error until every arm is handled.
+ *
+ * U29 retired `LogEvent`: no production BRAIN path had ever emitted a `log` frame, so this was
+ * a consumer arm the server could never actually feed. Removing it drops the count from 8 to 7.
  */
 export type ProgressEnvelope =
   | StepEvent
-  | LogEvent
   | ErrorEvent
   | PreviewReadyEvent
   | PreviewReconnectingEvent
@@ -319,10 +306,10 @@ export type ProgressEnvelope =
   | EndedEvent
 
 /**
- * The 6-member SUBSET the activity feed renders (U3). BOTH preview signals are excluded:
+ * The 5-member SUBSET the activity feed renders (U3). BOTH preview signals are excluded:
  * the owning hook (U4/U5) routes `preview_ready` and `preview_reconnecting` to preview STATUS
  * only (frame reload / reconnecting flag), never to a feed row — so the feed's `switch` +
- * `assertNever` stays over SIX members, and an `assertNever` over the full 8-member union would
+ * `assertNever` stays over FIVE members, and an `assertNever` over the full 7-member union would
  * (correctly) fail to compile without those two arms (C7 §3.4).
  */
 export type FeedEnvelope = Exclude<ProgressEnvelope, PreviewReadyEvent | PreviewReconnectingEvent>

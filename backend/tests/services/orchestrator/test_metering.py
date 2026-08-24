@@ -34,17 +34,21 @@ def _ready_fake() -> FakeSandbox:
 async def test_two_model_steps_fold_two_per_step_usages(db_session, billing_factory, sink) -> None:
     user = await UserFactory.create(db_session)
     fake = _ready_fake()
+    # TWO TOOL STEPS, NOT "a tool step then the closing paragraph" (U18/R30): a passing
+    # `declare_done` now ENDS the run in this harness too, so a script that put it first only
+    # ever bought one model step and this test measured folding against a single usage.
     model = scripted_model(
         [
             tool_turn(
-                "declare_done",
-                {"summary": "built it"},
+                "write_file",
+                {"path": "app/page.tsx", "file_text": "export {}\n"},
                 usage=RequestUsage(
                     input_tokens=11, output_tokens=22, cache_read_tokens=3, cache_write_tokens=4
                 ),
             ),
-            text_turn(
-                "done",
+            tool_turn(
+                "declare_done",
+                {"summary": "built it"},
                 usage=RequestUsage(
                     input_tokens=100, output_tokens=200, cache_read_tokens=5, cache_write_tokens=6
                 ),
@@ -77,10 +81,12 @@ async def test_enforce_raises_on_second_step_so_that_request_never_fires(
     fake = _ready_fake()
     model = scripted_model(
         [
-            # Step 1 spends exactly the cap; step 2's pre-request enforce then trips.
+            # Step 1 spends exactly the cap; step 2's pre-request enforce then trips. Step 1 is a
+            # NON-terminal tool call: a passing `declare_done` ends the run outright (U18/R30), so
+            # putting it here would mean there was never a second request for the gate to block.
             tool_turn(
-                "declare_done",
-                {"summary": "x"},
+                "write_file",
+                {"path": "app/page.tsx", "file_text": "export {}\n"},
                 usage=RequestUsage(input_tokens=100, output_tokens=0),
             ),
             text_turn("should never run", usage=RequestUsage(input_tokens=999, output_tokens=999)),

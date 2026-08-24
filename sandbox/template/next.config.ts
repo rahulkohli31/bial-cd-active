@@ -25,13 +25,17 @@ const nextConfig: NextConfig = {
   // Untrusted, agent-generated feature code lives here; keep type + build errors HARD so
   // BRAIN's self-heal loop (C7: tsc / next build failures over /exec) actually fires.
   typescript: { ignoreBuildErrors: false },
-  // The app is served by `next dev` to NON-TECHNICAL BIAL users, who cannot act on the dev-tools
-  // badge and read its red issue counter as "my app is broken". Hiding it costs the platform no
-  // signal, because the badge only DISPLAYS errors that already reach us by another path: Next 16
-  // defaults `logging.browserToTerminal` to "warn", forwarding browser console output (React's
-  // hydration-mismatch errors included) to the dev server's own stdout — the stream the self-heal
+  // BADGE-ONLY (measured, not assumed): this hides the small floating dev-tools indicator in the
+  // corner. It does NOT touch the full-viewport compile/runtime error overlay — Next still
+  // surfaces every compile and runtime error through that overlay regardless of this key. The app
+  // is served by `next dev` to NON-TECHNICAL BIAL users, who cannot act on the badge and read its
+  // red issue counter as "my app is broken", so hiding it costs the platform no signal: the badge
+  // only DISPLAYS errors that already reach us by another path — Next 16 defaults
+  // `logging.browserToTerminal` to "warn", forwarding browser console output (React's
+  // hydration-mismatch errors included) to the dev server's own stdout, the stream the self-heal
   // verify already tails. Keep those two facts together: re-enabling the terminal-logging opt-out
-  // would make this line a real loss of observability rather than a cosmetic one.
+  // would make this line a real loss of observability rather than a cosmetic one. (The overlay
+  // itself is suppressed separately, outside this file — see the supervisor's `dev_start`.)
   devIndicators: false,
 };
 

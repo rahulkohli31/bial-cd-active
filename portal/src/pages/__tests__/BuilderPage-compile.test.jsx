@@ -25,7 +25,6 @@ const h = vi.hoisted(() => ({
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), stopTurn: vi.fn(),
   switchMode: vi.fn(), resolvePlanOptions: vi.fn(),
   start: vi.fn(), relaunchPreview: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
-  acquireLock: vi.fn(), releaseLock: vi.fn(),
   fetchPreviewState: vi.fn(), fetchCompileState: vi.fn(), fetchSaveState: vi.fn(),
   checkWorkspace: vi.fn(),
 }))

@@ -78,12 +78,12 @@ async def test_full_replay_carries_id_lines_snake_case_and_done(
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/event-stream")
     frames = _frames(resp.text)
-    assert [f["id"] for f in frames if "id" in f] == ["1", "2", "3", "4"]  # gap-free
+    assert [f["id"] for f in frames if "id" in f] == ["1", "2", "3"]  # gap-free
     assert frames[-1]["data"] == "[DONE]"  # terminal sentinel
-    # Envelope fidelity: the preview_ready frame (seq 3) is the compact snake_case C7 shape.
-    ev3 = json.loads(next(f["data"] for f in frames if f.get("id") == "3"))
-    assert ev3["type"] == "preview_ready"
-    assert ev3["preview_url"] == "https://preview.example/"
+    # Envelope fidelity: the preview_ready frame (seq 2) is the compact snake_case C7 shape.
+    ev2 = json.loads(next(f["data"] for f in frames if f.get("id") == "2"))
+    assert ev2["type"] == "preview_ready"
+    assert ev2["preview_url"] == "https://preview.example/"
 
 
 async def test_replay_of_a_finished_session_has_exactly_one_truthful_terminal(
@@ -107,7 +107,7 @@ async def test_replay_of_a_finished_session_has_exactly_one_truthful_terminal(
     assert terminals[0]["snapshot_committed"] is True  # the truth, not BRAIN's stale `false`
     assert terminals[0]["reason"] == "completed"
     assert terminals[0]["status"] == "ended"
-    assert terminals[0]["seq"] == 4  # continues the run's stream — no gap at the handoff
+    assert terminals[0]["seq"] == 3  # continues the run's stream — no gap at the handoff
     assert frames[-1]["data"] == "[DONE]"  # …and the feed closed on it
 
 
@@ -116,11 +116,11 @@ async def test_resume_replays_only_after_last_event_id(
 ) -> None:
     user, sid = await _completed_session(client, db_session, wire, "sse2@rvaiglobal.com")
     resp = await client.get(
-        f"/v1/build-sessions/{sid}/events", headers={**_cookie(user), "Last-Event-ID": "2"}
+        f"/v1/build-sessions/{sid}/events", headers={**_cookie(user), "Last-Event-ID": "1"}
     )
     assert resp.status_code == 200
     frames = _frames(resp.text)
-    assert [f["id"] for f in frames if "id" in f] == ["3", "4"]  # only seq > 2
+    assert [f["id"] for f in frames if "id" in f] == ["2", "3"]  # only seq > 1
     assert frames[-1]["data"] == "[DONE]"
 
 
@@ -133,7 +133,7 @@ async def test_already_ended_session_without_cursor_gets_story_and_done(
     assert resp.status_code == 200
     frames = _frames(resp.text)
     assert frames[-1]["data"] == "[DONE]"
-    assert [f["id"] for f in frames if "id" in f] == ["1", "2", "3", "4"]
+    assert [f["id"] for f in frames if "id" in f] == ["1", "2", "3"]
 
 
 async def test_sse_auth_no_cookie_401_other_user_404(

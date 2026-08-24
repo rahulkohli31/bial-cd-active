@@ -10,7 +10,7 @@
  * source: the frames come off the turn stream the click subscribes to, not a C7 session feed.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { screen, waitFor, cleanup } from '@testing-library/react'
+import { screen, waitFor, cleanup, within } from '@testing-library/react'
 import {
   FakeEventSource, PREVIEW_URL, makeClient, primeClient, renderBuilder,
   primeTurn, sendAndConfirm, scriptBuildTurn, T_STEP, T_PREVIEW,
@@ -23,7 +23,6 @@ const h = vi.hoisted(() => ({
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
   switchMode: vi.fn(), resolvePlanOptions: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
-  acquireLock: vi.fn(), releaseLock: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
@@ -90,7 +89,11 @@ describe('BuilderPage — build turn visible without a refresh', () => {
     expect(h.getBuild).toHaveBeenCalledTimes(1) // the single mount-time adopt — no second hydration
 
     await turn.frame(T_STEP('Scaffolding your app…'))
-    expect(await screen.findByText(/Scaffolding your app/i)).toBeTruthy() // feed row in the DOM
+    // SCOPED TO THE VISIBLE ROW (U17). The label renders twice now — once in the feed row a
+    // person reads, once in the sr-only live region that paces what a screen reader hears — so
+    // an unscoped `findByText` is ambiguous rather than wrong.
+    const row = await screen.findByTestId('build-activity')
+    expect(await within(row).findByText(/Scaffolding your app/i)).toBeTruthy() // feed row in the DOM
   })
 
   it('flips the status line to "preview is live" once the preview frame arrives', async () => {

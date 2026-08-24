@@ -195,6 +195,40 @@ summary, a lint report), not just a diagnostic tail — but still bounded so a c
 dominate the context window. The RAW output is capped to `REDACT_INPUT_MAX_CHARS` BEFORE redaction
 (the linear ReDoS guard), then the redacted result is truncated to this."""
 
+RUN_COMMAND_SUMMARY_MAX_CHARS = 4_000
+"""Truncation cap on a SUCCEEDING command's output (U22 / R28 / ASM13). Summarise a success, dump
+a failure: on the success path the shape of the outcome is already known — an install finished, a
+lint run was clean — so a quarter of the failure budget is enough, and the rest of the context
+window is worth more to the build than a clean `npm install`'s package list. On the FAILURE path
+the payload is unknown by construction (that is what makes it a failure), so it keeps
+`RUN_COMMAND_OUTPUT_MAX_CHARS`. Either way the cut keeps BOTH ENDS and hands back a handle to the
+middle, so "summarise" never means "lose the error"."""
+
+
+def output_budget_for_exit(exit_code: int) -> int:
+    """The character budget a command's output is rendered under, given its exit code (ASM13).
+
+    THE RULE IS THE REPO'S OWN, from `docs/solutions/best-practices/never-truncate-failure-output`:
+    summarise a success, dump a failure. It lives here rather than in the two mirrored renderers so
+    the pair cannot drift on the one number that decides how much of a failure survives."""
+    return RUN_COMMAND_OUTPUT_MAX_CHARS if exit_code != 0 else RUN_COMMAND_SUMMARY_MAX_CHARS
+
+
+OUTPUT_SLICE_HANDLES_PER_TURN = 8
+"""How many truncated outputs a turn holds for `fetch_output_slice` at once (U22). The ring is
+per-`SandboxSession` and dies with it; each entry is already bounded by `REDACT_INPUT_MAX_CHARS`,
+so this is the second half of a hard ceiling — 8 x 32k = 256KB of retained text per live turn, and
+the oldest handle is evicted rather than the newest refused."""
+
+REPEATED_COMMAND_MEMORY = 256
+"""How many distinct commands one turn remembers for the repeat-run counter (U22). A ceiling, not
+a budget: past it new commands stop being recorded, so a repeat can go uncounted rather than a set
+growing without bound. It understates a metric; it never changes what the model may run."""
+
+OUTPUT_SLICE_MAX_LINES = 400
+"""Cap on one `fetch_output_slice` window (mirrors `VIEW_MAX_LINES`): the slice tool exists to
+recover a REGION, not to re-inject the whole capture the cap just removed."""
+
 REDACT_INPUT_MAX_CHARS = 32_000
 """Hard cap on the RAW diagnostic length fed to the secret-redactor before it is de-noised and
 truncated to `CLEANED_STACK_MAX_CHARS`. The redaction regex is linear, but a pathological

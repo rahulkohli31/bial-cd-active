@@ -303,14 +303,21 @@ async def test_metering_sum_matches_scripted_usage(db_session, billing_factory) 
     fake = FakeSandbox()
     fake.dev_ready = True
     sink = CollectingSink()
+    # A NON-TERMINAL first step: a passing `declare_done` ends the run outright (U18/R30), so a
+    # script that led with it would only ever buy ONE model step and this sum would measure one
+    # usage rather than the folding of two.
     model = scripted_model(
         [
             tool_turn(
-                "declare_done",
-                {"summary": "x"},
+                "write_file",
+                {"path": "app/page.tsx", "file_text": "export {}\n"},
                 usage=RequestUsage(input_tokens=7, output_tokens=8),
             ),
-            text_turn(usage=RequestUsage(input_tokens=9, output_tokens=10)),
+            tool_turn(
+                "declare_done",
+                {"summary": "x"},
+                usage=RequestUsage(input_tokens=9, output_tokens=10),
+            ),
         ]
     )
     orchestrator, _ = make_orchestrator(model, billing_factory)
@@ -321,6 +328,46 @@ async def test_metering_sum_matches_scripted_usage(db_session, billing_factory) 
     assert row is not None
     assert row.input_tokens == 16  # 7 + 9
     assert row.output_tokens == 18  # 8 + 10
+
+
+async def test_a_green_declare_done_ends_the_legacy_harness_run_too(
+    db_session, billing_factory, sink
+) -> None:
+    """★ U18/R30 ON THE OTHER CONSUMER OF THE SAME TOOL.
+
+    `declare_done` is ONE tool body serving two harnesses, and its return text now tells the model
+    "this turn ends here and nothing further is asked of you" on a passing check. The Write engine
+    was taught to mean it; this loop was not, so it walked into one more real, paid model request
+    whose entire premise the model had just been told was false — and the closing paragraph that
+    request bought is rendered nowhere.
+
+    Mutation check: delete the `done_requested` break in `_run_one`'s node loop and the request
+    count goes to 3."""
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    requests = {"n": 0}
+    turns = iter(
+        [
+            tool_turn("write_file", {"path": "app/page.tsx", "file_text": "export {}\n"}),
+            tool_turn("declare_done", {"summary": "the visitor list is live"}),
+            text_turn("nobody should ever ask for this"),
+        ]
+    )
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        requests["n"] += 1
+        return next(turns)
+
+    orchestrator, _ = make_orchestrator(FunctionModel(respond), billing_factory)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    # LIVENESS FIRST: the build really did run to a green completion. A cut that ended the run by
+    # breaking it would satisfy the count below and mean the opposite of what this asserts.
+    assert result.reason == "completed"
+    assert fake.workspace["app/page.tsx"] == "export {}\n"
+    assert requests["n"] == 2, "a third request means declare_done still buys a round-trip here"
 
 
 async def test_multimodal_prompt_reaches_the_model(db_session, billing_factory, sink) -> None:

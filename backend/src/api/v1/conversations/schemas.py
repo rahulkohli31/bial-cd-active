@@ -19,12 +19,21 @@ from __future__ import annotations
 import uuid
 from typing import Annotated, Any, Final, Literal
 
-from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, TypeAdapter
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Discriminator,
+    Field,
+    Tag,
+    TypeAdapter,
+    model_validator,
+)
 
 from src.api.v1.build_sessions.schemas import ErrorSource
 from src.db.models.conversation import ConversationKind, ConversationMode
 from src.schemas import CamelModel
 from src.services.messages.projection import DisplayItem, PlanOptionsItem, StepItem
+from src.services.orchestrator.errors import user_facing
 from src.services.sandbox.base import CompileState
 
 
@@ -228,8 +237,18 @@ class CompileFrame(CamelModel):
 
 class DiagnosticFrame(CamelModel):
     """An in-narrative build diagnostic. Deliberately NOT an `error` frame: the turn is not
-    failing — a repair run follows. `cleaned_stack` is already de-noised and secret-redacted
-    by `errors.declutter`, so it is safe to render verbatim."""
+    failing — a repair run follows.
+
+    TWO AUDIENCES RIDE ON ONE FRAME (U16), and they must not be confused for each other:
+
+    * `title` / `cleaned_stack` are the MODEL's half, carried unchanged from `BuildError` —
+      `title` is the compiler's own first meaningful line and `cleaned_stack` the de-noised,
+      secret-redacted log. Safe to transmit; NOT a product surface. The portal does not render
+      either, and the sentence "safe to render verbatim" that used to sit here is what produced
+      a stack trace under a file-path title in a citizen's chat.
+    * `user_message` / `user_action` are the CITIZEN's half — a plain sentence about their app
+      and something they can do about it. This is what the feed renders.
+    """
 
     type: Literal["diagnostic"] = "diagnostic"
     seq: int
@@ -239,6 +258,26 @@ class DiagnosticFrame(CamelModel):
     source: ErrorSource
     title: str
     cleaned_stack: str
+    # DERIVED FROM `source` WHEN THE PRODUCER SUPPLIES NOTHING, which is the whole safety
+    # property: the pair cannot be forgotten into emptiness by a caller that only knows about
+    # the model's half, so every diagnostic that reaches a person carries a sentence AND a next
+    # action. A producer that has something better to say may still pass its own.
+    user_message: str = ""
+    user_action: str = ""
+
+    @model_validator(mode="after")
+    def _speak_product_language(self) -> DiagnosticFrame:
+        """Backfill either empty half of the citizen-facing pair from the error class.
+
+        A cross-field invariant, not a presence check dressed up as one: what the pair should
+        say is a function of `source`, so it cannot be expressed as a no-default field — and a
+        blank half is the one state that must never egress, in every environment."""
+        fallback = user_facing(self.source)
+        if not self.user_message:
+            self.user_message = fallback.message
+        if not self.user_action:
+            self.user_action = fallback.action
+        return self
 
 
 class QuotaFrame(CamelModel):

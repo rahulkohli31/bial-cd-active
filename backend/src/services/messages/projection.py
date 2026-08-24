@@ -29,6 +29,8 @@ from typing import Any, Final, Literal
 
 from pydantic import Field
 
+from src.core.prompt_blocks import APPLY_SCHEMA_CHANGE_TOOL
+from src.db.models.conversation import ConversationMode
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.schemas import CamelModel
 from src.services.messages.store import ATTACHMENT_REF_KIND
@@ -66,6 +68,17 @@ _LBL_PREVIEW: Final = "Getting your preview ready"
 # degrades to this — the raw argv is DROPPED, never rendered. The open sandbox runs arbitrary
 # commands, so a recognized-only allowlist that leaked argv on the long tail is the bug we refuse.
 _LBL_FALLBACK: Final = "Working on your app"
+
+# U17/R24 — WHAT A LONG OPERATION SAYS WHILE IT IS STILL RUNNING.
+#
+# EXTENDS the table above rather than adding a second one, and that is the whole design. Every
+# label this module produces — the command classes, `_LBL_FALLBACK`, and the file-area labels
+# from `_friendly_area` — is already a present-participle phrase in the citizen's register
+# ("Setting up the tools your app needs"), so "Still …" turns ANY of them into a truthful
+# progress sentence. A label added tomorrow is narrated for free; a parallel table would be a
+# second place to forget, and the first label anyone forgot would show a citizen raw argv.
+_LONG_OPERATION_TAIL: Final = " — this one takes a little longer."
+_STILL: Final = "Still "
 
 # Friendly file-area copy (`_friendly_area`): the citizen sees an app AREA, never a filename.
 _AREA_MAIN_PAGE: Final = "your app's main page"
@@ -269,10 +282,17 @@ def _friendly_area(path: str) -> tuple[str, bool]:
 
 
 def _file_step_label(tool_name: str, path: str | None) -> tuple[str, bool]:
-    """(label, hidden) for a file-mutation tool — the friendly AREA, never the raw path.
-    `write_file` reads as *Building*, edits as *Updating*; the state glyph carries done-ness."""
+    """(label, hidden) for a file tool — the friendly AREA, never the raw path.
+    `write_file` reads as *Building*, edits as *Updating*, a read as *Looking at*; the state
+    glyph carries done-ness.
+
+    READS COME THROUGH HERE TOO (U16). The read arm used to build its own label as
+    `f"Read {path}"`, which contradicted three invariants stated in this module's own comments —
+    including `_friendly_area`, which exists precisely so a citizen sees an app AREA and never a
+    filename — and it reached BOTH feeds, live and reload. Routing it through the same helper the
+    writes use is what makes that structurally impossible to reintroduce on one side only."""
     area, hidden = _friendly_area(path) if path else (_AREA_GENERIC, False)
-    verb = "Building" if tool_name == "write_file" else "Updating"
+    verb = {"write_file": "Building", "read_file": "Looking at"}.get(tool_name, "Updating")
     return (f"{verb} {area}", hidden)
 
 
@@ -282,9 +302,25 @@ def _step_label(tool_name: str, args: dict[str, Any]) -> tuple[str, bool]:
     if tool_name in _FILE_MUTATORS:
         return _file_step_label(tool_name, path)
     if tool_name == "read_file":
-        return (f"Read {path}" if path else "Read a file", True)
+        # Hidden regardless of the area's own noise verdict: a read is inspection, and the whole
+        # class stays out of the visible feed (F3/U3). The LABEL still has to be clean, because
+        # an expanded Details view renders it.
+        label, _ = _file_step_label(tool_name, path)
+        return (label, True)
     if tool_name in ("list_files", "search_files"):  # fmt: skip
         return ("Looked through the app's files", True)
+    if tool_name == "fetch_output_slice":
+        # U22. Inspection, so it is hidden like a read — and it needs a branch of its own because
+        # the fallback below renders the RAW TOOL NAME ("Used fetch_output_slice") into a citizen's
+        # feed, which is exactly the raw-machinery leak `_friendly_area` exists to prevent (F3/U3).
+        return ("Looked at what a command printed", True)
+    if tool_name == APPLY_SCHEMA_CHANGE_TOOL:
+        # U23. The composite runs `drizzle-kit generate` then `npm run db:migrate`, so it lands on
+        # the SAME friendly label the two raw commands already classified to — a citizen watching
+        # a build must not be able to tell which spelling the agent reached for. Its own branch
+        # rather than the fallback below, which renders the raw tool name ("Used
+        # apply_schema_change") into the feed.
+        return (_LBL_DATA_SETUP, False)
     if tool_name == "declare_done":
         return ("Wrapping up the build", False)
     if tool_name == "run_command":
@@ -319,6 +355,41 @@ def command_needs_the_long_timeout(argv: list[str]) -> bool:
     thing to do is kill it and tell the model."""
     label, _ = _classify_command(argv)
     return label in {_LBL_INSTALL, _LBL_CHECKS}
+
+
+def command_only_inspects(argv: list[str]) -> bool:
+    """Does this argv only LOOK at the workspace (`cat`, `sed -n`, `grep`, `ls`, `wc`)?
+
+    Read off the same `_READ_ONLY_BINARIES` set the classifier hides steps by, so there is one
+    answer to "is this an inspection" and not two that can disagree.
+
+    U22's consumer is the output formatter (`orchestrator/tools`): a build log may have its
+    predictable dependency-manager chatter dropped, but an inspection's output IS file content,
+    and a filter that silently removes a line from it hands the model a file that does not say
+    what the file says. Fails CLOSED for the long tail — an unrecognized binary is treated as a
+    log, which at worst keeps a noise line, never deletes a real one."""
+    return bool(argv) and argv[0] in _READ_ONLY_BINARIES
+
+
+def long_operation_line(label: str) -> str:
+    """A step's friendly label, restated for an operation that has outrun the stillness
+    threshold (U17/R24) — the harness's own words for "this is still running".
+
+    FAILS CLOSED THE SAME WAY THE TABLE DOES. The input is always a label this module already
+    produced, so it is already free of argv and file paths; an empty one degrades to
+    `_LBL_FALLBACK` rather than to nothing, because a blank status line is a still screen with
+    extra steps.
+
+    IDEMPOTENT ON PURPOSE. The line is REFRESHED for as long as the operation runs, and it is
+    re-derived from the step's own label each time. Re-deriving must produce byte-identical
+    text: an unchanged sentence is what makes the refresh invisible to a screen reader (the
+    portal's atomic live region re-announces on change, never on a re-render of the same
+    string)."""
+    base = label.strip() or _LBL_FALLBACK
+    if base.endswith(_LONG_OPERATION_TAIL):
+        return base
+    opener = base if base.startswith(_STILL) else f"{_STILL}{base[0].lower()}{base[1:]}"
+    return f"{opener}{_LONG_OPERATION_TAIL}"
 
 
 def classify_file_step(tool_name: str, path: str | None) -> tuple[str, bool]:
@@ -501,11 +572,31 @@ def _project_response_parts(
     """One stored ModelResponse → assistant text + friendly steps + plan-options cards, in
     part order (text streamed before a tool call renders before it, matching the live feed)."""
     mode = row.mode.value
-    for part in message.get("parts", []):
-        if not isinstance(part, dict):
-            continue
+    parts = [p for p in message.get("parts", []) if isinstance(p, dict)]
+    # U15/R20 — WRITE-MODE NARRATION BETWEEN TOOLS IS NOT THE CITIZEN'S MESSAGE.
+    #
+    # A Write response that ALSO calls a tool is doing the work, and its prose is the model
+    # talking to itself on the way there ("let me check the server logs", "drizzle's generic
+    # wrapper"). The work already has a citizen-readable account — the friendly step label
+    # this same loop emits below — so dropping the prose loses nothing and removes the whole
+    # class. `NARRATION_VOICE` asks the model for this; a build that fails is exactly when it
+    # stops complying, so the guarantee cannot live in the prompt alone.
+    #
+    # STRUCTURAL, NOT A WORD LIST, and deliberately not keyed on `meta.kind`. A Write turn
+    # that mutates nothing never calls `declare_done` and is persisted as an ordinary
+    # `write_step` — the citizen asked a question and this prose IS the answer (the
+    # zero-mutation ending at `engine._TurnState.expects_mutation`). "Has a tool call beside
+    # it" keeps that answer and drops only narration; `kind == "write_completion"` would
+    # silently eat it. Mirrored live in `engine._stream_text` — change both or reload and
+    # the live feed disagree.
+    narrating_between_tools = row.mode is ConversationMode.WRITE and any(
+        p.get("part_kind") == "tool-call" for p in parts
+    )
+    for part in parts:
         part_kind = part.get("part_kind")
         if part_kind == "text":
+            if narrating_between_tools:
+                continue
             content = part.get("content")
             if isinstance(content, str) and content.strip():
                 items.append(AssistantTextItem(seq=row.seq, mode=mode, text=content))
