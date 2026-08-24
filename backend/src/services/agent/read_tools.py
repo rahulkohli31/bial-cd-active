@@ -60,7 +60,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.toolsets.function import FunctionToolset
 
-from src.core.redaction import scrub_untrusted
+from src.core.redaction import leaves_a_credential_value_open, scrub_untrusted
 
 if TYPE_CHECKING:
     # Annotation-only, deliberately: `LiveSandboxWorkspace` holds a `SandboxSession`, but this
@@ -788,6 +788,14 @@ def check_the_guest_list(argv: Sequence[str]) -> str | None:
 # always-off, and the noise policy has exactly one home and no second copy to drift.
 
 
+_WITHHELD_TAIL_NOTICE = (
+    "[... the end of this output was withheld: the part that was dropped opens a credential value "
+    "that never closes, so the remaining text may be the inside of one and cannot be masked "
+    "safely. Re-run a narrower command to see it ...]"
+)
+"""The MIRROR of the Write copy's notice — same words, same reason (see that one)."""
+
+
 def _capture_limit_marker(dropped: int) -> str:
     """What a capture too big to scan lost, said out loud (the MIRROR of the Write copy)."""
     return (
@@ -838,6 +846,12 @@ def _redacted_lines(text: str) -> list[str]:
     lines = scrub_untrusted(head, limit=_REDACT_INPUT_MAX_CHARS).splitlines() if head else []
     if dropped:
         lines.append(_capture_limit_marker(dropped))
+    # THE TAIL IS WITHHELD WHEN IT MIGHT BE A CREDENTIAL'S BODY — the MIRROR of the Write copy's
+    # guard, and the same reason: the redactor's quoted arms span newlines, so a tail beginning
+    # part-way through a value carries no key and masks to nothing. See the Write copy's guard.
+    if tail and leaves_a_credential_value_open(text[: len(text) - len(tail)]):
+        lines.append(_WITHHELD_TAIL_NOTICE)
+        return lines
     if tail:
         lines.extend(scrub_untrusted(tail, limit=_REDACT_INPUT_MAX_CHARS).splitlines())
     return lines

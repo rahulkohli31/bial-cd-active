@@ -61,7 +61,7 @@ from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.toolsets.function import FunctionToolset
 
 from src.core.prompt_blocks import APPLY_SCHEMA_CHANGE_TOOL
-from src.core.redaction import scrub_untrusted
+from src.core.redaction import leaves_a_credential_value_open, scrub_untrusted
 from src.db.models.harness_counter import HarnessCounter
 from src.services.messages.projection import (
     classify_command,
@@ -159,6 +159,18 @@ def _is_predictable_noise(line: str) -> bool:
     return any(pattern.search(line) for pattern in _NOISE_PATTERNS)
 
 
+_WITHHELD_TAIL_NOTICE = (
+    "[... the end of this output was withheld: the part that was dropped opens a credential value "
+    "that never closes, so the remaining text may be the inside of one and cannot be masked "
+    "safely. Re-run a narrower command to see it ...]"
+)
+"""Why the tail is missing, said to the model in terms it can act on.
+
+Withholding rather than masking, because there is nothing here to mask AGAINST: the key that
+identifies the value is in the text that was dropped. Guessing would either leak (mask nothing) or
+destroy the tail of every build log that happens to contain a quote (mask everything)."""
+
+
 def _capture_limit_marker(dropped: int) -> str:
     """What a capture too big to scan lost, said out loud. NOT recoverable through a handle —
     this text was never captured, so the marker names the only remedy there is."""
@@ -236,6 +248,17 @@ def _redacted_lines(text: str, *, denoise: bool) -> list[str]:
     lines = _scrubbed_lines(head, denoise=denoise)
     if dropped:
         lines.append(_capture_limit_marker(dropped))
+    # THE TAIL IS WITHHELD WHEN IT MIGHT BE A CREDENTIAL'S BODY. `_SECRET_ASSIGN_RE`'s quoted arms
+    # span newlines on purpose (a PEM, a passphrase), so "a credential is a shape on one line" —
+    # the assumption the line-boundary cut above was built on — is false for those arms. A tail
+    # that begins part-way through such a value carries no key, matches none of the redactor's
+    # shapes, and egresses in the clear; the old head-only cap never showed that text at all, so
+    # retaining the tail without this check was strictly worse than not retaining it.
+    # `leaves_a_credential_value_open` answers on everything BEFORE the tail (head + dropped
+    # middle) and fails toward withholding.
+    if tail and leaves_a_credential_value_open(text[: len(text) - len(tail)]):
+        lines.append(_WITHHELD_TAIL_NOTICE)
+        return lines
     lines.extend(_scrubbed_lines(tail, denoise=denoise))
     return lines
 

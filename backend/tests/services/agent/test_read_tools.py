@@ -20,6 +20,10 @@ from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
+from src.core.redaction import (
+    CREDENTIAL_OPEN_SCAN_MAX_CHARS,
+    leaves_a_credential_value_open,
+)
 from src.db.models.conversation import ConversationMode
 from src.services.agent import read_tools
 from src.services.agent.read_tools import (
@@ -29,6 +33,10 @@ from src.services.agent.read_tools import (
     check_the_guest_list,
 )
 from src.services.agent.toolsets import ReadDeps, toolsets_for_mode, workspace_from_read_deps
+from src.services.orchestrator.constants import (
+    REDACT_INPUT_MAX_CHARS,
+    RUN_COMMAND_OUTPUT_MAX_CHARS,
+)
 from src.services.orchestrator.tools import _redact_command_output
 from tests.services.orchestrator.model_harness import text_turn, tool_turn
 
@@ -570,6 +578,31 @@ _CAP_CASES: list[tuple[str, str, int, str | None, list[str], list[str]]] = [
     ),
 ]
 
+
+#: A multi-line quoted credential whose opening `KEY="` lands in the DROPPED MIDDLE of a capture
+#: and whose body runs into the retained TAIL. `_SECRET_ASSIGN_RE`'s quoted arms span newlines on
+#: purpose (a PEM, a passphrase), so the tail carries the VALUE with no key to identify it — which
+#: is why cutting on line boundaries does not save it.
+_PEM_BODY_SECRET = "hunter2NeverMaskedWithoutItsKey"
+
+
+def _credential_straddling_the_dropped_middle() -> str:
+    """A capture over the redactor's input cap, shaped so the credential's key is dropped and its
+    body survives into the tail. The old head-only cap never rendered this text at all, which is
+    what made retaining the tail a REGRESSION rather than an improvement."""
+    lead = "".join(f"ordinary build line {i}\n" for i in range(4_000))
+    pem = "".join(
+        f"MIIEowIBAAKCAQEA{i:04d}aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n" for i in range(1_200)
+    )
+    return (
+        lead
+        + 'PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\n'
+        + pem
+        + f'{_PEM_BODY_SECRET}\n-----END RSA PRIVATE KEY-----"\n'
+        + "".join(f"trailing line {i}\n" for i in range(50))
+    )
+
+
 # The noise case is deliberately NOT in the table above: it is the ONE dimension on which the two
 # copies are designed to differ, so asserting byte-equality on it would pin a bug as correct.
 # It is pinned per-copy instead, immediately below.
@@ -607,6 +640,66 @@ def test_the_two_mirrored_output_caps_behave_identically(
         assert expected in read_mode
     for unwanted in absent:
         assert unwanted not in read_mode
+
+
+def test_a_credential_body_in_the_tail_is_withheld_not_egressed() -> None:
+    """★ THE U22 REGRESSION, and the one case where this branch was WORSE than what it replaced.
+
+    `_SECRET_ASSIGN_RE`'s quoted arms deliberately span newlines, so "a credential is a shape on
+    ONE line" — the assumption the line-boundary capture cut rests on — is false for those arms.
+    When the opening `KEY="` falls in the dropped middle, the retained tail is the inside of a
+    private key with nothing left to identify it: it matches none of the redactor's shapes and
+    egressed in the clear, into the model's context AND into the slice buffer behind
+    `fetch_output_slice`.
+
+    The old head-only cap discarded the tail entirely, so this text never left the container. That
+    is what makes it a regression and not a pre-existing gap.
+
+    Both copies are asserted, because both cut captures the same way."""
+    raw = _credential_straddling_the_dropped_middle()
+
+    write_mode = _redact_command_output(raw, budget=RUN_COMMAND_OUTPUT_MAX_CHARS)
+    read_mode = read_tools._cap_redact_cap(raw, budget=RUN_COMMAND_OUTPUT_MAX_CHARS)
+
+    assert _PEM_BODY_SECRET not in write_mode
+    assert _PEM_BODY_SECRET not in read_mode
+    # Withheld, and SAID so — a silently missing tail is the failure mode the capture marker
+    # exists to prevent, and the model needs a next action rather than a gap.
+    assert "withheld" in write_mode
+    assert "withheld" in read_mode
+    assert "re-run a narrower command" in write_mode
+
+
+def test_a_truncated_capture_with_no_credential_still_keeps_its_tail() -> None:
+    """THE OTHER HALF. A guard that withholds every truncated tail would undo the whole reason the
+    tail is rendered — `Failed to compile.` and the failing assertion live at the END, and getting
+    them there is what stopped the agent re-running the command. So the withholding must be rare
+    and conditional, not the default."""
+    lead = "".join(f"ordinary build line {i}\n" for i in range(4_000))
+    raw = lead + "Failed to compile.\nerror TS2304: Cannot find name 'foo'.\n"
+    # A budget wider than the capture window so this isolates the CAPTURE layer (where the guard
+    # lives) rather than the render layer, which does its own head/tail cut and can legitimately
+    # drop the capture marker to fit.
+    budget = REDACT_INPUT_MAX_CHARS * 2
+
+    write_mode = _redact_command_output(raw, budget=budget)
+    read_mode = read_tools._cap_redact_cap(raw, budget=budget)
+
+    for rendered in (write_mode, read_mode):
+        assert "dropped at capture" in rendered  # it really was truncated
+        assert "Failed to compile." in rendered  # ...and the tail survived anyway
+        assert "withheld" not in rendered
+
+
+def test_the_open_credential_detector_answers_both_ways() -> None:
+    """The detector itself, at the unit level — the two answers the guard above turns on, plus the
+    fail-toward-withholding case. An earlier opener that CLOSED must not poison the answer, or
+    every build log containing one quoted credential would lose its tail forever."""
+    assert leaves_a_credential_value_open('PRIVATE_KEY="-----BEGIN\nstill going') is True
+    assert leaves_a_credential_value_open('PRIVATE_KEY="closed"\nmore output') is False
+    assert leaves_a_credential_value_open("no credential here at all\n") is False
+    # Unscannably large input is not a licence: it answers "assume open".
+    assert leaves_a_credential_value_open("x" * (CREDENTIAL_OPEN_SCAN_MAX_CHARS + 1)) is True
 
 
 def test_the_write_copy_drops_predictable_noise_but_keeps_the_signal() -> None:

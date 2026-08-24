@@ -380,6 +380,54 @@ def strip_control_sequences(text: str) -> str:
     return _INVISIBLE_RE.sub("", _ANSI_RE.sub("", text))
 
 
+#: The credential-shaped OPENER only: a key from the families above, its separator, and the quote
+#: that begins its value. Shares the same bounded key run as `_SECRET_ASSIGN_RE` (`{0,64}`), so
+#: this scan is linear for the same reason that one is — see the ReDoS note on `_URL_CRED_RE`.
+_CREDENTIAL_OPEN_QUOTE_RE = re.compile(
+    r"['\"]?[A-Za-z_][A-Za-z0-9_]{0,64}"
+    r"(?:_TOKEN|_SECRET|_SECRETS|_KEY|_APIKEY|_API_KEY|_ACCESS_KEY|_PASSWORD|_PASSWD|_PWD"
+    r"|_CREDENTIAL|_CREDENTIALS|_AUTH|_DSN|_CONNECTION_STRING)['\"]?\s*[:=]\s*(?P<q>[\"'])",
+    re.IGNORECASE,
+)
+
+#: Past this, `leaves_a_credential_value_open` stops scanning and answers "assume it does". A
+#: capture bigger than this is pathological, and a scan is not worth an event-loop stall to spare
+#: a tail nobody can read anyway.
+CREDENTIAL_OPEN_SCAN_MAX_CHARS = 8_000_000
+
+
+def leaves_a_credential_value_open(text: str) -> bool:
+    """Does `text` end INSIDE a credential-shaped quoted value? (Fails toward "yes".)
+
+    WHY THIS EXISTS, because it is not obvious from the signature. `_SECRET_ASSIGN_RE`'s quoted
+    arms deliberately span newlines — a PEM body or a multi-word passphrase is one value across
+    many lines — so a credential is NOT always "a shape on one line". Any consumer that cuts a
+    capture into pieces and masks each piece separately therefore has a hole: the piece holding
+    the VALUE carries no key, matches nothing, and egresses in the clear. Cutting on line
+    boundaries does not help, because the value legitimately contains newlines.
+
+    That is exactly how the orchestrator's head+tail output cap leaked: the head was masked with
+    its key present, the middle was dropped, and the retained tail began part-way through a
+    private key with nothing left to identify it. The old head-only cap never showed that text at
+    all, which is what made retaining the tail a regression rather than an improvement.
+
+    So a chunker asks this about everything preceding the chunk it is about to emit, and declines
+    to emit when the answer is yes. `True` on an unscannably large input, because an unestablished
+    fact on an egress path is not a licence.
+
+    Only the LAST opener matters: an earlier one that closed is not open, and one that never closed
+    swallows every opener after it."""
+    if len(text) > CREDENTIAL_OPEN_SCAN_MAX_CHARS:
+        return True
+    last: re.Match[str] | None = None
+    for last in _CREDENTIAL_OPEN_QUOTE_RE.finditer(text):  # noqa: B007
+        pass
+    if last is None:
+        return False
+    # Open unless its own quote character appears again after it.
+    return last.group("q") not in text[last.end() :]
+
+
 def scrub_untrusted(text: str, *, limit: int) -> str:
     """The ONE way sandbox-authored text is made safe to store, log or show: capped, then
     de-escaped, then masked — in that order.
