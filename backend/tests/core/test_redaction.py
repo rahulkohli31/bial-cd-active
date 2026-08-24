@@ -13,11 +13,14 @@ import dataclasses
 import time
 
 from src.core.redaction import (
+    CREDENTIAL_OPEN_SCAN_MAX_CHARS,
     SCAN_INPUT_MAX_CHARS,
     CredentialHit,
     Tier,
+    cut_before_an_open_credential,
     detect_credentials,
     detect_credentials_off_loop,
+    leaves_a_credential_value_open,
     redact_secrets,
 )
 
@@ -292,3 +295,77 @@ def test_widened_masking_is_idempotent() -> None:
         'const password = "hunter2"; Server=db;Password="p w";x Bearer tok_12345678'
     )
     assert redact_secrets(once) == once
+
+
+# --- the open-credential guard (U22's withholding decision) ------------------------------------
+#
+# THE ONE FACT EVERY CASE HERE TURNS ON, because it is not visible from the shapes: the masker
+# only ever fires on a CLOSED quoted value. `_SECRET_ASSIGN_RE`'s quoted arms need the closing
+# delimiter and its bare arm excludes quote characters outright, so an assignment whose value is
+# still open when the scanned text runs out matches NOTHING and renders verbatim. That is what
+# makes this guard the whole security property of the head/tail cut rather than a nicety, and it
+# is asserted first so no later case can be read as being about anything else.
+
+
+def test_an_unclosed_credential_value_is_not_masked_at_all() -> None:
+    """★ THE PREMISE. If this ever starts passing by accident (the masker learns to mask an open
+    value), the guards built on it become belt-and-braces rather than the only thing there is —
+    but until then, an unclosed value is raw text and nothing downstream can un-leak it."""
+    open_assignment = 'DATABASE_PASSWORD="' + "X" * 200
+    assert redact_secrets(open_assignment) == open_assignment
+
+
+def test_the_guard_sees_through_an_escape_between_the_key_and_its_quote() -> None:
+    """★ THE MUTATION TARGET for the de-escaping fix (drop `strip_control_sequences` from
+    `leaves_a_credential_value_open` → all three of these go False → the tail ships).
+
+    The guard reads RAW text; the masker that would process the chunk reads DE-ESCAPED text
+    (`scrub_untrusted` = strip → mask). Neither ESC nor U+200B is `\\s`, so one colour byte or one
+    zero-width character between the key and its opening quote made the guard answer "nothing is
+    open" over text the masker still could not mask. Colourised CLI output emits an SGR reset in
+    exactly that position as a matter of routine."""
+    for separator in ('\x1b[0m="', '\x1b[39m="', '​="', '﻿="', '="'):
+        opened = f"DB_PASSWORD{separator}-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAK"
+        assert leaves_a_credential_value_open(opened) is True, repr(separator)
+    # LIVENESS: the same shapes with the value CLOSED still answer no, so the fix did not simply
+    # teach the guard to say yes to everything (which would withhold every truncated tail).
+    for separator in ('\x1b[0m="', '​="', '="'):
+        closed = f'DB_PASSWORD{separator}hunter2"\nordinary build output'
+        assert leaves_a_credential_value_open(closed) is False, repr(separator)
+
+
+def test_an_earlier_unclosed_opener_is_not_forgiven_by_a_later_closed_one() -> None:
+    """A quote only ever closes the value that opened it. Reading the LAST opener alone said
+    "nothing is open" here — the `'` does close `B_TOKEN` — while `A_KEY`'s value runs on
+    unmasked to the end of the chunk, which is the leak the guard exists to stop."""
+    assert leaves_a_credential_value_open("A_KEY=\"still open B_TOKEN='v'") is True
+    assert leaves_a_credential_value_open("A_KEY=\"closed\" B_TOKEN='v'") is False
+
+
+def test_the_cut_drops_from_the_line_the_credential_opened_on() -> None:
+    """The chunk-emitting half: whole lines out, the opener's own line included (it carries the
+    key AND the start of the value), and `None` when there is nothing to cut."""
+    assert cut_before_an_open_credential('build line\nDB_PASSWORD="MIIEow\nmore') == "build line\n"
+    assert cut_before_an_open_credential('DB_PASSWORD="MIIEow\nmore') == ""
+    assert cut_before_an_open_credential("build line\nnothing to see here") is None
+
+
+def test_the_open_credential_scan_is_bounded_and_fails_closed_past_the_bound() -> None:
+    """WIRING, not the constant's value (the ReDoS learning's own rule). Past the ceiling the
+    scan does not happen at all, and the answer is the withholding one — an unestablished fact on
+    an egress path is not a licence."""
+    assert leaves_a_credential_value_open("x" * (CREDENTIAL_OPEN_SCAN_MAX_CHARS + 1)) is True
+    assert cut_before_an_open_credential("x" * (CREDENTIAL_OPEN_SCAN_MAX_CHARS + 1)) == ""
+    assert leaves_a_credential_value_open("x" * CREDENTIAL_OPEN_SCAN_MAX_CHARS) is False
+
+
+def test_the_open_credential_scan_stays_under_the_wall_clock_ceiling() -> None:
+    """The ReDoS discipline this module is built on, applied to the newest scan: a big
+    NON-MATCHING blob under a hard time assertion is the only thing that catches a quadratic
+    regression (an example-based leak test stays green through one). 5s never flakes on a linear
+    scan — the ceiling is measured in hundreds of milliseconds — and fails loudly on a
+    superlinear one."""
+    blob = ("A" * 79 + "\n") * (CREDENTIAL_OPEN_SCAN_MAX_CHARS // 80)
+    started = time.perf_counter()
+    assert leaves_a_credential_value_open(blob) is False
+    assert time.perf_counter() - started < 5.0

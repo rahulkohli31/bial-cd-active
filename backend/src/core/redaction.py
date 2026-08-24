@@ -390,10 +390,48 @@ _CREDENTIAL_OPEN_QUOTE_RE = re.compile(
     re.IGNORECASE,
 )
 
-#: Past this, `leaves_a_credential_value_open` stops scanning and answers "assume it does". A
-#: capture bigger than this is pathological, and a scan is not worth an event-loop stall to spare
-#: a tail nobody can read anyway.
-CREDENTIAL_OPEN_SCAN_MAX_CHARS = 8_000_000
+#: Past this, the open-credential scan stops and answers "assume one is open".
+#:
+#: THE BOUND IS THE WHOLE DEFENCE, and it was 8,000,000 — 250x `REDACT_INPUT_MAX_CHARS`, the bound
+#: every other synchronous scan on this path honours. The callers hand this the ENTIRE prefix of
+#: an app-controlled capture (`sandbox/supervisor` runs `subprocess.run(capture_output=True)` with
+#: no ceiling and the client adds none), so at 8 MB one `run_command` that cats a bundle stalled
+#: the control plane's single event loop for ~12s, per stream, per call — the exact failure the
+#: ReDoS P0 in `security-issues/redos-secret-redaction-regex-2026-07-14.md` was about, whose
+#: Prevention section states the rule this now follows: "cap input length BEFORE the scan, never
+#: after".
+#:
+#: AND `asyncio.to_thread` IS NOT THE ANSWER HERE, which is worth writing down because it is the
+#: obvious move and this module's own `detect_credentials_off_loop` looks like a precedent for it.
+#: The `re` module does not release the GIL, and a non-matching scan is ONE C call: measured on
+#: this pattern at 960 KB, a 1 ms-interval ticker got 0 ticks across a 304 ms `to_thread` scan
+#: (the same ticker gets ~255 across a 300 ms `to_thread(time.sleep)`). Moving the call to a
+#: worker thread buys the event loop nothing at all — only a smaller input does.
+#:
+#: 256,000 is ~81 ms at the ceiling (measured, identifier-shaped bytes), inside the envelope this
+#: path already accepts inline for `redact_secrets` at its own 32,000-char cap. What it costs: a
+#: capture bigger than roughly head + this + tail loses its TAIL rather than its correctness — the
+#: guard answers "assume open" and the withheld-tail notice says so.
+CREDENTIAL_OPEN_SCAN_MAX_CHARS = 256_000
+
+
+def _open_credential_start(text: str) -> int | None:
+    """The offset of the credential opener `text` never closes, or `None` if every one closed.
+    `text` must already be de-escaped — both public entry points below see to that.
+
+    LEFT TO RIGHT, not "the last opener wins", because a quote only ever closes the value that
+    opened it. In `A_KEY="… B_TOKEN='v'` the last opener is `B_TOKEN` and its quote does close,
+    so a right-to-left reading answers "nothing open" while `A_KEY`'s value runs on unmasked to
+    the end of the chunk. Each step jumps past the closing quote it just found, so no character
+    is visited twice and the scan stays LINEAR — the constraint every pattern in this module is
+    built around."""
+    pos = 0
+    while (opener := _CREDENTIAL_OPEN_QUOTE_RE.search(text, pos)) is not None:
+        closed_at = text.find(opener.group("q"), opener.end())
+        if closed_at < 0:
+            return opener.start()
+        pos = closed_at + 1
+    return None
 
 
 def leaves_a_credential_value_open(text: str) -> bool:
@@ -406,26 +444,48 @@ def leaves_a_credential_value_open(text: str) -> bool:
     the VALUE carries no key, matches nothing, and egresses in the clear. Cutting on line
     boundaries does not help, because the value legitimately contains newlines.
 
-    That is exactly how the orchestrator's head+tail output cap leaked: the head was masked with
-    its key present, the middle was dropped, and the retained tail began part-way through a
-    private key with nothing left to identify it. The old head-only cap never showed that text at
-    all, which is what made retaining the tail a regression rather than an improvement.
+    That is exactly how the orchestrator's head+tail output cap leaked: the middle was dropped and
+    the retained tail began part-way through a private key with nothing left to identify it. The
+    old head-only cap never showed that text at all, which is what made retaining the tail a
+    regression rather than an improvement.
 
     So a chunker asks this about everything preceding the chunk it is about to emit, and declines
     to emit when the answer is yes. `True` on an unscannably large input, because an unestablished
     fact on an egress path is not a licence.
 
-    Only the LAST opener matters: an earlier one that closed is not open, and one that never closed
-    swallows every opener after it."""
+    THE SCAN RUNS ON THE DE-ESCAPED TEXT, and that is the fix rather than a tidy-up: the masker
+    that would process the chunk is `scrub_untrusted` = strip → mask, so a guard reading the RAW
+    bytes and a masker reading the stripped ones disagree about the same input. Neither ESC nor
+    U+200B is `\\s`, so one colour byte between a key and its quote (`DB_PASSWORD\\x1b[0m="…`,
+    which colourised CLI output emits routinely) made this answer "nothing is open" while the
+    masker still saw — and could not mask — the value it opened. See `strip_control_sequences`."""
     if len(text) > CREDENTIAL_OPEN_SCAN_MAX_CHARS:
         return True
-    last: re.Match[str] | None = None
-    for last in _CREDENTIAL_OPEN_QUOTE_RE.finditer(text):  # noqa: B007
-        pass
-    if last is None:
-        return False
-    # Open unless its own quote character appears again after it.
-    return last.group("q") not in text[last.end() :]
+    return _open_credential_start(strip_control_sequences(text)) is not None
+
+
+def cut_before_an_open_credential(text: str) -> str | None:
+    """`text` — DE-ESCAPED, and cut back to the line before the credential value it leaves open —
+    or `None` when it leaves none open and the caller's own text needs no cut at all.
+
+    THE OTHER HALF OF THE GUARD ABOVE, for the chunk a caller emits rather than the one it drops.
+    A chunk that ENDS inside a credential value is just as unmaskable as one that BEGINS inside
+    it: `_SECRET_ASSIGN_RE`'s quoted arms need the closing delimiter, and its bare arm excludes
+    quote characters outright, so `PRIVATE_KEY="-----BEGIN…` with the closing quote past the cut
+    matches NOTHING and the value's whole visible prefix egresses in the clear. Withholding the
+    tail while rendering that is half a guard.
+
+    Cut on the LINE boundary before the opener, so "whole lines in, whole lines out" survives —
+    the caller hands the result straight to `scrub_untrusted`, whose own strip pass is then a
+    no-op over already-stripped text. An empty string is a legitimate answer (the opener was on
+    the first line, or the chunk is too big to scan): nothing here is worth a leak."""
+    if len(text) > CREDENTIAL_OPEN_SCAN_MAX_CHARS:
+        return ""
+    deescaped = strip_control_sequences(text)
+    start = _open_credential_start(deescaped)
+    if start is None:
+        return None
+    return deescaped[: deescaped.rfind("\n", 0, start) + 1]
 
 
 def scrub_untrusted(text: str, *, limit: int) -> str:

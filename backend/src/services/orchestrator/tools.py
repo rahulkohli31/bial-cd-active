@@ -61,7 +61,11 @@ from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.toolsets.function import FunctionToolset
 
 from src.core.prompt_blocks import APPLY_SCHEMA_CHANGE_TOOL
-from src.core.redaction import leaves_a_credential_value_open, scrub_untrusted
+from src.core.redaction import (
+    cut_before_an_open_credential,
+    leaves_a_credential_value_open,
+    scrub_untrusted,
+)
 from src.db.models.harness_counter import HarnessCounter
 from src.services.messages.projection import (
     classify_command,
@@ -171,6 +175,18 @@ identifies the value is in the text that was dropped. Guessing would either leak
 destroy the tail of every build log that happens to contain a quote (mask everything)."""
 
 
+_WITHHELD_HEAD_NOTICE = (
+    "[... the rest of this output was withheld: a credential value opens above and never closes "
+    "in what was captured, so everything after it may be the inside of one and cannot be masked "
+    "safely. Re-run a narrower command to see it ...]"
+)
+"""The SAME rule at the other end of the capture, said the same way.
+
+The redactor's quoted arms need their CLOSING delimiter, so a value that opens inside the head and
+closes past it matches nothing at all and renders raw — the head was never "masked with its key
+present", it was simply unmatched. Cut at the opener and say so, exactly as the tail does."""
+
+
 def _capture_limit_marker(dropped: int) -> str:
     """What a capture too big to scan lost, said out loud. NOT recoverable through a handle —
     this text was never captured, so the marker names the only remedy there is."""
@@ -190,10 +206,16 @@ def _within_the_capture_limit(text: str) -> tuple[str, str, int]:
     SECURITY: the redactor is never handed half a line. A credential is a shape on ONE line —
     `_URL_CRED_RE` needs the `@` that follows the password, the assignment families need their
     terminator — so a cut landing inside one leaves a fragment that matches nothing and is
-    egressed in the clear. Head-only hid that (the fragment sat at the cut, which was thrown
-    away); U22 renders and RETAINS the tail, so the fragment became the last line the model
-    reads. Whole lines in, whole lines out: a line is scanned entire or dropped entire, and a
-    single line longer than the window is therefore dropped rather than truncated.
+    egressed in the clear. Whole lines in, whole lines out: a line is scanned entire or dropped
+    entire, and a single line longer than the window is therefore dropped rather than truncated.
+
+    THAT IS NOT THE WHOLE OF IT, and this docstring used to claim it was ("head-only hid the
+    fragment; only the retained tail is new exposure"). It is false for the quoted arms, which
+    span newlines on purpose: a value that OPENS in the head and closes past the cut is not
+    masked-with-its-key-present, it matches nothing at all and renders verbatim — a line-boundary
+    cut does not help, because the value legitimately contains the newlines it is cut on. Both
+    ends of this cut therefore go through the same guard in `_redacted_lines`, one withholding
+    the tail and one cutting the head back to the credential's own line.
 
     TRUTHFULNESS: a head-only cap silently deleted the END of every capture over the limit —
     which is where `Failed to compile.` and the failing assertion live — and the notice below
@@ -245,7 +267,16 @@ def _redacted_lines(text: str, *, denoise: bool) -> list[str]:
     filter run over `cat`'s output silently deletes a line from a file the model asked to read,
     and an `edit_file` composed from that read then fails to match with no visible cause."""
     head, tail, dropped = _within_the_capture_limit(text)
-    lines = _scrubbed_lines(head, denoise=denoise)
+    # THE HEAD IS CUT WHEN IT ENDS INSIDE A CREDENTIAL — the same rule as the tail guard below,
+    # at the other end of the same cut, and it is NOT covered by masking the head. The redactor's
+    # quoted arms need their closing delimiter and its bare arm excludes quote characters, so a
+    # value opened in the head and closed past it matches nothing and renders VERBATIM. That is
+    # the whole head of a real bearer credential, in the model's context and in the persisted
+    # step row. Cheap, too: the head is inside the redaction cap by construction.
+    safe_head = cut_before_an_open_credential(head)
+    lines = _scrubbed_lines(head if safe_head is None else safe_head, denoise=denoise)
+    if safe_head is not None:
+        lines.append(_WITHHELD_HEAD_NOTICE)
     if dropped:
         lines.append(_capture_limit_marker(dropped))
     # THE TAIL IS WITHHELD WHEN IT MIGHT BE A CREDENTIAL'S BODY. `_SECRET_ASSIGN_RE`'s quoted arms
@@ -274,7 +305,15 @@ def _leading_lines_within(lines: list[str], budget: int) -> int:
 
 
 def _elision_notice(
-    *, elided_lines: int, elided_chars: int, first: int, last: int, total: int, handle: str | None
+    *,
+    elided_lines: int,
+    elided_chars: int,
+    first: int,
+    last: int,
+    total: int,
+    cut_line: int,
+    partly_shown: bool,
+    handle: str | None,
 ) -> str:
     """The truncation notice: WHAT was removed, and — inline — how to get it back.
 
@@ -284,11 +323,17 @@ def _elision_notice(
 
     The line numbers inside the call are printed WITHOUT thousands separators while the totals
     around them keep theirs: the first pair are arguments to be copied verbatim into a tool call,
-    and `start_line=1,024` is not an integer."""
+    and `start_line=1,024` is not an integer.
+
+    `cut_line` IS PASSED RATHER THAN DERIVED (it used to be `first - 1`). The caller now names the
+    elided range from the first line it did not show WHOLE, so the two numbers stopped being one
+    apart — and a notice that computes a line number out of another notice's arithmetic goes wrong
+    silently, one truncation shape at a time."""
     if elided_lines > 0:
+        edge = " (the ends of that range are only partly shown here)" if partly_shown else ""
         what = (
             f"{elided_lines:,} lines ({elided_chars:,} characters) elided — "
-            f"lines {first}-{last} of {total:,}"
+            f"lines {first}-{last} of {total:,}{edge}"
         )
         how = (
             f'read them with fetch_output_slice(handle="{handle}", '
@@ -297,10 +342,10 @@ def _elision_notice(
             else "re-run a narrower command to see them"
         )
     else:
-        what = f"{elided_chars:,} characters elided from the middle of line {first - 1:,}"
+        what = f"{elided_chars:,} characters elided from the middle of line {cut_line:,}"
         how = (
             f'read that line with fetch_output_slice(handle="{handle}", '
-            f"start_line={first - 1}, end_line={first - 1})"
+            f"start_line={cut_line}, end_line={cut_line})"
             if handle is not None
             else "re-run a narrower command to see them"
         )
@@ -323,7 +368,8 @@ def _render_output(lines: list[str], *, budget: int, handle: str | None) -> str:
     tail_budget = budget - head_budget
     # At least one line in the head even when that single line is longer than the whole budget;
     # it is hard-capped below, and the `else` arm carves the tail out of the same line.
-    head_count = max(1, _leading_lines_within(lines, head_budget))
+    whole_lines_in_head = _leading_lines_within(lines, head_budget)
+    head_count = max(1, whole_lines_in_head)
     remaining = lines[head_count:]
     tail_count = _leading_lines_within(remaining[::-1], tail_budget)
     head_text = "\n".join(lines[:head_count])[:head_budget]
@@ -337,12 +383,22 @@ def _render_output(lines: list[str], *, budget: int, handle: str | None) -> str:
         # the notice points at came back head-first and cut in the same place, so the end of
         # that line was unreachable in any number of calls.
         tail_text = lines[-1][-tail_budget:]
+    # A LINE SHOWN ONLY IN PART BELONGS IN THE ELIDED RANGE, at either end of it. The head's
+    # first line is hard-capped when no whole line fit (`whole_lines_in_head == 0`), and the tail
+    # is carved out of the last line when no whole line fit there (`tail_count == 0`) — in both
+    # cases the REST of that line is missing, and `fetch_output_slice` addresses LINES, so naming
+    # it in the range is the only way the model can ever read it whole. Reporting the head's cut
+    # line as fully shown (the old unconditional `head_count + 1`) left it unreachable in any
+    # number of slice calls, and the mid-line arm below only rescued it when nothing else was
+    # elided at all.
     notice = _elision_notice(
         elided_lines=len(lines) - head_count - tail_count,
         elided_chars=len(joined) - len(head_text) - len(tail_text),
-        first=head_count + 1,
+        first=head_count + 1 if whole_lines_in_head else head_count,
         last=len(lines) - tail_count,
         total=len(lines),
+        cut_line=head_count,
+        partly_shown=not whole_lines_in_head or not tail_count,
         handle=handle,
     )
     return head_text + notice + tail_text
@@ -558,7 +614,16 @@ def _the_command_lied(result: ExecResult, markers: tuple[str, ...]) -> bool:
 
     Raw, not redacted: the redactor and the noise filter both rewrite lines, and a detector that
     reads their output is one masking rule away from going quietly blind. Nothing scanned here is
-    ever returned — the report is built from `_redact_command_output`'s artifact, as always."""
+    ever returned — the report is built from `_redact_command_output`'s artifact, as always.
+
+    AND UNCAPPED, DELIBERATELY, unlike every regex on this path. The capture is app-controlled and
+    unbounded, so the instinct is to hand it the same head+tail window `_within_the_capture_limit`
+    cuts — but that window has a MIDDLE it throws away, and a marker dropped there turns a failed
+    step into a reported success. This detector fails OPEN when it misses, which is the one
+    direction that matters here. The cost that would buy: `.lower()` plus a substring search is
+    memchr-speed, measured at 3.7 ms over 6.4 MB (~0.6 ms/MB) — three orders of magnitude cheaper
+    per byte than the credential scan whose bound this would be copying, and not worth a detector
+    that can be silenced by padding."""
     printed = f"{result.stdout}\n{result.stderr}".lower()
     return any(marker in printed for marker in markers)
 

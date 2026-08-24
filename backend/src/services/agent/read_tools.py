@@ -60,7 +60,11 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.toolsets.function import FunctionToolset
 
-from src.core.redaction import leaves_a_credential_value_open, scrub_untrusted
+from src.core.redaction import (
+    cut_before_an_open_credential,
+    leaves_a_credential_value_open,
+    scrub_untrusted,
+)
 
 if TYPE_CHECKING:
     # Annotation-only, deliberately: `LiveSandboxWorkspace` holds a `SandboxSession`, but this
@@ -796,6 +800,14 @@ _WITHHELD_TAIL_NOTICE = (
 """The MIRROR of the Write copy's notice — same words, same reason (see that one)."""
 
 
+_WITHHELD_HEAD_NOTICE = (
+    "[... the rest of this output was withheld: a credential value opens above and never closes "
+    "in what was captured, so everything after it may be the inside of one and cannot be masked "
+    "safely. Re-run a narrower command to see it ...]"
+)
+"""The MIRROR of the Write copy's head notice — the same guard at the other end of the cut."""
+
+
 def _capture_limit_marker(dropped: int) -> str:
     """What a capture too big to scan lost, said out loud (the MIRROR of the Write copy)."""
     return (
@@ -843,7 +855,14 @@ def _redacted_lines(text: str) -> list[str]:
     after redaction re-exposes one. The capture cut above is the same rule one level up, which is
     why it cuts on lines."""
     head, tail, dropped = _within_the_capture_limit(text)
-    lines = scrub_untrusted(head, limit=_REDACT_INPUT_MAX_CHARS).splitlines() if head else []
+    # THE HEAD IS CUT WHEN IT ENDS INSIDE A CREDENTIAL — the MIRROR of the Write copy's head
+    # guard, and the same reason: a value opened in the head and closed past it matches none of
+    # the redactor's shapes and renders verbatim. See the Write copy's guard.
+    safe_head = cut_before_an_open_credential(head)
+    scannable = head if safe_head is None else safe_head
+    lines = scrub_untrusted(scannable, limit=_REDACT_INPUT_MAX_CHARS).splitlines()
+    if safe_head is not None:
+        lines.append(_WITHHELD_HEAD_NOTICE)
     if dropped:
         lines.append(_capture_limit_marker(dropped))
     # THE TAIL IS WITHHELD WHEN IT MIGHT BE A CREDENTIAL'S BODY — the MIRROR of the Write copy's
@@ -868,17 +887,30 @@ def _leading_lines_within(lines: list[str], budget: int) -> int:
 
 
 def _elision_notice(
-    *, elided_lines: int, elided_chars: int, first: int, last: int, total: int, handle: str | None
+    *,
+    elided_lines: int,
+    elided_chars: int,
+    first: int,
+    last: int,
+    total: int,
+    cut_line: int,
+    partly_shown: bool,
+    handle: str | None,
 ) -> str:
     """The truncation notice: WHAT was removed, and — inline — how to get it back.
 
     NAMING THE TOOL AND THE HANDLE IN THE NOTICE ITSELF is the point. A capability described once
     in a system prompt is a thing the model has to remember at the moment it is staring at a
-    truncated log; a call it can copy off the line in front of it is not."""
+    truncated log; a call it can copy off the line in front of it is not.
+
+    `cut_line` IS PASSED RATHER THAN DERIVED (it used to be `first - 1`) — the MIRROR of the Write
+    copy's change, and the same reason: the caller now names the elided range from the first line
+    it did not show WHOLE, so the two numbers stopped being one apart."""
     if elided_lines > 0:
+        edge = " (the ends of that range are only partly shown here)" if partly_shown else ""
         what = (
             f"{elided_lines:,} lines ({elided_chars:,} characters) elided — "
-            f"lines {first}-{last} of {total:,}"
+            f"lines {first}-{last} of {total:,}{edge}"
         )
         how = (
             f'read them with fetch_output_slice(handle="{handle}", '
@@ -887,10 +919,10 @@ def _elision_notice(
             else "re-run a narrower command to see them"
         )
     else:
-        what = f"{elided_chars:,} characters elided from the middle of line {first - 1:,}"
+        what = f"{elided_chars:,} characters elided from the middle of line {cut_line:,}"
         how = (
             f'read that line with fetch_output_slice(handle="{handle}", '
-            f"start_line={first - 1}, end_line={first - 1})"
+            f"start_line={cut_line}, end_line={cut_line})"
             if handle is not None
             else "re-run a narrower command to see them"
         )
@@ -913,7 +945,8 @@ def _render_output(lines: list[str], *, budget: int, handle: str | None) -> str:
     tail_budget = budget - head_budget
     # At least one line in the head even when that single line is longer than the whole budget;
     # it is hard-capped below, and the `else` arm carves the tail out of the same line.
-    head_count = max(1, _leading_lines_within(lines, head_budget))
+    whole_lines_in_head = _leading_lines_within(lines, head_budget)
+    head_count = max(1, whole_lines_in_head)
     remaining = lines[head_count:]
     tail_count = _leading_lines_within(remaining[::-1], tail_budget)
     head_text = "\n".join(lines[:head_count])[:head_budget]
@@ -924,12 +957,18 @@ def _render_output(lines: list[str], *, budget: int, handle: str | None) -> str:
         # capture that is one enormous line (a minified bundle, a `--json` payload) renders
         # head-only, and on this surface there is no handle to recover the rest with at all.
         tail_text = lines[-1][-tail_budget:]
+    # A LINE SHOWN ONLY IN PART BELONGS IN THE ELIDED RANGE, at either end of it — the MIRROR of
+    # the Write copy's rule, and the same reason: `fetch_output_slice` addresses LINES, so a line
+    # the render hard-capped is only ever recoverable if the range names it. On this surface
+    # there is no handle at all, so the notice's honesty is the whole of what the model gets.
     notice = _elision_notice(
         elided_lines=len(lines) - head_count - tail_count,
         elided_chars=len(joined) - len(head_text) - len(tail_text),
-        first=head_count + 1,
+        first=head_count + 1 if whole_lines_in_head else head_count,
         last=len(lines) - tail_count,
         total=len(lines),
+        cut_line=head_count,
+        partly_shown=not whole_lines_in_head or not tail_count,
         handle=handle,
     )
     return head_text + notice + tail_text

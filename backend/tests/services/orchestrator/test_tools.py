@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,7 @@ from src.services.orchestrator.tools import (
     OUTPUT_NO_LONGER_HELD,
     _is_predictable_noise,
     _redact_command_output,
+    _the_command_lied,
 )
 from src.services.sandbox import (
     ExecResult,
@@ -1115,6 +1117,27 @@ async def _apply(
         sink,
         [tool_turn("apply_schema_change", {"what_changed": what_changed}), text_turn("ok")],
     )
+
+
+def test_the_zero_exit_lie_detector_reads_a_marker_anywhere_in_a_huge_capture() -> None:
+    """The detector is handed the RAW `ExecResult` and nothing upstream caps it — the supervisor
+    runs `subprocess.run(capture_output=True)` with no ceiling and the client adds none. It is
+    left uncapped on purpose: the head+tail window every regex here uses has a MIDDLE it discards,
+    and a marker dropped there reports a failed schema change as a success. This pins that
+    direction, and the wall-clock bound alongside it pins the reason it is affordable —
+    `.lower()` plus a substring search is memchr-speed, ~0.6 ms/MB."""
+    filler = ("A" * 79 + "\n") * 40_000  # ~3.2 MB either side of the marker
+    markers = ("interactive prompts require a tty",)
+    buried = ExecResult(
+        stdout=filler + "Interactive prompts require a TTY terminal\n" + filler, stderr="", exit=0
+    )
+
+    started = time.perf_counter()
+    assert _the_command_lied(buried, markers) is True
+    # LIVENESS for the negative: the same blob with no marker in it answers the other way, so the
+    # assertion above is about the marker and not about the function saying yes to everything.
+    assert _the_command_lied(ExecResult(stdout=filler, stderr="", exit=0), markers) is False
+    assert time.perf_counter() - started < 1.5
 
 
 async def test_a_step_that_exits_zero_after_failing_is_reported_as_a_failure(
