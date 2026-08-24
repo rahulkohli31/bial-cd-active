@@ -4,6 +4,40 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.17] - 2026-08-24
+
+### Changed
+
+- The assistant now writes for the person who asked for the app, not for a developer. File
+  names, commands, and library names stay out of the chat, and build steps read as "Building
+  your app's main page" instead of a file path.
+- A build answers the moment you send it rather than sitting still while its sandbox starts.
+  An operation that runs long says what it is doing and clears itself when it finishes.
+- A finished build ends with a short list of what you can now do with your app.
+- Changing where your app stores information is one operation instead of two commands, so a
+  change can no longer half-apply or stall waiting on a question nobody can answer.
+- Long command output is trimmed by usefulness, with a way to read the part that was left
+  out, instead of flooding a build with dependency-manager chatter.
+- The starting template no longer ships a demonstration data model or example component to
+  work around.
+
+### Fixed
+
+- Attaching a slide deck no longer counts tokens against your daily usage before you have
+  sent a message.
+- "Build complete" is refused when the app is not actually working, so it can no longer
+  appear over an app that will not build.
+- A workspace that matches its last save but still holds uncommitted work is no longer
+  treated as safe to reclaim.
+- Trimmed command output can no longer reveal the inside of a credential, from either end of
+  the capture.
+- A build that fails partway now explains itself in plain words and says what happens next.
+
+### Removed
+
+- Retired internal surfaces that no longer had callers: the browser build lock and its
+  heartbeat, an unreachable supervisor route, and a progress frame nothing produced.
+
 ## [1.6.16] - 2026-08-23
 
 Everything below comes from one demo. On 18 August the platform destroyed a finished app twice,
