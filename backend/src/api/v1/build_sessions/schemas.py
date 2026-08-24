@@ -63,8 +63,10 @@ class BuildSessionStatus(enum.StrEnum):
 
 # --- Frozen lock TTL + cadence constants (C3 §3) -----------------------------
 # The Redis key namespace + TTLs are owned by C5; C3 freezes the client-facing
-# cadence. SESSION-API's Wave-1 lock ops set these; the portal keep-alive loop
-# renews/heartbeats to them.
+# cadence. SESSION-API's Wave-1 lock ops set these. There is no portal keep-alive
+# loop anymore (deleted in U13) and no HTTP surface to renew them from a browser
+# (the `lock/renew` / `heartbeat` routes were retired in U28) — the server itself
+# is the only renewer now, in-process, via `locks.py`/`manager.py`/`reaper.py`.
 
 LOCK_TTL_SECONDS = 900  # 15 min — lock auto-expires if not renewed (C5 reaper reconciles).
 LOCK_RENEW_CADENCE_SECONDS = 300  # 5 min — client renews at ⅓ TTL (two renews of head-room).
@@ -365,11 +367,14 @@ class ErrorSource(enum.StrEnum):
     TSC = "tsc"  # `tsc` typecheck failure, read over C1 /exec.
     NEXT_BUILD = "next_build"  # `next build` failure, read over C1 /exec.
     SERVER = "server"  # dev-server stderr, read over C1 /dev/logs.
-    # The browser client-error arm — LIVE as of U13, and no longer a class the user never
-    # hears about. Its REPORT stays agent-only (see `agent_only_detail`); what reaches the
-    # citizen is the platform's own sentence for the class, which `errors.user_facing` owns
-    # and `DiagnosticFrame` carries (U16). "Never emitted" and "never rendered" are both
-    # stale readings of this member — do not restore either.
+    # The browser client-error arm — LIVE as of U13. Its REPORT stays agent-only (see
+    # `agent_only_detail`): it still reaches the agent channel (`build_repair_prompt` acts on
+    # it, a repair run follows) and the health verdict (`outcome.error` carries it unchanged),
+    # but both current emit sites — `turns/engine.py` and `orchestrator/harness.py` — skip the
+    # `DiagnosticFrame` emit for this source on purpose, so it is NOT rendered to the citizen
+    # today. U16 still gave it a real citizen-facing sentence + action in `errors.user_facing`
+    # (not a placeholder) so that if a later plan decides to render it, the copy already
+    # speaks product language rather than a JS stack trace.
     CLIENT = "client"
 
 

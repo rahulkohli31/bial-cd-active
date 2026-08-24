@@ -69,7 +69,6 @@ export function estimateConversationTokens(messages: unknown, systemText = ''): 
   // UNCHECKED (matches pre-migration behavior): asserted after the Array.isArray guard.
   const msgs = messages as ChatMessage[]
   const lastIdx = msgs.length - 1
-  const seenDecks = new Set<string>() // de-dup bookkeeping only — decks are billed zero, see below
   let tokens = 0
   msgs.forEach((m, i) => {
     for (const p of m?.parts || []) {
@@ -80,13 +79,11 @@ export function estimateConversationTokens(messages: unknown, systemText = ''): 
         // EVERY turn by its real length — not the nominal one-turn binary cost.
         tokens += Math.ceil((p.text || '').length / CHARS_PER_TOKEN)
       } else if (p?.type === 'file' && p.kind === 'deck') {
-        // Zero charge: attachmentStore.ts:180 drops deck parts before the wire, so
-        // this content never ships (see the top-of-file comment below
-        // NOMINAL_FILE_TOKENS for the full reasoning). seenDecks bookkeeping is kept
-        // for a future path that does send deck content — it costs nothing to keep
-        // and saves re-deriving the key logic.
-        const key = p.pdfFileId || p.attachmentId
-        seenDecks.add(key)
+        // Zero charge: attachmentStore.ts:180 drops deck parts before the wire, so this
+        // content never ships (see the top-of-file comment below NOMINAL_FILE_TOKENS for
+        // the full reasoning). This branch exists only to intercept deck parts ahead of
+        // the generic file branch below, which would otherwise bill NOMINAL_FILE_TOKENS
+        // for a deck sitting in the newest turn.
       } else if (p?.type === 'file' && i === lastIdx) {
         tokens += NOMINAL_FILE_TOKENS
       }
