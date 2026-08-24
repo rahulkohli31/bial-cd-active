@@ -19,7 +19,7 @@ from pydantic_ai import RunContext
 from pydantic_ai.toolsets.function import FunctionToolset
 
 from src.api.v1.build_sessions.schemas import BuildError, ErrorSource
-from src.core.prompt_blocks import WRITE_TOOL_SURFACE
+from src.core.prompt_blocks import APPLY_SCHEMA_CHANGE_TOOL, WRITE_TOOL_SURFACE
 from src.db.models.conversation import ConversationMode
 from src.services.agent.toolsets import (
     first_sentence,
@@ -380,7 +380,8 @@ def test_prompt_teaches_the_drizzle_migration_discipline() -> None:
     lowered = prompt.lower()
     assert "db/schema.ts" in prompt
     assert "drizzle-kit" in prompt and "generate" in lowered
-    assert "db:migrate" in prompt
+    # U23: the applying half is the composite now, not `npm run db:migrate` spelled out.
+    assert APPLY_SCHEMA_CHANGE_TOOL in prompt
     # The ban is doctrine — and it is stated WITHOUT the literal command, so a repo-wide
     # `grep "drizzle-kit push"` stays a clean "nothing invokes it" check.
     assert "`push` command" in prompt
@@ -507,34 +508,45 @@ def _database_block(prompt: str) -> str:
     return prompt[prompt.index("DATABASE \u2014") :].split("\n\n", 1)[0]
 
 
-def test_both_model_facing_sources_prescribe_the_same_named_generate() -> None:
-    from src.core.prompt_blocks import MIGRATION_GENERATE_CMD
+def test_both_model_facing_sources_prescribe_the_same_one_call() -> None:
+    """★ U23 — the two voices that tell the model how to change a schema still agree, and what
+    they now agree ON is the composite rather than the two-command sequence.
+
+    This is the check that caught the last half-landed fix: the re-test patched the prompt and
+    missed the sentinel, so the model was corrected by one voice and mis-taught by the other."""
+    from src.core.prompt_blocks import APPLY_SCHEMA_CHANGE_TOOL, MIGRATION_CHANNEL
     from src.services.orchestrator.sql_guard import _refusal
 
     refusal = _refusal("DELETE without WHERE")
-    assert MIGRATION_GENERATE_CMD in refusal
-    assert "--name" in MIGRATION_GENERATE_CMD
-    # The build prompt teaches the same flag, in its own argv spelling.
-    assert '"--name"' in BUILD_SYSTEM_PROMPT
-    # Neither source may prescribe the BARE generate — not because it hangs (it does not; see
-    # the test below), but because it names the file at random and the two voices must match.
-    assert "`npx drizzle-kit generate`" not in refusal
+    assert MIGRATION_CHANNEL in refusal
+    assert APPLY_SCHEMA_CHANGE_TOOL in MIGRATION_CHANNEL
+    # The build prompt sends the model to the same one call.
+    assert APPLY_SCHEMA_CHANGE_TOOL in _database_block(BUILD_SYSTEM_PROMPT)
+    # …and NEITHER voice hands back the raw sequence it replaced. The sentinel used to spell out
+    # `npx drizzle-kit generate --name <what_changed>`, then `npm run db:migrate`, which is
+    # exactly the pair whose zero exit codes lie.
+    assert "drizzle-kit generate" not in refusal
+    assert "db:migrate" not in refusal
 
 
 _A_GENERATE_SPELLING = re.compile(r"drizzle-kit[\"\',\s]+generate(.{0,24})")
 
 
-def test_every_generate_the_model_reads_carries_the_name_flag() -> None:
-    """★ U20 / ASM28 — ONE SPELLING, EVERYWHERE THE MODEL LOOKS.
+def test_the_prompt_prescribes_no_generate_command_for_the_model_to_run() -> None:
+    """★ U20 / ASM28, finished by U23 — ONE SPELLING, EVERYWHERE THE MODEL LOOKS, and it is now
+    the tool rather than the command.
 
-    The TOOL SURFACE block used to carry `["npx","drizzle-kit","generate"]` as its `run_command`
-    example — the bare spelling the DATABASE block forbids two blocks earlier, in the same
-    prompt. The block is generated from the tools' own docstrings now, so the contradicting
-    example is gone rather than corrected; this pins that no future edit re-adds one."""
-    spellings = _A_GENERATE_SPELLING.findall(BUILD_SYSTEM_PROMPT)
-    assert spellings, "the prompt stopped teaching the generate command at all"
-    for tail in spellings:
+    U20 removed a `run_command` example carrying the bare `["npx","drizzle-kit","generate"]` the
+    DATABASE block forbade two blocks earlier in the same prompt. U23 removes the prescription
+    altogether: `apply_schema_change` runs the command, so the prompt has no reason to spell it.
+    The rule survives as an INERTNESS guard — any generate spelling that comes back must carry
+    the flag — plus the liveness assertion that says what replaced it, because an inertness
+    assertion alone is green against a prompt that stopped teaching migrations at all."""
+    for tail in _A_GENERATE_SPELLING.findall(BUILD_SYSTEM_PROMPT):
         assert "--name" in tail, f"a bare `drizzle-kit generate` survives in the prompt: {tail!r}"
+    assert "run_command([" not in _database_block(BUILD_SYSTEM_PROMPT)
+    # LIVENESS — the prompt still teaches how a schema change is made.
+    assert f"{APPLY_SCHEMA_CHANGE_TOOL}(what_changed=" in BUILD_SYSTEM_PROMPT
 
 
 def test_the_template_offers_no_second_spelling_of_the_generate_command() -> None:
@@ -552,25 +564,26 @@ def test_the_template_offers_no_second_spelling_of_the_generate_command() -> Non
     assert "db:migrate" in scripts
 
 
-def test_the_name_flag_claims_only_what_the_flag_actually_does() -> None:
-    """★ U20 / R26 / ASM28 — THE FLIPPED CLAIM.
+def test_the_migration_name_claims_only_what_naming_actually_buys() -> None:
+    """★ U20 / R26 / ASM28, carried onto U23's argument — THE FLIPPED CLAIM.
 
-    This sentence used to read "ALWAYS pass `--name`: without it the command PROMPTS when the
-    diff is ambiguous ... so it hangs until it is killed." A smoke against the template's pinned
+    The prompt used to read "ALWAYS pass `--name`: without it the command PROMPTS when the diff
+    is ambiguous ... so it hangs until it is killed." A smoke against the template's pinned
     `drizzle-kit@0.31.10` says otherwise: a bare generate over an unambiguous diff exits 0 and
-    writes `drizzle/0001_special_fantastic_four.sql` — a RANDOM NAME, not a hang. The flag stays
-    (a migration history nobody can read is a real cost) but it may only claim what it buys, or
-    the model reasons from a mechanism that does not exist."""
+    writes `drizzle/0001_special_fantastic_four.sql` — a RANDOM NAME, not a hang. The flag is the
+    composite's `what_changed` argument now, and it may still only claim what it buys, or the
+    model reasons from a mechanism that does not exist."""
     database = _database_block(BUILD_SYSTEM_PROMPT)
-    name_rule = database[database.index("ALWAYS pass") :].split("\n", 1)[0]
+    name_rule = database[database.index("`what_changed` names") :].split("\n", 1)[0].lower()
 
-    # INERTNESS — the hang, and the ambiguity mechanism, are not this sentence's business.
-    assert "hang" not in name_rule.lower()
-    assert "prompts" not in name_rule.lower()
+    # INERTNESS — the hang, and the ambiguity mechanism, are not this bullet's business. Matched
+    # as WORDS: `what_changed` itself contains the letters of "hang".
+    assert re.search(r"\bhangs?\b", name_rule) is None
+    assert re.search(r"\bprompts?\b", name_rule) is None
 
-    # THE REAL COST, stated concretely enough to be checkable.
-    assert "named at random" in name_rule
-    assert "--name" in name_rule
+    # THE REAL COST, stated concretely enough to be checkable: a name buys a READABLE history.
+    assert "read" in name_rule
+    assert "what_changed" in name_rule
 
 
 def test_the_prompt_teaches_the_split_that_actually_unblocked_the_wedged_build() -> None:
@@ -583,7 +596,7 @@ def test_the_prompt_teaches_the_split_that_actually_unblocked_the_wedged_build()
     model taught only "it hangs" reads that zero exit as success and builds on a schema change
     that never happened, so the zero exit is the half that must be said out loud."""
     database = _database_block(BUILD_SYSTEM_PROMPT).lower()
-    assert "one kind of change per generate" in database
+    assert "one kind of change per call" in database
     assert "rename" in database
     # The mechanism: an interactive question, and no flag answers it.
     assert "asks" in database
@@ -602,6 +615,58 @@ def test_the_drizzle_artifacts_instruction_is_emitted_exactly_once() -> None:
     assert lowered.count("travel with the snapshot") == 1
     # LIVENESS — the surviving copy is the DATABASE one, which carries the extra rule.
     assert "never hand-edit one that has already been applied" in lowered
+
+
+# --- U23 / R29: one operation for applying a database change ---------------------------------
+
+
+def test_the_two_step_sequence_is_no_longer_the_taught_path_but_the_tty_defences_still_are() -> (
+    None
+):
+    """★ U23 — the prompt-trim inertness guard, WITH the liveness assertion it needs beside it.
+
+    The DATABASE block used to dictate two `run_command([...])` invocations. It dictates one tool
+    call now, and that is the inert half: neither raw command may be prescribed as the path, or
+    the model is being taught the sequence whose zero exit codes lie.
+
+    The liveness half is a different file entirely, and it is the one this unit could break by
+    accident. The composite's cleanest failure — the rename resolver — is only FAST because of
+    three defences in `sandbox/supervisor/app.py`: `CI=1` (well-behaved tools refuse to prompt),
+    `stdin=DEVNULL` (drizzle-kit's prompt renderer probes `process.stdin.isTTY` and fails fast
+    against a closed one), and `_refuse_a_manufactured_tty` (the agent's `pty.spawn` workaround,
+    which bought the observed 4m09s stall). Remove any one and this tool's crispest detection
+    becomes a wedged command running to its timeout — with every assertion in this file still
+    green, because none of them is about that file. This one is."""
+    database = _database_block(BUILD_SYSTEM_PROMPT)
+    # INERTNESS — the sequence is not the prescribed path any more.
+    assert "run_command([" not in database
+    assert '"drizzle-kit"' not in database
+    assert '"db:migrate"' not in database
+    # …and the one call is.
+    assert f"{APPLY_SCHEMA_CHANGE_TOOL}(what_changed=" in database
+
+    # LIVENESS — the three TTY defences that make reaching the resolver fast and loud.
+    supervisor = (_TEMPLATE_ROOT.parent / "supervisor" / "app.py").read_text(encoding="utf-8")
+    assert 'env["CI"] = "1"' in supervisor
+    assert "stdin=subprocess.DEVNULL" in supervisor
+    assert "_refuse_a_manufactured_tty(body.cmd)" in supervisor
+
+
+async def test_the_composite_is_offered_and_its_line_is_its_own_first_sentence() -> None:
+    """★ U23 — the composite reaches the model as a REGISTERED TOOL, and the sentence the prompt
+    spends on it is the same string its registration carries.
+
+    The generic drift check covers every tool at once; this names the one this unit adds, so a
+    failure reads as "the composite fell out of the prompt" rather than as a snapshot mismatch."""
+    definitions = await registered_tool_definitions(ConversationMode.WRITE)
+    assert APPLY_SCHEMA_CHANGE_TOOL in definitions, "the composite is not registered for Write"
+    described = definitions[APPLY_SCHEMA_CHANGE_TOOL].description or ""
+    line = f"- `{APPLY_SCHEMA_CHANGE_TOOL}` \u2014 {first_sentence(described)}"
+    assert line in _tool_surface_block(BUILD_SYSTEM_PROMPT)
+    # The sentence has to carry the tool's REASON, not just its name — a roll-call line that only
+    # says "applies a schema change" leaves the model with no cause to prefer it over the two
+    # commands it already knows.
+    assert "truthfully" in line and "failed" in line
 
 
 # --- U20 / R26: the TOOL SURFACE block is GENERATED, and this is the check that keeps it so ---

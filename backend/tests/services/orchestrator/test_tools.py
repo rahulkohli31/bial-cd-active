@@ -5,16 +5,28 @@ path, not a hand-called function."""
 
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
+from pathlib import Path
 from typing import Any
 
 import pytest
-from pydantic_ai.messages import ModelMessage, ModelResponse
+from pydantic_ai.messages import (
+    FunctionToolCallEvent,
+    ModelMessage,
+    ModelResponse,
+    ToolCallPart,
+)
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
+from src.api.v1.conversations.schemas import StepFrame
+from src.core import prompt_blocks
+from src.db.models.conversation import ConversationMode
 from src.db.models.harness_counter import HarnessCounter
+from src.services.messages.projection import long_operation_line
 from src.services.orchestrator import build_agent, constants
+from src.services.orchestrator import tools as tools_module
 from src.services.orchestrator.deps import BuildDeps, HeldOutput, SandboxSession
 from src.services.orchestrator.progress import ProgressEmitter
 from src.services.orchestrator.tools import (
@@ -31,9 +43,17 @@ from src.services.sandbox import (
     SandboxGoneError,
     SandboxHandle,
 )
+from src.services.turns import engine as engine_module
+from src.services.turns.engine import _TurnState
 from tests.services.orchestrator.conftest import CollectingSink
 from tests.services.orchestrator.fake_sandbox import FAKE_SUPERVISOR_TOKEN, FakeSandbox
 from tests.services.orchestrator.model_harness import text_turn, tool_turn
+
+# Repo-root/sandbox — the real golden template and supervisor, read by the marker-drift pins
+# below. This file is backend/tests/services/orchestrator/test_tools.py, so parents[4] is the
+# repo root.
+_TEMPLATE_ROOT = Path(__file__).resolve().parents[4] / "sandbox" / "template"
+_SUPERVISOR_APP = Path(__file__).resolve().parents[4] / "sandbox" / "supervisor" / "app.py"
 
 _TOOL_NAMES = {
     "read_file",
@@ -46,6 +66,9 @@ _TOOL_NAMES = {
     # is registered here, on the sandbox toolset, because Write is the only mode that runs
     # commands. `test_toolsets.py` asserts the mode half against `toolsets_for_mode` directly.
     "fetch_output_slice",
+    # U23: the composite is registered here too — one call for the generate + migrate sequence
+    # the DATABASE block used to dictate step by step.
+    "apply_schema_change",
 }
 
 
@@ -1039,3 +1062,396 @@ async def test_a_repeat_run_is_counted_on_the_repeat_only(
         ],
     )
     assert counted == [HarnessCounter.COMMAND_RERUN_IN_TURN]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# U23 / R29 — one operation for applying a database change
+# ═══════════════════════════════════════════════════════════════════════════════════════
+#
+# THE DEFECT THESE PIN is not a slow loop, it is a LIE. Applying a schema change was two
+# prompt-taught commands and BOTH of them exit 0 after failing: drizzle-kit's rename resolver
+# prints "Interactive prompts require a TTY terminal", writes no migration and exits 0, and
+# `scripts/db-migrate.mjs` catches every error and exits 0 by design so a bad migration can never
+# stop the dev server. A model reading exit codes therefore believes a schema change happened
+# that did not, and then builds queries against tables that are not there.
+#
+# So every test below is really one assertion in two halves: the operation NEVER reports success
+# when a step failed, and when it reports failure it says which step, what the output actually
+# said, and what state that left the workspace and the database in.
+
+# The three exit-zero-after-failing shapes, spelled as the programs themselves spell them.
+_THE_TTY_REFUSAL = "Error: Interactive prompts require a TTY terminal"
+_THE_SWALLOWED_ERROR = (
+    '[db] migrations failed — starting the app anyway: relation "visitors" already exists'
+)
+_THE_ABANDONED_MIGRATION = (
+    "[db] migrations still running after 20000ms — starting the app without them."
+)
+_THE_SKIPPED_MIGRATION = (
+    "[db] BIAL_DATABASE_URL is not set — skipping migrations. The app will still start."
+)
+# …and the two success lines, which must NOT read as failures (the liveness half).
+_A_MIGRATION_WAS_WRITTEN = "[✓] Your SQL migration file ➜ drizzle/0001_add_visitors_table.sql"
+_MIGRATIONS_APPLIED = "[db] migrations up to date."
+
+_THE_GENERATE = ["npx", "drizzle-kit", "generate", "--name", "add_visitors_table"]
+_THE_MIGRATE = ["npm", "run", "db:migrate"]
+
+_A_REPORT = re.compile(r"apply_schema_change (?:SUCCEEDED|FAILED)[\s\S]*")
+
+
+def _report_in(captured: dict[str, Any]) -> str:
+    """The composite's own answer, sliced out of everything the model was handed."""
+    match = _A_REPORT.search(captured["all_incoming"])
+    assert match is not None, f"no composite report in:\n{captured['all_incoming'][-3000:]}"
+    return match.group(0)
+
+
+async def _apply(
+    fake: FakeSandbox, sink: CollectingSink, *, what_changed: str = "add visitors table"
+) -> dict[str, Any]:
+    return await _run(
+        fake,
+        sink,
+        [tool_turn("apply_schema_change", {"what_changed": what_changed}), text_turn("ok")],
+    )
+
+
+async def test_a_step_that_exits_zero_after_failing_is_reported_as_a_failure(
+    sink: CollectingSink,
+) -> None:
+    """★ AE16 — THE HEADLINE. drizzle-kit reached the rename resolver: it printed the refusal to
+    stderr, wrote no migration, and exited 0. The operation must report FAILURE anyway, name the
+    step, say what state the workspace was left in, and say out loud that it is overriding the
+    exit code — a verdict that silently contradicts a zero the model can see is a verdict the
+    model argues with.
+
+    Mutation-check: drop `_the_command_lied` from the `ok` expression and this goes red while
+    every exit-code assertion in this file stays green, which is the whole point of the unit."""
+    fake = FakeSandbox()
+    fake.queue_commands(ExecResult(stdout="", stderr=_THE_TTY_REFUSAL, exit=0))
+    report = _report_in(await _apply(fake, sink))
+
+    assert report.startswith("apply_schema_change FAILED at step 1 of 2 — generate the migration.")
+    # WHAT STATE IT LEFT THINGS IN — the half a bare "it failed" leaves the model guessing at.
+    assert "NO migration file was written and the database was not touched" in report
+    assert "has NOT been applied" in report
+    # THE OVERRIDE, said out loud rather than merely applied.
+    assert "it exited 0 — that exit code is WRONG" in report
+    assert "STEP 1 of 2 — generate the migration: FAILED" in report
+    # …and the underlying output is right there, so the model can see the cause for itself.
+    assert _THE_TTY_REFUSAL in report
+
+
+async def test_every_step_succeeding_reports_success_with_a_per_step_outcome(
+    sink: CollectingSink,
+) -> None:
+    """The other terminal state, and the liveness guard on every failure marker above: a real
+    generate and a real migrate print lines that must NOT be read as failures."""
+    fake = FakeSandbox()
+    fake.queue_commands(
+        ExecResult(stdout=_A_MIGRATION_WAS_WRITTEN, stderr="", exit=0),
+        ExecResult(stdout=_MIGRATIONS_APPLIED, stderr="", exit=0),
+    )
+    report = _report_in(await _apply(fake, sink))
+
+    assert report.startswith("apply_schema_change SUCCEEDED — all 2 steps ran.")
+    assert "the migration is applied — the database now matches `db/schema.ts`" in report
+    # A PER-STEP OUTCOME FOR EACH — not one verdict for the pair.
+    assert "STEP 1 of 2 — generate the migration: OK" in report
+    assert "STEP 2 of 2 — apply the migration to the database: OK" in report
+    assert "FAILED" not in report
+    # Both commands really ran, in order, and the model's words became the migration's name.
+    assert fake.command_calls == [_THE_GENERATE, _THE_MIGRATE]
+
+
+async def test_a_failed_first_step_stops_the_second_and_the_report_says_so(
+    sink: CollectingSink,
+) -> None:
+    """★ Applying half a schema change is worse than applying none: the migrate step would have
+    re-applied whatever was already pending under a name the model thinks describes its new edit.
+    So step two does not run — and "did not run" is REPORTED, because the state it implies
+    (nothing reached the database) is different from "ran and failed"."""
+    fake = FakeSandbox()
+    fake.queue_commands(ExecResult(stdout="", stderr=_THE_TTY_REFUSAL, exit=0))
+    report = _report_in(await _apply(fake, sink))
+
+    assert fake.command_calls == [_THE_GENERATE], "the migrate step ran after a failed generate"
+    assert "STEP 2 of 2 — apply the migration to the database: NOT RUN" in report
+    assert "step 1 failed, so this step never started" in report
+
+
+@pytest.mark.parametrize(
+    "printed",
+    [_THE_SWALLOWED_ERROR, _THE_ABANDONED_MIGRATION, _THE_SKIPPED_MIGRATION],
+    ids=["swallowed", "abandoned", "skipped"],
+)
+async def test_the_migrator_always_exits_zero_so_its_output_is_what_gets_read(
+    sink: CollectingSink, printed: str
+) -> None:
+    """★ AE16 again, on the second step and all three of its shapes. `db-migrate.mjs` is non-fatal
+    BY DESIGN — its own header explains why — so a caught error, a migration abandoned after its
+    20-second timer, and a run with no DSN to connect to all end in `process.exit(0)`. Each is a
+    schema change that did not happen wearing a clean exit code."""
+    fake = FakeSandbox()
+    fake.queue_commands(
+        ExecResult(stdout=_A_MIGRATION_WAS_WRITTEN, stderr="", exit=0),
+        ExecResult(stdout=printed, stderr="", exit=0),
+    )
+    report = _report_in(await _apply(fake, sink))
+
+    assert report.startswith(
+        "apply_schema_change FAILED at step 2 of 2 — apply the migration to the database."
+    )
+    # The state is the OTHER one — a migration file exists, and the database has not taken it.
+    assert "the migration file IS written under `drizzle/`" in report
+    assert "the tables still do not match `db/schema.ts`" in report
+    # …and step one is still reported honestly as the success it was.
+    assert "STEP 1 of 2 — generate the migration: OK" in report
+    assert "it exited 0 — that exit code is WRONG" in report
+
+
+def test_the_migrate_failure_markers_match_the_script_that_prints_them() -> None:
+    """★ THE PAIR THAT DRIFTS SILENTLY: a detector, and the program whose output it reads.
+
+    Every marker is a literal from `sandbox/template/scripts/db-migrate.mjs` on a path that ends
+    in `process.exit(0)`. Reword one of those `console.error` lines and this composite goes
+    quietly blind — reporting success on a migration that failed, which is precisely the defect
+    it exists to remove. Nothing else in either repo half would notice."""
+    script = (_TEMPLATE_ROOT / "scripts" / "db-migrate.mjs").read_text(encoding="utf-8")
+    for marker in tools_module._MIGRATE_FAILED_MARKERS:
+        assert marker in script.lower(), f"`{marker}` is no longer what the migrator prints"
+    # LIVENESS — the success line is in the same file and must match NO marker, or the composite
+    # would report every healthy migration as a failure.
+    assert _MIGRATIONS_APPLIED.lower() in script.lower()
+    assert not any(
+        marker in _MIGRATIONS_APPLIED.lower() for marker in tools_module._MIGRATE_FAILED_MARKERS
+    )
+
+
+async def test_the_interactive_resolver_fails_fast_with_a_plain_explanation(
+    sink: CollectingSink,
+) -> None:
+    """★ The wedge, asserted the only honest way: on the BOUND and the measured signature, never
+    by waiting one out.
+
+    Under a TTY the rename resolver waits forever — that is the observed 4m09s stall. Under this
+    sandbox's real conditions it cannot: the supervisor sets `CI=1`, closes stdin, and refuses a
+    manufactured pty (`test_prompt.py` pins all three), so drizzle-kit fails immediately with the
+    signature below. What this test owns is what the composite does with those seconds: it takes
+    the SHORT bound rather than the ten-minute install class, and it hands back an explanation in
+    words rather than a wedged command and a timeout."""
+    fake = FakeSandbox()
+    fake.queue_commands(ExecResult(stdout="", stderr=_THE_TTY_REFUSAL, exit=0))
+    captured = await _apply(fake, sink)
+
+    # A migration generate should take seconds. Ten minutes of waiting for a terminal that does
+    # not exist is ten minutes of the citizen's build (F4's whole argument for two bounds).
+    assert fake.command_timeouts == [constants.RUN_COMMAND_DEFAULT_TIMEOUT_S]
+    report = _report_in(captured)
+    # THE MEASURED SIGNATURE, pinned against the two other places the same measurement is
+    # written down. It is drizzle-kit's string, so no test can keep it TRUE — but a re-measurement
+    # that lands in one place and not the others is a drift this catches.
+    marker = tools_module._GENERATE_FAILED_MARKERS[0]
+    assert marker in _THE_TTY_REFUSAL.lower()
+    for recorded in (_SUPERVISOR_APP, Path(prompt_blocks.__file__)):
+        assert marker in recorded.read_text(encoding="utf-8").lower(), recorded
+    # THE PLAIN EXPLANATION: what to do differently, not just what broke.
+    assert "make ONE kind of schema change and call this again" in report
+    assert "Nothing needs undoing" in report
+    # …and the loop carried on rather than crashing — a failure here is a normal tool result.
+    assert captured["output"] == "ok"
+
+
+async def test_the_composites_output_is_capped_by_its_verdict_not_by_the_commands_exit_code(
+    sink: CollectingSink,
+) -> None:
+    """★ U22's cap, reached through U23's override. A step that failed while exiting 0 would be
+    SUMMARISED if the budget were read off `result.exit` — the misleading zero deciding how much
+    of the failure the model gets to see. The budget is asked about the OPERATION's verdict
+    instead, so a failing composite dumps and a succeeding one summarises, and both still hand
+    back the slice handle to whatever was cut."""
+    failing = FakeSandbox()
+    failing.queue_commands(
+        ExecResult(stdout=_long_output(lines=900), stderr=_THE_TTY_REFUSAL, exit=0)
+    )
+    failed = _report_in(await _apply(failing, sink))
+
+    passing = FakeSandbox()
+    passing.queue_commands(
+        ExecResult(stdout=_long_output(lines=900), stderr="", exit=0),
+        ExecResult(stdout=_MIGRATIONS_APPLIED, stderr="", exit=0),
+    )
+    passed = _report_in(await _apply(passing, sink))
+
+    assert "FAILED" in failed and "SUCCEEDED" in passed
+    # THE TWO BUDGETS, NAMED — not merely "one is bigger". A `len(failed) > len(passed)` pair
+    # survives a mutant that sizes BOTH from the underlying exit code, because the failure report
+    # carries extra words of its own; these two do not.
+    assert len(failed) > constants.RUN_COMMAND_OUTPUT_MAX_CHARS, "the failure was summarised"
+    assert len(passed) < constants.RUN_COMMAND_OUTPUT_MAX_CHARS, "the success was dumped"
+    assert len(passed) > constants.RUN_COMMAND_SUMMARY_MAX_CHARS  # it kept its summary budget
+    # Both were cut — a comparison where neither truncated would prove nothing about either.
+    assert "elided" in failed and "elided" in passed
+    # …and the elided middle is still recoverable in one call, exactly as `run_command`'s is.
+    assert _slice_call_in(failed) is not None
+    assert _slice_call_in(passed) is not None
+
+
+async def test_a_transport_failure_names_the_step_and_the_state_and_re_enters_the_loop(
+    sink: CollectingSink,
+) -> None:
+    """A supervisor blip is not a step verdict — the step never returned one — so it comes back as
+    a `ModelRetry` like `run_command`'s rather than a fabricated failure report. It still has to
+    say which step and what state, because "something went wrong somewhere in there" is exactly
+    the answer this tool exists to stop giving."""
+    fake = FakeSandbox()
+    fake.queue_exec_errors(SandboxError("exec timed out after 180s"))
+    captured = await _apply(fake, sink)
+
+    assert "The `generate the migration` step could not run" in captured["all_incoming"]
+    assert "NO migration file was written" in captured["all_incoming"]
+    assert captured["output"] == "ok"  # the loop healed rather than crashing (R11)
+
+
+async def test_a_gone_sandbox_still_escalates_from_the_composite(sink: CollectingSink) -> None:
+    """Only `SandboxGoneError` leaves the tool — the restore-needed escalation is terminal for the
+    handle and must not be dressed up as a step outcome (KD-11)."""
+    fake = FakeSandbox()
+    fake.queue_exec_errors(SandboxGoneError("the sandbox is gone"))
+    with pytest.raises(SandboxGoneError):
+        await _apply(fake, sink)
+
+
+async def test_the_model_writes_the_migration_name_in_words(sink: CollectingSink) -> None:
+    """`what_changed` is prose in the prompt and a slug on the command line, and the tool does the
+    conversion rather than bouncing the model for a formatting quibble — a `ModelRetry` here would
+    spend the exact round trip the whole unit exists to save. Only an input with nothing usable in
+    it is refused."""
+    fake = FakeSandbox()
+    fake.queue_commands(
+        ExecResult(stdout=_A_MIGRATION_WAS_WRITTEN, stderr="", exit=0),
+        ExecResult(stdout=_MIGRATIONS_APPLIED, stderr="", exit=0),
+    )
+    await _apply(fake, sink, what_changed="Add a Visitors table!")
+    assert fake.command_calls[0] == [
+        "npx",
+        "drizzle-kit",
+        "generate",
+        "--name",
+        "add_a_visitors_table",
+    ]
+
+    nameless = FakeSandbox()
+    captured = await _apply(nameless, sink, what_changed="   !!!   ")
+    assert "has to describe the schema edit in words" in captured["all_incoming"]
+    assert nameless.command_calls == [], "a nameless call still ran the generate"
+
+
+async def test_the_live_step_says_what_the_citizen_sees_never_the_shell(
+    sink: CollectingSink,
+) -> None:
+    """The composite runs two commands and emits ONE step, under the same friendly label the two
+    raw commands already classified to — a citizen must not be able to tell which spelling the
+    agent reached for. The fallback would have rendered the raw tool name into their feed."""
+    fake = FakeSandbox()
+    fake.queue_commands(ExecResult(stdout="", stderr=_THE_TTY_REFUSAL, exit=0))
+    await _apply(fake, sink)
+    step = next(e for e in _steps(sink) if e.name == "apply_schema_change")
+    assert step.state == "failed"
+    assert step.hidden is False
+    assert step.label == "Setting up where your app stores information"
+    for leaked in ("drizzle", "npm", "npx", "apply_schema_change", "$ "):
+        assert leaked not in step.label
+
+
+async def test_the_composite_gets_the_long_operation_status_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ AE17, SECOND CLAUSE. U17's stillness narrator exists for exactly this tool: the composite
+    removes the per-step narration that used to fill the gap, so a citizen watching a schema change
+    would otherwise watch a row that stopped changing when the generate started.
+
+    Driven at `_on_event`, the seam where a tool call becomes a step frame and the narrator is
+    armed — the threshold and cadence are compressed rather than waited out, because the property
+    under test is "past the threshold, and repeatedly", not the number of seconds.
+
+    Mutation-check: classify the composite as `hidden` and this goes red, because
+    `_start_long_operation` refuses to narrate a step that renders nowhere."""
+    engine = engine_module.TurnEngine()
+    monkeypatch.setattr(engine_module, "LONG_OPERATION_THRESHOLD_MS", 20)
+    monkeypatch.setattr(engine_module, "LONG_OPERATION_REFRESH_MS", 20)
+    state = _TurnState(
+        turn_id=uuid.uuid7(),
+        conversation_id=uuid.uuid7(),
+        user_id=uuid.uuid7(),
+        mode=ConversationMode.WRITE,
+    )
+
+    engine._on_event(
+        state,
+        FunctionToolCallEvent(
+            part=ToolCallPart(
+                tool_name="apply_schema_change",
+                args='{"what_changed": "add visitors table"}',
+                tool_call_id="c1",
+            )
+        ),
+    )
+    await asyncio.sleep(0.12)
+
+    labels = [
+        frame.item.label
+        for frame in state.ring
+        if isinstance(frame, StepFrame) and frame.phase == "started"
+    ]
+    assert labels, "no step frame at all — the seam under test never ran"
+    announced, refreshes = labels[0], labels[1:]
+    assert announced == "Setting up where your app stores information"
+    assert refreshes, "the composite ran past the threshold and said nothing"
+    assert set(refreshes) == {long_operation_line(announced)}
+    assert "Still setting up where your app stores information" in refreshes[0]
+    # Still the platform's language, not the shell's — the narrator restates the step's own label.
+    assert "drizzle" not in " ".join(labels).lower()
+    await engine._drain_long_operations(state)
+
+
+async def test_the_adoption_pair_tells_the_composite_from_the_hand_rolled_sequence(
+    sink: CollectingSink, counted: list[str]
+) -> None:
+    """★ The behavioural bet, counted. R29's open question is whether the agent actually REACHES
+    for the composite, and neither number answers it alone: "40 composite calls" is a fact about
+    traffic until you know how many hand-rolled sequences ran beside it.
+
+    The by-hand half counts the GENERATE only — the head of the sequence — so one hand-rolled
+    sequence scores one, exactly as one composite call does, and the two are comparable without a
+    correction factor. A lone `db:migrate` is legitimately re-applying an existing migration."""
+    fake = FakeSandbox()
+    fake.queue_commands(
+        ExecResult(stdout=_A_MIGRATION_WAS_WRITTEN, stderr="", exit=0),
+        ExecResult(stdout=_MIGRATIONS_APPLIED, stderr="", exit=0),
+    )
+    await _apply(fake, sink)
+    assert counted == [HarnessCounter.SCHEMA_CHANGE_COMPOSED]
+
+    counted.clear()
+    fake.queue_commands(
+        ExecResult(stdout=_A_MIGRATION_WAS_WRITTEN, stderr="", exit=0),
+        ExecResult(stdout=_MIGRATIONS_APPLIED, stderr="", exit=0),
+    )
+    await _run(
+        fake,
+        sink,
+        [
+            tool_turn("run_command", {"command": _THE_GENERATE}),
+            tool_turn("run_command", {"command": _THE_MIGRATE}),
+            text_turn(),
+        ],
+    )
+    # DISTINGUISHABLE: a different name, and counted ONCE for the two-command sequence.
+    assert counted == [HarnessCounter.SCHEMA_CHANGE_BY_HAND]
+
+    counted.clear()
+    fake.queue_commands(ExecResult(stdout="ok", stderr="", exit=0))
+    await _run(fake, sink, [tool_turn("run_command", {"command": ["npm", "run", "lint"]})])
+    assert counted == [], "an ordinary command was counted as a schema change"

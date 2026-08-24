@@ -3,7 +3,7 @@ KD-13).
 
 Two dataclasses, split along the seam U5 needs:
 
-* `SandboxSession` — EVERYTHING the seven sandbox tools touch, and nothing else. It is held by
+* `SandboxSession` — EVERYTHING the eight sandbox tools touch, and nothing else. It is held by
   `BuildDeps.sandbox` (the legacy `/build-sessions` harness) and, from U5, by a Write chat turn's
   own deps, so ONE tool body serves both consumers (`tools.sandbox_toolset`).
 * `BuildDeps` — the harness-only surround: the owner `user_id`, the single `ProgressEmitter` (so
@@ -51,7 +51,7 @@ class HeldOutput:
 
 @dataclass
 class SandboxSession:
-    """Everything the seven sandbox tools touch, and nothing else. Mutable so `declare_done` can
+    """Everything the eight sandbox tools touch, and nothing else. Mutable so `declare_done` can
     flip the done-signal; the harness resets it at the start of each run (KD-6).
 
     SECRET-SAFETY RULE (KD-9). `handle.token` is the LIVE supervisor bearer. Never `log()`,

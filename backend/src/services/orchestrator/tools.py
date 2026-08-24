@@ -1,4 +1,4 @@
-"""The seven sandbox tools — the model's ENTIRE action surface (KD-4 / KD-5 / KD-9 / KD-10 / R1).
+"""The eight sandbox tools — the model's ENTIRE action surface (KD-4 / KD-5 / KD-9 / KD-10 / R1).
 
 Five file tools go through the C2 `files()` op; `run_command` runs a general shell command over
 the C2 `exec` transport — the vibe-coding pivot, so the model can `npm install`, run linters, and
@@ -24,6 +24,13 @@ harness's per-run reset is its whole lifetime), never reaches the database or bl
 unknown handle with a plain re-run instruction rather than a `ModelRetry` — which would spend the
 round-trip the tool exists to save.
 
+`apply_schema_change` (U23/R29) is the eighth, and it is the one tool here that is a SEQUENCE
+rather than an action: `drizzle-kit generate` then `npm run db:migrate`, the pair the prompt used
+to dictate step by step. It exists because both of them can fail while exiting zero, so a model
+reading exit codes believes a schema change happened that did not — it reads what they PRINTED,
+reports a per-step outcome, refuses to call a run successful when any step failed, and says which
+step failed and what state that left the workspace and the database in.
+
 EVERY TOOL DOCSTRING BELOW IS PROMPT COPY (U20 / R26). pydantic-ai sends it to the model as the
 tool's description at registration, and since U20 the build prompt's `TOOL SURFACE` block is
 GENERATED from these same strings (`agent/toolsets.render_tool_surface`) — so a docstring edit
@@ -47,16 +54,19 @@ from __future__ import annotations
 import re
 import secrets
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, Final, Literal, cast
 
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.toolsets.function import FunctionToolset
 
+from src.core.prompt_blocks import APPLY_SCHEMA_CHANGE_TOOL
 from src.core.redaction import scrub_untrusted
 from src.db.models.harness_counter import HarnessCounter
 from src.services.messages.projection import (
     classify_command,
     classify_file_step,
+    classify_tool_call,
     command_needs_the_long_timeout,
     command_only_inspects,
 )
@@ -355,7 +365,12 @@ async def _count_at_the_tool_boundary(counter: HarnessCounter, session: SandboxS
 
 
 async def _format_command_result(
-    session: SandboxSession, result: ExecResult, *, command: str, denoise: bool
+    session: SandboxSession,
+    result: ExecResult,
+    *,
+    command: str,
+    denoise: bool,
+    budget: int | None = None,
 ) -> str:
     """Render an `ExecResult` for the model: the exit code plus redacted stdout/stderr, capped by
     what the exit code says the output is WORTH (ASM13) — a success is summarised, a failure is
@@ -363,8 +378,13 @@ async def _format_command_result(
 
     A stream that does not fit its budget is HELD under its own handle before it is cut, so the
     notice the model reads names something that actually resolves. A stream that fits is not held
-    at all: there is nothing to recover, and the ring is worth more to the next truncation."""
-    budget = output_budget_for_exit(result.exit)
+    at all: there is nothing to recover, and the ring is worth more to the next truncation.
+
+    `budget` OVERRIDES the exit code's own answer, and exists for exactly one caller: U23's
+    composite, whose whole point is that the underlying exit code lies. A step that exited 0 after
+    failing must be DUMPED, not summarised — sizing its output from `result.exit` would let the
+    misleading zero decide how much of the failure the model gets to read."""
+    budget = output_budget_for_exit(result.exit) if budget is None else budget
     sections = [f"exit code: {result.exit}"]
     for stream, raw in (("stdout", result.stdout), ("stderr", result.stderr)):
         lines = _redacted_lines(raw, denoise=denoise)
@@ -377,6 +397,203 @@ async def _format_command_result(
             await _count_at_the_tool_boundary(HarnessCounter.OUTPUT_TRUNCATED, session)
         rendered = _render_output(lines, budget=budget, handle=handle).strip()
         sections.append(f"{stream}:\n{rendered}")
+    return "\n\n".join(sections)
+
+
+# ---------------------------------------------------------------------------------------
+# U23 / R29: one operation for applying a database change, and a status that tells the truth
+# ---------------------------------------------------------------------------------------
+#
+# THE SHAPE R29 NAMES, MET TWICE IN ONE SEQUENCE. Applying a schema change used to be two
+# prompt-taught commands, and BOTH of them can fail while exiting zero:
+#
+#   1. `npx drizzle-kit generate --name <what>` reaches the RENAME RESOLVER whenever a diff is
+#      ambiguous ("is `label` created, or renamed from `title`?"). No CLI flag answers it —
+#      `--name` least of all, it names the output file — and under this sandbox's real conditions
+#      (`stdin=DEVNULL`, no TTY, `CI=1`) it does not even hang: drizzle-kit prints "Interactive
+#      prompts require a TTY terminal" to stderr, writes NO migration, and exits 0.
+#   2. `npm run db:migrate` runs `sandbox/template/scripts/db-migrate.mjs`, which is NON-FATAL BY
+#      DESIGN — its own file header explains why: a migrate step that fails hard means `next dev`
+#      never prints "Ready in", and the harness then reports a rendering fault that does not
+#      exist. So it catches every error, abandons a slow migration after 20s, and ALWAYS exits 0.
+#
+# The composite therefore does not merely save a round trip. It is the only thing in the loop that
+# reads what those commands PRINTED and reports the failure their exit codes hide — per step,
+# naming which step failed and what state that left the workspace and the database in.
+#
+# WHAT IT DOES NOT DO is prevent the rename resolver. The one-kind-of-change-per-call rule in the
+# DATABASE block is the only thing that does, and the TTY defences (`CI=1`,
+# `stdin=subprocess.DEVNULL`, and `_refuse_a_manufactured_tty`, all in `sandbox/supervisor/app.py`)
+# are what make reaching it FAST AND LOUD rather than the observed four-minute stall. All three
+# stay; trimming any of them turns this tool's cleanest failure back into a wedge.
+
+_GENERATE_ARGV: Final = ("npx", "drizzle-kit", "generate", "--name")
+_MIGRATE_ARGV: Final = ("npm", "run", "db:migrate")
+"""The ONLY place either command is spelled now that the prompt has stopped dictating them
+(`core/prompt_blocks.APPLY_SCHEMA_CHANGE_TOOL` carries the reasoning). One spelling, one caller."""
+
+_MIGRATION_NAME_MAX_CHARS: Final = 60
+_NOT_A_NAME: Final = re.compile(r"[^a-z0-9]+")
+"""Everything that is not a migration-name character, collapsed to one `_`. Linear and
+quantifier-flat, like every regex in this package (the ReDoS constraint)."""
+
+_GENERATE_FAILED_MARKERS: Final = ("interactive prompts require a tty",)
+"""EXIT-ZERO FAILURE SHAPE 1 — the interactive question nobody can answer. Measured against the
+template's pinned `drizzle-kit@0.31.10` under the sandbox's own conditions, which is the only
+place the string matters. It is a THIRD-PARTY string, so nothing in this repo can keep it true: a
+drizzle-kit bump that reworded it would make this detector silent. What the tests can do, and do,
+is pin it identical to the two other places the same measurement is written down — the supervisor's
+refusal note and `core/prompt_blocks.APPLY_SCHEMA_CHANGE_TOOL` — so re-measuring it lands in all
+three or in none."""
+
+_MIGRATE_FAILED_MARKERS: Final = (
+    "[db] migrations failed",
+    "[db] migrations still running after",
+    "skipping migrations",
+)
+"""EXIT-ZERO FAILURE SHAPES 2 AND 3 — an error caught and swallowed, and work abandoned or never
+attempted. Every one of them is `scripts/db-migrate.mjs`'s OWN wording, on a path that ends in
+`process.exit(0)`: the caught-error line, the 20-second abandon timer, and the no-DSN skip (which
+applies nothing at all and would otherwise read as a clean run). Pinned against the real script by
+`test_the_migrate_failure_markers_match_the_script_that_prints_them` — a detector and the program
+it reads are exactly the pair that drifts silently."""
+
+_APPLIED_STATE: Final = (
+    "the migration is applied — the database now matches `db/schema.ts`, and you can query the "
+    "new shape."
+)
+"""The only success state there is: BOTH steps ran, so the workspace and the database agree."""
+
+
+@dataclass(frozen=True)
+class _CompositeStep:
+    """One step of the composite: what it is called, what it runs, how it fails while claiming it
+    did not, and what a failure leaves behind for the model to reason from."""
+
+    #: The step's name in the report — plain words, because the model reads this, not a log.
+    what: str
+    argv: tuple[str, ...]
+    #: Substrings that mean "this failed", scanned case-folded over the RAW capture (before
+    #: redaction and de-noising, so neither can hide a marker from the detector).
+    failure_markers: tuple[str, ...]
+    #: What the workspace and the database are left in when THIS step fails. Not decoration: R29
+    #: asks the operation to say what state it left things in, and the answer differs per step.
+    state_when_failed: str
+
+
+@dataclass(frozen=True)
+class _StepOutcome:
+    """What one step actually did. `result is None` means it never ran."""
+
+    step: _CompositeStep
+    result: ExecResult | None
+    ok: bool
+
+
+def _migration_name(what_changed: str) -> str:
+    """A model-written description → the slug drizzle-kit names the migration file with.
+
+    NORMALISED RATHER THAN REFUSED, deliberately. "add visitors table" is exactly what a model
+    should be writing here, and bouncing it back as a `ModelRetry` would spend the round-trip this
+    whole unit exists to save on a formatting quibble. The report names the command it ran, so the
+    model sees the slug it got. Only an input with no usable characters at all is refused."""
+    return _NOT_A_NAME.sub("_", what_changed.strip().lower()).strip("_")[
+        :_MIGRATION_NAME_MAX_CHARS
+    ]
+
+
+def _the_two_steps(name: str) -> tuple[_CompositeStep, ...]:
+    """The fixed sequence, built around one migration name."""
+    return (
+        _CompositeStep(
+            what="generate the migration",
+            argv=(*_GENERATE_ARGV, name),
+            failure_markers=_GENERATE_FAILED_MARKERS,
+            state_when_failed=(
+                "NO migration file was written and the database was not touched, so your "
+                "`db/schema.ts` edit has NOT been applied — the code and the database disagree. "
+                "Nothing needs undoing; make ONE kind of schema change and call this again."
+            ),
+        ),
+        _CompositeStep(
+            what="apply the migration to the database",
+            argv=_MIGRATE_ARGV,
+            failure_markers=_MIGRATE_FAILED_MARKERS,
+            state_when_failed=(
+                "the migration file IS written under `drizzle/`, but the database did not take "
+                "it: the tables still do not match `db/schema.ts`, and a query against the new "
+                "shape will fail at runtime. Do NOT edit `db/schema.ts` again to work around it "
+                "— read the error below, fix its cause, and call this again (the generate step "
+                "finds nothing new to do and the same migration is re-applied)."
+            ),
+        ),
+    )
+
+
+def _the_command_lied(result: ExecResult, markers: tuple[str, ...]) -> bool:
+    """Did this command FAIL while exiting zero? Scanned over the RAW capture, case-folded.
+
+    Raw, not redacted: the redactor and the noise filter both rewrite lines, and a detector that
+    reads their output is one masking rule away from going quietly blind. Nothing scanned here is
+    ever returned — the report is built from `_redact_command_output`'s artifact, as always."""
+    printed = f"{result.stdout}\n{result.stderr}".lower()
+    return any(marker in printed for marker in markers)
+
+
+def _still_doing_it_the_hard_way(argv: list[str]) -> bool:
+    """Is this a raw `drizzle-kit generate` — the two-step sequence driven BY HAND (U23/R29)?
+
+    The adoption question, and the head of the sequence is what answers it. A lone
+    `npm run db:migrate` is NOT counted: re-applying an existing migration is legitimate work the
+    composite does not replace, and counting it would inflate the by-hand number with runs that
+    were never the sequence at all."""
+    joined = " ".join(argv).lower()
+    return "drizzle-kit" in joined and "generate" in joined
+
+
+async def _render_the_schema_change_report(
+    session: SandboxSession, outcomes: list[_StepOutcome], *, budget: int
+) -> str:
+    """The composite's whole answer: a terminal verdict, the state it left things in, and one
+    block per step — including the step that never ran, which is a per-step outcome too."""
+    total = len(outcomes)
+    failed = next(
+        (outcome for outcome in outcomes if outcome.result is not None and not outcome.ok), None
+    )
+    if failed is None:
+        headline = f"{APPLY_SCHEMA_CHANGE_TOOL} SUCCEEDED — all {total} steps ran."
+        state = _APPLIED_STATE
+    else:
+        headline = (
+            f"{APPLY_SCHEMA_CHANGE_TOOL} FAILED at step {outcomes.index(failed) + 1} of {total} "
+            f"— {failed.step.what}."
+        )
+        state = failed.step.state_when_failed
+    sections = [headline, f"WHAT STATE THINGS ARE IN: {state}"]
+    for index, outcome in enumerate(outcomes, start=1):
+        head = f"STEP {index} of {total} — {outcome.step.what}: "
+        if outcome.result is None:
+            sections.append(
+                f"{head}NOT RUN\nstep {index - 1} failed, so this step never started and nothing "
+                "it would have done has happened."
+            )
+            continue
+        command = redact_secrets(" ".join(outcome.step.argv)[:REDACT_INPUT_MAX_CHARS])
+        lines = [f"{head}{'OK' if outcome.ok else 'FAILED'}", f"command: `{command}`"]
+        if not outcome.ok and outcome.result.exit == 0:
+            # THE OVERRIDE, SAID OUT LOUD. The model has been taught for its whole life that a
+            # zero exit means success; a verdict that silently contradicts one is a verdict it
+            # will argue with. Naming the override is what makes it usable.
+            lines.append(
+                "it exited 0 — that exit code is WRONG, and this operation overrides it: the "
+                "output below says the step failed. Read the output, not the code."
+            )
+        lines.append(
+            await _format_command_result(
+                session, outcome.result, command=command, denoise=True, budget=budget
+            )
+        )
+        sections.append("\n".join(lines))
     return "\n\n".join(sections)
 
 
@@ -440,7 +657,7 @@ async def _reanchor(session: SandboxSession, path: str) -> str:
 def sandbox_toolset[DepsT](
     sandbox_of: Callable[[RunContext[DepsT]], SandboxSession],
 ) -> FunctionToolset[DepsT]:
-    """The seven sandbox tools over whatever deps `sandbox_of` resolves the session from. Generic
+    """The eight sandbox tools over whatever deps `sandbox_of` resolves the session from. Generic
     on the deps type for the same reason `read_only_toolset` is: ONE tool body, two consumers (the
     legacy harness's `BuildDeps`, a Write chat turn's own deps).
 
@@ -625,6 +842,11 @@ def sandbox_toolset[DepsT](
         # failed is a genuine repeat and counts as one.
         if session.note_command(redacted_cmd):
             await _count_at_the_tool_boundary(HarnessCounter.COMMAND_RERUN_IN_TURN, session)
+        # U23's adoption question, its other half: the sequence driven BY HAND, counted where the
+        # hand is. Read against `schema_change_composed` — one number alone cannot tell "the
+        # composite is being used" from "nobody is changing the schema at all".
+        if _still_doing_it_the_hard_way(command):
+            await _count_at_the_tool_boundary(HarnessCounter.SCHEMA_CHANGE_BY_HAND, session)
         # No `started` emit: run_command collapses to ONE terminal row per command (F3/U3). The
         # build headline spinner already conveys "working", and two emits sharing a friendly label
         # would otherwise render as two identical rows — this matches the reload projection's
@@ -743,6 +965,105 @@ def sandbox_toolset[DepsT](
             header += f" (more remains — continue from start_line={shown_last + 1})"
         return f"{header}\n{body}"
 
+    async def apply_schema_change(ctx: RunContext[Any], what_changed: str) -> str:
+        """Apply the schema edits you just made in `db/schema.ts` — this generates the migration
+        and runs it in one call, and tells you truthfully which step failed if either did.
+
+        Pass `what_changed` as a short description of the edit ("add visitors table"); it names
+        the migration file, so pass something a person could still read six months from now. Make
+        ONE kind of schema change per call — drizzle-kit cannot tell a rename from a drop plus a
+        create, so it stops and asks, and there is no terminal here to answer it. Both commands
+        behind this call can print a failure and still exit 0, which is exactly what this call
+        exists to catch: it reports each step's outcome, and on a failure it names the step,
+        overrides the misleading exit code, and tells you what state your workspace and database
+        were left in. Trust what it says over any exit code inside it, and do not run the
+        generate or migrate commands yourself through `run_command`."""
+        session = sandbox_of(ctx)
+        # THE ADOPTION QUESTION'S FIRST HALF, counted before anything can go wrong: "was the tool
+        # reached for", not "did it succeed". A composite that failed was still adopted.
+        await _count_at_the_tool_boundary(HarnessCounter.SCHEMA_CHANGE_COMPOSED, session)
+        name = _migration_name(what_changed)
+        if not name:
+            raise ModelRetry(
+                "`what_changed` has to describe the schema edit in words — "
+                f"`{redact_secrets(what_changed[:REDACT_INPUT_MAX_CHARS])}` leaves nothing to "
+                "name the migration file with. Try something like `add visitors table`."
+            )
+        friendly, hidden = classify_tool_call(APPLY_SCHEMA_CHANGE_TOOL, "")
+        # alias keeps the call off the JS-oriented exec guard
+        transport = session.sandbox_client.exec
+        outcomes: list[_StepOutcome] = []
+        for step in _the_two_steps(name):
+            if outcomes and not outcomes[-1].ok:
+                # STEP TWO DOES NOT RUN AFTER A FAILED STEP ONE, and it is recorded rather than
+                # dropped: "not run" is a per-step outcome the model needs, because the state it
+                # implies (nothing applied) is different from "ran and failed".
+                outcomes.append(_StepOutcome(step=step, result=None, ok=False))
+                continue
+            argv = list(step.argv)
+            # F4's classifier, ASKED RATHER THAN ASSUMED — the same one `run_command` uses, so a
+            # step here can never get a different bound from the identical command run by hand.
+            # Neither of these is in the slow class, and that is the point: a generate still
+            # running after minutes is waiting for a terminal that does not exist.
+            timeout_s = (
+                RUN_COMMAND_SLOW_TIMEOUT_S
+                if command_needs_the_long_timeout(argv)
+                else RUN_COMMAND_DEFAULT_TIMEOUT_S
+            )
+            try:
+                result = await transport(session.handle, argv, timeout_s=timeout_s)
+            except SandboxGoneError:
+                await _step(
+                    session,
+                    name=APPLY_SCHEMA_CHANGE_TOOL,
+                    label=f"{friendly} — couldn't finish",
+                    state="failed",
+                    hidden=hidden,
+                )
+                raise  # terminal infra failure — propagate to the sandbox_gone escalation (KD-11)
+            except SandboxError as exc:
+                await _step(
+                    session,
+                    name=APPLY_SCHEMA_CHANGE_TOOL,
+                    label=f"{friendly} — couldn't finish",
+                    state="failed",
+                    hidden=hidden,
+                )
+                # A transport failure is not a step verdict — the step never returned one — so it
+                # goes back as a `ModelRetry` like `run_command`'s, and still names the state.
+                detail = _redact_command_output(
+                    str(exc), budget=RUN_COMMAND_OUTPUT_MAX_CHARS, denoise=False
+                )
+                raise ModelRetry(
+                    f"The `{step.what}` step could not run: {detail}. "
+                    f"{step.state_when_failed} Retry once the sandbox settles."
+                ) from exc
+            # A step that RAN acted on the workspace — same rule `run_command` applies, and for
+            # the same reason: the generate writes files and the migrate writes tables.
+            session.workspace_touched = True
+            outcomes.append(
+                _StepOutcome(
+                    step=step,
+                    result=result,
+                    ok=result.exit == 0 and not _the_command_lied(result, step.failure_markers),
+                )
+            )
+        succeeded = all(outcome.ok for outcome in outcomes)
+        await _step(
+            session,
+            name=APPLY_SCHEMA_CHANGE_TOOL,
+            label=friendly,
+            state="ok" if succeeded else "failed",
+            hidden=hidden,
+        )
+        # THE OVERRIDE REACHES THE CAP TOO, not just the wording. `output_budget_for_exit` is
+        # asked about the OPERATION's verdict rather than any command's exit code, so a step that
+        # failed while exiting 0 is DUMPED like the failure it is — sizing it from the underlying
+        # zero would let the lie decide how much of the truth the model gets to read (U22/ASM13).
+        return await _render_the_schema_change_report(
+            session, outcomes, budget=output_budget_for_exit(0 if succeeded else 1)
+        )
+
     toolset = FunctionToolset[Any](
         [
             read_file,
@@ -752,6 +1073,7 @@ def sandbox_toolset[DepsT](
             declare_done,
             run_command,
             fetch_output_slice,
+            apply_schema_change,
         ],
         id="sandbox-tools",
     )

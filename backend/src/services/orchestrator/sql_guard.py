@@ -13,11 +13,11 @@ loses nothing by refusing it (simpler than plumbing a build-kind flag for a weak
 
 Generated Drizzle migrations remain the sanctioned channel for schema changes INCLUDING drops
 (user decision 2026-07-23 — no additive-only gate; requirements legitimately evolve to remove
-features). The exemption is structural, not a carve-out: applying migrations
-(`npm run db:migrate`, `npx drizzle-kit generate|migrate`) carries no SQL text in argv, so the
-sanctioned path passes without special-casing. The sentinel never reads file contents —
-iteration 1 by explicit decision; the write-a-script-then-run-it bypass is a named, accepted
-follow-up (iteration 2), with BRAIN-trace monitoring as the tripwire.
+features). The exemption is structural, not a carve-out: the sanctioned path
+(`apply_schema_change`, and the `drizzle-kit generate` / `npm run db:migrate` commands underneath
+it) carries no SQL text in argv, so it passes without special-casing. The sentinel never reads
+file contents — iteration 1 by explicit decision; the write-a-script-then-run-it bypass is a
+named, accepted follow-up (iteration 2), with BRAIN-trace monitoring as the tripwire.
 
 Spelling coverage: the same destructive statement has many legal spellings, and the sentinel
 must not be a keyword-shape trivia quiz. Comments are legal whitespace to the server, so the
@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import re
 
-from src.core.prompt_blocks import MIGRATION_GENERATE_CMD
+from src.core.prompt_blocks import MIGRATION_CHANNEL
 from src.services.orchestrator.constants import REDACT_INPUT_MAX_CHARS
 
 GUARD_INPUT_MAX_CHARS = REDACT_INPUT_MAX_CHARS
@@ -99,8 +99,7 @@ def _refusal(offense: str) -> str:
         "mutations are never part of a build — never DELETE, TRUNCATE, DROP, or UPDATE records "
         "to test, demo, or clean up. Verify your work by type-checking and rendering instead. "
         "If the user's requirements change the schema (including removing a table or column), "
-        f"edit `db/schema.ts` and generate a migration (`{MIGRATION_GENERATE_CMD}`, then "
-        "`npm run db:migrate`) — that is the sanctioned channel — and state plainly in your "
+        f"{MIGRATION_CHANNEL} — that is the sanctioned channel — and state plainly in your "
         "done-summary that the removed feature's data goes with it."
     )
 

@@ -39,11 +39,11 @@ from tests.services.orchestrator.model_harness import text_turn, tool_turn
 
 _READ_TOOLS = {"read_file", "list_files", "search_files", "run_command"}
 _WRITE_ONLY_TOOLS = {"write_file", "edit_file", "insert_lines", "declare_done"}
-_SANDBOX_ONLY_TOOLS = _WRITE_ONLY_TOOLS | {"fetch_output_slice"}
-"""U22: `fetch_output_slice` is registered on `sandbox_toolset`, so it is Write-only for exactly
-the same reason the four mutators are — and NOT on `read_only_toolset`, where the
-`_WRITE_STRUCTURED_READS` allowlist would have filtered it out of the only mode that runs
-commands, silently."""
+_SANDBOX_ONLY_TOOLS = _WRITE_ONLY_TOOLS | {"fetch_output_slice", "apply_schema_change"}
+"""U22 / U23: `fetch_output_slice` and `apply_schema_change` are registered on `sandbox_toolset`,
+so they are Write-only for exactly the same reason the four mutators are — and NOT on
+`read_only_toolset`, where the `_WRITE_STRUCTURED_READS` allowlist would have filtered them out of
+the only mode that runs commands, silently."""
 
 
 @pytest.fixture
@@ -164,9 +164,9 @@ def _build_deps() -> BuildDeps:
     )
 
 
-async def test_build_agent_still_carries_the_sandbox_seven_natively() -> None:
+async def test_build_agent_still_carries_the_whole_sandbox_set_natively() -> None:
     # The harness path is unchanged by U5's convergence: `build_agent` is constructed with
-    # `sandbox_toolset` and offers exactly the seven. Pinned here so the registry work below
+    # `sandbox_toolset` and offers exactly that set. Pinned here so the registry work below
     # cannot quietly move the harness's surface too.
     seen: dict[str, Any] = {}
     await build_agent.run(
@@ -189,11 +189,11 @@ def _write_toolsets(
     )
 
 
-async def test_write_mode_is_the_sandbox_seven_plus_exactly_two_structured_reads(
+async def test_write_mode_is_the_sandbox_set_plus_exactly_two_structured_reads(
     workspace: ExtractedSnapshotWorkspace,
 ) -> None:
-    # U5: Write is composed HERE now, not delegated to build_agent. The surface is the seven
-    # sandbox tools plus `list_files`/`search_files` borrowed off the read-only registry —
+    # U5: Write is composed HERE now, not delegated to build_agent. The surface is the sandbox
+    # tools plus `list_files`/`search_files` borrowed off the read-only registry —
     # and nothing else. Mutation-check: widen `_WRITE_STRUCTURED_READS` to include
     # `read_file` and the CombinedToolset raises on the duplicate name → red.
     seen: dict[str, Any] = {}

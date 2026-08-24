@@ -70,6 +70,18 @@ class HarnessCounter(enum.StrEnum):
     #: An identical command ran a second time inside ONE turn (U22) — the cost the slice handle
     #: exists to remove, counted so "it got better" is a number rather than an impression.
     COMMAND_RERUN_IN_TURN = "command_rerun_in_turn"
+    #: ── U23's adoption pair (R29) ───────────────────────────────────────────────────────────
+    #: A PAIR, for the same reason U22's is: neither number means anything alone. "The composite
+    #: was called 40 times" is a fact about traffic; "40 composite calls against 2 hand-rolled
+    #: sequences" is the answer to the behavioural bet R29 actually makes.
+    #: `apply_schema_change` ran — the one call that replaces generate-then-migrate (U23).
+    SCHEMA_CHANGE_COMPOSED = "schema_change_composed"
+    #: A raw `drizzle-kit generate` went through `run_command` instead (U23) — the HEAD of the
+    #: two-step sequence the composite replaces, and deliberately the only half counted: a lone
+    #: `npm run db:migrate` legitimately re-applies a migration that already exists, which is not
+    #: the sequence. So one hand-rolled sequence scores one, exactly as one composite call does,
+    #: and the two numbers can be read against each other without a correction factor.
+    SCHEMA_CHANGE_BY_HAND = "schema_change_by_hand"
 
 
 class HarnessCount(Base, UUIDv7PrimaryKeyMixin, TimestampMixin):

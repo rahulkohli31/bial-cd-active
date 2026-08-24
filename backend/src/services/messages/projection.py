@@ -29,6 +29,7 @@ from typing import Any, Final, Literal
 
 from pydantic import Field
 
+from src.core.prompt_blocks import APPLY_SCHEMA_CHANGE_TOOL
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.schemas import CamelModel
 from src.services.messages.store import ATTACHMENT_REF_KIND
@@ -312,6 +313,13 @@ def _step_label(tool_name: str, args: dict[str, Any]) -> tuple[str, bool]:
         # the fallback below renders the RAW TOOL NAME ("Used fetch_output_slice") into a citizen's
         # feed, which is exactly the raw-machinery leak `_friendly_area` exists to prevent (F3/U3).
         return ("Looked at what a command printed", True)
+    if tool_name == APPLY_SCHEMA_CHANGE_TOOL:
+        # U23. The composite runs `drizzle-kit generate` then `npm run db:migrate`, so it lands on
+        # the SAME friendly label the two raw commands already classified to — a citizen watching
+        # a build must not be able to tell which spelling the agent reached for. Its own branch
+        # rather than the fallback below, which renders the raw tool name ("Used
+        # apply_schema_change") into the feed.
+        return (_LBL_DATA_SETUP, False)
     if tool_name == "declare_done":
         return ("Wrapping up the build", False)
     if tool_name == "run_command":

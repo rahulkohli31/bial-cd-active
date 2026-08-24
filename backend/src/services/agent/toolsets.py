@@ -15,14 +15,16 @@ The mode → tool matrix (plan, confirmed):
 | Plan  | yes                    | allowlisted, read | —           | yes                  |
 | Write | yes (live workspace)   | full (+SQL guard) | yes         | —                    |
 
-Write additionally gets `fetch_output_slice` (U22/R28), and it reaches Write the ONLY way it
-could: it is registered on `sandbox_toolset`, beside the `run_command` whose truncation notice
-hands out its handles. Putting it on `read_only_toolset` would have been the silent failure this
-file's allowlist is designed to produce — `_WRITE_STRUCTURED_READS` names two tools and nothing
-else, so a slice tool added there would be filtered out of the one mode that runs commands, with
-no test going red. `test_toolsets.py` asserts its membership against `toolsets_for_mode` directly.
+Write additionally gets `fetch_output_slice` (U22/R28) and `apply_schema_change` (U23/R29), and
+both reach Write the ONLY way they could: registered on `sandbox_toolset`, beside the
+`run_command` whose truncation notice hands out the slice handles and whose two-step migration
+sequence the composite replaces. Putting either on `read_only_toolset` would have been the silent
+failure this file's allowlist is designed to produce — `_WRITE_STRUCTURED_READS` names two tools
+and nothing else, so a tool added there would be filtered out of the one mode that runs commands,
+with no test going red. `test_toolsets.py` asserts their membership against `toolsets_for_mode`
+directly.
 
-WRITE's surface is COMPOSED here, from two factories: the seven sandbox tools
+WRITE's surface is COMPOSED here, from two factories: the eight sandbox tools
 (`orchestrator/tools.sandbox_toolset`, resolved through the run's attached
 `SandboxSession`) plus exactly `list_files`/`search_files` off `read_only_toolset`. The
 read-only side is `.filtered()` down to those two names by an ALLOWLIST — its `read_file`
@@ -112,7 +114,7 @@ def plan_options_only_toolset() -> list[AbstractToolset[Any]]:
 
 
 _WRITE_STRUCTURED_READS: Final = frozenset({"list_files", "search_files"})
-"""The ONLY read-only tools Write may borrow: the two structured reads the sandbox seven do
+"""The ONLY read-only tools Write may borrow: the two structured reads the sandbox eight do
 not have. `read_file` and `run_command` exist on both sides, and Write must get the
 sandbox-routed ones."""
 

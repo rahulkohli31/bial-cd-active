@@ -36,29 +36,42 @@ no file is frozen:
   package.json, next.config.ts, tsconfig.json, postcss.config.mjs, components.json  — editable
 Add routes, components, libraries, and dependencies as your app needs them."""
 
-MIGRATION_GENERATE_CMD = "npx drizzle-kit generate --name <what_changed>"
-"""The ONE spelling of the migration-generate command (F4).
+APPLY_SCHEMA_CHANGE_TOOL = "apply_schema_change"
+"""The ONE sanctioned channel for a schema change, and the ONE spelling of it (U23 / R29 / F4).
 
-WHAT `--name` ACTUALLY BUYS, corrected (U20 / ASM28). This instruction used to say a bare
-`npx drizzle-kit generate` hangs, and that `--name` "supplies the answer up front". Both halves
-were wrong, and a smoke against the template's pinned `drizzle-kit@0.31.10` says so:
+It replaced a two-command sequence the prompt used to dictate step by step
+(`npx drizzle-kit generate --name <what_changed>`, then `npm run db:migrate`), and the reason is
+the measurement U20 recorded against the template's pinned `drizzle-kit@0.31.10`:
 
 - WITHOUT `--name`, an unambiguous diff generates fine and exits 0 — it just names the file at
   random (`drizzle/0001_special_fantastic_four.sql`). So the flag buys a READABLE migration
-  history, not a working command, and it is kept for that.
+  history, not a working command; the composite now passes it from `what_changed`.
 - WHAT STOPS THE COMMAND is the rename resolver — "is `label` created, or renamed from `title`?"
   — an interactive select that NO CLI flag answers, `--name` included. Under a TTY it waits
   forever (the 4m09s stall the walkthrough caught, after the agent manufactured its own pty —
   now refused by the supervisor's `_refuse_a_manufactured_tty`). Under the sandbox's real
   `stdin=DEVNULL` it is worse than a hang: drizzle-kit prints "Interactive prompts require a TTY
   terminal" to stderr, writes NO migration, and STILL EXITS 0 — a failure wearing a success.
+- And the second command is non-fatal BY DESIGN: `scripts/db-migrate.mjs` catches every error and
+  exits 0 so a failed migration can never stop the dev server from starting.
 
-That is why the ONE-KIND-OF-CHANGE-PER-GENERATE rule in the DATABASE block owns the real reason:
-it is the only thing that keeps the diff out of the resolver at all.
+So BOTH halves of the sequence can fail while reporting success, and a model reading exit codes
+believes a schema change happened that did not. Telling it about that in prose was the old fix;
+`apply_schema_change` is the new one — it reads what the commands PRINTED, reports the failure the
+exit code hides, and names which step failed and what state that left things in.
 
-Shared with `orchestrator/sql_guard.py`'s refusal, which is the OTHER place the model is told how
-to change the schema. Two copies is how the last fix half-landed: the re-test patched the prompt
-and missed the sentinel, so the model was corrected by one voice and mis-taught by the other."""
+The ONE-KIND-OF-CHANGE-PER-CALL rule in the DATABASE block still owns the rename resolver: the
+composite can only report that failure, never prevent it — keeping the diff out of the resolver is
+the only thing that does."""
+
+MIGRATION_CHANNEL = (
+    f'edit `db/schema.ts` and call `{APPLY_SCHEMA_CHANGE_TOOL}(what_changed="…")`, which '
+    "generates the migration and applies it in one step"
+)
+"""The sanctioned-channel sentence fragment, shared with `orchestrator/sql_guard.py`'s refusal —
+the OTHER place the model is told how to change the schema. Two copies is how the last fix
+half-landed: the re-test patched the prompt and missed the sentinel, so the model was corrected by
+one voice and mis-taught by the other."""
 
 PORTAL_SURFACES = """\
 ABOUT THE PORTAL YOU ARE PART OF — you are the BIAL citizen-developer portal's built-in \
@@ -153,7 +166,7 @@ the cross-package edge this module exists to avoid."""
 # full context window of output a turn, the exact diagnostic the harness hands it for free the
 # moment the turn ends. The agent does not do work the platform already does. `npm run build` is
 # named alongside it because that is the stand-in a model reaches for when `tsc` is closed off.
-BUILD_WORKING_RULES_HEAD = """\
+BUILD_WORKING_RULES_HEAD = f"""\
 ENVIRONMENT:
 - You have a real shell via `run_command`. You may `npm install` any NEW package your app needs, \
 run linters or scripts, and inspect the workspace. `package.json` and the lockfile are yours to \
@@ -202,24 +215,29 @@ ships `db/schema.ts` (empty — no demonstration tables), `db/index.ts` (the ser
 no generated SQL. The loop:
 - Edit `db/schema.ts` — it starts empty, so your first change is purely additive with nothing to \
 drop. Add the tables your app needs.
-- Run `run_command(["npx","drizzle-kit","generate","--name","<what_changed>"])` — that writes a \
-new versioned `.sql` file under `drizzle/` describing exactly what changed. ALWAYS pass \
-`--name`: without it the file is named at random (`0001_special_fantastic_four.sql`), and a \
-migration history nobody can read is one nobody can check.
-- Make ONE kind of change per generate. Renaming a column and adding another in the same step is \
+- Call `{APPLY_SCHEMA_CHANGE_TOOL}(what_changed="<what you just changed>")`. That ONE call writes \
+the new versioned `.sql` file under `drizzle/` and applies it to the database, and reports each \
+step's outcome separately. `what_changed` names the migration file — pass something a person \
+could read six months from now ("add visitors table"), because a migration history nobody can \
+read is one nobody can check. Do NOT drive the underlying commands yourself through \
+`run_command`: both of them can print a failure and still exit zero, and this call is the thing \
+that reads their output and tells you which step actually failed.
+- Make ONE kind of change per call. Renaming a column and adding another in the same step is \
 the ambiguity that stops the command: drizzle-kit cannot tell a rename from a drop plus a create, \
-so it stops and ASKS — an interactive question that no flag answers, `--name` included. There is \
-no terminal here to answer it, so the command gives up, writes no migration file, and still \
-reports a zero exit code: it looks like it worked. Rename first and generate; then add, and \
-generate again. Two small named migrations always beat one that silently did nothing.
-- Run `run_command(["npm","run","db:migrate"])` to apply the pending migrations. `npm run dev` \
-also applies them at boot, and never fails the app if it cannot.
+so it stops and ASKS — an interactive question that no flag answers. There is no terminal here \
+to answer it, so the command gives up, writes no migration file, and still \
+reports a zero exit code: it looks like it worked, and only the report you get back says \
+otherwise. Rename first and apply; then add, and apply again. Two small named migrations always \
+beat one that silently did nothing.
+- `npm run dev` also applies pending migrations at boot, and never fails the app if it cannot — \
+which is exactly why a green boot is not evidence your schema change landed. The report from \
+`{APPLY_SCHEMA_CHANGE_TOOL}` is.
 - Never reach for drizzle-kit's `push` command: it edits the database in place and writes no \
 migration file, so a restored snapshot comes back with code that expects tables the database \
-does not have. Generate a migration, always.
+does not have. Go through `{APPLY_SCHEMA_CHANGE_TOOL}`, always.
 - The files under `drizzle/` are versioned artifacts — leave them in the workspace so they \
 travel with the snapshot, and never hand-edit one that has already been applied (change \
-`db/schema.ts` and generate the next one instead).
+`db/schema.ts` and apply the next one instead).
 - Query through `getDb()` from `@/db` in Server Components, Route Handlers, and Server Actions. \
 A Client Component reaches data through a Route Handler or a Server Action — importing the \
 client into browser code would ship the connection string to the browser.
@@ -238,6 +256,9 @@ TOOL SURFACE:
 - `run_command` — Run a shell command in the app workspace and get its output back.
 - `fetch_output_slice` — Read the part of a command's output that was cut, using the handle \
 from its truncation notice.
+- `apply_schema_change` — Apply the schema edits you just made in `db/schema.ts` — this \
+generates the migration and runs it in one call, and tells you truthfully which step failed if \
+either did.
 - `list_files` — List every file in the app (relative paths; heavy dirs like node_modules \
 excluded).
 - `search_files` — Search the app's files for a regex `pattern` (grep-like; case-sensitive)."""
