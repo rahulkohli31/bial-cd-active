@@ -25,7 +25,9 @@ export interface UsePendingAttachmentsResult {
   removePending: (id: string) => void
   clearPending: () => void
   /** Puts a previously-cleared batch back (a failed send that already cleared the
-   *  composer) — REPLACES the current list, it does not merge with it. */
+   *  composer) — MERGES with whatever is currently staged (deduped by id), since the
+   *  composer stays live during the failing send and the user may have attached
+   *  something new in the meantime. */
   restorePending: (items: PendingAttachment[]) => void
   attachToast: string | null
   showAttachToast: (msg: string) => void
@@ -63,6 +65,16 @@ export function usePendingAttachments(): UsePendingAttachmentsResult {
   // FileReader finally resolves.
   const generationRef = useRef(0)
 
+  // Mirrors pendingAttachments, but updated SYNCHRONOUSLY by every mutator below instead of
+  // via an effect. Two concurrent handleFiles calls can both resolve in the same tick, and
+  // reading `pendingAttachments` (or a variable assigned inside the setState updater) to
+  // compute the per-message cap is unreliable there: React only eagerly re-runs an updater
+  // function for the FIRST call to a given setter within a batch, so the second call's
+  // overflow computation would silently see stale state. Every mutator reads this ref,
+  // computes the next array, writes it back here, THEN calls setPendingAttachments with the
+  // plain array — so correctness never depends on batching order.
+  const pendingRef = useRef<PendingAttachment[]>([])
+
   // Shared by the file-input picker AND drag-and-drop — one validation/read path so
   // the two entry points can't drift.
   const handleFiles = useCallback(
@@ -96,16 +108,18 @@ export function usePendingAttachments(): UsePendingAttachmentsResult {
       settled.forEach((r, i) => (r.status === 'fulfilled' ? read.push(r.value) : failedNames.push(incoming[i].name)))
 
       if (read.length > 0) {
-        // Re-checked here, not just by the upfront validate above: two concurrent drops
-        // (e.g. two 3-file drops in the same async window) both validate against the same
-        // pre-drop count and would otherwise both pass even though their COMBINED total
-        // exceeds the per-message cap.
-        let overflow = 0
-        setPendingAttachments((prev) => {
-          const room = Math.max(0, MAX_FILES_PER_MESSAGE - prev.length)
-          overflow = Math.max(0, read.length - room)
-          return [...prev, ...read.slice(0, room)]
-        })
+        // Computed from pendingRef, not from React state or an updater's `prev` — see the
+        // ref's own comment. Re-checked here, not just by the upfront validate above: two
+        // concurrent drops (e.g. two 3-file drops in the same async window) both validate
+        // against the same pre-drop count and would otherwise both pass even though their
+        // COMBINED total exceeds the per-message cap.
+        const room = Math.max(0, MAX_FILES_PER_MESSAGE - pendingRef.current.length)
+        const overflow = Math.max(0, read.length - room)
+        const accepted = read.slice(0, room)
+        if (accepted.length > 0) {
+          pendingRef.current = [...pendingRef.current, ...accepted]
+          setPendingAttachments(pendingRef.current)
+        }
         if (overflow > 0) showAttachToast(`You can attach at most ${MAX_FILES_PER_MESSAGE} files per message.`)
       }
       if (failedNames.length > 0) {
@@ -129,16 +143,23 @@ export function usePendingAttachments(): UsePendingAttachmentsResult {
   )
 
   const removePending = useCallback((id: string) => {
-    setPendingAttachments((prev) => prev.filter((a) => a.id !== id))
+    pendingRef.current = pendingRef.current.filter((a) => a.id !== id)
+    setPendingAttachments(pendingRef.current)
   }, [])
 
   const clearPending = useCallback(() => {
     generationRef.current += 1
+    pendingRef.current = []
     setPendingAttachments([])
   }, [])
 
   const restorePending = useCallback((items: PendingAttachment[]) => {
-    setPendingAttachments(items)
+    // Merge rather than replace: the composer stays live while the send that's being
+    // restored-from was failing, so the user may already have staged something new — a
+    // plain replace would discard it.
+    const seen = new Set(pendingRef.current.map((a) => a.id))
+    pendingRef.current = [...pendingRef.current, ...items.filter((a) => !seen.has(a.id))]
+    setPendingAttachments(pendingRef.current)
   }, [])
 
   // ── Drop-target feedback ────────────────────────────────────────────────────────────

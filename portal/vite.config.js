@@ -51,7 +51,7 @@ export default defineConfig({
       // /api/v1/auth/* dev↔prod, keeping the refresh cookie's Path and the OIDC
       // redirect_uri consistent (KD-8).
       '/api/v1/auth': {
-        target: 'http://localhost:8001',
+        target: 'http://localhost:8000',
         changeOrigin: true,
         rewrite: (p) => p.replace(/^\/api/, ''),
       },
@@ -60,7 +60,7 @@ export default defineConfig({
       // FastAPI, so mirror that here by rewriting the leading /api to /v1 — the
       // browser keeps calling /api/* dev↔prod while the backend sees /v1/*.
       '/api': {
-        target: 'http://localhost:8001',
+        target: 'http://localhost:8000',
         changeOrigin: true,
         rewrite: (p) => p.replace(/^\/api/, '/v1'),
       },
@@ -70,7 +70,7 @@ export default defineConfig({
       // app URL bounces to /login. Note the ordering: the more specific '/api' rule
       // above already claimed /api/apps/*, so this only catches the runner paths.
       '/apps': {
-        target: 'http://localhost:8001',
+        target: 'http://localhost:8000',
         changeOrigin: true,
       },
     },

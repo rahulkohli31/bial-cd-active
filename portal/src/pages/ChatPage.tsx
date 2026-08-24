@@ -403,6 +403,15 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
       // an upload failure must not cost the user the message they typed and the files they
       // picked, with nothing left to retry. `rawText`/`attachments` are this call's own
       // arguments, not stale closure state, so they're exactly what was cleared.
+      //
+      // But only restore into the chat that's STILL on screen. The upload await leaves the
+      // composer live with no spinner (generating is only set to true after this block), so
+      // switching chats mid-upload is ordinary, and the per-user storage cap makes rejection
+      // routine — restoring unconditionally would land chat-1's draft + attachments in
+      // chat-2's composer, clobbering whatever chat-2 already had staged (ChatRoute renders
+      // this page with no `key`, so it survives the switch). Mirrors the activeChatIdRef
+      // guard streamAssistant already uses for the identical race.
+      if (activeChatIdRef.current !== currentChatId) return
       runtime.thread.composer.setText(rawText)
       restorePending(attachments)
       return
