@@ -812,3 +812,112 @@ def test_the_portal_fallback_copy_and_the_server_last_resort_are_the_same_senten
     assert _UNCLASSIFIED.action == (
         "Try describing what you want again, or ask for something simpler."
     )
+
+
+# --- U15/R20: narration between tools never reaches the citizen ----------------
+#
+# The live browser run of 2026-08-24 is the fixture these three pin. A build that hit a
+# compile error made the model narrate its own debugging into the citizen's chat — ~1900
+# words naming Drizzle, HMR, `globalThis`, React Server Components, and the platform's own
+# word "harness". `NARRATION_VOICE` asks the model not to; a failing build is exactly when
+# it stops complying, so the guarantee is enforced here instead of only in the prompt.
+
+
+async def test_write_text_beside_a_tool_call_is_dropped(db_session) -> None:
+    """★ The observed leak: prose and a tool call in ONE response. The step label already
+    tells the citizen what happened, so the prose is the model talking to itself."""
+    user, _project, conversation = await _thread(db_session)
+    session_id = uuid.uuid4()
+    await _step(
+        db_session,
+        user,
+        conversation,
+        session_id,
+        [
+            ModelResponse(
+                parts=[
+                    TextPart(
+                        content=(
+                            "The SQL looks fine. Let me check if the migration was applied — "
+                            "maybe the pooled connection is caching a stale schema? `next dev` "
+                            "uses HMR and the DB pool is cached on globalThis."
+                        )
+                    ),
+                    ToolCallPart(
+                        tool_name="write_file",
+                        args='{"path": "app/page.tsx", "file_text": "x"}',
+                        tool_call_id="call-1",
+                    ),
+                ]
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name="write_file",
+                        content="Wrote `app/page.tsx`.",
+                        tool_call_id="call-1",
+                    )
+                ]
+            ),
+        ],
+    )
+    items = project_rows(await _rows(db_session, user, conversation))
+
+    assert not [i for i in items if isinstance(i, AssistantTextItem)]
+    # LIVENESS — the step must still be there, or this passes by rendering nothing at all.
+    steps = [i for i in items if isinstance(i, StepItem)]
+    assert [s.label for s in steps] == ["Building your app's main page"]
+
+
+async def test_write_text_with_no_tool_call_survives(db_session) -> None:
+    """★ The zero-mutation ending. A Write turn the citizen typed a QUESTION into touches no
+    file and never calls `declare_done` — this prose IS the answer, and dropping it would
+    leave them staring at nothing. Keyed on 'no tool call beside it', which is why keying on
+    `meta.kind == "write_completion"` would have been wrong."""
+    user, _project, conversation = await _thread(db_session)
+    await _step(
+        db_session,
+        user,
+        conversation,
+        uuid.uuid4(),
+        [ModelResponse(parts=[TextPart(content="Yes — the arrival time is stamped for you.")])],
+    )
+    items = project_rows(await _rows(db_session, user, conversation))
+
+    texts = [i for i in items if isinstance(i, AssistantTextItem)]
+    assert [t.text for t in texts] == ["Yes — the arrival time is stamped for you."]
+
+
+async def test_plan_mode_keeps_its_prose_beside_a_tool_call(db_session) -> None:
+    """★ Plan mode's prose IS the deliverable — the same drop there would delete the feature,
+    so the gate must be mode-scoped rather than universal.
+
+    `entry_kind=TURN`, not STEP, because that is the only shape the product can actually
+    produce: every production writer of a STEP row hardcodes WRITE mode (the BRAIN build
+    loop owns that kind), and Plan/Ask turns persist as TURN. Mirrors
+    `test_plan_options_three_states` above."""
+    user, _project, conversation = await _thread(db_session)
+    await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        messages=[
+            ModelResponse(
+                parts=[
+                    TextPart(content="Here is what your visitor log will do."),
+                    ToolCallPart(
+                        tool_name="read_file", args='{"path": "app/page.tsx"}', tool_call_id="p1"
+                    ),
+                ]
+            ),
+            ModelRequest(
+                parts=[ToolReturnPart(tool_name="read_file", content="1\tx", tool_call_id="p1")]
+            ),
+        ],
+        entry_kind=MessageEntryKind.TURN,
+        mode=ConversationMode.PLAN,
+    )
+    items = project_rows(await _rows(db_session, user, conversation))
+
+    texts = [i for i in items if isinstance(i, AssistantTextItem)]
+    assert [t.text for t in texts] == ["Here is what your visitor log will do."]

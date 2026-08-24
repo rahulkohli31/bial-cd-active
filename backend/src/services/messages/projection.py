@@ -30,6 +30,7 @@ from typing import Any, Final, Literal
 from pydantic import Field
 
 from src.core.prompt_blocks import APPLY_SCHEMA_CHANGE_TOOL
+from src.db.models.conversation import ConversationMode
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.schemas import CamelModel
 from src.services.messages.store import ATTACHMENT_REF_KIND
@@ -571,11 +572,31 @@ def _project_response_parts(
     """One stored ModelResponse → assistant text + friendly steps + plan-options cards, in
     part order (text streamed before a tool call renders before it, matching the live feed)."""
     mode = row.mode.value
-    for part in message.get("parts", []):
-        if not isinstance(part, dict):
-            continue
+    parts = [p for p in message.get("parts", []) if isinstance(p, dict)]
+    # U15/R20 — WRITE-MODE NARRATION BETWEEN TOOLS IS NOT THE CITIZEN'S MESSAGE.
+    #
+    # A Write response that ALSO calls a tool is doing the work, and its prose is the model
+    # talking to itself on the way there ("let me check the server logs", "drizzle's generic
+    # wrapper"). The work already has a citizen-readable account — the friendly step label
+    # this same loop emits below — so dropping the prose loses nothing and removes the whole
+    # class. `NARRATION_VOICE` asks the model for this; a build that fails is exactly when it
+    # stops complying, so the guarantee cannot live in the prompt alone.
+    #
+    # STRUCTURAL, NOT A WORD LIST, and deliberately not keyed on `meta.kind`. A Write turn
+    # that mutates nothing never calls `declare_done` and is persisted as an ordinary
+    # `write_step` — the citizen asked a question and this prose IS the answer (the
+    # zero-mutation ending at `engine._TurnState.expects_mutation`). "Has a tool call beside
+    # it" keeps that answer and drops only narration; `kind == "write_completion"` would
+    # silently eat it. Mirrored live in `engine._stream_text` — change both or reload and
+    # the live feed disagree.
+    narrating_between_tools = row.mode is ConversationMode.WRITE and any(
+        p.get("part_kind") == "tool-call" for p in parts
+    )
+    for part in parts:
         part_kind = part.get("part_kind")
         if part_kind == "text":
+            if narrating_between_tools:
+                continue
             content = part.get("content")
             if isinstance(content, str) and content.strip():
                 items.append(AssistantTextItem(seq=row.seq, mode=mode, text=content))

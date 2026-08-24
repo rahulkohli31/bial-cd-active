@@ -33,7 +33,10 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    PartDeltaEvent,
+    PartStartEvent,
     TextPart,
+    TextPartDelta,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
@@ -47,7 +50,7 @@ from pydantic_ai.models.function import (
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import BuildError, ErrorSource
-from src.api.v1.conversations.schemas import StepFrame
+from src.api.v1.conversations.schemas import StepFrame, TextDeltaFrame
 from src.config import settings
 from src.core.integrity_types import BaselineIdentity
 from src.db.models.conversation import ConversationMode
@@ -466,6 +469,13 @@ async def test_a_read_only_write_turn_is_just_a_chat_turn(
     assert state.status == "completed"
     assert state.end_reason is None  # nothing to explain — the turn did what was asked
     assert counts["runs"] == 1  # no CONTINUE_PROMPT second pass either
+    # U15/R20 — AND THE ANSWER ACTUALLY REACHED THE SCREEN. This turn calls no
+    # `declare_done`, so the held-prose flush is the ONLY thing that will ever say it: with
+    # the flush miswired, the text sits in `pending_text` forever, the live feed shows
+    # nothing, and a reload shows the answer — the live/reload split the drop exists to
+    # prevent. Asserted on `text_so_far()` because that is both the wire content and what a
+    # reconnecting client's snapshot replays.
+    assert "It renders the visitor list." in state.text_so_far()
 
 
 async def test_a_build_that_wrote_nothing_fails_instead_of_reporting_success(
@@ -2190,6 +2200,76 @@ async def test_the_acknowledgement_never_reaches_the_stored_transcript(
         if isinstance(frame, StepFrame) and frame.item.tool == engine_module.ACK_TOOL
     ]
     assert len(ack_frames) == 1
+
+
+def _narrated(text: str) -> PartStartEvent:
+    return PartStartEvent(index=0, part=TextPart(content=text))
+
+
+def _narrated_more(text: str) -> PartDeltaEvent:
+    return PartDeltaEvent(index=0, delta=TextPartDelta(content_delta=text))
+
+
+def _text_on_the_wire(state: _TurnState) -> str:
+    return "".join(frame.text for frame in state.ring if isinstance(frame, TextDeltaFrame))
+
+
+def test_write_narration_beside_a_tool_call_never_reaches_the_live_feed(_fresh_engine) -> None:
+    """★ THE LIVE HALF of U15/R20 — the twin of `test_projection.py`'s
+    `test_write_text_beside_a_tool_call_is_dropped`, which pins only the RELOAD half.
+
+    The production failure was on the LIVE FEED: ~1900 words of developer narration (Drizzle,
+    HMR, `globalThis`) streamed straight into a citizen's chat while she waited for her app. The
+    engine comment over `_stream_text` says "mirrored live in engine._stream_text — change both
+    or reload and the live feed disagree", and until now only one of the two had a test, so a
+    regression on this side shipped green.
+
+    Mutation check: delete the `_discard_pending_text(state)` call in `_on_event`'s
+    `FunctionToolCallEvent` arm, or the WRITE branch in `_stream_text`, and this goes red."""
+    engine = _fresh_engine
+    state = _bare_state()
+
+    engine._on_event(state, _narrated("Let me check the Drizzle schema — "))
+    engine._on_event(state, _narrated_more("globalThis is undefined in the HMR boundary."))
+    engine._on_event(state, _called("read_file", '{"path": "db/schema.ts"}', "c1"))
+    # THE FLUSH BOUNDARY, run here exactly as `_run_write_once` runs it once the tool-call node
+    # has been drained. Without it this asserts nothing: held prose has not reached the wire YET
+    # in any world, and the question is whether the flush that follows still finds it.
+    engine._flush_pending_text(state)
+
+    # LIVENESS: the turn really did stream and really did act — an assert-absence over a state
+    # where nothing happened at all would pass for the wrong reason.
+    assert _step_labels(state, phase="started"), "no step frame — the seam under test never ran"
+    assert "Drizzle" not in _text_on_the_wire(state)
+    assert "globalThis" not in _text_on_the_wire(state)
+    assert "".join(state.text_parts) == ""  # nor onto the snapshot the late subscriber reads
+
+
+def test_write_prose_with_no_tool_call_after_it_is_still_the_citizens_answer(
+    _fresh_engine,
+) -> None:
+    """THE OTHER HALF, and the reason the drop is held rather than unconditional. A Write
+    response that calls NO tool is the turn's own answer — the zero-mutation ending depends on
+    it, because that turn never calls `declare_done` and nothing else would ever say anything."""
+    engine = _fresh_engine
+    state = _bare_state()
+
+    engine._on_event(state, _narrated("Your visitor list is already showing arrival times."))
+    engine._flush_pending_text(state)
+
+    assert "arrival times" in _text_on_the_wire(state)
+    assert "arrival times" in "".join(state.text_parts)
+
+
+def test_ask_mode_prose_is_never_held(_fresh_engine) -> None:
+    """The hold is WRITE's alone: in Ask/Plan the prose IS the deliverable, and holding it would
+    be a dead screen for the length of the answer."""
+    engine = _fresh_engine
+    state = _bare_state(ConversationMode.ASK)
+
+    engine._on_event(state, _narrated("The visitor list lives in app/visitors/page.tsx."))
+
+    assert "app/visitors/page.tsx" in _text_on_the_wire(state)
 
 
 async def test_a_long_operation_gets_a_status_line_refreshed_until_it_completes(

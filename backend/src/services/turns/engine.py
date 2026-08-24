@@ -38,7 +38,7 @@ from collections.abc import AsyncIterable, Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 import structlog
 from pydantic_ai import Agent, BinaryContent, RunContext
@@ -206,8 +206,14 @@ _PERSIST_FAILED_MESSAGE = (
 # THE ACKNOWLEDGEMENT is a transient feed row, not a transcript message. It is emitted
 # synchronously inside `start_turn`, before the detached task is even created, so "before any
 # model work" is a structural fact rather than a timing hope. It is deliberately never written
-# into `state.steps`, which is what keeps it out of the catch-up snapshot AND out of the
-# persisted rows: a build's transcript must not accumulate one "Getting started" per turn.
+# into `state.steps`, which is what keeps it out of the persisted rows: a build's transcript must
+# not accumulate one "Getting started" per turn. It IS carried on the catch-up snapshot (held in
+# `state.acknowledgement`, retired by the first real step) — a client that subscribes a moment
+# after the turn starts would otherwise get a still screen, which is the whole point of U17.
+# Between two `TextPart`s of one response. Blank, not nothing: concatenating them raw ran the
+# last sentence of a block into the first word of the next ("…the workspace.Now let me…").
+TEXT_BLOCK_SEPARATOR: Final = "\n\n"
+
 ACK_TEXT = "Getting started on that…"
 # The reserved tool name the acknowledgement rides under, so it is identifiable as the
 # harness's own row rather than a step the agent took. The portal keys on the same string
@@ -529,6 +535,13 @@ class _TurnState:
     seq: int = 0
     ring: deque[TurnStreamFrame] = field(default_factory=lambda: deque(maxlen=RING_MAXLEN))
     text_parts: list[str] = field(default_factory=list)
+    # U15/R20 — WRITE-mode prose, held until we know what it is. Text streams BEFORE the tool
+    # call that would mark it as narration-between-tools, so the decision cannot be made at
+    # delta time; one model response's prose accumulates here and is either dropped by
+    # `_discard_pending_text` (a tool call followed → it was narration) or committed by
+    # `_flush_pending_text` (the response ended with no tool call → it was the turn's answer).
+    # Never used in Ask/Plan, where the prose IS the deliverable and streams as it arrives.
+    pending_text: list[str] = field(default_factory=list)
     steps: dict[str, StepItem] = field(default_factory=dict)  # tool_call_id → newest item
     # U17's acknowledgement, held OUT of `steps` and beside it. The distinction the original
     # comment collapsed: `steps` is what gets PERSISTED, so the ack must stay out of it — but the
@@ -1820,6 +1833,15 @@ class TurnEngine:
                     async with node.stream(run.ctx) as tool_stream:
                         async for tool_event in tool_stream:
                             self._on_event(state, tool_event)
+                    # THE FLUSH BOUNDARY, and it has to be here rather than at the end of the
+                    # model-request stream above (U15/R20). pydantic-ai streams a response's
+                    # TEXT and its TOOL CALLS from two different nodes, text first, so at the
+                    # end of the text stream we do not yet know which kind of prose this was.
+                    # By this line the tool-call node has been drained: a response that called
+                    # tools has already emptied the buffer via `_discard_pending_text`, so this
+                    # is a no-op for it, and a response that called none still holds its prose —
+                    # which is the citizen's answer, and the only thing that will ever say it.
+                    self._flush_pending_text(state)
                     node = await run.next(node)
                     # The step's tools have executed and their returns are in the history,
                     # so the step is complete — persist before the next request fires.
@@ -1970,6 +1992,12 @@ class TurnEngine:
         already keeps: a reply that was not stored has not been given. Silently swallowing it
         would end a build with a completion on screen that vanishes on the next reload."""
         text = sandbox.done_summary.strip() or _BUILD_FINISHED_FALLBACK
+        # An earlier iteration of this same turn can have flushed prose of its own (a response
+        # that called no tool — see `_flush_pending_text`), and `text_parts` is joined with
+        # nothing between entries. Without this the closing message runs into that prose's last
+        # sentence, which is the defect `TEXT_BLOCK_SEPARATOR` exists to prevent.
+        if state.text_parts:
+            self._push_text(state, TEXT_BLOCK_SEPARATOR)
         self._push_text(state, text)
         try:
             async with session_factory() as db:
@@ -2076,7 +2104,7 @@ class TurnEngine:
         reload.
 
         THREE FINISHED ARMS, not two, and the third is why this takes the verdict rather than a
-        bool (U6). "Not green yet" over a check that could not be REACHED tells the citizen their
+        bool (U6). "Not working yet" over a check that could not be REACHED tells the citizen their
         app is broken on the strength of our own timeout — the platform blaming the app for its
         own silence, which is the same shape of untruth as claiming a build finished when it did
         not. An unreachable verdict resolves the spinner neutrally and says so."""
@@ -2090,7 +2118,7 @@ class TurnEngine:
         elif verdict is HealthState.HEALTHY:
             label, step_state = "Build verified.", "ok"
         else:
-            label, step_state = "Not green yet — continuing.", "failed"
+            label, step_state = "Not working yet — fixing it.", "failed"
         item = StepItem(
             seq=0,
             mode=ConversationMode.WRITE.value,
@@ -2416,7 +2444,15 @@ class TurnEngine:
     def _event_handler(
         self, state: _TurnState
     ) -> Callable[[RunContext[ChatDeps], AsyncIterable[AgentStreamEvent]], Awaitable[None]]:
-        """The pydantic-ai event_stream_handler: model/tool events → typed frames."""
+        """The pydantic-ai event_stream_handler: model/tool events → typed frames.
+
+        ASK/PLAN ONLY — Write drives its own node loop (`_run_write_once`) and calls
+        `_on_event` directly. No flush here on purpose: pydantic-ai invokes this handler once
+        per NODE, and a response's text and its tool calls arrive from two different nodes,
+        text first. Flushing at the end of this iteration would therefore commit prose before
+        the tool call that classifies it has been seen — which is the leak, restated. Ask/Plan
+        never hold anything anyway (`_stream_text` commits immediately outside Write).
+        """
 
         async def handle(
             _ctx: RunContext[ChatDeps], events: AsyncIterable[AgentStreamEvent]
@@ -2429,11 +2465,15 @@ class TurnEngine:
     def _on_event(self, state: _TurnState, event: AgentStreamEvent) -> None:
         if isinstance(event, PartStartEvent):
             if isinstance(event.part, TextPart) and event.part.content:
-                self._push_text(state, event.part.content)
+                self._stream_text(state, event.part.content, new_block=True)
         elif isinstance(event, PartDeltaEvent):
             if isinstance(event.delta, TextPartDelta) and event.delta.content_delta:
-                self._push_text(state, event.delta.content_delta)
+                self._stream_text(state, event.delta.content_delta, new_block=False)
         elif isinstance(event, FunctionToolCallEvent):
+            # This response is DOING something, so any prose it opened with was the model
+            # narrating its way to the tool — not a message to the citizen. Dropped before
+            # it can reach the wire, which is why the live feed and a later reload agree.
+            self._discard_pending_text(state)
             if event.part.tool_name == PLAN_OPTIONS_TOOL:
                 # The options card, not a step: the call defers (the user's click is the
                 # result), so there is no 'finished' counterpart to wait for.
@@ -2554,8 +2594,50 @@ class TurnEngine:
                 )
 
     def _push_text(self, state: _TurnState, text: str) -> None:
+        """Commit prose to the citizen: onto the snapshot tail AND onto the wire.
+
+        DELIBERATELY UNGATED, and `_render_completion` is why — the completion message is
+        delivered through this same call (U18). A gate here rather than at the streaming
+        call site would silence the one message the U15 drop is relying on to survive.
+        """
         state.text_parts.append(text)
         self._emit(state, lambda seq: TextDeltaFrame(seq=seq, text=text))
+
+    def _stream_text(self, state: _TurnState, text: str, *, new_block: bool) -> None:
+        """Prose arriving mid-response, before we know whether a tool call follows it.
+
+        Ask/Plan commit immediately — there the prose IS the deliverable and a held stream
+        would be a dead screen. WRITE holds it: see `_TurnState.pending_text`.
+
+        `new_block` marks a fresh `TextPart` rather than a delta continuing the current one.
+        Blocks were previously concatenated with nothing between them, which ran the last
+        sentence of one into the first word of the next ("…the workspace.Now let me…") on
+        the live feed only — reload always kept them as separate items.
+        """
+        if state.mode is not ConversationMode.WRITE:
+            if new_block and state.text_parts:
+                self._push_text(state, TEXT_BLOCK_SEPARATOR)
+            self._push_text(state, text)
+            return
+        if new_block and state.pending_text:
+            state.pending_text.append(TEXT_BLOCK_SEPARATOR)
+        state.pending_text.append(text)
+
+    def _discard_pending_text(self, state: _TurnState) -> None:
+        """Drop held prose — a tool call proved it was narration between tools (U15/R20)."""
+        state.pending_text.clear()
+
+    def _flush_pending_text(self, state: _TurnState) -> None:
+        """Commit held prose — the response ended without calling a tool, so this is the
+        turn's own answer. The zero-mutation Write ending depends on this: that turn never
+        calls `declare_done`, so nothing else would ever say anything."""
+        held = "".join(state.pending_text)
+        state.pending_text.clear()
+        if not held.strip():
+            return
+        if state.text_parts:
+            self._push_text(state, TEXT_BLOCK_SEPARATOR)
+        self._push_text(state, held)
 
     def _step_item(self, state: _TurnState, tool_name: str, args_json: str) -> StepItem:
         label, hidden = classify_tool_call(tool_name, args_json)
