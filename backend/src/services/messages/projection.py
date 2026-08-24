@@ -307,6 +307,11 @@ def _step_label(tool_name: str, args: dict[str, Any]) -> tuple[str, bool]:
         return (label, True)
     if tool_name in ("list_files", "search_files"):  # fmt: skip
         return ("Looked through the app's files", True)
+    if tool_name == "fetch_output_slice":
+        # U22. Inspection, so it is hidden like a read — and it needs a branch of its own because
+        # the fallback below renders the RAW TOOL NAME ("Used fetch_output_slice") into a citizen's
+        # feed, which is exactly the raw-machinery leak `_friendly_area` exists to prevent (F3/U3).
+        return ("Looked at what a command printed", True)
     if tool_name == "declare_done":
         return ("Wrapping up the build", False)
     if tool_name == "run_command":
@@ -341,6 +346,20 @@ def command_needs_the_long_timeout(argv: list[str]) -> bool:
     thing to do is kill it and tell the model."""
     label, _ = _classify_command(argv)
     return label in {_LBL_INSTALL, _LBL_CHECKS}
+
+
+def command_only_inspects(argv: list[str]) -> bool:
+    """Does this argv only LOOK at the workspace (`cat`, `sed -n`, `grep`, `ls`, `wc`)?
+
+    Read off the same `_READ_ONLY_BINARIES` set the classifier hides steps by, so there is one
+    answer to "is this an inspection" and not two that can disagree.
+
+    U22's consumer is the output formatter (`orchestrator/tools`): a build log may have its
+    predictable dependency-manager chatter dropped, but an inspection's output IS file content,
+    and a filter that silently removes a line from it hands the model a file that does not say
+    what the file says. Fails CLOSED for the long tail — an unrecognized binary is treated as a
+    log, which at worst keeps a noise line, never deletes a real one."""
+    return bool(argv) and argv[0] in _READ_ONLY_BINARIES
 
 
 def long_operation_line(label: str) -> str:

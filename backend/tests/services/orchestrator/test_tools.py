@@ -5,6 +5,7 @@ path, not a hand-called function."""
 
 from __future__ import annotations
 
+import re
 import uuid
 from typing import Any
 
@@ -12,10 +13,15 @@ import pytest
 from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
+from src.db.models.harness_counter import HarnessCounter
 from src.services.orchestrator import build_agent, constants
-from src.services.orchestrator.deps import BuildDeps, SandboxSession
+from src.services.orchestrator.deps import BuildDeps, HeldOutput, SandboxSession
 from src.services.orchestrator.progress import ProgressEmitter
-from src.services.orchestrator.tools import _redact_command_output
+from src.services.orchestrator.tools import (
+    OUTPUT_NO_LONGER_HELD,
+    _is_predictable_noise,
+    _redact_command_output,
+)
 from src.services.sandbox import (
     ExecResult,
     FileOp,
@@ -36,6 +42,10 @@ _TOOL_NAMES = {
     "insert_lines",
     "declare_done",
     "run_command",
+    # U22: the slice handle is a REGISTERED TOOL, not a capability described in a prompt — and it
+    # is registered here, on the sandbox toolset, because Write is the only mode that runs
+    # commands. `test_toolsets.py` asserts the mode half against `toolsets_for_mode` directly.
+    "fetch_output_slice",
 }
 
 
@@ -589,14 +599,16 @@ async def test_run_command_output_is_secret_redacted(
 
 
 def test_redact_command_output_caps_raw_input_before_redacting() -> None:
-    # ReDoS guard: raw output is sliced to REDACT_INPUT_MAX_CHARS BEFORE redact_secrets runs, so a
+    # ReDoS guard: raw output is sliced to REDACT_INPUT_MAX_CHARS BEFORE the redactor runs, so a
     # trailing secret beyond the cap is dropped (never scanned) and the result stays bounded.
+    # U22 kept the ordering and moved the second cap: the artifact is now head + notice + tail,
+    # so the bound is the budget plus the notice rather than the budget plus a marker.
     trailing_secret = "bial_ThisIsPastTheInputCap0123456789"
     raw = ("A" * (constants.REDACT_INPUT_MAX_CHARS + 5_000)) + trailing_secret
-    out = _redact_command_output(raw)
+    out = _redact_command_output(raw, budget=constants.RUN_COMMAND_OUTPUT_MAX_CHARS)
     assert trailing_secret not in out
     assert "bial_ThisIsPast" not in out
-    assert len(out) <= constants.RUN_COMMAND_OUTPUT_MAX_CHARS + 64  # bound + truncation marker
+    assert len(out) <= constants.RUN_COMMAND_OUTPUT_MAX_CHARS + 400
 
 
 async def test_run_command_never_leaks_the_supervisor_token(sink: CollectingSink) -> None:
@@ -670,3 +682,360 @@ async def test_a_git_commit_through_run_command_is_still_an_ordinary_command(
     )
     assert "<system-reminder>" not in captured["all_incoming"]
     assert ["git", "commit", "-m", "whatever"] in fake.command_calls
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# U22 / R28 — cap tool output by usefulness, not by a fixed head
+# ═══════════════════════════════════════════════════════════════════════════════════════
+#
+# THE DEFECT THESE PIN: the cap was HEAD-ONLY. A failing `tsc` or `npm run build` puts its
+# message at the top and the failing assertion at the bottom, so a head cap threw away the half
+# the model needed and it paid a re-run to see the middle. The fix is exit-code-conditional
+# (summarise a success, dump a failure), keeps BOTH ends, and hands back a handle to what it cut.
+#
+# THE ONE TO RUN UNDER MUTATION is `test_a_secret_inside_the_elided_middle_is_never_retrievable`:
+# delete the `scrub_untrusted` call in `_redacted_lines` (the redact-before-buffering line) and it
+# goes red. It is DISTINCT from the boundary test below it — that one is about a cut splitting a
+# credential; this one is about the buffer being built from the wrong string in the first place,
+# and a secret sitting entirely inside an elided middle is the ordinary case, not an edge one.
+
+_ERROR_AT_THE_VERY_END = "error TS2322: Type 'string' is not assignable to type 'number'."
+_TRACE_TITLE_AT_THE_TOP = "FATAL: the migration runner refused to start"
+_SECRET_IN_THE_MIDDLE = "DATABASE_PASSWORD=hunter2-super-secret"
+
+
+def _long_output(*, lines: int = 140, middle: str | None = None) -> str:
+    """A capture with a recognisable head and tail and an optional planted middle line."""
+    body = [f"  at frame {n:03d} of a long and tedious stack ({'x' * 30})" for n in range(lines)]
+    if middle is not None:
+        body[len(body) // 2] = middle
+    return "\n".join([_TRACE_TITLE_AT_THE_TOP, *body, _ERROR_AT_THE_VERY_END])
+
+
+def _slice_call_in(text: str) -> re.Match[str] | None:
+    """The `fetch_output_slice(...)` call a truncation notice printed, parsed as the model would
+    copy it — the whole point of naming the tool and the handle INLINE."""
+    return re.search(
+        r'fetch_output_slice\(handle="([^"]+)", start_line=(\d+), end_line=(\d+)\)', text
+    )
+
+
+def _following_model(command: list[str], captured: dict[str, Any]) -> FunctionModel:
+    """A model that runs `command` and then FOLLOWS whatever the truncation notice told it to
+    call — no memory of any capability from the system prompt, just the line in front of it."""
+    step = {"n": 0}
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        captured.setdefault("incoming", []).append(_all_text(messages))
+        captured["tool_names"] = {t.name for t in info.function_tools}
+        current, step["n"] = step["n"], step["n"] + 1
+        if current == 0:
+            return tool_turn("run_command", {"command": command})
+        if current == 1:
+            match = _slice_call_in(captured["incoming"][-1])
+            assert match is not None, f"no slice call in:\n{captured['incoming'][-1]}"
+            captured["notice_call"] = match.group(0)
+            return tool_turn(
+                "fetch_output_slice",
+                {
+                    "handle": match.group(1),
+                    "start_line": int(match.group(2)),
+                    "end_line": int(match.group(3)),
+                },
+            )
+        return text_turn("done")
+
+    return FunctionModel(respond)
+
+
+async def _run_following(
+    fake: FakeSandbox, sink: CollectingSink, command: list[str]
+) -> dict[str, Any]:
+    captured: dict[str, Any] = {}
+    result = await build_agent.run(
+        "build the app", deps=_deps(fake, sink), model=_following_model(command, captured)
+    )
+    captured["output"] = result.output
+    captured["all_incoming"] = "\n".join(captured.get("incoming", []))
+    captured["slice_result"] = captured["incoming"][-1]
+    return captured
+
+
+def test_a_failing_commands_output_is_dumped_and_a_succeeding_ones_is_summarised() -> None:
+    """★ ASM13's rule, both arms measured against ONE capture.
+
+    A success's shape is already known — it is a confirmation. A failure's payload is unknown by
+    construction, which is what makes it a failure, so it gets four times the budget."""
+    raw = _long_output(lines=900)
+    failed = _redact_command_output(raw, budget=constants.output_budget_for_exit(1))
+    passed = _redact_command_output(raw, budget=constants.output_budget_for_exit(0))
+    assert len(failed) > len(passed)
+    assert len(passed) <= constants.RUN_COMMAND_SUMMARY_MAX_CHARS + 400  # + the notice
+    assert len(failed) <= constants.RUN_COMMAND_OUTPUT_MAX_CHARS + 400
+    # And both were cut — a test where neither truncated would prove nothing about either.
+    assert "elided" in failed
+    assert "elided" in passed
+
+
+def test_the_head_and_the_tail_both_survive_truncation() -> None:
+    """★ THE WHOLE DEFECT, in one assertion pair. Head-only kept the first and lost the second."""
+    out = _redact_command_output(_long_output(), budget=constants.RUN_COMMAND_SUMMARY_MAX_CHARS)
+    assert out.startswith(_TRACE_TITLE_AT_THE_TOP)  # the message, at the TOP of a trace
+    assert out.endswith(_ERROR_AT_THE_VERY_END)  # the failing assertion, at the very END
+    assert "elided" in out
+
+
+def test_the_truncation_notice_states_the_loss_and_names_the_tool_and_handle_inline() -> None:
+    out = _redact_command_output(
+        _long_output(), budget=constants.RUN_COMMAND_SUMMARY_MAX_CHARS, handle="out_deadbeef"
+    )
+    match = _slice_call_in(out)
+    assert match is not None, out
+    assert match.group(1) == "out_deadbeef"
+    # HOW MUCH was lost, in both units, and where it sat in the whole.
+    assert re.search(r"\[\.\.\. [\d,]+ lines \([\d,]+ characters\) elided — lines \d+-\d+ of", out)
+    # The range the notice names is the range that is actually missing. Line 1 is the title, so
+    # capture line `k` is `frame k-2` — the offset is spelled out rather than fudged, because a
+    # notice naming a range that is off by one is worse than no notice at all.
+    first, last = int(match.group(2)), int(match.group(3))
+    assert f"  at frame {first - 3:03d} " in out  # the last line still SHOWN
+    assert f"  at frame {first - 2:03d} " not in out  # the FIRST line elided
+    assert f"  at frame {last - 2:03d} " not in out  # the LAST line elided
+
+
+async def test_the_handle_fetches_the_named_middle_region_in_one_call(
+    sink: CollectingSink,
+) -> None:
+    """★ ONE round-trip, driven by a model that knows nothing but the notice it was handed."""
+    marker = "  at frame 070 of a long and tedious stack (the one the model came back for)"
+    fake = FakeSandbox()
+    fake.queue_commands(ExecResult(stdout=_long_output(middle=marker), stderr="", exit=0))
+    captured = await _run_following(fake, sink, ["npm", "run", "build"])
+    assert marker not in captured["incoming"][1]  # elided from the run_command result …
+    assert marker in captured["slice_result"]  # … and recovered by the handle it named
+
+
+async def test_a_secret_inside_the_elided_middle_is_never_retrievable(
+    sink: CollectingSink,
+) -> None:
+    """★ THE MUTATION TARGET (delete the `scrub_untrusted` call in `_redacted_lines` → red).
+
+    The returned artifact only ever exposed an already-redacted head. A handle retains a SECOND
+    artifact, and the part it holds is precisely the part no human read — so a buffer built from
+    raw stdout is a direct path to a credential that was never shown and never masked. This is
+    the ORDINARY case for a secret in a long capture, not a boundary one, which is why it is
+    written separately from the boundary test below."""
+    fake = FakeSandbox()
+    fake.queue_commands(
+        ExecResult(stdout=_long_output(middle=_SECRET_IN_THE_MIDDLE), stderr="", exit=0)
+    )
+    captured = await _run_following(fake, sink, ["npm", "run", "env-dump"])
+    # It really was in the elided middle: the slice fetched the region that held it …
+    assert "DATABASE_PASSWORD" in captured["slice_result"]
+    # … and what came back through the handle is masked, in the slice AND in every other thing
+    # the model ever saw this run.
+    assert "hunter2-super-secret" not in captured["all_incoming"]
+    assert "hunter2" not in captured["all_incoming"]
+    assert "DATABASE_PASSWORD=***" in captured["slice_result"]
+
+
+def test_a_secret_spanning_the_truncation_boundary_is_not_re_exposed() -> None:
+    """★ DISTINCT FROM THE ONE ABOVE: this is about the CUT, not the buffer.
+
+    Redaction runs once over the whole capture BEFORE anything is sliced. Cut first and redact
+    the pieces afterwards and a credential straddling the cut becomes two fragments that match
+    none of the redactor's shapes — half a password, in the clear, in the head."""
+    budget = constants.RUN_COMMAND_SUMMARY_MAX_CHARS
+    # One pathological line, with the credential's VALUE sitting exactly across the head cut.
+    spanning = ("A" * (budget // 2 - 31)) + f" {_SECRET_IN_THE_MIDDLE} " + ("B" * 5_000)
+    out = _redact_command_output(spanning, budget=budget)
+    assert "hunter2" not in out
+    assert "hunter2-sup" not in out  # the fragment a cut-then-redact order would have left
+    assert "DATABASE_PASSWORD=***" in out
+
+
+async def test_an_unknown_handle_returns_the_plain_instruction_not_an_exception(
+    sink: CollectingSink,
+) -> None:
+    """A `ModelRetry` here would spend the round-trip the tool exists to save, and there is
+    nothing to self-correct: the buffer is gone because the turn moved on."""
+    fake = FakeSandbox()
+    captured = await _run(
+        fake,
+        sink,
+        [
+            tool_turn(
+                "fetch_output_slice",
+                {"handle": "out_neverexisted", "start_line": 5, "end_line": 9},
+            ),
+            text_turn(),
+        ],
+    )
+    assert OUTPUT_NO_LONGER_HELD in captured["all_incoming"]
+    assert "retry" not in captured["all_incoming"].lower()
+
+
+async def test_a_handle_from_a_previous_run_is_no_longer_held(sink: CollectingSink) -> None:
+    """★ THE STATED LIFETIME, exercised rather than asserted about. The harness builds a fresh
+    `SandboxSession` per run (`harness.py`), so the buffer dies with the turn — nothing here is
+    persisted to the database or to blob."""
+    fake = FakeSandbox()
+    fake.queue_commands(ExecResult(stdout=_long_output(), stderr="", exit=0))
+    first = await _run_following(fake, sink, ["npm", "run", "build"])
+    handle = _slice_call_in(first["incoming"][1])
+    assert handle is not None
+
+    # A SECOND run, with its own session — exactly what the harness does at the start of a build.
+    second = await _run(
+        fake,
+        sink,
+        [
+            tool_turn(
+                "fetch_output_slice",
+                {"handle": handle.group(1), "start_line": 40, "end_line": 60},
+            ),
+            text_turn(),
+        ],
+    )
+    assert OUTPUT_NO_LONGER_HELD in second["all_incoming"]
+
+
+def test_the_held_output_ring_is_bounded() -> None:
+    """★ The ring's cap, asserted as a number rather than trusted to a comment: the oldest handle
+    is evicted, never the newest, because the newest is the one the model was just handed."""
+    session = SandboxSession(
+        sandbox_client=FakeSandbox(), handle=FakeSandbox().handle(), app_id=uuid.uuid4()
+    )
+    handles = [f"out_{n:08x}" for n in range(constants.OUTPUT_SLICE_HANDLES_PER_TURN + 3)]
+    for name in handles:
+        session.hold_output(name, HeldOutput(command="npm run build", lines=("a", "b")))
+    assert len(session.held_outputs) == constants.OUTPUT_SLICE_HANDLES_PER_TURN
+    assert handles[0] not in session.held_outputs  # oldest evicted
+    assert handles[-1] in session.held_outputs  # newest kept
+
+
+async def test_a_very_large_capture_does_not_retain_unbounded_memory(
+    sink: CollectingSink,
+) -> None:
+    """The other half of the bound: ONE entry is capped too, by the same ReDoS input cap the
+    redactor runs under. 8 handles x 32k is the whole ceiling a live turn can reach."""
+    fake = FakeSandbox()
+    huge = "\n".join(f"line {n} {'y' * 200}" for n in range(5_000))  # ~1MB
+    fake.queue_commands(ExecResult(stdout=huge, stderr="", exit=1))
+    deps = _deps(fake, sink)
+    await build_agent.run(
+        "build",
+        deps=deps,
+        model=_capturing_model(
+            [tool_turn("run_command", {"command": ["npm", "run", "build"]}), text_turn()], {}
+        ),
+    )
+    held = list(deps.sandbox.held_outputs.values())
+    assert len(held) == 1
+    assert len("\n".join(held[0].lines)) <= constants.REDACT_INPUT_MAX_CHARS
+
+
+def test_predictable_noise_goes_but_vulnerability_and_deprecation_signal_stays() -> None:
+    """★ WHERE THE NOISE BOUNDARY IS DRAWN. Solicitations and progress frames are dropped because
+    nothing a model can do about them exists; anything naming a deprecation, a vulnerability, an
+    audit or a CVE is kept, because deciding a citizen's app may keep a deprecated or vulnerable
+    dependency is not a decision the output formatter gets to make."""
+    noise = [
+        "npm notice New major version of npm available! 10.8.2 -> 11.0.0",
+        "npm notice To update run: npm install -g npm@11.0.0",
+        "12 packages are looking for funding",
+        "  run `npm fund` for details",
+        "Progress: resolved 812, reused 800, downloaded 0, added 0",
+        "⠙ idealTree:app: sill idealTree buildDeps",
+        "[####______]",
+    ]
+    signal = [
+        "npm warn deprecated request@2.88.2: request has been deprecated",
+        "3 vulnerabilities (1 moderate, 2 high)",
+        "# npm audit report",
+        "severity: high",
+        "(node:71) [DEP0040] DeprecationWarning: The `punycode` module is deprecated.",
+        "GHSA-1234: see the advisory for CVE-2026-0001",
+    ]
+    for line in noise:
+        assert _is_predictable_noise(line), line
+    for line in signal:
+        assert not _is_predictable_noise(line), line
+    kept = _redact_command_output("\n".join(noise + signal), budget=16_000)
+    assert kept == "\n".join(signal)
+
+
+# --- U22 adoption instrumentation ------------------------------------------------------
+#
+# THE QUESTION THESE ANSWER is not "does the tool work" but "did it change anything": a slice
+# fetch is the round-trip the handle SAVED, and an identical command re-run inside one turn is
+# the round-trip it did not. They are only readable as a pair, so they are emitted as a pair.
+# `count` owns its own session and swallows everything (U25), so patching its module attribute is
+# the honest seam — the tool-boundary call sites are what is under test, not the writer.
+
+
+@pytest.fixture
+def counted(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    recorded: list[str] = []
+
+    async def _record(counter: Any, **_kwargs: Any) -> None:
+        recorded.append(str(counter))
+
+    monkeypatch.setattr("src.services.build_sessions.counters.count", _record)
+    return recorded
+
+
+async def test_truncation_is_counted_and_only_when_output_is_actually_cut(
+    sink: CollectingSink, counted: list[str]
+) -> None:
+    fake = FakeSandbox()
+    fake.queue_commands(ExecResult(stdout="all good", stderr="", exit=0))
+    await _run(fake, sink, [tool_turn("run_command", {"command": ["npm", "test"]}), text_turn()])
+    assert counted == []  # nothing was cut, so nothing is counted
+
+    fake.queue_commands(ExecResult(stdout=_long_output(lines=900), stderr="", exit=1))
+    await _run(fake, sink, [tool_turn("run_command", {"command": ["npm", "test"]}), text_turn()])
+    assert counted == [HarnessCounter.OUTPUT_TRUNCATED]
+
+
+async def test_a_slice_fetch_is_counted_and_a_dead_handle_is_not(
+    sink: CollectingSink, counted: list[str]
+) -> None:
+    fake = FakeSandbox()
+    fake.queue_commands(ExecResult(stdout=_long_output(), stderr="", exit=0))
+    await _run_following(fake, sink, ["npm", "run", "build"])
+    assert counted == [HarnessCounter.OUTPUT_TRUNCATED, HarnessCounter.OUTPUT_SLICE_FETCHED]
+
+    counted.clear()
+    await _run(
+        fake,
+        sink,
+        [
+            tool_turn(
+                "fetch_output_slice", {"handle": "out_gone", "start_line": 1, "end_line": 2}
+            ),
+            text_turn(),
+        ],
+    )
+    assert counted == []  # a handle that resolved to nothing fetched nothing
+
+
+async def test_a_repeat_run_is_counted_on_the_repeat_only(
+    sink: CollectingSink, counted: list[str]
+) -> None:
+    """★ The other half of the adoption pair, and the one that has to be exact: counted on the
+    SECOND identical command, never on the first, and never on a merely similar one."""
+    fake = FakeSandbox()
+    for _ in range(3):
+        fake.queue_commands(ExecResult(stdout="ok", stderr="", exit=0))
+    await _run(
+        fake,
+        sink,
+        [
+            tool_turn("run_command", {"command": ["npm", "run", "lint"]}),
+            tool_turn("run_command", {"command": ["npm", "run", "build"]}),
+            tool_turn("run_command", {"command": ["npm", "run", "lint"]}),
+            text_turn(),
+        ],
+    )
+    assert counted == [HarnessCounter.COMMAND_RERUN_IN_TURN]

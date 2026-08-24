@@ -236,6 +236,8 @@ TOOL SURFACE:
 - `declare_done` — Declare the build finished, and put your closing message to the user in \
 `summary`.
 - `run_command` — Run a shell command in the app workspace and get its output back.
+- `fetch_output_slice` — Read the part of a command's output that was cut, using the handle \
+from its truncation notice.
 - `list_files` — List every file in the app (relative paths; heavy dirs like node_modules \
 excluded).
 - `search_files` — Search the app's files for a regex `pattern` (grep-like; case-sensitive)."""

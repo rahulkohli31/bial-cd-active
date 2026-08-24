@@ -2521,7 +2521,7 @@ class SessionManager:
         session itself; `59b5d13` renaming `ensure_write_sandbox` to `ensure_sandbox` is the
         commit where the name stopped carrying it.
 
-        A Write turn is an ordinary chat turn that happens to hold the sandbox six, so it
+        A Write turn is an ordinary chat turn that happens to hold the sandbox seven, so it
         needs the same container, the same one-per-user lock and the same registry entry as a
         build — but no `run_build` task, no `build_started` marker, no attachments and no
         `started_seq`. Those four belong to the C7 build feed, which the turn engine replaces:

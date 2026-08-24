@@ -29,6 +29,7 @@ from src.services.agent.read_tools import (
     check_the_guest_list,
 )
 from src.services.agent.toolsets import ReadDeps, toolsets_for_mode, workspace_from_read_deps
+from src.services.orchestrator.tools import _redact_command_output
 from tests.services.orchestrator.model_harness import text_turn, tool_turn
 
 _SECRET_DSN = "postgresql://appuser:sup3rs3cretpw@db.example/appdb"
@@ -500,3 +501,138 @@ async def test_search_files_tool_rejects_a_bad_regex_with_teaching(
         toolsets=toolsets_for_mode(ConversationMode.ASK, workspace_from_read_deps),
     )
     assert "not a valid regular expression" in captured["incoming"][1]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# U22 / R28 — the two mirrored output caps, proved identical from ONE table
+# ═══════════════════════════════════════════════════════════════════════════════════════
+#
+# `orchestrator/tools._redact_command_output` and `read_tools._cap_redact_cap` are the same
+# algorithm written twice, on purpose: the read surface adds NO runtime edge into the orchestrator
+# package (both module docstrings say why), so the copy cannot be replaced by an import. What a
+# copy CAN be replaced by is a test — and it has to be ONE test over BOTH, not two tests that
+# happen to agree today. Every case below runs through both functions and asserts, first, that
+# they returned the same string; the behavioural assertions come after and are therefore
+# assertions about both.
+
+_MIDDLE_SECRET = "DATABASE_PASSWORD=hunter2-super-secret"
+_TOP = "FATAL: the migration runner refused to start"
+_BOTTOM = "error TS2322: Type 'string' is not assignable to type 'number'."
+
+
+def _long_capture(middle: str | None = None) -> str:
+    body = [f"  at frame {n:03d} of a long and tedious stack ({'x' * 30})" for n in range(140)]
+    if middle is not None:
+        body[len(body) // 2] = middle
+    return "\n".join([_TOP, *body, _BOTTOM])
+
+
+_CAP_CASES: list[tuple[str, str, int, str | None, list[str], list[str]]] = [
+    (
+        "short output is returned whole and unmarked",
+        "exit fine\nnothing to see",
+        4_000,
+        "out_abc12345",
+        ["exit fine", "nothing to see"],
+        ["elided", "fetch_output_slice"],
+    ),
+    (
+        "a long capture keeps head AND tail and states the loss",
+        _long_capture(),
+        4_000,
+        "out_abc12345",
+        [_TOP, _BOTTOM, "elided", 'fetch_output_slice(handle="out_abc12345"'],
+        ["  at frame 070 "],
+    ),
+    (
+        "with no handle the notice names no tool the mode does not have",
+        _long_capture(),
+        4_000,
+        None,
+        [_TOP, _BOTTOM, "elided", "re-run a narrower command"],
+        ["fetch_output_slice"],
+    ),
+    (
+        "a secret in the elided middle is masked before anything is cut",
+        _long_capture(middle=_MIDDLE_SECRET),
+        4_000,
+        "out_abc12345",
+        [_TOP, _BOTTOM],
+        ["hunter2"],
+    ),
+    (
+        "a secret straddling the cut is not re-exposed as a fragment",
+        ("A" * 1_969) + f" {_MIDDLE_SECRET} " + ("B" * 5_000),
+        4_000,
+        None,
+        ["DATABASE_PASSWORD=***"],
+        ["hunter2", "hunter2-sup"],
+    ),
+]
+
+# The noise case is deliberately NOT in the table above: it is the ONE dimension on which the two
+# copies are designed to differ, so asserting byte-equality on it would pin a bug as correct.
+# It is pinned per-copy instead, immediately below.
+_NOISY_CAPTURE = (
+    "npm notice New major version of npm available!\n"
+    "12 packages are looking for funding\n"
+    "  run `npm fund` for details\n"
+    "npm warn deprecated request@2.88.2: request has been deprecated\n"
+    "3 vulnerabilities (1 moderate, 2 high)"
+)
+
+
+@pytest.mark.parametrize(
+    ("text", "budget", "handle", "present", "absent"),
+    [case[1:] for case in _CAP_CASES],
+    ids=[case[0] for case in _CAP_CASES],
+)
+def test_the_two_mirrored_output_caps_behave_identically(
+    text: str, budget: int, handle: str | None, present: list[str], absent: list[str]
+) -> None:
+    """★ THE ANTI-DRIFT TEST. Mutation check: change either copy's head/tail split, budget
+    handling or redaction ordering and the equality assertion goes red before any of the
+    behavioural ones do — which is the point, because a drift that keeps both copies
+    self-consistent is exactly the one no per-module test would catch.
+
+    Compared against `denoise=False` because that is the ACTUAL parity claim: the two pipelines are
+    identical *modulo the noise arm*, which the read copy does not have and is not supposed to have
+    (see the block comment in `read_tools`). Comparing against the default `denoise=True` would
+    assert a design difference away, and the only way to make it pass would be to teach the read
+    surface to drop lines out of file content — the exact silent edit that comment forbids."""
+    read_mode = read_tools._cap_redact_cap(text, budget=budget, handle=handle)
+    write_mode = _redact_command_output(text, budget=budget, handle=handle, denoise=False)
+    assert read_mode == write_mode, "the mirrored output caps have drifted apart"
+    for expected in present:
+        assert expected in read_mode
+    for unwanted in absent:
+        assert unwanted not in read_mode
+
+
+def test_the_write_copy_drops_predictable_noise_but_keeps_the_signal() -> None:
+    """The noise arm, pinned on the copy that HAS one. A dependency-manager solicitation and a
+    vulnerability advisory arrive on the same stream, so the filter earns its keep only if it can
+    tell them apart — dropping an advisory to save four lines of chatter is a bad trade."""
+    kept = _redact_command_output(_NOISY_CAPTURE, budget=4_000, denoise=True)
+
+    assert "deprecated" in kept
+    assert "vulnerabilities" in kept
+    assert "npm notice" not in kept
+    assert "looking for funding" not in kept
+    assert "npm fund" not in kept
+
+
+def test_the_read_copy_never_drops_a_line_of_what_it_was_asked_to_read() -> None:
+    """The other half, and the reason the copies differ. Everything reaching the read surface is
+    FILE CONTENT — `check_the_guest_list` admits only `ls, cat, head, tail, grep, sed, find, wc`,
+    and `search_files` renders hits out of files. Dropping a line there is not a saving, it is a
+    silent edit: a `sed -n '40,80p'` that answers 40 of the 41 lines it was asked for, and an
+    `edit_file` composed from that read failing to match with nothing on screen to explain why.
+
+    Written over the same capture the Write copy de-noises, so the two tests read as the pair they
+    are. These are PRESENCE assertions throughout: an absence assertion here would pass by vacuity
+    against a function that returned "", which is exactly the false green to avoid."""
+    read = read_tools._cap_redact_cap(_NOISY_CAPTURE, budget=4_000)
+
+    for line in _NOISY_CAPTURE.splitlines():
+        assert line.strip() in read, f"the read surface silently dropped: {line!r}"

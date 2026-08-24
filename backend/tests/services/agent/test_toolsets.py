@@ -23,7 +23,13 @@ from pydantic_ai.toolsets.abstract import AbstractToolset
 
 from src.db.models.conversation import ConversationMode
 from src.services.agent.read_tools import ExtractedSnapshotWorkspace
-from src.services.agent.toolsets import ReadDeps, toolsets_for_mode, workspace_from_read_deps
+from src.services.agent.toolsets import (
+    _WRITE_STRUCTURED_READS,  # the allowlist U22's trap lives in — asserted against directly
+    ReadDeps,
+    registered_tool_definitions,
+    toolsets_for_mode,
+    workspace_from_read_deps,
+)
 from src.services.orchestrator.agent import build_agent
 from src.services.orchestrator.deps import BuildDeps, SandboxSession
 from src.services.orchestrator.progress import ProgressEmitter
@@ -33,6 +39,11 @@ from tests.services.orchestrator.model_harness import text_turn, tool_turn
 
 _READ_TOOLS = {"read_file", "list_files", "search_files", "run_command"}
 _WRITE_ONLY_TOOLS = {"write_file", "edit_file", "insert_lines", "declare_done"}
+_SANDBOX_ONLY_TOOLS = _WRITE_ONLY_TOOLS | {"fetch_output_slice"}
+"""U22: `fetch_output_slice` is registered on `sandbox_toolset`, so it is Write-only for exactly
+the same reason the four mutators are — and NOT on `read_only_toolset`, where the
+`_WRITE_STRUCTURED_READS` allowlist would have filtered it out of the only mode that runs
+commands, silently."""
 
 
 @pytest.fixture
@@ -153,15 +164,15 @@ def _build_deps() -> BuildDeps:
     )
 
 
-async def test_build_agent_still_carries_the_sandbox_six_natively() -> None:
+async def test_build_agent_still_carries_the_sandbox_seven_natively() -> None:
     # The harness path is unchanged by U5's convergence: `build_agent` is constructed with
-    # `sandbox_toolset` and offers exactly the six. Pinned here so the registry work below
+    # `sandbox_toolset` and offers exactly the seven. Pinned here so the registry work below
     # cannot quietly move the harness's surface too.
     seen: dict[str, Any] = {}
     await build_agent.run(
         "build it", deps=_build_deps(), model=_tool_listing_model(seen, [text_turn("done")])
     )
-    assert seen["tool_names"] == {"read_file", "run_command"} | _WRITE_ONLY_TOOLS
+    assert seen["tool_names"] == {"read_file", "run_command"} | _SANDBOX_ONLY_TOOLS
 
 
 def _write_toolsets(
@@ -178,10 +189,10 @@ def _write_toolsets(
     )
 
 
-async def test_write_mode_is_the_sandbox_six_plus_exactly_two_structured_reads(
+async def test_write_mode_is_the_sandbox_seven_plus_exactly_two_structured_reads(
     workspace: ExtractedSnapshotWorkspace,
 ) -> None:
-    # U5: Write is composed HERE now, not delegated to build_agent. The surface is the six
+    # U5: Write is composed HERE now, not delegated to build_agent. The surface is the seven
     # sandbox tools plus `list_files`/`search_files` borrowed off the read-only registry —
     # and nothing else. Mutation-check: widen `_WRITE_STRUCTURED_READS` to include
     # `read_file` and the CombinedToolset raises on the duplicate name → red.
@@ -193,7 +204,7 @@ async def test_write_mode_is_the_sandbox_six_plus_exactly_two_structured_reads(
         model=_tool_listing_model(seen, [text_turn("done")]),
         toolsets=_write_toolsets(workspace),
     )
-    assert seen["tool_names"] == _READ_TOOLS | _WRITE_ONLY_TOOLS
+    assert seen["tool_names"] == _READ_TOOLS | _SANDBOX_ONLY_TOOLS
 
 
 async def test_writes_run_command_is_the_sandbox_one_not_the_read_only_guest_list(
@@ -230,3 +241,25 @@ async def test_a_caller_that_cannot_run_write_is_told_so_rather_than_handed_no_t
     # having built nothing. Fail-first instead.
     with pytest.raises(ValueError, match="sandbox accessor"):
         toolsets_for_mode(ConversationMode.WRITE, workspace_from_read_deps)
+
+
+async def test_fetch_output_slice_reaches_write_the_only_mode_that_runs_commands() -> None:
+    """★ THE ALLOWLIST TRAP (U22/R28), asserted where it would have fired silently.
+
+    `_WRITE_STRUCTURED_READS` is an ALLOWLIST of exactly `list_files`/`search_files`. Register the
+    slice tool on `read_only_toolset` — the natural home for something that only reads — and the
+    filter drops it from Write, the ONE mode that runs commands and therefore the one mode whose
+    truncation notices hand out handles. Nothing else in this suite would have gone red: the read
+    modes would list a tool they can never use, and Write would quietly lose it.
+
+    Asserted against `toolsets_for_mode` (through `registered_tool_definitions`, which enumerates
+    it) rather than against a hand-kept name set, so the assertion is about the registry the model
+    is actually handed."""
+    write = set(await registered_tool_definitions(ConversationMode.WRITE))
+    assert "fetch_output_slice" in write
+    assert "run_command" in write  # the tool whose notices name it — same mode, by construction
+    # It is a SANDBOX tool, not a borrowed read: it is NOT in the allowlist, and it is NOT in the
+    # read-only surface either. Both halves matter — one alone is satisfied by the broken shape.
+    assert "fetch_output_slice" not in _WRITE_STRUCTURED_READS
+    for read_mode in (ConversationMode.ASK, ConversationMode.PLAN):
+        assert "fetch_output_slice" not in set(await registered_tool_definitions(read_mode))
