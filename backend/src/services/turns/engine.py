@@ -530,6 +530,13 @@ class _TurnState:
     ring: deque[TurnStreamFrame] = field(default_factory=lambda: deque(maxlen=RING_MAXLEN))
     text_parts: list[str] = field(default_factory=list)
     steps: dict[str, StepItem] = field(default_factory=dict)  # tool_call_id → newest item
+    # U17's acknowledgement, held OUT of `steps` and beside it. The distinction the original
+    # comment collapsed: `steps` is what gets PERSISTED, so the ack must stay out of it — but the
+    # catch-up SNAPSHOT is the only way a subscriber ever learns about a frame emitted before it
+    # connected, and every client connects after `start_turn` has already run. Keeping the ack out
+    # of both meant it reached nobody. Cleared by the first real step, which is what "replaced by
+    # the first real step" has to mean on a transport where the ring frame is unreachable.
+    acknowledgement: StepItem | None = None
     subscribers: set[asyncio.Queue[None]] = field(default_factory=set)
     task: asyncio.Task[None] | None = None
     # U17 — the per-tool-call "this is still running" narrators, keyed by tool call id.
@@ -765,6 +772,7 @@ class TurnEngine:
                 hidden=False,
                 detail=step_detail(None, None),
             )
+            state.acknowledgement = ack
             self._emit(
                 state,
                 lambda seq: StepFrame(
@@ -2432,6 +2440,9 @@ class TurnEngine:
                 self._emit_plan_options(state, event.part.tool_call_id)
                 return
             item = self._step_item(state, event.part.tool_name, event.part.args_as_json_str())
+            # REPLACED, not accumulated beside: the first real step retires the ack from the
+            # snapshot, so a client that subscribes later never sees both.
+            state.acknowledgement = None
             state.steps[event.part.tool_call_id] = item
             self._emit(
                 state,
@@ -2653,7 +2664,14 @@ class TurnEngine:
             # tail and the reload projection both ship hidden steps with full detail); making
             # it a payload filter HERE meant a client that reconnected mid-turn silently lost
             # steps the other two paths kept.
-            steps=list(state.steps.values()),
+            # THE ACK RIDES HERE, and this is the only place it can. It is emitted at `seq == 1`
+            # before any client can subscribe, and the route sets `last_sent = snapshot.seq`, so
+            # the ring frame is already behind every subscriber's cursor. Same reasoning the
+            # preview/compile/error_message fields above are carried for — a frame that fired
+            # before the client connected lives only in the ring, and the snapshot is what makes
+            # a subscription self-sufficient. Ordered FIRST so it reads as the oldest row.
+            steps=([state.acknowledgement] if state.acknowledgement else [])
+            + list(state.steps.values()),
             error_message=state.error_message,
             workspace_state=state.workspace_state,
             preview_url=state.preview_url,

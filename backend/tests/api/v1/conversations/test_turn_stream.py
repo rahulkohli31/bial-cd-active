@@ -36,6 +36,7 @@ from src.api.v1.conversations.turns import KEEPALIVE_SECONDS
 from src.config import settings
 from src.services.auth.csrf import issue_csrf_token
 from src.services.auth.session_jwt import mint_session_jwt
+from src.services.turns import engine as engine_module
 from src.services.turns.engine import TurnEngine, _TurnState, set_turn_engine_for_tests
 from src.services.turns.guard import _mid_reply
 from tests.factories import ConversationFactory, UserFactory
@@ -199,6 +200,60 @@ async def test_mid_turn_subscribe_gets_snapshot_then_tail(
     assert frames[0].text_so_far + deltas == "first second"
     assert frames[-1].type == "turn_ended" and frames[-1].status == "completed"
     assert events.text.endswith("data: [DONE]\n\n")
+
+
+async def test_the_acknowledgement_actually_reaches_a_subscriber(
+    client, db_session, set_chat_model, _fresh_engine
+) -> None:
+    """★ THE DELIVERY TEST, and the one whose absence hid the bug.
+
+    U17's acknowledgement had three passing tests — emitted before any model request, replaced by
+    the first real step, never persisted — and reached NOBODY. All three asserted against the
+    in-memory ring; none asserted against the stream a client actually reads.
+
+    The mechanism: the ack is `seq == 1`, emitted synchronously inside `start_turn` before the
+    detached task exists. Every client POSTs the turn and only then opens the stream, so by the
+    time it subscribes the route builds a snapshot, sets `last_sent = snapshot.seq` (already past
+    1), and yields only `seq > last_sent`. The ack frame was behind the cursor before anyone could
+    see it, and it was deliberately kept out of `state.steps`, so it was in neither the snapshot
+    nor the tail.
+
+    So this test subscribes exactly the way the portal does — POST, then GET with no cursor — and
+    asserts the acknowledgement is in the DELIVERED frames. Assert against the wire, not the ring:
+    that distinction is the entire defect."""
+    gate = asyncio.Event()
+
+    async def _paced(messages: list[ModelMessage], info: AgentInfo):
+        await gate.wait()
+        yield "done"
+
+    user, conv = await _auth_with_conversation(db_session)
+    set_chat_model(FunctionModel(stream_function=_paced))
+    resp = await _post_turn(client, _headers(user), conv)
+    assert resp.status_code == 202
+
+    state = _fresh_engine.peek(conv.id)
+    assert state is not None
+
+    reader = asyncio.create_task(
+        client.get(f"/v1/conversations/{conv.id}/events", headers=_headers(user))
+    )
+    while not state.subscribers:
+        await asyncio.sleep(0.01)
+    gate.set()
+    events = await asyncio.wait_for(reader, timeout=10)
+
+    frames = _frames_of(events.text)
+    assert frames[0].type == "snapshot"
+    # Liveness first: the stream really carried this turn, so the assertion below is about the
+    # acknowledgement's absence-or-presence and not about an empty read.
+    assert frames[-1].type == "turn_ended"
+
+    delivered = events.text
+    assert engine_module.ACK_TEXT in delivered, (
+        "the acknowledgement never reached the subscriber — it is emitted at seq 1, before any "
+        "client can connect, so it has to ride the snapshot"
+    )
 
 
 async def test_second_post_while_running_is_409(
