@@ -2,9 +2,12 @@
 
 THIS IS THE EXPOSURE BOUNDARY, and it is the reason these models are hand-written rather
 than derived from the ORM rows. Every other list on the platform is scoped by `user_id`
-(ADR-0004); the marketplace is the first read that deliberately drops that predicate, so
-what a caller may see about someone else's app has to be enumerated in one place a reviewer
-can check at a glance.
+(ADR-0004: cross-user access is normally an explicit, role-gated, audited action); the
+marketplace is a DELIBERATE, REASONED DEVIATION from that default, argued in full in PR
+#147 rather than an oversight — an enterprise platform where no app is a private document.
+There is no separate ADR document to amend for this (ADR-0004 has no standalone file in
+this repo, only inline citations); what a caller may see about someone else's app is
+instead enumerated in one place a reviewer can check at a glance, here.
 
 FOUR FIELDS, and nothing else: the application name, its description, the display name of
 the person who built it, and the address it is live at. Never app code, submission
@@ -25,7 +28,16 @@ from src.schemas.base import CamelModel
 
 class MarketplaceEntry(CamelModel):
     """One published app as the catalog shows it. See the module docstring for why this
-    list is short and closed."""
+    list is short and closed.
+
+    WORTH STATING PLAINLY: this materially widens a pre-existing accepted risk rather than
+    creating a new one. `login_required` has no enforcement reader anywhere on the platform,
+    and a published app carries no auth of its own — so this endpoint converts "you need to
+    already have the URL" into "everyone signed in has every URL, searchable by what the app
+    does." No `SECURITY.md` exists in this repo to carry that line separately, so it is
+    recorded here, next to the field that does it (`url`). The mitigating context: #148's
+    `AUTO_DEPLOY_MAX_SCORE = 0` gate already routes any sensitive-category app through
+    mandatory admin review before it can go live at all."""
 
     #: The app's name. `app_registry` carries no name of its own (#48) — the owning
     #: project's name IS the app name.
@@ -46,9 +58,14 @@ class MarketplaceListResponse(CamelModel):
     `pagination.py` states the platform's position plainly: keyset, not offset, and no
     `total`/`totalPages` (KD-1), because offset cannot guarantee a page with no duplicates
     or skips while rows are being inserted underneath it. That reasoning is about a list YOU
-    OWN AND ARE WRITING TO. The marketplace is a read-only catalog of other people's
-    published apps: nobody is inserting into it while you page through it, and #145 sizes it
-    at 10-200 rows, where `COUNT(*)` is trivial and offset's deep-page cost never arrives.
+    OWN AND ARE WRITING TO — but it is NOT true that nobody writes this derived view while a
+    caller pages through it. `store.succeed` and `store.unpublish` write it on every deploy
+    and every takedown, and because ids are UUIDv7 under `ORDER BY id DESC`, an insert lands
+    at position 0 — the worst case for OFFSET, not a benign one. The ACCEPTED risk, stated
+    honestly rather than assumed away: a concurrent deploy or unpublish during a page walk
+    can duplicate or skip an entry at a page boundary, and `total` is a separate read from
+    the page itself under READ COMMITTED, not one snapshot. #145 sizes the catalog at
+    10-200 rows, where that window is small and `COUNT(*)` stays trivial regardless.
 
     What offset buys that keyset cannot: a page NUMBER a person can jump to, a total so the
     UI knows how many pages exist, and ordering by something other than the cursor column —

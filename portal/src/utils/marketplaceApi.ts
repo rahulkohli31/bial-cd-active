@@ -8,8 +8,11 @@
  * The parsers coerce rather than throw on a missing optional field: a catalog entry whose
  * builder has no display name, or whose app has no description, is a normal row here (#145
  * accepts that descriptions are not guaranteed), not a response we should refuse to render.
+ * That tolerance extends to a whole row: this is the ONE list on the platform every user
+ * shares, so one unparseable entry drops itself rather than blanking the catalog for the
+ * entire org.
  */
-import { ApiError, isRecord, readApiError } from './apiError'
+import { isRecord, readApiError } from './apiError'
 import { authFetch } from './api'
 import type { AuthFetchDeps } from './api'
 
@@ -24,6 +27,15 @@ export interface MarketplaceEntry {
 /** How the catalog may be ordered while BROWSING. Ignored while searching, where relevance
  *  wins — see `listMarketplace`. */
 export type MarketplaceSort = 'newest' | 'name'
+
+/** The page sizes the rows-per-page control offers, and the default it starts on.
+ *
+ *  Exported from HERE rather than declared in the page so the component's initial state and
+ *  `toPage`'s fallback are the same number by construction. They previously disagreed (the
+ *  page defaulted to 10, the parser fell back to 25), which is only invisible because the
+ *  fallback is unreachable while the server always sends `pageSize`. */
+export const PAGE_SIZES = [10, 25, 50] as const
+export const DEFAULT_PAGE_SIZE = PAGE_SIZES[0]
 
 /**
  * An OFFSET page of catalog entries.
@@ -62,11 +74,13 @@ function asNumber(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback
 }
 
-function toEntry(value: unknown): MarketplaceEntry {
+/** One row, or `null` if it is unusable. NOT a throw: see `toPage`. */
+function toEntry(value: unknown): MarketplaceEntry | null {
   if (!isRecord(value) || typeof value.url !== 'string' || value.url === '') {
     // The URL is the one field an entry cannot be useful without — it is the whole point of
-    // the listing, and an entry only exists server-side because a deployment has one.
-    throw new ApiError('The server returned a marketplace entry we could not read.', 500)
+    // the listing, and an entry only exists server-side because a deployment has one. A row
+    // without one is dropped rather than rendered as a dead card.
+    return null
   }
   return {
     name: asString(value.name),
@@ -79,9 +93,19 @@ function toEntry(value: unknown): MarketplaceEntry {
 function toPage(value: unknown): MarketplacePage {
   const doc = isRecord(value) ? value : {}
   return {
-    items: Array.isArray(doc.items) ? doc.items.map(toEntry) : [],
+    // DROP unparseable rows, never discard the page. This is the one list on the platform
+    // shared by every user, so an all-or-nothing throw here has an org-wide blast radius:
+    // a single malformed entry would blank the catalog for everyone rather than for the one
+    // app that is broken. Matches this module's stated "coerce, don't throw" posture for
+    // every other field.
+    items: Array.isArray(doc.items)
+      ? doc.items.flatMap((row) => {
+          const entry = toEntry(row)
+          return entry === null ? [] : [entry]
+        })
+      : [],
     page: asNumber(doc.page, 1),
-    pageSize: asNumber(doc.pageSize, 25),
+    pageSize: asNumber(doc.pageSize, DEFAULT_PAGE_SIZE),
     total: asNumber(doc.total, 0),
     // Never below 1: a control that renders "Page 1 of 0" for an empty catalog reads as
     // broken rather than empty.

@@ -1,11 +1,13 @@
 """`GET /v1/marketplace` — the catalog of published apps, and keyword search over it (#145).
 
 THE ONE READ ON THIS PLATFORM THAT DELIBERATELY DROPS THE `user_id` PREDICATE. Every other
-list is owner-scoped (ADR-0004); this one exists precisely because that scoping means
-nothing in the product can answer "what has anyone else already built?", so people rebuild
-tools that are already running. It is authenticated but NOT admin-gated: this is an
-enterprise platform, no app on it is personal, and the missing catalog is a gap rather than
-a privacy feature.
+list is owner-scoped (ADR-0004: cross-user access is normally an explicit, role-gated,
+audited action). This route is a DELIBERATE, REASONED DEVIATION from that default — not an
+oversight — argued in full in PR #147: an enterprise platform where no app is a private
+document, reading a read-only, non-personal catalog, authenticated but not admin-gated.
+There is no separate ADR document to amend (ADR-0004 has no standalone file in this repo,
+only inline citations like this one); the deviation is recorded here, next to the code it
+governs, instead.
 
 Because that predicate is absent on purpose, the exposure surface is pinned in one place —
 `MarketplaceEntry` (`schemas/marketplace.py`) — and this module SELECTs those columns
@@ -29,6 +31,7 @@ from typing import Annotated, Any, Literal
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Query
+from sqlalchemy.orm import aliased
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.v1.pagination import (
@@ -39,19 +42,14 @@ from src.api.v1.pagination import (
     clean_search,
 )
 from src.core.errors import AppApiError
-from src.db.models.app_registry import AppRegistry
+from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.deployment import Deployment, DeploymentStatus
-from src.db.models.project import Project
+from src.db.models.project import DESCRIPTION_TSV_REGCONFIG, Project
 from src.db.models.user import User
 from src.schemas import AUTH_401, ErrorEnvelope, error_responses
 from src.schemas.marketplace import MarketplaceEntry, MarketplaceListResponse
 
 router = APIRouter(prefix="/marketplace", tags=["marketplace"])
-
-# The search configuration, named once. It must match the one the generated `description_tsv`
-# column was built with (migration 0033) — a query parsed under a different configuration
-# stems differently and silently under-matches.
-_REGCONFIG = "english"
 
 #: What the browse-order control offers. A closed set, validated rather than defaulted: a
 #: typo'd `sort` must 422 rather than quietly returning newest-first, which looks to the
@@ -62,16 +60,24 @@ PageQuery = Annotated[int, Query()]
 SortQuery = Annotated[str | None, Query()]
 
 
+# Bounds `(page - 1) * limit` comfortably inside int64 so an absurd page number 422s
+# instead of overflowing asyncpg's OFFSET parameter (a raw `DataError: value out of int64
+# range` reaching the client as an unhandled 500 — contradicting this route's own "a page
+# past the end is empty, not an error" contract). Far beyond any realistic catalog depth:
+# #145 sizes the whole catalog at 10-200 rows.
+MAX_PAGE = 100_000
+
+
 def clean_page(value: int) -> int:
-    """Reject a non-positive `?page=` in the same `{error:{message}}` 422 shape as
+    """Reject an out-of-range `?page=` in the same `{error:{message}}` 422 shape as
     `clean_limit`/`clean_search`.
 
     Lives here rather than in `pagination.py` on purpose: that module is the platform's
     KEYSET contract, and putting an offset helper inside it would blur the one boundary this
     endpoint's deviation depends on staying visible.
     """
-    if value < 1:
-        raise AppApiError(422, "page must be 1 or greater.")
+    if not 1 <= value <= MAX_PAGE:
+        raise AppApiError(422, f"page must be between 1 and {MAX_PAGE}.")
     return value
 
 
@@ -87,17 +93,45 @@ def clean_sort(value: str | None) -> Sort:
     raise AppApiError(422, "sort must be one of: newest, name.")
 
 
-def _live_catalog(search: str | None) -> sa.Select[Any]:
+def _live_catalog(search: str | None) -> tuple[sa.Select[Any], Any]:
     """The catalog's membership predicate + the active filter, expressed EXACTLY ONCE.
 
     Both the page query and the `COUNT(*)` build on this. That is not tidiness: a total
     computed over a different predicate than the page would render page numbers the user can
     click and find empty, and the discrepancy would only appear at a page boundary.
 
-    An app is listed because it currently has a live deployment: a `succeeded` attempt that
-    produced a URL and has not been taken down. `unpublished_at` is a second axis from
-    `status` (#113) — a taken-down app keeps its `succeeded` status, so filtering on status
-    alone would keep listing an app an admin has deliberately pulled.
+    `deployments` is APPEND-ONLY — one row per deploy attempt, not one row per app — so
+    membership is derived from a COLLAPSE, not a flat filter. Two different collapses,
+    because they answer two different questions and reading either off the wrong row is a
+    real bug (#147 review), not a hypothetical one:
+
+    `unpublished_at` is authoritative ONLY on the ABSOLUTE NEWEST row per app. That is the
+    exact row `unpublish` itself resolves via `latest_for_app` and stamps, WHATEVER ITS
+    STATUS (`deploy/router.py`'s own `unpublish` docstring: "THE ROW TO STAMP IS THE NEWEST
+    ONE, NOT THE NEWEST SUCCEEDED ONE" — a redeploy that settles FAILED can still leave the
+    container running, externally addressable, and billing). A later deploy attempt always
+    supersedes an earlier unpublish; reading `unpublished_at` off any row OTHER than the
+    absolute newest can miss an unpublish stamped on a failed redeploy.
+
+    What is actually SHOWN is the newest row that SUCCEEDED with a URL. A later FAILED
+    redeploy does not retract this: the pipeline creates the container app before it awaits
+    the new revision, so a failed attempt commonly leaves the PREVIOUS successful revision
+    still running and serving (`deploy/service.py`'s own citizen-facing copy, verbatim in
+    five places: "Your previous version is still running"). Collapsing to the newest row
+    REGARDLESS of status — the simpler-looking version of this query — would drop that app
+    from the catalog on every failed redeploy, which is wrong for the identical reason the
+    old flat-filter version could show the same app twice: both read the wrong row.
+
+    `AppRegistry.status != AppStatus.DISABLED` is a separate axis again: `disable` (the
+    admin kill-switch for a compromised or data-leaking app) severs the per-app database but
+    writes nothing to `deployments`, so an app can be disabled while its most recent
+    deployment row still reads `succeeded`. This predicate is scoped entirely to this query;
+    `disable()` itself is unchanged — see the PR body for why that boundary was kept.
+
+    SUSPENDED OWNERS are a decision, not an accident of the `User` join: an already-published
+    app does not stop being useful to someone else merely because its builder's account is
+    suspended, and de-listing on suspension has its own edge cases (an app under active use).
+    So this deliberately does NOT filter on `User.suspended_at`.
 
     KNOWN LIMITATION, decided during planning rather than discovered in production: a
     deployment whose container was torn down out-of-band still reads `succeeded` and stays
@@ -105,37 +139,64 @@ def _live_catalog(search: str | None) -> sa.Select[Any]:
     pipeline and freezes at settle, and the deploy reconciler sweeps only RUNNING rows — and
     the alternatives were both worse: probing every candidate on a paginated read turns a
     cheap query into an I/O fan-out, and teaching the reconciler to sweep settled rows is a
-    separate piece of work. Admin unpublish is the intended correction.
+    separate piece of work. Admin unpublish is the intended correction — and, since the
+    collapse above, it now actually works for a multi-deploy app.
+
+    Returns `(query, deployment)` — `deployment` is the ORM-aliased "newest successful row
+    per app" entity the query selects from. Callers need it for ordering/column selection:
+    the raw `Deployment` class no longer participates in the FROM clause once the collapse
+    is in place.
     """
+    newest = (
+        sa.select(Deployment.app_id, Deployment.unpublished_at)
+        .distinct(Deployment.app_id)
+        .order_by(Deployment.app_id, Deployment.id.desc())
+        .subquery()
+    )
+    last_success = (
+        sa.select(Deployment)
+        .where(Deployment.status == DeploymentStatus.SUCCEEDED, Deployment.url.is_not(None))
+        .distinct(Deployment.app_id)
+        .order_by(Deployment.app_id, Deployment.id.desc())
+        .subquery()
+    )
+    deployment = aliased(Deployment, last_success, name="last_success")
+
     query = (
-        sa.select(Deployment.id)
-        .select_from(Deployment)
-        .join(AppRegistry, AppRegistry.id == Deployment.app_id)
+        sa.select(deployment.id)
+        .select_from(deployment)
+        .join(newest, newest.c.app_id == deployment.app_id)
+        .join(AppRegistry, AppRegistry.id == deployment.app_id)
         .join(Project, Project.id == AppRegistry.project_id)
         # The builder, for their display name only. INNER join: an app with no owner row is
         # not a catalog entry, it is a data-integrity problem, and it should not be listed.
-        .join(User, User.id == Deployment.user_id)
+        .join(User, User.id == deployment.user_id)
         .where(
-            Deployment.status == DeploymentStatus.SUCCEEDED,
-            Deployment.url.is_not(None),
-            Deployment.unpublished_at.is_(None),
+            newest.c.unpublished_at.is_(None),
+            AppRegistry.status != AppStatus.DISABLED,
         )
     )
     if search is not None:
         query = query.where(Project.description_tsv.op("@@")(_tsquery(search)))
-    return query
+    return query, deployment
 
 
 def _tsquery(search: str) -> sa.Function[Any]:
-    return sa.func.websearch_to_tsquery(_REGCONFIG, search)
+    return sa.func.websearch_to_tsquery(DESCRIPTION_TSV_REGCONFIG, search)
 
 
 def _entry(row: sa.Row[Any]) -> MarketplaceEntry:
+    # `row._tuple()`, not attribute access: `Row.__getattr__` is typed to return `Any`
+    # unconditionally, so `row.name`/`row.url`/etc type-check clean no matter how the row
+    # is shaped — a rename or reorder in `with_only_columns` below becomes a runtime
+    # `AttributeError`, not a type error. `_tuple()` carries the real tuple type, so the
+    # order here must match `with_only_columns`'s order exactly.
+    name, description, display_name, url, _id = row._tuple()
     return MarketplaceEntry(
-        name=row.name,
-        description=row.description,
-        builder_display_name=row.display_name,
-        url=row.url,
+        name=name,
+        description=description,
+        builder_display_name=display_name,
+        url=url,
     )
 
 
@@ -177,18 +238,20 @@ async def list_marketplace(
     search = clean_search(q)
     order = clean_sort(sort)
 
-    # COUNT over the same predicate as the page — see `_live_catalog`.
-    total = await db.scalar(
-        sa.select(sa.func.count()).select_from(_live_catalog(search).subquery())
-    )
+    # COUNT over the same predicate as the page — see `_live_catalog`. A fresh call, not a
+    # shared query object: each call to `_live_catalog` builds its own independent collapse
+    # subqueries, so the COUNT and the page can never accidentally share (and corrupt) state.
+    count_query, _ = _live_catalog(search)
+    total = await db.scalar(sa.select(sa.func.count()).select_from(count_query.subquery()))
     total = int(total or 0)
 
-    query = _live_catalog(search).with_only_columns(
+    catalog, deployment = _live_catalog(search)
+    query = catalog.with_only_columns(
         Project.name,
         Project.description,
         User.display_name,
-        Deployment.url,
-        Deployment.id,
+        deployment.url,
+        deployment.id,
     )
 
     if search is not None:
@@ -196,7 +259,7 @@ async def list_marketplace(
         # same query differently.
         query = query.order_by(
             sa.func.ts_rank_cd(Project.description_tsv, _tsquery(search)).desc(),
-            Deployment.id.desc(),
+            deployment.id.desc(),
         )
     elif order == "name":
         # `lower()` makes the ordering COLLATION-INDEPENDENT rather than case-insensitive
@@ -205,9 +268,9 @@ async def list_marketplace(
         # no test can tell the two apart here. Under `C` collation it would matter: byte
         # ordering puts every capital ahead of every lowercase, so "Zebra" would sort before
         # "apple". Kept so the answer does not depend on how a database was initialised.
-        query = query.order_by(sa.func.lower(Project.name).asc(), Deployment.id.desc())
+        query = query.order_by(sa.func.lower(Project.name).asc(), deployment.id.desc())
     else:
-        query = query.order_by(Deployment.id.desc())
+        query = query.order_by(deployment.id.desc())
 
     rows = (await db.execute(query.offset((page - 1) * limit).limit(limit))).all()
 

@@ -11,6 +11,15 @@
  * to this one surface). The debounce that hook provided is kept here by hand — typing must
  * not fire a request per keystroke.
  *
+ * ONE DISPATCHER, and it is the effect below. Every fetch this page makes comes from that
+ * single `useEffect`, keyed on the COMMITTED state (`page`/`pageSize`/`sort`/`applied`).
+ * The debounce commits `applied` and nothing else; it never calls the loader itself. That
+ * is what makes the controls safe to interleave: an earlier design had the debounce firing
+ * its own request with `pageSize`/`sort` captured at KEYSTROKE time, so changing rows-per-page
+ * inside the 300ms window lost to a stale request that happened to be issued later and
+ * therefore won the `requestId` guard — rendering rows fetched at the old page size while
+ * the control read the new one.
+ *
  * THE RULE THAT TIES THE CONTROLS TOGETHER: anything that changes what the result SET is —
  * a new query, a new page size, a new sort — resets to page 1. Without that you can be on
  * page 4 of a three-page result and see nothing, with no clue why.
@@ -30,6 +39,15 @@ import {
   PaginationPrevious,
 } from '../components/ui/pagination'
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '../components/ui/select'
+import {
+  DEFAULT_PAGE_SIZE,
+  PAGE_SIZES,
   listMarketplace,
   type MarketplaceEntry,
   type MarketplacePage,
@@ -37,10 +55,6 @@ import {
 } from '../utils/marketplaceApi'
 
 const DEBOUNCE_MS = 300
-const PAGE_SIZES = [10, 25, 50] as const
-// Matches the mockup, and is why the control is visible at all on a small catalog: at 25 a
-// 20-app catalog is one page and there is nothing to page through.
-const DEFAULT_PAGE_SIZE = PAGE_SIZES[0]
 /** How many numbered buttons to show before collapsing to an ellipsis. */
 const WINDOW = 5
 
@@ -110,7 +124,11 @@ function EntryCard({ entry }: { entry: MarketplaceEntry }): React.JSX.Element {
 
 export default function MarketplacePage(): React.JSX.Element {
   const [query, setQuery] = useState('')
-  const [applied, setApplied] = useState<string | null>(null)
+  // The COMMITTED filter text — what actually produced the rows on screen. Distinct from
+  // `query`, which runs ahead by the debounce window. Never read inside the dispatcher's
+  // dependencies as `query`, or a page click mid-keystroke would send text the user has not
+  // finished typing.
+  const [applied, setApplied] = useState('')
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE)
   const [sort, setSort] = useState<MarketplaceSort>('newest')
@@ -122,6 +140,12 @@ export default function MarketplacePage(): React.JSX.Element {
   // Guards against an out-of-order response overwriting a newer one: type fast enough and a
   // slow early request can land after the request that superseded it.
   const requestId = useRef(0)
+  // The last page number that actually RENDERED. A failed fetch rolls `page` back to this,
+  // so the highlighted page always matches the cards on screen and re-clicking the page that
+  // failed is a real state change rather than a no-op React bails out of. A ref, not state:
+  // putting it in `load`'s dependencies would change the callback's identity and re-trigger
+  // the dispatcher.
+  const lastGoodPage = useRef(1)
 
   const load = useCallback(
     async (args: { page: number; pageSize: number; sort: MarketplaceSort; q: string }) => {
@@ -135,12 +159,16 @@ export default function MarketplacePage(): React.JSX.Element {
           q: args.q || undefined,
         })
         if (id !== requestId.current) return // superseded
+        lastGoodPage.current = body.page
         setData(body)
-        setApplied(args.q)
         setError(null)
       } catch (err) {
         if (id !== requestId.current) return
         setError(err instanceof Error ? err : new Error('Failed to load the marketplace'))
+        // Without this the failed page number stays active over the PREVIOUS page's cards,
+        // and clicking it again is `setPage(sameValue)` — React bails, the effect never
+        // re-runs, and there is no way back short of a reload.
+        setPage(lastGoodPage.current)
       } finally {
         if (id === requestId.current) setLoading(false)
       }
@@ -148,23 +176,20 @@ export default function MarketplacePage(): React.JSX.Element {
     [],
   )
 
-  // Page / size / sort changes fetch immediately; only the free-text box is debounced, and
-  // that debounce lives in `onQueryChange` rather than here so a page click is never delayed.
+  // THE ONLY PLACE A FETCH IS DISPATCHED. Everything else commits state and lets this run.
   useEffect(() => {
-    void load({ page, pageSize, sort, q: query })
-    // `query` is applied through the debounced handler below; including it here would fire a
-    // request per keystroke. The directive has to sit on the line immediately above the deps
-    // array — with the reason above it, not appended to it, or it suppresses nothing.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page, pageSize, sort, load])
+    void load({ page, pageSize, sort, q: applied })
+  }, [page, pageSize, sort, applied, load])
 
   const onQueryChange = (next: string): void => {
     setQuery(next)
     if (debounce.current !== null) clearTimeout(debounce.current)
     debounce.current = setTimeout(() => {
       debounce.current = null
+      // Commit only. The dispatcher above notices `applied` changed and does the fetch, so
+      // no control handler has to clear anyone else's pending timer to stay correct.
+      setApplied(next)
       setPage(1) // a new query is a new result set
-      void load({ page: 1, pageSize, sort, q: next })
     }, DEBOUNCE_MS)
   }
 
@@ -178,7 +203,7 @@ export default function MarketplacePage(): React.JSX.Element {
   // Decided from the query that produced the CURRENT items, never the input value — the
   // input runs ahead by the debounce window, so using it would flash "nothing published
   // yet" at someone who has merely started typing.
-  const searching = applied !== null && applied !== ''
+  const searching = applied !== ''
   const { items, totalPages, total } = data
   const goTo = (next: number): void => setPage(Math.min(Math.max(1, next), totalPages))
 
@@ -187,8 +212,12 @@ export default function MarketplacePage(): React.JSX.Element {
   // 30 apps at 50 rows is a single page, so the control that would take you back to 10 would
   // be hidden exactly when you wanted it. It shows whenever the catalog is larger than the
   // smallest size on offer.
-  const showSizer = !loading && total > PAGE_SIZES[0]
-  const showPages = !loading && totalPages > 1
+  //
+  // Neither is gated on `!loading` any more: doing so unmounted the whole control on every
+  // fetch, so the button under the pointer vanished mid-click, keyboard focus dropped to
+  // <body>, and the layout shifted. They stay mounted and are marked `aria-busy` instead.
+  const showSizer = total > PAGE_SIZES[0]
+  const showPages = totalPages > 1
 
   return (
     // Same shell as ProjectsPage: each page renders its own `Navbar` (there is no layout
@@ -228,21 +257,36 @@ export default function MarketplacePage(): React.JSX.Element {
             />
           </div>
 
-          <label className="flex items-center gap-2 text-xs text-neutral whitespace-nowrap">
+          {/* A <label> cannot wrap a non-labelable element, and Radix's trigger is a
+              <button> — so the visible "Sort by" text no longer associates for free and the
+              trigger carries its own accessible name. */}
+          <div className="flex items-center gap-2 text-xs text-neutral whitespace-nowrap">
             Sort by
-            <select
-              data-testid="marketplace-sort"
+            <Select
               value={sort}
-              onChange={(e) => {
-                setSort(e.target.value as MarketplaceSort)
+              onValueChange={(value: string) => {
+                // Total over the two-member union rather than `as MarketplaceSort`: adding a
+                // third sort server-side becomes a compile-time decision here instead of a
+                // silent runtime fallback to 'newest'.
+                setSort(value === 'name' ? 'name' : 'newest')
                 setPage(1) // a new order is a new result set
               }}
-              className="px-2.5 py-2 text-sm text-tertiary bg-white border border-bial-border rounded-xl focus:outline-none focus:ring-2 focus:ring-primary/30"
             >
-              <option value="newest">Newest first</option>
-              <option value="name">Name (A–Z)</option>
-            </select>
-          </label>
+              {/* Width pinned: a Radix trigger is content-sized and would otherwise jitter
+                  between "Newest first" and "Name (A–Z)". */}
+              <SelectTrigger
+                data-testid="marketplace-sort"
+                aria-label="Sort by"
+                className="w-[150px]"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="newest">Newest first</SelectItem>
+                <SelectItem value="name">Name (A–Z)</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
         </div>
 
         {/* Said plainly while searching: the sort control stays usable, but relevance wins,
@@ -262,13 +306,19 @@ export default function MarketplacePage(): React.JSX.Element {
 
         {items.length > 0 && (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            {items.map((entry) => (
-              <EntryCard key={entry.url} entry={entry} />
+            {items.map((entry, i) => (
+              // Index-qualified: the server now guarantees one row per app, but a future
+              // server-side duplicate should degrade to a visible duplicate card rather than
+              // a React reconciliation hazard.
+              <EntryCard key={`${entry.url}-${i}`} entry={entry} />
             ))}
           </div>
         )}
 
-        {!loading && items.length === 0 && (
+        {/* `!error` matters: on a failed first load `loading` is false and `items` is empty,
+            so without it this renders "Nothing has been published yet" directly beneath the
+            error banner — telling the user the catalog is empty when we do not know. */}
+        {!loading && !error && items.length === 0 && (
           <p data-testid="marketplace-empty" className="text-sm text-neutral py-10 text-center">
             {searching
               ? 'No published app matches that yet.'
@@ -280,66 +330,74 @@ export default function MarketplacePage(): React.JSX.Element {
 
         {(showSizer || showPages) && (
           <div className="flex flex-col sm:flex-row items-center justify-between gap-4 pt-2">
-            {/* `sm:ml-auto` on the nav keeps it right-aligned when the sizer is absent. */}
             {showSizer && (
-            <label className="flex items-center gap-2 text-xs text-neutral whitespace-nowrap">
-              Rows per page
-              <select
-                data-testid="marketplace-page-size"
-                value={pageSize}
-                onChange={(e) => {
-                  setPageSize(Number(e.target.value))
-                  setPage(1) // a new page size renumbers every page
-                }}
-                className="px-2.5 py-1.5 text-sm text-tertiary bg-white border border-bial-border rounded-xl focus:outline-none focus:ring-2 focus:ring-primary/30"
-              >
-                {PAGE_SIZES.map((size) => (
-                  <option key={size} value={size}>
-                    {size}
-                  </option>
-                ))}
-              </select>
-            </label>
+              <div className="flex items-center gap-2 text-xs text-neutral whitespace-nowrap">
+                Rows per page
+                <Select
+                  value={String(pageSize)}
+                  onValueChange={(value: string) => {
+                    // Radix values are strings only, so this coerces at both ends.
+                    setPageSize(Number(value))
+                    setPage(1) // a new page size renumbers every page
+                  }}
+                >
+                  <SelectTrigger
+                    data-testid="marketplace-page-size"
+                    aria-label="Rows per page"
+                    className="w-[72px] py-1.5"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {PAGE_SIZES.map((size) => (
+                      <SelectItem key={size} value={String(size)}>
+                        {size}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
             )}
 
+            {/* `sm:ml-auto` keeps the nav right-aligned when the sizer is absent. */}
             {showPages && (
-            <Pagination className="mx-0 w-auto justify-end sm:ml-auto">
-              <PaginationContent>
-                <PaginationItem>
-                  <PaginationPrevious
-                    data-testid="marketplace-prev"
-                    disabled={page <= 1}
-                    onClick={() => goTo(page - 1)}
-                  />
-                </PaginationItem>
+              <Pagination className="mx-0 w-auto justify-end sm:ml-auto" aria-busy={loading}>
+                <PaginationContent>
+                  <PaginationItem>
+                    <PaginationPrevious
+                      data-testid="marketplace-prev"
+                      disabled={page <= 1}
+                      onClick={() => goTo(page - 1)}
+                    />
+                  </PaginationItem>
 
-                {pageWindow(page, totalPages).map((entry, i) =>
-                  entry === 'gap' ? (
-                    <PaginationItem key={`gap-${i}`}>
-                      <PaginationEllipsis />
-                    </PaginationItem>
-                  ) : (
-                    <PaginationItem key={entry}>
-                      <PaginationLink
-                        data-testid={`marketplace-page-${entry}`}
-                        isActive={entry === page}
-                        onClick={() => goTo(entry)}
-                      >
-                        {entry}
-                      </PaginationLink>
-                    </PaginationItem>
-                  ),
-                )}
+                  {pageWindow(page, totalPages).map((entry, i) =>
+                    entry === 'gap' ? (
+                      <PaginationItem key={`gap-${i}`}>
+                        <PaginationEllipsis />
+                      </PaginationItem>
+                    ) : (
+                      <PaginationItem key={entry}>
+                        <PaginationLink
+                          data-testid={`marketplace-page-${entry}`}
+                          isActive={entry === page}
+                          onClick={() => goTo(entry)}
+                        >
+                          {entry}
+                        </PaginationLink>
+                      </PaginationItem>
+                    ),
+                  )}
 
-                <PaginationItem>
-                  <PaginationNext
-                    data-testid="marketplace-next"
-                    disabled={page >= totalPages}
-                    onClick={() => goTo(page + 1)}
-                  />
-                </PaginationItem>
-              </PaginationContent>
-            </Pagination>
+                  <PaginationItem>
+                    <PaginationNext
+                      data-testid="marketplace-next"
+                      disabled={page >= totalPages}
+                      onClick={() => goTo(page + 1)}
+                    />
+                  </PaginationItem>
+                </PaginationContent>
+              </Pagination>
             )}
           </div>
         )}

@@ -37,6 +37,25 @@ _INDEX = "ix_projects_description_tsv"
 
 
 def upgrade() -> None:
+    # LOCKING, for whoever runs this against production (#147 review).
+    #
+    # `ADD COLUMN ... GENERATED ALWAYS AS (...) STORED` is NOT the metadata-only fast path a
+    # plain nullable `ADD COLUMN` gets: Postgres computes and stores the expression for every
+    # existing row under ACCESS EXCLUSIVE, blocking reads AND writes on `projects` for the
+    # duration. And `projects` is not the 10-200-row marketplace catalog — it is every user's
+    # every project. The `CREATE INDEX` below is not CONCURRENTLY either, so it holds a SHARE
+    # lock (blocking writes) while it builds.
+    #
+    # Both are almost certainly a non-event at this table's real size, which is why this is a
+    # comment rather than an `autocommit_block()` + CONCURRENTLY rewrite (that variant leaves
+    # an INVALID index needing manual cleanup if it fails, a worse trade at this scale). What
+    # is worth knowing is the queue behaviour: nothing here sets `lock_timeout`, so if any
+    # session is holding even an AccessShareLock when the ALTER queues, everything behind it
+    # stalls FIFO rather than failing fast. Check `count(*)` on `projects` first, and consider
+    # `SET LOCAL lock_timeout = '5s'` as cheap insurance on a busy database.
+    #
+    # The two-arg `to_tsvector('english', ...)` is required, not stylistic: the one-arg form
+    # is rejected outright with `ERROR: generation expression is not immutable`.
     op.execute(
         """
         ALTER TABLE projects

@@ -2,12 +2,13 @@
  * The marketplace client's REQUEST and PARSE contract (#145).
  *
  * Two things are worth pinning here that a component test cannot reach. First, the query
- * string: `q`, `cursor` and `limit` have to arrive as the server's own param names or the
- * catalog silently ignores the search and returns page one of everything — a failure that
- * looks like "search found nothing" rather than "search never ran". Second, the tolerant
- * parse: a description or a builder display name may legitimately be absent (#145 does not
- * generate descriptions), so those must come back as `null` rather than throwing away the
- * whole page.
+ * string: `q`, `page`, `limit` and `sort` have to arrive as the server's own param names or
+ * the catalog silently ignores the search and returns page one of everything — a failure
+ * that looks like "search found nothing" rather than "search never ran". Second, the
+ * tolerant parse: a description or a builder display name may legitimately be absent (#145
+ * does not generate descriptions), so those must come back as `null` rather than throwing
+ * away the whole page — and a row that is unusable outright drops itself rather than taking
+ * the catalog down with it.
  */
 import { describe, it, expect, vi } from 'vitest'
 import { listMarketplace } from '../marketplaceApi'
@@ -28,7 +29,7 @@ const ENTRY = {
   builderDisplayName: 'Priya Builder',
   url: 'https://pub-abc.example/',
 }
-const PAGE = { items: [ENTRY], page: 1, pageSize: 25, total: 1, totalPages: 1 }
+const PAGE = { items: [ENTRY], page: 1, pageSize: 10, total: 1, totalPages: 1 }
 
 describe('listMarketplace request shape', () => {
   it('hits the catalog with no query string when unfiltered', async () => {
@@ -78,7 +79,7 @@ describe('listMarketplace parse contract', () => {
 
     expect(page.items[0]).toEqual(ENTRY)
     expect(page.page).toBe(1)
-    expect(page.pageSize).toBe(25)
+    expect(page.pageSize).toBe(10)
     expect(page.total).toBe(1)
     expect(page.totalPages).toBe(1)
   })
@@ -106,12 +107,16 @@ describe('listMarketplace parse contract', () => {
     expect(page.total).toBe(0)
   })
 
-  it('refuses an entry with no url — the one field a listing cannot be useful without', async () => {
-    const broken = { ...PAGE, items: [{ ...ENTRY, url: '' }] }
+  it('drops an unparseable row rather than discarding the whole page', async () => {
+    // The URL is the one field an entry cannot be useful without, so a row without one is
+    // not renderable. But this is the ONE list every user on the platform shares, so an
+    // all-or-nothing throw has an org-wide blast radius — one malformed entry would blank
+    // the catalog for everyone instead of for the single app that is broken.
+    const mixed = { ...PAGE, items: [{ ...ENTRY, url: '' }, ENTRY], total: 2 }
 
-    await expect(listMarketplace({}, deps(vi.fn(async () => ok(broken))))).rejects.toThrow(
-      /could not read/i,
-    )
+    const page = await listMarketplace({}, deps(vi.fn(async () => ok(mixed))))
+
+    expect(page.items).toEqual([ENTRY])
   })
 
   it('surfaces a non-ok response as an ApiError', async () => {

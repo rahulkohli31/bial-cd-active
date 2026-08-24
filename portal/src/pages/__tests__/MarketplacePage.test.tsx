@@ -8,8 +8,14 @@
  *
  * The empty state is also decided from the query that produced the CURRENT items, never the
  * input value, which runs ahead by the debounce window.
+ *
+ * Both dropdowns are Radix `<Select>`s, not native `<select>`s (#147 review: a native
+ * option list is drawn by the OS and cannot be branded). That changes how tests drive them:
+ * `fireEvent.change` on a `role="combobox"` button does not throw, it silently no-ops — so
+ * a stale interaction here surfaces as a `waitFor` timeout rather than an obvious error.
+ * Use `pickSelect`.
  */
-import { describe, it, expect, vi, afterEach } from 'vitest'
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 
@@ -17,7 +23,13 @@ import MarketplacePage from '../MarketplacePage'
 import type { MarketplacePage as Page } from '../../utils/marketplaceApi'
 
 const h = vi.hoisted(() => ({ listMarketplace: vi.fn() }))
-vi.mock('../../utils/marketplaceApi', () => h)
+vi.mock('../../utils/marketplaceApi', async (importOriginal) => {
+  // Only the network call is faked. `PAGE_SIZES`/`DEFAULT_PAGE_SIZE` are real constants the
+  // component renders from, so stubbing the whole module would silently empty the
+  // rows-per-page list and make its assertions meaningless.
+  const actual = await importOriginal<typeof import('../../utils/marketplaceApi')>()
+  return { ...actual, ...h }
+})
 // Stubbed like every other page test here: the chrome is not what this file is about, and
 // the real one pulls in auth + router state the assertions do not touch.
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
@@ -33,7 +45,7 @@ const entry = (over: Partial<Page['items'][number]> = {}) => ({
 const page = (over: Partial<Page> = {}): Page => ({
   items: [entry()],
   page: 1,
-  pageSize: 25,
+  pageSize: 10,
   total: 1,
   totalPages: 1,
   ...over,
@@ -49,7 +61,23 @@ const renderPage = () =>
 /** The args of the most recent request — what the page actually asked the server for. */
 const lastCall = () => h.listMarketplace.mock.calls.at(-1)?.[0]
 
+/** Opens a <Select> trigger and picks the option with this text. */
+async function pickSelect(triggerTestId: string, optionText: string) {
+  fireEvent.click(screen.getByTestId(triggerTestId))
+  fireEvent.click(await screen.findByRole('option', { name: optionText }))
+}
+
 afterEach(cleanup)
+beforeEach(() => {
+  h.listMarketplace.mockReset()
+  // jsdom doesn't implement these; Radix's <Select> calls them on open/scroll (suite-wide
+  // convention, see UsersLimitsPanel/BuilderPage test files — vitest.config.js has no
+  // setupFiles, so the shim lives per-file).
+  Element.prototype.scrollIntoView = vi.fn()
+  Element.prototype.hasPointerCapture = vi.fn().mockReturnValue(false)
+  Element.prototype.releasePointerCapture = vi.fn()
+  Element.prototype.setPointerCapture = vi.fn()
+})
 
 describe('MarketplacePage', () => {
   it('shows an app built by someone else, naming the builder', async () => {
@@ -109,12 +137,27 @@ describe('MarketplacePage', () => {
   })
 
   it('disables Previous on the first page and Next on the last', async () => {
+    // Both halves of the name, actually exercised. An earlier version asserted "Prev
+    // disabled" and "Next enabled" while never leaving page 1 — both page-1 facts, so
+    // `disabled={page >= totalPages}` was never evaluated at the boundary and a mutant that
+    // dropped it survived.
     h.listMarketplace.mockResolvedValue(page({ pageSize: 10, total: 25, totalPages: 3 }))
     renderPage()
 
     const prev = await screen.findByTestId('marketplace-prev', {}, { timeout: 5000 })
     expect((prev as HTMLButtonElement).disabled).toBe(true)
     expect((screen.getByTestId('marketplace-next') as HTMLButtonElement).disabled).toBe(false)
+
+    // Navigate to the LAST page and assert the other end of the boundary.
+    h.listMarketplace.mockResolvedValue(
+      page({ page: 3, pageSize: 10, total: 25, totalPages: 3 }),
+    )
+    fireEvent.click(screen.getByTestId('marketplace-page-3'))
+
+    await waitFor(() =>
+      expect((screen.getByTestId('marketplace-next') as HTMLButtonElement).disabled).toBe(true),
+    )
+    expect((screen.getByTestId('marketplace-prev') as HTMLButtonElement).disabled).toBe(false)
   })
 
   it('resets to page 1 when the page size changes', async () => {
@@ -128,7 +171,7 @@ describe('MarketplacePage', () => {
     fireEvent.click(screen.getByTestId('marketplace-page-3'))
     await waitFor(() => expect(lastCall()).toMatchObject({ page: 3 }))
 
-    fireEvent.change(screen.getByTestId('marketplace-page-size'), { target: { value: '50' } })
+    await pickSelect('marketplace-page-size', '50')
 
     await waitFor(() => expect(lastCall()).toMatchObject({ page: 1, limit: 50 }))
   })
@@ -142,7 +185,9 @@ describe('MarketplacePage', () => {
     fireEvent.click(screen.getByTestId('marketplace-page-3'))
     await waitFor(() => expect(lastCall()).toMatchObject({ page: 3 }))
 
-    fireEvent.change(screen.getByTestId('marketplace-sort'), { target: { value: 'name' } })
+    // NB: en dash (U+2013) in "Name (A–Z)", not a hyphen — `findByRole` name matching is
+    // exact, so a plain '-' silently fails to match and times out.
+    await pickSelect('marketplace-sort', 'Name (A–Z)')
 
     await waitFor(() => expect(lastCall()).toMatchObject({ page: 1, sort: 'name' }))
   })
@@ -174,7 +219,7 @@ describe('MarketplacePage', () => {
     renderPage()
     await screen.findByText('Baggage Belt Faults', {}, { timeout: 5000 })
 
-    fireEvent.change(screen.getByTestId('marketplace-sort'), { target: { value: 'name' } })
+    await pickSelect('marketplace-sort', 'Name (A–Z)')
     fireEvent.change(screen.getByTestId('marketplace-search'), { target: { value: 'baggage' } })
 
     await waitFor(() => expect(lastCall()).toMatchObject({ q: 'baggage' }))
@@ -186,5 +231,97 @@ describe('MarketplacePage', () => {
     renderPage()
 
     expect(await screen.findByText(/no description yet/i, {}, { timeout: 5000 })).toBeTruthy()
+  })
+
+  it('does not claim the catalog is empty when the FIRST load failed', async () => {
+    // The reviewer's exact scenario, and it has to be the FIRST load: `loading` is false,
+    // `error` is set, and `data` is still the EMPTY sentinel — so `items.length === 0` is
+    // genuinely true and the empty-state copy renders right beside the error banner,
+    // telling the reader the marketplace is empty when in fact we do not know.
+    //
+    // Failing a LATER load does not pin this: `data` still holds the previous page's items,
+    // so `items.length === 0` is false and the empty state stays hidden for the wrong
+    // reason. (Learned the hard way — the first version of this receipt survived its mutant.)
+    //
+    // Mutation receipt: drop `!error` from the empty-state guard and this goes red.
+    h.listMarketplace.mockRejectedValue(new Error('Network is down'))
+    renderPage()
+
+    expect(await screen.findByRole('alert', {}, { timeout: 5000 })).toBeTruthy()
+    expect(screen.queryByTestId('marketplace-empty')).toBeNull()
+  })
+
+  it('shows the error alone on a failed load, and lets the reader retry', async () => {
+    // Two defects pinned here, neither of which had ANY coverage before (#147 review): the
+    // failed page staying active over the PREVIOUS page's cards, and the retry being a
+    // no-op because `setPage(sameValue)` is a React bail-out, so the dispatcher never
+    // re-runs. (The empty-state guard is pinned by the test above, which fails the FIRST
+    // load — the only point at which `items` is genuinely empty.)
+    h.listMarketplace.mockResolvedValue(page({ pageSize: 10, total: 25, totalPages: 3 }))
+    renderPage()
+    await screen.findByTestId('marketplace-page-2', {}, { timeout: 5000 })
+
+    h.listMarketplace.mockRejectedValueOnce(new Error('Network is down'))
+    fireEvent.click(screen.getByTestId('marketplace-page-2'))
+
+    expect(await screen.findByRole('alert', {}, { timeout: 5000 })).toBeTruthy()
+
+    // `page` rolled back to the last one that rendered, so page 1 is active again — which
+    // is what makes re-clicking page 2 a real state change rather than a no-op.
+    await waitFor(() =>
+      expect(screen.getByTestId('marketplace-page-1').getAttribute('aria-current')).toBe('page'),
+    )
+
+    h.listMarketplace.mockResolvedValue(
+      page({ page: 2, pageSize: 10, total: 25, totalPages: 3 }),
+    )
+    fireEvent.click(screen.getByTestId('marketplace-page-2'))
+
+    await waitFor(() => expect(lastCall()).toMatchObject({ page: 2 }))
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+  })
+
+  it('ignores a stale response that lands after a newer one', async () => {
+    // The `requestId` guard, which was previously deletable with the whole suite green
+    // (#147 review). The FIRST request resolves LAST here — exactly the interleaving a slow
+    // network produces — so an implementation without the guard commits the stale page-2
+    // body over the page-3 one the user actually asked for.
+    let resolveFirst: (value: Page) => void = () => {}
+    const firstInFlight = new Promise<Page>((resolve) => {
+      resolveFirst = resolve
+    })
+
+    h.listMarketplace.mockResolvedValue(page({ pageSize: 10, total: 25, totalPages: 3 }))
+    renderPage()
+    await screen.findByTestId('marketplace-page-2', {}, { timeout: 5000 })
+
+    const stale = page({
+      page: 2,
+      pageSize: 10,
+      total: 25,
+      totalPages: 3,
+      items: [entry({ name: 'STALE PAGE TWO', url: 'https://pub-stale.example/' })],
+    })
+    const fresh = page({
+      page: 3,
+      pageSize: 10,
+      total: 25,
+      totalPages: 3,
+      items: [entry({ name: 'FRESH PAGE THREE', url: 'https://pub-fresh.example/' })],
+    })
+
+    h.listMarketplace.mockReturnValueOnce(firstInFlight) // page 2 — hangs
+    fireEvent.click(screen.getByTestId('marketplace-page-2'))
+    await waitFor(() => expect(lastCall()).toMatchObject({ page: 2 }))
+
+    h.listMarketplace.mockResolvedValueOnce(fresh) // page 3 — resolves immediately
+    fireEvent.click(screen.getByTestId('marketplace-page-3'))
+    await screen.findByText('FRESH PAGE THREE', {}, { timeout: 5000 })
+
+    // Only now does the superseded page-2 request come back.
+    resolveFirst(stale)
+
+    await waitFor(() => expect(screen.queryByText('STALE PAGE TWO')).toBeNull())
+    expect(screen.getByText('FRESH PAGE THREE')).toBeTruthy()
   })
 })

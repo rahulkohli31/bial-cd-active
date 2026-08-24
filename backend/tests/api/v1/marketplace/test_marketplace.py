@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
+from src.db.models.app_registry import AppStatus
 from src.db.models.deployment import Deployment, DeploymentStatus
 from src.services.auth.session_jwt import mint_session_jwt
 from tests.factories import AppRegistryFactory, ProjectFactory, UserFactory
@@ -44,15 +45,21 @@ async def _published_app(
     status: DeploymentStatus = DeploymentStatus.SUCCEEDED,
     url: str | None = "https://pub-example.azurecontainerapps.io/",
     unpublished_at: datetime | None = None,
+    app_status: AppStatus | None = None,
 ) -> Deployment:
     """A project + its one app + a deployment row in the shape a finished deploy leaves.
 
     Defaults describe a LIVE app — succeeded, has a URL, not taken down — so each test
-    overrides only the one axis it is about, and a reader can see which.
+    overrides only the one axis it is about, and a reader can see which. `app_status` is
+    `None` by default (the factory's own `AppStatus.DRAFT`), overridden only by the
+    disabled-app test — the catalog otherwise never reads `AppRegistry.status`.
     """
     owner = await UserFactory.create(db, email=owner_email, display_name=display_name)
     project = await ProjectFactory.create(db, owner.id, name=name, description=description)
-    app = await AppRegistryFactory.create(db, user_id=owner.id, project_id=project.id)
+    registry_overrides = {} if app_status is None else {"status": app_status}
+    app = await AppRegistryFactory.create(
+        db, user_id=owner.id, project_id=project.id, **registry_overrides
+    )
     row = Deployment(
         app_id=app.id,
         user_id=owner.id,
@@ -67,11 +74,41 @@ async def _published_app(
     return row
 
 
+async def _redeploy(
+    db: AsyncSession,
+    prior: Deployment,
+    *,
+    status: DeploymentStatus = DeploymentStatus.SUCCEEDED,
+    url: str | None = "https://pub-example.azurecontainerapps.io/",
+    unpublished_at: datetime | None = None,
+) -> Deployment:
+    """A second (or later) deployment attempt for the SAME app — what an ordinary redeploy
+    actually leaves in the append-only `deployments` table.
+
+    `_published_app` mints exactly one row per app, and every one of the original 16 tests
+    used it — so no test represented an app that had been redeployed, which is an ordinary
+    thing the append-only table explicitly supports. That gap is exactly what let both the
+    duplicate-listing and unpublish-bypass bugs ship green (#147 review).
+    """
+    row = Deployment(
+        app_id=prior.app_id,
+        user_id=prior.user_id,
+        status=status,
+        image_digest="sha256:" + "cd" * 32,
+        url=url,
+        unpublished_at=unpublished_at,
+    )
+    db.add(row)
+    await db.flush()
+    await db.refresh(row)
+    return row
+
+
 async def test_a_signed_in_user_sees_an_app_built_by_someone_else(app, client, db_session) -> None:
     """THE POINT OF THE FEATURE, and the first read on this platform that is correct
     BECAUSE it is not owner-scoped.
 
-    Mutation receipt: add `Deployment.user_id == user.id` to `_live_catalog_query`'s
+    Mutation receipt: add `Deployment.user_id == user.id` to `_live_catalog`'s
     `where(...)` and this goes red with an empty catalog."""
     headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
     await _published_app(
@@ -132,6 +169,143 @@ async def test_an_unpublished_app_leaves_the_catalog(app, client, db_session) ->
         name="Taken Down Tool",
         description="This one was pulled.",
         unpublished_at=datetime.now(UTC),
+    )
+
+    resp = await client.get(_MARKETPLACE, headers=headers)
+
+    assert resp.json()["items"] == []
+
+
+async def test_a_redeployed_app_is_listed_once(app, client, db_session) -> None:
+    """The duplicate-listing blocker (#147 review). `deployments` is APPEND-ONLY — a
+    redeploy adds a SECOND succeeded row for the same app, it does not replace the first —
+    and the URL is identical across both because `published_app_name` derives the
+    container name from the immutable `app_id`. Before the collapse in `_live_catalog`,
+    this returned two byte-identical cards and a `total` that counted attempts, not apps.
+
+    Mutation receipt: replace the `last_success` DISTINCT ON collapse with a flat filter
+    (drop straight to `sa.select(Deployment).where(status==SUCCEEDED, url.is_not(None))`,
+    no `.distinct(...)`) and this goes red with two items and `total == 2`."""
+    headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
+    first = await _published_app(
+        db_session,
+        owner_email="builder@rvaiglobal.com",
+        name="Redeployed Tool",
+        description="Deployed more than once.",
+    )
+    await _redeploy(db_session, first)
+
+    resp = await client.get(_MARKETPLACE, headers=headers)
+    body = resp.json()
+
+    assert [item["name"] for item in body["items"]] == ["Redeployed Tool"]
+    assert body["total"] == 1
+
+
+async def test_unpublish_survives_a_redeploy(app, client, db_session) -> None:
+    """The unpublish-bypass blocker (#147 review). Admin unpublish stamps `unpublished_at`
+    on the NEWEST deployment row for the app (`deploy/router.py`'s `unpublish`, via
+    `store.latest_for_app`) — so on a redeployed app, only the second row carries the
+    stamp. A catalog that filtered a flat `unpublished_at IS NULL` across every row would
+    resurrect the app through its first, unstamped row.
+
+    Mutation receipt: read `unpublished_at` off the `last_success` collapse's own row
+    instead of the separate `newest` collapse, and this goes red with the app still
+    listed."""
+    headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
+    first = await _published_app(
+        db_session,
+        owner_email="builder@rvaiglobal.com",
+        name="Unpublished After Redeploy",
+        description="Taken down on its second deploy.",
+    )
+    await _redeploy(db_session, first, unpublished_at=datetime.now(UTC))
+
+    resp = await client.get(_MARKETPLACE, headers=headers)
+
+    assert resp.json()["items"] == []
+
+
+async def test_a_failed_redeploy_does_not_unlist_the_still_serving_app(
+    app, client, db_session
+) -> None:
+    """The design decision the review left explicitly open: a redeploy attempt that
+    settles FAILED does not mean the app went dark. The pipeline creates the container app
+    before it awaits the new revision, so a failed attempt commonly leaves the PREVIOUS,
+    succeeded revision still running and serving — `deploy/service.py`'s own citizen-facing
+    copy states this outright: "Your previous version is still running." Collapsing to the
+    newest row REGARDLESS of status (the reviewer's literal suggested SQL) would drop this
+    app from the catalog on every failed redeploy; collapsing to the newest SUCCEEDED row
+    does not.
+
+    Mutation receipt: collapse `last_success` to the newest row overall instead of the
+    newest row where `status == SUCCEEDED` (i.e. drop the `.where(status==SUCCEEDED,
+    url.is_not(None))` filter before the `.distinct(...)`), and this goes red with an
+    empty catalog."""
+    headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
+    first = await _published_app(
+        db_session,
+        owner_email="builder@rvaiglobal.com",
+        name="Still Running After A Failed Redeploy",
+        description="The old revision is still serving.",
+    )
+    await _redeploy(db_session, first, status=DeploymentStatus.FAILED, url=None)
+
+    resp = await client.get(_MARKETPLACE, headers=headers)
+    body = resp.json()
+
+    assert [item["name"] for item in body["items"]] == ["Still Running After A Failed Redeploy"]
+    assert body["total"] == 1
+
+
+async def test_unpublish_after_a_failed_redeploy_still_removes_the_app(
+    app, client, db_session
+) -> None:
+    """Pins the two-collapse design specifically, not just its two halves separately. A
+    naive fix that reads `unpublished_at` off the SUCCEEDED row's own value (rather than
+    off the absolute newest row) would pass the previous two tests but fail this one: here
+    the admin's unpublish lands on the FAILED redeploy — because `unpublish` always
+    targets the newest row, whatever its status — and the succeeded row's own
+    `unpublished_at` stays NULL throughout.
+
+    Mutation receipt: read `unpublished_at` from `last_success`'s own row instead of the
+    separate `newest` (absolute-newest-row) collapse, and this goes red with the app still
+    listed despite the unpublish."""
+    headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
+    first = await _published_app(
+        db_session,
+        owner_email="builder@rvaiglobal.com",
+        name="Unpublished Via A Failed Redeploy",
+        description="The kill-switch landed on the failed attempt.",
+    )
+    await _redeploy(
+        db_session,
+        first,
+        status=DeploymentStatus.FAILED,
+        url=None,
+        unpublished_at=datetime.now(UTC),
+    )
+
+    resp = await client.get(_MARKETPLACE, headers=headers)
+
+    assert resp.json()["items"] == []
+
+
+async def test_a_disabled_app_is_not_advertised(app, client, db_session) -> None:
+    """The second blocker (#147 review): `disable` (the admin kill-switch for a
+    compromised or data-leaking app) severs the per-app database but writes nothing to
+    `deployments` — so a disabled app's deployment row can still read `succeeded`, and the
+    old flat filter kept advertising it platform-wide.
+
+    Mutation receipt: drop `AppRegistry.status != AppStatus.DISABLED` from `_live_catalog`
+    and this goes red with the app still listed."""
+    headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
+    await _published_app(
+        db_session,
+        owner_email="builder@rvaiglobal.com",
+        name="Disabled For Cause",
+        description="Pulled by an admin for a data-classification hit.",
+        app_status=AppStatus.DISABLED,
     )
 
     resp = await client.get(_MARKETPLACE, headers=headers)
@@ -382,6 +556,28 @@ async def test_a_non_positive_page_is_a_422(app, client, db_session) -> None:
     headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
 
     resp = await client.get(_MARKETPLACE, headers=headers, params={"page": 0})
+
+    assert resp.status_code == 422
+
+
+async def test_an_absurdly_large_page_is_a_422_not_a_500(app, client, db_session) -> None:
+    """`clean_page` bounds BOTH ends, like `clean_limit`. Without an upper bound,
+    `(page - 1) * limit` overflows int64 on its way into asyncpg's OFFSET parameter
+    (`DataError: value out of int64 range`), which falls through to the catch-all as a
+    500 — contradicting this route's own documented "a page past the end is empty, not an
+    error" contract.
+
+    Distinct from `test_a_page_past_the_end_is_empty_not_an_error`, which uses `page=9`:
+    that is a legitimate past-the-end read and must stay a 200. This is the failure
+    region, nowhere near it.
+
+    Mutation receipt: drop the `<= MAX_PAGE` half of the bound and this goes red with a
+    500 instead of a 422."""
+    headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
+
+    resp = await client.get(
+        _MARKETPLACE, headers=headers, params={"page": 99999999999999999999, "limit": 100}
+    )
 
     assert resp.status_code == 422
 

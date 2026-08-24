@@ -36,6 +36,12 @@ MAX_PROJECT_NAME = 120
 # an unbounded description is an uncapped per-turn token cost (KD-8). Enforced at the
 # Pydantic write boundary (U4/U7); this constant is the shared source of truth.
 MAX_PROJECT_DESCRIPTION = 2000
+# The marketplace's search text configuration (#145, migration 0033), named ONCE here —
+# where the generated column it must match lives — and imported by the marketplace router
+# rather than redeclared. A query parsed under a different configuration than the one the
+# generated column was built with stems differently and silently under-matches; that
+# failure mode is exactly why this can't be two independent constants that happen to agree.
+DESCRIPTION_TSV_REGCONFIG = "english"
 
 
 class Project(UUIDv7PrimaryKeyMixin, TimestampMixin, OwnedByUserMixin, Base):
@@ -55,8 +61,25 @@ class Project(UUIDv7PrimaryKeyMixin, TimestampMixin, OwnedByUserMixin, Base):
     # `coalesce(description, '')` mirrors the migration exactly: a NULL description yields
     # an empty tsvector, which matches nothing — which is how an app with no description
     # stays out of search while remaining in the unfiltered catalog (#145, accepted).
+    #
+    # `deferred=True`: this column is otherwise mapped, non-deferred, and `Project` is
+    # loaded as a full entity on the chat hot path (`conversations/turns.py`,
+    # `conversations/transition.py`, `claude/router.py`, `services/projects/resolve.py`) —
+    # every one of those was pulling the tsvector along for no reason. Deferred loading
+    # does NOT affect the marketplace router: it never loads `Project` as an ORM instance,
+    # it references `Project.description_tsv` as a raw column expression in `.where()` /
+    # `order_by()`, which works identically whether the mapped attribute is deferred or not.
+    #
+    # DEPLOY-ORDERING HAZARD: this column must exist before the image that queries it
+    # ships — migrate first, THEN deploy; roll back in the reverse order (redeploy the
+    # previous image first, then downgrade). Getting this backwards makes every chat turn
+    # and every build fail with `UndefinedColumn`, org-wide, not just `/v1/marketplace`.
     description_tsv: Mapped[str | None] = mapped_column(
         TSVECTOR,
-        sa.Computed("to_tsvector('english', coalesce(description, ''))", persisted=True),
+        sa.Computed(
+            f"to_tsvector('{DESCRIPTION_TSV_REGCONFIG}', coalesce(description, ''))",
+            persisted=True,
+        ),
         nullable=True,
+        deferred=True,
     )
