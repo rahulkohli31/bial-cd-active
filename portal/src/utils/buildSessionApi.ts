@@ -9,7 +9,7 @@
  * never `any`. Every non-2xx becomes an `ApiError` (via `readApiError`) so callers
  * branch on `.status` / `.code` (409 / 403) instead of re-parsing envelopes.
  *
- * CSRF (KTD-2): `start` / `stop` / all lock ops are mutating POSTs and carry the
+ * CSRF (KTD-2): `start` / `stop` / `forceEnd` are mutating POSTs and carry the
  * signed double-submit token (`X-CSRF-Token`, reusing `auth.js` `getCsrfToken()`);
  * `getStatus` GET and the SSE GET (a separate transport, `buildSessionEvents.ts`)
  * are safe methods and carry NO token. This is net-new: no prior business route in
@@ -24,8 +24,6 @@ import type {
   BuildSessionStatus,
   BuildSessionStatusResponse,
   ForceEndResponse,
-  LockReleaseResponse,
-  LockStateResponse,
   RelaunchPreviewRequest,
   RelaunchPreviewResponse,
   StartBuildRequest,
@@ -64,7 +62,7 @@ const BASE = '/api/build-sessions'
 const JSON_HEADERS = { 'Content-Type': 'application/json' }
 
 /**
- * Thrown by `start` (and `acquireLock`) on a `409 build_session_already_active`,
+ * Thrown by `start` (and `relaunchPreview`) on a `409 build_session_already_active`,
  * carrying the EXISTING session's id so the caller can `getStatus` it and decide,
  * by comparing projectIds, between re-attach (same project) and block (cross-project)
  * — the `409` alone is not a self-describing discriminator (U5 identity model).
@@ -91,10 +89,6 @@ function asStringOrNull(value: unknown): string | null {
 
 function asNumberOrNull(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
-}
-
-function asNumber(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0
 }
 
 /** A status we don't recognize is unusable — fail closed rather than let the UI render an undefined lifecycle. */
@@ -183,22 +177,6 @@ function toForceEndResponse(value: unknown): ForceEndResponse {
   return { sessionId: requireSessionId(value), status: toBuildSessionStatus(value.status) }
 }
 
-function toLockStateResponse(value: unknown): LockStateResponse {
-  if (!isRecord(value)) throw new ApiError('The server returned a lock state we could not read.', 500)
-  return {
-    sessionId: requireSessionId(value),
-    held: value.held === true,
-    ownerUserId: asString(value.ownerUserId),
-    ttlSeconds: asNumber(value.ttlSeconds),
-    expiresAt: asString(value.expiresAt),
-  }
-}
-
-function toLockReleaseResponse(value: unknown): LockReleaseResponse {
-  if (!isRecord(value)) throw new ApiError('The server returned a lock state we could not read.', 500)
-  return { sessionId: requireSessionId(value), released: value.released === true }
-}
-
 // ─── request plumbing ────────────────────────────────────────────────────────
 
 /** The double-submit CSRF header for a mutating POST, or `{}` when no csrf cookie is readable (parity with `auth.js`). */
@@ -217,8 +195,8 @@ function existingSessionIdOf(body: unknown): string | null {
 }
 
 /**
- * A mutating POST with CSRF. `body === undefined` sends no JSON body (the lock ops
- * and heartbeat take none, C3 §3). A non-2xx becomes an `ApiError`, EXCEPT a
+ * A mutating POST with CSRF. `body === undefined` sends no JSON body (`forceEnd` — the one
+ * surviving lock op — takes none, C3 §3). A non-2xx becomes an `ApiError`, EXCEPT a
  * `409 build_session_already_active` which becomes the richer
  * `BuildSessionAlreadyActiveError` carrying the existing session id.
  */
@@ -296,18 +274,11 @@ export async function getStatus(sessionId: string, deps: AuthFetchDeps = {}): Pr
 }
 
 // ─── lock operations (C3 §3) ─────────────────────────────────────────────────
-
-/** `acquire` — take the one-per-user lock explicitly. 409 → `BuildSessionAlreadyActiveError`. */
-export async function acquireLock(sessionId: string, deps: AuthFetchDeps = {}): Promise<LockStateResponse> {
-  const body = await postJson(`${BASE}/${encodeURIComponent(sessionId)}/lock/acquire`, undefined, 'Failed to acquire the build lock', deps)
-  return toLockStateResponse(body)
-}
-
-/** `release` — graceful release after a clean stop. Idempotent. */
-export async function releaseLock(sessionId: string, deps: AuthFetchDeps = {}): Promise<LockReleaseResponse> {
-  const body = await postJson(`${BASE}/${encodeURIComponent(sessionId)}/lock/release`, undefined, 'Failed to release the build lock', deps)
-  return toLockReleaseResponse(body)
-}
+//
+// `acquireLock` and `releaseLock` are GONE (U28): nothing called them — the portal's blind
+// keep-alive loop that was their only caller was itself deleted back in U13, same as
+// `renewLock` and `heartbeat` before them (see the note above). `forceEnd` is the one lock
+// op still reachable from the UI, fed by relaunch's 409.
 
 /** `force-end` — the owner-only kill switch (`kill_switch()`), regardless of in-flight state. A non-owner → `403 build_session_forbidden`. */
 export async function forceEnd(sessionId: string, deps: AuthFetchDeps = {}): Promise<ForceEndResponse> {
@@ -326,8 +297,6 @@ export interface BuildSessionClient {
   relaunchPreview: typeof relaunchPreview
   stop: typeof stop
   getStatus: typeof getStatus
-  acquireLock: typeof acquireLock
-  releaseLock: typeof releaseLock
   forceEnd: typeof forceEnd
 }
 
@@ -337,8 +306,6 @@ export const buildSessionClient: BuildSessionClient = {
   relaunchPreview,
   stop,
   getStatus,
-  acquireLock,
-  releaseLock,
   forceEnd,
 }
 

@@ -30,9 +30,6 @@ from src.api.v1.build_sessions.schemas import (
     ErrorSource,
     EscalationEvent,
     ForceEndResponse,
-    HeartbeatResponse,
-    LockReleaseResponse,
-    LockStateResponse,
     LogEvent,
     PreviewReadyEvent,
     PreviewReconnectingEvent,
@@ -139,38 +136,18 @@ def test_start_response_requires_its_fields() -> None:
         StartBuildResponse.model_validate({"session_id": str(uuid.uuid4())})
 
 
-# --- C3: lock-op response models ----------------------------------------------
+# --- C3: lock-op response models ------------------------------------------------
+# U28 retired `LockStateResponse` / `LockReleaseResponse` / `HeartbeatResponse` along with the
+# `acquire` / `renew` / `release` / `heartbeat` routes they served — nothing called them (the
+# portal's keep-alive loop that was their only caller was itself deleted back in U13).
+# `ForceEndResponse` is the one lock-op model still live.
 
 
-def test_lock_state_response_validates_required_fields() -> None:
-    resp = LockStateResponse(
-        session_id=uuid.uuid4(),
-        held=True,
-        owner_user_id=uuid.uuid4(),
-        ttl_seconds=900,
-        expires_at=_NOW,
-    )
-    assert resp.held is True
-    assert resp.ttl_seconds == 900
-
-
-def test_lock_state_response_rejects_missing_owner() -> None:
-    with pytest.raises(ValidationError):
-        LockStateResponse.model_validate(
-            {"session_id": str(uuid.uuid4()), "held": True, "ttl_seconds": 900}
-        )
-
-
-def test_release_force_end_heartbeat_responses_validate() -> None:
+def test_force_end_response_validates() -> None:
     sid = uuid.uuid4()
-    assert LockReleaseResponse(session_id=sid, released=True).released is True
     assert ForceEndResponse(session_id=sid, status=BuildSessionStatus.ENDED).status is (
         BuildSessionStatus.ENDED
     )
-    hb = HeartbeatResponse(
-        session_id=sid, alive=True, cadence_seconds=30, heartbeat_expires_at=_NOW
-    )
-    assert hb.alive is True and hb.cadence_seconds == 30
 
 
 def test_stop_response_carries_terminal_status() -> None:

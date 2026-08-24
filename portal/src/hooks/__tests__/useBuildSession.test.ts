@@ -12,7 +12,6 @@ afterEach(() => {
   vi.useRealTimers()
 })
 
-const LOCK = { sessionId: 's1', held: true, ownerUserId: 'u', ttlSeconds: 900, expiresAt: 'e' }
 const PREVIEW_URL = 'https://app.example.azurecontainerapps.io/'
 
 function makeClient(over: Partial<BuildSessionClient> = {}): BuildSessionClient {
@@ -21,8 +20,6 @@ function makeClient(over: Partial<BuildSessionClient> = {}): BuildSessionClient 
     relaunchPreview: vi.fn(async () => ({ appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready' as const, restoredFromFailedBuild: false, ready: true })),
     stop: vi.fn(async () => ({ sessionId: 's1', status: 'ended' as const })),
     getStatus: vi.fn(async () => ({ sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'provisioning' as const, previewUrl: null, lastSeq: null, createdAt: 'c', updatedAt: 'u' })),
-    acquireLock: vi.fn(async () => LOCK),
-    releaseLock: vi.fn(async () => ({ sessionId: 's1', released: true })),
     forceEnd: vi.fn(async () => ({ sessionId: 's1', status: 'ended' as const })),
     ...over,
   }

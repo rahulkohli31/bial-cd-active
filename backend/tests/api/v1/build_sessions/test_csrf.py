@@ -25,11 +25,11 @@ _TTL = settings.auth.access_ttl_seconds
 # superadmin gate, so the caller is allowlisted to prove CSRF (not RBAC) is the failing check.
 _MUTATING_POSTS = [
     "/v1/build-sessions/{sid}/stop",
-    "/v1/build-sessions/{sid}/lock/acquire",
-    "/v1/build-sessions/{sid}/lock/renew",
-    "/v1/build-sessions/{sid}/lock/release",
+    # U28 — `lock/acquire` / `lock/renew` / `lock/release` / `heartbeat` are RETIRED: nothing
+    # called them (the portal's keep-alive loop that was their only caller was itself deleted
+    # back in U13), so their rows are gone with the routes. `lock/force-end` is the one lock op
+    # still reachable from the UI and stays covered below.
     "/v1/build-sessions/{sid}/lock/force-end",
-    "/v1/build-sessions/{sid}/heartbeat",
     "/v1/build-sessions/internal/reap",
     "/v1/build-sessions/projects/{project_id}/save",
     # U13 — the app's own client-error report. This table is HAND-MAINTAINED, not

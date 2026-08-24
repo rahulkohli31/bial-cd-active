@@ -250,25 +250,12 @@ class BuildSessionStatusResponse(CamelModel):
     updated_at: datetime
 
 
-# --- Lock operations: acquire / renew / release / force-end / heartbeat (C3 §3) ---
-# The lock ops carry no request body; only the response bodies are typed.
-
-
-class LockStateResponse(CamelModel):
-    """`.../lock/acquire` and `.../lock/renew` → 200 (C3 §3.1, §3.2)."""
-
-    session_id: uuid.UUID
-    held: bool  # true when the caller now holds the lock.
-    owner_user_id: uuid.UUID  # the current holder (always the caller when held).
-    ttl_seconds: int  # the TTL just (re)set — LOCK_TTL_SECONDS.
-    expires_at: datetime  # UTC instant the lock lapses if not renewed.
-
-
-class LockReleaseResponse(CamelModel):
-    """`.../lock/release` → 200 (C3 §3.3). Idempotent."""
-
-    session_id: uuid.UUID
-    released: bool  # true if the lock was held-and-released or already free.
+# --- Lock operations: force-end (C3 §3) ---------------------------------------
+# U28 retired `acquire` / `renew` / `release` / `heartbeat` along with their response models
+# (`LockStateResponse`, `LockReleaseResponse`, `HeartbeatResponse`) — the portal's keep-alive
+# loop that was their only caller was itself deleted back in U13, and nothing else ever called
+# these routes. `force-end` is the sole survivor of this section, and it carries no request
+# body, same as its four retired neighbours.
 
 
 class ForceEndResponse(CamelModel):
@@ -276,15 +263,6 @@ class ForceEndResponse(CamelModel):
 
     session_id: uuid.UUID
     status: BuildSessionStatus  # `ended`.
-
-
-class HeartbeatResponse(CamelModel):
-    """`.../heartbeat` → 200 (C3 §3.5). The portal's liveness ping."""
-
-    session_id: uuid.UUID
-    alive: bool  # true — the session is live and the heartbeat was recorded.
-    cadence_seconds: int  # HEARTBEAT_CADENCE_SECONDS — the client's next-beat interval.
-    heartbeat_expires_at: datetime  # UTC instant the reaper considers the session idle.
 
 
 # --- the app's own client-error report (U13, R17 runtime half) ----------------

@@ -45,8 +45,6 @@ const h = vi.hoisted(() => ({
   stop: vi.fn(),
   getStatus: vi.fn(),
   forceEnd: vi.fn(),
-  acquireLock: vi.fn(),
-  releaseLock: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({

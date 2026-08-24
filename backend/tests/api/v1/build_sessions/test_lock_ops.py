@@ -1,5 +1,11 @@
-"""U6 — the five lock ops + the superadmin internal/reap (owner-scoping: 404 everywhere
-except the one force-end 403)."""
+"""U6 — the surviving lock op (`force-end`) + the superadmin internal/reap (owner-scoping:
+404 everywhere except the one force-end 403).
+
+U28 retired `acquire` / `renew` / `release` / `heartbeat`, along with the tests that were
+about them specifically (their happy path, the renew-a-lost-lock 409, the acquire-vs-active
+409, and their shared Redis-outage/Redis-unconfigured coverage): nothing called those routes
+— the portal's keep-alive loop that was their only caller was itself deleted back in U13. The
+reap half of this suite is untouched below."""
 
 from __future__ import annotations
 
@@ -14,7 +20,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps_rbac import superadmin_allowlist
 from src.api.v1.build_sessions.deps import run_build_dependency
 from src.db.models.audit import AuditLog
-from src.services.build_sessions import BuildSession
 from src.services.redis import (
     BUILD_COORDINATION_UNAVAILABLE_MSG,
     REGISTRY_STATE_READY,
@@ -28,7 +33,6 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_TOKEN_REF,
 )
-from src.services.sandbox.base import SandboxHandle
 from tests.api.v1.build_sessions.conftest import BlockingBrain, auth_headers, drain
 from tests.factories import ProjectFactory, UserFactory
 from tests.fakes import FakeBrain, a_sandbox_name
@@ -47,62 +51,6 @@ async def _live_session(client, db, wire, email):
     )
     assert r.status_code == 201
     return user, r.json()["sessionId"], brain
-
-
-async def test_acquire_renew_release_happy(
-    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
-) -> None:
-    user, sid, brain = await _live_session(client, db_session, wire, "lk1@rvaiglobal.com")
-    acq = await client.post(f"/v1/build-sessions/{sid}/lock/acquire", headers=auth_headers(user))
-    assert acq.status_code == 200
-    body = acq.json()
-    assert body["held"] is True
-    assert body["ownerUserId"] == str(user.id)
-    assert body["ttlSeconds"] == 900
-    assert "expiresAt" in body
-
-    ren = await client.post(f"/v1/build-sessions/{sid}/lock/renew", headers=auth_headers(user))
-    assert ren.status_code == 200 and ren.json()["held"] is True
-
-    rel = await client.post(f"/v1/build-sessions/{sid}/lock/release", headers=auth_headers(user))
-    assert rel.status_code == 200 and rel.json()["released"] is True
-
-    brain.release()
-    await drain(wire.manager, sid)
-
-
-async def test_renew_a_lost_lock_is_409(
-    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
-) -> None:
-    user, sid, brain = await _live_session(client, db_session, wire, "lk2@rvaiglobal.com")
-    # Drop the lock out from under the session, then renew -> lock lost.
-    await fake_redis.delete(lock_key(user.id))
-    ren = await client.post(f"/v1/build-sessions/{sid}/lock/renew", headers=auth_headers(user))
-    assert ren.status_code == 409
-    assert ren.json()["error"]["code"] == "build_session_lock_lost"
-    brain.release()
-    await drain(wire.manager, sid)
-
-
-async def test_heartbeat_happy_and_cross_user_404(
-    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
-) -> None:
-    user, sid, brain = await _live_session(client, db_session, wire, "lk3@rvaiglobal.com")
-    hb = await client.post(f"/v1/build-sessions/{sid}/heartbeat", headers=auth_headers(user))
-    assert hb.status_code == 200
-    body = hb.json()
-    assert body["alive"] is True
-    assert body["cadenceSeconds"] == 30
-    assert "heartbeatExpiresAt" in body
-
-    intruder = await UserFactory.create(db_session, email="lk3b@rvaiglobal.com")
-    other = await client.post(
-        f"/v1/build-sessions/{sid}/heartbeat", headers=auth_headers(intruder)
-    )
-    assert other.status_code == 404  # another user's session -> 404
-
-    brain.release()
-    await drain(wire.manager, sid)
 
 
 async def test_force_end_owner_200_nonowner_403_unknown_404(
@@ -199,108 +147,15 @@ async def test_internal_reap_is_audited(
     assert row.detail == {"reaped": 1, "failed": 0}
 
 
-async def test_acquire_409_already_active_when_another_session_holds_the_lock(
-    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
-) -> None:
-    # C3 §3.1 (#14): a live session B holds the one-per-user lock; acquiring on a DIFFERENT
-    # owned session A → 409 `build_session_already_active` carrying B's id — NOT the
-    # `build_session_lock_lost` the old acquire==renew impl always returned.
-    user, sid_b, brain = await _live_session(client, db_session, wire, "lk-acq@rvaiglobal.com")
-    # A second owned-but-not-active session (an earlier, ended session still held in memory).
-    stale = BuildSession(
-        session_id=uuid.uuid7(),
-        user_id=user.id,
-        project_id=uuid.uuid4(),
-        app_id=uuid.uuid4(),
-        prompt="p",
-        lock_token="stale-tok",
-        handle=SandboxHandle(
-            fqdn="a.example",
-            token="t",
-            app_name=a_sandbox_name("a"),
-            preview_url="https://a.example/",
-            ready=False,
-        ),
-    )
-    wire.manager._sessions[stale.session_id] = stale
-
-    r = await client.post(
-        f"/v1/build-sessions/{stale.session_id}/lock/acquire", headers=auth_headers(user)
-    )
-    assert r.status_code == 409
-    err = r.json()["error"]
-    assert err["code"] == "build_session_already_active"
-    assert err["sessionId"] == sid_b  # carries the LIVE session, not the acquired-on one
-
-    brain.release()
-    await drain(wire.manager, sid_b)
-
-
-# --- U3: the lock ops answer a Redis outage with 503, never a 500 and never a lie -------
-
-
-@pytest.mark.parametrize(
-    ("path", "cursed_command"),
-    [
-        ("lock/renew", "eval"),
-        ("lock/release", "eval"),
-        ("heartbeat", "set"),
-    ],
-)
-async def test_lock_ops_503_on_a_redis_outage(
+async def test_internal_reap_documents_the_503_in_its_openapi_responses(
     client: AsyncClient,
-    db_session: AsyncSession,
-    fake_redis,
-    fake_storage,
-    wire,
-    path: str,
-    cursed_command: str,
 ) -> None:
-    """These three routes call the BARE primitives (`locks.py`'s REDIS-ERROR POLICY), so
-    before U3 an outage on any of them was an opaque 500.
-
-    Guarding inside the primitive is not the alternative — that policy spells out why it
-    would be worse here: `release_lock_as_holder` swallowing would make this route answer
-    `200 {"released": true}` about a release that never happened, and `write_heartbeat`
-    swallowing would answer `200 {"alive": true}` with an expiry the portal then schedules
-    its next beat against. A 503 is the only answer that is both non-500 and true.
-    """
-    user, sid, brain = await _live_session(client, db_session, wire, f"lk-503-{path[:5]}@x.com")
-
-    async def the_store_is_gone(*args: object, **kwargs: object) -> object:
-        raise RedisError("redis is down")
-
-    # Undone before the drain: the live session's own finalize needs a working Redis, and a
-    # cursed teardown would mask the assertion below with unrelated noise.
-    curse = pytest.MonkeyPatch()
-    curse.setattr(fake_redis, cursed_command, the_store_is_gone)
-    try:
-        resp = await client.post(f"/v1/build-sessions/{sid}/{path}", headers=auth_headers(user))
-    finally:
-        curse.undo()
-
-    assert resp.status_code == 503
-    body = resp.json()["error"]
-    assert body["message"] == BUILD_COORDINATION_UNAVAILABLE_MSG
-    # Not a 409 either: `renew_lock` returning False means the token stopped matching, and
-    # an unanswered Redis is not evidence of that. Ending a healthy build on a phantom
-    # "lock lost" is the failure this arm exists to prevent.
-    assert body.get("code") != "build_session_lock_lost"
-
-    brain.release()
-    await drain(wire.manager, sid)
-
-
-async def test_lock_ops_document_the_503_in_their_openapi_responses(client: AsyncClient) -> None:
+    # The lock-op half of this table used to sit here too (acquire/renew/release/heartbeat all
+    # documented the same 503) and is gone with the routes (U28) — `force-end` never touched
+    # Redis synchronously, so it never documented one. `internal/reap` is what remains.
     schema = (await client.get("/openapi.json")).json()
-    for path in (
-        "/v1/build-sessions/{session_id}/lock/acquire",
-        "/v1/build-sessions/{session_id}/lock/renew",
-        "/v1/build-sessions/{session_id}/lock/release",
-        "/v1/build-sessions/{session_id}/heartbeat",
-        "/v1/build-sessions/internal/reap",
-    ):
-        assert "503" in schema["paths"][path]["post"]["responses"], path
+    path = "/v1/build-sessions/internal/reap"
+    assert "503" in schema["paths"][path]["post"]["responses"], path
 
 
 # --- internal/reap: a Redis outage is a 503 to the operator, never a 500 -----------------
@@ -354,64 +209,26 @@ async def test_internal_reap_is_503_not_500_when_redis_is_not_configured(
     assert row is None
 
 
-# --- FIX 1 regression: the lock ops answer a Redis-off deployment with 503, not a 500 -----
+# --- FIX 1 regression, re-anchored onto force-end (U28) -----------------------------------
 #
-# Deliberately FIXTURE-FREE (no `fake_redis`): `fake_redis` binds the client singleton, so with it
-# in place `RedisNotConfiguredError` is unreachable BY CONSTRUCTION and this branch could never be
-# tested (`.claude/rules/testing.md`). Before FIX 1 these routes took `redis: RedisDep`, resolved
-# by FastAPI BEFORE the body ran, so a store-off deployment raised at dependency-solve time → an
-# undocumented 500 `{"detail": ...}`. Now Redis is acquired lazily INSIDE the seam, so the answer
-# is the documented 503 `{"error": {...}}`.
+# The Redis-unconfigured 503 half of this section (`_inject_owned_session` +
+# `test_lock_op_is_503_not_500_when_redis_is_not_configured`) is gone WITH the four retired
+# routes — `force-end` never touches Redis synchronously (`manager.force_end` swallows its
+# best-effort Redis call, see `manager.py::_end`), so there is no 503-on-Redis-off case left
+# to anchor on it, and inventing one would test a scenario the surviving route cannot reach.
+#
+# The ownership-before-Redis 404 DOES generalize: `lock_force_end` checks `manager.get(...)`
+# and ownership BEFORE calling `manager.force_end` at all, so a bogus/unowned session id is a
+# 404 even with no Redis configured. Deliberately FIXTURE-FREE (no `fake_redis`): with it bound,
+# `RedisNotConfiguredError` is unreachable BY CONSTRUCTION and this branch could never be tested
+# (`.claude/rules/testing.md`).
 
 
-def _inject_owned_session(manager, user_id: uuid.UUID) -> uuid.UUID:
-    """Register a valid OWNED (but not `_active_by_user`) session directly in the manager, so a
-    lock op passes the 404 ownership check and reaches the Redis seam WITHOUT a real build — which
-    could not start here, because starting one needs Redis. Mirrors the direct-injection the
-    already-active 409 test above uses."""
-    session = BuildSession(
-        session_id=uuid.uuid7(),
-        user_id=user_id,
-        project_id=uuid.uuid4(),
-        app_id=uuid.uuid4(),
-        prompt="p",
-        lock_token="tok",
-        handle=SandboxHandle(
-            fqdn="a.example",
-            token="t",
-            app_name=a_sandbox_name("a"),
-            preview_url="https://a.example/",
-            ready=False,
-        ),
-    )
-    manager._sessions[session.session_id] = session
-    return session.session_id
-
-
-@pytest.mark.parametrize("path", ["lock/acquire", "lock/renew", "lock/release", "heartbeat"])
-async def test_lock_op_is_503_not_500_when_redis_is_not_configured(
-    client: AsyncClient, db_session: AsyncSession, wire, path: str
+async def test_force_end_404s_a_bogus_session_before_touching_redis(
+    client: AsyncClient, db_session: AsyncSession, wire
 ) -> None:
-    user = await UserFactory.create(db_session, email=f"lk-off-{path.replace('/', '-')}@x.com")
-    sid = _inject_owned_session(wire.manager, user.id)
-
-    resp = await client.post(f"/v1/build-sessions/{sid}/{path}", headers=auth_headers(user))
-    assert resp.status_code == 503
-    assert resp.status_code != 500
-    body = resp.json()
-    assert body["error"]["message"] == BUILD_COORDINATION_UNAVAILABLE_MSG
-    assert "detail" not in body  # the 503 `{"error": {...}}` envelope, never a 500 `{"detail": …}`
-
-
-@pytest.mark.parametrize("path", ["lock/acquire", "lock/renew", "lock/release", "heartbeat"])
-async def test_lock_op_404s_a_bogus_session_before_touching_redis(
-    client: AsyncClient, db_session: AsyncSession, wire, path: str
-) -> None:
-    # The ownership check runs BEFORE Redis: a bogus/unowned session id is a 404 even with no Redis
-    # configured (which would otherwise 503), proving `_owned_or_404` still fires first after FIX 1
-    # moved Redis acquisition into the body.
-    user = await UserFactory.create(db_session, email=f"lk-404-{path.replace('/', '-')}@x.com")
+    user = await UserFactory.create(db_session, email="lk-404-force-end@x.com")
     resp = await client.post(
-        f"/v1/build-sessions/{uuid.uuid4()}/{path}", headers=auth_headers(user)
+        f"/v1/build-sessions/{uuid.uuid4()}/lock/force-end", headers=auth_headers(user)
     )
     assert resp.status_code == 404

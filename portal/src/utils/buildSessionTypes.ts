@@ -160,35 +160,17 @@ export interface BuildSessionStatusResponse {
   updatedAt: string
 }
 
-// ─── C3: lock operations — acquire / renew / release / force-end / heartbeat (§3) ─
-
-/** `…/lock/acquire` and `…/lock/renew` → 200. */
-export interface LockStateResponse {
-  sessionId: string
-  held: boolean
-  ownerUserId: string
-  ttlSeconds: number
-  expiresAt: string
-}
-
-/** `…/lock/release` → 200. Idempotent — true if the lock was held-and-released or already free. */
-export interface LockReleaseResponse {
-  sessionId: string
-  released: boolean
-}
+// ─── C3: lock operations — force-end (§3) ─────────────────────────────────────
+//
+// `LockStateResponse` / `LockReleaseResponse` / `HeartbeatResponse` are GONE (U28): they typed
+// `acquire` / `renew` / `release` / `heartbeat`, and nothing called those routes — the portal's
+// keep-alive loop that was their only caller was itself deleted back in U13. `ForceEndResponse`
+// is the one lock-op response shape still live.
 
 /** `…/lock/force-end` → 200. The owner-only kill switch; `status` is `ended`. */
 export interface ForceEndResponse {
   sessionId: string
   status: BuildSessionStatus
-}
-
-/** `…/heartbeat` → 200. The portal's liveness ping. */
-export interface HeartbeatResponse {
-  sessionId: string
-  alive: boolean
-  cadenceSeconds: number
-  heartbeatExpiresAt: string
 }
 
 // ─── C7: the tagged-union progress envelope (snake_case surface) ─────────────

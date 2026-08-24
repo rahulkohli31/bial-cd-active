@@ -200,8 +200,11 @@ def test_the_app_still_builds_with_its_full_route_surface() -> None:
     # routes for the trees U2 and U3 park (`internal/apps/{app_id}/parked` and `.../promote`) —
     # without a reader those objects would be write-only, and in a false-reversion they hold the
     # only copy of somebody's work. Each recorded in C3 §9 in the same change that added it.
-    assert len(build_session_paths) == 21, (
-        f"the C3 build-session route surface changed: expected 21 paths, found "
+    # 17 since U28 retired `lock/acquire` / `lock/renew` / `lock/release` / `heartbeat` (21 - 4):
+    # nothing called them — the portal's keep-alive loop that was their only caller was itself
+    # deleted back in U13. `lock/force-end` is the one lock op still reachable from the UI.
+    assert len(build_session_paths) == 17, (
+        f"the C3 build-session route surface changed: expected 17 paths, found "
         f"{len(build_session_paths)}. If a route was deliberately added or removed, amend C3 "
         f"and update this number in the same change.\n{sorted(build_session_paths)}"
     )

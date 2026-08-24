@@ -99,13 +99,9 @@ async function scriptBuild(
     })
   })
 
-  // The keep-alive + status surfaces the hook drives while a session is live.
-  await page.route('**/api/build-sessions/*/heartbeat', (route) =>
-    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ sessionId: SESSION_ID, alive: true, cadenceSeconds: 30, heartbeatExpiresAt: 'e' }) }),
-  )
-  await page.route('**/api/build-sessions/*/lock/**', (route) =>
-    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ sessionId: SESSION_ID, held: true, ownerUserId: 'u', ttlSeconds: 900, expiresAt: 'e' }) }),
-  )
+  // The heartbeat + lock/acquire/renew/release route stubs that used to sit here are gone
+  // (U28): the portal's keep-alive loop that was their only caller was itself deleted back in
+  // U13, so this spec never drove them even before the backend routes were retired.
   await page.route('**/api/build-sessions/*', async (route: Route) => {
     if (route.request().method() !== 'GET') return route.fallback()
     await route.fulfill({
