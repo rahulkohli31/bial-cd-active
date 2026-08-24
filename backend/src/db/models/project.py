@@ -36,7 +36,7 @@ MAX_PROJECT_NAME = 120
 # an unbounded description is an uncapped per-turn token cost (KD-8). Enforced at the
 # Pydantic write boundary (U4/U7); this constant is the shared source of truth.
 MAX_PROJECT_DESCRIPTION = 2000
-# The marketplace's search text configuration (#145, migration 0033), named ONCE here —
+# The marketplace's search text configuration (#145, migration 0034), named ONCE here —
 # where the generated column it must match lives — and imported by the marketplace router
 # rather than redeclared. A query parsed under a different configuration than the one the
 # generated column was built with stems differently and silently under-matches; that
@@ -52,7 +52,7 @@ class Project(UUIDv7PrimaryKeyMixin, TimestampMixin, OwnedByUserMixin, Base):
     # boundary normalizes empty/whitespace to NULL so there is no undefined
     # empty-string third state (KD-8). Length is capped at the boundary, not here.
     description: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
-    # The marketplace's search index (#145, migration 0033). DERIVED from `description` by
+    # The marketplace's search index (#145, migration 0034). DERIVED from `description` by
     # Postgres, never written from here — declared `Computed(persisted=True)` so SQLAlchemy
     # excludes it from INSERT/UPDATE rather than letting the database reject the write.
     # Mapped at all (instead of raw SQL in the query) so the marketplace's `@@` match and
