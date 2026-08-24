@@ -170,10 +170,18 @@ class _Reachable:
     `head` is `None` when the attach SUCCEEDED but the state probe did not answer. That is not the
     same as not reaching the container at all, and the two arms want it separated: the gate reads
     a `None` head as "fall back to the bundle", while the copy can still be taken from a container
-    that merely failed to count its commits."""
+    that merely failed to count its commits.
+
+    `uncommitted` RIDES ALONGSIDE `head` BECAUSE A HEAD ALONE STOPPED BEING AN ANSWER (U19). The
+    agent no longer commits as it works, so a turn that wrote files leaves `HEAD` where the last
+    turn's recovery copy was stamped — and a gate handed only the head reads that as preserved and
+    destroys the tree. This field is the difference between "nothing changed since the copy" and
+    "nothing was COMMITTED since the copy". `None` when the probe did not answer, which
+    `confirm_durable_copy` refuses rather than guesses."""
 
     handle: SandboxHandle
     head: str | None
+    uncommitted: bool | None
 
 
 async def _reach_the_container(
@@ -204,7 +212,13 @@ async def _reach_the_container(
         # container cannot be asked anything", which is precisely the case the fallback is for.
         return None
     state = await container_state(sandbox_client, handle)
-    return _Reachable(handle=handle, head=state.head if state is not None else None)
+    return _Reachable(
+        handle=handle,
+        head=state.head if state is not None else None,
+        # BOTH FIELDS COME FROM THE SAME PROBE, so a state that did not answer leaves both
+        # unknown rather than leaving `uncommitted` looking like a confident "clean".
+        uncommitted=state.uncommitted if state is not None else None,
+    )
 
 
 async def _take_the_copy_we_promised(
@@ -405,7 +419,9 @@ async def reap_user(
         # actually not answer first.
         reached = await _reach_the_container(sandbox_client, user_uuid)
         verdict = await confirm_durable_copy(
-            app_id, container_head=reached.head if reached else None
+            app_id,
+            container_head=reached.head if reached else None,
+            container_dirty=reached.uncommitted if reached else None,
         )
         # AND THEN TAKE THE COPY (U5, ADR-0029 §7), rather than sparing on the strength of the
         # verdict alone. This branch used to end here with a log line, so a container whose
@@ -487,7 +503,11 @@ async def reap_the_container_we_judged(
     # It is also why U5 cannot take a copy for an unregistered orphan: there is no address to
     # bundle from, and the address we DO have belongs to somebody else's container.
     reached = await _reach_the_container(sandbox_client, user_uuid) if ours else None
-    verdict = await confirm_durable_copy(app_id, container_head=reached.head if reached else None)
+    verdict = await confirm_durable_copy(
+        app_id,
+        container_head=reached.head if reached else None,
+        container_dirty=reached.uncommitted if reached else None,
+    )
     # AND THEN TAKE THE COPY (U5, ADR-0029 §7). The janitor is the caller with nobody watching it,
     # so it is the one that was quietly sparing the same containers pass after pass.
     if not await _take_the_copy_we_promised(
