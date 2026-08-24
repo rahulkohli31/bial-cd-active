@@ -129,7 +129,9 @@ export const ACK_STEP_NAME = '__ack__'
  * faster than anyone can listen coalesces to its newest line rather than queueing six.
  *
  * Trailing-edge, never dropping: a change held back by the window is announced when the window
- * elapses, so the last thing that happened is always what gets said.
+ * elapses — or immediately, flushed rather than discarded, if the build ends first. See the
+ * FLUSH branch in `useAnnouncement`: without it, a step held inside the window when the build
+ * ends would be overwritten by the terminal `''` sentinel and never spoken at all.
  */
 export const ANNOUNCE_MIN_INTERVAL_MS = 10_000
 
@@ -143,6 +145,12 @@ const WORKING_PLACEHOLDER = 'Working…'
  * The visible row is deliberately NOT throttled with it: a failed step has to appear the
  * instant it arrives (the live row is the fastest signal something went wrong), and only the
  * SPEAKING of it is worth pacing.
+ *
+ * FLUSHES rather than drops a held change when the build ends. The call site passes `''` the
+ * instant the build stops being active — that is the ONE way `text` ever becomes the empty
+ * sentinel — so if a real change was still sitting in `pending` (held inside the window, not yet
+ * announced) when that happens, it is the build's last meaningful step and is spoken now instead
+ * of being silently overwritten by the sentinel.
  */
 function useAnnouncement(text: string): string {
   const [announced, setAnnounced] = useState(text)
@@ -151,7 +159,23 @@ function useAnnouncement(text: string): string {
   // must not be delayed behind a window that never spoke.
   const lastAnnouncedAt = useRef(0)
   const pending = useRef(text)
+  // Set once the flush below has delivered a held change. From then on `text` stays `''` for
+  // the life of this hook (the build is over), so there is nothing left to throttle — and
+  // running the throttle again would schedule a second pass that eventually overwrites the
+  // just-flushed announcement with `''`, quietly reintroducing the same drop one step later.
+  const flushed = useRef(false)
   useEffect(() => {
+    if (flushed.current) return undefined
+    // THE FLUSH (fixes the regression: a held change silently dropped when the build ends
+    // before its window elapses). `pending.current` still holds whatever change was held —
+    // the cleanup below only cancels the timer, it never touches `pending` — so if that held
+    // value hasn't reached `announced` yet, it is spoken now, once, instead of being lost when
+    // the line below overwrites `pending.current` with the terminal `''`.
+    if (text === '' && pending.current !== '' && pending.current !== announced) {
+      flushed.current = true
+      setAnnounced(pending.current)
+      return undefined
+    }
     pending.current = text
     if (text === announced) return undefined
     const wait = ANNOUNCE_MIN_INTERVAL_MS - (Date.now() - lastAnnouncedAt.current)
@@ -526,38 +550,45 @@ export default function BuildProgress({
           BuildOutcome appends below it — a cosmetic jump the reviewer flagged, not a functional
           one, but cheap to steady. */}
       <div className={currentStepRow || liveSteps.length > 0 ? 'min-h-[2.75rem]' : undefined}>
+        {/* WHAT THE BUILD SAYS OUT LOUD — one line, spoken politely, never stealing focus.
+            `role="status" aria-atomic="true"` — NOT `role="log"`, which describes an APPENDING
+            region where old entries persist; this node's one child is replaced in place, and
+            `status` (with its implicit `aria-live="polite"`) is the role for a single
+            live-updating value, `aria-atomic` making the whole line announce coherently rather
+            than as a partial diff. Under a burst of steps arriving faster than a screen reader
+            can speak them, only the newest one is ever announced — that's an accepted trade, not
+            a bug: the newest step is the only authoritative one.
+
+            U17 EXTENDS THAT, it does not undo it. The atomic region is now a dedicated MIRROR of
+            the visible row rather than the visible row itself, because the two want different
+            clocks: the row has to update at the speed of the build (a failure must appear the
+            moment it lands), while the region — which re-announces its whole contents on every
+            change — has to update at the speed of a person listening. A long-operation status
+            line "refreshed until it completes" inside the visible node would be the same
+            sentence read aloud every few seconds. `useAnnouncement` is the pacing; `aria-atomic`
+            is still why the line is spoken whole.
+
+            RENDERED OUTSIDE the working/terminal split (not nested inside the live arm) for
+            exactly one reason: the regression fix. `useAnnouncement` FLUSHES a step that was
+            still held inside the throttle window when the build ends — that flush lands in
+            `announcement` on the SAME render that flips `working` to false, and a region gated
+            on `working` alone would unmount before that flushed text ever reached the DOM,
+            recreating the drop one layer up. Gating on `announcement !== ''` instead means the
+            ordinary terminal case (nothing was held) stays silent and absent exactly as before —
+            only a genuinely flushed announcement keeps it around for one more beat. */}
+        {(working || announcement !== '') && (
+          <div
+            role="status"
+            aria-atomic="true"
+            aria-label="Build activity"
+            className="sr-only"
+            data-testid="build-activity-announcement"
+          >
+            {announcement}
+          </div>
+        )}
         {working ? (
           <div className="space-y-2">
-            {/* WHAT THE BUILD SAYS OUT LOUD — one line, spoken politely, never stealing focus.
-                `role="status" aria-atomic="true"` — NOT `role="log"`, which describes an
-                APPENDING region where old entries persist; this node's one child is replaced in
-                place, and `status` (with its implicit `aria-live="polite"`) is the role for a
-                single live-updating value, `aria-atomic` making the whole line announce
-                coherently rather than as a partial diff. Under a burst of steps arriving faster
-                than a screen reader can speak them, only the newest one is ever announced —
-                that's an accepted trade, not a bug: the newest step is the only authoritative
-                one.
-
-                U17 EXTENDS THAT, it does not undo it. The atomic region is now a dedicated
-                MIRROR of the visible row rather than the visible row itself, because the two
-                want different clocks: the row has to update at the speed of the build (a
-                failure must appear the moment it lands), while the region — which re-announces
-                its whole contents on every change — has to update at the speed of a person
-                listening. A long-operation status line "refreshed until it completes" inside
-                the visible node would be the same sentence read aloud every few seconds.
-                `useAnnouncement` is the pacing; `aria-atomic` is still why the line is spoken
-                whole. It lives on the live arm for the same reason the row does: at a terminal
-                the outcome message owns the ending, and a region still saying "Working…" under
-                a finished build is the spinner's old lie in another modality. */}
-            <div
-              role="status"
-              aria-atomic="true"
-              aria-label="Build activity"
-              className="sr-only"
-              data-testid="build-activity-announcement"
-            >
-              {announcement}
-            </div>
             {line && (
               <div className="flex items-center gap-2 text-xs text-tertiary">
                 {spinner}

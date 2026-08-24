@@ -1027,4 +1027,54 @@ describe('U17: the live region announces on change, and at most once per 10s', (
     expect(container.querySelector('button[aria-expanded]')).toBeTruthy()
     expect(screen.queryByRole('status', { name: /build activity/i })).toBeNull()
   })
+
+  it('REGRESSION: a change held inside the window is still announced when the build ends before the window elapses', () => {
+    // The bug: `useAnnouncement`'s own comment claimed a held change is "never dropped" — true
+    // only while the build keeps running. If a real change is held inside the 10s window and
+    // the build ENDS before that window elapses, the effect's cleanup cancels the pending timer
+    // and the SAME run overwrites `pending.current` with the terminal `''` sentinel — the held
+    // step is never announced, not late, not ever. This reproduces exactly that shape: a change
+    // held only ~1s into the 10s window, then the build ends.
+    vi.useFakeTimers()
+    const { container, rerender } = draw({ envelopes: running(RUNNING) })
+    const region = screen.getByRole('status', { name: /build activity/i })
+    // LIVENESS: the region exists and says the first line before any throttling is exercised.
+    expect(region.textContent).toBe(RUNNING)
+
+    // First change: announced immediately (mirrors "a CHANGE in the text is announced" above).
+    rerender(paint(running(STILL_RUNNING)))
+    expect(region.textContent).toBe(STILL_RUNNING)
+
+    // Second change, 1s later — well inside the 10s window, so it is HELD rather than spoken
+    // (mirrors "a second change inside the window is HELD").
+    const HELD_TEXT = 'Making sure everything fits together'
+    act(() => {
+      vi.advanceTimersByTime(1000)
+    })
+    rerender(paint(running(HELD_TEXT)))
+    expect(region.textContent).toBe(STILL_RUNNING) // still held, not yet spoken
+
+    // THE REGRESSION TRIGGER: the build ends here — only ~1s into the 10s hold, nowhere near
+    // the window elapsing — before the held change was ever announced.
+    rerender(
+      paint(
+        [{ type: 'step', seq: 1, name: 'run', label: HELD_TEXT, state: 'ok' }],
+        'ended',
+      ),
+    )
+
+    // LIVENESS before the fix's own assertion: the bubble survived the transition and now shows
+    // the finished-build chrome, so what follows is a genuine flush and not a component that
+    // fell over on its way to rendering nothing.
+    expect(container.querySelector('[data-testid="build-progress"]')).toBeTruthy()
+    expect(container.querySelector('button[aria-expanded]')).toBeTruthy()
+
+    // THE FIX: the held step is still announced — flushed, not silently dropped, once the build
+    // ends. `getByRole` (not `queryByRole`) so a region that never flushed fails loudly here
+    // rather than the test degrading into an assert-absence check that a crash could also pass.
+    const finalRegion = screen.getByRole('status', { name: /build activity/i })
+    expect(finalRegion.textContent).toBe(HELD_TEXT)
+    expect(finalRegion.textContent).not.toBe('')
+    expect(finalRegion.textContent).not.toBe(STILL_RUNNING)
+  })
 })
