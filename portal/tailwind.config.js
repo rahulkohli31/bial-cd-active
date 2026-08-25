@@ -3,7 +3,9 @@ export default {
   // 'class' strategy for shadcn/ui (U13 prep). No behavior change today: the portal has
   // zero `dark:` usages, so nothing activates until an element opts in with class="dark".
   darkMode: ['class'],
-  content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}'],
+  // Streamdown's dist ships its own Tailwind utility classes (code-block controls,
+  // table controls, etc.) — scan it too so those classes aren't purged.
+  content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}', './node_modules/streamdown/dist/**/*.js'],
   theme: {
     extend: {
       colors: {
@@ -28,6 +30,13 @@ export default {
         muted: {
           DEFAULT: 'hsl(var(--muted))',
           foreground: 'hsl(var(--muted-foreground))',
+        },
+        // Streamdown's dist code-block chrome (Streamdown variant, A2) styles itself with
+        // `bg-sidebar`/`bg-sidebar/80`/`border-sidebar` — undefined here left the card
+        // transparent, so it needs a real token even though nothing else in the portal
+        // uses "sidebar" as a concept yet.
+        sidebar: {
+          DEFAULT: 'hsl(var(--sidebar))',
         },
         destructive: {
           DEFAULT: 'hsl(var(--destructive))',

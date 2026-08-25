@@ -9,6 +9,22 @@ export default defineConfig({
     // tsconfig.json `paths` and vitest.config.js so all three resolvers agree.
     alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) },
   },
+  build: {
+    rollupOptions: {
+      output: {
+        // The assistant-ui/Streamdown migration (A2) added ~137 kB gzip to the entry chunk
+        // (measured: 264 kB → 401 kB gzip, +52%) with zero code splitting — every visitor
+        // downloads the markdown renderer + composer chrome before first paint even loads.
+        // Splitting them into their own vendor chunk doesn't shrink the total, but lets the
+        // browser fetch it in parallel with the entry chunk and cache it independently of
+        // app-code churn, instead of it inflating the one chunk everything blocks on.
+        manualChunks: {
+          markdown: ['streamdown', 'remark-gfm', 'remark-breaks'],
+          'assistant-ui': ['@assistant-ui/react'],
+        },
+      },
+    },
+  },
   server: {
     // Disable vite's own dev-server CORS. The builder live-preview runs in a
     // sandboxed, opaque-origin iframe (Origin: null) and calls the Data Service at
