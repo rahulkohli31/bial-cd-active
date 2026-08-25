@@ -291,6 +291,90 @@ async def test_unpublish_after_a_failed_redeploy_still_removes_the_app(
     assert resp.json()["items"] == []
 
 
+async def test_a_redeploy_attempt_does_not_resurrect_an_unpublished_app(
+    app, client, db_session
+) -> None:
+    """An unpublish DELETES the container. A later deploy attempt that has not SUCCEEDED has
+    not recreated it — so the app must stay dark until the new attempt actually lands.
+
+    This is the window the redeploy path opens: `unpublish`'s own docstring says a later
+    Deploy "brings it back at the same URL", and nothing in `deploy_project` consults
+    `unpublished_at`, so unpublish -> redeploy is the documented recovery. The pipeline
+    creates its `deployments` row at claim time, while the attempt is still RUNNING, and the
+    URL is a pure function of `app_id` — so the newest SUCCEEDED row still names the address
+    of a container that unpublish has already torn down.
+
+    Reading `unpublished_at` off the absolute newest row alone gets this wrong: the RUNNING
+    row carries no stamp, so the takedown looks undone before anything has been republished.
+
+    Mutation receipt: read `unpublished_at` off the newest row per app (rather than comparing
+    the newest UNPUBLISHED row against the live one) and this goes red with the app listed at
+    a dead URL."""
+    headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
+    live = await _published_app(
+        db_session,
+        owner_email="builder@rvaiglobal.com",
+        name="Taken Down Then Redeployed",
+        description="Unpublished, then a redeploy started but has not landed.",
+        unpublished_at=datetime.now(UTC),
+    )
+    # The pipeline's row exists from claim time: RUNNING, no URL yet, no stamp.
+    await _redeploy(db_session, live, status=DeploymentStatus.RUNNING, url=None)
+
+    resp = await client.get(_MARKETPLACE, headers=headers)
+
+    assert resp.json()["items"] == []
+
+
+async def test_a_failed_redeploy_does_not_resurrect_an_unpublished_app(
+    app, client, db_session
+) -> None:
+    """The same window, but permanent: if the redeploy SETTLES FAILED, nothing ever recreates
+    the container, so the app must not drift back into the catalog at a dead address.
+
+    Distinct from `test_a_failed_redeploy_does_not_unlist_the_still_serving_app`, and the
+    pair is the whole point: a failed redeploy leaves the PREVIOUS revision serving *only if*
+    that revision was not torn down first. Here it was."""
+    headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
+    live = await _published_app(
+        db_session,
+        owner_email="builder@rvaiglobal.com",
+        name="Taken Down Then Failed Redeploy",
+        description="Unpublished, then a redeploy that never landed.",
+        unpublished_at=datetime.now(UTC),
+    )
+    await _redeploy(db_session, live, status=DeploymentStatus.FAILED, url=None)
+
+    resp = await client.get(_MARKETPLACE, headers=headers)
+
+    assert resp.json()["items"] == []
+
+
+async def test_a_successful_republish_brings_the_app_back(app, client, db_session) -> None:
+    """The other half of the contract, and the reason the fix is a COMPARISON rather than a
+    blanket "was this app ever unpublished?" filter.
+
+    Once the redeploy succeeds, the container exists again at the same URL, so the app
+    belongs back in the catalog. An implementation that simply excluded any app with an
+    unpublish anywhere in its history would strand it permanently.
+
+    Mutation receipt: replace the `last_unpublished.id < deployment.id` comparison with a
+    bare `last_unpublished.id IS NULL` and this goes red with an empty catalog."""
+    headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
+    live = await _published_app(
+        db_session,
+        owner_email="builder@rvaiglobal.com",
+        name="Republished After Takedown",
+        description="Unpublished, then successfully redeployed.",
+        unpublished_at=datetime.now(UTC),
+    )
+    await _redeploy(db_session, live)  # succeeded, has a URL, no stamp
+
+    resp = await client.get(_MARKETPLACE, headers=headers)
+
+    assert [item["name"] for item in resp.json()["items"]] == ["Republished After Takedown"]
+
+
 async def test_a_disabled_app_is_not_advertised(app, client, db_session) -> None:
     """The second blocker (#147 review): `disable` (the admin kill-switch for a
     compromised or data-leaking app) severs the per-app database but writes nothing to

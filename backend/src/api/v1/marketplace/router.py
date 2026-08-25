@@ -105,13 +105,28 @@ def _live_catalog(search: str | None) -> tuple[sa.Select[Any], Any]:
     because they answer two different questions and reading either off the wrong row is a
     real bug (#147 review), not a hypothetical one:
 
-    `unpublished_at` is authoritative ONLY on the ABSOLUTE NEWEST row per app. That is the
-    exact row `unpublish` itself resolves via `latest_for_app` and stamps, WHATEVER ITS
-    STATUS (`deploy/router.py`'s own `unpublish` docstring: "THE ROW TO STAMP IS THE NEWEST
-    ONE, NOT THE NEWEST SUCCEEDED ONE" — a redeploy that settles FAILED can still leave the
-    container running, externally addressable, and billing). A later deploy attempt always
-    supersedes an earlier unpublish; reading `unpublished_at` off any row OTHER than the
-    absolute newest can miss an unpublish stamped on a failed redeploy.
+    AN UNPUBLISH COUNTS IF IT LANDED AT OR AFTER THE REVISION BEING SHOWN. `unpublish`
+    stamps whichever row was newest at the time, WHATEVER ITS STATUS (`deploy/router.py`:
+    "THE ROW TO STAMP IS THE NEWEST ONE, NOT THE NEWEST SUCCEEDED ONE" — a redeploy that
+    settles FAILED can still leave a container running, addressable, and billing). So the
+    question is not "does the newest row carry a stamp" but "did a takedown happen after the
+    thing we are about to advertise". Because ids are UUIDv7 and therefore creation-ordered,
+    that is a straight comparison: the newest UNPUBLISHED row must be strictly OLDER than the
+    row whose URL is being published.
+
+    Both halves of the comparison are load-bearing, and each has a test:
+
+      * Reading the stamp off only the newest row re-advertises a taken-down app the moment
+        ANY new row appears. Unpublish DELETES the container; a redeploy's row is created at
+        claim time while it is still RUNNING, so the newest row carries no stamp while the
+        newest SUCCEEDED row still names an address that no longer resolves. If that attempt
+        then settles FAILED, nothing ever recreates it and the dead listing is permanent.
+        Unpublish -> redeploy is the documented recovery path, so this window is reachable,
+        not theoretical.
+      * Excluding any app with an unpublish anywhere in its history strands it forever. A
+        SUCCEEDED redeploy genuinely does recreate the container at the same URL, and the
+        app belongs back in the catalog — which is exactly what the comparison allows and a
+        blanket exclusion would not.
 
     What is actually SHOWN is the newest row that SUCCEEDED with a URL. A later FAILED
     redeploy does not retract this: the pipeline creates the container app before it awaits
@@ -147,8 +162,9 @@ def _live_catalog(search: str | None) -> tuple[sa.Select[Any], Any]:
     the raw `Deployment` class no longer participates in the FROM clause once the collapse
     is in place.
     """
-    newest = (
-        sa.select(Deployment.app_id, Deployment.unpublished_at)
+    last_unpublished = (
+        sa.select(Deployment.app_id, Deployment.id)
+        .where(Deployment.unpublished_at.is_not(None))
         .distinct(Deployment.app_id)
         .order_by(Deployment.app_id, Deployment.id.desc())
         .subquery()
@@ -165,14 +181,18 @@ def _live_catalog(search: str | None) -> tuple[sa.Select[Any], Any]:
     query = (
         sa.select(deployment.id)
         .select_from(deployment)
-        .join(newest, newest.c.app_id == deployment.app_id)
+        # OUTER: an app that has never been unpublished has no row here, and must still list.
+        .outerjoin(last_unpublished, last_unpublished.c.app_id == deployment.app_id)
         .join(AppRegistry, AppRegistry.id == deployment.app_id)
         .join(Project, Project.id == AppRegistry.project_id)
         # The builder, for their display name only. INNER join: an app with no owner row is
         # not a catalog entry, it is a data-integrity problem, and it should not be listed.
         .join(User, User.id == deployment.user_id)
         .where(
-            newest.c.unpublished_at.is_(None),
+            sa.or_(
+                last_unpublished.c.id.is_(None),
+                last_unpublished.c.id < deployment.id,
+            ),
             AppRegistry.status != AppStatus.DISABLED,
         )
     )

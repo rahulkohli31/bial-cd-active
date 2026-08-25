@@ -126,14 +126,19 @@ describe('MarketplacePage', () => {
   it('marks the current page for assistive tech, not just visually', async () => {
     // Mutation receipt: drop `aria-current` from `PaginationLink` and this goes red. The
     // underline alone tells a sighted user which page they are on and nobody else.
+    //
+    // The highlight follows the RENDERED page (`data.page`), not the requested one — so a
+    // response saying "this is page 2" highlights 2. An earlier version of this test asserted
+    // the opposite, which quietly encoded the mismatch the review asked to fix: the control
+    // claiming page 1 while page 2's cards were on screen.
     h.listMarketplace.mockResolvedValue(
       page({ page: 2, pageSize: 10, total: 25, totalPages: 3 }),
     )
     renderPage()
 
-    const current = await screen.findByTestId('marketplace-page-1', {}, { timeout: 5000 })
+    const current = await screen.findByTestId('marketplace-page-2', {}, { timeout: 5000 })
     expect(current.getAttribute('aria-current')).toBe('page')
-    expect(screen.getByTestId('marketplace-page-2').getAttribute('aria-current')).toBeNull()
+    expect(screen.getByTestId('marketplace-page-1').getAttribute('aria-current')).toBeNull()
   })
 
   it('disables Previous on the first page and Next on the last', async () => {
@@ -279,6 +284,71 @@ describe('MarketplacePage', () => {
 
     await waitFor(() => expect(lastCall()).toMatchObject({ page: 2 }))
     await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+  })
+
+  it('leaves a failed navigation visible instead of silently reverting it', async () => {
+    // The bug this replaced: rolling `page` back inside `catch` looked like a fix, but `page`
+    // is a dispatcher dependency — so the rollback immediately refetched the previous page,
+    // and that success cleared `error`. A transient failure on "Next" reverted the
+    // navigation and dismissed its own banner before anyone could read it.
+    //
+    // Note `mockRejectedValue`, not `...Once`: if a stray refetch happens this stays failed
+    // and the assertions below still hold, so the test cannot pass by racing a recovery.
+    //
+    // Mutation receipt: re-add `setPage(lastGoodPage)` to the catch arm and this goes red —
+    // the request count climbs and the alert disappears.
+    h.listMarketplace.mockResolvedValue(page({ pageSize: 10, total: 25, totalPages: 3 }))
+    renderPage()
+    await screen.findByTestId('marketplace-page-2', {}, { timeout: 5000 })
+    const before = h.listMarketplace.mock.calls.length
+
+    h.listMarketplace.mockRejectedValue(new Error('Network is down'))
+    fireEvent.click(screen.getByTestId('marketplace-page-2'))
+    await screen.findByRole('alert', {}, { timeout: 5000 })
+
+    // Exactly ONE new request: the failed one. No self-triggered refetch behind it.
+    await waitFor(() => expect(h.listMarketplace.mock.calls.length).toBe(before + 1))
+    // And the banner is still there a tick later, rather than clearing itself.
+    await new Promise((r) => setTimeout(r, 50))
+    expect(screen.queryByRole('alert')).not.toBeNull()
+  })
+
+  it('climbs back out of a page past the end of a shrunken catalog', async () => {
+    // A page past the end is a NORMAL response — the server documents it, and it happens
+    // whenever the catalog shrinks under a reader who is deep in it. Left alone it was a dead
+    // end: `items` empty so nothing to page from, and with the catalog now under one page
+    // both controls unmount, stranding `page` at a number nothing on screen can reach.
+    //
+    // Mutation receipt: delete the past-the-end effect and this goes red — the page never
+    // re-requests, and the empty state sits under a non-zero "N published apps".
+    h.listMarketplace.mockResolvedValue(page({ pageSize: 10, total: 25, totalPages: 3 }))
+    renderPage()
+    await screen.findByTestId('marketplace-page-3', {}, { timeout: 5000 })
+
+    // The catalog shrinks to a single page while the reader is on page 3.
+    h.listMarketplace.mockResolvedValue(
+      page({ items: [], page: 3, pageSize: 10, total: 5, totalPages: 1 }),
+    )
+    fireEvent.click(screen.getByTestId('marketplace-page-3'))
+
+    // It re-requests the last page that actually exists rather than stranding the reader.
+    await waitFor(() => expect(lastCall()).toMatchObject({ page: 1 }))
+  })
+
+  it('does not call an overshot page an empty catalog', async () => {
+    // `total` is non-zero, so "Nothing has been published yet" would be a plain lie sitting
+    // directly above "5 published apps".
+    //
+    // Mutation receipt: drop the `total === 0` branch from the empty-state copy and this
+    // goes red.
+    h.listMarketplace.mockResolvedValue(
+      page({ items: [], page: 3, pageSize: 10, total: 5, totalPages: 1 }),
+    )
+    renderPage()
+
+    const empty = await screen.findByTestId('marketplace-empty', {}, { timeout: 5000 })
+    expect(empty.textContent).toMatch(/past the end/i)
+    expect(empty.textContent).not.toMatch(/nothing has been published/i)
   })
 
   it('ignores a stale response that lands after a newer one', async () => {

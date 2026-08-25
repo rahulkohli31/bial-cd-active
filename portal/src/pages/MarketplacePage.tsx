@@ -140,12 +140,15 @@ export default function MarketplacePage(): React.JSX.Element {
   // Guards against an out-of-order response overwriting a newer one: type fast enough and a
   // slow early request can land after the request that superseded it.
   const requestId = useRef(0)
-  // The last page number that actually RENDERED. A failed fetch rolls `page` back to this,
-  // so the highlighted page always matches the cards on screen and re-clicking the page that
-  // failed is a real state change rather than a no-op React bails out of. A ref, not state:
-  // putting it in `load`'s dependencies would change the callback's identity and re-trigger
-  // the dispatcher.
-  const lastGoodPage = useRef(1)
+  // Bumped to re-dispatch the SAME page — the retry path. `setPage(sameValue)` is a React
+  // bail-out, so without this a failed page has no way back short of a reload.
+  //
+  // This replaces an earlier design that rolled `page` back to the last good value inside
+  // `catch`. That looked like a fix and was a bug: `page` is a dispatcher dependency, so the
+  // rollback immediately refetched the previous page, and on success cleared `error` — a
+  // transient failure on "Next" silently reverted the navigation and dismissed its own error
+  // banner before anyone could read it.
+  const [reloadNonce, setReloadNonce] = useState(0)
 
   const load = useCallback(
     async (args: { page: number; pageSize: number; sort: MarketplaceSort; q: string }) => {
@@ -159,16 +162,15 @@ export default function MarketplacePage(): React.JSX.Element {
           q: args.q || undefined,
         })
         if (id !== requestId.current) return // superseded
-        lastGoodPage.current = body.page
         setData(body)
         setError(null)
       } catch (err) {
         if (id !== requestId.current) return
         setError(err instanceof Error ? err : new Error('Failed to load the marketplace'))
-        // Without this the failed page number stays active over the PREVIOUS page's cards,
-        // and clicking it again is `setPage(sameValue)` — React bails, the effect never
-        // re-runs, and there is no way back short of a reload.
-        setPage(lastGoodPage.current)
+        // Deliberately does NOT touch `page`. The pagination reads its state from `data`
+        // (see `shownPage`), so the highlight already matches the cards on screen without
+        // mutating a dispatcher dependency — and the error banner stays up until something
+        // actually succeeds.
       } finally {
         if (id === requestId.current) setLoading(false)
       }
@@ -179,7 +181,7 @@ export default function MarketplacePage(): React.JSX.Element {
   // THE ONLY PLACE A FETCH IS DISPATCHED. Everything else commits state and lets this run.
   useEffect(() => {
     void load({ page, pageSize, sort, q: applied })
-  }, [page, pageSize, sort, applied, load])
+  }, [page, pageSize, sort, applied, reloadNonce, load])
 
   const onQueryChange = (next: string): void => {
     setQuery(next)
@@ -205,7 +207,31 @@ export default function MarketplacePage(): React.JSX.Element {
   // yet" at someone who has merely started typing.
   const searching = applied !== ''
   const { items, totalPages, total } = data
-  const goTo = (next: number): void => setPage(Math.min(Math.max(1, next), totalPages))
+  // THE PAGE ON SCREEN, which is not always the page requested: a failed fetch leaves `page`
+  // at the value that failed while `data` still holds the last success. Driving the control
+  // from `data` keeps the highlight and the Prev/Next boundaries honest about what the reader
+  // is actually looking at, and removes any reason to mutate `page` on failure.
+  const shownPage = data.page
+
+  const goTo = (next: number): void => {
+    const target = Math.min(Math.max(1, next), totalPages)
+    // Same page re-requested (the retry after a failure): `setPage` would be a no-op, so
+    // nudge the nonce instead and let the one dispatcher run again.
+    if (target === page) setReloadNonce((n) => n + 1)
+    else setPage(target)
+  }
+
+  // A page past the end is a NORMAL response, not an error — the server says so, and it
+  // happens whenever the catalog shrinks under a reader who is deep in it (an admin
+  // unpublishing a few apps is enough). Left alone it is a dead end: `items` is empty, so
+  // there is nothing to page from, and if the catalog has shrunk below one page the whole
+  // control unmounts, stranding `page` at a number nothing can reach. Snap back to the last
+  // real page instead. Runs at most once — after it fires, `page <= totalPages` holds.
+  useEffect(() => {
+    if (!loading && !error && items.length === 0 && total > 0 && page > totalPages) {
+      setPage(totalPages)
+    }
+  }, [loading, error, items.length, total, page, totalPages])
 
   // The two controls appear on DIFFERENT conditions, deliberately. Page numbers are
   // meaningless at one page. But gating rows-per-page on the same condition would be a trap:
@@ -322,7 +348,9 @@ export default function MarketplacePage(): React.JSX.Element {
           <p data-testid="marketplace-empty" className="text-sm text-neutral py-10 text-center">
             {searching
               ? 'No published app matches that yet.'
-              : 'Nothing has been published yet. The first app to go live shows up here.'}
+              : total === 0
+                ? 'Nothing has been published yet. The first app to go live shows up here.'
+                : 'That page is past the end of the catalog — taking you back.'}
           </p>
         )}
 
@@ -366,12 +394,12 @@ export default function MarketplacePage(): React.JSX.Element {
                   <PaginationItem>
                     <PaginationPrevious
                       data-testid="marketplace-prev"
-                      disabled={page <= 1}
-                      onClick={() => goTo(page - 1)}
+                      disabled={shownPage <= 1}
+                      onClick={() => goTo(shownPage - 1)}
                     />
                   </PaginationItem>
 
-                  {pageWindow(page, totalPages).map((entry, i) =>
+                  {pageWindow(shownPage, totalPages).map((entry, i) =>
                     entry === 'gap' ? (
                       <PaginationItem key={`gap-${i}`}>
                         <PaginationEllipsis />
@@ -380,7 +408,7 @@ export default function MarketplacePage(): React.JSX.Element {
                       <PaginationItem key={entry}>
                         <PaginationLink
                           data-testid={`marketplace-page-${entry}`}
-                          isActive={entry === page}
+                          isActive={entry === shownPage}
                           onClick={() => goTo(entry)}
                         >
                           {entry}
@@ -392,8 +420,8 @@ export default function MarketplacePage(): React.JSX.Element {
                   <PaginationItem>
                     <PaginationNext
                       data-testid="marketplace-next"
-                      disabled={page >= totalPages}
-                      onClick={() => goTo(page + 1)}
+                      disabled={shownPage >= totalPages}
+                      onClick={() => goTo(shownPage + 1)}
                     />
                   </PaginationItem>
                 </PaginationContent>
