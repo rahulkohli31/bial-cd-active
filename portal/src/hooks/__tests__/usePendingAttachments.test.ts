@@ -119,3 +119,93 @@ describe('usePendingAttachments — restorePending', () => {
     expect(result.current.pendingAttachments.map((a) => a.id)).toEqual(['r1'])
   })
 })
+
+describe('usePendingAttachments — restorePending respects the per-message cap', () => {
+  const attachment = (id: string): PendingAttachment => ({
+    id, name: `${id}.png`, mediaType: 'image/png', size: 10, base64: 'AAA',
+  })
+
+  it('clamps the merged total to the cap and says so, rather than appending unbounded', async () => {
+    // The real sequence: 5 files staged and sent (the composer clears optimistically), 5 more
+    // staged during the upload window — those validate against an empty list, so they are
+    // legitimately accepted — then the upload fails and the first batch is restored on top.
+    // An unclamped merge leaves 10 chips against a cap of 5, and `validateAttachmentFiles`
+    // (the only enforcement point) never runs again on the send path, so all 10 would send.
+    h.fileToBase64.mockImplementation(async () => 'AAA')
+    const { result } = renderHook(() => usePendingAttachments())
+
+    await act(async () => {
+      await result.current.handleFiles([
+        makeFile('n1.png'), makeFile('n2.png'), makeFile('n3.png'), makeFile('n4.png'), makeFile('n5.png'),
+      ])
+    })
+    expect(result.current.pendingAttachments).toHaveLength(5)
+
+    act(() => {
+      result.current.restorePending([attachment('r1'), attachment('r2'), attachment('r3')])
+    })
+
+    expect(result.current.pendingAttachments).toHaveLength(5)
+    expect(result.current.attachToast).toBe('You can attach at most 5 files per message.')
+  })
+
+  it('truncates the RESTORED batch, never the files the user just staged', () => {
+    const { result } = renderHook(() => usePendingAttachments())
+
+    act(() => {
+      result.current.restorePending([attachment('own1'), attachment('own2'), attachment('own3')])
+    })
+    act(() => {
+      // Only two slots left, three restored — the user can see and re-pick what they staged
+      // a moment ago, but has no way of knowing what the restore dropped.
+      result.current.restorePending([attachment('r1'), attachment('r2'), attachment('r3')])
+    })
+
+    expect(result.current.pendingAttachments.map((a) => a.id)).toEqual(['own1', 'own2', 'own3', 'r1', 'r2'])
+  })
+})
+
+describe('usePendingAttachments — the send clear vs. the chat-switch clear', () => {
+  it('clearPendingAfterSend lets an in-flight read land, staged for the next message', async () => {
+    // A large PDF dropped just before Enter used to vanish outright: the send path shared the
+    // chat-switch clear, whose generation bump supersedes the read — no chip, no toast, no log,
+    // and the user believes it was attached when the model never saw it.
+    let resolveRead: (v: string) => void = () => {}
+    h.fileToBase64.mockImplementation(() => new Promise<string>((resolve) => { resolveRead = resolve }))
+    const { result } = renderHook(() => usePendingAttachments())
+
+    let pending: Promise<void> = Promise.resolve()
+    act(() => {
+      pending = result.current.handleFiles([makeFile('big.pdf')])
+    })
+    act(() => {
+      result.current.clearPendingAfterSend()
+    })
+    await act(async () => {
+      resolveRead('AAA')
+      await pending
+    })
+
+    expect(result.current.pendingAttachments.map((a) => a.name)).toEqual(['big.pdf'])
+  })
+
+  it('clearPending (the chat switch) still supersedes it — the bytes belong to the old chat', async () => {
+    let resolveRead: (v: string) => void = () => {}
+    h.fileToBase64.mockImplementation(() => new Promise<string>((resolve) => { resolveRead = resolve }))
+    const { result } = renderHook(() => usePendingAttachments())
+
+    let pending: Promise<void> = Promise.resolve()
+    act(() => {
+      pending = result.current.handleFiles([makeFile('big.pdf')])
+    })
+    act(() => {
+      result.current.clearPending()
+    })
+    await act(async () => {
+      resolveRead('AAA')
+      await pending
+    })
+
+    expect(result.current.pendingAttachments).toEqual([])
+  })
+})

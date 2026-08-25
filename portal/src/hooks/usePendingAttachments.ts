@@ -23,11 +23,17 @@ export interface UsePendingAttachmentsResult {
   handleFiles: (incoming: File[]) => Promise<void>
   handleFileSelect: (e: ChangeEvent<HTMLInputElement>) => Promise<void>
   removePending: (id: string) => void
+  /** Clears for a CHAT SWITCH — also supersedes any in-flight read, whose bytes belong to
+   *  the chat being left. Use `clearPendingAfterSend` on the send path instead. */
   clearPending: () => void
+  /** Clears for a SEND — leaves in-flight reads alone so they land in the now-empty
+   *  composer and stage for the next message rather than vanishing silently. */
+  clearPendingAfterSend: () => void
   /** Puts a previously-cleared batch back (a failed send that already cleared the
    *  composer) — MERGES with whatever is currently staged (deduped by id), since the
    *  composer stays live during the failing send and the user may have attached
-   *  something new in the meantime. */
+   *  something new in the meantime. Clamped to the per-message cap; the RESTORED batch is
+   *  what gets truncated, and a toast fires when it does. */
   restorePending: (items: PendingAttachment[]) => void
   attachToast: string | null
   showAttachToast: (msg: string) => void
@@ -58,11 +64,17 @@ export function usePendingAttachments(): UsePendingAttachmentsResult {
     toastTimer.current = setTimeout(() => setAttachToast(null), 3500)
   }, [])
 
-  // Bumped by clearPending() (fired on every chat switch) — a read started against the
-  // OLD chat that resolves after the switch has nowhere honest to land, so handleFiles
-  // checks this hasn't moved before committing. Without it, a file dropped just before
-  // navigating to another chat could land its bytes in the NEW chat's composer once the
-  // FileReader finally resolves.
+  // Bumped by clearPending() — the CHAT-SWITCH clear, and only that one. A read started
+  // against the OLD chat that resolves after the switch has nowhere honest to land, so
+  // handleFiles checks this hasn't moved before committing. Without it, a file dropped just
+  // before navigating to another chat could land its bytes in the NEW chat's composer once
+  // the FileReader finally resolves.
+  //
+  // Deliberately NOT bumped by clearPendingAfterSend(): a send stays in the same chat, so a
+  // read still in flight when the user hits Enter has somewhere perfectly honest to land —
+  // the now-empty composer, staged for their next message. Discarding it there (which is
+  // what a shared clear did) drops a large PDF silently, with no chip, no toast and no log,
+  // leaving the user believing it was attached when the model never saw it.
   const generationRef = useRef(0)
 
   // Mirrors pendingAttachments, but updated SYNCHRONOUSLY by every mutator below instead of
@@ -147,8 +159,18 @@ export function usePendingAttachments(): UsePendingAttachmentsResult {
     setPendingAttachments(pendingRef.current)
   }, [])
 
+  /** The CHAT-SWITCH clear: empties the composer AND supersedes any read still in flight,
+   *  because those bytes belong to the chat being left. */
   const clearPending = useCallback(() => {
     generationRef.current += 1
+    pendingRef.current = []
+    setPendingAttachments([])
+  }, [])
+
+  /** The SEND clear: empties the composer but leaves the generation alone, so a read that
+   *  was still in flight when the message went out lands in the now-empty composer and is
+   *  staged for the next one — rather than vanishing with no feedback. */
+  const clearPendingAfterSend = useCallback(() => {
     pendingRef.current = []
     setPendingAttachments([])
   }, [])
@@ -158,9 +180,22 @@ export function usePendingAttachments(): UsePendingAttachmentsResult {
     // restored-from was failing, so the user may already have staged something new — a
     // plain replace would discard it.
     const seen = new Set(pendingRef.current.map((a) => a.id))
-    pendingRef.current = [...pendingRef.current, ...items.filter((a) => !seen.has(a.id))]
+    const fresh = items.filter((a) => !seen.has(a.id))
+    // Clamped to the SAME per-message cap handleFiles re-checks at commit time. Without it
+    // the merge is an unbounded append: the composer stays live through the failing send
+    // (no spinner — ChatPage sets `generating` only after the upload resolves), so the user
+    // can stage a second full batch that validated against an empty list, and the restore
+    // then stacks the original batch on top. That compounds across repeated failures
+    // (5 → 10 → 15), and at the per-user storage cap EVERY upload fails, so it's the steady
+    // state rather than a one-off. `validateAttachmentFiles` is the sole enforcement point
+    // for this cap and never runs again on the send path, so an over-cap list sends as-is.
+    const room = Math.max(0, MAX_FILES_PER_MESSAGE - pendingRef.current.length)
+    // Truncate the RESTORED batch, not what the user just staged: they can still see and
+    // re-pick the files they chose a moment ago, but have no idea what the restore dropped.
+    if (fresh.length > room) showAttachToast(`You can attach at most ${MAX_FILES_PER_MESSAGE} files per message.`)
+    pendingRef.current = [...pendingRef.current, ...fresh.slice(0, room)]
     setPendingAttachments(pendingRef.current)
-  }, [])
+  }, [showAttachToast])
 
   // ── Drop-target feedback ────────────────────────────────────────────────────────────
   // Without it the composer advertises "drop them anywhere in the composer" (the attach
@@ -253,6 +288,7 @@ export function usePendingAttachments(): UsePendingAttachmentsResult {
     handleFileSelect,
     removePending,
     clearPending,
+    clearPendingAfterSend,
     restorePending,
     attachToast,
     showAttachToast,

@@ -591,7 +591,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     return null
   }, [messages, livePlanOptions])
 
-  const { pendingAttachments, handleFileSelect, removePending, clearPending, attachToast, showAttachToast, draggingFiles, dragHandlers } =
+  const { pendingAttachments, handleFileSelect, removePending, clearPending, clearPendingAfterSend, attachToast, showAttachToast, draggingFiles, dragHandlers } =
     usePendingAttachments()
 
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -1505,7 +1505,9 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
           // Clear the PERSISTED draft with the in-memory one, or the next reload re-populates the
           // composer with the message that was just sent — which is easy to send twice by accident.
           clearDraft(sendChatId)
-          clearPending()
+          // The SEND clear, not the chat-switch one — see usePendingAttachments: a read
+          // still in flight here belongs to THIS chat and stages for the next message.
+          clearPendingAfterSend()
         },
       })
     } finally {

@@ -117,6 +117,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     handleFileSelect,
     removePending,
     clearPending,
+    clearPendingAfterSend,
     restorePending,
     attachToast,
     showAttachToast,
@@ -412,7 +413,14 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
       // this page with no `key`, so it survives the switch). Mirrors the activeChatIdRef
       // guard streamAssistant already uses for the identical race.
       if (activeChatIdRef.current !== currentChatId) return
-      runtime.thread.composer.setText(rawText)
+      // Prepend rather than overwrite, for the same reason restorePending merges rather than
+      // replaces: the composer stayed live through the failing upload (no spinner), so the
+      // user may already be typing their next thought. A blind setText destroys it — and
+      // unrecoverably, because assistant-ui's ComposerPrimitive.Input is fully controlled, so
+      // a store write bypasses the browser's native undo stack and ctrl+Z will not bring it
+      // back. The failed message goes first: it's the one being retried.
+      const typedSince = runtime.thread.composer.getState().text
+      runtime.thread.composer.setText(typedSince ? `${rawText}\n\n${typedSince}` : rawText)
       restorePending(attachments)
       return
     }
@@ -503,7 +511,9 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     }
 
     runtime.thread.composer.setText('')
-    clearPending()
+    // The SEND clear, not the chat-switch one: a file still being read when Enter lands
+    // stays live and stages for the next message instead of vanishing without a chip.
+    clearPendingAfterSend()
 
     // Pass the route's chat id explicitly. Under flat routing it is known from the
     // first render, while `activeChatId` only commits once hydration resolves — a send
