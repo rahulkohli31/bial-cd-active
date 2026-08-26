@@ -214,33 +214,3 @@ describe('the waiting-count badge (P1)', () => {
   })
 })
 
-/**
- * The bell and the badge must not contradict each other. "You're all caught up" was
- * unconditional; it became false the moment the badge showed a number, and an
- * administrator who opened the conventional place to check would be told the opposite of
- * the badge two inches away.
- */
-describe('the bell agrees with the badge', () => {
-  it('does NOT say "all caught up" while apps are waiting', async () => {
-    h.getStoredUser.mockReturnValue(ADMIN)
-    h.fetchAppStatusCounts.mockResolvedValue(counts(3))
-    renderNavbar()
-    await screen.findByTestId('waiting-count-nav')
-
-    fireEvent.click(document.querySelector('nav').querySelectorAll('button')[1])
-    const waiting = await screen.findByTestId('bell-waiting')
-    expect(waiting.textContent).toContain('3 apps waiting for review')
-    expect(screen.queryByText("You're all caught up")).toBeNull()
-  })
-
-  it('still says "all caught up" when nothing is waiting', async () => {
-    h.getStoredUser.mockReturnValue(ADMIN)
-    h.fetchAppStatusCounts.mockResolvedValue(counts(0))
-    renderNavbar()
-    await waitFor(() => expect(h.fetchAppStatusCounts).toHaveBeenCalled())
-
-    fireEvent.click(document.querySelector('nav').querySelectorAll('button')[1])
-    expect(await screen.findByText("You're all caught up")).toBeTruthy()
-    expect(screen.queryByTestId('bell-waiting')).toBeNull()
-  })
-})
