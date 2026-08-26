@@ -41,6 +41,7 @@ from enum import StrEnum
 from urllib.parse import urlsplit
 
 from src.services.deploy.names import published_app_name
+from src.services.sandbox.base import base_path_for
 
 
 class AddressState(StrEnum):
@@ -88,7 +89,7 @@ def classify(recorded: str | None, *, app_id: uuid.UUID, apps_base_url: str) -> 
         # moved" would hide it behind a no-op.
         return (
             AddressState.ALREADY_MOVED
-            if parsed.path.startswith(f"/a/{name}")
+            if parsed.path.startswith(base_path_for(name))
             else AddressState.SOMEWHERE_ELSE
         )
     if host.split(".")[0] == name:
@@ -114,6 +115,10 @@ class Action:
     app_id: uuid.UUID
     platform: AddressState
     recorded: AddressState
+    recorded_before: str | None
+    """The value `app_registry.deployed_url` held before this pass. Carried so the driver can
+    write a pre-image BEFORE overwriting: this is the one writer of that column with no person
+    in the loop, and an overwrite nobody recorded is an overwrite nobody can undo."""
     rewrite_recorded_to: str | None
     """The new `app_registry.deployed_url`, or None when nothing is written."""
     blocked_reason: str | None
@@ -134,21 +139,23 @@ def decide(addresses: AppAddresses, *, apps_base_url: str) -> Action:
         addresses.recorded_url, app_id=addresses.app_id, apps_base_url=apps_base_url
     )
     name = published_app_name(addresses.app_id)
-    target = f"{apps_base_url}/a/{name}/"
+    # One owner for the `/a/<name>` shape, shared with the sandbox side rather than re-spelled.
+    target = f"{apps_base_url}{base_path_for(name)}/"
 
     if recorded is not AddressState.NAMES_ITS_CONTAINER:
         # Absent, already moved, or somewhere else — all three are "leave it".
-        return Action(addresses.app_id, platform, recorded, None, None)
+        return Action(addresses.app_id, platform, recorded, addresses.recorded_url, None, None)
 
     if platform is not AddressState.ALREADY_MOVED:
         return Action(
             addresses.app_id,
             platform,
             recorded,
+            addresses.recorded_url,
             None,
             "the app has not been republished yet — its platform address still names its "
             "container, so an image serving under the key is not proven to exist. Rewriting "
             "now would turn a link that does not resolve into one that answers 404.",
         )
 
-    return Action(addresses.app_id, platform, recorded, target, None)
+    return Action(addresses.app_id, platform, recorded, addresses.recorded_url, target, None)

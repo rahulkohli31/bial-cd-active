@@ -29,6 +29,8 @@ from urllib.parse import urlsplit
 from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from src.services.sandbox.base import base_path_for
+
 # The single env-source contract, shared verbatim by every profile.
 #
 # `SettingsConfigDict` rather than a bare dict literal ON PURPOSE: it is a TypedDict, so all four
@@ -161,7 +163,12 @@ class CoreSettings(BaseSettings):
 
         `app_name` is `sbx-`/`pub-` plus 28 hex — the container app's own name — which is what
         makes this a string composition rather than a lookup, and is why the router needs no
-        registry. The trailing slash is deliberate: it is the app's root, and a link without one
-        is a redirect the person following it does not need.
+        registry.
+
+        NO TRAILING SLASH, and this is measured rather than chosen. Against a real Next 16 dev
+        server, `/<base>/` answers 308 and redirects to `/<base>`; only the unslashed form
+        answers 200. A slash here would put a redirect in front of every framed preview and
+        every published link somebody shares — the opposite of what an earlier draft of this
+        docstring claimed it was avoiding.
         """
-        return f"{self.APPS_BASE_URL}/a/{app_name}/"
+        return f"{self.APPS_BASE_URL}{base_path_for(app_name)}"

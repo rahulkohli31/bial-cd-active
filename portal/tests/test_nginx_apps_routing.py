@@ -354,8 +354,15 @@ def test_top_level_navigation_sets_exactly_one_correctly_attributed_cookie(
     Plain `SameSite=Lax` works inside the portal's iframe only because the two hostnames share
     the registrable domain; if the portal ever moves, this silently stops working in the frame
     and `SameSite=None; Secure` becomes required."""
+    # A REAL BROWSER SENDS BOTH `Sec-Fetch-*` HEADERS. `none` is what a typed address or a
+    # bookmark carries — the ordinary way somebody opens a link a colleague sent them.
     _, headers, _ = router.request(
-        f"/a/{SBX_KEY}/", headers={"Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document"}
+        f"/a/{SBX_KEY}/",
+        headers={
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Site": "none",
+        },
     )
     assert headers["__set_cookie_count"] == "1"
     cookie = headers["set-cookie"]
@@ -372,8 +379,16 @@ def test_cookie_is_also_set_when_the_app_loads_inside_the_portal_iframe(
 ) -> None:
     """The COMMON case, not the top-level one. Testing only a document navigation would pass
     while every preview in the cockpit failed to get a fallback cookie at all."""
+    # The portal and the apps host share the registrable domain, so framing one from the other
+    # is `same-site` — which is precisely why the cookie's plain `SameSite=Lax` works in the
+    # frame at all, and why `same-site` has to be on the allowed list here.
     _, headers, _ = router.request(
-        f"/a/{SBX_KEY}/", headers={"Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "iframe"}
+        f"/a/{SBX_KEY}/",
+        headers={
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Dest": "iframe",
+            "Sec-Fetch-Site": "same-site",
+        },
     )
     assert headers["__set_cookie_count"] == "1"
     assert headers["set-cookie"].startswith(f"bial_app={SBX_KEY};")
@@ -382,9 +397,18 @@ def test_cookie_is_also_set_when_the_app_loads_inside_the_portal_iframe(
 @pytest.mark.parametrize(
     "headers",
     [
-        {"Sec-Fetch-Mode": "no-cors", "Sec-Fetch-Dest": "image"},
-        {"Sec-Fetch-Mode": "cors"},
-        {},  # a client that sends no Sec-Fetch-Mode at all
+        {"Sec-Fetch-Mode": "no-cors", "Sec-Fetch-Dest": "image", "Sec-Fetch-Site": "same-origin"},
+        {"Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin"},
+        {},  # a client that sends no Sec-Fetch-* headers at all
+        # ★ THE CROSS-SITE NAVIGATION. `Sec-Fetch-Mode: navigate` ALONE admits this — a link or
+        # a `window.open` from any page on the internet — so an attacker who gets one click could
+        # otherwise plant the routing cookie and repoint every later keyless call the victim's
+        # own app makes. This is the case the second signal exists for.
+        {
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Site": "cross-site",
+        },
     ],
 )
 def test_a_subresource_request_never_writes_the_cookie(
@@ -526,3 +550,21 @@ def test_the_access_log_separates_no_such_app_from_a_dead_app(
     # And the field that looks like it should discriminate does not — pinned so nobody
     # "simplifies" the log format down to it.
     assert "upstream_status=502" in dead_line, dead_line
+
+
+def test_a_dead_apps_404_does_not_plant_a_routing_cookie(router: Router) -> None:
+    """A navigation to an app that no longer exists must not pin the browser to it.
+
+    The cookie is the fallback that resolves EVERY later keyless request from this browser. If a
+    stale link planted one, the person would be routed to a dead container for the rest of the
+    session — including from a different app they opened afterwards, since the cookie is
+    host-wide. The keyed location's `add_header` does not survive the `error_page` hop into
+    `@app_gone`, which is what makes this hold; it is asserted rather than assumed because that
+    is a property of nginx's header inheritance, not of anything written here.
+    """
+    status, headers, _ = router.request(
+        f"/a/{GHOST_KEY}/", headers={"Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document"}
+    )
+    assert status == 404
+    assert headers["__set_cookie_count"] == "0"
+    assert "set-cookie" not in headers

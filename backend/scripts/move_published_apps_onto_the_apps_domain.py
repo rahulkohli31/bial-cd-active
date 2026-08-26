@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from pathlib import Path
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -48,6 +49,8 @@ from src.db.models.app_registry import AppRegistry
 from src.db.models.deployment import Deployment, DeploymentStatus
 from src.services.deploy.backfill import Action, AddressState, AppAddresses, decide
 
+_PRE_IMAGE_DIR = Path("/tmp/bial-apps-domain-backfill")
+
 
 async def _load(db: AsyncSession) -> list[AppAddresses]:
     """Every app that has ever recorded an address, with both of its addresses.
@@ -56,19 +59,31 @@ async def _load(db: AsyncSession) -> list[AppAddresses]:
     or running row says nothing about what is live, and reading one would let a half-finished
     publish open the rewrite gate.
     """
-    latest = (
+    # ONE ROW PER APP, and the `rn == 1` filter is what makes that true. A window function does
+    # NOT collapse rows — `first_value(...) OVER (PARTITION BY app_id)` computes the right VALUE
+    # on every row and still returns one row per deployment, so an app with a redeploy history
+    # would be joined once per deploy: counted twice in the report, and written twice by
+    # `--execute`. The value was never wrong; the row count was, which is exactly the kind of
+    # defect a report reads past.
+    #
+    # `id` breaks a `created_at` tie. UUIDv7 primary keys are time-sortable, so it agrees with
+    # `created_at` rather than fighting it, and it makes the ordering total instead of merely
+    # usually-unique.
+    ranked = (
         sa.select(
             Deployment.app_id,
-            sa.func.first_value(Deployment.url)
+            Deployment.url,
+            sa.func.row_number()
             .over(
                 partition_by=Deployment.app_id,
-                order_by=Deployment.created_at.desc(),
+                order_by=(Deployment.created_at.desc(), Deployment.id.desc()),
             )
-            .label("url"),
+            .label("rn"),
         )
         .where(Deployment.status == DeploymentStatus.SUCCEEDED)
         .subquery()
     )
+    latest = sa.select(ranked.c.app_id, ranked.c.url).where(ranked.c.rn == 1).subquery()
     rows = (
         await db.execute(
             sa.select(AppRegistry.id, AppRegistry.deployed_url, latest.c.url)
@@ -116,6 +131,22 @@ async def _run(execute: bool) -> None:
             print(f"\nDRY RUN — nothing written. {len(moves)} app(s) would move.")
             print("Re-run with --execute once you are satisfied with the list above.")
             return
+        # THE PRE-IMAGE, WRITTEN BEFORE THE OVERWRITE. `deployed_url` is a field a human typed,
+        # and this is the one writer that replaces it without a person in the loop — every other
+        # writer is an admin action with an audit row behind it. An overwrite with no record of
+        # what was there is not reversible, and "we can work it out from the app id" stops being
+        # true the moment one of these rows turns out to have been right.
+        pre_image = _PRE_IMAGE_DIR / f"deployed-url-preimage-{len(moves)}-rows.tsv"
+        pre_image.parent.mkdir(parents=True, exist_ok=True)
+        pre_image.write_text(
+            "app_id\told_deployed_url\tnew_deployed_url\n"
+            + "".join(
+                f"{a.app_id}\t{a.recorded_before}\t{a.rewrite_recorded_to}\n" for a in moves
+            ),
+            encoding="utf-8",
+        )
+        print(f"\nPre-image written to {pre_image} — keep it until the move is confirmed.")
+
         for a in moves:
             await db.execute(
                 sa.update(AppRegistry)
@@ -123,7 +154,7 @@ async def _run(execute: bool) -> None:
                 .values(deployed_url=a.rewrite_recorded_to)
             )
         await db.commit()
-        print(f"\nWROTE {len(moves)} recorded address(es).")
+        print(f"WROTE {len(moves)} recorded address(es).")
 
 
 def main() -> None:

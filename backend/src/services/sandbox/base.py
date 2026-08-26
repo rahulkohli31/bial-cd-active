@@ -11,16 +11,22 @@ concrete ACA/helper client in Wave 1, and Track BRAIN imports it READ-ONLY (call
 a subset through an injected client — it never implements or edits this file).
 
 No vendor type crosses this port. Every supervisor call the client makes goes to
-`https://{handle.fqdn}/_sup/<endpoint>` with `Authorization: Bearer {handle.token}`
-(Caddy strips `/_sup`, so the supervisor sees the C1 paths); `handle.preview_url`
-is the un-prefixed `next dev` root `https://{handle.fqdn}/`.
+`https://{handle.fqdn}/_sup/<endpoint>` with `Authorization: Bearer {handle.token}` (Caddy
+strips `/_sup`, so the supervisor sees the C1 paths).
 
-THE BROWSER NO LONGER GOES THERE. A generated app is served to a person through the platform's
-router, on one public hostname with the app's key in the path (`/a/sbx-<28 hex>/`), because
-per-app subdomains would need a wildcard certificate BIAL refused. So this module's addresses
-are the CONTROL PLANE's: direct, private, and never handed to a browser. `handle.app_root_url`
-is where the app's own pages live on that direct address; `settings.app_url(app_name)` is what
-a person is given.
+TWO ADDRESSES, AND THEY ARE NOT INTERCHANGEABLE. A generated app is served to a person through
+the platform's router, on one public hostname with the app's key in the path
+(`/a/sbx-<28 hex>/`), because per-app subdomains would need a wildcard certificate BIAL
+refused — and BIAL's Container Apps environment is internal, so its own domain resolves for
+nobody outside the VNet. So:
+
+  `handle.preview_url`   PUBLIC. The router address a browser is given. Carries the key.
+  `handle.app_root_url`  PRIVATE. Where this container serves the app's own pages, direct.
+  `handle.fqdn`          PRIVATE. The container's ACA ingress host; `/_sup/*` composes from it.
+
+The control plane uses the private pair and must keep doing so: a probe that followed
+`preview_url` would leave the VNet, traverse the public gateway, and work only in a development
+environment whose Container Apps environment happens not to be internal.
 """
 
 from __future__ import annotations
@@ -372,8 +378,10 @@ class SandboxHandle:
     unchanged and every `dataclasses.replace` call site keeps working."""
 
     fqdn: str
-    """Public ACA ingress FQDN, host only, NO scheme (e.g. `app-xyz.westeurope.
-    azurecontainerapps.io`). All `/_sup/*` calls and `preview_url` derive from it."""
+    """The container's ACA ingress FQDN, host only, NO scheme (e.g. `app-xyz.westeurope.
+    azurecontainerapps.io`). `/_sup/*` and `app_root_url` derive from it — `preview_url` does
+    NOT, and has not since apps moved behind the router. On an internal environment this name
+    has no public DNS at all, so it is a private address despite ACA calling it public."""
     token: str
     """The per-session supervisor bearer token, sent as `Authorization: Bearer
     {token}` to `/_sup/*`. Held IN-PROCESS only; NEVER persisted raw — the C5
@@ -381,13 +389,14 @@ class SandboxHandle:
     app_name: str
     """The app/container identifier (one-app-per-project); == C5 registry `app_name`."""
     preview_url: str
-    """The un-prefixed `next dev` root `https://{fqdn}/` — the browsable preview the
-    portal frames cross-origin (C8). Never carries the bearer token.
+    """THE PUBLIC ADDRESS — `https://<apps-host>/a/<app_name>/`, the browsable preview the portal
+    frames cross-origin (C8). Never carries the bearer token.
 
-    NOTE this is the CONTAINER'S OWN address, reached directly over the private network. It is
-    no longer where a browser goes: an app is served to a person through the platform's router,
-    on one public hostname with the app's key in the path. Anything handed to a browser must be
-    composed from `settings.app_url(app_name)`, never from this."""
+    It used to be the container's own un-prefixed root, `https://{fqdn}/`. It is not that any
+    more, and the distinction is load-bearing rather than cosmetic: an internal Container Apps
+    environment publishes no public DNS, so the old value resolved for nobody outside the VNet.
+    Use `app_root_url` for anything the CONTROL PLANE does — a probe pointed here would leave
+    the VNet and traverse the public gateway."""
     ready: bool
     """Dev-server readiness snapshot (mirrors C1 `/dev/status.ready` — A REQUEST TO THE APP
     ROOT ACTUALLY SUCCEEDED) at handle construction; refreshed by `wait_ready` / `dev_status`.
@@ -489,9 +498,25 @@ class CompileReport:
         Named here so no call site re-derives it from the reason string."""
         return self.state is CompileState.UNKNOWN and self.reason == _DRIFT_REASON
 
+    @property
+    def config_tampered(self) -> bool:
+        """The app is not serving under the path the platform assigned it.
+
+        Almost always: the model edited or deleted the platform-owned `next.config.ts` and the
+        app went back to answering at `/`. This exists so the failure NAMES ITSELF. Without it
+        the only observable symptom is the app's own root answering 404, which the serving
+        verdict reports as "the root route does not resolve — make sure `app/page.tsx` exists" —
+        sending the model to repair a file that was never wrong, three retries deep.
+        """
+        return self.state is CompileState.UNKNOWN and self.reason == _TAMPERED_REASON
+
 
 _DRIFT_REASON: Final = "no_recognised_frame"
 """The supervisor's word for the canary firing. Matched, not re-spelled, in one place."""
+
+_TAMPERED_REASON: Final = "config_tampered"
+"""The supervisor's word for "the served base path is not the injected one". Same rule as
+`_DRIFT_REASON`: matched here, never re-spelled at a call site."""
 
 
 SERVED_HEAD_MAX_CHARS: Final = 2_000

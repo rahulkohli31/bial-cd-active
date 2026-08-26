@@ -496,6 +496,9 @@ def test_an_app_url_is_composed_from_the_container_name(prefix: str) -> None:
     why the router holds no registry. Preview and published differ only by the prefix."""
     env = {**_CORE, **_AUTH, **_ADMINS, **_SUPPORT, **_APP_DB}
     name = f"{prefix}1a2b3c4d5e6f70819a2b3c4d5e6f"
-    assert _boot(ApiSettings, env).app_url(name) == (
-        f"https://citizenapps.bialairport.com/a/{name}/"
-    )
+    url = _boot(ApiSettings, env).app_url(name)
+    assert url == f"https://citizenapps.bialairport.com/a/{name}"
+    # NO TRAILING SLASH, measured against a real Next 16 dev server: `/<base>/` answers 308 and
+    # redirects to `/<base>`. A slash here would put a redirect in front of every framed preview
+    # and every published link somebody shares.
+    assert not url.endswith("/")

@@ -512,7 +512,7 @@ async def test_the_warm_relaunch_attaches_to_the_pre_existing_container(
     assert aca_wire.aca.create_calls == creates_after_cold, (
         "the warm relaunch attached; a rebuild would have appended another create"
     )
-    expected = f"https://citizenapps.bialairport.com/a/{app_name_for(app_id)}/"
+    expected = f"https://citizenapps.bialairport.com/a/{app_name_for(app_id)}"
     assert cold.json()["previewUrl"] == expected
     assert warm.json()["previewUrl"] == expected
 

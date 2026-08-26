@@ -673,7 +673,7 @@ async def test_the_handle_hands_the_browser_the_public_address(
     aca = FakeAca()
     client = _client(aca)
     handle = await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
-    assert handle.preview_url == f"https://citizenapps.bialairport.com/a/{APP_NAME}/"
+    assert handle.preview_url == f"https://citizenapps.bialairport.com/a/{APP_NAME}"
     assert ".azurecontainerapps.io" not in handle.preview_url
     await client.aclose()
 

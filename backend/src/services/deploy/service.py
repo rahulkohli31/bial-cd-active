@@ -56,6 +56,7 @@ import sqlalchemy as sa
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.config import settings
 from src.core.errors import AppApiError
 from src.core.redaction import redact_and_cap
 from src.db.models.app_registry import AppRegistry, ApprovalRoute
@@ -553,17 +554,10 @@ class DeployService:
         # name cannot resolve it. This value is recorded on the deployment row, rendered as a
         # link in the outcome card, and shared outside the platform; it has to be the address
         # the router actually serves.
-        return self._public_url(app_id)
-
-    def _public_url(self, app_id: uuid.UUID) -> str:
-        """Where a browser reaches this published app.
-
-        Composed from the container app's own name, which is `pub-` plus 28 hex of the app id —
-        derived, never looked up — so the address is STABLE across redeploys. That stability is
-        the whole point: a link a colleague already holds keeps working after the next publish.
-        """
-        from src.config import settings  # lazy: avoid an import cycle via src.config
-
+        # Composed from the container app's own name — `pub-` plus 28 hex of the app id,
+        # derived rather than looked up — so the address is STABLE across redeploys. That
+        # stability is the point: a link a colleague already holds keeps working after the
+        # next publish.
         return settings.app_url(self._aca_name(app_id))
 
     async def _await_revision(self, *, app_id: uuid.UUID, deployment_id: uuid.UUID) -> None:

@@ -149,6 +149,32 @@ _SERVED_BADLY_DETAIL = (
 )
 
 
+# THE ONE CASE THE TEXT ABOVE WOULD GET WRONG, AND EXPENSIVELY.
+#
+# A generated app is served under a path the platform assigns it (`/a/<key>/`), set by the
+# platform-owned `next.config.ts`. If that file is edited or deleted, the app goes back to
+# answering at `/` and its assigned path 404s — so the serving probe reports a 4xx and the
+# diagnostic above tells the model to make sure `app/page.tsx` exists. It does exist. Nothing is
+# wrong with it. The model then spends its retry budget rewriting a file that was never broken,
+# and the real cause is a file it was told not to touch.
+#
+# The supervisor already detects this precisely and publishes `config_tampered`. This is where
+# that signal earns its keep: the detection is worthless if the diagnostic it exists to correct
+# is still the one the model receives.
+_CONFIG_TAMPERED_DETAIL = (
+    "The app is not being served at the address the platform assigned it, so nothing can reach "
+    "it. This is not a problem with your page code — `app/page.tsx` is almost certainly fine. "
+    "`next.config.ts` is owned by the platform and carries the path this app is served under; "
+    "it has been changed or removed. Restore it to what it was and do not modify it again. If "
+    "you need configuration of your own, put it in your own files."
+)
+
+
+def config_tampered_error() -> BuildError:
+    """The diagnostic for "the app answered badly BECAUSE it is no longer at its own address"."""
+    return from_server(_CONFIG_TAMPERED_DETAIL)
+
+
 def served_badly_error(status: int) -> BuildError:
     """The diagnostic for "the dev server is up, the types are clean, and the app's own home page
     answers with an error" (U6, R9). Routed through `from_server` because the status came from the
@@ -728,8 +754,21 @@ async def _verify_once(
     elif not (200 <= served.status < 400):
         # R9's serving half. A 3xx counts as serving: the route compiled and answered, which is
         # the whole question — an agent that replaced the root with a redirect built something.
+        #
+        # ASK WHY BEFORE SAYING WHAT. A 4xx here has two very different causes and only one of
+        # them is the app's fault; `config_tampered` is the supervisor telling us which. Reading
+        # it costs one already-cheap call and saves the model three retries aimed at the wrong
+        # file. Any other reason, or no answer at all, falls through to the ordinary diagnostic —
+        # this narrows the message, it never suppresses it.
         state = HealthState.UNHEALTHY
-        error = served_badly_error(served.status)
+        # `compile_state` never raises and never returns None — a transport failure reads as
+        # UNKNOWN with a reason, which is exactly the shape this predicate already handles.
+        compile_report = await sandbox_client.compile_state(handle)
+        error = (
+            config_tampered_error()
+            if compile_report.config_tampered
+            else served_badly_error(served.status)
+        )
     elif baseline is BaselineIdentity.UNANSWERABLE:
         # No root commit, more than one, or a baseline the repository never held. Never UNHEALTHY
         # and never HEALTHY: an app cannot be convicted of showing the template by a check that

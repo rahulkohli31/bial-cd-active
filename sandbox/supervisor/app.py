@@ -412,9 +412,13 @@ def _dev_port_status(
 
     This holds the mechanics `_dev_port_serving` used to hold inline; that function is now the
     one-line predicate over it, so the fail-open lives in exactly one place and reads as what it
-    is — "an answer, any answer". The status is surfaced because ONE caller genuinely needs to
-    tell a 404 from a 200 (`_detect_base_path_tampering`), and readiness deliberately still does
-    not.
+    is — "an answer, any answer" — rather than being spelled out in the middle of socket
+    bookkeeping.
+
+    NO CALLER READS THE INT TODAY, and that is worth saying plainly rather than dressing up: the
+    split exists to isolate the fail-open, not to serve a second consumer. Tamper detection needs
+    a response BODY as well as a status, so it opens its own connection (`_served_base_path`)
+    instead of reusing this. If that ever changes, this is the seam to reuse.
     """
     read_budget = timeout if read_timeout is None else read_timeout
     target = (_base_path() or "/") if path is None else path
@@ -476,14 +480,30 @@ def _served_base_path() -> str | None:
     Returns None — never a guess — when nothing identifiable comes back, so an app that replaces
     the not-found page with plain text is reported as unknown rather than as tampered.
     """
+    # THE SAME WATCHDOG THE READINESS PROBE CARRIES, AND FOR THE SAME REASON. `settimeout` re-arms
+    # on every socket operation, and this response comes from an unreviewed generated app — a peer
+    # that trickles one byte at a time satisfies each read forever and this call never returns.
+    # This one reads a BODY as well as headers, so it is strictly more exposed than its sibling,
+    # and it runs on a fire-and-forget thread with nobody waiting on it: a hang here is a leaked
+    # thread per dev-server restart, not a slow answer somebody notices.
     conn = http.client.HTTPConnection("127.0.0.1", _DEV_PORT, timeout=_TAMPER_TIMEOUT)
+    watchdog: threading.Timer | None = None
     try:
+        conn.connect()
+        sock = conn.sock
+        if sock is not None:
+            sock.settimeout(_TAMPER_TIMEOUT)
+            watchdog = threading.Timer(_TAMPER_TIMEOUT, _abandon_socket, args=(sock,))
+            watchdog.daemon = True
+            watchdog.start()
         conn.request("GET", "/")
         resp = conn.getresponse()
         body = resp.read(_TAMPER_BODY_MAX).decode("utf-8", "replace")
     except (OSError, http.client.HTTPException):
         return None
     finally:
+        if watchdog is not None:
+            watchdog.cancel()
         conn.close()
     match = _NEXT_ASSET_RE.search(body)
     return match.group("prefix") if match else None
@@ -857,11 +877,16 @@ def _consume_hmr() -> None:
         return
     # THE SOCKET LIVES BEHIND THE BASE PATH TOO. `basePath` gates every route Next serves, the
     # dev endpoints included, so an app at `/a/sbx-<key>` answers the handshake only at
-    # `/a/sbx-<key>/_next/hmr`. Resolved per attempt rather than captured once: the loop
-    # reconnects forever across dev-server restarts and a restore can re-inject the environment
-    # underneath it.
-    url = f"ws://127.0.0.1:{_DEV_PORT}{_base_path()}{_HMR_PATH}"
+    # `/a/sbx-<key>/_next/hmr`.
     while True:
+        # COMPOSED INSIDE THE LOOP, not once above it. This thread starts at most once per
+        # container life and reconnects forever, so a URL captured before the loop is captured
+        # for good — and `_base_path()` reads `os.environ` at call time precisely because a
+        # restore re-injects the environment underneath a running supervisor. Hoisting this line
+        # out of the loop would pin the consumer to a stale path with no symptom: the canary
+        # only arms AFTER a successful connect, so a connect that never succeeds is invisible to
+        # it. That is the same shape as the `/_next/webpack-hmr` defect recorded above.
+        url = f"ws://127.0.0.1:{_DEV_PORT}{_base_path()}{_HMR_PATH}"
         try:
             with connect(url, open_timeout=_HMR_CONNECT_TIMEOUT, close_timeout=1.0) as ws:
                 with _Compile.lock:

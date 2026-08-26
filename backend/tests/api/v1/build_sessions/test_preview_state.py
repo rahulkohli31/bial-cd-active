@@ -199,7 +199,7 @@ async def test_a_live_container_for_this_project_is_alive_with_a_framable_url(
     # building a `SandboxHandle`, so it is invisible to anything that follows the handle's field
     # — and it is what the cockpit frames, so getting it wrong shows a blank preview over a
     # perfectly healthy container.
-    assert body["previewUrl"] == (f"https://citizenapps.bialairport.com/a/{app_name_for(app_id)}/")
+    assert body["previewUrl"] == (f"https://citizenapps.bialairport.com/a/{app_name_for(app_id)}")
     assert "azurecontainerapps.io" not in body["previewUrl"]
     assert body["occupyingProjectName"] is None  # nobody is standing in the way
 

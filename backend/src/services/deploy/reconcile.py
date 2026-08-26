@@ -32,9 +32,11 @@ from contextlib import AbstractAsyncContextManager
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.config import settings
 from src.db.models.deployment import Deployment
 from src.services.deploy import store
 from src.services.deploy.aca_publish import PublishedAppReader
+from src.services.deploy.names import published_app_name
 from src.services.sandbox.aca import AcaTransientError
 
 _log = structlog.get_logger()
@@ -48,19 +50,6 @@ SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 STALE_AFTER_S: float = 120.0
 
 RECONCILED_EVENT = "deployment_reconciled"
-
-
-def _public_url(app_id: uuid.UUID) -> str:
-    """Where a browser reaches this published app — the same composition the deploy pipeline's
-    own success terminal uses, so the two writers of `deployments.url` cannot disagree.
-
-    Lazy imports for the module's own cycle reason: `src.config` reaches back into the service
-    packages, and `deploy.names` is imported the same way at every other reconcile-adjacent site.
-    """
-    from src.config import settings
-    from src.services.deploy.names import published_app_name
-
-    return settings.app_url(published_app_name(app_id))
 
 
 async def reconcile_stalled_deployments(
@@ -113,7 +102,9 @@ async def _resolve(
             # writes the same column, so the two must not disagree about what a deployment's URL
             # means. Composed from the container name rather than the fqdn for the same reason:
             # BIAL's environment is internal, and its own domain does not resolve from a desk.
-            settled = await store.succeed(db, row.id, url=_public_url(app_id))
+            settled = await store.succeed(
+                db, row.id, url=settings.app_url(published_app_name(app_id))
+            )
         if settled:
             _log.info(RECONCILED_EVENT, deployment_id=str(row.id), outcome="promoted")
         return settled

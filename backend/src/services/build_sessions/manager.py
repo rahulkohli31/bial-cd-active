@@ -51,6 +51,7 @@ from src.api.v1.build_sessions.schemas import (
     ProgressEnvelope,
     RunBuild,
 )
+from src.config import settings
 from src.db.base import async_session_factory
 from src.db.models.app_registry import AppRegistry
 from src.db.models.harness_counter import HarnessCounter
@@ -775,17 +776,6 @@ def _registry_serves_and_is_ready(reg: dict[str, str], app_name: str) -> bool:
         reg.get(REGISTRY_FIELD_APP_NAME) == app_name
         and reg.get(REGISTRY_FIELD_STATE) == REGISTRY_STATE_READY
     )
-
-
-def _public_app_url(app_name: str) -> str:
-    """Where a browser reaches the app whose container is called `app_name`.
-
-    Lazy settings import, matching every other settings read reachable from this module:
-    `src.config` reaches back into the service packages, so a module-level import is a cycle.
-    """
-    from src.config import settings
-
-    return settings.app_url(app_name)
 
 
 def app_name_for(app_id: uuid.UUID) -> str:
@@ -1904,7 +1894,7 @@ class SessionManager:
                 # FQDN. This site builds no `SandboxHandle`, so it is invisible to anything
                 # that follows the handle's field — and it is what the cockpit frames, so
                 # getting it wrong shows a blank preview over a perfectly healthy container.
-                preview_url=_public_app_url(mine) if fqdn else None,
+                preview_url=settings.app_url(mine) if fqdn else None,
             )
         # Everything below is a workspace that is NOT serving this project — which is the only
         # place the restore offer is rendered, so this is the one place the answer earns its
