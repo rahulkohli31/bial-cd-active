@@ -34,6 +34,8 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 _INDEX = "ix_projects_description_tsv"
+_SUCCESS_IDX = "ix_deployments_success_collapse"
+_UNPUBLISHED_IDX = "ix_deployments_unpublished_collapse"
 
 
 def upgrade() -> None:
@@ -46,16 +48,20 @@ def upgrade() -> None:
     # every project. The `CREATE INDEX` below is not CONCURRENTLY either, so it holds a SHARE
     # lock (blocking writes) while it builds.
     #
-    # Both are almost certainly a non-event at this table's real size, which is why this is a
-    # comment rather than an `autocommit_block()` + CONCURRENTLY rewrite (that variant leaves
-    # an INVALID index needing manual cleanup if it fails, a worse trade at this scale). What
-    # is worth knowing is the queue behaviour: nothing here sets `lock_timeout`, so if any
-    # session is holding even an AccessShareLock when the ALTER queues, everything behind it
-    # stalls FIFO rather than failing fast. Check `count(*)` on `projects` first, and consider
-    # `SET LOCAL lock_timeout = '5s'` as cheap insurance on a busy database.
+    # Both are almost certainly a non-event at this table's real size, which is why this is
+    # not an `autocommit_block()` + CONCURRENTLY rewrite (that variant leaves an INVALID
+    # index needing manual cleanup if it fails, a worse trade at this scale).
+    #
+    # The queue behaviour is the part that bites: without a `lock_timeout`, if any session
+    # holds even an AccessShareLock when the ALTER queues, everything behind it stalls FIFO
+    # rather than failing fast. Production alembic runs OUT OF BAND here, so the operator who
+    # most needs that protection is the one least likely to be reading this file at the time
+    # — hence SET rather than recommended (#147 round 3). Alembic already wraps the revision
+    # in a transaction, so `SET LOCAL` scopes it to this migration and reverts automatically.
     #
     # The two-arg `to_tsvector('english', ...)` is required, not stylistic: the one-arg form
     # is rejected outright with `ERROR: generation expression is not immutable`.
+    op.execute("SET LOCAL lock_timeout = '5s'")
     op.execute(
         """
         ALTER TABLE projects
@@ -67,7 +73,27 @@ def upgrade() -> None:
     # build, materially faster to search, and this column is written far less than it is read.
     op.execute(f"CREATE INDEX {_INDEX} ON projects USING GIN (description_tsv)")
 
+    # THE MARKETPLACE'S TWO COLLAPSES, indexed to match `_live_catalog`'s predicates exactly.
+    # Without them each collapse Seq Scans `deployments`, and that table is append-only with
+    # no reaper — so the cost tracks TOTAL HISTORICAL DEPLOY ATTEMPTS across the platform's
+    # life, not the 10-200 live apps this catalog is sized for. Measured on PG18 at 51k rows:
+    # ~100-180ms of DB time per request without, ~35ms with (#147 round 3).
+    op.execute(
+        f"""
+        CREATE INDEX {_SUCCESS_IDX} ON deployments (app_id, id DESC)
+        WHERE status = 'succeeded' AND url IS NOT NULL
+        """
+    )
+    op.execute(
+        f"""
+        CREATE INDEX {_UNPUBLISHED_IDX} ON deployments (app_id, id DESC)
+        WHERE unpublished_at IS NOT NULL
+        """
+    )
+
 
 def downgrade() -> None:
+    op.execute(f"DROP INDEX IF EXISTS {_UNPUBLISHED_IDX}")
+    op.execute(f"DROP INDEX IF EXISTS {_SUCCESS_IDX}")
     op.execute(f"DROP INDEX IF EXISTS {_INDEX}")
     op.execute("ALTER TABLE projects DROP COLUMN IF EXISTS description_tsv")

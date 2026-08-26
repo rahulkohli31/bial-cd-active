@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
@@ -46,6 +47,7 @@ async def _published_app(
     url: str | None = "https://pub-example.azurecontainerapps.io/",
     unpublished_at: datetime | None = None,
     app_status: AppStatus | None = None,
+    rejection_standing: bool | None = None,
 ) -> Deployment:
     """A project + its one app + a deployment row in the shape a finished deploy leaves.
 
@@ -56,7 +58,11 @@ async def _published_app(
     """
     owner = await UserFactory.create(db, email=owner_email, display_name=display_name)
     project = await ProjectFactory.create(db, owner.id, name=name, description=description)
-    registry_overrides = {} if app_status is None else {"status": app_status}
+    registry_overrides: dict[str, object] = {}
+    if app_status is not None:
+        registry_overrides["status"] = app_status
+    if rejection_standing is not None:
+        registry_overrides["rejection_standing"] = rejection_standing
     app = await AppRegistryFactory.create(
         db, user_id=owner.id, project_id=project.id, **registry_overrides
     )
@@ -375,22 +381,97 @@ async def test_a_successful_republish_brings_the_app_back(app, client, db_sessio
     assert [item["name"] for item in resp.json()["items"]] == ["Republished After Takedown"]
 
 
-async def test_a_disabled_app_is_not_advertised(app, client, db_session) -> None:
-    """The second blocker (#147 review): `disable` (the admin kill-switch for a
-    compromised or data-leaking app) severs the per-app database but writes nothing to
-    `deployments` — so a disabled app's deployment row can still read `succeeded`, and the
-    old flat filter kept advertising it platform-wide.
+@pytest.mark.parametrize(
+    ("app_status", "listed"),
+    [
+        (AppStatus.DRAFT, True),
+        (AppStatus.PENDING, True),
+        (AppStatus.APPROVED, True),
+        (AppStatus.REJECTED, False),
+        (AppStatus.DISABLED, False),
+    ],
+)
+async def test_the_catalog_lists_by_app_status(
+    app, client, db_session, app_status: AppStatus, listed: bool
+) -> None:
+    """EVERY lifecycle state, not just the one the predicate was written for (#147 round 3).
 
-    Mutation receipt: drop `AppRegistry.status != AppStatus.DISABLED` from `_live_catalog`
-    and this goes red with the app still listed."""
+    The round-2 version of this test seeded `DISABLED` alone, which hid two things at once:
+    that DRAFT is the ORDINARY catalog member (one-click deploy never writes `status` —
+    `deployment.py`: "a self-deployed app is still `draft`"), and that REJECTED was being
+    advertised org-wide with nothing to stop it.
+
+    DRAFT/PENDING/APPROVED all list: a citizen's self-published app is a legitimate catalog
+    entry and there is no approval on that path. REJECTED and DISABLED do not.
+
+    Mutation receipt: drop `AppRegistry.status.notin_(...)` and the REJECTED case goes red.
+    """
     headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
     await _published_app(
         db_session,
         owner_email="builder@rvaiglobal.com",
-        name="Disabled For Cause",
-        description="Pulled by an admin for a data-classification hit.",
-        app_status=AppStatus.DISABLED,
+        name=f"App In {app_status.value}",
+        description="A tool.",
+        app_status=app_status,
     )
+
+    resp = await client.get(_MARKETPLACE, headers=headers)
+    names = [item["name"] for item in resp.json()["items"]]
+
+    assert names == ([f"App In {app_status.value}"] if listed else [])
+
+
+async def test_a_laundered_rejection_stays_out_of_the_catalog(app, client, db_session) -> None:
+    """`rejection_standing` is the DURABLE fact, and `status` is not.
+
+    `app_registry.py` says why the column exists: reading a policy fact off mutable
+    lifecycle state "is what let a reject->publish->withdraw round trip launder a rejection
+    and publish unattended." That round trip ends with `status` back at DRAFT — which the
+    status predicate alone happily lists — while `rejection_standing` stays True.
+
+    Mutation receipt: drop `AppRegistry.rejection_standing.is_(False)` and this goes red
+    with the laundered app listed."""
+    headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
+    await _published_app(
+        db_session,
+        owner_email="builder@rvaiglobal.com",
+        name="Laundered Rejection",
+        description="Rejected, then round-tripped back to draft.",
+        app_status=AppStatus.DRAFT,
+        rejection_standing=True,
+    )
+
+    resp = await client.get(_MARKETPLACE, headers=headers)
+
+    assert resp.json()["items"] == []
+
+
+async def test_a_second_takedown_after_a_republish_still_removes_the_app(
+    app, client, db_session
+) -> None:
+    """The collapse must read the NEWEST unpublish, not just any unpublish.
+
+    Every other test in this file stamps at most one `unpublished_at` per app, so the oldest
+    and newest stamps are the same row and the `.desc()` in `last_unpublished` is doing no
+    observable work — a surviving mutant (#147 round 3). This is the case that separates
+    them: taken down, republished (which legitimately re-lists it), then taken down AGAIN.
+
+    Reachable rather than contrived: unpublish -> redeploy is the documented recovery path,
+    so a twice-taken-down app is an ordinary history.
+
+    Mutation receipt: flip `last_unpublished`'s `.order_by(..., Deployment.id.desc())` to
+    `.asc()` and this goes red — the collapse picks the FIRST takedown, which is older than
+    the republish, so the app returns to the catalog pointing at a torn-down container."""
+    headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
+    first = await _published_app(
+        db_session,
+        owner_email="builder@rvaiglobal.com",
+        name="Taken Down Twice",
+        description="Unpublished, republished, unpublished again.",
+        unpublished_at=datetime.now(UTC),
+    )
+    republished = await _redeploy(db_session, first)  # succeeded -> legitimately back
+    await _redeploy(db_session, republished, unpublished_at=datetime.now(UTC))  # and gone again
 
     resp = await client.get(_MARKETPLACE, headers=headers)
 
@@ -672,6 +753,23 @@ async def test_an_unrecognized_sort_is_a_422(app, client, db_session) -> None:
     headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
 
     resp = await client.get(_MARKETPLACE, headers=headers, params={"sort": "sideways"})
+
+    assert resp.status_code == 422
+
+
+async def test_a_q_containing_a_nul_byte_is_a_422_not_a_500(app, client, db_session) -> None:
+    """A NUL byte is not representable in a Postgres text value, so before this it reached
+    asyncpg and raised `CharacterNotInRepertoireError` — escaping as an unhandled 500 on an
+    authenticated endpoint, while this route's `responses=` declares a 422 for a bad `q`.
+
+    Fixed in the SHARED `clean_search`, so `/v1/projects` and the admin roster stop 500ing on
+    the same input too (#147 round 3 — pre-existing, flagged here because this is the route
+    that documents the contract it broke).
+
+    Mutation receipt: drop the NUL-byte check from `clean_search` and this goes red with a 500."""
+    headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
+
+    resp = await client.get(_MARKETPLACE, headers=headers, params={"q": "runway" + chr(0)})
 
     assert resp.status_code == 422
 

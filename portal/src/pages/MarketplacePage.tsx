@@ -324,10 +324,24 @@ export default function MarketplacePage(): React.JSX.Element {
           </p>
         )}
 
+        {/* The retry lives HERE, not on the pagination nav, and that is the whole point.
+            `reloadNonce` was previously only reachable through `goTo` — but on a failed
+            FIRST load `data` is still the EMPTY sentinel, so `showSizer`/`showPages` are
+            both false, the nav never mounts, and the reader is left with a bare banner and
+            no way forward short of reloading the browser (#147 round 3). Bound to `error`
+            alone, it is present in exactly the states that need it. */}
         {error && (
-          <p role="alert" className="text-sm text-danger">
-            {error.message}
-          </p>
+          <div role="alert" className="flex flex-col items-start gap-2 text-sm text-danger">
+            <p>{error.message}</p>
+            <button
+              type="button"
+              data-testid="marketplace-retry"
+              onClick={() => setReloadNonce((n) => n + 1)}
+              className="rounded-xl border border-bial-border bg-white px-3 py-1.5 text-xs font-semibold text-tertiary transition hover:bg-bial-bg focus:outline-none focus:ring-2 focus:ring-primary/30"
+            >
+              Try again
+            </button>
+          </div>
         )}
 
         {items.length > 0 && (
@@ -346,11 +360,15 @@ export default function MarketplacePage(): React.JSX.Element {
             error banner — telling the user the catalog is empty when we do not know. */}
         {!loading && !error && items.length === 0 && (
           <p data-testid="marketplace-empty" className="text-sm text-neutral py-10 text-center">
+            {/* Branching on `page > totalPages` rather than `total !== 0`: `total` and the
+                rows are two separate reads (the accepted READ COMMITTED risk), so an
+                unpublish landing between them can return zero items on page 1 with a stale
+                non-zero `total` — and "taking you back" on page 1 has nowhere to go. */}
             {searching
               ? 'No published app matches that yet.'
-              : total === 0
-                ? 'Nothing has been published yet. The first app to go live shows up here.'
-                : 'That page is past the end of the catalog — taking you back.'}
+              : page > totalPages
+                ? 'That page is past the end of the catalog — taking you back.'
+                : 'Nothing has been published yet. The first app to go live shows up here.'}
           </p>
         )}
 

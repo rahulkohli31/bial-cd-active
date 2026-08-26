@@ -113,6 +113,28 @@ class Deployment(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base):
             unique=True,
             postgresql_where=sa.text("status = 'running'"),
         ),
+        # THE MARKETPLACE'S TWO COLLAPSES (#145, migration 0034). Partial indexes matching
+        # `_live_catalog`'s predicates exactly, so each collapse is an index scan rather
+        # than a Seq Scan of this table.
+        #
+        # The reason they are worth having on a 10-200 app catalog: this table is
+        # APPEND-ONLY with no reaper, so what the collapses scan is TOTAL HISTORICAL DEPLOY
+        # ATTEMPTS across the platform's life, not the number of live apps. Measured on
+        # PG18 at 51k rows: ~100-180ms of DB time per request without these, ~35ms with
+        # (#147 round 3). Declared here, not only in the migration, so `--autogenerate`
+        # does not emit a `drop_index` for them.
+        sa.Index(
+            "ix_deployments_success_collapse",
+            "app_id",
+            sa.text("id DESC"),
+            postgresql_where=sa.text("status = 'succeeded' AND url IS NOT NULL"),
+        ),
+        sa.Index(
+            "ix_deployments_unpublished_collapse",
+            "app_id",
+            sa.text("id DESC"),
+            postgresql_where=sa.text("unpublished_at IS NOT NULL"),
+        ),
     )
 
     # The app this deploy publishes. CASCADE so a deleted app can never leave a row

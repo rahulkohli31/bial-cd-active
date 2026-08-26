@@ -44,6 +44,15 @@ class MarketplaceEntry(CamelModel):
     name: str
     #: What the app does. Nullable: an app whose builder never wrote one still appears in
     #: the unfiltered catalog, it simply cannot be found by typing (#145, accepted).
+    #:
+    #: WORTH KNOWING, and not a leak: `Project.description` was introduced as CHAT
+    #: GROUNDING — private context for the builder's own assistant — and it can be
+    #: model-written from the app's source. Nothing at the write surface tells the author it
+    #: will be republished verbatim to everyone in the org and made searchable by it. It is
+    #: the owner's own text and the enterprise-catalog framing is settled, but "the sentence
+    #: I typed to orient the assistant" and "my app's public listing copy" are different acts
+    #: of writing sharing one field with no notice (#147 round 3). A notice at the write
+    #: surface is filed separately rather than done from this PR.
     description: str | None
     #: WHO BUILT IT, by display name only. Nullable because `users.display_name` is.
     builder_display_name: str | None

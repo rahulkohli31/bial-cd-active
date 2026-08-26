@@ -57,7 +57,14 @@ router = APIRouter(prefix="/marketplace", tags=["marketplace"])
 Sort = Literal["newest", "name"]
 
 PageQuery = Annotated[int, Query()]
-SortQuery = Annotated[str | None, Query()]
+SortQuery = Annotated[
+    str | None,
+    # The closed set is named in the schema even though the type is `str | None`: validation
+    # lives in `clean_sort` so the 422 keeps this platform's `ErrorEnvelope` shape rather
+    # than FastAPI's, which means OpenAPI would otherwise advertise a free-form string and a
+    # generated client could not see the two legal values (#147 round 3).
+    Query(description="Browse order. One of: newest (default), name."),
+]
 
 
 # Bounds `(page - 1) * limit` comfortably inside int64 so an absurd page number 422s
@@ -93,7 +100,7 @@ def clean_sort(value: str | None) -> Sort:
     raise AppApiError(422, "sort must be one of: newest, name.")
 
 
-def _live_catalog(search: str | None) -> tuple[sa.Select[Any], Any]:
+def _live_catalog(search: str | None) -> tuple[sa.Select[Any], type[Deployment]]:
     """The catalog's membership predicate + the active filter, expressed EXACTLY ONCE.
 
     Both the page query and the `COUNT(*)` build on this. That is not tidiness: a total
@@ -113,6 +120,16 @@ def _live_catalog(search: str | None) -> tuple[sa.Select[Any], Any]:
     thing we are about to advertise". Because ids are UUIDv7 and therefore creation-ordered,
     that is a straight comparison: the newest UNPUBLISHED row must be strictly OLDER than the
     row whose URL is being published.
+
+    THE COMPARISON RESTS ON AN INVARIANT WORTH NAMING, because it lives nowhere near this
+    line and breaks silently: Postgres `uuid` ordering equals creation order only because
+    every row here is minted by CPython's in-process monotonic `uuid7()` via
+    `store._try_claim` (the only insert path), serialised per app by
+    `uq_deployments_one_in_flight`, on a control plane that is SINGLE-REPLICA BY DESIGN.
+    A second API replica reopens this: two hosts minting ids from independent clocks can
+    interleave out of order, and an out-of-order id breaks the comparison in BOTH directions
+    (a taken-down app listed at a dead URL, or a live one hidden). Whoever scales the control
+    plane needs to revisit this predicate, not just the deployment topology.
 
     Both halves of the comparison are load-bearing, and each has a test:
 
@@ -137,11 +154,36 @@ def _live_catalog(search: str | None) -> tuple[sa.Select[Any], Any]:
     from the catalog on every failed redeploy, which is wrong for the identical reason the
     old flat-filter version could show the same app twice: both read the wrong row.
 
-    `AppRegistry.status != AppStatus.DISABLED` is a separate axis again: `disable` (the
-    admin kill-switch for a compromised or data-leaking app) severs the per-app database but
-    writes nothing to `deployments`, so an app can be disabled while its most recent
-    deployment row still reads `succeeded`. This predicate is scoped entirely to this query;
-    `disable()` itself is unchanged — see the PR body for why that boundary was kept.
+    THE REGISTRY PREDICATES ARE A SEPARATE AXIS, and this is where the containment story is
+    weaker than it looks — stated plainly here because the previous version of this docstring
+    overstated it (#147 round 3).
+
+    Two lifecycle facts are read, because one of them cannot be trusted alone:
+
+      * `status` NOT IN (DISABLED, REJECTED). `disable` severs the per-app database and
+        `reject` writes REJECTED; neither writes anything to `deployments`, so either can be
+        true while the newest deployment row still reads `succeeded`.
+      * `rejection_standing IS FALSE`. `status` is MUTABLE lifecycle state and cannot carry a
+        policy fact: `app_registry.py` says the column exists because reading the fact off
+        `status` "is what let a reject->publish->withdraw round trip launder a rejection and
+        publish unattended." That round trip ends with `status` back at DRAFT, which the
+        first predicate would list.
+
+    WHAT THIS DOES NOT GIVE YOU, and the reason it is spelled out: `disable` is NOT a
+    working kill-switch for the ordinary member of this catalog.
+    `STATUS_TRANSITIONS[DISABLED] == {APPROVED}`, so `admin/router.py` answers 409 "Only an
+    approved app can be disabled" for anything else — and a one-click deploy never writes
+    `status` at all (`deployment.py`: "there is no admin approval on this path... a
+    self-deployed app is still `draft`"). A DRAFT app cannot be rejected either
+    (`STATUS_TRANSITIONS[DRAFT] == {PENDING}`). So for a self-published app the only lever
+    left is `unpublish`, which `deploy/router.py` itself disclaims as "AN OPERATOR
+    CONVENIENCE, NOT AN ENFORCEMENT LEVER" — it leaves the per-app Postgres role
+    LOGIN-enabled and the owner can republish at the same URL one click later.
+
+    These predicates stop such an app being ADVERTISED once someone marks it; they do not
+    give an admin a way to mark it. Widening `STATUS_TRANSITIONS[DISABLED]` to accept
+    DRAFT/PENDING/REJECTED is the actual fix and is filed separately — deliberately not
+    smuggled into a marketplace PR, since it changes an existing admin route's contract.
 
     SUSPENDED OWNERS are a decision, not an accident of the `User` join: an already-published
     app does not stop being useful to someone else merely because its builder's account is
@@ -193,7 +235,8 @@ def _live_catalog(search: str | None) -> tuple[sa.Select[Any], Any]:
                 last_unpublished.c.id.is_(None),
                 last_unpublished.c.id < deployment.id,
             ),
-            AppRegistry.status != AppStatus.DISABLED,
+            AppRegistry.status.notin_((AppStatus.DISABLED, AppStatus.REJECTED)),
+            AppRegistry.rejection_standing.is_(False),
         )
     )
     if search is not None:
@@ -206,12 +249,18 @@ def _tsquery(search: str) -> sa.Function[Any]:
 
 
 def _entry(row: sa.Row[Any]) -> MarketplaceEntry:
-    # `row._tuple()`, not attribute access: `Row.__getattr__` is typed to return `Any`
-    # unconditionally, so `row.name`/`row.url`/etc type-check clean no matter how the row
-    # is shaped — a rename or reorder in `with_only_columns` below becomes a runtime
-    # `AttributeError`, not a type error. `_tuple()` carries the real tuple type, so the
-    # order here must match `with_only_columns`'s order exactly.
-    name, description, display_name, url, _id = row._tuple()
+    # `row._tuple()`, not attribute access — but be precise about what that buys, because
+    # this comment is the module's stated defence and the previous version overclaimed it
+    # (#147 round 3). On an `Any`-parameterised `Row`, `_tuple()` is itself typed `Any`, so
+    # NEITHER the arity nor the order below is checked statically; swapping two same-typed
+    # columns in `with_only_columns` passes mypy clean.
+    #
+    # What it does buy is still worth having, and it is runtime + tests rather than types:
+    # an arity change raises a loud `ValueError` here instead of a silent `AttributeError`
+    # at attribute-access time, and a reorder is caught by
+    # `test_a_signed_in_user_sees_an_app_built_by_someone_else`. The order here must match
+    # `with_only_columns`'s order exactly.
+    name, description, display_name, url = row._tuple()
     return MarketplaceEntry(
         name=name,
         description=description,
@@ -249,6 +298,14 @@ async def list_marketplace(
     That falls out of the generated column (`to_tsvector('english', coalesce(description,
     ''))` matches no query) rather than being special-cased here.
 
+    TWO 422 ENVELOPES REACH THIS ROUTE, and `responses=` can only document one. An
+    out-of-range `page`/`limit`/`sort` raises through `clean_*` and carries this platform's
+    `{"error":{"message":...}}`; a NON-NUMERIC `?page=abc` never reaches `clean_page` at all,
+    because FastAPI's own int coercion fails first and emits `{"detail":[...]}`. So the
+    declaration below is accurate for out-of-range and inaccurate for non-numeric. Inherited
+    from `pagination.py`'s `LimitQuery` rather than invented here, and the portal's
+    `apiError.ts` already tolerates both shapes (#147 round 3).
+
     A page past the end returns an empty `items` with the real `total`, rather than 404:
     "you scrolled past the last page" is a normal thing for a client to do while the catalog
     shrinks under it, not an error the user should be shown.
@@ -271,7 +328,6 @@ async def list_marketplace(
         Project.description,
         User.display_name,
         deployment.url,
-        deployment.id,
     )
 
     if search is not None:

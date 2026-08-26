@@ -335,20 +335,84 @@ describe('MarketplacePage', () => {
     await waitFor(() => expect(lastCall()).toMatchObject({ page: 1 }))
   })
 
-  it('does not call an overshot page an empty catalog', async () => {
-    // `total` is non-zero, so "Nothing has been published yet" would be a plain lie sitting
-    // directly above "5 published apps".
+  it('does not blame the page when page 1 comes back empty with a stale total', async () => {
+    // The race agc129 named: `total` and the rows are two separate reads under READ
+    // COMMITTED, so an unpublish landing between them returns zero items on PAGE 1 with a
+    // stale non-zero `total`. Branching the copy on `total !== 0` showed "past the end" —
+    // on page 1, which has nowhere to go back to. Branching on `page > totalPages` falls
+    // through to the ordinary empty copy, which is the honest thing to say.
     //
-    // Mutation receipt: drop the `total === 0` branch from the empty-state copy and this
-    // goes red.
+    // This is also the ONLY deterministic pin for that branch: when `page > totalPages` is
+    // genuinely true the auto-correct effect fires in the same commit, so the overshoot
+    // message exists for a single frame and no assertion can catch it reliably.
+    //
+    // Mutation receipt: swap the ternary back to `total === 0` first and this goes red with
+    // "past the end" on page 1.
     h.listMarketplace.mockResolvedValue(
-      page({ items: [], page: 3, pageSize: 10, total: 5, totalPages: 1 }),
+      page({ items: [], page: 1, pageSize: 10, total: 5, totalPages: 1 }),
     )
     renderPage()
 
     const empty = await screen.findByTestId('marketplace-empty', {}, { timeout: 5000 })
-    expect(empty.textContent).toMatch(/past the end/i)
-    expect(empty.textContent).not.toMatch(/nothing has been published/i)
+    expect(empty.textContent).toMatch(/nothing has been published/i)
+    expect(empty.textContent).not.toMatch(/past the end/i)
+  })
+
+  it('recovers instead of stranding the reader when the catalog shrinks under them', async () => {
+    // Driven to page 3 rather than MOCKED there. The previous version set `page: 3` in the
+    // response payload while the component's own `page` stayed 1 — so it asserted copy the
+    // product would never show in that combination, which is the same "seed a state the
+    // product reaches differently" shape flagged twice in review (#147 round 3).
+    //
+    // What is pinned here is RECOVERY, because that is what is durable: the overshoot copy
+    // is transient by construction — the auto-correct effect fires in the same commit and
+    // snaps `page` back, so the message exists for one frame. Asserting the end state is
+    // both honest and non-racy.
+    h.listMarketplace.mockResolvedValue(page({ pageSize: 10, total: 25, totalPages: 3 }))
+    renderPage()
+    await screen.findByTestId('marketplace-page-3', {}, { timeout: 5000 })
+
+    // Both responses are queued BEFORE the click. Installing the second one afterwards is a
+    // race the auto-correct can win — its refetch fires in the same tick as the overshoot
+    // response, so it would sometimes read the shrunk mock and land back on the empty state.
+    // `Once` then default makes the ordering deterministic regardless of scheduling.
+    h.listMarketplace
+      .mockResolvedValueOnce(page({ items: [], page: 3, pageSize: 10, total: 5, totalPages: 1 }))
+      .mockResolvedValue(page({ pageSize: 10, total: 5, totalPages: 1 }))
+
+    fireEvent.click(screen.getByTestId('marketplace-page-3'))
+    await waitFor(() => expect(lastCall()).toMatchObject({ page: 3 }))
+
+    // Auto-correct re-requests the last real page, and the reader lands on actual results
+    // rather than a dead end with no control mounted.
+    await waitFor(() => expect(lastCall()).toMatchObject({ page: 1 }))
+    expect(await screen.findByText('Baggage Belt Faults', {}, { timeout: 5000 })).toBeTruthy()
+    expect(screen.queryByTestId('marketplace-empty')).toBeNull()
+  })
+
+  it('offers a retry when the FIRST load fails, with no pagination mounted', async () => {
+    // The gap round 3 found: `reloadNonce` was only reachable through the pagination nav,
+    // and on a failed first load `data` is still the EMPTY sentinel — so `showSizer` and
+    // `showPages` are both false, the nav never mounts, and the reader is stranded with a
+    // banner and no control at all. Neither existing error test covers this: one only
+    // asserts the empty-state copy is suppressed, and the other starts from a SUCCESSFUL
+    // load, so its nav is already on screen.
+    //
+    // Mutation receipt: delete the `marketplace-retry` button (or re-bind it to
+    // `showPages`) and this goes red.
+    h.listMarketplace.mockRejectedValueOnce(new Error('Network is down'))
+    renderPage()
+
+    expect(await screen.findByRole('alert', {}, { timeout: 5000 })).toBeTruthy()
+    // Nothing else on the page can dispatch a fetch in this state.
+    expect(screen.queryByTestId('marketplace-next')).toBeNull()
+    expect(screen.queryByTestId('marketplace-page-size')).toBeNull()
+
+    h.listMarketplace.mockResolvedValue(page())
+    fireEvent.click(screen.getByTestId('marketplace-retry'))
+
+    expect(await screen.findByText('Baggage Belt Faults', {}, { timeout: 5000 })).toBeTruthy()
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
   })
 
   it('ignores a stale response that lands after a newer one', async () => {

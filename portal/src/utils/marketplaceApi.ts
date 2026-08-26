@@ -101,7 +101,17 @@ function toPage(value: unknown): MarketplacePage {
     items: Array.isArray(doc.items)
       ? doc.items.flatMap((row) => {
           const entry = toEntry(row)
-          return entry === null ? [] : [entry]
+          if (entry === null) {
+            // Dropping the row is the right trade — one bad entry must not blank an
+            // org-wide catalog — but doing it SILENTLY makes `total` and the rendered
+            // count disagree with no signal to anyone: "10 results / Page 1 of 3"
+            // rendering 9 cards indefinitely, indistinguishable from a correct page
+            // (#147 round 3). This is the only thing that turns that into a reported
+            // failure rather than a mystery.
+            console.warn('marketplace: dropped an unreadable catalog entry', row)
+            return []
+          }
+          return [entry]
         })
       : [],
     page: asNumber(doc.page, 1),
