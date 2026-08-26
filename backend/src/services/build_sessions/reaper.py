@@ -116,12 +116,20 @@ def _user_from_registry_key(key: str) -> uuid.UUID | None:
 def _handle_named(app_name: str, *, fqdn: str = "") -> SandboxHandle:
     """The minimal handle a teardown needs — ACA delete is keyed by `app_name` alone, and no
     in-process token survives a crash. The `fqdn` is carried when we happen to know it and left
-    empty when we do not; nothing on the teardown path reads it."""
+    empty when we do not; nothing on the teardown path reads it.
+
+    `preview_url` is EMPTY here rather than composed, and that is a correction rather than a
+    shortcut. It used to be built from the fqdn, which produced `https:///` whenever the fqdn was
+    absent — a value that means nothing and that the field's own contract now forbids, since a
+    `preview_url` is the PUBLIC address a person is given. Teardown hands nothing to a browser,
+    so the honest value is no value. Composing a real one here would also drag `settings` into
+    the reap path for a field the docstring above says nothing reads.
+    """
     return SandboxHandle(
         fqdn=fqdn,
         token="",
         app_name=app_name,
-        preview_url=f"https://{fqdn}/",
+        preview_url="",
         ready=False,
     )
 

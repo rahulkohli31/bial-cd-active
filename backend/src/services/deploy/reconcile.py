@@ -50,6 +50,19 @@ STALE_AFTER_S: float = 120.0
 RECONCILED_EVENT = "deployment_reconciled"
 
 
+def _public_url(app_id: uuid.UUID) -> str:
+    """Where a browser reaches this published app — the same composition the deploy pipeline's
+    own success terminal uses, so the two writers of `deployments.url` cannot disagree.
+
+    Lazy imports for the module's own cycle reason: `src.config` reaches back into the service
+    packages, and `deploy.names` is imported the same way at every other reconcile-adjacent site.
+    """
+    from src.config import settings
+    from src.services.deploy.names import published_app_name
+
+    return settings.app_url(published_app_name(app_id))
+
+
 async def reconcile_stalled_deployments(
     session_factory: SessionFactory, published_apps: PublishedAppReader
 ) -> int:
@@ -95,7 +108,12 @@ async def _resolve(
         # We got as far as provisioning and died before writing it down. The app IS the one
         # this row built, so the honest record is success.
         async with session_factory() as db:
-            settled = await store.succeed(db, row.id, url=f"https://{fqdn}/")
+            # The PUBLIC address, exactly as the pipeline's own success terminal writes it. This
+            # path runs in BOTH roles — the API's boot one-shot and the worker's cron — and it
+            # writes the same column, so the two must not disagree about what a deployment's URL
+            # means. Composed from the container name rather than the fqdn for the same reason:
+            # BIAL's environment is internal, and its own domain does not resolve from a desk.
+            settled = await store.succeed(db, row.id, url=_public_url(app_id))
         if settled:
             _log.info(RECONCILED_EVENT, deployment_id=str(row.id), outcome="promoted")
         return settled

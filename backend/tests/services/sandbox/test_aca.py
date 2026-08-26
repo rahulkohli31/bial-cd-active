@@ -602,3 +602,121 @@ async def test_a_missing_bundle_leaves_the_live_container_standing(
     reg = await fake_redis.hgetall(registry_key(USER))
     assert reg[REGISTRY_FIELD_APP_NAME] == APP_NAME
     await client.aclose()
+
+
+# --- where the app is served from (generated-app access domain) -------------------------------
+#
+# Every generated app is reached on ONE public hostname with the app's key in the path, because
+# per-app subdomains would need a wildcard certificate BIAL refused. The container therefore has
+# to be TOLD its own path, and the whole class of failure here is silent: a container that never
+# learns it serves at `/` while the router asks for `/a/<key>/`, and the preview shows a blank
+# page while every automated check still reports healthy.
+
+
+async def test_a_provisioned_sandbox_is_told_where_it_is_served_from(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """MUTATION CHECK: drop the injection from `_provision_container` and this fails.
+
+    The value is DERIVED from the container's own name, which is what makes an app's address a
+    string composition rather than a lookup — the router at the edge holds no registry.
+    """
+    aca = FakeAca()
+    client = _client(aca)
+    await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+    env = aca.created[APP_NAME]
+    assert env["BIAL_BASE_PATH"] == f"/a/{APP_NAME}"
+    assert env["BIAL_APPS_HOSTNAME"] == "citizenapps.bialairport.com"
+    await client.aclose()
+
+
+async def test_a_restored_sandbox_comes_back_at_the_same_path(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """A relaunch that stranded the preview at a path the router will never produce would be
+    invisible: the container is healthy, the dev server is serving, and the frame is blank.
+    Deriving at the shared provision seam rather than at each call site is what makes this hold
+    for restore, relaunch and a fresh provision alike, without three places to keep in step."""
+    aca = FakeAca()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in ("/_sup/files", "/_sup/exec"):
+            return httpx.Response(200, json={"stdout": "", "stderr": "", "exit": 0})
+        return httpx.Response(404)
+
+    client = _client(aca, handler)
+    await fake_storage.put(snapshot_key(APP_ID), a_git_bundle())
+    await client.restore_from_snapshot(str(USER), APP_NAME, app_env=_app_env())
+    assert aca.created[APP_NAME]["BIAL_BASE_PATH"] == f"/a/{APP_NAME}"
+    await client.aclose()
+
+
+async def test_the_base_path_carries_no_trailing_slash(fake_redis: aioredis.Redis) -> None:
+    """Measured against a live Next 16 dev server, not a style preference: `/<base>/` is
+    308-redirected to `/<base>`, so a slashed value would make every probe read a redirect
+    instead of the app — and Next rejects a `basePath` ending in `/` outright."""
+    aca = FakeAca()
+    client = _client(aca)
+    await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+    base = aca.created[APP_NAME]["BIAL_BASE_PATH"]
+    assert base.startswith("/a/")
+    assert not base.endswith("/")
+    await client.aclose()
+
+
+async def test_the_handle_hands_the_browser_the_public_address(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """AE1. `preview_url` is what the cockpit frames, and an internal Container Apps environment
+    publishes no public DNS — so the container's own FQDN does not resolve from a BIAL desk at
+    all. That unresolvable address is the entire defect this change exists to fix."""
+    aca = FakeAca()
+    client = _client(aca)
+    handle = await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+    assert handle.preview_url == f"https://citizenapps.bialairport.com/a/{APP_NAME}/"
+    assert ".azurecontainerapps.io" not in handle.preview_url
+    await client.aclose()
+
+
+async def test_the_control_plane_keeps_the_direct_private_address(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """★ THE REGRESSION THAT WOULD BE HARDEST TO SEE. The browser's address moved; the control
+    plane's must NOT. `/_sup/*` and both serving probes compose from `handle.fqdn`, so the two
+    are different hosts by construction rather than by discipline.
+
+    If they were ever collapsed back onto one field, every build's supervisor call and every
+    health probe would start traversing the public gateway — working, in a dev environment whose
+    Container Apps environment happens to be public, and failing in the internal one this design
+    is actually for. That is the worst shape a defect can have here: green everywhere we can
+    test, broken only where we cannot.
+    """
+    aca = FakeAca()
+    client = _client(aca)
+    handle = await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+
+    assert handle.fqdn.endswith(".azurecontainerapps.io")
+    assert handle.app_root_url == f"https://{handle.fqdn}/a/{APP_NAME}"
+    assert "citizenapps" not in handle.app_root_url
+    # The two addresses reach the same app and are deliberately different hosts.
+    assert handle.app_root_url.split("/a/")[0] != handle.preview_url.split("/a/")[0]
+    await client.aclose()
+
+
+async def test_attach_agrees_with_provision_about_where_a_person_goes(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """Two mint sites for one field. If they disagree, a relaunched session frames a different
+    URL from the one that was just working, and only on the relaunch path."""
+    aca = FakeAca()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/dev/status"):
+            return httpx.Response(200, json={"running": True, "ready": True, "port": 3000})
+        return httpx.Response(200, json={"ok": True})  # /_sup/health probe
+
+    client = _client(aca, handler)
+    provisioned = await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+    attached = await client.attach_existing(str(USER))
+    assert attached.preview_url == provisioned.preview_url
+    await client.aclose()

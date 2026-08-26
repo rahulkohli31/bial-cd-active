@@ -485,21 +485,36 @@ async def test_a_relaunch_onto_a_live_healthy_container_touches_no_aca_lifecycle
     assert aca_wire.aca.create_calls == [app_name_for(app_id)]
 
 
-async def test_the_warm_relaunch_hands_back_the_pre_existing_containers_own_fqdn(
+async def test_the_warm_relaunch_attaches_to_the_pre_existing_container(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, aca_wire
 ) -> None:
-    """The user is looking at the SAME container, not a same-named replacement. `app_name_for`
-    is stable per app, so the name proves nothing — the create-ordinal in `RecordingAca`'s
-    FQDN is what makes this falsifiable (a rebuild would answer `-r2`)."""
+    """The user is looking at the SAME container, not a same-named replacement.
+
+    THE INSTRUMENT CHANGED AND THE CLAIM DID NOT. This used to read the create-ordinal out of
+    the returned FQDN (`-r1` vs `-r2`), because `previewUrl` carried the container's own name.
+    It no longer does — every app is served from one public hostname under a key derived from
+    the app id, so the address is IDENTICAL for a reuse and for a rebuild and can no longer
+    falsify anything here. Asserting it alone would be a tautology, which is worse than not
+    asserting it: the test would still read as if it proved something.
+
+    So the proof moves to the thing it was always a proxy for — whether ACA was asked to create
+    a container a second time. That is a direct observation rather than an inference from a
+    name, and it stays falsifiable: make relaunch rebuild instead of attach and `create_calls`
+    grows.
+    """
     user, project = await _user_project(db_session, "rl-attach-fqdn@rvaiglobal.com")
     app_id = await _seed_snapshot(db_session, user, project, fake_storage)
 
     cold = await _relaunch(client, user, project)
+    creates_after_cold = list(aca_wire.aca.create_calls)
     warm = await _relaunch(client, user, project)
 
-    born = f"https://{app_name_for(app_id)}-r1.westeurope.azurecontainerapps.io/"
-    assert cold.json()["previewUrl"] == born
-    assert warm.json()["previewUrl"] == born  # the birth container, not a rebuilt one
+    assert aca_wire.aca.create_calls == creates_after_cold, (
+        "the warm relaunch attached; a rebuild would have appended another create"
+    )
+    expected = f"https://citizenapps.bialairport.com/a/{app_name_for(app_id)}/"
+    assert cold.json()["previewUrl"] == expected
+    assert warm.json()["previewUrl"] == expected
 
 
 async def test_a_registry_naming_a_different_app_refuses_the_relaunch(

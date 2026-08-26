@@ -250,13 +250,16 @@ describe('nginx.conf — the framing policy names the apps host without revoking
     expect(new Set(declared).size).toBe(1)
   })
 
-  it('permits BOTH the apps hostname and the Container Apps wildcard', () => {
-    // ADDITIVE. The apps hostname is where the preview is going; the wildcard is the address the
-    // portal is still handing the browser today. Naming only the new one would blank every
-    // preview with nothing but a console message. The wildcard leaves when the address moves.
+  it('permits the apps hostname and NOT the retired Container Apps wildcard', () => {
+    // The wildcard was kept only while the portal was still handing the browser a
+    // `*.${APPS_DOMAIN}` preview URL. That address has moved, so the wildcard now permits an
+    // origin nothing produces — and re-adding it to "support direct ACA previews" would be
+    // permitting an origin that does not resolve from a BIAL desk at all, which is the entire
+    // reason this design exists. ${APPS_DOMAIN} is still a required input; its job is composing
+    // the router's upstream, not this header.
     const policy = declared[0]!
     expect(policy).toContain('https://${APPS_HOSTNAME}')
-    expect(policy).toContain('https://*.${APPS_DOMAIN}')
+    expect(policy).not.toContain('${APPS_DOMAIN}')
     expect(policy).toMatch(/frame-src 'self'/)
     // The portal itself stays un-frameable; this policy constrains framing and nothing else, so a
     // default-src/script-src creeping in here is a change of kind, not of degree.
@@ -302,10 +305,10 @@ describe('vite.config.js — the dev server states the same framing policy as th
     )
   }
 
-  it('permits the apps hostname and still permits the Container Apps wildcard', () => {
+  it('permits the apps hostname and NOT the retired Container Apps wildcard', () => {
     expect(devPolicy).toBeTruthy()
     expect(devPolicy).toContain('https://citizenapps.bialairport.com')
-    expect(devPolicy).toContain('https://*.azurecontainerapps.io')
+    expect(devPolicy).not.toContain('azurecontainerapps.io')
     expect(devPolicy).toMatch(/frame-ancestors 'self'/)
   })
 

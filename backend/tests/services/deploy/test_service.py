@@ -37,6 +37,7 @@ from src.services.deploy.aca_publish import RevisionState, _state_of
 from src.services.deploy.classification import CLASSIFICATION_KEYS
 from src.services.deploy.config import DeployConfig
 from src.services.deploy.images import BuiltImage, ImageBuildError
+from src.services.deploy.names import published_app_name
 from src.services.deploy.service import DeployNotPossibleError, DeployService, VersionRecheck
 from src.services.storage import snapshot_key
 from src.services.storage.snapshot_read import ExtractedSnapshot, NoAppYet
@@ -311,7 +312,10 @@ async def test_a_deploy_settles_with_a_url(wire, db_session) -> None:
     _started, row = await _run(wire, db_session, user, app)
 
     assert row.status is DeploymentStatus.SUCCEEDED
-    assert row.url.startswith("https://pub-")
+    # THE ADDRESS A PERSON IS GIVEN — the public apps host with the app's key in the path, not
+    # the container's own name. BIAL's Container Apps environment is internal and publishes no
+    # public DNS, so a colleague sent `https://pub-….azurecontainerapps.io` cannot resolve it.
+    assert row.url == f"https://citizenapps.bialairport.com/a/{published_app_name(app.id)}/"
     assert row.step == "live"
     assert row.finished_at is not None
     assert row.failure_code is None
@@ -561,7 +565,10 @@ async def test_a_re_checked_version_the_review_agrees_with_goes_live(wire, db_se
     )
 
     assert row.status is DeploymentStatus.SUCCEEDED
-    assert row.url.startswith("https://pub-")
+    # THE ADDRESS A PERSON IS GIVEN — the public apps host with the app's key in the path, not
+    # the container's own name. BIAL's Container Apps environment is internal and publishes no
+    # public DNS, so a colleague sent `https://pub-….azurecontainerapps.io` cannot resolve it.
+    assert row.url == f"https://citizenapps.bialairport.com/a/{published_app_name(app.id)}/"
     fresh = await db_session.get(AppRegistry, app.id, populate_existing=True)
     assert fresh.status is AppStatus.DRAFT  # never entered the queue
 
