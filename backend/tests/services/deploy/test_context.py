@@ -55,9 +55,12 @@ def hostile_tree(tmp_path: Path) -> Path:
     (root / "scripts" / "db-migrate.mjs").write_text("// the app's own lenient migrator")
     (root / "tsconfig.json").write_text("{}")
 
-    # The app's config — with the exact key the platform must take back.
+    # The app's config — with the exact keys the platform must take back, and one it must
+    # keep. `basePath` is the address grab: an agent that picks its own path takes the app off
+    # the only one the router forwards to it.
     (root / "next.config.ts").write_text(
-        "export default { typescript: { ignoreBuildErrors: true }, images: { unoptimized: true } }"
+        'export default { basePath: "/whatever-the-agent-wants", '
+        "typescript: { ignoreBuildErrors: true }, images: { unoptimized: true } }"
     )
 
     # --- the hostile parts -------------------------------------------------------
@@ -150,6 +153,24 @@ def test_an_agent_disabling_type_checking_is_overridden(hostile_tree: Path) -> N
     assert wrapper.index("...appConfig") < wrapper.index("ignoreBuildErrors: false")
 
 
+def test_an_agent_choosing_its_own_address_is_overridden(hostile_tree: Path) -> None:
+    """`basePath` decides where the app answers, and the platform decides `basePath`.
+
+    OVERRIDDEN, NOT MERGED: the wrapper reads the value from the build environment and never
+    spreads the app's, so the agent's choice survives only in the moved-aside config where
+    nothing reads it. Merging would hand an app the ability to leave its own address, which
+    surfaces as a 404 behind the router rather than as a bad config anyone could see."""
+    files = _unpack(build_context(hostile_tree))
+    wrapper = files["next.config.ts"].decode()
+
+    # The agent's value is still on disk — moved aside, inert.
+    assert b"/whatever-the-agent-wants" in files["next.config.app.ts"]
+    # And nowhere near the config Next actually loads.
+    assert "/whatever-the-agent-wants" not in wrapper
+    assert "process.env.BIAL_BASE_PATH" in wrapper
+    assert wrapper.index("...appConfig") < wrapper.index("\n  basePath,")
+
+
 def test_an_app_with_no_config_still_builds(tmp_path: Path) -> None:
     """The wrapper imports `./next.config.app` unconditionally, so a stub has to exist or
     the build fails on a missing module."""
@@ -160,6 +181,21 @@ def test_an_app_with_no_config_still_builds(tmp_path: Path) -> None:
     files = _unpack(build_context(root))
     assert "next.config.app.ts" in files
     assert b"export default {}" in files["next.config.app.ts"]
+
+
+def test_an_app_with_no_config_still_receives_its_base_path(tmp_path: Path) -> None:
+    """The address comes from the wrapper, which the overlay writes whether or not the app
+    brought a config of its own — so the empty-stub branch needs nothing extra to be correct.
+    Worth pinning: it is the branch nobody thinks about, and its failure mode is an app that
+    builds and then answers 404 to everything."""
+    root = tmp_path / "bare"
+    root.mkdir()
+    (root / "package.json").write_text("{}")
+
+    wrapper = _unpack(build_context(root))["next.config.ts"].decode()
+
+    assert "process.env.BIAL_BASE_PATH" in wrapper
+    assert "process.env.BIAL_APPS_HOSTNAME" in wrapper
 
 
 def test_a_javascript_config_keeps_its_extension(tmp_path: Path) -> None:

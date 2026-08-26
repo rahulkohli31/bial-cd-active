@@ -139,9 +139,65 @@ async def test_no_secret_is_passed_as_a_build_argument() -> None:
 
     body = json.loads(next(c for c in calls if c.url.path.endswith("/scheduleRun")).content)
     names = {a["name"] for a in body["arguments"]}
-    assert names == {"NODE_IMAGE"}
+    # An EXACT set, not a subset: the point is that nothing NEW quietly joins this list. The
+    # three that are here are a base image, a URL path and a hostname — none of them a secret,
+    # and none of them worth hiding from a request body ARM keeps.
+    assert names == {"NODE_IMAGE", "BIAL_BASE_PATH", "BIAL_APPS_HOSTNAME"}
     assert all(a["isSecret"] is False for a in body["arguments"])
     assert "acr-pass" not in json.dumps(body)
+    await builder.aclose()
+
+
+def _arguments(calls: list[httpx.Request]) -> dict[str, str]:
+    import json
+
+    schedule = next(c for c in calls if c.url.path.endswith("/scheduleRun"))
+    body = json.loads(schedule.content)
+    return {a["name"]: a["value"] for a in body["arguments"]}
+
+
+async def test_the_build_carries_this_apps_own_base_path() -> None:
+    """`next build` BAKES the base path into every link and asset URL, so it has to reach the
+    BUILD — a container environment variable would arrive after the output was written.
+
+    Derived from the app id, which is what makes two apps structurally unable to share an
+    address: the value IS the published container's name, so a second app cannot inherit the
+    first one's prefix through a copied config or a stale row."""
+    from src.services.deploy.names import published_app_name
+
+    other_app = uuid.UUID("99999999-8888-7777-6666-555555555555")
+
+    calls: list[httpx.Request] = []
+    builder = _builder(_happy(calls))
+    await builder.build(app_id=_APP_ID, deployment_id=_DEPLOY_ID, context=b"tar")
+    mine = _arguments(calls)["BIAL_BASE_PATH"]
+
+    calls.clear()
+    await builder.build(app_id=other_app, deployment_id=_DEPLOY_ID, context=b"tar")
+    theirs = _arguments(calls)["BIAL_BASE_PATH"]
+
+    assert mine == f"/a/{published_app_name(_APP_ID)}"
+    assert theirs == f"/a/{published_app_name(other_app)}"
+    assert mine != theirs
+    # Leading slash, no trailing one. Next 308-redirects `/<base>/` and rejects a value that
+    # does not start with `/` outright — either shape turns a green build into a dead app.
+    assert mine.startswith("/a/pub-") and not mine.endswith("/")
+    await builder.aclose()
+
+
+async def test_the_apps_hostname_travels_without_its_scheme() -> None:
+    """Next compares a Server Action's browser `Origin` against `allowedOrigins`, which wants a
+    HOST. A value carrying `https://` fails closed and silently: nothing matches, and every form
+    post in the app is aborted as a CSRF attempt with no other symptom."""
+    from src.config import settings
+
+    calls: list[httpx.Request] = []
+    builder = _builder(_happy(calls))
+    await builder.build(app_id=_APP_ID, deployment_id=_DEPLOY_ID, context=b"tar")
+
+    hostname = _arguments(calls)["BIAL_APPS_HOSTNAME"]
+    assert hostname == settings.apps_hostname
+    assert hostname and "://" not in hostname and "/" not in hostname
     await builder.aclose()
 
 

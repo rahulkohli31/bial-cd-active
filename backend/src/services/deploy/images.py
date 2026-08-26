@@ -37,7 +37,8 @@ import structlog
 from azure.identity import DefaultAzureCredential
 
 from src.services.deploy.config import DeployConfig
-from src.services.deploy.names import image_tag
+from src.services.deploy.names import image_tag, published_app_name
+from src.services.sandbox.base import base_path_for
 
 _log = structlog.get_logger()
 
@@ -160,6 +161,15 @@ class AcrImageBuilder:
     async def build(
         self, *, app_id: uuid.UUID, deployment_id: uuid.UUID, context: bytes
     ) -> BuiltImage:
+        # Lazy, like the singleton below: a module-level `src.config` import is a cycle. The
+        # apps hostname is CORE settings rather than a `DeployConfig` field on purpose — it is
+        # the one address every generated app is served from, preview and published alike, so
+        # it is not a property of the publishing block and does not belong behind its
+        # `extra="forbid"`.
+        from src.config import settings
+
+        apps_hostname = settings.apps_hostname
+
         tag = image_tag(
             repository_prefix=self._config.image_repository_prefix,
             app_id=app_id,
@@ -195,7 +205,27 @@ class AcrImageBuilder:
                         "name": "NODE_IMAGE",
                         "value": self._config.node_base_image,
                         "isSecret": False,
-                    }
+                    },
+                    # WHERE THE APP LIVES, and it has to be known HERE because `next build`
+                    # bakes it: every link, asset URL and route in the output is written under
+                    # this prefix, so a container environment variable would arrive after the
+                    # decision was already made. Derived from `app_id` rather than taken as a
+                    # parameter — the published container's name IS the key, so there is
+                    # nothing to pass in and nothing to keep in sync.
+                    {
+                        "name": "BIAL_BASE_PATH",
+                        "value": base_path_for(published_app_name(app_id)),
+                        "isSecret": False,
+                    },
+                    # The one hostname every generated app is served from. Baked for the same
+                    # reason, and read for a different one: Next checks a Server Action's
+                    # browser `Origin` against the forwarded host, which stops matching the
+                    # moment traffic arrives through the router.
+                    {
+                        "name": "BIAL_APPS_HOSTNAME",
+                        "value": apps_hostname,
+                        "isSecret": False,
+                    },
                 ],
             },
         )
