@@ -76,7 +76,13 @@ export default function Dashboard() {
 
       <footer className="border-t border-bial-border bg-white py-4 px-6">
         <div className="max-w-5xl mx-auto flex items-center justify-between">
-          <p className="text-xs text-neutral">Kempegowda International Airport Bengaluru &middot; V 2.4.0-Build</p>
+          {/* No version string. "V 2.4.0-Build" was invented — the real product version is
+              1.6.17 (root VERSION) / 1.5.0 (package.json), and 2.4.0 appears nowhere in
+              the repo. This was the ONLY version the product reported about itself, so an
+              invented one was worse than none (#157 C1). Wiring the real value needs a
+              Vite `define` fed from the root VERSION file — a build-config change, filed
+              rather than done from a UI-removal chore. */}
+          <p className="text-xs text-neutral">Kempegowda International Airport Bengaluru</p>
           <div className="flex gap-5">
             <button
               onClick={() => navigate('/help')}

@@ -51,11 +51,11 @@ const FAQS = [
   },
   {
     q: 'Who can use this portal?',
-    a: 'Any BIAL staff member with a valid Staff ID (BIAL-XXXXX) can log in and start building apps. No programming experience is required.',
+    a: 'Sign in with your BIAL Microsoft account — the only sign-in the portal offers. Access is limited to the BIAL organisation. No programming experience is required.',
   },
   {
     q: 'What happens when I click "Start Chat"?',
-    a: 'The AI analyzes your prompt and starts building a real, running application behind the scenes — this is a multi-minute build, not an instant preview. You can watch its progress and keep chatting to refine the app as it comes together.',
+    a: 'It opens a chat — it does not start a build. The composer has three modes and defaults to Plan: Ask answers questions about your app and changes nothing, Plan works out an approach with you and waits for your confirmation, and Write actually builds the changes into your app. Only Write starts the multi-minute build, and from Plan you get there by approving the plan first.',
   },
   {
     q: 'Can I edit the app after it is generated?',
@@ -73,12 +73,12 @@ const FAQS = [
   },
   {
     q: 'Is there a limit to how many apps I can build?',
-    a: 'There is no hard limit during the current phase. Build as many prototypes as you need.',
+    a: 'There is no limit on how many apps you can create. There is a daily limit on how much AI work you can use across all of them: the token counter in the header shows what you have left, turns amber as you approach it, and once it is exhausted a build stops until the allowance resets.',
   },
   {
     q: 'Who do I contact for help?',
     // TODO: confirm support address
-    a: 'Reach out to the IT Support Desk via the portal footer link, or email citizen-developer-support@bialairport.com.',
+    a: 'Use the Feedback button in the header — it submits straight to the team and is the fastest route. You can also email citizen-developer-support@bialairport.com.',
   },
 ]
 
@@ -150,7 +150,7 @@ export default function HelpPage() {
                     { title: 'Describe the data', body: 'Explain what information the app works with — the columns of an Excel/CSV you will upload, or the records the app should capture and store. Attaching a sample file in the builder grounds the app in real data.' },
                     { title: 'Describe the users', body: 'Who will use this app? Ground ops staff on mobile during shifts? Control room operators on desktop dashboards? Knowing the user shapes the layout.' },
                     { title: 'Specify key features', body: 'List the 3–5 most important features. For example: "Include a calendar view, a status dashboard, alert notifications, and a CSV export button."' },
-                    { title: 'Set design expectations', body: 'Mention if you want mobile-first, dashboard-style, kiosk-friendly, or standard desktop layout. Selecting a Theme from the dropdown also helps.' },
+                    { title: 'Set design expectations', body: 'Mention if you want mobile-first, dashboard-style, kiosk-friendly, or standard desktop layout.' },
                   ].map(({ title, body }) => (
                     <div key={title} className="flex gap-3">
                       <div className="w-1.5 h-1.5 rounded-full bg-primary mt-2 flex-shrink-0" />
