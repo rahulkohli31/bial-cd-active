@@ -22,6 +22,19 @@ import { test, expect, type Page } from '@playwright/test'
 
 const REAL_SANDBOX = process.env.E2E_REAL_SANDBOX === '1'
 
+/**
+ * The address a live preview is served at. Generated apps no longer get a per-app
+ * `*.azurecontainerapps.io` hostname — they share ONE hostname with the app key in the path
+ * (`/a/sbx-<28 hex>`), because BIAL refused a wildcard certificate and their Container Apps
+ * environment publishes no public DNS. Matched by SHAPE rather than against a literal host: the
+ * hostname is deployment configuration (`APPS_BASE_URL`), so pinning one here is what made the
+ * previous assertion go stale silently.
+ *
+ * `apps-domain.spec.ts` is the test that proves the base path actually works; this one only needs
+ * to keep asserting that a real sandbox produces a real, correctly-shaped preview address.
+ */
+const PREVIEW_ADDRESS = /^https?:\/\/[^/]+\/a\/sbx-[0-9a-f]{28}\/?$/
+
 const composer = (page: Page) => page.getByPlaceholder(/describe what you need/i)
 
 async function createProject(page: Page, name: string): Promise<string> {
@@ -91,8 +104,13 @@ test.describe('real Azure sandbox (opt-in, E2E_REAL_SANDBOX=1)', () => {
     // Both 5 and 8 minutes were guesses that happened to sit just under that real number, which is
     // exactly why both failed here. 12 gives real margin over a measured value instead of another
     // guess, while leaving room in the 20-minute total test budget for everything after it.
+    //
+    // The pattern asserts the SHAPE of the address rather than a literal host: this used to pin
+    // `*.azurecontainerapps.io`, which stopped being true the moment previews moved onto the
+    // shared apps hostname. A stale literal here fails a 20-minute run for a reason that has
+    // nothing to do with the sandbox it exists to test.
     const iframe = page.locator('iframe[title="App Preview"]')
-    await expect(iframe).toHaveAttribute('src', /^https:\/\/.*\.azurecontainerapps\.io\//, {
+    await expect(iframe).toHaveAttribute('src', PREVIEW_ADDRESS, {
       timeout: 12 * 60_000,
     })
 
@@ -158,7 +176,7 @@ test.describe('real Azure sandbox (opt-in, E2E_REAL_SANDBOX=1)', () => {
     const endedCard = page.getByTestId('preview-ended-card')
     await expect(endedCard).toBeVisible({ timeout: 60_000 })
     await endedCard.getByRole('button', { name: /relaunch/i }).click()
-    await expect(iframe).toHaveAttribute('src', /^https:\/\/.*\.azurecontainerapps\.io\//, {
+    await expect(iframe).toHaveAttribute('src', PREVIEW_ADDRESS, {
       timeout: 3 * 60_000,
     })
 

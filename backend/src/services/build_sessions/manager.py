@@ -51,6 +51,7 @@ from src.api.v1.build_sessions.schemas import (
     ProgressEnvelope,
     RunBuild,
 )
+from src.config import settings
 from src.db.base import async_session_factory
 from src.db.models.app_registry import AppRegistry
 from src.db.models.harness_counter import HarnessCounter
@@ -1889,7 +1890,11 @@ class SessionManager:
             # this as "the poll did not say", exactly as it reads an unreachable store.
             return PreviewState(
                 state=PreviewLifeState.ALIVE,
-                preview_url=f"https://{fqdn}/" if fqdn else None,
+                # The PUBLIC address, composed from the app name rather than the registry
+                # FQDN. This site builds no `SandboxHandle`, so it is invisible to anything
+                # that follows the handle's field — and it is what the cockpit frames, so
+                # getting it wrong shows a blank preview over a perfectly healthy container.
+                preview_url=settings.app_url(mine) if fqdn else None,
             )
         # Everything below is a workspace that is NOT serving this project — which is the only
         # place the restore offer is rendered, so this is the one place the answer earns its

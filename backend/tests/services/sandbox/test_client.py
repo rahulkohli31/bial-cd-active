@@ -353,9 +353,13 @@ async def test_a_warm_request_transport_error_is_swallowed_too() -> None:
 
 
 async def test_the_warm_request_goes_in_the_front_door() -> None:
-    """It must hit the APP root through Caddy's `/*` block — the same door the iframe uses —
-    and NOT the bearer-guarded `/_sup/*` supervisor. Warming a path no user takes would compile
-    the wrong route and prove nothing."""
+    """It must hit the APP'S OWN ROOT through Caddy's `/*` block — the same door the iframe
+    uses — and NOT the bearer-guarded `/_sup/*` supervisor. Warming a path no user takes would
+    compile the wrong route and prove nothing.
+
+    THE APP'S ROOT IS NOW `/a/<app-name>`, not `/`. Under a base path the container root belongs
+    to no route, so warming `/` compiles the framework's 404 and leaves the first real visitor
+    waiting on exactly the cold compile this call exists to absorb — while reporting 200."""
     seen: dict[str, object] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -364,7 +368,7 @@ async def test_the_warm_request_goes_in_the_front_door() -> None:
         return httpx.Response(200, text="<html>hello</html>")
 
     assert await _client(handler).someone_has_to_go_first(_handle()) == 200
-    assert seen["path"] == "/"
+    assert seen["path"] == "/a/sbx-abc"
     assert seen["auth"] is None, (
         "the app root is public; the supervisor token has no business here"
     )
@@ -444,8 +448,8 @@ async def test_the_warm_request_does_not_follow_the_apps_redirect() -> None:
     status = await _client(handler).someone_has_to_go_first(_handle())
 
     assert status == 302, "the redirect is REPORTED, not chased"
-    assert seen == ["https://app-xyz.westeurope.azurecontainerapps.io/"], (
-        "exactly one request, to the app root — the Location was never fetched"
+    assert seen == ["https://app-xyz.westeurope.azurecontainerapps.io/a/sbx-abc"], (
+        "exactly one request, to the app's own root — the Location was never fetched"
     )
 
 
@@ -619,3 +623,73 @@ async def test_the_default_client_declines_with_unknown_rather_than_clean() -> N
     report = await SandboxClient.compile_state(nobody, _handle())
     assert report.state is CompileState.UNKNOWN
     assert report.reason == "no_sandbox_client"
+
+
+# --- what the app is actually serving ---------------------------------------------------------
+#
+# `what_is_it_serving` is the SERVING half of the build's health verdict and it had no direct
+# coverage at all: its only exercise was through hand-written fakes elsewhere. It is also the
+# probe with the most to lose from a base path, because its answer is fed to self-heal as
+# evidence — a framework 404 read as "what the app serves" becomes "make sure `app/page.tsx`
+# exists", and the model burns metered tokens repairing a file that was never wrong.
+
+
+def _streamed(status: int, body: str) -> httpx.Response:
+    """A response whose body must be STREAMED, matching what the probe actually does.
+
+    `httpx.Response(status, text=...)` sets the content eagerly, and `aiter_raw()` — which the
+    probe uses deliberately, to bound the read over WIRE bytes rather than decoded ones — refuses
+    it. A test built on the eager form would not exercise the read path at all.
+    """
+
+    async def _chunks() -> AsyncIterator[bytes]:
+        yield body.encode()
+
+    return httpx.Response(status, content=_chunks())
+
+
+async def test_the_serving_probe_reads_the_apps_own_page_not_the_container_root() -> None:
+    """THE MUTANT THAT MUST FAIL. Point this back at `handle.preview_url` and it goes red.
+
+    Under a base path the container root is a route that does not exist. Both responses below
+    are a legitimate 200/404 pair, so nothing about the STATUS distinguishes them — only which
+    URL was asked for does.
+    """
+    asked: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        asked.append(request.url.path)
+        if request.url.path == "/a/sbx-abc":
+            return _streamed(200, "<html><body>the citizen's app</body></html>")
+        return _streamed(404, "<html><body>This page could not be found</body></html>")
+
+    served = await _client(handler).what_is_it_serving(_handle())
+
+    assert asked == ["/a/sbx-abc"]
+    assert served is not None
+    assert served.status == 200
+    assert "the citizen's app" in served.head
+
+
+async def test_the_serving_probe_still_reports_a_real_404_as_a_404() -> None:
+    """Moving the probe must not make it fail-open. An app that genuinely has no page at its own
+    root is UNHEALTHY, and saying so is the whole point of the verdict."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return _streamed(404, "<html>nothing here</html>")
+
+    served = await _client(handler).what_is_it_serving(_handle())
+    assert served is not None and served.status == 404
+
+
+async def test_the_serving_probe_sends_no_bearer_to_the_app() -> None:
+    """The app's own root is public and is written by unreviewed, agent-authored code. The
+    supervisor token has no business travelling there."""
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["auth"] = request.headers.get("authorization")
+        return _streamed(200, "<html>ok</html>")
+
+    await _client(handler).what_is_it_serving(_handle())
+    assert seen["auth"] is None

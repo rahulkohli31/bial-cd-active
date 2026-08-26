@@ -17,3 +17,12 @@ playwright-report/
 
 # tsc --build incremental cache — a local artifact, never a shipped one.
 *.tsbuildinfo
+
+# Python tool artifacts from the Docker-backed router harness under tests/. That suite runs
+# under the BACKEND interpreter (`uv run --project ../backend pytest`), so it drops the same
+# caches backend/ and sandbox/ already ignore — this keeps them out of a Node project's tree.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/

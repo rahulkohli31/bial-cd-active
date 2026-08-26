@@ -17,6 +17,14 @@ reached through `BIAL_DATABASE_URL` (see `appdb_env.py`). The `app_key` COLUMN s
 `GET /apps/{id}/status` still returns it — it is simply no longer injected.
 
 Both names survive the C1 child-env scrub allowlist (`_BIAL_INJECTED_KEYS`, D5/C6).
+
+WHAT IS *NOT* HERE, AND MUST NOT BE. `BIAL_BASE_PATH` and `BIAL_APPS_HOSTNAME` — the address a
+generated app is served at — are injected by `sandbox/client._provision_container`, not by this
+builder, and the reason is that `deploy/env.py` calls `build_app_env` too. A base path added
+here would ship an `sbx-` value into published containers whose images were built with a `pub-`
+one, so every published app would be configured for an address that does not exist. The
+provision seam is also the narrower place: it is the one point both a fresh provision and a
+restore pass through, so a relaunched sandbox comes back at the same path for free.
 The one-app-per-project upsert is REPLICATED inline (KTD-6) rather than extracted from
 another domain's router — refactoring it would edit another domain's file (anti-collision).
 """

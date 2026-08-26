@@ -446,6 +446,9 @@ def _api_env(*, without: str | None = None) -> dict[str, str]:
         "AUTH__REDIRECT_URI": "http://localhost:8000/api/v1/auth/callback",
         "SUPERADMIN_EMAILS": "admin@bial.com",
         "SUPPORT_CONTACT_EMAIL": "help@bial.com",
+        # Required of every role with no default — a profile built without it would fail for a
+        # reason that has nothing to do with the support contact this file is about.
+        "APPS_BASE_URL": "https://citizenapps.bialairport.com",
     }
     if without is not None:
         del env[without]

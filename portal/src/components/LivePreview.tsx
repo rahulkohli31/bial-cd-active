@@ -266,11 +266,16 @@ function BouncingWait({ children, className = '' }: { children: ReactNode; class
  *   - `iterating`  — true while the loop keeps emitting step/log envelopes AFTER the preview
  *                    went live (a refine turn holding at `ready`); shows a subtle overlay.
  *   - `onFrameMessage` — the client-error receiver seam, LIVE as of U13. The inbound `message`
- *                    listener validates `e.origin` against the sandbox origin (the C8 §3 security
- *                    assertion, pinned by the skeleton) and forwards ONLY origin-valid messages
- *                    here; `BuilderPage` relays them to the harness, where a reported browser
- *                    crash makes the health verdict not-green. Origin proves PROVENANCE, not
- *                    content — the shape check lives on the receiving side.
+ *                    listener validates BOTH `e.origin` against the preview origin AND `e.source`
+ *                    against this pane's own iframe window (the C8 §3 security assertion), and
+ *                    forwards only messages that pass both; `BuilderPage` relays them to the
+ *                    harness, where a reported browser crash makes the health verdict not-green.
+ *                    The source half is what survives every app sharing one hostname — origin
+ *                    alone no longer tells this pane's app from any other app in the document.
+ *                    Together they prove PROVENANCE, not content — the shape check lives on the
+ *                    receiving side. Note `scripts/skeleton/frame-proof` is a standalone Chromium
+ *                    rig with its OWN inline origin guard: it never renders this component, so it
+ *                    neither exercises nor regression-catches the gate written here.
  *
  *   - `onRelaunch` — when set, the terminal (ended/failed) placeholder offers a "Relaunch preview"
  *                    button (#43): restore the torn-down app from its snapshot into a fresh sandbox.
@@ -420,16 +425,40 @@ export default function LivePreview({
   previewOriginRef.current = previewOrigin
   const onFrameMessageRef = useRef(onFrameMessage)
   onFrameMessageRef.current = onFrameMessage
+  // This pane's own frame, for the sender-identity half of the trust gate below. A ref for the
+  // same reason the two above are: the listener mounts once and must read the CURRENT frame.
+  const frameRef = useRef<HTMLIFrameElement | null>(null)
 
-  // C8 §3: the one cross-origin trust seam. Reject any message whose origin is not the sandbox
-  // preview origin — the only trusted sender — BEFORE trusting the payload. A null previewOrigin
-  // (preview dark) rejects everything. This is a security assertion, not a nicety; the walking
-  // skeleton (scripts/skeleton) pins the reject path for real. The forwarded payload feeds the
-  // browser client-error arm of self-heal (U13), which is wired: passing this gate proves only
-  // WHERE the bytes came from, so the receiver narrows their shape before forwarding them on.
+  // C8 §3: the one cross-origin trust seam, and it now takes TWO facts, not one.
+  //
+  // WHY THE ORIGIN CHECK STOPPED BEING ENOUGH. It only ever discriminated because each app had a
+  // hostname of its own. BIAL refused a wildcard certificate, so every generated app is now served
+  // from ONE name — one certificate, one label, one browser origin for all of them — and an origin
+  // comparison that used to mean "this is the app I am framing" degrades to "this is an app". The
+  // reachable sender is not an unrelated tab (every place the portal opens an app in a new tab
+  // severs window.opener with rel="noopener"): it is a nested or sibling frame inside THIS portal
+  // document, whose e.origin is now identical to the pane's own preview origin.
+  //
+  // So the sender's identity is checked as well: `e.source` must be the window of the iframe this
+  // pane rendered. Both halves stay — origin proves the bytes came from the apps host, source
+  // proves they came from THIS pane's app rather than any other one on it. Dropping either is a
+  // regression, not a simplification.
+  //
+  // FAILS CLOSED, DELIBERATELY STRUCTURALLY. The frame is conditionally mounted and keyed, so the
+  // ref is legitimately null while the pane is reconnecting/terminal/relaunching and across every
+  // reload-nonce remount; messages arriving then are dropped, where origin alone used to forward
+  // them. That is accepted knowingly — in those states the app document is gone, so nothing can be
+  // posting. `frameWindow` is bound and null-guarded rather than compared inline because
+  // `e.source !== ref.current?.contentWindow` reads correct while being one character (`!==` ->
+  // `!=`) away from accepting every source-less message: null == undefined.
+  //
+  // The forwarded payload feeds the browser client-error arm of self-heal (U13): passing this gate
+  // proves only WHERE the bytes came from, so the receiver narrows their shape downstream.
   useEffect(() => {
     const onMsg = (e: MessageEvent) => {
       if (!previewOriginRef.current || e.origin !== previewOriginRef.current) return
+      const frameWindow = frameRef.current?.contentWindow
+      if (!frameWindow || e.source !== frameWindow) return
       onFrameMessageRef.current?.(e.data)
     }
     window.addEventListener('message', onMsg)
@@ -1075,6 +1104,10 @@ export default function LivePreview({
                    container, repaired app (#5). A plain re-render still keeps the same DOM node,
                    so the framed app's HMR websocket is not leaked on every status tick. */
                 key={frameKey}
+                /* The identity the inbound message gate compares `e.source` against (C8 §3).
+                   React attaches and detaches this alongside `key`, so a remount or an unmounted
+                   pane nulls it on its own — which is the fail-closed state, not a gap. */
+                ref={frameRef}
                 src={previewUrl}
                 /* U5 — the ONLY thing that reveals this frame. Recording the KEY rather than a
                    bare `true` is what makes the next load re-gate itself. */

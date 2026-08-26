@@ -38,10 +38,28 @@ export default defineConfig({
     // Dev parity for the portal's document CSP (prod sets this via nginx envsubst; C8 §2, KTD-3).
     // A concrete, non-empty value so a dev-server load exercises the SAME framing constraint the
     // built SPA ships with — only framing is constrained (no default-src/script-src/connect-src),
-    // so vite's HMR client, module graph, and the API proxy below are untouched. The wildcard
-    // covers any per-session ACA sandbox FQDN the cockpit frames.
+    // so vite's HMR client, module graph, and the API proxy below are untouched.
+    //
+    // THIS IS THE FOURTH COPY OF THE FRAMING POLICY and the only one nginx does not emit, which is
+    // exactly why it gets forgotten: it has no envsubst variable to follow, so it silently keeps
+    // whatever host it was born with while the edge moves on. Left behind, a dev-server load
+    // refuses to frame the preview once its address moves to the shared apps hostname, with
+    // nothing but a console message and no server-side trace at all — the failure looks like a
+    // broken preview, not like a stale config. The ACA wildcard that used to sit beside the apps
+    // hostname is GONE: it covered the per-session sandbox FQDN the cockpit used to be handed,
+    // and that address has moved. Do not re-add it — an internal Container Apps environment
+    // publishes no public DNS, so nothing produces that origin any more. Literal rather than an
+    // env var: the deployed value is a fixed BIAL name, and a dev-only knob with a fallback would
+    // just be a second thing to forget. Pinned against nginx.conf by
+    // src/__tests__/nginx-apps-routing.test.ts.
+    //
+    // CONSEQUENCE FOR THE LOCAL DEV LOOP, stated here because it is not obvious: a preview is now
+    // addressed through the platform's router, so `npm run dev` alone cannot frame one. Running
+    // the portal CONTAINER (which carries the apps vhost) is what makes a local preview work —
+    // that is exactly what portal/tests/ stands up.
     headers: {
-      'Content-Security-Policy': "frame-src 'self' https://*.azurecontainerapps.io; frame-ancestors 'self'",
+      'Content-Security-Policy':
+        "frame-src 'self' https://citizenapps.bialairport.com; frame-ancestors 'self'",
     },
     proxy: {
       // Entra ID auth is served by the FastAPI control-plane (:8000), NOT Express.

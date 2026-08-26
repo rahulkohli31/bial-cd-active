@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.18] - 2026-08-26
+
+### Added
+
+- Generated apps now open at one BIAL address, with the app's own key in the link. Before
+  this, every app was handed an address that only resolved outside the BIAL network, so a
+  preview or a shared app link opened to nothing from a BIAL desk.
+- A link to an app that cannot be reached shows a plain "this app is not available at this
+  address" page with a button back to the portal, instead of a raw server error.
+- Apps published before this change can be moved onto the new address by a one-off script.
+  It refuses to rewrite an app's link until that app has actually been published again, so a
+  link that plainly does not resolve is never swapped for one that returns a confusing error.
+
+### Changed
+
+- Moving around inside an app keeps the app's key in the address, so a shared or bookmarked
+  link still lands where it should instead of dropping out of the app.
+- The portal now only allows an app to be shown inside it from the shared app address.
+
+### Fixed
+
+- Live reload inside a preview works again. It had been connecting to an address the
+  framework no longer serves, so a preview could quietly stop updating between changes while
+  still looking healthy.
+- A request that tries to change your data from somewhere other than the portal is now
+  refused, which matters because apps and the portal now share a site.
+
 ## [1.6.17] - 2026-08-24
 
 ### Changed

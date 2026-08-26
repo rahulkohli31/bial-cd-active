@@ -106,6 +106,16 @@ _INJECTED_ENV: tuple[InjectedEnvVar, ...] = (
         "the app's own PostgreSQL connection string (secret, server-only — never printed)",
         True,
     ),
+    InjectedEnvVar(
+        "BIAL_BASE_PATH",
+        "the path this app is served under, e.g. /a/sbx-<28 hex> (read by next.config.ts)",
+        False,
+    ),
+    InjectedEnvVar(
+        "BIAL_APPS_HOSTNAME",
+        "the public hostname every generated app is served from (Server Actions origin)",
+        False,
+    ),
 )
 # The child-env allowlist: exactly the injected names, carried through the fail-closed scrub.
 _BIAL_INJECTED_KEYS = tuple(v.name for v in _INJECTED_ENV)
@@ -113,6 +123,26 @@ _BIAL_INJECTED_KEYS = tuple(v.name for v in _INJECTED_ENV)
 _SECRET_ENV_NAMES = tuple(v.name for v in _INJECTED_ENV if v.secret)
 # A shorter value can't be a real SAS/credential; redacting it would blank ordinary text (KTD-8).
 _MIN_SECRET_LEN = 8
+
+# The exact shape the router will actually route: `/a/` plus the container app's own name, which
+# is `sbx-`/`pub-` and 28 lowercase hex. Validated here rather than trusted because this value
+# reaches `next dev` as configuration and reaches `http.client` as a request target, and a
+# malformed one would be a silent 404 in the first case and a header-injection attempt in the
+# second. Anything that does not match is treated as ABSENT, which degrades to the pre-base-path
+# behaviour — the app at `/` — rather than to a half-configured server.
+_BASE_PATH_RE = re.compile(r"^/a/(?:sbx|pub)-[0-9a-f]{28}$")
+
+
+def _base_path() -> str:
+    """The app's assigned base path, or `""` when it is serving at the root.
+
+    Read from `os.environ` at CALL time, not bound at import: the supervisor starts before the
+    dev server and a restore re-injects the environment, so a value captured at import could
+    describe a previous life of this container. Every caller is cheap and infrequent.
+    """
+    raw = os.environ.get("BIAL_BASE_PATH", "").strip()
+    return raw if _BASE_PATH_RE.match(raw) else ""
+
 
 app = FastAPI(title="bial-sandbox-spike-supervisor")
 
@@ -318,7 +348,10 @@ def _dev_port_bound(port: int = _DEV_PORT, timeout: float = _READY_CONNECT_TIMEO
 
 
 def _dev_port_serving(
-    port: int = _DEV_PORT, timeout: float = 1.0, read_timeout: float | None = None
+    port: int = _DEV_PORT,
+    timeout: float = 1.0,
+    read_timeout: float | None = None,
+    path: str | None = None,
 ) -> bool:
     """True when something ANSWERS HTTP on the dev port — observed truth, not child state.
 
@@ -351,8 +384,44 @@ def _dev_port_serving(
     permanent state, not a slow one. The watchdog below tears the socket down at the deadline
     (see `_abandon_socket` — shutdown, not close), and the resulting failure lands in the same
     not-serving arm as any other unreachable peer.
+
+    WHAT IT ASKS FOR is `path`, defaulting to the app's assigned base path (see `_base_path`)
+    and to `/` when there is none. THE FAIL-OPEN IS UNCHANGED — this widens WHAT is asked
+    without touching WHETHER a non-answer is tolerated, which is the only reason it is safe to
+    touch a function on the readiness chain at all: a wrongly-negative readiness leads to a
+    recovery path that silently rolls the workspace back to the last Save. Leaving the request
+    at `/` was the behavioural change, not moving it — under a base path `/` belongs to no
+    route, so "ready" would decay to "the dev server can render its own 404", which is true
+    before the citizen's first route has compiled and true forever for an app that never
+    compiles. That is the exact false-ready this probe was rewritten to kill.
+
+    NO TRAILING SLASH on the base path, and that is measured rather than stylistic: Next
+    redirects `/<base>/` to `/<base>` with a 308, so the slashed form would answer with a
+    redirect instead of the app and tell us nothing about whether the app renders.
+    """
+    return _dev_port_status(port, timeout, read_timeout, path) is not None
+
+
+def _dev_port_status(
+    port: int = _DEV_PORT,
+    timeout: float = 1.0,
+    read_timeout: float | None = None,
+    path: str | None = None,
+) -> int | None:
+    """The HTTP status the dev port answered with, or None when nothing answered at all.
+
+    This holds the mechanics `_dev_port_serving` used to hold inline; that function is now the
+    one-line predicate over it, so the fail-open lives in exactly one place and reads as what it
+    is — "an answer, any answer" — rather than being spelled out in the middle of socket
+    bookkeeping.
+
+    NO CALLER READS THE INT TODAY, and that is worth saying plainly rather than dressing up: the
+    split exists to isolate the fail-open, not to serve a second consumer. Tamper detection needs
+    a response BODY as well as a status, so it opens its own connection (`_served_base_path`)
+    instead of reusing this. If that ever changes, this is the seam to reuse.
     """
     read_budget = timeout if read_timeout is None else read_timeout
+    target = (_base_path() or "/") if path is None else path
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     watchdog: threading.Timer | None = None
     try:
@@ -363,21 +432,99 @@ def _dev_port_serving(
             watchdog = threading.Timer(read_budget, _abandon_socket, args=(sock,))
             watchdog.daemon = True
             watchdog.start()
-        conn.request("GET", "/")
+        conn.request("GET", target)
         # Response HEADERS are the bar: `next dev` withholds them for the whole compile and
         # sends them once the route actually renders, so this is "a request succeeded" without
         # waiting on a streamed body.
-        conn.getresponse()
-        return True
+        return conn.getresponse().status
     except (OSError, http.client.HTTPException):
         # ConnectionRefusedError / TimeoutError (both OSError) and a non-HTTP reply — including
         # the watchdog's own close, which surfaces as one of these. An HTTP ERROR STATUS is NOT
-        # here — it returned True above, which is the fail-open guard.
-        return False
+        # here — it returned a status above, which is the fail-open guard.
+        return None
     finally:
         if watchdog is not None:
             watchdog.cancel()  # the common case: the response arrived, nothing was abandoned
         conn.close()
+
+
+# How much of the root response to read when checking whether the served base path is the one
+# we injected. The answer is in the first framework asset URL, which Next emits in the document
+# head — about 400 bytes in on the pinned template. 4 KiB is generous cover for a bigger head
+# without ever reading an app's whole page into the supervisor.
+_TAMPER_BODY_MAX = 4096
+_TAMPER_TIMEOUT = 3.0
+
+# The prefix a framework asset URL carries. Next generates every `/_next/…` URL under whatever
+# `basePath` the CONFIG ACTUALLY HAS, which is what makes this readable rather than inferred:
+# the served value names itself, so the signal can say what the app is doing instead of only
+# that it is wrong.
+_NEXT_ASSET_RE = re.compile(r"""["'](?P<prefix>[^"']*?)/_next/""")
+
+_TAMPERED_REASON = "config_tampered"
+"""The supervisor's word for "the app is not at the address the platform routes to".
+
+It exists so this failure NAMES ITSELF. Without it a removed `basePath` presents to the control
+plane as a preview that 404s, self-heal converts that into "make sure `app/page.tsx` exists",
+and the model burns metered tokens repairing a file that was never wrong."""
+
+
+def _served_base_path() -> str | None:
+    """The base path the dev server is ACTUALLY generating URLs under, or None if unreadable.
+
+    Read from the ROOT rather than from the configured path, because the root is the request
+    whose answer differs between the two cases. Under a correct `basePath` the root is a 404
+    whose body still carries prefixed asset URLs; with `basePath` removed the root is the app
+    itself, carrying unprefixed ones. Either way the first `/_next/` reference names the truth.
+
+    Returns None — never a guess — when nothing identifiable comes back, so an app that replaces
+    the not-found page with plain text is reported as unknown rather than as tampered.
+    """
+    # THE SAME WATCHDOG THE READINESS PROBE CARRIES, AND FOR THE SAME REASON. `settimeout` re-arms
+    # on every socket operation, and this response comes from an unreviewed generated app — a peer
+    # that trickles one byte at a time satisfies each read forever and this call never returns.
+    # This one reads a BODY as well as headers, so it is strictly more exposed than its sibling,
+    # and it runs on a fire-and-forget thread with nobody waiting on it: a hang here is a leaked
+    # thread per dev-server restart, not a slow answer somebody notices.
+    conn = http.client.HTTPConnection("127.0.0.1", _DEV_PORT, timeout=_TAMPER_TIMEOUT)
+    watchdog: threading.Timer | None = None
+    try:
+        conn.connect()
+        sock = conn.sock
+        if sock is not None:
+            sock.settimeout(_TAMPER_TIMEOUT)
+            watchdog = threading.Timer(_TAMPER_TIMEOUT, _abandon_socket, args=(sock,))
+            watchdog.daemon = True
+            watchdog.start()
+        conn.request("GET", "/")
+        resp = conn.getresponse()
+        body = resp.read(_TAMPER_BODY_MAX).decode("utf-8", "replace")
+    except (OSError, http.client.HTTPException):
+        return None
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
+        conn.close()
+    match = _NEXT_ASSET_RE.search(body)
+    return match.group("prefix") if match else None
+
+
+def _detect_base_path_tampering() -> None:
+    """Publish `config_tampered` when the app is not serving under its assigned path.
+
+    Runs at most once per readiness generation and only once an app has actually answered, so it
+    cannot fire against a server that is merely still compiling. It NEVER touches readiness:
+    a tampered config still counts as serving, exactly as a 500-ing dev server does, because the
+    alternative is a false not-ready — and a false not-ready reaches a recovery path that
+    silently rolls the workspace back to the last Save. This reports; it does not judge.
+    """
+    injected = _base_path()
+    if not injected:
+        return  # no assigned path; there is nothing to be wrong about
+    served = _served_base_path()
+    if served is None or served == injected:
+        return
+    _forget_compile(_TAMPERED_REASON)
 
 
 _READY_CACHE_TTL = 5.0
@@ -417,6 +564,9 @@ class _Ready:
     generation: int = 0
     probing: threading.Event | None = None  # the in-flight probe's signal; None = idle
     mourned: object | None = None  # the child whose death already invalidated the cache
+    # The generation whose base path has already been checked. Once per dev-server life: the
+    # config cannot change without a restart, and a restart bumps `generation`.
+    base_path_checked: int = -1
 
 
 def _forget_ready(mourned: object | None = None) -> None:
@@ -435,11 +585,16 @@ def _forget_ready(mourned: object | None = None) -> None:
         _Ready.served_until = 0.0
         _Ready.generation += 1
         _Ready.probing = None
+        # Re-arm the base-path check. `base_path_checked` holds a generation, and the new one is
+        # by construction unequal, but resetting it explicitly keeps the latch's meaning local
+        # rather than dependent on the counter never wrapping or being restored.
+        _Ready.base_path_checked = -1
 
 
 def _run_probe(done: threading.Event, generation: int) -> None:
     """Probe the dev port once, then publish — unless a reset has since disowned this answer."""
     serving = False
+    check_base_path = False
     try:
         serving = _dev_port_serving(_DEV_PORT, _READY_CONNECT_TIMEOUT, _READY_READ_TIMEOUT)
     finally:
@@ -447,8 +602,17 @@ def _run_probe(done: threading.Event, generation: int) -> None:
             if generation == _Ready.generation:  # a restart mid-probe discards the result
                 if serving:
                     _Ready.served_until = time.monotonic() + _READY_CACHE_TTL
+                    if _Ready.base_path_checked != generation:
+                        _Ready.base_path_checked = generation
+                        check_base_path = True
                 _Ready.probing = None  # the single-flight slot is free again
         done.set()
+    # OFF THE READINESS PATH ON PURPOSE, in its own thread and after `done` is set. The check
+    # costs a second request, and the single-flight slot is held for the whole of `_run_probe`
+    # — so doing it inline would make every caller of `/dev/status` wait on a diagnostic. A
+    # readiness answer must never be slower because of something that only reports.
+    if check_base_path:
+        threading.Thread(target=_detect_base_path_tampering, daemon=True).start()
 
 
 def _dev_is_serving() -> bool:
@@ -524,15 +688,36 @@ def _pump(proc: subprocess.Popen[str]) -> None:
 # (`unknown`) and every failure lands on it: never connected, connection dropped, unparseable
 # frame, library missing from the image, or the protocol renamed upstream.
 #
-# THE PROTOCOL IS UNVERSIONED AND INTERNAL. `/_next/webpack-hmr` keeps its name under Turbopack
-# (the default bundler in Next 16) and the frame verbs were identical across 16.2.10 and 16.3.1,
-# but none of that is a promise. Parsing is therefore defensive — unknown verbs and missing
-# fields are ignored rather than thrown — which on its own would make an upstream rename
-# INVISIBLE: we would quietly receive nothing forever while reporting a clean app. `_HMR_CANARY_S`
-# is what gives that teeth. It exploits the sync-on-connect property: a SUCCESSFUL connect that
-# produces no recognised frame within the window is reported as `unknown` with a `reason` the
-# control plane raises a pinned alarm on. That is the one signal that says the protocol moved.
-_HMR_PATH = "/_next/webpack-hmr"
+# THE PROTOCOL IS UNVERSIONED AND INTERNAL, AND IT HAS ALREADY MOVED ONCE UNDER US.
+#
+# This constant read `/_next/webpack-hmr` until 2026-08-26, with a comment asserting that the
+# name survived the move to Turbopack. It did not. Measured against the pinned `next@16.3.1`:
+# `_next/webpack-hmr` appears in exactly one file in the published package — a Next 12 upgrade
+# guide — while the live endpoint registered by `server/lib/router-server.js` and dialled by
+# `client/dev/hot-reloader/app/web-socket.js` is `/_next/hmr`. A handshake against the old path
+# times out; a handshake against the new one returns 101 and the first `sync` frame arrives in
+# milliseconds. So the compile signal had been dark for the whole Next 16 line: the consumer
+# never connected, every attempt landed in the `disconnected` arm, and compile state sat at
+# `unknown` forever. Nothing in the logs said so, which is precisely the silence the canary
+# below exists to break — and the canary could not fire either, because it only arms AFTER a
+# SUCCESSFUL connect.
+#
+# THE LESSON, recorded here rather than in a commit message: a connect that never succeeds is
+# invisible to a drift alarm that arms on connect. If this path is ever wrong again the symptom
+# is silence, not an error, so the test that covers it must assert a REAL connection is made —
+# not merely that the constant has some value.
+#
+# Parsing stays defensive — unknown verbs and missing fields are ignored rather than thrown —
+# which on its own would make an upstream RENAME invisible: we would quietly receive nothing
+# forever while reporting a clean app. `_HMR_CANARY_S` is what gives that teeth. It exploits the
+# sync-on-connect property: a SUCCESSFUL connect that produces no recognised frame within the
+# window is reported as `unknown` with a `reason` the control plane raises a pinned alarm on.
+# That is the one signal that says the protocol moved.
+#
+# The frames observed on 16.3.1 carry their verb in `type` (`turbopack-connected`, `sync`,
+# `isrManifest`) rather than in `action`; `_derive_compile` already reads whichever is present,
+# which is why only the PATH needed correcting and not the vocabulary.
+_HMR_PATH = "/_next/hmr"
 
 _HMR_CONNECT_TIMEOUT = 3.0
 """Connect budget for one attempt at the HMR socket. Loopback: a refusal (nothing listening
@@ -690,8 +875,18 @@ def _consume_hmr() -> None:
         # import would have taken the whole container down for a diagnostic feature.
         _forget_compile("consumer_unavailable")
         return
-    url = f"ws://127.0.0.1:{_DEV_PORT}{_HMR_PATH}"
+    # THE SOCKET LIVES BEHIND THE BASE PATH TOO. `basePath` gates every route Next serves, the
+    # dev endpoints included, so an app at `/a/sbx-<key>` answers the handshake only at
+    # `/a/sbx-<key>/_next/hmr`.
     while True:
+        # COMPOSED INSIDE THE LOOP, not once above it. This thread starts at most once per
+        # container life and reconnects forever, so a URL captured before the loop is captured
+        # for good — and `_base_path()` reads `os.environ` at call time precisely because a
+        # restore re-injects the environment underneath a running supervisor. Hoisting this line
+        # out of the loop would pin the consumer to a stale path with no symptom: the canary
+        # only arms AFTER a successful connect, so a connect that never succeeds is invisible to
+        # it. That is the same shape as the `/_next/webpack-hmr` defect recorded above.
+        url = f"ws://127.0.0.1:{_DEV_PORT}{_base_path()}{_HMR_PATH}"
         try:
             with connect(url, open_timeout=_HMR_CONNECT_TIMEOUT, close_timeout=1.0) as ws:
                 with _Compile.lock:

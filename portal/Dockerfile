@@ -13,7 +13,15 @@
 #   BACKEND_URL=http://backend:8000  # the FastAPI backend (see backend/Dockerfile)
 #   DNS_RESOLVER (REQUIRED)          # request-time DNS for the proxy: 168.63.129.16 on
 #                                    # Azure App Service, 127.0.0.11 under local Docker
-#   APPS_DOMAIN (REQUIRED)           # CSP frame-src apps domain (C8 §2)
+#   APPS_DOMAIN (REQUIRED)           # the Container Apps environment's OWN default domain.
+#                                    # Composes the apps router's upstream
+#                                    # (sbx-<key>.$APPS_DOMAIN). NOT the public apps hostname.
+#   APPS_HOSTNAME (REQUIRED)         # the PUBLIC hostname generated apps are served on, e.g.
+#                                    # citizenapps.bialairport.com. server_name of the apps
+#                                    # site + the origin the portal CSP may frame.
+#   PORTAL_ORIGIN (REQUIRED)         # the portal's own origin, e.g.
+#                                    # https://blrcitizen.bialairport.com. Link target on the
+#                                    # apps site's 404 page.
 
 # ── Stage 1: build the SPA (Node at BUILD time only) ─────────────────────────
 FROM node:24-trixie-slim AS build
@@ -45,15 +53,18 @@ FROM nginx:alpine-slim
 # or by nginx at runtime.
 #
 # nginx:alpine-slim runs envsubst over /etc/nginx/templates/*.template at start (writing
-# the result into /etc/nginx/conf.d/), so ${PORT}, ${BACKEND_URL}, ${DNS_RESOLVER} and
-# ${APPS_DOMAIN} (the CSP frame-src apps domain, C8 §2) are substituted from the environment
-# while nginx's own $host/$uri variables are left untouched.
+# the result into /etc/nginx/conf.d/), so ${PORT}, ${BACKEND_URL}, ${DNS_RESOLVER},
+# ${APPS_DOMAIN}, ${APPS_HOSTNAME} and ${PORTAL_ORIGIN} are substituted from the environment
+# while nginx's own $host/$uri variables are left untouched. envsubst is handed an explicit
+# list of the DEFINED environment variables, so `$1` in a map capture and `$app_host` in a
+# proxy_set_header survive it — only names that exist in the environment are replaced.
 COPY nginx.conf /etc/nginx/templates/default.conf.template
 COPY --from=build /app/dist /usr/share/nginx/html
 
-# Fail-first guard (KTD-3): APPS_DOMAIN and DNS_RESOLVER are REQUIRED deploy inputs with no
-# sensible defaults — this runs at start, before nginx's envsubst, and exits non-zero if
-# either is unset/empty (malformed CSP / dead request-time DNS otherwise). It is a shell
+# Fail-first guard (KTD-3): APPS_DOMAIN, APPS_HOSTNAME, PORTAL_ORIGIN and DNS_RESOLVER are
+# REQUIRED deploy inputs with no sensible defaults — this runs at start, before nginx's
+# envsubst, and exits non-zero if any is unset, empty, or SHAPED WRONG (a scheme, a `*.`
+# prefix, a port or a trailing slash all produce a config that loads and misroutes). It is a shell
 # artifact BUILT ON THE WINDOWS VM, so strip any CRLF and make it executable — the exact
 # `#!/bin/sh\r` → "no such file or directory" trap CLAUDE.local.md warns about.
 COPY docker-entrypoint.d/19-require-apps-domain.sh /docker-entrypoint.d/19-require-apps-domain.sh
@@ -71,10 +82,10 @@ RUN sed -i 's/\r$//' /etc/nginx/templates/default.conf.template \
     && sed -i 's/\r$//' /docker-entrypoint.d/19-require-apps-domain.sh \
     && chmod +x /docker-entrypoint.d/19-require-apps-domain.sh
 
-# NOTE: APPS_DOMAIN and DNS_RESOLVER have NO ENV defaults here (fail-first) — both are
-# deployment-specific (a Docker-correct DNS_RESOLVER default would be silently wrong on App
-# Service) and the guard above enforces their presence. PORT/BACKEND_URL keep their
-# container-network defaults.
+# NOTE: APPS_DOMAIN, APPS_HOSTNAME, PORTAL_ORIGIN and DNS_RESOLVER have NO ENV defaults here
+# (fail-first) — all are deployment-specific (a Docker-correct DNS_RESOLVER default would be
+# silently wrong on App Service) and the guard above enforces their presence and their shape.
+# PORT/BACKEND_URL keep their container-network defaults.
 ENV PORT=8080 \
     BACKEND_URL=http://backend:8000
 EXPOSE 8080

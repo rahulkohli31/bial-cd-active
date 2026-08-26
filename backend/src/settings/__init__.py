@@ -34,6 +34,7 @@ WHICH BLOCKS EACH ROLE READS
     ------------------   -------------------------   -------------------------
     ENVIRONMENT          REQUIRED (core)             REQUIRED (core)
     DATABASE_URL         REQUIRED (core)             REQUIRED (core)
+    APPS_BASE_URL        REQUIRED (core)             REQUIRED (core)
     AUTH__               REQUIRED                    --
     SUPERADMIN_EMAILS    REQUIRED                    --
     SUPPORT_CONTACT_EMAIL REQUIRED                   --

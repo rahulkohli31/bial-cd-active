@@ -1559,3 +1559,181 @@ def test_a_fresh_supervisor_reports_unknown_never_clean() -> None:
     assert body["state"] == "unknown"
     assert body["reason"] == "never_connected"
     assert sup._Compile.state == "unknown"
+
+
+@contextlib.contextmanager
+def _stub_http_server(asked: list[str], *, status: int = 200, body: str = "ok") -> Iterator[int]:
+    """A dev server stand-in that RECORDS THE REQUEST TARGET it was asked for.
+
+    Recording the target is the point. Every test in this section is about WHICH path was
+    requested, and a stub that only returned a status would pass just as well against a probe
+    still hard-coded to `/` — which is the exact defect being guarded against here.
+    """
+    payload = body.encode()
+
+    class _Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's own spelling
+            asked.append(self.path)
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_args: object) -> None:
+            pass  # silence per-request stderr noise
+
+    with _http_serving(_Handler) as port:
+        yield port
+
+
+# --- the assigned base path, and everything that has to follow it --------------------------
+#
+# The whole class of failure here is SILENT. A base path the child never sees, a probe left at
+# `/`, or a socket path that no longer exists all present as a preview that looks like it is
+# still compiling — never as an error. So every test below asserts on an OBSERVED effect (the
+# child's environment, the request target, a real connection) rather than on a constant's value.
+
+
+def test_the_base_path_reaches_the_child(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MUTATION CHECK: delete BIAL_BASE_PATH's row from `_INJECTED_ENV` and this fails.
+
+    Without a row the scrub drops the variable, `next dev` starts at the root, the router
+    forwards a prefixed path, and the preview shows a 404 while readiness still reports healthy.
+    """
+    monkeypatch.setenv("BIAL_BASE_PATH", "/a/sbx-1a2b3c4d5e6f70819a2b3c4d5e6f")
+    monkeypatch.setenv("BIAL_APPS_HOSTNAME", "citizenapps.bialairport.com")
+    env = _child_env()
+    assert env["BIAL_BASE_PATH"] == "/a/sbx-1a2b3c4d5e6f70819a2b3c4d5e6f"
+    assert env["BIAL_APPS_HOSTNAME"] == "citizenapps.bialairport.com"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "/",
+        "a/sbx-1a2b3c4d5e6f70819a2b3c4d5e6f",  # no leading slash
+        "/a/sbx-1a2b3c4d5e6f70819a2b3c4d5e6f/",  # trailing slash: Next 308s the slashed form
+        "/a/sbx-1A2B3C4D5E6F70819A2B3C4D5E6F",  # uppercase
+        "/a/sbx-1a2b3c4d5e6f70819a2b3c4d5e",  # 26 hex
+        "/a/dev-1a2b3c4d5e6f70819a2b3c4d5e6f",  # wrong prefix
+        "/a/sbx-1a2b3c4d5e6f70819a2b3c4d5e6f/../etc",
+        "/a/sbx-1a2b3c4d5e6f70819a2b3c4d5e6f\r\nX-Injected: 1",
+    ],
+)
+def test_a_malformed_base_path_is_treated_as_absent(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """This value becomes BOTH a config key `next dev` reads AND a request target handed to
+    `http.client`, so a malformed one is a silent 404 in the first case and a header-injection
+    attempt in the second. Degrading to "no base path" puts the app back at the root, which is
+    a state the whole system already handles."""
+    monkeypatch.setenv("BIAL_BASE_PATH", raw)
+    assert sup._base_path() == ""
+
+
+def test_the_readiness_probe_asks_for_the_base_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ASM1. The probe's fail-open counts ANY response as serving, a 404 included — so under a
+    base path a probe left at `/` never FAILS, it just stops meaning anything. "Ready" would
+    decay to "the dev server can render its own 404", which is true before the citizen's first
+    route compiles and true forever for an app that never compiles."""
+    base = "/a/sbx-1a2b3c4d5e6f70819a2b3c4d5e6f"
+    monkeypatch.setenv("BIAL_BASE_PATH", base)
+    asked: list[str] = []
+    with _stub_http_server(asked, status=200) as port:
+        assert sup._dev_port_serving(port=port, timeout=2.0) is True
+    assert asked == [base]
+
+
+def test_with_no_base_path_the_probe_still_asks_for_the_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The local dev loop and every pre-existing test must be unchanged."""
+    monkeypatch.delenv("BIAL_BASE_PATH", raising=False)
+    asked: list[str] = []
+    with _stub_http_server(asked, status=200) as port:
+        assert sup._dev_port_serving(port=port, timeout=2.0) is True
+    assert asked == ["/"]
+
+
+def test_the_probe_still_fails_open_on_an_error_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE INVARIANT THAT MUST NOT MOVE. A 500-ing dev server is still serving, and its
+    brokenness is the app's business. Without this fail-open a compile error would wedge `ready`
+    False forever — and a false not-ready reaches a recovery path that silently rolls the
+    workspace back to the last Save. This change widened WHAT is asked; it must never have
+    touched WHETHER a non-answer is tolerated."""
+    monkeypatch.setenv("BIAL_BASE_PATH", "/a/sbx-1a2b3c4d5e6f70819a2b3c4d5e6f")
+    for status in (404, 500):
+        asked: list[str] = []
+        with _stub_http_server(asked, status=status) as port:
+            assert sup._dev_port_serving(port=port, timeout=2.0) is True
+
+
+def test_the_status_helper_reports_what_the_predicate_hides() -> None:
+    """`_dev_port_serving` deliberately cannot tell a 404 from a 200. Exactly one caller needs
+    to — the tamper detector — which is why the status is exposed separately rather than by
+    weakening the predicate."""
+    asked: list[str] = []
+    with _stub_http_server(asked, status=404) as port:
+        assert sup._dev_port_status(port=port, timeout=2.0, path="/") == 404
+
+
+# --- the base path the app is ACTUALLY serving under ----------------------------------------
+
+
+def test_a_removed_base_path_names_itself_as_config_tampered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE MUTANT THAT MUST FAIL. Without this signal a removed `basePath` presents to the
+    control plane as a preview that 404s, self-heal converts that into "make sure app/page.tsx
+    exists", and the model burns metered tokens repairing a file that was never wrong.
+
+    Next generates every `/_next/…` URL under whatever `basePath` the config ACTUALLY has, so
+    the served value names itself — even from the root's own 404 page.
+    """
+    monkeypatch.setenv("BIAL_BASE_PATH", "/a/sbx-1a2b3c4d5e6f70819a2b3c4d5e6f")
+    body = '<html><head><script src="/_next/static/chunks/main.js"></script></head></html>'
+    with _stub_http_server([], status=200, body=body) as port:
+        monkeypatch.setattr(sup, "_DEV_PORT", port)
+        sup._detect_base_path_tampering()
+    assert sup._Compile.reason == "config_tampered"
+    assert sup._Compile.state == "unknown"
+
+
+def test_the_correct_base_path_raises_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    base = "/a/sbx-1a2b3c4d5e6f70819a2b3c4d5e6f"
+    monkeypatch.setenv("BIAL_BASE_PATH", base)
+    sup._publish_locked("clean", (), None)
+    body = f'<html><head><script src="{base}/_next/static/chunks/main.js"></script></head></html>'
+    with _stub_http_server([], status=404, body=body) as port:
+        monkeypatch.setattr(sup, "_DEV_PORT", port)
+        sup._detect_base_path_tampering()
+    assert sup._Compile.reason is None
+    assert sup._Compile.state == "clean"
+
+
+def test_an_unreadable_root_is_not_reported_as_tampering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An app that replaces the not-found page with plain text carries no framework asset URL to
+    read. Unknown must stay unknown: a detector that guessed would accuse a working app."""
+    monkeypatch.setenv("BIAL_BASE_PATH", "/a/sbx-1a2b3c4d5e6f70819a2b3c4d5e6f")
+    sup._publish_locked("clean", (), None)
+    with _stub_http_server([], status=404, body="nothing here") as port:
+        monkeypatch.setattr(sup, "_DEV_PORT", port)
+        sup._detect_base_path_tampering()
+    assert sup._Compile.state == "clean"
+
+
+def test_no_assigned_base_path_means_nothing_to_detect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("BIAL_BASE_PATH", raising=False)
+    sup._publish_locked("clean", (), None)
+    sup._detect_base_path_tampering()
+    assert sup._Compile.state == "clean"
