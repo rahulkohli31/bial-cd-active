@@ -335,6 +335,35 @@ describe('MarketplacePage', () => {
     await waitFor(() => expect(lastCall()).toMatchObject({ page: 1 }))
   })
 
+  it('recovers when the catalog empties COMPLETELY under a reader on a later page', async () => {
+    // The worst case, and the one the recovery effect used to miss: gated on `total > 0`, an
+    // emptied catalog (`total: 0`, `totalPages` clamped to 1) on page 2+ meant the effect
+    // never fired, the nav unmounted, and the copy promised "taking you back" while nothing
+    // took anyone anywhere. `page > totalPages` alone is the correct trigger.
+    //
+    // Mutation receipt: re-add `total > 0` to the effect's condition and this goes red —
+    // `page` stays at 2 and the request for page 1 never happens.
+    h.listMarketplace.mockResolvedValue(page({ pageSize: 10, total: 25, totalPages: 3 }))
+    renderPage()
+    await screen.findByTestId('marketplace-page-2', {}, { timeout: 5000 })
+
+    // Everything is unpublished while the reader sits on page 2.
+    h.listMarketplace
+      .mockResolvedValueOnce(page({ items: [], page: 2, pageSize: 10, total: 0, totalPages: 1 }))
+      .mockResolvedValue(page({ items: [], page: 1, pageSize: 10, total: 0, totalPages: 1 }))
+
+    fireEvent.click(screen.getByTestId('marketplace-page-2'))
+    await waitFor(() => expect(lastCall()).toMatchObject({ page: 2 }))
+
+    // The effect snaps back rather than stranding them behind an unmounted nav.
+    await waitFor(() => expect(lastCall()).toMatchObject({ page: 1 }))
+    await waitFor(() =>
+      expect(screen.getByTestId('marketplace-empty').textContent).toMatch(
+        /nothing has been published/i,
+      ),
+    )
+  })
+
   it('does not blame the page when page 1 comes back empty with a stale total', async () => {
     // The race agc129 named: `total` and the rows are two separate reads under READ
     // COMMITTED, so an unpublish landing between them returns zero items on PAGE 1 with a

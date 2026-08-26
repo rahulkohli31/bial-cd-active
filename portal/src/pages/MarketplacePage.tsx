@@ -227,8 +227,15 @@ export default function MarketplacePage(): React.JSX.Element {
   // there is nothing to page from, and if the catalog has shrunk below one page the whole
   // control unmounts, stranding `page` at a number nothing can reach. Snap back to the last
   // real page instead. Runs at most once — after it fires, `page <= totalPages` holds.
+  //
+  // DELIBERATELY NOT gated on `total > 0`. It was, and that left the worst case unhandled:
+  // if the catalog empties COMPLETELY while the reader is on page 2+, `totalPages` clamps to
+  // 1, so the copy below promises "taking you back" while the effect that would do it never
+  // fires and the nav has already unmounted — a stranded page under a message that never
+  // comes true. `page > totalPages` alone is the correct trigger; an empty catalog on page 1
+  // does not satisfy it, so the ordinary empty state is unaffected.
   useEffect(() => {
-    if (!loading && !error && items.length === 0 && total > 0 && page > totalPages) {
+    if (!loading && !error && items.length === 0 && page > totalPages) {
       setPage(totalPages)
     }
   }, [loading, error, items.length, total, page, totalPages])

@@ -56,8 +56,16 @@ def upgrade() -> None:
     # holds even an AccessShareLock when the ALTER queues, everything behind it stalls FIFO
     # rather than failing fast. Production alembic runs OUT OF BAND here, so the operator who
     # most needs that protection is the one least likely to be reading this file at the time
-    # — hence SET rather than recommended (#147 round 3). Alembic already wraps the revision
-    # in a transaction, so `SET LOCAL` scopes it to this migration and reverts automatically.
+    # — hence SET rather than recommended (#147 round 3).
+    #
+    # AND IT IS RESET AT THE END OF `upgrade()`, which is not optional. `SET LOCAL` is scoped
+    # to the TRANSACTION, not to the revision, and `alembic/env.py` leaves
+    # `transaction_per_migration` at its default of False — so one `alembic upgrade` runs
+    # every pending revision inside a SINGLE transaction. Without the reset below this
+    # timeout would leak into every migration applied after this one in the same run, and a
+    # later revision that legitimately waits more than 5s on a lock would abort with
+    # `lock_not_available` and roll back the WHOLE upgrade. An earlier version of this
+    # comment claimed the scoping was automatic; it is not.
     #
     # The two-arg `to_tsvector('english', ...)` is required, not stylistic: the one-arg form
     # is rejected outright with `ERROR: generation expression is not immutable`.
@@ -90,6 +98,9 @@ def upgrade() -> None:
         WHERE unpublished_at IS NOT NULL
         """
     )
+
+    # Hand the rest of the upgrade back its original lock behaviour — see the note above.
+    op.execute("SET LOCAL lock_timeout = DEFAULT")
 
 
 def downgrade() -> None:
