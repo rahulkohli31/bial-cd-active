@@ -1,0 +1,8 @@
+# The stand-in app container for the Docker-backed router tests. Built rather than
+# bind-mounted: a build context has no host path semantics, so this works identically on the
+# Linux/macOS dev loop and on the Windows VM that produces the shipped artifact.
+FROM python:3.13-alpine
+RUN pip install --no-cache-dir cryptography
+COPY tests/stub_upstream.py /stub_upstream.py
+EXPOSE 443
+CMD ["python", "/stub_upstream.py"]

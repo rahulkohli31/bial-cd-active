@@ -1,0 +1,19 @@
+# The portal edge under test: THE REAL nginx.conf and THE REAL boot guard, on the same base
+# image the shipped artifact uses.
+#
+# It deliberately skips stage 1 of portal/Dockerfile (npm ci + vite build). These tests assert
+# routing, not the SPA, and a Node build would add minutes to every run for a bundle no
+# assertion reads. Everything the tests DO exercise — the config, the guard, the entrypoint
+# ordering, envsubst — is byte-identical to production.
+FROM nginx:alpine-slim
+COPY nginx.conf /etc/nginx/templates/default.conf.template
+COPY docker-entrypoint.d/19-require-apps-domain.sh /docker-entrypoint.d/19-require-apps-domain.sh
+# Same CR strip as the shipped image, for the same Windows-checkout reason.
+RUN sed -i 's/\r$//' /etc/nginx/templates/default.conf.template \
+    && sed -i 's/\r$//' /docker-entrypoint.d/19-require-apps-domain.sh \
+    && chmod +x /docker-entrypoint.d/19-require-apps-domain.sh
+# A stand-in for the SPA, so the portal site's regression assertions have something to serve.
+RUN mkdir -p /usr/share/nginx/html/assets \
+    && printf 'portal-index\n' > /usr/share/nginx/html/index.html \
+    && printf 'portal-asset\n' > /usr/share/nginx/html/assets/app.js
+EXPOSE 8080
