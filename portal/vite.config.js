@@ -38,10 +38,21 @@ export default defineConfig({
     // Dev parity for the portal's document CSP (prod sets this via nginx envsubst; C8 §2, KTD-3).
     // A concrete, non-empty value so a dev-server load exercises the SAME framing constraint the
     // built SPA ships with — only framing is constrained (no default-src/script-src/connect-src),
-    // so vite's HMR client, module graph, and the API proxy below are untouched. The wildcard
-    // covers any per-session ACA sandbox FQDN the cockpit frames.
+    // so vite's HMR client, module graph, and the API proxy below are untouched.
+    //
+    // THIS IS THE FOURTH COPY OF THE FRAMING POLICY and the only one nginx does not emit, which is
+    // exactly why it gets forgotten: it has no envsubst variable to follow, so it silently keeps
+    // whatever host it was born with while the edge moves on. Left behind, a dev-server load
+    // refuses to frame the preview once its address moves to the shared apps hostname, with
+    // nothing but a console message and no server-side trace at all — the failure looks like a
+    // broken preview, not like a stale config. Additive for the same reason nginx.conf is: the
+    // ACA wildcard covers the per-session sandbox FQDN the cockpit is still handed today, and the
+    // apps hostname covers where it is going. Literal rather than an env var — the deployed value
+    // is a fixed BIAL name, and a dev-only knob with a fallback would just be a second thing to
+    // forget. It is pinned against nginx.conf by src/__tests__/nginx-apps-routing.test.ts.
     headers: {
-      'Content-Security-Policy': "frame-src 'self' https://*.azurecontainerapps.io; frame-ancestors 'self'",
+      'Content-Security-Policy':
+        "frame-src 'self' https://*.azurecontainerapps.io https://citizenapps.bialairport.com; frame-ancestors 'self'",
     },
     proxy: {
       // Entra ID auth is served by the FastAPI control-plane (:8000), NOT Express.

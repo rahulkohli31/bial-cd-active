@@ -7,16 +7,20 @@
 #     `pub-<key>.${APPS_DOMAIN}` is the container app's real FQDN, so a wrong value here is not
 #     a cosmetic error: EVERY generated app becomes unreachable while the portal itself looks
 #     perfectly healthy. This used to be a CSP-only input, which is why its old failure text
-#     talked about frame-src; that is no longer its main job. It is the Container Apps
-#     environment's OWN default domain (`<env-id>.<region>.azurecontainerapps.io`) and it must
-#     NOT be changed to the public apps hostname — those are different names for different hops,
-#     and swapping them produces an upstream that does not resolve.
-#   - APPS_HOSTNAME is the PUBLIC name a BIAL employee's browser uses, and the `server_name` of
-#     the apps site. Missing -> the apps `server` block gets an empty server_name and nginx
-#     refuses to load; malformed -> the block never matches the Host the gateway forwards, so
-#     every app request falls through to the portal site and gets the SPA's index.html back
-#     instead of the app. That failure looks like "the app renders the portal", not like a
-#     routing error.
+#     talked about frame-src; that is no longer its main job — it still supplies the wildcard arm
+#     of the portal's frame-src, but only until the preview URL itself moves to APPS_HOSTNAME, so
+#     do not reason about this value from the CSP. It is the Container Apps environment's OWN
+#     default domain (`<env-id>.<region>.azurecontainerapps.io`) and it must NOT be changed to the
+#     public apps hostname — those are different names for different hops, and swapping them
+#     produces an upstream that does not resolve.
+#   - APPS_HOSTNAME is the PUBLIC name a BIAL employee's browser uses, the `server_name` of the
+#     apps site, and — because every app now shares that one name — the single origin the portal's
+#     frame-src permits for a framed app. Missing -> the apps `server` block gets an empty
+#     server_name and nginx refuses to load; malformed -> the block never matches the Host the
+#     gateway forwards, so every app request falls through to the portal site and gets the SPA's
+#     index.html back instead of the app, AND the emitted frame-src names an origin no app is
+#     served from, so the preview pane goes blank with only a console message. That failure looks
+#     like "the app renders the portal", not like a routing error.
 #   - PORTAL_ORIGIN is the link target on the apps site's 404 page — the way back for an
 #     employee who followed a stale link. Missing -> envsubst emits `href=""`, a dead button.
 #   - DNS_RESOLVER feeds `resolver ${DNS_RESOLVER}` so nginx re-resolves upstreams at request

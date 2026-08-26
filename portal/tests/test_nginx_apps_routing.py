@@ -19,8 +19,12 @@ from _router import (
     OTHER_SBX_KEY,
     PORTAL_ORIGIN,
     PUB_KEY,
+    ROUTER_IMAGE,
     SBX_KEY,
     Router,
+    _free_port,
+    _run,
+    _wait_for_router,
     boot_router,
     requires_docker,
 )
@@ -459,3 +463,66 @@ def test_the_good_environment_actually_boots(images: None, docker_network: str) 
     gets through. Without this, a guard that rejected everything would pass all of them."""
     proc = boot_router(_GOOD_ENV, network=docker_network)
     assert proc.stderr == b"__STAYED_UP__", proc.stderr.decode()[-2000:]
+
+
+# --------------------------------------------------------------------------------------
+# U2 — the operator's only way to tell the two 404s apart
+# --------------------------------------------------------------------------------------
+
+
+def test_the_access_log_separates_no_such_app_from_a_dead_app(
+    images: None, docker_network: str
+) -> None:
+    """The router answers a flat 404 for BOTH an unknown key and a live app that stopped
+    listening, because naming the upstream to a browser would disclose the environment's naming
+    convention. That makes the log the ONLY place an operator can tell "the link is stale" from
+    "the app crashed" — and DEPLOYMENT-FACTS.md now sends them here to do it, so it is pinned.
+
+    The discriminating field is `$upstream_addr`, NOT `$upstream_status`. That is measured, and
+    it is the opposite of the intuitive reading: a refused connect reports `upstream_status=502`
+    even though nothing ever answered, so only the presence of a resolved address separates
+    them.
+    """
+    import subprocess
+    import uuid as _uuid
+
+    ghost = "sbx-" + "deadbeefdeadbeefdeadbeefdead"  # never given a DNS alias
+    listening_elsewhere = "sbx-" + "1111111111111111111111111111"
+
+    # A container that RESOLVES but is not serving on 443 — "the app died", not "no such app".
+    dead = f"dead-{_uuid.uuid4().hex[:8]}"
+    _run(
+        ["docker", "run", "-d", "--name", dead, "--network", docker_network,
+         "--network-alias", f"{listening_elsewhere}.{APPS_DOMAIN}", "nginx:alpine-slim"],
+        timeout=120,
+    )  # fmt: skip
+    port = _free_port()
+    router = f"router-log-{_uuid.uuid4().hex[:8]}"
+    _run(
+        ["docker", "run", "-d", "--name", router, "--network", docker_network,
+         "-p", f"127.0.0.1:{port}:8080",
+         "-e", "PORT=8080", "-e", "DNS_RESOLVER=127.0.0.11",
+         "-e", "BACKEND_URL=http://backend-not-used:8000",
+         "-e", f"APPS_DOMAIN={APPS_DOMAIN}", "-e", f"APPS_HOSTNAME={APPS_HOSTNAME}",
+         "-e", f"PORTAL_ORIGIN={PORTAL_ORIGIN}", ROUTER_IMAGE],
+        timeout=120,
+    )  # fmt: skip
+    try:
+        r = Router(port=port, container=router)
+        _wait_for_router(r, router)
+        assert r.request(f"/a/{ghost}/")[0] == 404
+        assert r.request(f"/a/{listening_elsewhere}/")[0] == 404
+        logs = subprocess.run(
+            ["docker", "logs", router], capture_output=True, timeout=60
+        ).stdout.decode()
+    finally:
+        _run(["docker", "rm", "-f", router, dead], timeout=90)
+
+    ghost_line = next(ln for ln in logs.splitlines() if ghost in ln)
+    dead_line = next(ln for ln in logs.splitlines() if listening_elsewhere in ln)
+    assert "upstream=-" in ghost_line, ghost_line
+    assert "upstream=-" not in dead_line, dead_line
+    assert ":443" in dead_line, dead_line
+    # And the field that looks like it should discriminate does not — pinned so nobody
+    # "simplifies" the log format down to it.
+    assert "upstream_status=502" in dead_line, dead_line

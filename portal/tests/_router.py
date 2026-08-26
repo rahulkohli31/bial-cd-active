@@ -20,6 +20,7 @@ from __future__ import annotations
 import http.client
 import socket
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -177,3 +178,15 @@ def boot_router(env: dict[str, str], *, network: str) -> subprocess.CompletedPro
         return subprocess.CompletedProcess(args, 0, b"", b"__STAYED_UP__")
     finally:
         _run(["docker", "rm", "-f", name], timeout=60)
+
+
+def _wait_for_router(r: Router, container: str, timeout: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            r.request("/", host="unmatched.invalid")
+            return
+        except OSError:
+            time.sleep(0.4)
+    logs = _run(["docker", "logs", container], timeout=30)
+    raise RuntimeError(f"router never came up:\n{logs.stderr.decode()[-4000:]}")
