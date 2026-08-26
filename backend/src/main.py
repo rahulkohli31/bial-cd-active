@@ -34,6 +34,7 @@ from typing import Final
 
 import structlog
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
 
 from src.config import settings
@@ -195,6 +196,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await aclose_image_builder()
 
 
+_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+"""The methods a cross-origin caller could use to change something. `GET`/`HEAD` are
+excluded deliberately: they are not supposed to mutate, and refusing them would break
+ordinary cross-origin reads the CORS layer already governs."""
+
+
 def create_app() -> FastAPI:
     from src.api.v1.router import v1_router
     from src.core.errors import register_exception_handlers
@@ -224,6 +231,45 @@ def create_app() -> FastAPI:
     # sites that assume a single replica (with the reaper's live-session shield and the
     # manager's double-session guard); scaling out needs a shared store for all three.
     install_rate_limiting(app)
+
+    # CROSS-ORIGIN WRITE GUARD — the cost of moving generated apps onto a BIAL hostname.
+    #
+    # Generated apps used to live on `*.azurecontainerapps.io`, a different registrable domain
+    # from the portal's, so they were CROSS-SITE to it and `SameSite=Lax` withheld the session
+    # cookie from anything they sent here. Serving them from `citizenapps.bialairport.com` makes
+    # them SAME-SITE with `blrcitizen.bialairport.com`, and Lax stops being a barrier: a POST
+    # from app code now carries the viewer's session. The app's code is written by a model from
+    # a citizen's prompt — it is untrusted by construction.
+    #
+    # CSRF protection here is opt-in per route (`RequireCsrf`), and the admin, attachment and
+    # feedback routers do not declare it. Rather than change that design late, this closes the
+    # newly-opened door directly: a mutating request that announces an Origin which is not the
+    # portal's is refused before it reaches a route.
+    #
+    # WHY AN ABSENT ORIGIN IS ALLOWED. Browsers attach `Origin` to every mutating request,
+    # cross-site form posts included, so absence means a non-browser caller — curl, a health
+    # check, a server-to-server call — which is not the threat and which no cookie authenticates
+    # anyway. Blocking it would break every scripted client for no gain.
+    #
+    # Middleware, not a dependency: it must cover routes that never declared one, which is the
+    # entire point. Declared BEFORE `security_headers` so that one stays outermost and the 403
+    # still carries the standard headers.
+    @app.middleware("http")
+    async def refuse_cross_origin_writes(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        origin = request.headers.get("origin")
+        if request.method in _MUTATING_METHODS and origin and origin != settings.FRONTEND_URL:
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": {
+                        "code": "cross_origin_write_refused",
+                        "detail": "This request came from another origin and was refused.",
+                    }
+                },
+            )
+        return await call_next(request)
 
     @app.middleware("http")
     async def security_headers(
