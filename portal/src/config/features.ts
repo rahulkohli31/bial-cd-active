@@ -22,5 +22,13 @@
  * (DECK_ATTACHMENTS_ENABLED env + a reachable GOTENBERG_URL) and rejects .pptx
  * cleanly when off. Enabling the feature means flipping BOTH this flag and the
  * server env — that pair is the whole "turn it on".
+ *
+ * OFF, because ON was only ever half the pair (#157 B2). The server gate is not
+ * enabled, so .pptx appeared in the picker and staged a slide chip in the composer,
+ * and then Send failed every time with "PowerPoint attachments aren't enabled" —
+ * a capability offered and refused at the last step. Turning this off cannot cost
+ * anyone a working capability: the client-side wire strip in `attachmentStore`
+ * makes decks a no-op even where GOTENBERG_URL is set. Flip both together to
+ * actually ship the feature.
  */
-export const DECK_ATTACHMENTS_ENABLED = true
+export const DECK_ATTACHMENTS_ENABLED = false

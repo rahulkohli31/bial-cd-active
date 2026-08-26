@@ -4,9 +4,10 @@
  * What this pins:
  *  - the shared ModeSwitcher (F5/U6) renders with PLAN as the default;
  *  - every submit MINTS A FRESH conversation at /chat/{uuid}?projectId=&kind=builder,
- *    carrying { prompt, mode, theme, pendingAttachments } — the canonical-thread resolve
- *    is gone, and so is the per-mode send label (the action is mode-neutral);
- *  - the theme selector still offers its four themes;
+ *    carrying { prompt, mode, pendingAttachments } — the canonical-thread resolve is gone,
+ *    and so is the per-mode send label (the action is mode-neutral). `theme` left this
+ *    payload with the Select Theme control in #157 B1: nothing downstream ever read it;
+ *  - that theme selector is GONE, and its absence is pinned below;
  *  - NO generic idea-starter cards render inside a dedicated project (F6);
  *  - a blocked prompt opens the guardrail modal instead of navigating.
  */
@@ -73,22 +74,22 @@ describe('ProjectBuilder', () => {
     // The compact in-composer switcher shows the sticky default, Plan (the plan's lock).
     expect(screen.getByRole('button', { name: /Mode: Plan/i })).toBeTruthy()
 
-    expect(screen.getByRole('button', { name: /Bangalore Airport Theme/i })).toBeTruthy()
     expect(screen.getByRole('button', { name: /Upload File/i })).toBeTruthy()
     const start = screen.getByRole('button', { name: /Start Chat/i })
     expect(start.disabled).toBe(true) // disabled until typed
   })
 
-  it('opens the theme selector to the four themes and updates the trigger on choose', () => {
+  it('offers NO theme selector — it changed nothing downstream (#157 B1)', () => {
     renderBuilder()
 
-    fireEvent.click(screen.getByRole('button', { name: /Bangalore Airport Theme/i }))
-    expect(screen.getByText('App Style (iOS/Android)')).toBeTruthy()
-    expect(screen.getByText('Dashboard / Analytics')).toBeTruthy()
-    expect(screen.getByText('Kiosk / Public Display')).toBeTruthy()
-
-    fireEvent.click(screen.getByText('Kiosk / Public Display'))
-    expect(screen.getByRole('button', { name: /Kiosk \/ Public Display/i })).toBeTruthy()
+    // Kept as an ABSENCE test rather than deleted outright: the control looked entirely
+    // functional (it updated its own pill and rode into `conversation.context`), which is
+    // exactly why it survived this long. Pinning its absence means a future re-add has to
+    // be a deliberate act with a real consumer, not an accident.
+    expect(screen.queryByRole('button', { name: /Bangalore Airport Theme/i })).toBeNull()
+    expect(screen.queryByText('App Style (iOS/Android)')).toBeNull()
+    expect(screen.queryByText('Dashboard / Analytics')).toBeNull()
+    expect(screen.queryByText('Kiosk / Public Display')).toBeNull()
   })
 
   it('renders NO generic idea-starter cards inside a dedicated project (F6)', () => {
@@ -106,7 +107,7 @@ describe('ProjectBuilder', () => {
     expect(screen.getByRole('button', { name: /Start Chat/i }).disabled).toBe(false)
   })
 
-  it('a submit mints a FRESH builder chat carrying { prompt, mode, theme, pendingAttachments }', async () => {
+  it('a submit mints a FRESH builder chat carrying { prompt, mode, pendingAttachments }', async () => {
     renderBuilder()
 
     const textarea = screen.getByPlaceholderText(/we.ll shape the plan together/i)
@@ -121,7 +122,8 @@ describe('ProjectBuilder', () => {
     const state = JSON.parse(screen.getByTestId('chat-state').textContent)
     expect(state.prompt).toBe('a gate tracker')
     expect(state.mode).toBe('plan')
-    expect(state.theme).toBe('bial')
+    // The key is gone from the payload entirely, not merely defaulted.
+    expect(state.theme).toBeUndefined()
     expect(state.pendingAttachments).toEqual([])
   })
 

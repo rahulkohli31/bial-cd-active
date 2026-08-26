@@ -631,7 +631,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     // in a shared link, so a bookmarked `/chat/{id}?kind=…` still asks the server for the truth.
     navigate(
       `/chat/${uuidv7()}?projectId=${encodeURIComponent(projectId)}&kind=builder`,
-      { state: { prompt: builderPrompt, mode: 'plan', theme: 'bial', uploadedFiles: [], freshlyMinted: true } },
+      { state: { prompt: builderPrompt, mode: 'plan', uploadedFiles: [], freshlyMinted: true } },
     )
   }, [builderPrompt, navigate, projectId])
 
