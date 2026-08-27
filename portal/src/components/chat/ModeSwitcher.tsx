@@ -39,7 +39,11 @@ export interface ModeSwitcherProps {
   composerRef?: React.RefObject<HTMLTextAreaElement | null>
 }
 
-const MODES: ReadonlyArray<{
+/** The three modes, exported as the single source of truth for what they are CALLED.
+ *  The Help FAQ describes them in prose, and prose drifts; HelpPage.test.tsx reconciles
+ *  that answer against this list so adding a mode fails a test instead of quietly
+ *  leaving the FAQ describing two of three (#157 review). */
+export const MODES: ReadonlyArray<{
   value: ConversationMode
   label: string
   description: string

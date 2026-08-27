@@ -3,6 +3,16 @@ import { ChevronDown, CheckCircle, XCircle } from 'lucide-react'
 import Navbar from '../components/layout/Navbar'
 import { DECK_ATTACHMENTS_ENABLED } from '../config/features'
 
+// The one support address this page states, rather than the two hardcoded copies it
+// carried (each under its own "TODO: confirm support address"). The CONFIGURED address
+// is `ApiSettings.SUPPORT_CONTACT_EMAIL`, but it is backend-only: it reaches a citizen
+// solely inside the server-rendered at-limit sentence that BuildProgress turns into a
+// mailto. No endpoint returns it, and the portal reads no VITE_* vars, so this page
+// cannot read it without the config endpoint filed under #157 B3. Until then a single
+// constant is the honest shape: one place to fix when the address is confirmed, instead
+// of two that can drift apart — which is the trap B3 removed one level down.
+const SUPPORT_EMAIL = 'citizen-developer-support@bialairport.com'
+
 const EXAMPLE_PROMPTS = [
   {
     level: 'Simple',
@@ -44,7 +54,12 @@ const DONTS = [
   'Expect a perfect app on the first prompt',
 ]
 
-const FAQS = [
+/** Exported for HelpPage.test.tsx. Asserting on the DATA rather than a render is
+ *  deliberate: AccordionItem renders its answer as `{open && ...}`, so a collapsed
+ *  accordion puts no answer text in the DOM at all and every "this false claim is
+ *  gone" assertion would pass vacuously. That exact trap cost a round in the #157
+ *  browser harness; the data cannot go vacuous the same way. */
+export const FAQS = [
   {
     q: 'What is the BIAL Citizen Developer portal?',
     a: 'It is an internal platform that empowers Bangalore International Airport staff to build custom operational tools and digital solutions without writing code. You describe what you need in plain English, and the AI generates a working application for terminal operations.',
@@ -55,7 +70,7 @@ const FAQS = [
   },
   {
     q: 'What happens when I click "Start Chat"?',
-    a: 'It opens a chat — it does not start a build. The composer has three modes and defaults to Plan: Ask answers questions about your app and changes nothing, Plan works out an approach with you and waits for your confirmation, and Write actually builds the changes into your app. Only Write starts the multi-minute build, and from Plan you get there by approving the plan first.',
+    a: 'That depends on the mode you picked. The composer has three modes and defaults to Plan. In Ask, it opens a chat that answers questions about your app and changes nothing. In Plan, it works out an approach with you and waits for your confirmation before anything is built. In Write, it starts the multi-minute build straight away, with no plan step — so from Plan you reach a build by approving the plan first, and from Write you are already in one. Changes stay in your workspace until you save them.',
   },
   {
     q: 'Can I edit the app after it is generated?',
@@ -73,12 +88,11 @@ const FAQS = [
   },
   {
     q: 'Is there a limit to how many apps I can build?',
-    a: 'There is no limit on how many apps you can create. There is a daily limit on how much AI work you can use across all of them: the token counter in the header shows what you have left, turns amber as you approach it, and once it is exhausted a build stops until the allowance resets.',
+    a: 'There is no limit on how many apps you can create. There is a daily limit on how much AI work you can use across all of them: the token counter in the header shows what you have left and turns amber once you have used 80% of it. When the allowance runs out it stops every AI action, not just builds — Ask and Plan included — until it resets at midnight IST.',
   },
   {
     q: 'Who do I contact for help?',
-    // TODO: confirm support address
-    a: 'Use the Feedback button in the header — it submits straight to the team and is the fastest route. You can also email citizen-developer-support@bialairport.com.',
+    a: `Use the Feedback button in the header to record a note for the platform team, or email ${SUPPORT_EMAIL} directly.`,
   },
 ]
 
@@ -221,8 +235,7 @@ export default function HelpPage() {
           <div className="text-center pb-8">
             <p className="text-sm text-neutral">
               Still need help?{' '}
-              {/* TODO: confirm support address */}
-              <a href="mailto:citizen-developer-support@bialairport.com" className="text-primary font-semibold hover:underline">
+              <a href={`mailto:${SUPPORT_EMAIL}`} className="text-primary font-semibold hover:underline">
                 Contact IT Support Desk
               </a>
             </p>
