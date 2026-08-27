@@ -31,7 +31,7 @@ function mountAt({ pathname, search = '', state = null }) {
   return renderHook(() => useDropTransientQuery()).result.current
 }
 
-const HANDOFF = { prompt: 'a visitor log app', mode: 'plan', theme: 'bial', pendingAttachments: [] }
+const HANDOFF = { prompt: 'a visitor log app', mode: 'plan', pendingAttachments: [] }
 
 describe('useDropTransientQuery', () => {
   it('THE BUG: the dropped entry carries no hand-off prompt', () => {

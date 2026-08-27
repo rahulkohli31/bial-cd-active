@@ -40,7 +40,6 @@ const _compactTokenFormat = new Intl.NumberFormat('en-US', {
 })
 const compactTokens = (n: number): string => _compactTokenFormat.format(n)
 
-
 export default function Navbar() {
   const navigate = useNavigate()
   const [userMenuOpen, setUserMenuOpen] = useState(false)
@@ -126,7 +125,6 @@ export default function Navbar() {
     return () => document.removeEventListener('keydown', onEsc)
   }, [])
 
-
   const showToast = (msg: string) => {
     setToastMsg(msg)
     if (toastTimer.current) clearTimeout(toastTimer.current)
@@ -147,8 +145,6 @@ export default function Navbar() {
     if (!ok) showToast('Sign-out may be incomplete on this device.')
     navigate('/login')
   }
-
-
 
   return (
     <>
@@ -219,10 +215,13 @@ export default function Navbar() {
               )
             })()}
 
-            {/* Feedback — always visible (every authed user); icon-only on mobile */}
+            {/* Feedback — always visible (every authed user); icon-only on mobile.
+                Closes the user menu on the way: the button sits OUTSIDE the menu, so
+                clicking it while the menu is open left the menu rendered behind the modal
+                (pre-existing, and the dropdown union had it too — #157 review). */}
             <button
               ref={feedbackBtnRef}
-              onClick={() => setFeedbackOpen(true)}
+              onClick={() => { setUserMenuOpen(false); setFeedbackOpen(true) }}
               title="Send feedback"
               className="flex items-center gap-1.5 px-2.5 py-2 text-neutral hover:text-primary transition rounded-lg hover:bg-surface-muted text-sm font-medium"
             >

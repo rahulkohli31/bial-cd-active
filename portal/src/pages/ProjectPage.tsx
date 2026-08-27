@@ -3,7 +3,7 @@
  *
  * ONE surface for every project, built or not:
  *   - the Sandbox build composer (`ProjectBuilder`) renders UNCONDITIONALLY at the top
- *     of the main column — Build/Plan toggle, theme selector, sample prompts, and all —
+ *     of the main column — Build/Plan toggle, sample prompts, and all —
  *     whether or not the project already has an app. It is never collapsed or pushed
  *     below an app card.
  *   - the description sits in a text-only right rail, joined by the Publish card and the

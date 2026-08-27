@@ -86,6 +86,12 @@ describe('ProjectBuilder', () => {
     // functional (it updated its own pill and rode into `conversation.context`), which is
     // exactly why it survived this long. Pinning its absence means a future re-add has to
     // be a deliberate act with a real consumer, not an accident.
+    // LIVENESS FIRST. Four queryBy().toBeNull() calls and nothing else would also pass if
+    // ProjectBuilder threw or early-returned, i.e. if it rendered NOTHING — an absence test
+    // with no positive assertion cannot tell "the control is gone" from "the page is gone."
+    // Its F6 sibling below already does this; this one missed it (#157 review).
+    expect(screen.getByRole('button', { name: /Mode: Plan/i })).toBeTruthy()
+
     expect(screen.queryByRole('button', { name: /Bangalore Airport Theme/i })).toBeNull()
     expect(screen.queryByText('App Style (iOS/Android)')).toBeNull()
     expect(screen.queryByText('Dashboard / Analytics')).toBeNull()
