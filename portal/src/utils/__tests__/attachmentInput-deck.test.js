@@ -38,10 +38,19 @@ describe('deck (.pptx) — feature ENABLED', () => {
     expect(validateAttachmentFiles([file('big.pptx', PPTX_MEDIA_TYPE, MAX_FILE_SIZE + 1)], 0).error).toMatch(/4 MB/)
   })
 
-  it('still rejects a legacy .ppt even when the feature is enabled', () => {
+  it('rejects a legacy .ppt with the "save as .pptx" message (no PDF mention)', () => {
+    // Moved here from the unmocked attachmentInput.test.js, where it sat under a
+    // "flag-independent" heading it had stopped earning: the advice to save as .pptx
+    // only leads anywhere while .pptx is in the allowlist, i.e. only in THIS file's
+    // world. The flag-off counterpart is in attachmentInput-deck-disabled.test.js.
     expect(validateAttachmentFiles([file('old.ppt', 'application/vnd.ms-powerpoint')], 0)).toEqual({
       error: LEGACY_PPT_REJECT_MSG,
     })
+    expect(validateAttachmentFiles([file('deck.ppt', '')], 0)).toEqual({ error: LEGACY_PPT_REJECT_MSG })
+    // The deck -> PDF conversion is invisible to the user, so the message must not
+    // leak it. This assertion belongs where the conversion exists: with decks off
+    // there is no conversion to reveal.
+    expect(LEGACY_PPT_REJECT_MSG).not.toMatch(/pdf/i)
   })
 
   it('resolveMediaType maps .pptx to the OOXML presentation type', () => {

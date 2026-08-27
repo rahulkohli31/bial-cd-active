@@ -18,17 +18,28 @@
  * composer (file picker + drag/drop allowlist). A deck is converted to a PDF by
  * an in-tenant Gotenberg sidecar and read by Claude with vision — unlike Word/
  * Excel, which are read as extracted text. This client flag only controls whether
- * .pptx is OFFERED in the UI; the server independently enforces its own gate
- * (DECK_ATTACHMENTS_ENABLED env + a reachable GOTENBERG_URL) and rejects .pptx
- * cleanly when off. Enabling the feature means flipping BOTH this flag and the
- * server env — that pair is the whole "turn it on".
+ * .pptx is OFFERED in the UI.
  *
- * OFF, because ON was only ever half the pair (#157 B2). The server gate is not
- * enabled, so .pptx appeared in the picker and staged a slide chip in the composer,
- * and then Send failed every time with "PowerPoint attachments aren't enabled" —
- * a capability offered and refused at the last step. Turning this off cannot cost
- * anyone a working capability: the client-side wire strip in `attachmentStore`
- * makes decks a no-op even where GOTENBERG_URL is set. Flip both together to
- * actually ship the feature.
+ * THE SERVER HAS NO FLAG OF ITS OWN. An earlier version of this comment described a
+ * server-side `DECK_ATTACHMENTS_ENABLED` env as the other half of the pair; there is
+ * no such setting anywhere in `backend/` or the Express server. The real gate is
+ * `deck_attachments_enabled()` (backend/src/services/extract/deck.py), which is just
+ * `bool(GOTENBERG_URL)` — configuring the sidecar IS enabling the feature, and the
+ * server rejects .pptx cleanly (501) whenever that URL is unset. So "turn it on" is:
+ * point GOTENBERG_URL at a reachable sidecar, and flip this flag. Restating the wrong
+ * model was worth correcting here (#157 review) because it is the sentence whoever
+ * ships the feature will act on.
+ *
+ * OFF, because ON was only ever half of that pair (#157 B2). No sidecar is configured,
+ * so .pptx appeared in the picker and staged a slide chip in the composer, and then Send
+ * failed every time with "PowerPoint attachments aren't enabled" — a capability
+ * offered and refused at the last step. Turning this off cannot cost anyone a working
+ * capability: the client-side wire strip in `attachmentStore` makes decks a no-op even
+ * where GOTENBERG_URL is set.
+ *
+ * The flag is load-bearing for COPY as well as offering: `attachmentInput`'s legacy-.ppt
+ * message and the Help FAQ's attachment answer both branch on it, because advice to
+ * "save as .pptx" is only followable while .pptx is accepted. Its shipped value is
+ * asserted against the real, unmocked import in attachmentInput.test.js.
  */
 export const DECK_ATTACHMENTS_ENABLED = false
