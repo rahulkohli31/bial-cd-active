@@ -40,11 +40,10 @@ const _compactTokenFormat = new Intl.NumberFormat('en-US', {
 })
 const compactTokens = (n: number): string => _compactTokenFormat.format(n)
 
-type DropdownName = 'user'
 
 export default function Navbar() {
   const navigate = useNavigate()
-  const [activeDropdown, setActiveDropdown] = useState<DropdownName | null>(null)
+  const [userMenuOpen, setUserMenuOpen] = useState(false)
   const [toastMsg, setToastMsg] = useState<string | null>(null)
   const [usage, setUsage] = useState<UsageToday | null>(null)
   const [feedbackOpen, setFeedbackOpen] = useState(false)
@@ -64,7 +63,7 @@ export default function Navbar() {
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const feedbackBtnRef = useRef<HTMLButtonElement>(null)
 
-  useClickOutside(navRef, () => setActiveDropdown(null))
+  useClickOutside(navRef, () => setUserMenuOpen(false))
 
   // Daily token usage badge: fetch on mount and after each completed turn
   // (notifyUsageChanged). Gated on isAuthenticated so it never fires during
@@ -122,12 +121,11 @@ export default function Navbar() {
   }, [isAdmin])
 
   useEffect(() => {
-    const onEsc = (e: KeyboardEvent) => { if (e.key === 'Escape') { setActiveDropdown(null); setFeedbackOpen(false) } }
+    const onEsc = (e: KeyboardEvent) => { if (e.key === 'Escape') { setUserMenuOpen(false); setFeedbackOpen(false) } }
     document.addEventListener('keydown', onEsc)
     return () => document.removeEventListener('keydown', onEsc)
   }, [])
 
-  const toggle = (name: DropdownName) => setActiveDropdown((prev) => (prev === name ? null : name))
 
   const showToast = (msg: string) => {
     setToastMsg(msg)
@@ -235,7 +233,7 @@ export default function Navbar() {
             {/* User avatar */}
             <div className="relative">
               <button
-                onClick={() => toggle('user')}
+                onClick={() => setUserMenuOpen((open) => !open)}
                 className="flex items-center gap-2 p-1.5 rounded-lg hover:bg-surface-muted transition"
               >
                 <div className="w-8 h-8 rounded-full bg-primary flex items-center justify-center text-white text-xs font-bold">
@@ -248,7 +246,7 @@ export default function Navbar() {
                 <ChevronDown size={13} className="text-neutral hidden lg:block" />
               </button>
 
-              {activeDropdown === 'user' && (
+              {userMenuOpen && (
                 <div className="absolute right-0 top-11 w-52 bg-white rounded-xl border border-bial-border shadow-xl py-2 z-50">
                   <div className="px-4 py-2.5 border-b border-bial-border">
                     <p className="text-xs font-bold text-tertiary">{displayName}</p>
