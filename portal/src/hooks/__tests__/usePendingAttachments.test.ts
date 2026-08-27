@@ -125,7 +125,7 @@ describe('usePendingAttachments — restorePending respects the per-message cap'
     id, name: `${id}.png`, mediaType: 'image/png', size: 10, base64: 'AAA',
   })
 
-  it('clamps the merged total to the cap and says so, rather than appending unbounded', async () => {
+  it('clamps the merged total to the cap and REPORTS the shortfall, rather than appending unbounded', async () => {
     // The real sequence: 5 files staged and sent (the composer clears optimistically), 5 more
     // staged during the upload window — those validate against an empty list, so they are
     // legitimately accepted — then the upload fails and the first batch is restored on top.
@@ -141,12 +141,37 @@ describe('usePendingAttachments — restorePending respects the per-message cap'
     })
     expect(result.current.pendingAttachments).toHaveLength(5)
 
+    let dropped = -1
     act(() => {
-      result.current.restorePending([attachment('r1'), attachment('r2'), attachment('r3')])
+      dropped = result.current.restorePending([attachment('r1'), attachment('r2'), attachment('r3')])
     })
 
     expect(result.current.pendingAttachments).toHaveLength(5)
-    expect(result.current.attachToast).toBe('You can attach at most 5 files per message.')
+    expect(dropped).toBe(3)
+    // NOT toasted here: the only caller is an error path that has already surfaced the real
+    // failure reason, and attachToast is a single slot — a toast here would overwrite it in
+    // the same synchronous continuation, telling the user they attached too many files when
+    // the send actually failed on the storage cap. ChatPage composes one message instead.
+    expect(result.current.attachToast).toBeNull()
+  })
+
+  it('reports nothing dropped when the restored batch fits EXACTLY', () => {
+    // The boundary the over-cap cases can't reach: `fresh.length === room`. Without it a
+    // `>`-to-`>=` style off-by-one (or any +1 on the dropped count) reports a phantom drop
+    // on a clean restore and the suite stays green. The length assertion is the liveness
+    // half — it fails if the restore silently stopped landing anything at all.
+    const { result } = renderHook(() => usePendingAttachments())
+
+    act(() => {
+      result.current.restorePending([attachment('own1'), attachment('own2'), attachment('own3')])
+    })
+    let dropped = -1
+    act(() => {
+      dropped = result.current.restorePending([attachment('r1'), attachment('r2')])
+    })
+
+    expect(result.current.pendingAttachments).toHaveLength(5)
+    expect(dropped).toBe(0)
   })
 
   it('truncates the RESTORED batch, never the files the user just staged', () => {

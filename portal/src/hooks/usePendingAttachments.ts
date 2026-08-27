@@ -33,8 +33,13 @@ export interface UsePendingAttachmentsResult {
    *  composer) — MERGES with whatever is currently staged (deduped by id), since the
    *  composer stays live during the failing send and the user may have attached
    *  something new in the meantime. Clamped to the per-message cap; the RESTORED batch is
-   *  what gets truncated, and a toast fires when it does. */
-  restorePending: (items: PendingAttachment[]) => void
+   *  what gets truncated.
+   *
+   *  RETURNS the number dropped by that clamp, and deliberately does NOT toast: its only
+   *  caller is an error path that has already surfaced the real failure reason, and
+   *  `attachToast` is a single slot — a toast here would overwrite that reason before it
+   *  ever rendered. The caller composes one message from both facts instead. */
+  restorePending: (items: PendingAttachment[]) => number
   attachToast: string | null
   showAttachToast: (msg: string) => void
   /** True while a FILE drag is over the composer — drives the drop-target highlight. */
@@ -175,7 +180,7 @@ export function usePendingAttachments(): UsePendingAttachmentsResult {
     setPendingAttachments([])
   }, [])
 
-  const restorePending = useCallback((items: PendingAttachment[]) => {
+  const restorePending = useCallback((items: PendingAttachment[]): number => {
     // Merge rather than replace: the composer stays live while the send that's being
     // restored-from was failing, so the user may already have staged something new — a
     // plain replace would discard it.
@@ -192,10 +197,12 @@ export function usePendingAttachments(): UsePendingAttachmentsResult {
     const room = Math.max(0, MAX_FILES_PER_MESSAGE - pendingRef.current.length)
     // Truncate the RESTORED batch, not what the user just staged: they can still see and
     // re-pick the files they chose a moment ago, but have no idea what the restore dropped.
-    if (fresh.length > room) showAttachToast(`You can attach at most ${MAX_FILES_PER_MESSAGE} files per message.`)
+    const dropped = Math.max(0, fresh.length - room)
     pendingRef.current = [...pendingRef.current, ...fresh.slice(0, room)]
     setPendingAttachments(pendingRef.current)
-  }, [showAttachToast])
+    // Reported, not toasted — see the interface docblock. The caller owns the message.
+    return dropped
+  }, [])
 
   // ── Drop-target feedback ────────────────────────────────────────────────────────────
   // Without it the composer advertises "drop them anywhere in the composer" (the attach

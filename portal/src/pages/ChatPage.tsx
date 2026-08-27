@@ -22,7 +22,7 @@ import {
   deriveTitle,
 } from '../utils/chatHistory'
 import { wireMessageFromParts, buildUserParts, partsToText, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
-import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../utils/attachmentInput'
+import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat, MAX_FILES_PER_MESSAGE } from '../utils/attachmentInput'
 import type { PendingAttachment } from '../utils/attachmentInput'
 import { openPdf } from '../utils/attachmentViewer'
 import { describeSaveFailure, isConversationGone } from '../utils/chatErrors'
@@ -399,7 +399,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     try {
       parts = await buildUserParts(text, attachments)
     } catch (err) {
-      showAttachToast(err instanceof Error ? err.message : 'Could not upload the attachment.')
+      const reason = err instanceof Error ? err.message : 'Could not upload the attachment.'
       // doSend already cleared the composer + pendingAttachments before calling fireMessage —
       // an upload failure must not cost the user the message they typed and the files they
       // picked, with nothing left to retry. `rawText`/`attachments` are this call's own
@@ -412,16 +412,36 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
       // chat-2's composer, clobbering whatever chat-2 already had staged (ChatRoute renders
       // this page with no `key`, so it survives the switch). Mirrors the activeChatIdRef
       // guard streamAssistant already uses for the identical race.
-      if (activeChatIdRef.current !== currentChatId) return
+      // The toast is UNCONDITIONAL — the guard skips the restore, never the notification,
+      // or a send that failed while the user was reading another chat would fail silently.
+      if (activeChatIdRef.current !== currentChatId) {
+        showAttachToast(reason)
+        return
+      }
       // Prepend rather than overwrite, for the same reason restorePending merges rather than
       // replaces: the composer stayed live through the failing upload (no spinner), so the
       // user may already be typing their next thought. A blind setText destroys it — and
       // unrecoverably, because assistant-ui's ComposerPrimitive.Input is fully controlled, so
       // a store write bypasses the browser's native undo stack and ctrl+Z will not bring it
       // back. The failed message goes first: it's the one being retried.
+      //
+      // Both halves are checked, not just `typedSince`: an attachment-only send is legal
+      // (doSend gates on `!text && !attachments.length`), so `rawText` can be '' — and a
+      // one-sided join would hand back a draft with two blank lines above it.
       const typedSince = runtime.thread.composer.getState().text
-      runtime.thread.composer.setText(typedSince ? `${rawText}\n\n${typedSince}` : rawText)
-      restorePending(attachments)
+      runtime.thread.composer.setText(
+        rawText && typedSince ? `${rawText}\n\n${typedSince}` : (rawText || typedSince),
+      )
+      // One message, composed from both facts. `attachToast` is a single slot and this is the
+      // only error surface on this path, so toasting the cap separately inside restorePending
+      // would overwrite `reason` in the same synchronous continuation — telling the user they
+      // attached too many files when the send actually failed on the storage cap.
+      const dropped = restorePending(attachments)
+      showAttachToast(
+        dropped > 0
+          ? `${reason} ${dropped} attachment${dropped === 1 ? '' : 's'} dropped — ${MAX_FILES_PER_MESSAGE}-file limit.`
+          : reason,
+      )
       return
     }
 

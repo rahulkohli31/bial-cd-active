@@ -74,12 +74,15 @@ const composerText = () => screen.getByPlaceholderText(/Describe what you're thi
 
 /** Stage a file the way a user does — the composer's own drop target, so this exercises the
  *  real validate → read → commit path rather than poking state. */
-async function stageFile(name) {
+async function stageFile(...names) {
   const composer = await screen.findByTestId('composer')
   fireEvent.drop(composer, {
-    dataTransfer: { types: ['Files'], files: [new File(['x'.repeat(50)], name, { type: 'image/png' })] },
+    dataTransfer: {
+      types: ['Files'],
+      files: names.map((n) => new File(['x'.repeat(50)], n, { type: 'image/png' })),
+    },
   })
-  return screen.findByText(name)
+  return screen.findByText(names[names.length - 1])
 }
 
 function typeAndSend(text) {
@@ -187,5 +190,60 @@ describe('ChatPage — the restore does not destroy what was typed during the up
     await failUpload()
 
     expect(composerText()).toBe('MESSAGE ONE\n\nMESSAGE TWO')
+  })
+
+  it('does not prepend blank lines when the failed send carried no text of its own', async () => {
+    // An attachment-only send is legal — doSend gates on `!text && !attachments.length`, so
+    // `rawText` is '' here. Joining on `typedSince` alone yields '' + newlines + typed, handing
+    // back a draft pushed down by two blank lines on the very path where the user is already
+    // dealing with a failure.
+    const failUpload = deferredUploadFailure()
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+
+    await stageFile('report.png')
+    // Send with the file only, no typed message.
+    fireEvent.keyDown(screen.getByPlaceholderText(/Describe what you're thinking/i), { key: 'Enter' })
+    await waitFor(() => expect(h.buildUserParts).toHaveBeenCalledTimes(1))
+
+    fireEvent.change(screen.getByPlaceholderText(/Describe what you're thinking/i), {
+      target: { value: 'typed while it uploaded' },
+    })
+
+    await failUpload()
+
+    expect(composerText()).toBe('typed while it uploaded')
+  })
+})
+
+describe('ChatPage — the failure reason survives the cap clamp on restore', () => {
+  it('tells the user WHY the send failed, not just that files were dropped', async () => {
+    // The collision this guards: `attachToast` is a single slot and the only error surface on
+    // this path. Toasting the cap inside restorePending overwrote the real reason in the same
+    // synchronous continuation — so a send rejected by the per-user STORAGE cap reported "you
+    // can attach at most 5 files per message", and the user would retry with fewer files while
+    // the server kept rejecting them for an unrelated reason.
+    //
+    // Reaching it needs the clamp to actually bite, which needs files staged DURING the upload
+    // window — the premise of this whole feature, and the arm every other test here misses,
+    // because they all restore into an empty composer where `room` is the full cap.
+    const failUpload = deferredUploadFailure()
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+
+    await stageFile('a1.png', 'a2.png', 'a3.png', 'a4.png', 'a5.png')
+    typeAndSend('the original message')
+    await waitFor(() => expect(h.buildUserParts).toHaveBeenCalledTimes(1))
+
+    // The composer is empty and live, so these five validate against an empty list and are
+    // legitimately accepted — leaving no room for the five about to be restored.
+    await stageFile('b1.png', 'b2.png', 'b3.png', 'b4.png', 'b5.png')
+
+    await failUpload()
+
+    const toast = await screen.findByText(/Storage limit reached/i)
+    // Both facts, one message — the reason first, since it is what the user has to act on.
+    expect(toast.textContent).toBe('Storage limit reached. 5 attachments dropped — 5-file limit.')
+    // The clamp still held: the newly staged batch survives, the restored one is what gave way.
+    expect(screen.getByText('b1.png')).toBeTruthy()
+    expect(screen.queryByText('a1.png')).toBeNull()
   })
 })
