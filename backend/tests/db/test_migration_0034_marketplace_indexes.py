@@ -46,8 +46,10 @@ async def test_autogenerate_against_the_migrated_schema_is_empty(test_engine) ->
     bare `assert not diffs` sends the reader back to reproduce it by hand.
     """
 
-    def _compare(sync_conn: object) -> list[object]:
-        context = MigrationContext.configure(sync_conn)  # ty: ignore[invalid-argument-type]
+    def _compare(sync_conn: sa.Connection) -> list[object]:
+        # `run_sync` hands the SYNC Connection the greenlet is driving, which is exactly what
+        # MigrationContext wants — alembic has no async API of its own.
+        context = MigrationContext.configure(sync_conn)
         return compare_metadata(context, Base.metadata)
 
     async with test_engine.connect() as conn:
