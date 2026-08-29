@@ -18,7 +18,6 @@ is what stops a future refactor from quietly reintroducing either shape.
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 from collections.abc import Callable
@@ -30,6 +29,7 @@ from taskiq.schedule_sources import LabelScheduleSource
 import src.worker_main as worker_main
 from src.broker import broker
 from src.scheduler import schedule_sources, scheduler
+from tests.subprocess_env import child_env
 
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -150,7 +150,7 @@ def test_the_entrypoint_builds_no_web_app_and_loads_no_model_client() -> None:
             " print('NEVER:' + ','.join(never))",
         ],
         cwd=_BACKEND_ROOT,
-        env={"PATH": os.environ["PATH"], "ENV_FILE": ".env.test"},
+        env=child_env(ENV_FILE=".env.test"),
         capture_output=True,
         text=True,
         check=False,

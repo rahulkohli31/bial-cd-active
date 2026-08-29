@@ -21,7 +21,6 @@ gate, the schedule, the log line, and the boot one-shot it must not have replace
 from __future__ import annotations
 
 import contextlib
-import os
 import subprocess
 import sys
 import uuid
@@ -53,6 +52,7 @@ from src.workers.deploy_reconcile import (
     reconcile_stalled_deploys,
 )
 from tests.factories import AppRegistryFactory, UserFactory
+from tests.subprocess_env import child_env
 
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent.parent
 _DIGEST = "sha256:" + "ef" * 32
@@ -272,7 +272,7 @@ def test_a_disabled_pass_imports_nothing_heavy() -> None:
             " print('HEAVY:' + ','.join(heavy))",
         ],
         cwd=_BACKEND_ROOT,
-        env={"PATH": os.environ["PATH"], "ENV_FILE": ".env.test"},
+        env=child_env(ENV_FILE=".env.test"),
         capture_output=True,
         text=True,
         check=False,
