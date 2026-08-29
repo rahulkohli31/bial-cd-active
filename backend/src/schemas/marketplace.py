@@ -51,8 +51,12 @@ class MarketplaceEntry(CamelModel):
     #: will be republished verbatim to everyone in the org and made searchable by it. It is
     #: the owner's own text and the enterprise-catalog framing is settled, but "the sentence
     #: I typed to orient the assistant" and "my app's public listing copy" are different acts
-    #: of writing sharing one field with no notice (#147 round 3). A notice at the write
-    #: surface is filed separately rather than done from this PR.
+    #: of writing sharing one field with no notice (#147 round 3). THAT NOTICE NOW EXISTS:
+    #: `ProjectDescriptionEditor` states, at the write surface, that a published app's
+    #: description becomes its Marketplace listing and is searchable org-wide. It ships in
+    #: this PR rather than after it, because THIS is the change that makes the field public
+    #: — deferring the notice would leave a window where descriptions go org-wide with no
+    #: warning where they are written.
     description: str | None
     #: WHO BUILT IT, by display name only. Nullable because `users.display_name` is.
     builder_display_name: str | None
