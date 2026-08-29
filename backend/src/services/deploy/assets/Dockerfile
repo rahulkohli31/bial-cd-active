@@ -43,7 +43,27 @@ RUN npm ci --ignore-scripts --no-audit --no-fund --loglevel=error
 # ── build ────────────────────────────────────────────────────────────────────
 FROM ${NODE_IMAGE} AS builder
 WORKDIR /app
-ENV NEXT_TELEMETRY_DISABLED=1
+# The app's own address (`/a/pub-<28 hex>`) and the single hostname every generated app is
+# served from. `images.py` sends both on every platform build.
+#
+# RE-DECLARED INSIDE THE STAGE, and that is the whole point: `ARG NODE_IMAGE` above sits before
+# the first `FROM`, which scopes it to `FROM` lines only. Declared up there, these two would be
+# accepted by the registry and expand to the empty string here — a build that looks fine and
+# bakes root-relative URLs into an app the router can only reach under its key.
+#
+# NO DEFAULTS, deliberately. The next.config wrapper throws when either is empty, which is the
+# only reason a missing value fails at build time instead of shipping. A default here would
+# satisfy that check with a value that is correct for no app at all.
+ARG BIAL_BASE_PATH
+ARG BIAL_APPS_HOSTNAME
+# Promoted to the environment because the next.config wrapper reads them from `process.env`
+# when `next build` evaluates it below, and because an ENV is where a reader expects to find
+# what the build actually consumed. The runtime stage sets neither: it is AFTER the build, so
+# it could not influence the baked URLs, and the standalone output carries its own resolved
+# copy of the config anyway.
+ENV NEXT_TELEMETRY_DISABLED=1 \
+    BIAL_BASE_PATH=${BIAL_BASE_PATH} \
+    BIAL_APPS_HOSTNAME=${BIAL_APPS_HOSTNAME}
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 # No BIAL_DATABASE_URL is present at build time, by design: the app must not need a live

@@ -1,0 +1,17 @@
+# Ruff config for the portal's Python test harness (`tests/` — the Docker-backed apps-router
+# suite). Mirrors backend's rule set + line length.
+#
+# A standalone `ruff.toml` rather than a `[tool.ruff]` table in `pyproject.toml`, for the reason
+# spelled out in `pytest.ini`: a `[project]`-less pyproject.toml makes uv treat this Node package
+# as a virtual workspace root. Ruff documents the two forms as functionally equivalent with an
+# identical schema — `ruff.toml` simply drops the `tool.ruff` prefix, so `[tool.ruff.lint]`
+# becomes `[lint]`.
+target-version = "py313"
+line-length = 99
+
+[lint]
+select = ["E", "F", "I", "N", "W", "UP", "S"]
+
+[lint.per-file-ignores]
+# Test code asserts; the harness shells out to docker with list-form args only.
+"tests/*" = ["S101", "S603", "S607"]

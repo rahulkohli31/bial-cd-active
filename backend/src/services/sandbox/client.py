@@ -74,6 +74,7 @@ from src.services.sandbox.base import (
     SandboxHandle,
     SandboxNotReadyError,
     ServedPage,
+    base_path_for,
     sandbox_tags,
 )
 from src.services.sandbox.config import SandboxConfig
@@ -246,6 +247,33 @@ async def _asleep(seconds: float) -> None:
     """Poll/backoff sleep behind one indirection so tests can record the schedule
     without real waits."""
     await asyncio.sleep(seconds)
+
+
+def _public_app_url(app_name: str) -> str:
+    """Where a BIAL employee's browser reaches this app.
+
+    NOT `https://{fqdn}/`. The Container Apps environment is internal and publishes no public
+    DNS, so its own domain does not resolve from a BIAL desk — which is the defect this whole
+    change exists to fix. Lazy settings import for the same cycle reason as `_apps_hostname`.
+    """
+    from src.config import settings  # lazy: avoid an import cycle via src.config
+
+    return settings.app_url(app_name)
+
+
+def _apps_hostname() -> str:
+    """The public hostname every generated app is served from, e.g. `citizenapps.bialairport.com`.
+
+    Read lazily, for the same import-cycle reason `get_sandbox` gives at the bottom of this file:
+    `src.config` reaches back into the service packages, so a module-level import here is a cycle.
+
+    A HOST, never an origin. It becomes Next's `serverActions.allowedOrigins`, which compares the
+    browser's `Origin` against the forwarded host — and a value carrying a scheme fails CLOSED and
+    SILENTLY, aborting every form post in the app as a CSRF attempt with no other symptom.
+    """
+    from src.config import settings  # lazy: avoid an import cycle via src.config
+
+    return settings.apps_hostname
 
 
 class AcaSandboxClient(SandboxClient):
@@ -549,8 +577,13 @@ class AcaSandboxClient(SandboxClient):
         try:
             async with (
                 asyncio.timeout(_SERVING_TIMEOUT_SECONDS),
+                # THE APP'S OWN PAGES, not the container root. Under a base path the root
+                # belongs to no route and answers the framework's 404 — which this probe would
+                # faithfully report as "what the app is serving", self-heal would convert into
+                # "make sure `app/page.tsx` exists", and the model would burn metered tokens
+                # repairing a file that was never wrong.
                 self._http.stream(
-                    "GET", handle.preview_url, headers={"Accept-Encoding": "identity"}
+                    "GET", handle.app_root_url, headers={"Accept-Encoding": "identity"}
                 ) as resp,
             ):
                 chunks: list[bytes] = []
@@ -636,7 +669,10 @@ class AcaSandboxClient(SandboxClient):
         try:
             async with (
                 asyncio.timeout(_WARM_TIMEOUT_SECONDS),
-                self._http.stream("GET", handle.preview_url) as resp,
+                # The app's own pages, for the same reason as `what_is_it_serving`: a warm
+                # request against a base-path app's root warms the 404 route and leaves the
+                # first real visitor waiting on the cold compile this call exists to absorb.
+                self._http.stream("GET", handle.app_root_url) as resp,
             ):
                 if not resp.is_success:
                     # The route ANSWERED, and answered badly — a compile error, a crashed
@@ -844,7 +880,20 @@ class AcaSandboxClient(SandboxClient):
         token = secrets.token_urlsafe(_SUPERVISOR_TOKEN_BYTES)
         # The supervisor bearer lives ONLY in the container env (C1 keeps it out of the
         # scrubbed child env) and in-process; Redis stores a token_ref, never the token.
-        env = {**app_env, _SUPERVISOR_TOKEN_ENV: token}
+        #
+        # WHERE THIS APP IS SERVED FROM, derived here rather than passed in. This is the one seam
+        # BOTH births pass through — `provision_new` and `restore_from_snapshot` — so a restored
+        # sandbox comes back at the same path for free, and a relaunch cannot strand the preview
+        # at an address the router will never produce. It is deliberately NOT in
+        # `build_app_env`: the publish path calls that same builder, and a base path added there
+        # would ship an `sbx-` value into published containers whose images were built with a
+        # `pub-` one. `app_name` is in scope here and is exactly the key the router matches on.
+        env = {
+            **app_env,
+            _SUPERVISOR_TOKEN_ENV: token,
+            "BIAL_BASE_PATH": base_path_for(app_name),
+            "BIAL_APPS_HOSTNAME": _apps_hostname(),
+        }
         # C10 identity, resolved BEFORE the create so a container never exists untagged. The app_id
         # comes from `app_env` for the same reason `restore_from_snapshot` reads it there: the
         # frozen C2 signature carries no app_id, and C9 guarantees the variable (a KeyError here
@@ -867,7 +916,14 @@ class AcaSandboxClient(SandboxClient):
             fqdn=fqdn,
             token=token,
             app_name=app_name,
-            preview_url=f"https://{fqdn}/",
+            # THE BROWSER-FACING ADDRESS, which is no longer this container's own name. An
+            # internal Container Apps environment publishes no public DNS, so a BIAL desk cannot
+            # resolve `{fqdn}` at all — apps are reached through the platform's router on one
+            # public hostname with the app's key in the path. The control plane keeps using the
+            # direct address: `/_sup/*` composes from `fqdn`, and both serving probes compose
+            # from `handle.app_root_url`, which also derives from `fqdn`. Repointing this field
+            # therefore cannot drag control-plane traffic onto the public gateway.
+            preview_url=_public_app_url(app_name),
             ready=False,
         )
 
@@ -950,7 +1006,9 @@ class AcaSandboxClient(SandboxClient):
             fqdn=fqdn,
             token=token,
             app_name=app_name,
-            preview_url=f"https://{fqdn}/",
+            # Same public address as a fresh provision — attach and provision must not disagree
+            # about where a person goes, or a relaunched session frames a different URL.
+            preview_url=_public_app_url(app_name),
             ready=False,
         )
         await self._probe_with_retry(handle)

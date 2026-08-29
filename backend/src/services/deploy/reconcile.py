@@ -32,9 +32,11 @@ from contextlib import AbstractAsyncContextManager
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.config import settings
 from src.db.models.deployment import Deployment
 from src.services.deploy import store
 from src.services.deploy.aca_publish import PublishedAppReader
+from src.services.deploy.names import published_app_name
 from src.services.sandbox.aca import AcaTransientError
 
 _log = structlog.get_logger()
@@ -95,7 +97,14 @@ async def _resolve(
         # We got as far as provisioning and died before writing it down. The app IS the one
         # this row built, so the honest record is success.
         async with session_factory() as db:
-            settled = await store.succeed(db, row.id, url=f"https://{fqdn}/")
+            # The PUBLIC address, exactly as the pipeline's own success terminal writes it. This
+            # path runs in BOTH roles — the API's boot one-shot and the worker's cron — and it
+            # writes the same column, so the two must not disagree about what a deployment's URL
+            # means. Composed from the container name rather than the fqdn for the same reason:
+            # BIAL's environment is internal, and its own domain does not resolve from a desk.
+            settled = await store.succeed(
+                db, row.id, url=settings.app_url(published_app_name(app_id))
+            )
         if settled:
             _log.info(RECONCILED_EVENT, deployment_id=str(row.id), outcome="promoted")
         return settled

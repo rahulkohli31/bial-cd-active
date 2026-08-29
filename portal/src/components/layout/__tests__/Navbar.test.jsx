@@ -214,33 +214,78 @@ describe('the waiting-count badge (P1)', () => {
   })
 })
 
-/**
- * The bell and the badge must not contradict each other. "You're all caught up" was
- * unconditional; it became false the moment the badge showed a number, and an
- * administrator who opened the conventional place to check would be told the opposite of
- * the badge two inches away.
- */
-describe('the bell agrees with the badge', () => {
-  it('does NOT say "all caught up" while apps are waiting', async () => {
-    h.getStoredUser.mockReturnValue(ADMIN)
-    h.fetchAppStatusCounts.mockResolvedValue(counts(3))
-    renderNavbar()
-    await screen.findByTestId('waiting-count-nav')
 
-    fireEvent.click(document.querySelector('nav').querySelectorAll('button')[1])
-    const waiting = await screen.findByTestId('bell-waiting')
-    expect(waiting.textContent).toContain('3 apps waiting for review')
-    expect(screen.queryByText("You're all caught up")).toBeNull()
+/**
+ * The avatar menu's state machine.
+ *
+ * #157 A removed three of the four header dropdowns, which left a `DropdownName` union with one
+ * member and a `toggle(name)` comparing it against itself; a later commit collapsed both into a
+ * boolean. Nothing in this file covered the open/close behaviour either before or after, so the
+ * rewrite rested entirely on a manual browser pass. These are the three ways the menu closes.
+ */
+describe('the avatar menu opens and closes (#157 A)', () => {
+  // Resolved ONCE, while the menu is closed, and the node is reused afterwards. Two traps
+  // here, both of which bit during #157:
+  //   - `getAllByRole('button').at(-1)` re-resolves, and once the menu is open the last
+  //     button in the nav IS "Sign out" — the browser harness clicked it and logged itself
+  //     out mid-run, then asserted the rest against a login page.
+  //   - the display name is rendered TWICE while the menu is open (trigger + menu header),
+  //     so even a name-based query is ambiguous after the first click.
+  // React keeps the same DOM node for the trigger across these re-renders, so holding the
+  // reference is both stable and unambiguous.
+  const openMenu = () => {
+    const trigger = screen.getByText('Asha', { selector: 'p' }).closest('button')
+    fireEvent.click(trigger)
+    return trigger
+  }
+  const menuIsOpen = () => screen.queryByRole('button', { name: /sign out/i }) !== null
+
+  it('starts closed, opens on click, and the same click closes it again', async () => {
+    renderNavbar()
+    await waitFor(() => expect(h.fetchUsageToday).toHaveBeenCalled())
+
+    expect(menuIsOpen()).toBe(false)
+    const trigger = openMenu()
+    expect(menuIsOpen()).toBe(true)
+    // The toggle half. A handler that only ever SET the flag would pass the line above and
+    // fail here — which is the mutation the collapse could plausibly have introduced.
+    fireEvent.click(trigger)
+    expect(menuIsOpen()).toBe(false)
   })
 
-  it('still says "all caught up" when nothing is waiting', async () => {
-    h.getStoredUser.mockReturnValue(ADMIN)
-    h.fetchAppStatusCounts.mockResolvedValue(counts(0))
+  it('closes on Escape', async () => {
     renderNavbar()
-    await waitFor(() => expect(h.fetchAppStatusCounts).toHaveBeenCalled())
+    await waitFor(() => expect(h.fetchUsageToday).toHaveBeenCalled())
 
-    fireEvent.click(document.querySelector('nav').querySelectorAll('button')[1])
-    expect(await screen.findByText("You're all caught up")).toBeTruthy()
-    expect(screen.queryByTestId('bell-waiting')).toBeNull()
+    openMenu()
+    expect(menuIsOpen()).toBe(true)
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(menuIsOpen()).toBe(false)
+  })
+
+  it('closes on a click outside the nav, but not on a click inside it', async () => {
+    renderNavbar()
+    await waitFor(() => expect(h.fetchUsageToday).toHaveBeenCalled())
+
+    const trigger = openMenu()
+    // Inside first: useClickOutside listens on `mousedown` at the document, so a nav-local
+    // mousedown must NOT close the menu the click that follows is trying to use.
+    fireEvent.mouseDown(trigger)
+    expect(menuIsOpen()).toBe(true)
+
+    fireEvent.mouseDown(document.body)
+    expect(menuIsOpen()).toBe(false)
+  })
+
+  it('closes when Feedback opens, instead of sitting behind the modal', async () => {
+    // Pre-existing gap the dropdown union had too: the Feedback button lives OUTSIDE the
+    // menu, so opening the modal left the menu rendered underneath it (#157 review).
+    renderNavbar()
+    await waitFor(() => expect(h.fetchUsageToday).toHaveBeenCalled())
+
+    openMenu()
+    expect(menuIsOpen()).toBe(true)
+    fireEvent.click(screen.getByTitle('Send feedback'))
+    expect(menuIsOpen()).toBe(false)
   })
 })

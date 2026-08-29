@@ -21,10 +21,11 @@ than on source text: a source-text check passes against a re-export spelled a ne
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 from pathlib import Path
+
+from tests.subprocess_env import child_env
 
 # `backend/` — tests/ lives directly under it.
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
@@ -37,7 +38,7 @@ def _import_in_fresh_interpreter(snippet: str) -> subprocess.CompletedProcess[st
     return subprocess.run(  # noqa: S603
         [sys.executable, "-B", "-c", snippet],
         cwd=_BACKEND_ROOT,
-        env={"PATH": os.environ["PATH"], "ENV_FILE": ".env.test"},
+        env=child_env(ENV_FILE=".env.test"),
         capture_output=True,
         text=True,
         check=False,

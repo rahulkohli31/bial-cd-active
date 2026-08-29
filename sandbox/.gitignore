@@ -9,6 +9,11 @@ __pycache__/
 # pin the supervisor's deps somewhere nobody looks. Same reasoning as the package-lock anchor
 # below: keep an accidental lockfile out of a tree whose real lockfile is build-critical.
 uv.lock
+# ...and the `.venv/` the same stray invocation creates. Root cause now REMOVED: the
+# `[project]`-less `pyproject.toml` that made uv read this directory as a virtual workspace
+# root (astral-sh/uv#4541) is gone, replaced by `pytest.ini` + `ruff.toml`, which uv ignores.
+# Both entries are kept as belt-and-braces against anyone reintroducing a pyproject here.
+.venv/
 
 # Tool caches
 .ruff_cache/

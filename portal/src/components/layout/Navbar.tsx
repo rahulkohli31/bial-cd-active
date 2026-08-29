@@ -1,17 +1,16 @@
 import { useState, useRef, useEffect } from 'react'
 import { NavLink, useNavigate } from 'react-router-dom'
-import {
-  Bell, Settings, Search, ChevronDown, LogOut, User,
-  Inbox, Boxes, Store,
-  UserCircle, BookOpen, Info, Monitor, MessageSquare,
-} from 'lucide-react'
+// `Info` is NOT left over from the removed settings menu — it is the toast's own icon
+// (see the toast render below). The nine icons that went with #157's dead header controls
+// are gone; these four all have live consumers.
+import { ChevronDown, LogOut, Info, MessageSquare } from 'lucide-react'
 import type { RefObject } from 'react'
 import { getStoredUser, isAuthenticated, logout } from '../../utils/auth'
 import { fetchUsageToday, onUsageChanged } from '../../utils/usage'
 import type { UsageToday } from '../../utils/usage'
 import { revokeAllAttachmentUrls } from '../../utils/attachmentApi'
 import { fetchAppStatusCounts } from '../../utils/appRegistryApi'
-import WaitingCountBadge, { waitingForReviewLabel } from '../admin/WaitingCountBadge'
+import WaitingCountBadge from '../admin/WaitingCountBadge'
 import FeedbackModal from '../FeedbackModal'
 import BIALLogo from '../BIALLogo'
 
@@ -22,23 +21,6 @@ const NAV_LINKS = [
 ]
 
 const ADMIN_LINK = { label: 'Admin', to: '/admin' }
-
-const SETTINGS_ITEMS = [
-  { icon: UserCircle, label: 'Profile Settings' },
-  { icon: Bell, label: 'Notification Preferences' },
-  { icon: Monitor, label: 'Display & Accessibility' },
-  { icon: Info, label: 'About BIAL Citizen Developer' },
-]
-
-const SEARCH_PAGES = [
-  { label: 'Projects', to: '/projects', icon: Boxes },
-  { label: 'Marketplace', to: '/marketplace', icon: Store },
-  { label: 'Help Center', to: '/help', icon: BookOpen },
-]
-
-const SEARCH_ACTIONS = [
-  { label: 'View Projects', to: '/projects', icon: Inbox },
-]
 
 function useClickOutside(ref: RefObject<HTMLElement | null>, handler: () => void) {
   useEffect(() => {
@@ -59,12 +41,9 @@ const _compactTokenFormat = new Intl.NumberFormat('en-US', {
 })
 const compactTokens = (n: number): string => _compactTokenFormat.format(n)
 
-type DropdownName = 'search' | 'bell' | 'settings' | 'user'
-
 export default function Navbar() {
   const navigate = useNavigate()
-  const [activeDropdown, setActiveDropdown] = useState<DropdownName | null>(null)
-  const [searchQuery, setSearchQuery] = useState('')
+  const [userMenuOpen, setUserMenuOpen] = useState(false)
   const [toastMsg, setToastMsg] = useState<string | null>(null)
   const [usage, setUsage] = useState<UsageToday | null>(null)
   const [feedbackOpen, setFeedbackOpen] = useState(false)
@@ -84,7 +63,7 @@ export default function Navbar() {
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const feedbackBtnRef = useRef<HTMLButtonElement>(null)
 
-  useClickOutside(navRef, () => setActiveDropdown(null))
+  useClickOutside(navRef, () => setUserMenuOpen(false))
 
   // Daily token usage badge: fetch on mount and after each completed turn
   // (notifyUsageChanged). Gated on isAuthenticated so it never fires during
@@ -142,12 +121,10 @@ export default function Navbar() {
   }, [isAdmin])
 
   useEffect(() => {
-    const onEsc = (e: KeyboardEvent) => { if (e.key === 'Escape') { setActiveDropdown(null); setSearchQuery(''); setFeedbackOpen(false) } }
+    const onEsc = (e: KeyboardEvent) => { if (e.key === 'Escape') { setUserMenuOpen(false); setFeedbackOpen(false) } }
     document.addEventListener('keydown', onEsc)
     return () => document.removeEventListener('keydown', onEsc)
   }, [])
-
-  const toggle = (name: DropdownName) => setActiveDropdown((prev) => (prev === name ? null : name))
 
   const showToast = (msg: string) => {
     setToastMsg(msg)
@@ -169,23 +146,6 @@ export default function Navbar() {
     if (!ok) showToast('Sign-out may be incomplete on this device.')
     navigate('/login')
   }
-
-  const handleNav = (to: string) => {
-    setActiveDropdown(null)
-    setSearchQuery('')
-    navigate(to)
-  }
-
-  // The bell's sentence is generated from the SAME helper as the badge's accessible name,
-  // so the two literally cannot say different numbers or different words.
-  const waitingCopy = waiting === null ? '' : waitingForReviewLabel(waiting)
-
-  const filteredSearch = searchQuery.trim()
-    ? {
-        pages: SEARCH_PAGES.filter((p) => p.label.toLowerCase().includes(searchQuery.toLowerCase())),
-        actions: SEARCH_ACTIONS.filter((a) => a.label.toLowerCase().includes(searchQuery.toLowerCase())),
-      }
-    : null
 
   return (
     <>
@@ -218,75 +178,6 @@ export default function Navbar() {
 
           {/* Right cluster */}
           <div className="flex items-center gap-1">
-            {/* Search */}
-            <div className="relative hidden lg:block">
-              <div
-                className="flex items-center gap-2 bg-surface-muted border border-bial-border rounded-lg px-3 py-1.5 cursor-text"
-                onClick={() => { setActiveDropdown('search'); }}
-              >
-                <Search size={13} className="text-neutral flex-shrink-0" />
-                <input
-                  type="text"
-                  placeholder="Search pages or actions..."
-                  value={searchQuery}
-                  onChange={(e) => { setSearchQuery(e.target.value); setActiveDropdown('search') }}
-                  className="bg-transparent text-sm text-tertiary placeholder:text-gray-400 focus:outline-none w-48"
-                  onFocus={() => setActiveDropdown('search')}
-                />
-              </div>
-
-              {activeDropdown === 'search' && (
-                <div className="absolute top-full right-0 mt-1.5 w-72 bg-white rounded-xl border border-bial-border shadow-xl z-50 py-2 overflow-hidden">
-                  {filteredSearch ? (
-                    <>
-                      {filteredSearch.pages.length > 0 && (
-                        <div>
-                          <p className="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider text-neutral">Pages</p>
-                          {filteredSearch.pages.map((p) => (
-                            <button key={p.to} onClick={() => handleNav(p.to)} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-bial-bg transition text-left">
-                              <p.icon size={13} className="text-primary flex-shrink-0" />
-                              <span className="text-sm text-tertiary">{p.label}</span>
-                            </button>
-                          ))}
-                        </div>
-                      )}
-                      {filteredSearch.actions.length > 0 && (
-                        <div>
-                          <p className="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider text-neutral border-t border-bial-border mt-1">Actions</p>
-                          {filteredSearch.actions.map((a) => (
-                            <button key={a.label} onClick={() => handleNav(a.to)} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-bial-bg transition text-left">
-                              <a.icon size={13} className="text-primary flex-shrink-0" />
-                              <span className="text-sm text-tertiary">{a.label}</span>
-                            </button>
-                          ))}
-                        </div>
-                      )}
-                      {!filteredSearch.pages.length && !filteredSearch.actions.length && (
-                        <p className="px-4 py-3 text-sm text-neutral text-center">No results for "{searchQuery}"</p>
-                      )}
-                    </>
-                  ) : (
-                    <>
-                      <p className="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider text-neutral">Pages</p>
-                      {SEARCH_PAGES.map((p) => (
-                        <button key={p.to} onClick={() => handleNav(p.to)} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-bial-bg transition text-left">
-                          <p.icon size={13} className="text-primary flex-shrink-0" />
-                          <span className="text-sm text-tertiary">{p.label}</span>
-                        </button>
-                      ))}
-                      <p className="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider text-neutral border-t border-bial-border mt-1">Quick Actions</p>
-                      {SEARCH_ACTIONS.map((a) => (
-                        <button key={a.label} onClick={() => handleNav(a.to)} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-bial-bg transition text-left">
-                          <a.icon size={13} className="text-primary flex-shrink-0" />
-                          <span className="text-sm text-tertiary">{a.label}</span>
-                        </button>
-                      ))}
-                    </>
-                  )}
-                </div>
-              )}
-            </div>
-
             {/* Daily token usage — prominent status chip bound to the live
                 /api/usage/today source. Three-state colour: healthy (primary) →
                 nearing the limit (accent/amber) → exhausted (danger). */}
@@ -325,10 +216,13 @@ export default function Navbar() {
               )
             })()}
 
-            {/* Feedback — always visible (every authed user); icon-only on mobile */}
+            {/* Feedback — always visible (every authed user); icon-only on mobile.
+                Closes the user menu on the way: the button sits OUTSIDE the menu, so
+                clicking it while the menu is open left the menu rendered behind the modal
+                (pre-existing, and the dropdown union had it too — #157 review). */}
             <button
               ref={feedbackBtnRef}
-              onClick={() => setFeedbackOpen(true)}
+              onClick={() => { setUserMenuOpen(false); setFeedbackOpen(true) }}
               title="Send feedback"
               className="flex items-center gap-1.5 px-2.5 py-2 text-neutral hover:text-primary transition rounded-lg hover:bg-surface-muted text-sm font-medium"
             >
@@ -336,75 +230,10 @@ export default function Navbar() {
               <span className="hidden md:inline">Feedback</span>
             </button>
 
-            {/* Bell */}
-            <div className="relative">
-              <button
-                onClick={() => toggle('bell')}
-                className="p-2 text-neutral hover:text-primary transition rounded-lg hover:bg-surface-muted relative"
-              >
-                <Bell size={17} />
-              </button>
-              {activeDropdown === 'bell' && (
-                <div className="absolute right-0 top-11 w-80 bg-white rounded-xl border border-bial-border shadow-xl z-50 overflow-hidden">
-                  <div className="px-4 py-3 border-b border-bial-border">
-                    <p className="text-sm font-bold text-tertiary">Notifications</p>
-                  </div>
-                  {/* THE TWO MUST NOT CONTRADICT EACH OTHER (U13). "You're all caught up"
-                      was unconditional, and it stopped being true the moment the badge two
-                      inches away started showing a number — an administrator who opened the
-                      conventional place to check would be told the opposite. This is NOT a
-                      notification feed (explicitly out of scope): when something is waiting
-                      it says so and points at the queue, and otherwise it says exactly what
-                      it said before. */}
-                  {waiting !== null && waiting > 0 ? (
-                    <button
-                      data-testid="bell-waiting"
-                      onClick={() => handleNav(ADMIN_LINK.to)}
-                      className="w-full flex flex-col items-center justify-center px-4 py-8 text-center hover:bg-bial-bg transition"
-                    >
-                      <Bell size={22} className="text-primary mb-2" />
-                      <p className="text-sm font-medium text-tertiary">{waitingCopy}</p>
-                      <p className="text-[11px] text-neutral mt-0.5">Open the admin queue to review them.</p>
-                    </button>
-                  ) : (
-                    <div className="flex flex-col items-center justify-center px-4 py-8 text-center">
-                      <Bell size={22} className="text-neutral/40 mb-2" />
-                      <p className="text-sm font-medium text-tertiary">You're all caught up</p>
-                      <p className="text-[11px] text-neutral mt-0.5">No new notifications right now.</p>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-
-            {/* Settings */}
-            <div className="relative">
-              <button
-                onClick={() => toggle('settings')}
-                className="p-2 text-neutral hover:text-primary transition rounded-lg hover:bg-surface-muted"
-              >
-                <Settings size={17} />
-              </button>
-              {activeDropdown === 'settings' && (
-                <div className="absolute right-0 top-11 w-52 bg-white rounded-xl border border-bial-border shadow-xl z-50 py-2 overflow-hidden">
-                  {SETTINGS_ITEMS.map(({ icon: Icon, label }) => (
-                    <button
-                      key={label}
-                      onClick={() => { setActiveDropdown(null); showToast('Coming soon') }}
-                      className="w-full flex items-center gap-2.5 px-4 py-2.5 text-sm text-tertiary hover:bg-bial-bg transition text-left"
-                    >
-                      <Icon size={14} className="text-neutral flex-shrink-0" />
-                      {label}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-
             {/* User avatar */}
             <div className="relative">
               <button
-                onClick={() => toggle('user')}
+                onClick={() => setUserMenuOpen((open) => !open)}
                 className="flex items-center gap-2 p-1.5 rounded-lg hover:bg-surface-muted transition"
               >
                 <div className="w-8 h-8 rounded-full bg-primary flex items-center justify-center text-white text-xs font-bold">
@@ -417,20 +246,17 @@ export default function Navbar() {
                 <ChevronDown size={13} className="text-neutral hidden lg:block" />
               </button>
 
-              {activeDropdown === 'user' && (
+              {userMenuOpen && (
                 <div className="absolute right-0 top-11 w-52 bg-white rounded-xl border border-bial-border shadow-xl py-2 z-50">
                   <div className="px-4 py-2.5 border-b border-bial-border">
                     <p className="text-xs font-bold text-tertiary">{displayName}</p>
                     <p className="text-[10px] text-neutral">{secondaryLine}</p>
                   </div>
-                  <button
-                    onClick={() => { setActiveDropdown(null); showToast('Coming soon') }}
-                    className="w-full flex items-center gap-2.5 px-4 py-2.5 text-sm text-tertiary hover:bg-bial-bg transition"
-                  >
-                    <User size={13} className="text-neutral flex-shrink-0" />
-                    My Profile
-                  </button>
-                  <div className="border-t border-bial-border mt-1 pt-1">
+                  {/* No border of its own: the name/email header above already carries the one
+                      divider this menu needs. It sat under "My Profile" until that placeholder was
+                      removed (#157 A4); keeping `border-t` would now render a second hairline a few
+                      pixels below the first. */}
+                  <div className="mt-1">
                     <button
                       onClick={handleLogout}
                       className="w-full flex items-center gap-2.5 px-4 py-2.5 text-sm text-danger hover:bg-red-50 transition"

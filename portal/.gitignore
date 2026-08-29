@@ -17,3 +17,20 @@ playwright-report/
 
 # tsc --build incremental cache — a local artifact, never a shipped one.
 *.tsbuildinfo
+
+# Python tool artifacts from the Docker-backed router harness under tests/. That suite runs
+# under the BACKEND interpreter (`uv run --project ../backend pytest`), so it drops the same
+# caches backend/ and sandbox/ already ignore — this keeps them out of a Node project's tree.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# uv artifacts. `pyproject.toml` here carries pytest/ruff config only and has no [project]
+# table, which uv reads as an implicit VIRTUAL WORKSPACE ROOT (astral-sh/uv#4541) — so any bare
+# `uv` call in portal/ (i.e. one that forgets `--project ../backend`) drops a .venv and an empty
+# 3-line uv.lock into this Node package. There are no Python deps to lock at this level; the
+# harness resolves against backend/uv.lock.
+uv.lock
+.venv/

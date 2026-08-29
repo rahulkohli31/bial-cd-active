@@ -1,7 +1,5 @@
 import { test, expect, type Page } from '@playwright/test'
 
-const PPTX_MT = 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
-
 /**
  * Open a composer and return its hidden file input.
  *
@@ -39,8 +37,13 @@ function watchModelCalls(page: Page): { count: () => number } {
 // Client-side rejections — no network, no model, identical in dev and container.
 // Fixtures are in-memory buffers (no committed binaries): the rejection is decided
 // by extension/size before any upload, so the bytes need not be valid OOXML.
+// BOTH tests below were written when DECK_ATTACHMENTS_ENABLED was on, and #157 B2 turned it
+// off. Neither noticed, because this suite is not in CI (`ci.yml` runs typecheck + lint +
+// vitest), so it stays green until someone runs `npm run e2e` by hand. They are retargeted at
+// the shipped state rather than deleted: the invariant they exist for — a rejected attachment
+// never reaches the model — is flag-independent and worth keeping pinned.
 test.describe('deck attachment rejections (client-side)', () => {
-  test('legacy .ppt is rejected with the "save as .pptx" message (no PDF mention)', async ({ page }) => {
+  test('legacy .ppt gets the generic unsupported-type message, not advice it cannot follow', async ({ page }) => {
     const model = watchModelCalls(page)
     const input = await openComposer(page)
 
@@ -50,28 +53,37 @@ test.describe('deck attachment rejections (client-side)', () => {
       buffer: Buffer.from('legacy-binary-ppt'),
     })
 
-    // The honest message must NOT reveal the internal PDF conversion.
-    const toast = page.getByText('save as .pptx and re-upload')
-    await expect(toast).toBeVisible()
-    await expect(toast).not.toContainText(/pdf/i)
+    // THE DEAD END this test used to pin the wrong side of: with decks off, "save as .pptx"
+    // sent the user to a file the allowlist refuses too. The generic message is the honest
+    // one — it names what IS accepted, so there is a next step.
+    await expect(page.getByText(/isn't supported/)).toBeVisible()
+    await expect(page.getByText(/save as \.pptx/i)).toHaveCount(0)
+    // The `not.toContainText(/pdf/i)` assertion that lived here has moved to
+    // attachmentInput-deck.test.js: it pinned "never reveal the internal deck→PDF
+    // conversion," and the generic copy legitimately lists PDF as an ACCEPTED type. With
+    // decks off there is no conversion to reveal.
 
     // No chip was added and no assistant turn was generated.
     await expect(page.getByText('legacy.ppt')).toHaveCount(0)
     expect(model.count(), 'a rejected attachment must never reach the model').toBe(0)
   })
 
-  test('oversize .pptx (> 4 MB) is rejected and generates no assistant turn', async ({ page }) => {
+  test('an oversize attachment (> 4 MB) is rejected and generates no assistant turn', async ({ page }) => {
     const model = watchModelCalls(page)
     const input = await openComposer(page)
 
+    // A PDF, not the .pptx this used to use: with decks off the allowlist check fires
+    // BEFORE the size check, so an oversize .pptx never reaches the 4 MB cap and this test
+    // silently stopped exercising it. A PDF is accepted at any flag setting, so the cap is
+    // genuinely the thing being tested again.
     await input.setInputFiles({
-      name: 'oversize.pptx',
-      mimeType: PPTX_MT,
+      name: 'oversize.pdf',
+      mimeType: 'application/pdf',
       buffer: Buffer.alloc(4 * 1024 * 1024 + 128 * 1024), // ~4.1 MB > 4 MB cap
     })
 
     await expect(page.getByText('exceeds the 4 MB limit')).toBeVisible()
-    await expect(page.getByText('oversize.pptx')).toHaveCount(0)
+    await expect(page.getByText('oversize.pdf')).toHaveCount(0)
     expect(model.count(), 'a rejected attachment must never reach the model').toBe(0)
   })
 })

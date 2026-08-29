@@ -95,7 +95,10 @@ async def test_a_deploy_that_landed_before_the_crash_is_promoted(db_session) -> 
     assert resolved == 1
     row = await _row(db_session, deployment_id)
     assert row.status is DeploymentStatus.SUCCEEDED
-    assert row.url == "https://pub-x.example.io/"
+    # The reconciler and the pipeline write the SAME column, so they must agree about what an
+    # address means. Composed from the container name rather than the fqdn the reconciler just
+    # read from ARM — that fqdn proves the app is live, it is not where a person goes.
+    assert row.url == f"https://citizenapps.bialairport.com/a/{published_app_name(row.app_id)}"
 
 
 async def test_a_different_image_means_ours_never_landed(db_session) -> None:

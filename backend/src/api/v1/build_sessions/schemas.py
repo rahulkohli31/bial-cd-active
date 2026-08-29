@@ -209,8 +209,10 @@ class RelaunchPreviewResponse(CamelModel):
     the container — cost a citizen their unsaved work."""
 
     app_id: uuid.UUID
-    # the framable https://{fqdn}/ root. Live whenever `ready`; on a degraded attach it is the
-    # right URL for a server that has not answered yet.
+    # The framable PUBLIC address — `https://<apps-host>/a/<app-name>/`, NOT the container's own
+    # ACA fqdn, which an internal environment publishes no public DNS for and a BIAL desk cannot
+    # resolve. Live whenever `ready`; on a degraded attach it is the right URL for a server that
+    # has not answered yet.
     preview_url: str
     status: BuildSessionStatus  # `ready`, or `provisioning` when the app is not serving yet.
     # U6's "last saved version" signal (#43): True when the project's NEWEST recorded build
@@ -246,7 +248,10 @@ class BuildSessionStatusResponse(CamelModel):
     project_id: uuid.UUID
     app_id: uuid.UUID
     status: BuildSessionStatus
-    preview_url: str | None  # the sandbox `next dev` root (un-prefixed). Null until `ready`.
+    # The PUBLIC address the portal frames — prefixed with the app's key. It is NOT the sandbox
+    # `next dev` root: the control plane reaches that directly and privately, and the two are
+    # deliberately different hosts. Null until `ready`.
+    preview_url: str | None
     last_seq: int | None  # highest C7 envelope `seq` so far; a client resumes SSE from it (§4).
     created_at: datetime
     updated_at: datetime
@@ -449,7 +454,9 @@ class PreviewReadyEvent(_ProgressEventBase):
     (C7 §3.4). Flips C3 status → `ready` and triggers the portal iframe (re)load."""
 
     type: Literal["preview_ready"] = "preview_ready"
-    preview_url: str  # the sandbox `next dev` root — un-prefixed `https://{fqdn}/` (C2).
+    # The PUBLIC address — `https://<apps-host>/a/<app-name>/`. Handed straight to the portal's
+    # iframe, so it must be the address a browser can actually resolve, never the container's.
+    preview_url: str
 
 
 class PreviewReconnectingEvent(_ProgressEventBase):

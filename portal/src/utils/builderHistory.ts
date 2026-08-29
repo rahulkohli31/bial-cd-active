@@ -7,7 +7,7 @@
  * app registry + build snapshots.
  *
  * A build header is `{ id, title, createdAt, updatedAt, context, mode }`:
- *   - context: generation settings (theme/uploadedFiles), passed at create so
+ *   - context: generation settings (uploadedFiles), passed at create so
  *     refinements after a resume keep their configuration.
  */
 import { createConversationStore, deriveTitle } from './conversationApi'

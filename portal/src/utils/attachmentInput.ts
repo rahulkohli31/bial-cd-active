@@ -28,8 +28,12 @@ export const DECK_MEDIA_TYPES = new Set([PPTX_MEDIA_TYPE])
 // attachmentStore.buildUserParts), but they share this allowlist so the validator
 // and OS file picker accept them.
 // PowerPoint (.pptx) is OFFERED only when the deck feature is on.
-// resolveMediaType + the legacy-.ppt reject below are flag-independent; the
-// SERVER is the authoritative gate (a clean 501 when off).
+// `resolveMediaType` is flag-independent (canonicalizing a type is not offering
+// it). The legacy-.ppt reject below is NOT: its advice is "save as .pptx", which
+// only leads somewhere while .pptx is in this allowlist. With the flag off the
+// file never leaves the browser, so the server's own gate is not what the user
+// meets — the client is the whole story, and PowerPoint in EVERY form is
+// simply unsupported. See the flag check on that branch (#157 review).
 export const ALLOWED_MEDIA_TYPES = [
   'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf',
   'text/csv', 'text/plain', WORD_MEDIA_TYPE, EXCEL_MEDIA_TYPE,
@@ -129,7 +133,18 @@ export function validateAttachmentFiles(
     // Legacy binary PowerPoint (.ppt) — not the OOXML .pptx. The extension is
     // authoritative: a real .pptx the OS mislabels as `application/vnd.ms-powerpoint`
     // must NOT be rejected (extension wins). `\.ppt$` never matches `.pptx`.
-    if (/\.ppt$/i.test(name) || (file.type === 'application/vnd.ms-powerpoint' && !/\.pptx$/i.test(name))) {
+    //
+    // GATED ON THE FLAG, unlike the .doc reject above. This message's whole value is
+    // the way out it names ("save as .pptx"), and that way out only exists while the
+    // deck feature is on. With it off, .pptx fails the allowlist below too, so a user
+    // who followed this advice would be rejected twice and told nothing new. Falling
+    // through to the generic message instead is both true (PowerPoint is unsupported
+    // in every form here) and followable (it names what IS accepted). Same reasoning
+    // as the `ppt` fragment in that message.
+    if (
+      DECK_ATTACHMENTS_ENABLED &&
+      (/\.ppt$/i.test(name) || (file.type === 'application/vnd.ms-powerpoint' && !/\.pptx$/i.test(name)))
+    ) {
       return { error: LEGACY_PPT_REJECT_MSG }
     }
     const mediaType = resolveMediaType(file)

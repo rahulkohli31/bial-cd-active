@@ -11,11 +11,20 @@ real import cycle (agent -> mode_prompts -> orchestrator -> ... -> projects -> a
 from __future__ import annotations
 
 # The golden-template file manifest (C6) — hard-coded so the model never needs a computed repo
-# map (KD-10). Mirrors `sandbox/template/`. Everything is an editable starting point (R19).
+# map (KD-10). Mirrors `sandbox/template/`. Everything is an editable starting point (R19) EXCEPT
+# `next.config.ts`, which the platform owns: it carries the app's assigned base path, and an app
+# whose config loses it serves at `/` while the router asks for `/a/<key>/` — a preview that
+# loads a blank page while every automated check still reports healthy. The file itself stays
+# technically writable by decision (the sandbox is an open workspace and renaming a file out from
+# under the agent mid-build is a larger behavioural change than the risk it removes), so this
+# prompt text is the control. It must agree with the two other statements below — the categorical
+# grant in the manifest header and the WRITE SURFACE paragraph — because all three ship in the
+# same composed prompt, and a half-correction reads to the model as a contradiction.
 _GOLDEN_TEMPLATE_MANIFEST = """\
 The app starts from a minimal Next.js template (App Router, TypeScript, React, Tailwind v4,
-shadcn/ui, Drizzle + PostgreSQL). Everything below is a starting point you may edit or replace —
-no file is frozen:
+shadcn/ui, Drizzle + PostgreSQL). Everything below is a starting point you may edit or replace,
+with ONE exception — `next.config.ts` is owned by the platform, carries the address your app is
+served at, and must be left exactly as it is:
   app/layout.tsx            root layout — keep the <BialErrorCapture/> mount (it publishes the
                             portal origin to window.__BIAL_CONFIG and captures runtime errors)
   app/page.tsx              home page — replace with your app's UI
@@ -33,7 +42,12 @@ no file is frozen:
   components/ui/*.tsx        shadcn primitives (button, card, dialog, form, input, label, ...) —
                             editable
   components/bial/error-capture.tsx  runtime-error + config-bootstrap shim — editable
-  package.json, next.config.ts, tsconfig.json, postcss.config.mjs, components.json  — editable
+  package.json, tsconfig.json, postcss.config.mjs, components.json  — editable
+  next.config.ts            PLATFORM-OWNED — do NOT edit, replace, or delete it. It carries the
+                            path this app is served under; without it the app answers at `/`
+                            while the platform routes to `/a/<key>/`, and the user sees a blank
+                            page. Nothing you are asked to build needs a change here — put app
+                            configuration in your own files instead.
 Add routes, components, libraries, and dependencies as your app needs them."""
 
 APPLY_SCHEMA_CHANGE_TOOL = "apply_schema_change"
@@ -188,10 +202,11 @@ reach for `npm run build` as a stand-in for it. A check you run yourself costs t
 command to learn what the harness is about to tell you anyway — write your code, end your turn, \
 and read the diagnostic that comes back.
 
-WRITE SURFACE — the WHOLE workspace is editable: feature code, `components/ui/**`, config, \
-`package.json`, and your own schema and migrations included. The only exceptions are `.git/` \
-(protected so the snapshot history stays intact) and paths that escape the workspace (absolute \
-paths or `..`).
+WRITE SURFACE — the workspace is editable: feature code, `components/ui/**`, your own config, \
+`package.json`, and your own schema and migrations included. Three exceptions: `.git/` \
+(protected so the snapshot history stays intact), paths that escape the workspace (absolute \
+paths or `..`), and `next.config.ts` (platform-owned — it carries the address this app is served \
+at, and editing it takes the app off that address while every automated check still passes).
 
 DATA & STORAGE — the platform injects your app's identity, database, and object-store coordinates \
 as environment variables (read them server-side from `process.env`). Write your own data/storage \

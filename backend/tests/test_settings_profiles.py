@@ -37,6 +37,7 @@ import pytest
 from pydantic import ValidationError
 
 from src.settings import ApiSettings, WorkerSettings
+from tests.subprocess_env import child_env
 
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 
@@ -45,6 +46,10 @@ _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 _CORE: dict[str, str] = {
     "ENVIRONMENT": "development",
     "DATABASE_URL": "postgresql+asyncpg://u:p@localhost:5432/citizen_one_test",
+    # Required of BOTH roles with no default: every generated app's browser-facing address is
+    # composed from it, so a profile built without it would fail for a reason unrelated to
+    # whatever that profile is actually testing.
+    "APPS_BASE_URL": "https://citizenapps.bialairport.com",
 }
 _STORE: dict[str, str] = {
     "OBJECT_STORE__ACCOUNT_URL": "https://acct.blob.core.windows.net",
@@ -343,7 +348,7 @@ def test_the_worker_profile_builds_from_os_environ_in_a_fresh_interpreter() -> N
             " print('OK', s.object_store is not None, s.sandbox is not None)",
         ],
         cwd=_BACKEND_ROOT,
-        env={"PATH": os.environ["PATH"], "ENV_FILE": "/nonexistent-on-purpose", **_WORKER_ENV},
+        env=child_env(ENV_FILE="/nonexistent-on-purpose", **_WORKER_ENV),
         capture_output=True,
         text=True,
         check=False,
@@ -388,12 +393,11 @@ def test_the_role_env_var_selects_the_worker_profile() -> None:
             " print('PROFILE:' + type(resolve_settings()).__name__)",
         ],
         cwd=_BACKEND_ROOT,
-        env={
-            "PATH": os.environ["PATH"],
-            "ENV_FILE": "/nonexistent-on-purpose",
-            "BIAL_ROLE": "worker",
+        env=child_env(
+            ENV_FILE="/nonexistent-on-purpose",
+            BIAL_ROLE="worker",
             **_WORKER_ENV,
-        },
+        ),
         capture_output=True,
         text=True,
         check=False,
@@ -424,7 +428,7 @@ def test_importing_the_shim_does_not_construct_settings() -> None:
             "    print('FAILED_ON_ACCESS:' + type(exc).__name__)\n",
         ],
         cwd=_BACKEND_ROOT,
-        env={"PATH": os.environ["PATH"], "ENV_FILE": "/nonexistent-on-purpose"},
+        env=child_env(ENV_FILE="/nonexistent-on-purpose"),
         capture_output=True,
         text=True,
         check=False,
@@ -434,3 +438,67 @@ def test_importing_the_shim_does_not_construct_settings() -> None:
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
     assert "FAILED_ON_ACCESS:ValidationError" in result.stdout, result.stdout
+
+
+# --- APPS_BASE_URL: where a generated app is reached from a browser ---------------------------
+#
+# It is in CORE rather than in a role, so BOTH columns of the manifest say REQUIRED. The API
+# hands the browser a preview address and injects the hostname into every sandbox; the worker's
+# deploy reconciliation writes a published app's real, shared address. A role that could not
+# compose an app address would write an unreachable link and find out when somebody clicked it.
+
+
+def test_both_roles_refuse_to_start_without_the_apps_base_url() -> None:
+    """Fail-first, in both roles. There is no deployment where a guessed value is correct."""
+    api = {**_CORE, **_AUTH, **_ADMINS, **_SUPPORT, **_APP_DB}
+    worker = {**_CORE, **_STORE, **_REDIS, **_SANDBOX}
+    for env in (api, worker):
+        env.pop("APPS_BASE_URL")
+    # `_boot` rather than a bare construction: it disables the env file, so `.env.test` on disk
+    # cannot supply the value and make this pass for the wrong reason.
+    with pytest.raises(ValidationError, match="APPS_BASE_URL"):
+        _boot(ApiSettings, api)
+    with pytest.raises(ValidationError, match="APPS_BASE_URL"):
+        _boot(WorkerSettings, worker)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "citizenapps.bialairport.com",  # no scheme -> composes a relative link
+        "https://citizenapps.bialairport.com/",  # trailing slash -> ...com//a/<key>/
+        "https://citizenapps.bialairport.com/apps",  # a path -> .../apps/a/<key>/
+        "https://",  # no host
+        "ftp://citizenapps.bialairport.com",
+        "",
+    ],
+)
+def test_a_shape_that_would_compose_a_wrong_address_is_refused(bad: str) -> None:
+    """NONE of these raises anywhere downstream. Each produces a plausible-looking URL that goes
+    nowhere, so the first report comes from a colleague who could not open a shared app — which
+    is exactly the class of failure this whole change exists to remove."""
+    env = {**_CORE, **_AUTH, **_ADMINS, **_SUPPORT, **_APP_DB, "APPS_BASE_URL": bad}
+    with pytest.raises(ValidationError, match="APPS_BASE_URL"):
+        _boot(ApiSettings, env)
+
+
+def test_the_apps_hostname_is_stripped_of_its_scheme() -> None:
+    """Next's `serverActions.allowedOrigins` wants a HOST, not an origin. A value carrying a
+    scheme fails CLOSED and silently: the origin comparison never matches, so every form post in
+    every generated app is aborted as a CSRF attempt with no other symptom."""
+    env = {**_CORE, **_AUTH, **_ADMINS, **_SUPPORT, **_APP_DB}
+    assert _boot(ApiSettings, env).apps_hostname == "citizenapps.bialairport.com"
+
+
+@pytest.mark.parametrize("prefix", ["sbx-", "pub-"])
+def test_an_app_url_is_composed_from_the_container_name(prefix: str) -> None:
+    """The key IS the container app's own name, which is what makes the address derivable and is
+    why the router holds no registry. Preview and published differ only by the prefix."""
+    env = {**_CORE, **_AUTH, **_ADMINS, **_SUPPORT, **_APP_DB}
+    name = f"{prefix}1a2b3c4d5e6f70819a2b3c4d5e6f"
+    url = _boot(ApiSettings, env).app_url(name)
+    assert url == f"https://citizenapps.bialairport.com/a/{name}"
+    # NO TRAILING SLASH, measured against a real Next 16 dev server: `/<base>/` answers 308 and
+    # redirects to `/<base>`. A slash here would put a redirect in front of every framed preview
+    # and every published link somebody shares.
+    assert not url.endswith("/")

@@ -813,3 +813,51 @@ async def test_run_commands_dev_server_rule_is_registered_copy_as_well_as_prompt
     assert "already running" in described
     # And the prompt's own wording (U19's guard, restated here because the two travel together).
     assert "do not start, restart, or kill it" in BUILD_SYSTEM_PROMPT.lower()
+
+
+def test_the_harness_never_grants_edit_permission_over_the_platform_config() -> None:
+    """★ THE MUTANT THAT MUST FAIL, and it must fail for ALL THREE statements.
+
+    `next.config.ts` carries the path the app is served under. An app whose config loses it
+    answers at `/` while the router asks for `/a/<key>/`: the preview loads a blank page, and
+    every automated check — the readiness probe, the warm request, an HTTP status check —
+    still reports healthy. The file stays technically writable by decision, so this prompt text
+    IS the control.
+
+    Three separate statements grant edit permission, they all ship in the SAME composed prompt,
+    and correcting fewer than three leaves a contradiction the model can resolve either way:
+
+      1. the manifest header's categorical "no file is frozen"
+      2. the manifest's own line for the file
+      3. the WRITE SURFACE paragraph's categorical "the WHOLE workspace is editable"
+
+    A test that only checked one would go green against a half-fix, which is exactly how the
+    original review missed the third.
+    """
+    prompt = BUILD_SYSTEM_PROMPT
+
+    # 1 — the categorical grant in the manifest header is gone.
+    assert "no file is frozen" not in prompt
+
+    # 2 — the file is named as platform-owned rather than listed among the editable ones.
+    assert "next.config.ts" in prompt, "the manifest must still NAME the file"
+    assert "package.json, next.config.ts" not in prompt, (
+        "the file must not sit in the editable comma-list"
+    )
+    assert "PLATFORM-OWNED" in prompt
+
+    # 3 — the WRITE SURFACE paragraph excepts it alongside `.git/`.
+    write_surface = prompt.split("WRITE SURFACE")[1].split("DATA & STORAGE")[0]
+    assert "next.config.ts" in write_surface, (
+        "the categorical write grant must except the platform config by name"
+    )
+    assert "the WHOLE workspace is editable" not in write_surface
+
+    # And the SAME correction must reach the Write-turn prompt, which is a different composition
+    # over the same blocks. Asserted rather than assumed: if the two ever stop sharing
+    # `prompt_blocks`, a fix applied to one would silently leave the other granting permission.
+    from src.services.agent.mode_prompts import _WRITE_SEGMENT
+
+    assert "no file is frozen" not in _WRITE_SEGMENT
+    assert "the WHOLE workspace is editable" not in _WRITE_SEGMENT
+    assert "next.config.ts" in _WRITE_SEGMENT

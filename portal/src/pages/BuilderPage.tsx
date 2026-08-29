@@ -340,8 +340,12 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const params = useParams()
   const buildId = chatIdProp ?? params.chatId
   const initialPrompt = location.state?.prompt || ''
-  const contextRef = useRef<{ theme: string; uploadedFiles: unknown[] }>({
-    theme: location.state?.theme || 'bial',
+  // `theme` used to ride in here from the builder's Select Theme control. Nothing
+  // downstream ever read it — not the prompt, not the sandbox, not the generated app —
+  // so the control and this key went together (#157 B1). Rows written before that keep an
+  // orphan `theme` in their stored context; harmless, and no migration is needed because
+  // nothing reads it.
+  const contextRef = useRef<{ uploadedFiles: unknown[] }>({
     uploadedFiles: location.state?.uploadedFiles || [],
   })
   const dropTransientQuery = useDropTransientQuery()
@@ -796,7 +800,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         if (!alive || buildIdRef.current !== buildId) return
         loadedBuildRef.current = buildId
         // UNCHECKED (matches pre-migration behavior): the stored context's shape is asserted.
-        if (saved?.context) contextRef.current = saved.context as { theme: string; uploadedFiles: unknown[] }
+        if (saved?.context) contextRef.current = saved.context as { uploadedFiles: unknown[] }
         if (saved?.mode) setChatMode(saved.mode)
         const restored = saved?.messages ?? []
         if (restored.length > 0) {

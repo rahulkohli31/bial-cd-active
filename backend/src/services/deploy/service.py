@@ -56,6 +56,7 @@ import sqlalchemy as sa
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.config import settings
 from src.core.errors import AppApiError
 from src.core.redaction import redact_and_cap
 from src.db.models.app_registry import AppRegistry, ApprovalRoute
@@ -515,7 +516,11 @@ class DeployService:
             digest=built.digest,
         )
         try:
-            fqdn = await self._aca.create_or_update(
+            # The returned FQDN is deliberately NOT bound. It used to become the app's recorded
+            # address; that address is now the router's, composed from the container name. What
+            # this call still provides is the SIDE EFFECT and the failure — the app exists, or it
+            # raises — which is exactly what the `except` below is for.
+            await self._aca.create_or_update(
                 app_id=app_id,
                 deployment_id=deployment_id,
                 image=image,
@@ -543,7 +548,17 @@ class DeployService:
         # that the new REVISION is healthy; in single-revision mode ARM settles the app
         # while a revision can still fail to activate.
         await self._await_revision(app_id=app_id, deployment_id=deployment_id)
-        return f"https://{fqdn}/"
+        # THE ADDRESS A PERSON IS GIVEN, not the container's own. `fqdn` is still what proves the
+        # app exists, and it is still where the platform reaches it — but BIAL's Container Apps
+        # environment is internal and publishes no public DNS, so a colleague who is sent that
+        # name cannot resolve it. This value is recorded on the deployment row, rendered as a
+        # link in the outcome card, and shared outside the platform; it has to be the address
+        # the router actually serves.
+        # Composed from the container app's own name — `pub-` plus 28 hex of the app id,
+        # derived rather than looked up — so the address is STABLE across redeploys. That
+        # stability is the point: a link a colleague already holds keeps working after the
+        # next publish.
+        return settings.app_url(self._aca_name(app_id))
 
     async def _await_revision(self, *, app_id: uuid.UUID, deployment_id: uuid.UUID) -> None:
         deadline = asyncio.get_running_loop().time() + self._aca_config.ready_timeout_s

@@ -8,6 +8,7 @@ import {
   fileToBase64,
   toAttachmentRef,
   ACCEPT_ATTR,
+  ALLOWED_MEDIA_TYPES,
   LEGACY_DOC_REJECT_MSG,
   LEGACY_PPT_REJECT_MSG,
   PPTX_MEDIA_TYPE,
@@ -19,6 +20,8 @@ import {
   MAX_FILES_PER_MESSAGE,
   MAX_ATTACHMENTS_PER_CONVERSATION,
 } from '../attachmentInput'
+// NOT mocked here, deliberately — see the shipped-default block at the bottom.
+import { DECK_ATTACHMENTS_ENABLED } from '../../config/features'
 
 // validateAttachmentFiles only reads name/type/size, so plain objects suffice
 // (and let us set an arbitrary size without allocating megabytes).
@@ -161,10 +164,10 @@ describe('ACCEPT_ATTR', () => {
   })
 })
 
-// These hold regardless of the deck feature flag. The shipped default now has
-// DECK_ATTACHMENTS_ENABLED ON, so the off-state offering is covered separately in
-// attachmentInput-deck-disabled.test.js (which mocks the flag off) rather than
-// asserted against the real flag here.
+// These two hold in BOTH flag states, so they belong in the unmocked file. The
+// per-state behaviour lives in attachmentInput-deck.test.js (ON) and
+// attachmentInput-deck-disabled.test.js (OFF); the shipped default itself is
+// pinned at the bottom of this file, against the real flag.
 describe('deck (.pptx) — flag-independent behavior', () => {
   it('resolveMediaType canonicalizes .pptx by extension even with empty/generic MIME', () => {
     expect(resolveMediaType(file('q3.pptx', ''))).toBe(PPTX_MEDIA_TYPE)
@@ -172,17 +175,12 @@ describe('deck (.pptx) — flag-independent behavior', () => {
     expect(resolveMediaType(file('zip.pptx', 'application/zip'))).toBe(PPTX_MEDIA_TYPE)
   })
 
-  it('rejects a legacy .ppt with a clear "save as .pptx" message (no PDF mention)', () => {
-    expect(validateAttachmentFiles([file('old.ppt', 'application/vnd.ms-powerpoint')], 0)).toEqual({
-      error: LEGACY_PPT_REJECT_MSG,
-    })
-    expect(validateAttachmentFiles([file('deck.ppt', '')], 0)).toEqual({ error: LEGACY_PPT_REJECT_MSG })
-    expect(LEGACY_PPT_REJECT_MSG).not.toMatch(/pdf/i) // invisible conversion
-  })
-
   it('treats a real .pptx the OS mislabels as application/vnd.ms-powerpoint by extension (never as legacy .ppt)', () => {
     // Extension wins over the ms-powerpoint mislabel, so it is NEVER the legacy
-    // .ppt rejection — independent of whether the deck feature is on or off.
+    // .ppt rejection. True in both flag states, for two different reasons: with decks
+    // ON the branch's own `!/\.pptx$/` guard excludes it, and with decks OFF the branch
+    // does not run at all. Either way this file gets the generic message, never advice
+    // to convert a file it already is.
     const res = validateAttachmentFiles([file('real.pptx', 'application/vnd.ms-powerpoint')], 0)
     expect(res.error || '').not.toBe(LEGACY_PPT_REJECT_MSG)
   })
@@ -220,5 +218,40 @@ describe('fileToBase64', () => {
   it('reads a Blob as raw base64 (data: prefix stripped)', async () => {
     const blob = new File(['ABC'], 'a.png', { type: 'image/png' })
     expect(await fileToBase64(blob)).toBe('QUJD') // base64('ABC')
+  })
+})
+
+// THE SHIPPED DEFAULT, asserted against the real flag rather than a mocked one.
+//
+// This block exists because #157 B2 turned the deck feature off and NOTHING went red.
+// Both deck spec files `vi.mock('../../config/features')`, so between them they cover
+// the two hypothetical worlds and neither says which one we ship — flipping
+// DECK_ATTACHMENTS_ENABLED back to `true` failed zero tests. A mocked module cannot
+// pin a shipped default; only an unmocked import can, which is why this file imports
+// it directly and why these assertions live here rather than beside their siblings.
+describe('the deck feature is OFF in the shipped build', () => {
+  it('ships with DECK_ATTACHMENTS_ENABLED false', () => {
+    // Half of "turn decks on" (#157 B2). The other half is a reachable GOTENBERG_URL
+    // server-side; flipping this alone re-offers a capability the server refuses.
+    expect(DECK_ATTACHMENTS_ENABLED).toBe(false)
+  })
+
+  it('offers .pptx nowhere in the real allowlist or the real OS picker', () => {
+    expect(ALLOWED_MEDIA_TYPES).not.toContain(PPTX_MEDIA_TYPE)
+    expect(ACCEPT_ATTR).not.toContain('.pptx')
+    expect(ACCEPT_ATTR).not.toContain(PPTX_MEDIA_TYPE)
+  })
+
+  it('THE DEAD END: a rejected .ppt is never told to save as .pptx', () => {
+    // The bug this pins: "save as .pptx and re-upload" is only followable while .pptx
+    // is in the allowlist above. With decks off, a user who followed it was rejected a
+    // SECOND time and told nothing new. The generic message is the honest one — it
+    // names what IS accepted, so there is a next step.
+    const res = validateAttachmentFiles([file('deck.ppt', 'application/vnd.ms-powerpoint')], 0)
+    expect(res.error).not.toBe(LEGACY_PPT_REJECT_MSG)
+    expect(res.error).not.toMatch(/save as \.pptx/i)
+    expect(res.error).toMatch(/isn't supported/)
+    // ...and the generic copy must not advertise the feature that is off.
+    expect(res.error).not.toMatch(/powerpoint/i)
   })
 })

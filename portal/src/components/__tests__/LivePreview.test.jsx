@@ -16,9 +16,11 @@ function setup(props = {}) {
   return { ...view, iframe }
 }
 
-// A message that passes the C8 origin guard (comes from the sandbox origin).
-function fromSandbox(data) {
-  return new MessageEvent('message', { data, origin: SANDBOX_ORIGIN })
+// A message that passes BOTH halves of the C8 §3 guard: the sandbox origin AND the window of the
+// frame this pane actually rendered. Origin alone stopped being sufficient once every generated
+// app began sharing one hostname, so `source` is no longer optional decoration on these events.
+function fromSandbox(data, source) {
+  return new MessageEvent('message', { data, origin: SANDBOX_ORIGIN, source })
 }
 
 describe('LivePreview — cross-origin sandbox preview frame (C8)', () => {
@@ -43,11 +45,50 @@ describe('LivePreview — cross-origin sandbox preview frame (C8)', () => {
     expect(onFrameMessage).not.toHaveBeenCalled()
   })
 
-  it('forwards ONLY an origin-valid inbound message to the Wave-1 receiver seam', () => {
+  it('forwards a message from the framed app’s OWN window to the Wave-1 receiver seam', () => {
     const onFrameMessage = vi.fn()
-    setup({ onFrameMessage })
-    window.dispatchEvent(fromSandbox({ kind: 'client_error' }))
+    const { iframe } = setup({ onFrameMessage })
+    window.dispatchEvent(fromSandbox({ kind: 'client_error' }, iframe.contentWindow))
     expect(onFrameMessage).toHaveBeenCalledWith({ kind: 'client_error' })
+  })
+
+  // THE ASSERTION THAT SURVIVES THE SHARED HOSTNAME. Every generated app is served from one name
+  // now (BIAL refused a wildcard certificate), so `e.origin` is identical for all of them and can
+  // no longer say WHICH app spoke. The reachable impostor is not a separate tab — the portal opens
+  // every app link with rel="noopener", so no tab it opens holds a handle back — it is another
+  // frame inside this same portal document, which is exactly what the second iframe below stands
+  // in for: same origin, different window.
+  //
+  // ASSERT-ABSENCE, PAIRED WITH LIVENESS. jsdom SWALLOWS a throw inside a window listener, so
+  // `dispatchEvent` returns normally and a bare `.not.toHaveBeenCalled()` is equally green over a
+  // handler that crashed, or one that rejects everything. The genuine message afterwards is what
+  // makes the rejection mean "rejected THIS sender" rather than "the gate is dead".
+  it('REJECTS a correct-origin message sent from a DIFFERENT window — origin alone no longer authorises', () => {
+    const onFrameMessage = vi.fn()
+    const { iframe } = setup({ onFrameMessage })
+    const impostor = document.body.appendChild(document.createElement('iframe'))
+    try {
+      window.dispatchEvent(fromSandbox({ kind: 'client_error' }, impostor.contentWindow))
+      expect(onFrameMessage).not.toHaveBeenCalled()
+
+      // LIVENESS: the very same payload from the pane's OWN frame still gets through.
+      window.dispatchEvent(fromSandbox({ kind: 'client_error' }, iframe.contentWindow))
+      expect(onFrameMessage).toHaveBeenCalledWith({ kind: 'client_error' })
+    } finally {
+      impostor.remove()
+    }
+  })
+
+  it('REJECTS a correct-origin message carrying NO source at all (fails closed, not open)', () => {
+    // The mutant this exists for: written as `e.source !== ref.current?.contentWindow`, flipping
+    // `!==` to `!=` makes `null == undefined` true for an unmounted pane and accepts every
+    // source-less message. Liveness paired for the same jsdom reason as above.
+    const onFrameMessage = vi.fn()
+    const { iframe } = setup({ onFrameMessage })
+    window.dispatchEvent(fromSandbox({ kind: 'client_error' }))
+    expect(onFrameMessage).not.toHaveBeenCalled()
+    window.dispatchEvent(fromSandbox({ kind: 'client_error' }, iframe.contentWindow))
+    expect(onFrameMessage).toHaveBeenCalledTimes(1)
   })
 
   it('rejects ALL inbound messages when previewUrl is null (preview dark, origin unknowable)', () => {
@@ -76,8 +117,10 @@ describe('LivePreview — cross-origin sandbox preview frame (C8)', () => {
   it('the single-file relay is INERT — no outbound postMessage of code/config/token occurs (ORIG-§3-a)', () => {
     const { iframe } = setup({ status: 'ready' })
     const post = vi.spyOn(iframe.contentWindow, 'postMessage')
-    // A previewReady-style message that USED to round-trip code back must now do nothing.
-    window.dispatchEvent(fromSandbox({ previewReady: true }))
+    // A previewReady-style message that USED to round-trip code back must now do nothing. Sent
+    // from the frame's own window on purpose: source-less, it would be dropped by the C8 §3 gate
+    // before reaching any code, and this test would assert inertness over a message nothing read.
+    window.dispatchEvent(fromSandbox({ previewReady: true }, iframe.contentWindow))
     expect(post).not.toHaveBeenCalled()
   })
 })

@@ -66,11 +66,13 @@ EMPTY_TRANSCRIPT: Final = -1
 # out of that parse, which is the point: this string is rendered straight into an `<a href>` in the
 # portal's outcome card, same-origin with the user's session.
 #
-# Nothing reaching here should ever fail it — the only writer is this module and the only value is
-# the ACA FQDN the platform itself minted onto the sandbox handle. That is precisely why the check
-# is cheap to keep: it is the fail-closed floor under "we only write URLs we minted", so that claim
-# stays true by validation rather than by every future producer of `handle.preview_url` being
-# careful.
+# Nothing reaching here should ever fail it — the only writer is this module, and the only value is
+# the public app address the platform itself composed onto the sandbox handle. That address is now
+# `https://<apps-host>/a/<app-name>/` rather than the ACA FQDN it used to be; it CARRIES A PATH,
+# and the constraint above still passes it, because the constraint is scheme plus length and never
+# host or shape. That is precisely why the check is cheap to keep: it is the fail-closed floor
+# under "we only write URLs we minted", so that claim stays true by validation rather than by every
+# future producer of `handle.preview_url` being careful.
 _PREVIEW_URL_MAX_CHARS: Final = 2048
 _PREVIEW_URL: Final[TypeAdapter[AnyUrl]] = TypeAdapter(
     Annotated[AnyUrl, UrlConstraints(max_length=_PREVIEW_URL_MAX_CHARS, allowed_schemes=["https"])]
