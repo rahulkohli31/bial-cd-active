@@ -76,12 +76,14 @@ export default function Dashboard() {
 
       <footer className="border-t border-bial-border bg-white py-4 px-6">
         <div className="max-w-5xl mx-auto flex items-center justify-between">
-          {/* No version string. "V 2.4.0-Build" was invented — the real product version is
-              1.6.17 (root VERSION) / 1.5.0 (package.json), and 2.4.0 appears nowhere in
-              the repo. This was the ONLY version the product reported about itself, so an
-              invented one was worse than none (#157 C1). Wiring the real value needs a
-              Vite `define` fed from the root VERSION file — a build-config change, filed
-              rather than done from a UI-removal chore. */}
+          {/* No version string. "V 2.4.0-Build" was invented — 2.4.0 appears nowhere in the
+              repo. The real product version is the root VERSION file; portal's package.json
+              carries its own separate number and is not it. This was the ONLY version the
+              product reported about itself, so an invented one was worse than none (#157 C1).
+              Wiring the real value needs a Vite `define` fed from the root VERSION file — a
+              build-config change, filed rather than done from a UI-removal chore.
+              Deliberately no literal version in this comment: the previous one hardcoded
+              1.6.17 and was stale within two releases. */}
           <p className="text-xs text-neutral">Kempegowda International Airport Bengaluru</p>
           <div className="flex gap-5">
             <button

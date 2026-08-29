@@ -231,8 +231,11 @@ def _live_catalog(search: str | None) -> tuple[sa.Select[Any], type[Deployment]]
         # generic plan cannot prove `status = $1` implies `ix_deployments_success_collapse`'s
         # `status = 'succeeded'` predicate, so it drops the index and falls back to a Seq
         # Scan — measured at 5.2k apps / 52k rows as 13-15ms for executions 1-5 and 27-30ms
-        # from execution 6 (#147 round 3). `deploy/store.py`'s `_IN_FLIGHT_PREDICATE` is the
-        # same fix for the same reason on `uq_deployments_one_in_flight`.
+        # from execution 6 (#147 round 3). `deploy/store.py`'s `_IN_FLIGHT_PREDICATE` renders
+        # a literal too, but for a DIFFERENT reason: it is only ever an `index_where=` on an
+        # ON CONFLICT, and arbiter inference is a compile-time syntactic match, so it faces
+        # no plan-cache risk at all. Same remedy, different cause — neither one is evidence
+        # that the other is handled.
         #
         # `literal_execute` rather than that module's `sa.text`: it renders the identical
         # SQL while keeping the value the ENUM, so renaming `SUCCEEDED` moves the predicate
