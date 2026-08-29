@@ -268,6 +268,21 @@ export default function ProjectDescriptionEditor({
               className="w-full rounded-xl border border-bial-border bg-white px-3 py-2 text-sm text-tertiary placeholder:text-neutral focus:outline-none focus:ring-2 focus:ring-primary/30 disabled:bg-bial-bg disabled:text-neutral resize-y"
             />
 
+            {/* THE WRITE-SURFACE NOTICE (#147). This field was introduced as CHAT GROUNDING
+                — private context for the builder's own assistant — and the marketplace
+                republishes it verbatim to the whole org and indexes it for full-text search.
+                It can also be model-written from the app's source by Generate above, so the
+                text being broadcast is not necessarily anything the author composed or read.
+                Not a leak (it is the owner's own field on their own project), but "the
+                sentence I typed to orient the assistant" and "my app's public listing copy"
+                are two different acts of writing sharing one input, and nothing here said
+                so. Stated at the WRITE surface because that is the only place it can change
+                what someone types. */}
+            <p className="mt-2 text-xs text-neutral">
+              Once your app is published, this becomes its listing in the Marketplace —
+              visible to everyone at BIAL and searchable by these words.
+            </p>
+
             {mode === 'generating' && (
               <p className="mt-2 flex items-center gap-1.5 text-xs text-neutral" role="status">
                 <Loader2 size={13} className="animate-spin text-primary" />

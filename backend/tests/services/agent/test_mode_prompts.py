@@ -80,7 +80,13 @@ def test_every_mode_carries_the_truthful_portal_self_description(
     assert "There are no other tabs" in composed
     assert "say so plainly" in composed
     # Named surfaces exist as routes in `portal/src/App.jsx` — extend clause and list together.
-    for real_surface in ("Dashboard", "Projects list", "Help page", "Admin review area"):
+    for real_surface in (
+        "Dashboard",
+        "Projects list",
+        "Help page",
+        "Marketplace",
+        "Admin review area",
+    ):
         assert real_surface in composed
     # R10: the unified chat's right pane is the APP. The relay's retiring wording said the
     # builder view was "a chat beside a live preview"; this layout must not be re-described.

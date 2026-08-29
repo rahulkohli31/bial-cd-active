@@ -16,6 +16,7 @@ import BIALLogo from '../BIALLogo'
 
 const NAV_LINKS = [
   { label: 'Projects', to: '/projects' },
+  { label: 'Marketplace', to: '/marketplace' },
   { label: 'Help', to: '/help' },
 ]
 

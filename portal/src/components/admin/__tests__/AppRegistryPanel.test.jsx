@@ -122,6 +122,38 @@ describe('AppRegistryPanel — registry vocabulary + actions', () => {
     expect(screen.getAllByText('Pending Review').length).toBeGreaterThan(0) // tab + badge
   })
 
+  it('warns that rejecting a LIVE app de-lists it, and says how to actually take it down', async () => {
+    // Rejecting sets a standing rejection, which the marketplace query reads — so the app
+    // vanishes from the catalog while its URL keeps serving, and only the OWNER can undo it
+    // by submitting again. Submit is legal from APPROVED, so an admin rejecting a
+    // re-submission of a running app was doing this blind (#147 round 3 review).
+    h.listApps.mockResolvedValue([{ ...PENDING, deployedUrl: 'https://live.example/' }])
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await screen.findByText('Gate Tool')
+    fireEvent.click(screen.getByTestId('review-app-1'))
+    fireEvent.click(screen.getByTestId('reject-btn'))
+
+    const warning = screen.getByTestId('reject-delists-warning')
+    expect(warning.textContent).toMatch(/removes it from the Marketplace/i)
+    expect(warning.textContent).toMatch(/only its owner can undo/i)
+    // The actionable half: the lever that really takes an app down is Unpublish.
+    expect(warning.textContent).toMatch(/Unpublish/i)
+  })
+
+  it('does NOT warn about de-listing when the app was never deployed', async () => {
+    // The other direction, so the assertion above cannot pass by always rendering. A
+    // never-deployed app is in no catalog, so the warning would be noise on the common case.
+    h.listApps.mockResolvedValue([{ ...PENDING, deployedUrl: null }])
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await screen.findByText('Gate Tool')
+    fireEvent.click(screen.getByTestId('review-app-1'))
+    fireEvent.click(screen.getByTestId('reject-btn'))
+
+    // Liveness: the reject pane really is open, so the absence below is meaningful.
+    expect(screen.getByTestId('reject-confirm')).toBeTruthy()
+    expect(screen.queryByTestId('reject-delists-warning')).toBeNull()
+  })
+
   it('the review modal shows submission METADATA (SHA, submitted-at) and no internal ids', async () => {
     render(<AppRegistryPanel onToast={() => {}} />)
     await screen.findByText('Gate Tool')

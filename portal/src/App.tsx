@@ -5,6 +5,7 @@ import Dashboard from './pages/Dashboard'
 import HelpPage from './pages/HelpPage'
 import AdminPage from './pages/AdminPage'
 import ChatRoute from './pages/ChatRoute'
+import MarketplacePage from './pages/MarketplacePage'
 import ProjectsPage from './pages/ProjectsPage'
 import ProjectPage from './pages/ProjectPage'
 import { isAuthenticated, bootstrapSession } from './utils/auth'
@@ -77,6 +78,8 @@ export default function App() {
 
         {/* Project-first: a project is the thing you open, name, and return to. */}
         <Route path="/projects" element={<RequireAuth><ProjectsPage /></RequireAuth>} />
+        {/* Cross-user by design (#145): every signed-in BIAL user sees the same catalog. */}
+        <Route path="/marketplace" element={<RequireAuth><MarketplacePage /></RequireAuth>} />
         <Route path="/projects/:projectId" element={<RequireAuth><ProjectPage /></RequireAuth>} />
 
         {/* One flat chat URL for both kinds. ChatRoute reads the conversation's `kind`

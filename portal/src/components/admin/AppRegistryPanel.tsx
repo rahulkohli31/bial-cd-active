@@ -313,6 +313,18 @@ function ReviewModal({ app, withdrawn, onClose, onApprove, onReject }: ReviewMod
                       ? `This is the only thing the developer gets back — write at least ${MIN_REJECTION_NOTE} characters (${trimmedNote.length} so far).`
                       : 'This goes straight back to the developer.'}
                   </p>
+                  {/* Only when the app is actually SERVING. Rejecting sets a standing
+                      rejection, which the marketplace reads — so a live app vanishes from
+                      the catalog while its URL keeps working, and only the OWNER can
+                      re-submit to undo it. An admin rejecting a re-submission of an
+                      already-approved app had no way to know that (#147 round 3 review). */}
+                  {app.deployedUrl && (
+                    <p data-testid="reject-delists-warning" className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mt-2">
+                      This app is live. Rejecting removes it from the Marketplace but leaves
+                      it running at its URL, and only its owner can undo that by submitting
+                      again. To take it down, use Unpublish instead.
+                    </p>
+                  )}
                 </div>
               )}
               <div className="flex gap-3">

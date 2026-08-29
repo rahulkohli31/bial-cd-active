@@ -610,6 +610,19 @@ async def reject(
     # `rejection_standing` is the half that OUTLIVES this status (P4): the citizen may
     # legitimately move the row out of REJECTED by publishing (which routes) and then
     # withdrawing, so the refusal cannot live in `status`. Only `approve` lowers it.
+    #
+    # THIS ALSO DE-LISTS A LIVE APP FROM THE MARKETPLACE, and the admin gets no signal.
+    # Submit is legal from APPROVED (`_SUBMIT_FROM = STATUS_TRANSITIONS[PENDING]`), so an
+    # already-approved app that is serving traffic can be re-submitted and rejected here.
+    # `marketplace/router.py` reads `rejection_standing`, so the app KEEPS SERVING at its
+    # URL while disappearing from the catalog. That is deliberate and fails closed — a
+    # standing rejection is an app-level bar on publishing, so "not publishable" and "not
+    # advertised" are one policy.
+    #
+    # The gap is RECOVERY: only the OWNER can re-submit, so an app whose owner has left
+    # BIAL stays running-but-invisible with no admin path back. `approve` is the only
+    # thing that lowers `rejection_standing`, and it needs a pending submission to act on.
+    # Use `unpublish` if the intent is to actually take the app down (#147 round 3 review).
     moved = await _transition(
         db,
         app_id,

@@ -121,7 +121,13 @@ def test_self_description_names_only_surfaces_the_portal_actually_has() -> None:
     the say-so-plainly instruction, which are what actually stop the model from inventing
     a Settings page to send the user to. If the portal grows a surface, extend the clause
     AND this list together."""
-    for real_surface in ("Dashboard", "Projects list", "Help page", "Admin review area"):
+    for real_surface in (
+        "Dashboard",
+        "Projects list",
+        "Help page",
+        "Marketplace",
+        "Admin review area",
+    ):
         assert real_surface in PORTAL_SELF_DESCRIPTION
     assert "live preview" in PORTAL_SELF_DESCRIPTION
     assert "submit-for-review" in PORTAL_SELF_DESCRIPTION

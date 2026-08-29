@@ -91,6 +91,33 @@ describe('ProjectDescriptionEditor — read view and pop-up open/close', () => {
     expect(textarea().value).toBe('stored text')
   })
 
+  it('tells the author, at the write surface, that this becomes public catalog copy', () => {
+    // `Project.description` was introduced as CHAT GROUNDING, and the marketplace (#145/#147)
+    // republishes it verbatim org-wide and makes it full-text searchable. It can also be
+    // model-written from the app's source by Generate, so the broadcast text is not
+    // necessarily anything the author composed. Nothing here said so, and the notice belongs
+    // at the WRITE surface because that is the only place it can change what someone types.
+    render(<ProjectDescriptionEditor projectId="p1" description="stored text" onProjectUpdate={vi.fn()} />)
+
+    openEditor()
+
+    const notice = screen.getByText(/becomes its listing in the Marketplace/i)
+    expect(notice).toBeTruthy()
+    // Both halves of the exposure: who can see it, and that the words are the search index.
+    expect(notice.textContent).toMatch(/everyone at BIAL/i)
+    expect(notice.textContent).toMatch(/searchable/i)
+  })
+
+  it('does not show the public-listing notice until the editor is actually open', () => {
+    // The other direction, so the assertion above cannot pass by always rendering. The
+    // read-only card is not a write surface, so the notice would be noise there.
+    render(<ProjectDescriptionEditor projectId="p1" description="stored text" onProjectUpdate={vi.fn()} />)
+
+    expect(screen.queryByText(/becomes its listing in the Marketplace/i)).toBeNull()
+    // Liveness: the card really did render, so this absence means something.
+    expect(editBtn()).toBeTruthy()
+  })
+
   it('Cancel closes the pop-up WITHOUT saving and discards unsaved typing', () => {
     render(<ProjectDescriptionEditor projectId="p1" description="stored text" onProjectUpdate={vi.fn()} />)
 

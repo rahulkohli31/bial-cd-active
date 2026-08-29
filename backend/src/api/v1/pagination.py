@@ -61,7 +61,8 @@ def clean_limit(value: int) -> int:
 
 
 def clean_search(q: str | None) -> str | None:
-    """Normalize a `?q=` token: strip, empty → None (no filter), over-long → 422."""
+    """Normalize a `?q=` token: strip, empty → None (no filter), over-long or
+    unrepresentable → 422."""
     if q is None:
         return None
     q = q.strip()
@@ -69,6 +70,14 @@ def clean_search(q: str | None) -> str | None:
         return None
     if len(q) > MAX_SEARCH_Q:
         raise AppApiError(422, f"q must be at most {MAX_SEARCH_Q} characters.")
+    # A NUL byte is not representable in a Postgres text value, so it reaches asyncpg and
+    # raises `CharacterNotInRepertoireError` — escaping as an unhandled 500 on an
+    # authenticated endpoint. Rejected HERE rather than at any one call site because this
+    # function is the platform's `?q=` boundary: the same input 500s `/v1/projects` and the
+    # admin roster identically (#147 round 3). No info disclosure — the cost was a lying
+    # error contract, since every caller documents a 422 for a bad `q`.
+    if "\x00" in q:
+        raise AppApiError(422, "q contains an unsupported character.")
     return q
 
 

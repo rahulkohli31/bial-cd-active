@@ -113,6 +113,40 @@ class Deployment(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base):
             unique=True,
             postgresql_where=sa.text("status = 'running'"),
         ),
+        # THE MARKETPLACE'S TWO COLLAPSES (#145, migration 0034). Partial indexes matching
+        # `_live_catalog`'s predicates exactly, so each collapse is an index scan rather
+        # than a Seq Scan of this table.
+        #
+        # The reason they are worth having on a 10-200 app catalog: this table is
+        # APPEND-ONLY with no reaper, so what the collapses scan is TOTAL HISTORICAL DEPLOY
+        # ATTEMPTS across the platform's life, not the number of live apps. Measured on
+        # PG18 at 51k rows: ~100-180ms of DB time per request without these, ~35ms with
+        # (#147 round 3). Declared here, not only in the migration, so `--autogenerate`
+        # does not emit a `drop_index` for them.
+        #
+        # THE SUCCESS INDEX HAS A LOAD-BEARING REQUIREMENT ON ITS QUERY: the `status`
+        # predicate in `marketplace/router.py` must render as a LITERAL. As a bound
+        # parameter the planner cannot prove `status = $1` implies this index's
+        # `status = 'succeeded'`, so from the 6th execution on a pooled connection —
+        # once Postgres switches to a generic plan — the index goes unused and the table
+        # pays its write and storage cost for nothing. That is the fact most likely to be
+        # silently undone by a later refactor, and no functional test can see it: the
+        # answer stays correct and only the plan degrades. The compiled SQL is pinned by
+        # `test_the_success_collapse_predicate_renders_a_literal`.
+        #
+        # The unpublished index below is immune — its predicate carries no parameter.
+        sa.Index(
+            "ix_deployments_success_collapse",
+            "app_id",
+            sa.text("id DESC"),
+            postgresql_where=sa.text("status = 'succeeded' AND url IS NOT NULL"),
+        ),
+        sa.Index(
+            "ix_deployments_unpublished_collapse",
+            "app_id",
+            sa.text("id DESC"),
+            postgresql_where=sa.text("unpublished_at IS NOT NULL"),
+        ),
     )
 
     # The app this deploy publishes. CASCADE so a deleted app can never leave a row
