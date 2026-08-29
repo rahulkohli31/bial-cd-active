@@ -4,6 +4,46 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.19] - 2026-08-29
+
+### Added
+
+- A Marketplace of every app published at BIAL, reachable from the header and open to
+  everyone who is signed in. Until now an app could only be opened by someone who had
+  been sent its link, so there was no way to answer "has anyone already built this?" —
+  and people spent build time recreating tools that were already running.
+- Search the Marketplace by what an app does. What you type is matched against the app's
+  description and results come back best-match-first rather than newest-first; quoted
+  phrases and negation behave the way they do in an ordinary search box. An app whose
+  description is empty still appears in the full list, but cannot be found by typing —
+  descriptions are not yet written automatically.
+- Apps join the Marketplace on their own once they are live. There is no listing step and
+  no setting anyone has to remember, and unpublishing an app takes it back out. Each entry
+  shows the app's name, its description, who built it, and a button that opens it.
+
+### Removed
+
+- The header controls that did nothing when clicked: the "Search pages or actions" box,
+  whose entire index was three links already sitting in the nav above it; the notification
+  bell, which only ever repeated a count already shown on the Admin link beside it; the
+  settings gear, whose four items all produced the same "Coming soon" message; and
+  "My Profile" under your own avatar, which was the same placeholder.
+- The theme picker in the project builder. Picking a theme changed the label on the picker
+  and nothing else — no part of the app that got built ever read the choice.
+- PowerPoint (.pptx) from the attachment picker. A deck could be attached but never sent:
+  every attempt failed at send time, so the option offered nothing but the failure.
+
+### Changed
+
+- Four Help Center answers described behaviour the product does not have. They now match
+  what it actually does.
+
+### Fixed
+
+- The backend test suite can now be run from a Windows checkout. Fifteen tests were failing
+  there for a reason that had nothing to do with what they were testing, which made a
+  perfectly healthy checkout look broken.
+
 ## [1.6.18] - 2026-08-26
 
 ### Added
