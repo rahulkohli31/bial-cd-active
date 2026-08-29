@@ -123,6 +123,18 @@ class Deployment(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base):
         # PG18 at 51k rows: ~100-180ms of DB time per request without these, ~35ms with
         # (#147 round 3). Declared here, not only in the migration, so `--autogenerate`
         # does not emit a `drop_index` for them.
+        #
+        # THE SUCCESS INDEX HAS A LOAD-BEARING REQUIREMENT ON ITS QUERY: the `status`
+        # predicate in `marketplace/router.py` must render as a LITERAL. As a bound
+        # parameter the planner cannot prove `status = $1` implies this index's
+        # `status = 'succeeded'`, so from the 6th execution on a pooled connection —
+        # once Postgres switches to a generic plan — the index goes unused and the table
+        # pays its write and storage cost for nothing. That is the fact most likely to be
+        # silently undone by a later refactor, and no functional test can see it: the
+        # answer stays correct and only the plan degrades. The compiled SQL is pinned by
+        # `test_the_success_collapse_predicate_renders_a_literal`.
+        #
+        # The unpublished index below is immune — its predicate carries no parameter.
         sa.Index(
             "ix_deployments_success_collapse",
             "app_id",

@@ -169,21 +169,32 @@ def _live_catalog(search: str | None) -> tuple[sa.Select[Any], type[Deployment]]
         publish unattended." That round trip ends with `status` back at DRAFT, which the
         first predicate would list.
 
-    WHAT THIS DOES NOT GIVE YOU, and the reason it is spelled out: `disable` is NOT a
-    working kill-switch for the ordinary member of this catalog.
-    `STATUS_TRANSITIONS[DISABLED] == {APPROVED}`, so `admin/router.py` answers 409 "Only an
-    approved app can be disabled" for anything else — and a one-click deploy never writes
-    `status` at all (`deployment.py`: "there is no admin approval on this path... a
-    self-deployed app is still `draft`"). A DRAFT app cannot be rejected either
-    (`STATUS_TRANSITIONS[DRAFT] == {PENDING}`). So for a self-published app the only lever
-    left is `unpublish`, which `deploy/router.py` itself disclaims as "AN OPERATOR
-    CONVENIENCE, NOT AN ENFORCEMENT LEVER" — it leaves the per-app Postgres role
-    LOGIN-enabled and the owner can republish at the same URL one click later.
+    WHAT THIS DOES NOT GIVE YOU: `disable` and `reject` are NOT available for the ordinary
+    member of this catalog. `STATUS_TRANSITIONS[DISABLED] == {APPROVED}`, so
+    `admin/router.py` answers 409 "Only an approved app can be disabled" for anything else
+    — and a one-click deploy never writes `status` at all (`deployment.py`: "there is no
+    admin approval on this path... a self-deployed app is still `draft`"). A DRAFT app
+    cannot be rejected either (`STATUS_TRANSITIONS[DRAFT] == {PENDING}`).
 
-    These predicates stop such an app being ADVERTISED once someone marks it; they do not
-    give an admin a way to mark it. Widening `STATUS_TRANSITIONS[DISABLED]` to accept
-    DRAFT/PENDING/REJECTED is the actual fix and is filed separately — deliberately not
-    smuggled into a marketplace PR, since it changes an existing admin route's contract.
+    WHAT AN ADMIN CAN DO TODAY, stated precisely because this is the paragraph someone reads
+    during an incident: `unpublish` + `deactivate` IS a working, durable takedown.
+    `POST /v1/admin/apps/{id}/unpublish` carries no `AppStatus` guard at all, so it returns
+    200 on a self-published DRAFT app, deletes the container, and drops it from browse and
+    search. `deploy/router.py` disclaims it as "AN OPERATOR CONVENIENCE, NOT AN ENFORCEMENT
+    LEVER" because on its own the owner can republish one click later — so pair it with
+    `POST /v1/admin/users/{id}/deactivate`, which stamps `suspended_at`, bumps
+    `token_version` and revokes every refresh family, and the redeploy fails in the shared
+    auth dependency. (An earlier draft of this docstring said `unpublish` was the only lever
+    and undersold it; that was wrong, and it is corrected here rather than left to mislead.)
+
+    Widening `STATUS_TRANSITIONS[DISABLED]` to accept DRAFT/PENDING/REJECTED would give an
+    admin the ADVERTISING switch directly instead of via the takedown pair. Filed as #163,
+    and NOT a one-liner: `enable` returns DISABLED -> APPROVED guarded on
+    `approved_submission_id IS NOT NULL`, which a self-published app never has, so widening
+    `disable` alone strands the app in DISABLED for good. Un-sticking that needs DISABLED in
+    `STATUS_TRANSITIONS[DRAFT]` — which `withdraw` also reads, and `withdraw` is
+    citizen-facing, so it would let an app's OWNER undo an admin kill switch. The fix is a
+    lifecycle decision, not a predicate change, which is why it is not in a catalog PR.
 
     SUSPENDED OWNERS are a decision, not an accident of the `User` join: an already-published
     app does not stop being useful to someone else merely because its builder's account is
@@ -213,7 +224,28 @@ def _live_catalog(search: str | None) -> tuple[sa.Select[Any], type[Deployment]]
     )
     last_success = (
         sa.select(Deployment)
-        .where(Deployment.status == DeploymentStatus.SUCCEEDED, Deployment.url.is_not(None))
+        # THE `status` PREDICATE MUST RENDER AS A LITERAL, which is what `literal_execute`
+        # buys and a plain `Deployment.status == ...` does not. That renders `status = $1`,
+        # and asyncpg prepares server-side against a long-lived pool (`pool_size=20`, no
+        # recycle), so from the 6th execution on a connection Postgres plans generically. A
+        # generic plan cannot prove `status = $1` implies `ix_deployments_success_collapse`'s
+        # `status = 'succeeded'` predicate, so it drops the index and falls back to a Seq
+        # Scan — measured at 5.2k apps / 52k rows as 13-15ms for executions 1-5 and 27-30ms
+        # from execution 6 (#147 round 3). `deploy/store.py`'s `_IN_FLIGHT_PREDICATE` is the
+        # same fix for the same reason on `uq_deployments_one_in_flight`.
+        #
+        # `literal_execute` rather than that module's `sa.text`: it renders the identical
+        # SQL while keeping the value the ENUM, so renaming `SUCCEEDED` moves the predicate
+        # with it instead of leaving a string that silently matches nothing.
+        #
+        # Nothing here fails loudly if this regresses — the answer stays correct and only
+        # the plan degrades — so `test_the_success_collapse_predicate_renders_a_literal`
+        # pins the compiled SQL.
+        .where(
+            Deployment.status
+            == sa.bindparam("succeeded", DeploymentStatus.SUCCEEDED, literal_execute=True),
+            Deployment.url.is_not(None),
+        )
         .distinct(Deployment.app_id)
         .order_by(Deployment.app_id, Deployment.id.desc())
         .subquery()

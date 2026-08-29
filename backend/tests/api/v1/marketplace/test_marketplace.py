@@ -15,8 +15,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.v1.marketplace.router import _live_catalog
 from src.config import settings
 from src.db.models.app_registry import AppStatus
 from src.db.models.deployment import Deployment, DeploymentStatus
@@ -382,17 +384,29 @@ async def test_a_successful_republish_brings_the_app_back(app, client, db_sessio
 
 
 @pytest.mark.parametrize(
-    ("app_status", "listed"),
+    ("case", "app_status", "standing", "listed"),
     [
-        (AppStatus.DRAFT, True),
-        (AppStatus.PENDING, True),
-        (AppStatus.APPROVED, True),
-        (AppStatus.REJECTED, False),
-        (AppStatus.DISABLED, False),
+        ("draft", AppStatus.DRAFT, False, True),
+        ("pending", AppStatus.PENDING, False, True),
+        ("approved", AppStatus.APPROVED, False, True),
+        # THE REACHABLE REJECTION: `reject` writes `status` and `rejection_standing` in one
+        # UPDATE, and 0032 backfilled every legacy row, so this pairing is what a real
+        # rejected app looks like. Excluded by BOTH predicates.
+        ("rejected", AppStatus.REJECTED, True, False),
+        # DELIBERATELY UNREACHABLE, and kept anyway. `REJECTED` with `standing=False` is a
+        # state the product cannot produce (see above), which makes `notin_(REJECTED)`
+        # redundant with the `rejection_standing` predicate beside it. It is retained as
+        # defence-in-depth, and this case is the only thing that PINS it: with
+        # `standing=True` the row is excluded by the other predicate, so reverting
+        # `notin_((DISABLED, REJECTED))` to `!= DISABLED` would stay green and the receipt
+        # would be lost. Review suggested re-parametrising this case rather than adding one;
+        # that would have dropped the very receipt it was meant to keep (#147 round 3).
+        ("rejected-standing-cleared", AppStatus.REJECTED, False, False),
+        ("disabled", AppStatus.DISABLED, False, False),
     ],
 )
 async def test_the_catalog_lists_by_app_status(
-    app, client, db_session, app_status: AppStatus, listed: bool
+    app, client, db_session, case: str, app_status: AppStatus, standing: bool, listed: bool
 ) -> None:
     """EVERY lifecycle state, not just the one the predicate was written for (#147 round 3).
 
@@ -404,21 +418,24 @@ async def test_the_catalog_lists_by_app_status(
     DRAFT/PENDING/APPROVED all list: a citizen's self-published app is a legitimate catalog
     entry and there is no approval on that path. REJECTED and DISABLED do not.
 
-    Mutation receipt: drop `AppRegistry.status.notin_(...)` and the REJECTED case goes red.
+    Mutation receipts: drop `AppRegistry.status.notin_(...)` and `rejected-standing-cleared`
+    goes red; drop `AppRegistry.rejection_standing.is_(False)` and `rejected` goes red. The
+    two cases exist so each predicate has its own.
     """
     headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
     await _published_app(
         db_session,
         owner_email="builder@rvaiglobal.com",
-        name=f"App In {app_status.value}",
+        name=f"App In {case}",
         description="A tool.",
         app_status=app_status,
+        rejection_standing=standing,
     )
 
     resp = await client.get(_MARKETPLACE, headers=headers)
     names = [item["name"] for item in resp.json()["items"]]
 
-    assert names == ([f"App In {app_status.value}"] if listed else [])
+    assert names == ([f"App In {case}"] if listed else [])
 
 
 async def test_a_laundered_rejection_stays_out_of_the_catalog(app, client, db_session) -> None:
@@ -781,3 +798,41 @@ async def test_an_over_long_q_is_a_422(app, client, db_session) -> None:
     resp = await client.get(_MARKETPLACE, headers=headers, params={"q": "x" * 201})
 
     assert resp.status_code == 422
+
+
+async def test_the_success_collapse_predicate_renders_a_literal(app, client, db_session) -> None:
+    """The `status` predicate must compile to `= 'succeeded'`, never to a bound parameter.
+
+    THE BUG THIS PINS is a performance regression that returns the RIGHT ANSWER, which is why
+    it needs a test at all — no functional assertion anywhere can see it, and a single EXPLAIN
+    looks perfect because the first five executions get a custom plan.
+
+    `Deployment.status == DeploymentStatus.SUCCEEDED` renders `status = $1`. asyncpg prepares
+    server-side and the pool is long-lived, so from the 6th execution on a connection Postgres
+    switches to a generic plan, which cannot prove `status = $1` implies
+    `ix_deployments_success_collapse`'s `status = 'succeeded'` predicate — and silently stops
+    using the index the 0034 migration exists to provide. Measured at 5.2k apps / 52k rows:
+    13-15ms for executions 1-5, then 27-30ms (#147 round 3).
+
+    Asserting on the COMPILED SQL rather than on a plan keeps this a unit test: reproducing the
+    plan flip needs a seeded table and either `plan_cache_mode` forced or six executions on one
+    connection, none of which belongs in the suite.
+    """
+    query, _ = _live_catalog(search=None)
+    # `render_postcompile=True` is the whole point: a `literal_execute` bindparam is expanded
+    # at the POSTCOMPILE stage, which is the string the driver actually prepares. Compiling
+    # without it shows the pre-expansion placeholder and would make this test pass either way.
+    compiled = str(
+        query.compile(dialect=postgresql.dialect(), compile_kwargs={"render_postcompile": True})
+    )
+
+    assert "status = 'succeeded'" in compiled, (
+        "the success-collapse predicate is no longer a literal, so the partial index is "
+        f"unreachable under a generic plan. Compiled SQL: {compiled}"
+    )
+    # And the literal is the ENUM's value, not a hand-typed string that could drift from it.
+    assert DeploymentStatus.SUCCEEDED.value == "succeeded"
+
+    # The unpublished-side predicate carries no parameter, so it was never affected — asserted
+    # so a future "make both consistent" refactor cannot quietly parameterise this one.
+    assert "unpublished_at IS NOT NULL" in compiled
