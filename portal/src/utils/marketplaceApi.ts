@@ -106,8 +106,11 @@ function toPage(value: unknown): MarketplacePage {
             // org-wide catalog — but doing it SILENTLY makes `total` and the rendered
             // count disagree with no signal to anyone: "10 results / Page 1 of 3"
             // rendering 9 cards indefinitely, indistinguishable from a correct page
-            // (#147 round 3). This is the only thing that turns that into a reported
-            // failure rather than a mystery.
+            // (#147 round 3). This does not turn it into a REPORTED failure — the portal
+            // captures no console output, so in practice it helps whoever already has
+            // devtools open. That is still the difference between a diagnosable page and a
+            // mystery, but it is not telemetry, and the empty-state copy in
+            // `MarketplacePage` is what covers the reader who never opens devtools.
             console.warn('marketplace: dropped an unreadable catalog entry', row)
             return []
           }

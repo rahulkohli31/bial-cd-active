@@ -367,15 +367,26 @@ export default function MarketplacePage(): React.JSX.Element {
             error banner — telling the user the catalog is empty when we do not know. */}
         {!loading && !error && items.length === 0 && (
           <p data-testid="marketplace-empty" className="text-sm text-neutral py-10 text-center">
-            {/* Branching on `page > totalPages` rather than `total !== 0`: `total` and the
-                rows are two separate reads (the accepted READ COMMITTED risk), so an
-                unpublish landing between them can return zero items on page 1 with a stale
-                non-zero `total` — and "taking you back" on page 1 has nowhere to go. */}
-            {searching
-              ? 'No published app matches that yet.'
-              : page > totalPages
-                ? 'That page is past the end of the catalog — taking you back.'
-                : 'Nothing has been published yet. The first app to go live shows up here.'}
+            {/* FOUR states, and the order matters. `page > totalPages` is checked before
+                `total` because the overshoot has its own auto-correct; the disagreement
+                branch is checked before `searching` because a search that matches nothing
+                returns `total: 0`, so a non-zero `total` with no rows is a genuine
+                inconsistency in either mode.
+
+                THE DISAGREEMENT BRANCH exists because "nothing has been published" is the
+                one thing we must not say when the count says otherwise: a reader who
+                believes it goes and rebuilds an app that already exists, which is the
+                feature's whole pitch inverted (#147 round 3 review). Two ways in, and only
+                the first needs a race: `total` and the rows are separate reads under READ
+                COMMITTED, and — with no race at all — a page whose only entry fails
+                `toEntry` yields zero items while `total` is carried through untouched. */}
+            {page > totalPages
+              ? 'That page is past the end of the catalog — taking you back.'
+              : total > 0
+                ? `Nothing could be loaded just now, though ${total} ${searching ? (total === 1 ? 'match was' : 'matches were') : (total === 1 ? 'published app was' : 'published apps were')} reported. Try again in a moment.`
+                : searching
+                  ? 'No published app matches that yet.'
+                  : 'Nothing has been published yet. The first app to go live shows up here.'}
           </p>
         )}
 
@@ -455,7 +466,10 @@ export default function MarketplacePage(): React.JSX.Element {
           </div>
         )}
 
-        {total > 0 && !loading && (
+        {/* `items.length > 0`: without it this count renders directly beneath the empty
+            state, so the page said "Nothing has been published yet" above "5 published
+            apps". The disagreement branch above now carries the count in that case. */}
+        {total > 0 && !loading && items.length > 0 && (
           <p className="text-xs text-neutral/70 text-center">
             {total} published {total === 1 ? 'app' : 'apps'}
           </p>

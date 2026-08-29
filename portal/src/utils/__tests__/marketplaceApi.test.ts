@@ -113,10 +113,19 @@ describe('listMarketplace parse contract', () => {
     // all-or-nothing throw has an org-wide blast radius — one malformed entry would blank
     // the catalog for everyone instead of for the single app that is broken.
     const mixed = { ...PAGE, items: [{ ...ENTRY, url: '' }, ENTRY], total: 2 }
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
 
     const page = await listMarketplace({}, deps(vi.fn(async () => ok(mixed))))
 
     expect(page.items).toEqual([ENTRY])
+
+    // The drop must not be SILENT. Dropping the row is the right trade, but it leaves
+    // `total` and the rendered count disagreeing, and without a signal that is
+    // indistinguishable from a correct page. This was the one round-3 fix with no receipt
+    // — deleting the `console.warn` left the whole suite green (#147 round 3 review).
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn.mock.calls[0][0]).toMatch(/dropped an unreadable catalog entry/)
+    warn.mockRestore()
   })
 
   it('surfaces a non-ok response as an ApiError', async () => {

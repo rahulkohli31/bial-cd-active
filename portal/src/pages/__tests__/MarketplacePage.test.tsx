@@ -364,27 +364,49 @@ describe('MarketplacePage', () => {
     )
   })
 
-  it('does not blame the page when page 1 comes back empty with a stale total', async () => {
-    // The race agc129 named: `total` and the rows are two separate reads under READ
-    // COMMITTED, so an unpublish landing between them returns zero items on PAGE 1 with a
-    // stale non-zero `total`. Branching the copy on `total !== 0` showed "past the end" —
-    // on page 1, which has nowhere to go back to. Branching on `page > totalPages` falls
-    // through to the ordinary empty copy, which is the honest thing to say.
+  it('says rows and count disagree, rather than "empty" or "past the end"', async () => {
+    // THIS FIXTURE USED TO PIN THE BUG. `total` and the rows are two separate reads under
+    // READ COMMITTED, so an unpublish landing between them returns zero items on PAGE 1
+    // with a stale non-zero `total`. Branching the copy on `total !== 0` showed "past the
+    // end" on page 1, which has nowhere to go back to; branching on `page > totalPages`
+    // fell through to "Nothing has been published yet" — and this test asserted exactly
+    // that, while the footer four lines below rendered "5 published apps" from the same
+    // payload. It pinned a page that contradicted itself (#147 round 3 review).
     //
-    // This is also the ONLY deterministic pin for that branch: when `page > totalPages` is
-    // genuinely true the auto-correct effect fires in the same commit, so the overshoot
-    // message exists for a single frame and no assertion can catch it reliably.
+    // The empty copy is the one thing we must not say here: a reader who believes it goes
+    // and rebuilds an app that already exists. Nor is a second entry path a race at all
+    // — a page whose only entry fails `toEntry` produces this same shape, with `total`
+    // carried straight through from the wire.
     //
-    // Mutation receipt: swap the ternary back to `total === 0` first and this goes red with
-    // "past the end" on page 1.
+    // Mutation receipts: drop `total > 0` from the ternary and this goes red with "nothing
+    // has been published"; drop `items.length > 0` from the footer gate and the count
+    // assertion below goes red.
     h.listMarketplace.mockResolvedValue(
       page({ items: [], page: 1, pageSize: 10, total: 5, totalPages: 1 }),
     )
     renderPage()
 
     const empty = await screen.findByTestId('marketplace-empty', {}, { timeout: 5000 })
-    expect(empty.textContent).toMatch(/nothing has been published/i)
+    expect(empty.textContent).toMatch(/5 published apps were reported/i)
+    expect(empty.textContent).not.toMatch(/nothing has been published/i)
     expect(empty.textContent).not.toMatch(/past the end/i)
+
+    // ...and the footer count is gone, so the page no longer states both at once.
+    expect(screen.queryByText(/^5 published apps$/)).toBeNull()
+  })
+
+  it('still says the catalog is empty when it genuinely is', async () => {
+    // The other side of the branch above: with `total: 0` the honest message is the plain
+    // empty one, and the disagreement copy must NOT appear. Without this, gating the empty
+    // state on `total > 0` alone could swallow the real empty case.
+    h.listMarketplace.mockResolvedValue(
+      page({ items: [], page: 1, pageSize: 10, total: 0, totalPages: 0 }),
+    )
+    renderPage()
+
+    const empty = await screen.findByTestId('marketplace-empty', {}, { timeout: 5000 })
+    expect(empty.textContent).toMatch(/nothing has been published/i)
+    expect(empty.textContent).not.toMatch(/were reported/i)
   })
 
   it('recovers instead of stranding the reader when the catalog shrinks under them', async () => {
