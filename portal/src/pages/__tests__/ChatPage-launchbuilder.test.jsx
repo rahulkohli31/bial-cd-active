@@ -115,12 +115,17 @@ describe('ChatPage → Launch Builder', () => {
     fireEvent.click(screen.getByRole('button', { name: /launch builder/i }))
 
     await waitFor(() => expect(screen.queryByTestId('state')).toBeTruthy())
-    expect(JSON.parse(screen.getByTestId('state').textContent)).toMatchObject({
+    const state = JSON.parse(screen.getByTestId('state').textContent)
+    expect(state).toMatchObject({
       prompt: 'Build an application for BIAL that tracks visitors.',
       mode: 'plan',
       // ChatRoute skips this chat's guaranteed-404 GET only because the marker is here.
       freshlyMinted: true,
     })
+    // toMatchObject passes on EXTRA keys, so it cannot see `theme` coming back. The consumer
+    // side (ProjectBuilder) asserts its absence explicitly; this is the producer, and the pair
+    // is only symmetric with this line (#157 B1 / review).
+    expect(state.theme).toBeUndefined()
   })
 })
 

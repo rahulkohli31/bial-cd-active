@@ -6,16 +6,16 @@
  * project, so it gated every handoff behind "pick a project first". Here the project is
  * a required prop, so `startChat` mints a chat in the selected mode and hands off directly —
  * mirroring the exact router-state shape `BuilderPage` / `ChatPage` already read
- * (`{ prompt, theme, pendingAttachments }` for a build, `{ initialMessage }` for a plan).
+ * (`{ prompt, pendingAttachments }` for a build, `{ initialMessage }` for a plan).
  *
  * Rendered UNCONDITIONALLY by `ProjectPage` (D-fold): the composer is present whether or
  * not the project already has an app. There are no generic idea-starter cards here (F6) — a
  * dedicated project already has an established purpose; the mode helper copy + the mode-aware
  * placeholder are the first-run guidance.
  */
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Palette, Sparkles, ChevronDown, ShieldAlert, X, Paperclip, FileText, FileSpreadsheet, Presentation, type LucideIcon } from 'lucide-react'
+import { Sparkles, ShieldAlert, X, Paperclip, FileText, FileSpreadsheet, Presentation } from 'lucide-react'
 import { validatePrompt } from '../../utils/promptGuardrails'
 import type { PromptViolation } from '../../utils/promptGuardrails'
 import { uuidv7 } from '../../utils/conversationApi'
@@ -23,71 +23,6 @@ import { usePendingAttachments } from '../../hooks/usePendingAttachments'
 import { ACCEPT_ATTR, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../../utils/attachmentInput'
 import { ModeSwitcher } from '../chat/ModeSwitcher'
 import type { ConversationMode } from '../../utils/turnStreamApi'
-
-interface ThemeOption {
-  id: string
-  name: string
-  subtitle: string
-}
-
-const THEMES: ThemeOption[] = [
-  { id: 'bial', name: 'Bangalore Airport Theme', subtitle: 'Official BIAL brand colors and typography' },
-  { id: 'mobile', name: 'App Style (iOS/Android)', subtitle: 'Clean mobile-first material design' },
-  { id: 'dashboard', name: 'Dashboard / Analytics', subtitle: 'Data-dense layout with charts and metrics' },
-  { id: 'kiosk', name: 'Kiosk / Public Display', subtitle: 'Large text, high contrast, touch-friendly' },
-]
-
-interface SelectDropdownProps {
-  icon: LucideIcon
-  options: ThemeOption[]
-  value: string
-  onChange: (id: string) => void
-  placeholder: string
-}
-
-function SelectDropdown({ icon: Icon, options, value, onChange, placeholder }: SelectDropdownProps) {
-  const [open, setOpen] = useState(false)
-  const ref = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
-    const onOutside = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false) }
-    const onEsc = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
-    document.addEventListener('mousedown', onOutside)
-    document.addEventListener('keydown', onEsc)
-    return () => { document.removeEventListener('mousedown', onOutside); document.removeEventListener('keydown', onEsc) }
-  }, [])
-
-  const selected = options.find((o) => o.id === value)
-
-  return (
-    <div className="relative flex-shrink-0" ref={ref}>
-      <button
-        onClick={() => setOpen((o) => !o)}
-        className={`flex items-center gap-1.5 text-xs font-worksans font-medium border rounded-lg px-3 py-2 transition whitespace-nowrap ${
-          value ? 'bg-primary/5 border-primary text-primary' : 'bg-white border-bial-border text-neutral hover:border-primary hover:text-primary'
-        }`}
-      >
-        <Icon size={12} />
-        <span className="max-w-[120px] truncate">{selected ? selected.name : placeholder}</span>
-        <ChevronDown size={11} className={`transition-transform flex-shrink-0 ${open ? 'rotate-180' : ''}`} />
-      </button>
-      {open && (
-        <div className="absolute top-full left-0 mt-1.5 w-64 bg-white rounded-xl border border-bial-border shadow-xl z-50 py-1 overflow-hidden">
-          {options.map((opt) => (
-            <button
-              key={opt.id}
-              onClick={() => { onChange(opt.id); setOpen(false) }}
-              className={`w-full text-left px-4 py-2.5 hover:bg-primary/5 transition flex flex-col gap-0.5 ${value === opt.id ? 'bg-primary/5' : ''}`}
-            >
-              <span className={`text-xs font-bold ${value === opt.id ? 'text-primary' : 'text-tertiary'}`}>{opt.name}</span>
-              <span className="text-[10px] text-neutral">{opt.subtitle}</span>
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
 
 export interface ProjectBuilderProps {
   /** The project this composer builds/plans into. Required: it is what removes
@@ -98,7 +33,6 @@ export interface ProjectBuilderProps {
 export default function ProjectBuilder({ projectId }: ProjectBuilderProps) {
   const navigate = useNavigate()
   const [prompt, setPrompt] = useState('')
-  const [theme, setTheme] = useState('bial')
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   // Shared chat-attachment composer — same allowlist + validation as Plan/Builder
@@ -112,13 +46,6 @@ export default function ProjectBuilder({ projectId }: ProjectBuilderProps) {
   // app + its snapshots, not in one blessed chat).
   const [mode, setMode] = useState<ConversationMode>('plan')
   const [guardRailModal, setGuardRailModal] = useState<PromptViolation | null>(null)
-  const [toast, setToast] = useState<string | null>(null)
-
-  const showToast = (msg: string) => {
-    setToast(msg)
-    setTimeout(() => setToast(null), 3000)
-  }
-
   /** Mint a fresh unified chat in the selected mode and hand the draft off to it. */
   const startChat = () => {
     if (!prompt.trim()) return
@@ -137,7 +64,7 @@ export default function ProjectBuilder({ projectId }: ProjectBuilderProps) {
     // in a shared link: a bookmarked `/chat/{id}?kind=…` must still take its kind from the server.
     navigate(
       `/chat/${uuidv7()}?projectId=${encodeURIComponent(projectId)}&kind=builder`,
-      { state: { prompt, mode, theme, pendingAttachments, freshlyMinted: true } },
+      { state: { prompt, mode, pendingAttachments, freshlyMinted: true } },
     )
   }
 
@@ -194,14 +121,6 @@ export default function ProjectBuilder({ projectId }: ProjectBuilderProps) {
         <div className="px-4 py-3 border-t border-bial-border space-y-2">
           {(
             <div className="flex flex-wrap items-center gap-2">
-              <SelectDropdown
-                icon={Palette}
-                options={THEMES}
-                value={theme}
-                onChange={setTheme}
-                placeholder="Select Theme"
-              />
-
               <input
                 ref={fileInputRef}
                 type="file"
@@ -283,12 +202,6 @@ export default function ProjectBuilder({ projectId }: ProjectBuilderProps) {
             </div>
             <div className="flex gap-3 justify-end">
               <button
-                onClick={() => showToast('Reach out to citizen-developer-support@bialport.com')}
-                className="text-sm font-semibold text-neutral border border-gray-200 px-4 py-2 rounded-xl hover:border-gray-300 transition"
-              >
-                Contact IT Support
-              </button>
-              <button
                 onClick={() => setGuardRailModal(null)}
                 className="text-sm font-bold bg-primary text-white px-5 py-2 rounded-xl hover:bg-primary/90 transition"
               >
@@ -299,10 +212,13 @@ export default function ProjectBuilder({ projectId }: ProjectBuilderProps) {
         </div>
       )}
 
-      {/* Toast (guardrail contact / attachment validation) */}
-      {(attachToast || toast) && (
+      {/* Toast — attachment validation only. The guardrail modal's "Contact IT Support"
+          was this component's other toast source until #157 B3 removed it: it announced a
+          support address that was not a mailto, not clickable, not copyable, and wrong
+          (bialport.com, not bialairport.com). */}
+      {attachToast && (
         <div className="fixed bottom-6 right-6 bg-tertiary text-white text-xs font-semibold px-4 py-3 rounded-xl shadow-xl z-50 max-w-xs">
-          {attachToast || toast}
+          {attachToast}
         </div>
       )}
     </div>
