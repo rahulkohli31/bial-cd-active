@@ -9,7 +9,6 @@ asserted rather than trusted.
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +20,7 @@ from taskiq_redis import RedisStreamBroker
 
 from src.broker import STREAM_MAXLEN, UNACKED_LOCK_TIMEOUT_S, XREAD_BLOCK_MS, broker
 from src.services.redis.config import RedisConfig
+from tests.subprocess_env import child_env
 
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 
@@ -157,7 +157,7 @@ def test_the_broker_imports_without_the_fastapi_app() -> None:
     result = subprocess.run(  # noqa: S603
         [sys.executable, "-B", "-c", "import src.broker; print('ok')"],
         cwd=_BACKEND_ROOT,
-        env={"PATH": os.environ["PATH"], "ENV_FILE": ".env.test"},
+        env=child_env(ENV_FILE=".env.test"),
         capture_output=True,
         text=True,
         check=False,

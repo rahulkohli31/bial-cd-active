@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -14,6 +13,7 @@ from src.config import FoundryConfig, Settings
 from src.services.appdb.config import AppDatabaseSettings
 from src.services.auth.config import AuthConfig
 from src.services.redis.config import RedisConfig
+from tests.subprocess_env import child_env
 
 # A minimal valid AUTH__* block. `auth` is a required sub-model now, so every
 # Settings constructed here needs one (a partial block fails its inner required
@@ -639,7 +639,7 @@ def _boot_from(sample: str, probe: str) -> subprocess.CompletedProcess[str]:
         cwd=_BACKEND_ROOT,
         # Scrubbed: PATH only, plus the sample under test. No inherited DATABASE_URL,
         # no inherited REDIS__*, no ENV_FILE from the suite's own conftest.
-        env={"PATH": os.environ["PATH"], "ENV_FILE": sample},
+        env=child_env(ENV_FILE=sample),
         capture_output=True,
         text=True,
         check=False,

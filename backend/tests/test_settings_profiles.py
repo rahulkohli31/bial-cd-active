@@ -37,6 +37,7 @@ import pytest
 from pydantic import ValidationError
 
 from src.settings import ApiSettings, WorkerSettings
+from tests.subprocess_env import child_env
 
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 
@@ -347,7 +348,7 @@ def test_the_worker_profile_builds_from_os_environ_in_a_fresh_interpreter() -> N
             " print('OK', s.object_store is not None, s.sandbox is not None)",
         ],
         cwd=_BACKEND_ROOT,
-        env={"PATH": os.environ["PATH"], "ENV_FILE": "/nonexistent-on-purpose", **_WORKER_ENV},
+        env=child_env(ENV_FILE="/nonexistent-on-purpose", **_WORKER_ENV),
         capture_output=True,
         text=True,
         check=False,
@@ -392,12 +393,11 @@ def test_the_role_env_var_selects_the_worker_profile() -> None:
             " print('PROFILE:' + type(resolve_settings()).__name__)",
         ],
         cwd=_BACKEND_ROOT,
-        env={
-            "PATH": os.environ["PATH"],
-            "ENV_FILE": "/nonexistent-on-purpose",
-            "BIAL_ROLE": "worker",
+        env=child_env(
+            ENV_FILE="/nonexistent-on-purpose",
+            BIAL_ROLE="worker",
             **_WORKER_ENV,
-        },
+        ),
         capture_output=True,
         text=True,
         check=False,
@@ -428,7 +428,7 @@ def test_importing_the_shim_does_not_construct_settings() -> None:
             "    print('FAILED_ON_ACCESS:' + type(exc).__name__)\n",
         ],
         cwd=_BACKEND_ROOT,
-        env={"PATH": os.environ["PATH"], "ENV_FILE": "/nonexistent-on-purpose"},
+        env=child_env(ENV_FILE="/nonexistent-on-purpose"),
         capture_output=True,
         text=True,
         check=False,
