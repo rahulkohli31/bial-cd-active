@@ -28,6 +28,16 @@ the moment, not a per-user filter afterwards, and keeping the table un-scoped is
 that filter would be. This is an observability endpoint inside a single-tenant enterprise
 deployment; it must not become a way to profile a citizen.
 
+AND THE BOUND THIS ROUTE DOES NOT ENFORCE, said plainly rather than left to be discovered. Each
+name is bounded ALONE. Nothing here relates one to another, so `project_opened_chat` can be
+written with no `project_opened` behind it and R105's ratio can come out above 1. The invariant
+that keeps it at or below 1 lives in the BROWSER (`portal/src/utils/observe.ts` only marks a chat
+open for a project already marked open in this page load), which means it holds for the portal and
+not for a hand-made request. Enforcing it here would need a server-issued visit token — a session
+model this plan deliberately does not build. So the reading rule, which belongs beside the number:
+`1 - (project_opened_chat / project_opened)` outside [0, 1] is not a surprising result, it is
+poisoned or lossy data, and should be read as such rather than reported.
+
 The rule that follows and is binding elsewhere: any user-facing "roughly how long" estimate is
 sourced from the SERVER-measured `app_cold_start_ms`, never from the browser-measured duration
 this route accepts.
@@ -65,13 +75,14 @@ _REQUEST_BODY_DOC = raw_body_doc(ObservationRequest)
 
 # The longest a first view of an app can honestly take, in milliseconds.
 #
-# DERIVED, not picked. The machine half of the worst honest journey is the cold-ready budget
-# (`_COLD_READY_BUDGET_SECONDS`, 120 s) plus the frame's own load cap (`FRAME_LOAD_CAP_MS`, 20 s)
-# — 140 s. The interval also contains one HUMAN step, choosing which chat to open, so the ceiling
-# has to sit above 140 s or it would refuse ordinary slow journeys, which are precisely the ones
-# R104 exists to see. Ten minutes is the line: past it, this is a tab that was backgrounded, a
-# laptop that slept, or a lie, and refusing is cheaper and more honest than a second client-side
-# mechanism trying to detect the same thing.
+# DERIVED, not picked, and deliberately loose at the top end. The machine half of a slow honest
+# journey is a cold restore (whose readiness wait alone budgets `_COLD_READY_BUDGET_SECONDS`,
+# 120 s, on top of an unbounded ACA create) plus the frame's own load cap (`FRAME_LOAD_CAP_MS`,
+# 20 s). The interval then adds one HUMAN step — choosing which chat to open — so a ceiling near
+# the machine figure would refuse exactly the slow journeys R104 exists to see. Ten minutes is the
+# line: past it, this is a tab that was backgrounded, a laptop that slept, or a lie, and refusing
+# is cheaper and more honest than a second client-side mechanism trying to detect the same thing.
+# It is a poison bound, NOT a plausibility bound — a value under it is not thereby trustworthy.
 MAX_OBSERVED_MS: Final = 10 * 60 * 1000
 
 # THE ALLOWLIST, and it is a mapping rather than a set because the ceiling is per name.
@@ -79,7 +90,9 @@ MAX_OBSERVED_MS: Final = 10 * 60 * 1000
 # AN OCCURRENCE COUNTER'S CEILING IS 1, because an occurrence IS one. A browser reporting
 # `project_opened` with a value of 40 is not reporting an occurrence, it is inflating R105's
 # denominator — and one comparison refuses that without a second code path for "this name is an
-# occurrence". A missing value is 1, so the ordinary occurrence call needs no value at all.
+# occurrence". A ceiling of 1 is also what makes a MISSING value legible: it means "one of these
+# happened", which is the whole payload an occurrence has. For a DURATION the same omission means
+# nothing at all, and is refused rather than defaulted — see `_bounded_value`.
 _CEILING_BY_NAME: Final[dict[str, int]] = {
     HarnessCounter.PROJECT_TO_APP_VISIBLE_MS.value: MAX_OBSERVED_MS,
     HarnessCounter.PROJECT_OPENED.value: 1,
@@ -108,10 +121,17 @@ _observation_limiter = rate_limit(
 
 def _bounded_value(raw: Any, ceiling: int) -> int:
     """The observation's value, or a refusal. Never clamps — see the module docstring."""
+    if raw is None:
+        # An OCCURRENCE (ceiling 1) says everything it has to say by arriving, so a missing value
+        # is the ordinary call. A DURATION with no value is a measurement that did not happen, and
+        # defaulting it to 1 would file a one-millisecond first-view — the same silent corruption
+        # of the mean this module refuses a too-LARGE value to avoid, arriving from the other end
+        # and, with no user id on the row, just as impossible to exclude afterwards.
+        if ceiling == 1:
+            return 1
+        raise AppApiError(400, "Observation value is required.", code="invalid_value")
     # `bool` is an `int` in Python, and `True` would otherwise sail through as 1. A boolean is
     # not a measurement.
-    if raw is None:
-        return 1
     if isinstance(raw, bool) or not isinstance(raw, int):
         raise AppApiError(400, "Observation value must be a whole number.", code="invalid_value")
     if raw < 1 or raw > ceiling:

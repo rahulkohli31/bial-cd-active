@@ -859,6 +859,17 @@ async def _counter_values(counter: HarnessCounter) -> list[int]:
     return [int(v) for (v,) in rows]
 
 
+async def _counter_app_ids(counter: HarnessCounter) -> list[uuid.UUID | None]:
+    """Which app each row under one counter name was about, `None` included."""
+    async with async_session_factory() as db:
+        rows = (
+            await db.execute(
+                sa.select(HarnessCount.app_id).where(HarnessCount.name == counter.value)
+            )
+        ).all()
+    return [app_id for (app_id,) in rows]
+
+
 async def test_a_cold_relaunch_records_the_press_the_arrival_and_the_wait(
     client: AsyncClient,
     db_session: AsyncSession,
@@ -869,7 +880,7 @@ async def test_a_cold_relaunch_records_the_press_the_arrival_and_the_wait(
 ) -> None:
     """The whole of R102/R103 on the happy path: one press, one arrival, one duration."""
     user, project = await _user_project(db_session, "rl-count-cold@rvaiglobal.com")
-    await _seed_snapshot(db_session, user, project, fake_storage)
+    app_id = await _seed_snapshot(db_session, user, project, fake_storage)
 
     assert (await _relaunch(client, user, project)).status_code == 200
 
@@ -877,9 +888,20 @@ async def test_a_cold_relaunch_records_the_press_the_arrival_and_the_wait(
     assert await _counter_values(HarnessCounter.APP_START_REACHED_RUNNING) == [1]
     cold = await _counter_values(HarnessCounter.APP_COLD_START_MS)
     assert len(cold) == 1
-    # Bounded by the cold budget it is measuring — a duration outside it is a clock reading
-    # something else entirely, which is the failure this number cannot survive.
+    # A sanity bound only — the fake sandbox answers instantly, so this cannot fail for the
+    # boundary it names. The clock's real boundary is pinned by the slow-attach test below.
     assert 0 <= cold[0] < 120_000
+
+    # ★ AND WHICH APP EACH ROW IS ABOUT, which is a claim the method's docstring makes and
+    # nothing else checks. The attempted row is written before anything is resolved, so it
+    # carries NO app id — a complete denominator bought at the price of attribution on the one
+    # row that only ever means "someone pressed". The two rows written after resolution do carry
+    # it, which is what makes them diagnosable.
+    #
+    # Mutation check: pass `app_id=app_id` to the attempted emit and this goes red.
+    assert await _counter_app_ids(HarnessCounter.APP_START_ATTEMPTED) == [None]
+    assert await _counter_app_ids(HarnessCounter.APP_START_REACHED_RUNNING) == [app_id]
+    assert await _counter_app_ids(HarnessCounter.APP_COLD_START_MS) == [app_id]
 
 
 async def test_the_attach_arm_records_the_press_and_the_arrival_but_no_duration(

@@ -31,20 +31,51 @@
  * project id is exactly what makes its second visit look like a first. A reload clears them. The
  * ceiling is therefore "projects one person opened without reloading", which is a handful.
  *
- * IT LIVES IN MEMORY, and the two biases that follow are recorded rather than hidden: a reload
- * mid-journey abandons the measurement (so the sample tilts toward smooth journeys), and a
- * backgrounded tab inflates one (up to the server-side ceiling, which refuses the rest). There is
- * deliberately NO visibility listener — that would be a second mechanism doing work the ceiling
- * already does at the only place it can be enforced, and it would discard a slice of exactly the
- * slow journeys R104 exists to see.
+ * IT LIVES IN MEMORY, and the biases that follow are recorded rather than hidden. A reload
+ * mid-journey abandons the measurement, so the sample tilts toward smooth journeys. A backgrounded
+ * tab inflates one — and where that inflation crosses the server's ceiling the row is REFUSED
+ * outright, so the effect is a lost reading, not a capped one: the R104 mean is biased toward the
+ * fast journeys twice over, once by reloads and once by the ceiling. Same for the long-lived tab
+ * that returns to a project hours later: its first visit's clock is still open, so the reveal it
+ * eventually gets is measured from the wrong start and refused. Those are lost rows, not wrong
+ * ones, which is the right way round — but it means R104 is a floor on a healthy journey rather
+ * than an average over all of them.
+ *
+ * There is deliberately NO visibility listener — that would be a second mechanism doing work the
+ * ceiling already does at the only place it can be enforced, and it would discard a slice of
+ * exactly the slow journeys R104 exists to see.
+ *
+ * AND WHAT THE STOP-CLOCK DOES NOT PROMISE. `markAppVisible` fires when the preview pane is
+ * SHOWING the app uncovered, which is the honest end of the wait — but a cross-origin frame's
+ * `load` fires for a 500 as readily as a 200, and the pane deliberately reveals a frame whose
+ * compile verdict never arrived rather than leave older containers permanently blank. So this
+ * measures how long until the citizen was looking at their app, not until the app was known good;
+ * a broken app ends a wait too. The one case that is NOT a real view — a confirmed workspace
+ * reversion, where a cover is up over a loaded frame — is excluded at the pane
+ * (`LivePreview.tsx`'s reveal effect checks `workspaceLost`).
  *
  * EVERY CALL IS FIRE-AND-FORGET. A failed observation never surfaces to the citizen and never
  * fails the thing it was observing — the same contract `count(...)` holds on the server side.
  */
 import { authFetch } from './api'
 
-/** The three names the beacon route allows. It refuses anything else; this is not the gate. */
-export type ObservationName = 'project_opened' | 'project_opened_chat' | 'project_to_app_visible_ms'
+/**
+ * The three names the beacon route allows. It refuses anything else; this is NOT the gate — the
+ * gate is `_CEILING_BY_NAME` in `backend/src/api/v1/observations/router.py`, and a name that only
+ * exists here is a beacon that 400s forever in silence, because this whole path is
+ * fire-and-forget by design and nothing would ever surface the refusal.
+ *
+ * A runtime array rather than a bare type union, so that silence is testable: the type is derived
+ * from the values, and `observationContract.test.ts` reconciles the values against the server's
+ * allowlist. A union alone is erased at compile time and cannot be compared to anything.
+ */
+export const OBSERVATION_NAMES = [
+  'project_opened',
+  'project_opened_chat',
+  'project_to_app_visible_ms',
+] as const
+
+export type ObservationName = (typeof OBSERVATION_NAMES)[number]
 
 /** Project ids marked open in THIS page load. Also the StrictMode guard. */
 const openedProjects = new Set<string>()

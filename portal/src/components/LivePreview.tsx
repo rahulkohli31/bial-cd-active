@@ -366,11 +366,17 @@ export interface LivePreviewProps {
   saveError?: string | null
   toolbarLeading?: ReactNode
   toolbarTrailing?: ReactNode
-  // R104's stop-clock, and the ONLY honest one: `revealed` is the frame loaded AND the cover
-  // down, which is the exact moment a citizen is looking at their own app rather than at a
-  // spinner, a cover, or a blank card. Optional and fire-and-forget — this pane owes the caller
-  // nothing if the caller does not care. Fires at most once per FRAME KEY, the same discipline
-  // the load and stall verdicts follow.
+  // Fired the moment this pane is actually SHOWING the app — the frame loaded and no cover is
+  // over it — which is the honest stop-clock for "how long until the citizen saw their app".
+  // Optional and fire-and-forget: this pane owes the caller nothing if the caller does not care,
+  // and a throwing callback is swallowed rather than allowed to take the pane down. Fires at most
+  // once per FRAME KEY, the same discipline the load and stall verdicts follow.
+  //
+  // WHAT IT DOES NOT PROMISE, so a counter built on it is read correctly: that the app WORKS. A
+  // cross-origin `load` fires for a 500 exactly as for a 200, and this pane deliberately reveals
+  // an un-verdicted frame rather than leave every pre-compile-endpoint container permanently
+  // blank (see `covered` above). So this fires when the citizen is looking at their app, not when
+  // the app is known good — the wait is what it measures, and a broken app ends a wait too.
   onRevealed?: () => void
 }
 
@@ -732,13 +738,27 @@ export default function LivePreview({
   // the same document is not a second first-view. A reload (a new nonce, so a new key) does
   // announce again; the caller's own mark is idempotent, so the two guards agree rather than
   // either one having to be perfect.
+  //
+  // AND IT CHECKS `workspaceLost` SEPARATELY, because `revealed` is NOT "the cover is down".
+  // `showCover` is `covered || workspaceLost` while `revealed` reads only `covered`, so a
+  // confirmed reversion leaves the frame at full opacity UNDER a cover that says the app stopped
+  // running — visually correct (the cover is on top) and, without this term, a reported first
+  // view of an app the citizen cannot see. `revealed` already implies `!covered`, so this is the
+  // only case the two expressions disagree on.
   const announcedRevealOf = useRef<string | null>(null)
   useEffect(() => {
-    if (!revealed || !frameKey) return
+    if (!revealed || workspaceLost || !frameKey) return
     if (announcedRevealOf.current === frameKey) return
     announcedRevealOf.current = frameKey
-    onRevealed?.()
-  }, [revealed, frameKey, onRevealed])
+    try {
+      onRevealed?.()
+    } catch {
+      // The pane owes the caller nothing, and that has to include not dying for them. There is
+      // no ErrorBoundary anywhere in this portal, so a throw from a caller's telemetry would
+      // white-screen the builder — a measurement failing the thing it measures, which is the one
+      // outcome this whole surface is built to avoid.
+    }
+  }, [revealed, workspaceLost, frameKey, onRevealed])
   const framePending = showFrame && !frameLoaded && !frameStalled
   const showLoading =
     framePending || (!isTerminal && !relaunching && !previewUrl && (status === 'provisioning' || status === 'building'))

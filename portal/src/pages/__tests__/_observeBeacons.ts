@@ -10,10 +10,17 @@
  * test must use its OWN project id — a shared one would let one test's mark silence the next.
  */
 import type { Mock } from 'vitest'
+import type { authFetch } from '../../utils/api'
 
-/** The observation bodies posted through a mocked `authFetch`, in order. */
-export function beaconsFrom(authFetch: Mock): unknown[] {
-  return authFetch.mock.calls
+/**
+ * The observation bodies posted through a mocked `authFetch`, in order.
+ *
+ * PARAMETERIZED on the real `authFetch`, because a bare `Mock` leaves its args `any` — and an
+ * `as RequestInit` cast applied to an `any` looks like verification while checking nothing, and
+ * would survive the signature it claims to track being changed underneath it.
+ */
+export function beaconsFrom(mocked: Mock<typeof authFetch>): unknown[] {
+  return mocked.mock.calls
     .filter(([url]) => url === '/api/observations')
-    .map(([, opts]) => JSON.parse(String((opts as RequestInit).body)))
+    .map(([, opts]) => JSON.parse(String(opts?.body)))
 }

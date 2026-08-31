@@ -197,6 +197,70 @@ async def test_the_ceiling_itself_is_accepted(client: AsyncClient, db_session) -
     ]
 
 
+async def test_a_duration_with_no_value_is_refused_rather_than_recorded_as_one_millisecond(
+    client: AsyncClient, db_session
+) -> None:
+    """★ A missing value means something for an OCCURRENCE and nothing for a DURATION.
+
+    Defaulting a duration to 1 files a one-millisecond first view — the same silent corruption of
+    the mean this route refuses a too-LARGE value to avoid, arriving from the other end, and with
+    no user id on the row it is exactly as impossible to exclude afterwards.
+
+    Mutation check: return 1 for any missing value and this goes red."""
+    user = await UserFactory.create(db_session, email="obs-noval@rvaiglobal.com")
+
+    resp = await client.post(
+        "/v1/observations",
+        json={"name": HarnessCounter.PROJECT_TO_APP_VISIBLE_MS.value},
+        headers=_headers(user),
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_value"
+    assert await _rows() == []
+
+
+async def test_a_body_that_is_not_json_at_all_is_refused(client: AsyncClient, db_session) -> None:
+    """The hand-parsed-body branch, reachable only with a RAW payload.
+
+    Every other test here posts through httpx's `json=`, which always serialises valid JSON — so
+    the `except (ValueError, TypeError)` arm that is the whole reason this route parses its own
+    body was, until this test, unreachable by the suite that covers it."""
+    user = await UserFactory.create(db_session, email="obs-rawbody@rvaiglobal.com")
+
+    resp = await client.post(
+        "/v1/observations",
+        content=b"{not json at all",
+        headers={**_headers(user), "Content-Type": "application/json"},
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_body"
+    assert await _rows() == []
+
+
+async def test_the_route_does_not_relate_one_counter_to_another(
+    client: AsyncClient, db_session
+) -> None:
+    """The gap this route deliberately does NOT close, pinned so it cannot close by accident.
+
+    Each name is bounded alone; nothing here knows that R105's numerator should never outrun its
+    denominator. That invariant lives in the browser, which means it holds for the portal and not
+    for a hand-made request. Enforcing it server-side needs a visit token this plan does not
+    build — so the behaviour is documented, and the reading rule (a ratio outside [0,1] is
+    poisoned data, not a surprising result) lives beside the number."""
+    user = await UserFactory.create(db_session, email="obs-invariant@rvaiglobal.com")
+
+    resp = await client.post(
+        "/v1/observations",
+        json={"name": HarnessCounter.PROJECT_OPENED_CHAT.value},
+        headers=_headers(user),
+    )
+
+    assert resp.status_code == 201  # accepted with no `project_opened` behind it
+    assert await _rows() == [(HarnessCounter.PROJECT_OPENED_CHAT.value, 1, None, None)]
+
+
 async def test_an_occurrence_cannot_be_sent_as_a_batch(client: AsyncClient, db_session) -> None:
     """An occurrence IS one. A browser reporting `project_opened` with a value of 40 is not
     reporting an occurrence, it is inflating R105's denominator — and a denominator a client can
@@ -299,6 +363,17 @@ async def test_the_per_user_limit_stops_the_next_one_and_keeps_the_ones_before_i
     assert blocked.status_code == 429
     # The limit refuses the NEXT one; it does not retract what was already observed.
     assert len(await _rows()) == OBSERVATION_RATE_LIMIT
+
+    # ★ AND IT IS PER USER. Without this, a limiter keyed on a constant passes every assertion
+    # above while letting any one citizen silence everybody else's measurements for five minutes.
+    # Mutation check: return a constant from `_observation_rate_key` and this goes red.
+    neighbour = await UserFactory.create(db_session, email="obs-limit-neighbour@rvaiglobal.com")
+    ok = await client.post(
+        "/v1/observations",
+        json={"name": HarnessCounter.PROJECT_OPENED.value},
+        headers=_headers(neighbour),
+    )
+    assert ok.status_code == 201
 
 
 def test_observations_openapi_documents_its_refusals() -> None:

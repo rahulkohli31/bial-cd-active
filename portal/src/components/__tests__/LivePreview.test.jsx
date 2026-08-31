@@ -604,6 +604,41 @@ describe('LivePreview — R104\u2019s stop-clock: `onRevealed` (U4)', () => {
     expect(onRevealed).toHaveBeenCalledTimes(1)
   })
 
+  it('\u2605 does NOT fire when the workspace-lost cover is up over the frame', () => {
+    // `revealed` is NOT "the cover is down". `showCover` is `covered || workspaceLost` while
+    // `revealed` reads only `covered`, so a confirmed reversion leaves the frame at full opacity
+    // UNDERNEATH a cover that says the app stopped running. Firing here reports a first view of
+    // an app the citizen cannot see \u2014 and reports it as FAST, since the frame loaded fine.
+    //
+    // Mutation check: drop `workspaceLost` from the effect's guard and this goes red.
+    const onRevealed = vi.fn()
+    const { container } = render(
+      <LivePreview previewUrl={SANDBOX_URL} status="ready" workspaceLost onRevealed={onRevealed} />,
+    )
+    fireEvent.load(container.querySelector('iframe'))
+
+    expect(container.textContent).toMatch(/stopped running/i) // the cover really is up
+    expect(onRevealed).not.toHaveBeenCalled()
+  })
+
+  it('\u2605 a callback that throws does not take the preview pane down with it', () => {
+    // There is no ErrorBoundary anywhere in this portal, so an unguarded throw out of this effect
+    // white-screens the builder \u2014 a measurement failing the thing it measures, which is the one
+    // outcome this surface exists to avoid.
+    const { container } = render(
+      <LivePreview
+        previewUrl={SANDBOX_URL}
+        status="ready"
+        onRevealed={() => {
+          throw new Error('the beacon module blew up')
+        }}
+      />,
+    )
+
+    expect(() => fireEvent.load(container.querySelector('iframe'))).not.toThrow()
+    expect(card(container).className).toMatch(/opacity-100/) // and the app is still shown
+  })
+
   it('is optional \u2014 a caller that does not measure anything still reveals normally', () => {
     const { container } = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" />)
     fireEvent.load(container.querySelector('iframe'))

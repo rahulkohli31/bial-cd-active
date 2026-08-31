@@ -44,8 +44,15 @@ export interface ChatKindPresentation {
   iconTint: string
 }
 
-/** One record per kind the API can send. Keyed on the wire value, not on a display name. */
-export const CHAT_KINDS: Readonly<Record<string, ChatKindPresentation>> = {
+/**
+ * One record per kind the API can send. Keyed on the wire value, not on a display name.
+ *
+ * `Partial<>` is load-bearing, not decoration: a bare `Record<string, …>` claims a TOTAL map, so
+ * `CHAT_KINDS[anything].word` type-checks clean and the fallback below reads as a courtesy the
+ * compiler would happily let someone delete. Declared partial, the `??` in `chatKindFor` is the
+ * only thing that satisfies the type.
+ */
+export const CHAT_KINDS: Readonly<Partial<Record<string, ChatKindPresentation>>> = {
   builder: {
     // "Build chat"
     word: 'Build',
@@ -76,7 +83,14 @@ export const UNKNOWN_CHAT_KIND: ChatKindPresentation = {
   iconTint: 'text-neutral',
 }
 
-/** How to present one chat row's kind. Never throws, never returns undefined. */
+/**
+ * How to present one chat row's kind. Never throws, never returns undefined.
+ *
+ * `Object.hasOwn`, NOT a bare lookup, and this is a real bug rather than a nicety: `kind` is
+ * unvalidated wire data (`narrowChat` passes through whatever string the API sent), so a row whose
+ * kind is `"constructor"` or `"toString"` would find a truthy value on `Object.prototype`, sail
+ * past `??`, and render a row with an undefined word and no icon. Own-property only.
+ */
 export function chatKindFor(kind: string): ChatKindPresentation {
-  return CHAT_KINDS[kind] ?? UNKNOWN_CHAT_KIND
+  return (Object.hasOwn(CHAT_KINDS, kind) ? CHAT_KINDS[kind] : undefined) ?? UNKNOWN_CHAT_KIND
 }
