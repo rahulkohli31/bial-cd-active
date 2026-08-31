@@ -88,6 +88,18 @@ describe('chatKindFor', () => {
     expect(chatKindFor('plan')).toBe(UNKNOWN_CHAT_KIND)
   })
 
+  it('falls back rather than throwing when a profile arrives with no catalogue at all', () => {
+    // A THIRD MISS, and the one the type system says is impossible: a NON-NULL profile whose
+    // `chat_kinds` is absent. `UserProfile` is an unchecked cast over whatever `/auth/me`
+    // returned, so this is a wire shape, not a contradiction — a stale service worker, a
+    // server that predates the catalogue, a test double. The function's own contract says it
+    // never throws, and it is called once per row of the chat list: a throw here is not one
+    // bad badge, it is the whole project page failing to render.
+    h.getStoredUser.mockReturnValue({} as never)
+    expect(() => chatKindFor('plan')).not.toThrow()
+    expect(chatKindFor('plan')).toBe(UNKNOWN_CHAT_KIND)
+  })
+
   it('★ falls back for a kind that collides with an inherited Object property', () => {
     // THE ONE THAT WAS A CRASH. A bare index into the local look-up table finds
     // `Object.prototype.constructor` — a truthy function — so `??` never fires, and the row

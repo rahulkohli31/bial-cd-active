@@ -19,11 +19,15 @@ import { readApiError } from './apiError'
 // Frame types (mirror backend `conversations/schemas.py`; camelCase on the wire)
 // ---------------------------------------------------------------------------------------
 
-export interface StepDetail {
-  args?: string | null
-  result?: string | null
-}
-
+/**
+ * A step, and DELIBERATELY WITHOUT A `detail`. `StepDetail` carried the tool's own arguments
+ * and result, and it is gone from the server (`services/messages/projection.py`, which now
+ * pins its emitted field set in a test) because nothing rendered it: it was a platform
+ * internal that crossed to the browser and sat there, one refactor away from an expander.
+ * Re-adding the field here would rebuild the client half of that seam and give the next
+ * contributor something to wire up — which is why this comment names it rather than leaving
+ * a silent omission. The egress rule it belongs to is C7 §3.0.
+ */
 export interface StepItem {
   type: 'step'
   seq: number
@@ -31,7 +35,6 @@ export interface StepItem {
   label: string
   state: 'ok' | 'failed' | 'pending'
   hidden: boolean
-  detail: StepDetail
 }
 
 /** Projection items ride the snapshot verbatim (U6 shapes); the hook re-exposes them. */
@@ -263,14 +266,6 @@ function asString(value: unknown): string {
   return typeof value === 'string' ? value : ''
 }
 
-function toStepDetail(value: unknown): StepDetail {
-  const doc = isRecord(value) ? value : {}
-  return {
-    args: typeof doc.args === 'string' ? doc.args : null,
-    result: typeof doc.result === 'string' ? doc.result : null,
-  }
-}
-
 /** Exported so conversationApi.ts's reload path can narrow a stored `step` item the
  * same way the live path does, instead of a raw `as unknown as StepItem` cast — see
  * PR #93 review finding 9. */
@@ -288,7 +283,6 @@ export function toStepItem(value: unknown): StepItem | null {
     // F3/U3: `hidden` is a RENDER hint that must survive the parse — dropping it makes the
     // consumer's `!step.hidden` filter a no-op on `undefined`.
     hidden: value.hidden === true,
-    detail: toStepDetail(value.detail),
   }
 }
 

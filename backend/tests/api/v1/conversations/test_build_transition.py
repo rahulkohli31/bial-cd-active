@@ -42,6 +42,7 @@ from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.message import Message, MessageVisibility
 from src.db.models.user_limit import UserLimit
 from src.services.build_sessions import SessionManager
+from src.services.build_sessions.manager import SandboxReclaimBlockedError
 from src.services.messages.projection import (
     AssistantTextItem,
     PlanOptionsItem,
@@ -52,7 +53,11 @@ from src.services.messages.store import load_history, load_rows
 from src.services.turns.copy import ALREADY_BUILDING_HERE_CODE
 from src.services.turns.engine import TurnEngine, set_turn_engine_for_tests
 from src.services.turns.guard import _mid_reply
-from src.services.turns.plan_options import find_pending
+from src.services.turns.plan_options import (
+    find_pending,
+    resolution_of,
+    resolve_pending_as_refine,
+)
 from src.services.usage.gate import record_usage
 from tests.api.v1.build_sessions.conftest import _sandbox_config
 from tests.api.v1.conversations.test_turn_stream import _headers
@@ -790,7 +795,182 @@ async def test_a_workspace_busy_in_another_chat_is_a_coded_409(
     assert await _chats_with_id(db_session, minted) == 0
 
 
-# --- the retired state --------------------------------------------------------------------
+# --- the refusals a retry must not be given -------------------------------------------------
+
+
+async def test_a_retry_after_the_build_attached_its_sandbox_is_still_answered_idempotently(
+    client, db_session, set_chat_model, wire, _fresh_engine, fake_redis, fake_storage
+) -> None:
+    """★ AE10. THE RETRY THAT ARRIVES LATE, which is the ordinary one: a reload, or a resend
+    after the first response was dropped.
+
+    It is the same case as the fast double press, but it reaches the route in a different
+    world — the first press's turn has attached its sandbox by now, so the user HAS a live
+    session. The busy check reads that session and compares it against the PLAN chat, and a
+    handoff's session can never belong to the plan chat: it belongs to the Build chat, which
+    is a different conversation by construction. So the comparison is true for every late
+    retry, forever, and the citizen was told `409 already_building_here` — "another chat is
+    using your workspace" — about their own build, in a chat they were never taken to.
+
+    The fix is an ORDERING one, which is why this test plants the session rather than mocking
+    the refusal: the idempotency read has to run before every capacity question, because none
+    of them applies to a press that already succeeded.
+    """
+    user, plan_chat, headers = await _plan_chat_with_offer(
+        client, db_session, set_chat_model, _fresh_engine
+    )
+    set_chat_model(_streaming_text("building it now"))
+    minted = uuid.uuid4()
+
+    first = await client.post(_build_url(plan_chat), headers=headers, json={"chatId": str(minted)})
+    assert first.status_code == 200, first.text
+
+    # The manager's own shape for a turn's session. `ensure_sandbox` — the one attach path
+    # every Plan and Build turn takes — never threads a conversation id through, so this is
+    # `None` in production; either way it is not the plan chat's id, which is the whole point.
+    session_id = uuid.uuid4()
+    wire.manager._active_by_user[user.id] = session_id  # noqa: SLF001
+    wire.manager._sessions[session_id] = SimpleNamespace(conversation_id=None)  # noqa: SLF001
+
+    second = await client.post(
+        _build_url(plan_chat), headers=headers, json={"chatId": str(minted)}
+    )
+
+    assert second.status_code == 200, second.text
+    assert second.json()["outcome"] == "already_started"
+    assert second.json()["chatId"] == str(minted)
+    await _settle(_fresh_engine, minted)
+    assert await _chats_with_id(db_session, minted) == 1
+
+
+async def test_unsaved_work_in_another_project_refuses_the_handoff_with_its_own_code(
+    client, db_session, set_chat_model, wire, _fresh_engine, fake_redis, fake_storage
+) -> None:
+    """★ R19's SECOND refusal, on this route rather than the send route.
+
+    The two are different questions with the same status: the first is "one of your own chats
+    holds the workspace", this is "taking the workspace would destroy unsaved work in another
+    project". The send route's copy of this block is tested (`test_turn_stream.py`); the
+    handoff's own copy was not, so deleting it here — or letting the exception escape as a
+    500 — passed the whole suite while a Build press quietly reclaimed and destroyed a
+    different project's live sandbox.
+    """
+    _user, plan_chat, headers = await _plan_chat_with_offer(
+        client, db_session, set_chat_model, _fresh_engine
+    )
+
+    async def _blocked(*a: object, **k: object) -> None:
+        raise SandboxReclaimBlockedError(
+            project_id=uuid.uuid4(), project_name="Visitor Log", app_id=uuid.uuid4(), dirty=True
+        )
+
+    minted = uuid.uuid4()
+    original = SessionManager.reclaim_preflight
+    SessionManager.reclaim_preflight = _blocked  # type: ignore[method-assign]
+    try:
+        resp = await client.post(
+            _build_url(plan_chat), headers=headers, json={"chatId": str(minted)}
+        )
+    finally:
+        SessionManager.reclaim_preflight = original  # type: ignore[method-assign]
+
+    assert resp.status_code == 409
+    error = resp.json()["error"]
+    assert error["code"] == "sandbox_reclaim_blocked"  # NOT the generic try-again-shortly
+    assert error["projectName"] == "Visitor Log"  # it names what is in the way
+    assert await _chats_with_id(db_session, minted) == 0  # and nothing was created
+
+
+async def test_a_minted_id_that_is_the_users_own_plan_chat_is_one_flat_409(
+    client, db_session, set_chat_model, wire, _fresh_engine, fake_redis, fake_storage
+) -> None:
+    """The other two disjuncts of the collision guard, which the owner test does not reach.
+
+    A client-minted id can collide with any conversation, including the caller's OWN. Answering
+    `already_started` for one would hand back a live turn id for a chat that has nothing to do
+    with this press — a Plan chat, or a Build chat in a different project. All three disjuncts
+    produce the same flat 409 for the same reason: the answer must not distinguish."""
+    user, plan_chat, headers = await _plan_chat_with_offer(
+        client, db_session, set_chat_model, _fresh_engine
+    )
+    other_project = await ProjectFactory.create(db_session, user.id)
+    elsewhere = await ConversationFactory.create(
+        db_session, user.id, kind=ChatKind.BUILD, project_id=other_project.id
+    )
+
+    for colliding in (plan_chat.id, elsewhere.id):
+        resp = await client.post(
+            _build_url(plan_chat), headers=headers, json={"chatId": str(colliding)}
+        )
+        assert resp.status_code == 409, resp.text
+        # THE SAME SENTENCE FOR BOTH, and the same one an id belonging to a stranger gets. It
+        # says nothing about what the id turned out to be, and it carries no turn id — which
+        # is the actual leak an `already_started` answer here would be.
+        assert resp.json()["error"]["message"] == "This conversation id is already in use."
+        assert "turnId" not in resp.text
+
+
+async def test_a_raced_refine_leaves_exactly_one_return_on_the_wire(
+    client, db_session, set_chat_model, wire, _fresh_engine, fake_redis, fake_storage
+) -> None:
+    """★ The Build-it vs turn-start race, from the route rather than from the recorder.
+
+    A free-text send in the Plan chat resolves the open offer as `refine`. If a Build press for
+    that same card then answers off the snapshot it opened with, it writes a SECOND real
+    `ToolReturnPart` for one call id — and the two readers disagree about what happened: the
+    model's history takes the first (`repair_dangling_tool_calls` dedupes first-wins) and the
+    citizen's card takes the last. The build DID start, so the resolution has to say `build`;
+    it just cannot say it on the wire twice. A hidden overlay is how it says it once.
+    """
+    user, plan_chat, headers = await _plan_chat_with_offer(
+        client, db_session, set_chat_model, _fresh_engine
+    )
+    # The racing resolution, written the way a concurrent free-text send writes it.
+    await resolve_pending_as_refine(db_session, user_id=user.id, conversation_id=plan_chat.id)
+
+    set_chat_model(_streaming_text("building it now"))
+    minted = uuid.uuid4()
+    resp = await client.post(_build_url(plan_chat), headers=headers, json={"chatId": str(minted)})
+    assert resp.status_code == 200, resp.text
+    await _settle(_fresh_engine, minted)
+
+    rows = list(
+        await load_rows(
+            db_session, user_id=user.id, conversation_id=plan_chat.id, include_hidden=True
+        )
+    )
+    returns = [
+        part
+        for row in rows
+        for message in (row.payload if isinstance(row.payload, list) else [])
+        if isinstance(message, dict)
+        for part in message.get("parts", [])
+        if isinstance(part, dict)
+        and part.get("part_kind") == "tool-return"
+        and part.get("tool_call_id") == "opt-build"
+    ]
+    assert len(returns) == 1  # the refine, and nothing stacked on top of it
+    # And the card still reads what actually happened, off the hidden overlay.
+    assert resolution_of(rows, "opt-build") == "build"
+
+
+# THE GENUINE-RACE ARM IS NOT COVERED HERE, AND IT IS NOT AN OVERSIGHT.
+#
+# Two presses in flight at once both find nothing at the idempotency read and one loses the
+# insert; the route catches that, ROLLS BACK, and answers with the existing chat. Reaching it
+# from this file means blinding the idempotency read once — which works — and then the route's
+# own `db.rollback()` unwinds the connection-level transaction every test here shares with the
+# app, so the next statement dies on a `MissingGreenlet` before any assertion runs. What such a
+# test would prove is the fixture, not the arm.
+#
+# Covering it honestly needs a request holding its OWN session (a live server and two real
+# concurrent posts), which is an integration-lane shape this suite does not have. Until then
+# the arm is reviewed rather than pinned, and a mutation to it — `except Exception: raise`, or
+# dropping the rollback — survives this file. It is written down here so the next reader does
+# not mistake the sequential double-press test above for coverage of it.
+
+
+# --- the retired state ------------------------------------------------------------------
 
 
 def test_no_resolution_value_exists_that_a_user_cannot_produce() -> None:

@@ -9,9 +9,10 @@ explicit alias because Pydantic treats a leading-underscore field name as privat
 The legacy message-append/read schemas died with their endpoints (U4's destructive reset);
 the projection read shape joins in U6.
 
-Net-new routes (the U13 mode switch, the U10/U11/U12 turn surfaces) parse their bodies
-through models normally — only the Express-era routes keep the byte-matched JSONResponse
-discipline.
+Net-new routes (the turn surfaces, the Build-it handoff) parse their bodies through models
+normally — only the Express-era routes keep the byte-matched JSONResponse discipline. The
+mode-switch request/response models are gone with the route that took them: a chat's kind is
+chosen at creation and there is nothing to switch.
 """
 
 from __future__ import annotations

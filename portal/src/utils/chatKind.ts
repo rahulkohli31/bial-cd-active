@@ -117,7 +117,13 @@ export const UNKNOWN_CHAT_KIND: ChatKindPresentation = {
 export function chatKindFor(kind: string): ChatKindPresentation {
   const look = Object.hasOwn(CHAT_KIND_LOOKS, kind) ? CHAT_KIND_LOOKS[kind] : undefined
   if (!look) return UNKNOWN_CHAT_KIND
-  const entry = getStoredUser()?.chat_kinds.find((candidate) => candidate.value === kind)
+  // `?.` ON THE ARRAY TOO, not just on the profile. `UserProfile` is an unchecked cast over
+  // whatever `/auth/me` returned (`utils/auth.ts` asserts the shape, nothing validates it), so
+  // an absent `chat_kinds` is a wire fact rather than a type-system impossibility — a stale
+  // service worker, a test double, or a server that predates the catalogue. It has to degrade
+  // to the unknown badge exactly like an unrecognised value, not throw mid-render and take the
+  // whole chat list down with it. Same promise the `Object.hasOwn` guard above keeps.
+  const entry = getStoredUser()?.chat_kinds?.find((candidate) => candidate.value === kind)
   if (!entry) return UNKNOWN_CHAT_KIND
   return {
     word: entry.name,

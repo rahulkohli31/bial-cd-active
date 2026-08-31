@@ -874,8 +874,16 @@ class TurnEngine:
                 note = await self._workspace_note(state)
                 history = [*history, ModelRequest(parts=[UserPromptPart(content=note)])]
             if state.kind is ChatKind.BUILD:
-                # THE SECOND AND LAST READER OF THE KIND, and a different question from the
-                # toolset registry's: this one selects a HARNESS SHAPE — the node loop with
+                # ONE OF THE THREE READERS OF THE KIND, and each asks a different question:
+                # `agent/toolsets.py` asks what the model CAN DO, `agent/mode_prompts.py` asks
+                # what it is TOLD, and this asks WHICH HARNESS RUNS it. Three, not two — the
+                # organising rule is that behaviour lives in the toolset rather than in
+                # scattered branches, and the honest statement of it is that these three sites
+                # are the closed set. Anyone auditing every place the kind changes behaviour,
+                # adding a third kind, or building the import guard that enforces this, has to
+                # find all three; a comment claiming two would send them looking for two.
+                #
+                # This one selects a HARNESS SHAPE — the node loop with
                 # its per-step billing fold versus a single `chat_agent.run`, and with it the
                 # `output_type` below. Unifying the two loops would mean giving a Plan run the
                 # streaming node loop and the per-step billing it has no steps for.

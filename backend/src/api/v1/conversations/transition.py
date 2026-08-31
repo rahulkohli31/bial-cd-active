@@ -44,6 +44,7 @@ from typing import Literal
 import structlog
 from fastapi import APIRouter, status
 from fastapi.responses import JSONResponse
+from pydantic_ai.messages import ToolCallPart
 from sqlalchemy.exc import IntegrityError
 
 from src.api.deps import CurrentUser, DbSession
@@ -192,6 +193,28 @@ async def build_it(
         message, code = _refusal_for(call)
         raise AppApiError(400, message, code=code)
 
+    # --- THE IDEMPOTENCY READ, AND IT HAS TO SIT HERE -----------------------------------------
+    #
+    # A press that already succeeded is answered with ITS OWN ANSWER, before anything asks
+    # whether a NEW build could start — because none of those questions apply to it. The three
+    # refusals above are about whether this press is meaningful at all (a card, the newest card,
+    # a plan in it) and a retry has to pass them too. Everything below is about capacity: the
+    # daily ceiling, a configured model and sandbox, and the one-workspace-per-user rules. A
+    # retry that reaches those gets told it cannot start the build it has ALREADY started.
+    #
+    # THE BUSY CHECK IN PARTICULAR IS UNANSWERABLE FROM DOWN THERE. It compares the user's live
+    # session against `plan_chat.id`, and a handoff's session belongs to the BUILD chat, which
+    # is a different conversation by construction — so once the first press has attached its
+    # sandbox, that comparison is true for every retry, forever, and a reload or a resend after
+    # a dropped response was answered `409 already_building_here` instead of `already_started`.
+    # The browser caches the minted id per card precisely so a retry is recognisable; this is
+    # where it gets recognised.
+    #
+    # STILL SIDE-EFFECT FREE, so it does not disturb the "nothing is written until every refusal
+    # has passed" property the block above rests on: `_already_started` is two SELECTs.
+    if await db.get(Conversation, body.chat_id) is not None:
+        return await _already_started(db, user.id, body.chat_id, plan_chat.project_id)
+
     # 429 with its byte-stable body, and the card STAYS PRESSABLE — nothing has been written, so
     # there is no half-started build and the citizen can simply press again tomorrow.
     try:
@@ -227,20 +250,13 @@ async def build_it(
         raise AppApiError(404, "Conversation not found.")
     app_id = await _app_id_for_project(db, user.id, plan_chat.project_id)
 
-    # --- the idempotency arm, asked FIRST and caught SECOND ---------------------------------
-    #
-    # THE ORDINARY DOUBLE PRESS IS A READ. A second press, a retry and a reload all carry the id
-    # the browser minted for that press, so the chat is already there and answering takes one
-    # SELECT — no failed INSERT, no savepoint, and no session left holding a rejected object
-    # that the arm's own re-read would try to flush again.
-    #
-    # THE CATCH BELOW IS THE RACE BACKSTOP, not the mechanism: two presses genuinely in flight at
-    # once both find nothing here and one of them loses the insert. It is the same answer either
-    # way, which is what makes the fast path safe to take.
-    if await db.get(Conversation, body.chat_id) is not None:
-        return await _already_started(db, user.id, body.chat_id, plan_chat.project_id)
-
     # --- the new chat: FLUSHED, deliberately not committed ----------------------------------
+    #
+    # THE ORDINARY DOUBLE PRESS NEVER REACHES HERE — it was answered by the idempotency read
+    # above, which is one SELECT rather than a failed INSERT. THE CATCH BELOW IS THE RACE
+    # BACKSTOP, not the mechanism: two presses genuinely in flight at once both find nothing up
+    # there and one of them loses this insert. It is the same answer either way, which is what
+    # makes the fast path safe to take.
     build_chat = Conversation(
         id=body.chat_id,
         user_id=user.id,
@@ -299,18 +315,40 @@ async def build_it(
     # never a count. That is what makes "no stored field references both conversations" a fact
     # about the row rather than an aspiration.
     #
-    # SKIPPED WHEN THE CALL IS ALREADY ANSWERED, which is the week-later press: the offer stays
-    # pressable after a build (nothing archives it), and a second `ToolReturnPart` for one call
-    # id would wedge the thread on its next load.
-    if resolution_of(rows, tool_call_id) is None:
-        await record_build_started(db, user_id=user.id, conversation_id=plan_chat.id, pending=card)
+    # AND IT IS DECIDED ON A FRESH READ, NOT ON `rows`. `rows` is the snapshot this request
+    # opened with, and everything between there and here takes real time: the daily-limit read,
+    # the reclaim preflight, the insert, and a turn start that does not return until a sandbox
+    # is attached. A free-text send in the Plan chat from a second tab resolves this same card
+    # as `refine` inside that window — and answering off the stale snapshot would put a SECOND
+    # real `ToolReturnPart` on one call id, which is the hazard the comment below names.
+    #
+    # THREE ANSWERS, ONE READ:
+    #   nothing stored  → write the real `ToolReturnPart`; this is the ordinary press.
+    #   `build` stored  → write nothing. The week-later press: the offer stays pressable after a
+    #                     build (nothing archives it) and the card already reads what happened.
+    #   anything else   → the raced `refine`, or a `build_failed:` string left by the retired
+    #                     recorder. The build DID start, so it is recorded as a hidden overlay
+    #                     instead: the projection reads `build` as the newest resolution and the
+    #                     wire still carries exactly one return for the call id.
+    fresh = list(
+        await load_rows(db, user_id=user.id, conversation_id=plan_chat.id, include_hidden=True)
+    )
+    prior = resolution_of(fresh, tool_call_id)
+    if prior != "build":
+        await record_build_started(
+            db,
+            user_id=user.id,
+            conversation_id=plan_chat.id,
+            pending=card,
+            answered_already=prior is not None,
+        )
     await count(BUILD_HANDOFF_PRESSED)
     return BuildHandoffResponse(
         outcome="started", chat_id=str(build_chat.id), turn_id=str(turn_id)
     )
 
 
-def _refusal_for(call: object) -> tuple[str, str]:
+def _refusal_for(call: ToolCallPart | None) -> tuple[str, str]:
     """(message, code) for an offer that cannot be built from.
 
     TWO CODES, because the two causes have different remedies. "There is no plan in this offer"
@@ -321,9 +359,7 @@ def _refusal_for(call: object) -> tuple[str, str]:
     ASKS THE SAME QUESTION `plan_from_call` ASKS rather than re-deriving it. The ceiling is the
     only thing separating the two refusals, so "the call carries a plan argument at all" IS
     "the plan is too long" — and it stays true if a third rejection is ever added there."""
-    from pydantic_ai.messages import ToolCallPart  # local: keeps the wire types off this seam
-
-    if isinstance(call, ToolCallPart) and plan_argument_of(call) is not None:
+    if call is not None and plan_argument_of(call) is not None:
         return _PLAN_TOO_LONG_MESSAGE, PLAN_TOO_LONG_CODE
     return _NO_PLAN_MESSAGE, NO_PLAN_CODE
 

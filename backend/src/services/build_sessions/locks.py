@@ -347,11 +347,13 @@ async def write_starting_marker(
     no marker had ever been written — a bounded claim, not a pardon (see the module docstring's
     TTL discussion for the liveness lease, which this repeats for a different family).
 
-    BARE on Redis errors, per the module's REDIS-ERROR POLICY: this call sits inside
-    `_holding_user_lock`'s protected region, before the lock is yielded to the caller, so a
-    failure here is caught by the SAME `except BaseException` that would compensate a failed
-    `acquire_lock` — there is no live container yet for the marker to protect, so tearing
-    nothing down and releasing the lock is exactly right."""
+    BARE on Redis errors, per the module's REDIS-ERROR POLICY, and that is only safe because
+    of WHERE it is called: inside `_holding_user_lock`'s try, after the lock is acquired and
+    before the scope is yielded. A raise there reaches the compensation arm, which releases the
+    lock and tears down a container that does not exist yet — the right outcome for a marker
+    whose write failed. Called from ABOVE that try it would be the opposite: the lock is already
+    held by then, so an unguarded raise leaks it for the whole 900s TTL and locks the user out
+    of their own workspace. Anyone adding a second call site owes it the same placement."""
     await redis.set(starting_key(user_uuid), str(project_id), ex=STARTING_MARKER_TTL_SECONDS)
 
 

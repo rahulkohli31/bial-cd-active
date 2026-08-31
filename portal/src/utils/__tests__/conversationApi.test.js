@@ -135,17 +135,15 @@ describe('messagesFromProjection', () => {
         { type: 'build_in_progress', seq: 3, sessionId: 's' },
       ]),
     ).toEqual([
-      // The step part is now toStepItem(visible), not the raw stored item — same
-      // narrowing function turnStreamApi.ts's live path uses (PR #93 review finding
-      // 9), so it also fills toStepItem's own default for the field `visible` never
-      // had (detail: {args: null, result: null}) rather than forwarding the raw
-      // object's exact fields untouched. `mode` used to get the same default-fill
-      // treatment here; StepItem carries no such field any more, so there is nothing
-      // left to default.
+      // The step part is now toStepItem(visible), not the raw stored item — the same
+      // narrowing function turnStreamApi.ts's live path uses (PR #93 review finding 9).
+      // It used to default-fill two fields the stored row never had, `mode` and
+      // `detail: {args: null, result: null}`; StepItem carries neither any more, so a
+      // reloaded step is exactly the six fields below and nothing is synthesized.
       {
         id: 'srv_1_s_0',
         role: 'assistant',
-        parts: [{ type: 'step', step: { ...visible, detail: { args: null, result: null } } }],
+        parts: [{ type: 'step', step: { ...visible } }],
         seq: 1,
       },
       // …index 2, not 1: the ordinal counts SOURCE position, so skipping the hidden step at

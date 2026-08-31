@@ -37,7 +37,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, fireEvent, waitFor, act, cleanup, within } from '@testing-library/react'
-import { MemoryRouter, Routes, Route } from 'react-router-dom'
+import { MemoryRouter, Routes, Route, useNavigate } from 'react-router-dom'
 import {
   FakeEventSource, makeClient, primeClient,
   PLAN_CARD_ID, planReply, primeTurn,
@@ -90,11 +90,22 @@ vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), bui
 import BuilderPage from '../BuilderPage'
 import ChatPage from '../ChatPage'
 
+/**
+ * The browser's Back button, as a thing a test can press. Rendered as a sibling of the routed
+ * page so it survives the handoff's navigate — which is the only way to reach the state this
+ * file's back-navigation test is about.
+ */
+function BackButton() {
+  const navigate = useNavigate()
+  return <button data-testid="go-back" onClick={() => navigate(-1)} />
+}
+
 function renderBuilder(chatId, projectId = 'p1') {
   const fake = new FakeEventSource(chatId)
   const deps = { client: makeClient(h), eventSourceFactory: () => fake }
   const view = render(
     <MemoryRouter initialEntries={[`/chat/${chatId}`]}>
+      <BackButton />
       <Routes>
         <Route path="/chat/:chatId" element={<BuilderPage projectId={projectId} projectName="VIP Movement" buildSessionDeps={deps} />} />
       </Routes>
@@ -332,6 +343,78 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     // which is itself another Build-it press, so it mints (and claims) a fresh chat too.
     mintBuild('new-B', 'Second build')
     fireEvent.click(within(card).getByRole('button', { name: /^Build it$/ }))
+    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledTimes(2))
+    expect(h.buildFromPlan).toHaveBeenLastCalledWith('build-B', PLAN_CARD_ID, 'new-B')
+  })
+
+  it('★ Back, straight after a handoff, does not leave the chat it returns to blank', async () => {
+    // THE HANDOFF MADE THIS REACHABLE ON THE COMMONEST ACTION THERE IS. Build it pushes a
+    // navigation to the new chat, and the arrival effect wipes the transcript on screen before
+    // a byte of the new one arrives. Press Back before that fetch resolves and the effect runs
+    // again for the chat we came from — where its own "already loaded" guard used to still
+    // name it, because the guard was only ever updated on a SUCCESSFUL load. Hydration was
+    // skipped, and the citizen sat looking at the empty transcript the outbound trip made,
+    // with no way back to it short of reloading the page.
+    //
+    // The guard means "the chat whose transcript is on screen". Clearing the transcript has to
+    // clear it too, and this is what says so.
+    mintBuild('new-A', 'First build')
+    // THE FETCH FOR THE NEW CHAT NEVER RESOLVES, which is the whole precondition: Back has to
+    // land while the outbound hydration is still in flight. A resolved one would have moved
+    // the guard on to the new chat, and the return trip would re-hydrate for the wrong reason.
+    const settled = h.getBuild.getMockImplementation()
+    h.getBuild.mockImplementation(async (id) => (id === 'new-A' ? new Promise(() => {}) : settled(id)))
+
+    const a = renderBuilder('build-A')
+    await buildFrom(a.container)
+    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledWith('build-A', PLAN_CARD_ID, 'new-A'))
+    await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('new-A'))
+
+    const before = h.getBuild.mock.calls.filter(([id]) => id === 'build-A').length
+    fireEvent.click(within(a.container).getByTestId('go-back'))
+
+    // Asked the server again for the chat we came back to — the hydration was not skipped.
+    await waitFor(() =>
+      expect(h.getBuild.mock.calls.filter(([id]) => id === 'build-A').length).toBeGreaterThan(before),
+    )
+    // And it is a working chat, not an empty shell: the composer is live again.
+    await within(a.container).findByPlaceholderText(/describe what you need/i)
+  })
+
+  it('★ releases the claim when the chat it handed off to has nothing running', async () => {
+    // THE LEAK THE HANDOFF OPENED. Acquire and release used to be one scope — the build ran in
+    // the chat the button was pressed in, and that watcher's own settle retracted the claim.
+    // Now the press claims a chat it is about to NAVIGATE to, and the release belongs to
+    // whoever ends up watching that chat's turn. When there is no turn to watch — the build
+    // ended before this page arrived and asked, or the read projection has not caught up —
+    // nobody retracts it, and the 5s heartbeat goes on announcing a claim with nothing behind
+    // it. The citizen's symptom is not subtle: every later Build press in this project, in
+    // this tab or a sibling, is told "another chat is already building this project", and
+    // only closing the tab clears it.
+    //
+    // Registered in the project directory but deliberately NOT in `liveTurnByChat`, which is
+    // exactly "arrived, asked, and nothing is running here".
+    h.uuidv7.mockReturnValueOnce('new-A')
+    projectBuilds = [
+      ...projectBuilds,
+      { id: 'new-A', kind: 'build', title: 'First build', updatedAt: new Date().toISOString() },
+    ]
+
+    const a = renderBuilder('build-A')
+    await buildFrom(a.container)
+    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledWith('build-A', PLAN_CARD_ID, 'new-A'))
+    // The page followed the handoff and hydrated the new chat — this is the moment the claim
+    // has to go, because nothing after it will.
+    await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('new-A'))
+
+    mintBuild('new-B', 'Second build')
+    const b = renderBuilder('build-B')
+    await within(b.container).findByPlaceholderText(/describe what you need/i)
+    await flushChannel()
+    await buildFrom(b.container, 'and add a table')
+
+    // Not blocked: B's press reaches the server and hands off to its own new chat. With the
+    // claim leaked, B is refused locally by `buildBlockedMessage` and never gets this far.
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledTimes(2))
     expect(h.buildFromPlan).toHaveBeenLastCalledWith('build-B', PLAN_CARD_ID, 'new-B')
   })

@@ -1,4 +1,4 @@
-"""The `conversations` table — one chat, keyed by a CLIENT-MINTED id, with server-owned mode.
+"""The `conversations` table — one chat, keyed by a CLIENT-MINTED id, with a fixed kind.
 
 A conversation is minted by the SPA (`crypto.randomUUID`) and its id is externally
 meaningful: a *builder* conversation's id IS the deployed `appId` (Plan B's
@@ -6,10 +6,11 @@ meaningful: a *builder* conversation's id IS the deployed `appId` (Plan B's
 migration (R4) — the SPA supplies it on the first append, never the server. The
 `UUIDv7PrimaryKeyMixin` default only covers a hypothetical server-minted row.
 
-`kind` is a native PG enum (ADR-0008); it retires with the builder-thread endpoint (U13).
-`mode` is the unified chat's STICKY, SERVER-OWNED mode (U4 / plan 2026-07-22-002): tool
-gating derives from THIS column, never from anything the client sends, and it changes only
-between turns through the explicit switch endpoint (or the atomic Build-it transition).
+`kind` is a native PG enum (ADR-0008) and it is the WHOLE classification: `plan` or `build`,
+chosen at creation and never changed, because no route mutates it (R14/R15). Tool gating
+derives from this column and from nothing the client sends. There is no `mode` column any
+more — it and its switch endpoint were dropped in migration 0035, and the two three-valued
+vocabularies they carried collapsed into this one two-valued one.
 `title`/`context` are the mutable header fields the SPA owns. The legacy `code` JSONB (the
 single builder code snapshot) was dropped in migration 0024 — code truth lives in
 `app_registry.current_code` and the build snapshots.

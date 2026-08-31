@@ -790,6 +790,14 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // routing). The composer draft belongs to the OLD chat — a leaked draft would send into this
     // one — so restore THIS chat's saved draft rather than blanking unconditionally (G3).
     setMessages([])
+    // AND THE GUARD ABOVE IS INVALIDATED IN THE SAME BREATH. `loadedBuildRef` means "the chat
+    // whose transcript is on screen", and one line ago that stopped being true — so it has to
+    // stop saying so here rather than only when the fetch below succeeds. It did not, and the
+    // handoff made that reachable on the platform's commonest action: Build it push-navigates
+    // to the new chat, and Back before its `getBuild` resolves returned to a chat whose ref
+    // still named it. The guard then skipped the whole hydration and left the citizen looking
+    // at the empty transcript this line just made, recoverable only by reloading the page.
+    loadedBuildRef.current = null
     setInput(readDraft(buildId))
     clearPending()
     // Re-ask the live-build question for the chat we are arriving at. Carrying the previous chat's
@@ -806,7 +814,18 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
 
     getBuild(buildId)
       .then((saved) => {
-        if (!alive || buildIdRef.current !== buildId) return
+        if (!alive || buildIdRef.current !== buildId) {
+          // ARRIVAL ABANDONED, so nothing on this page will ever watch a turn here — and the
+          // advisory build claim is retracted by whatever watches (`endGenerating`). Leaving
+          // it announced would keep the 5s heartbeat re-asserting a claim with no watcher
+          // behind it, and every later Build press in this project — this tab or a sibling —
+          // would be told "another chat is already building" until the tab was reloaded. A
+          // release for a conversation holding no claim is a no-op, so this costs nothing on
+          // the ordinary path. The build itself is unaffected: it runs server-side, and the
+          // one-workspace-per-user refusal there is the authoritative gate this only mirrors.
+          releaseBuildClaim(buildId)
+          return
+        }
         loadedBuildRef.current = buildId
         // UNCHECKED (matches pre-migration behavior): the stored context's shape is asserted.
         if (saved?.context) contextRef.current = saved.context as { uploadedFiles: unknown[] }
@@ -844,9 +863,16 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         // other over one shared controller.
         if (!handedOff && saved?.activeTurn?.turnId) {
           void reattachToTurn(buildId, saved.activeTurn, () => alive)
+        } else if (!handedOff) {
+          // NOTHING IS RUNNING HERE, so nothing will settle and retract the claim. This is the
+          // handoff's own narrow window: the press announced a claim for a chat whose turn had
+          // already ended (or had not yet reached the read projection) by the time this page
+          // arrived and asked. Same reasoning as the abandoned-arrival release above.
+          releaseBuildClaim(buildId)
         }
       })
       .catch(() => {
+        releaseBuildClaim(buildId)
         if (alive) navigate('/projects', { replace: true })
       })
     return () => {
@@ -993,6 +1019,18 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     [refreshSaveState],
   )
 
+  /**
+   * Retract this page's advisory build claim for one chat. A no-op when it holds none.
+   *
+   * Called from `endGenerating` (a turn settled) AND from the arrival effect (there is no turn
+   * to settle). Both are needed because the handoff SPLIT acquire from release: the press
+   * claims a chat it is about to navigate to, and the release belongs to whoever ends up
+   * watching that chat — which, on an abandoned or already-finished arrival, is nobody.
+   */
+  const releaseBuildClaim = useCallback((activeId: string) => {
+    buildLockRef.current?.release(activeId)
+  }, [])
+
   const endGenerating = useCallback(
     (activeId: string) => {
       setGeneratingChatId((prev) => (prev === activeId ? null : prev))
@@ -1004,11 +1042,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       // button. A release for a conversation holding no claim is a no-op, so this is safe on
       // every ordinary reply too — and a claim nobody retracts blocks the user's next build
       // until they close the tab, which is the failure worth being generous about.
-      buildLockRef.current?.release(activeId)
+      releaseBuildClaim(activeId)
       notifyUsageChanged()
       settleSaveState()
     },
-    [settleSaveState],
+    [releaseBuildClaim, settleSaveState],
   )
 
   /** Arm (d)'s way out: re-run the same adopt round-trip that could not be completed. */
@@ -1563,12 +1601,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     }
   }
 
-  /**
-   * Build it — the atomic U12 transition: ONE server call records the choice, flips the
-   * conversation to Write, acquires the build lock, and starts the build. Every failure
-   * is a typed outcome that re-arms the card; `started` hands back the session this page
-   * attaches its cockpit to. Stale plans warn first — the user decides (force).
-   */
   /**
    * WATCHING A BUILD FROM THE CHAT IT WAS PRESSED IN USED TO LIVE HERE, and it is gone because
    * the build no longer runs in this chat. `Build it` creates a SECOND conversation, seeded with

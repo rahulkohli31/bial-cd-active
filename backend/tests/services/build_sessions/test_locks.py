@@ -323,10 +323,12 @@ async def test_the_pipelined_read_surfaces_redis_errors_bare(
 async def test_write_starting_marker_surfaces_redis_errors_bare(
     fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The write sits inside `_holding_user_lock`'s protected region, BEFORE the lock is
-    yielded to the caller — so a failure here is exactly what `acquire_lock` failing would
-    have been, and must surface the same way rather than being swallowed into a silent
-    non-start."""
+    """The write must SURFACE rather than be swallowed into a silent non-start: it sits inside
+    `_holding_user_lock`'s try, so raising is what reaches the compensation arm that releases
+    the lock this request already holds. Swallowing it would leave a start nobody can see
+    behind a lock nobody can explain. The PLACEMENT half of that contract — that the call is
+    inside the try and not above it — is pinned by
+    `test_manager.py::test_a_failed_starting_marker_write_leaks_no_lock`."""
     monkeypatch.setattr(fake_redis, "set", _boom)
     with pytest.raises(RedisError):
         await locks.write_starting_marker(fake_redis, USER, PROJECT)

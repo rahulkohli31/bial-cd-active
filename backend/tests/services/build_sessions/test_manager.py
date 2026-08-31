@@ -461,6 +461,42 @@ async def test_start_compensates_a_provision_failure_no_leaked_lock(
     await session.task
 
 
+async def test_a_failed_starting_marker_write_leaks_no_lock(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ U13s placement rule, and it is a placement rule rather than a style note.
+
+    `write_starting_marker` runs with the per-user lock ALREADY HELD. Called from above
+    `_holding_user_lock`s try — where it was — a Redis blip on that one `SET` unwinds straight
+    out, past the compensation arm that releases the lock, and leaves it in place for its full
+    900-second TTL. Every start, relaunch and turn that user attempts for the next fifteen
+    minutes is refused with "already building" while nothing is building. Inside the try, the
+    same blip is compensated: the lock goes, and the next start succeeds immediately.
+    """
+    user, project_id = await _mk(db_session, "marker@rvaiglobal.com")
+    manager = SessionManager()
+
+    async def _boom(*args: object, **kwargs: object) -> object:
+        raise RedisError("redis is down")
+
+    monkeypatch.setattr("src.services.build_sessions.manager.write_starting_marker", _boom)
+    with pytest.raises(RedisError):
+        await manager.start(
+            db_session,
+            user,
+            project_id,
+            "p",
+            run_build=FakeBrain(),
+            sandbox_client=FakeSandboxClient(),
+        )
+
+    assert await lock_is_held(fake_redis, user.id) is False
+    assert manager.active_session_for(user.id) is None
+
+
 async def test_abnormal_completion_synthesizes_failed_ended(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:

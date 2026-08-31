@@ -37,7 +37,9 @@ left holding something the new code cannot answer:
     synthesized 'interrupted' result is stitched in". The reason is the CARD: a migrated Build
     chat would otherwise project a live Build-it offer for a tool its new toolset does not
     contain, and the citizen would press a button nothing can answer. The overlay written here
-    is exactly the shape `plan_options.record_build_failure` already writes — `entry_kind =
+    is exactly the shape `plan_options.record_build_failure` wrote before this same change
+    retired it (it is called "the retired recorder" further down this file, and it is not
+    in `src/` any more — the shape is quoted here rather than pointed at) — `entry_kind =
     system_event`, `visibility = hidden`, empty payload, `meta.kind = plan_options_resolved`,
     `choice = refine`. Deliberately NOT a `ToolReturnPart`: no historical payload is rewritten
     and no `ToolReturnPart` is synthesized, because the model-history half is already covered.
@@ -118,18 +120,27 @@ def _resolve_outstanding_plan_options() -> None:
     `present_plan_options` return necessarily contains the tool's name. Rows failing it come
     back with `NULL` and skip the walk exactly as an empty payload always did.
 
-    Every row is still READ, because `head_seq` needs the whole conversation's high-water mark
-    and `meta` carries the other half of the resolutions — it is the 100 KB payloads, not the
-    rows, that had to stop travelling.
+    AND ONLY THE CONVERSATIONS THAT HOLD A CARD ARE READ AT ALL, which is the bound that
+    matters at deploy time. Everything this loop computes — the owner, the high-water `seq`, the
+    resolutions — is consumed under `pendings`, and a conversation is only in `pendings` if it
+    has a `plan_options_pending` row. Reading the rest was work whose result was thrown away,
+    and it was not free: this revision runs inside one transaction with the `ALTER COLUMN kind`
+    that already holds ACCESS EXCLUSIVE on `messages`, so every row scanned here extends the
+    window in which nobody can chat or build. The subquery costs one pass over `meta`; the outer
+    scan then touches a handful of conversations instead of the platform's entire history.
     """
     bind = op.get_bind()
     rows = bind.execute(
         sa.text(
             "SELECT user_id, conversation_id, seq, meta, "
             "  CASE WHEN payload::text LIKE :probe THEN payload END AS payload "
-            "FROM messages ORDER BY conversation_id, seq"
+            "FROM messages "
+            "WHERE conversation_id IN ("
+            "  SELECT conversation_id FROM messages WHERE meta->>'kind' = :pending"
+            ") "
+            "ORDER BY conversation_id, seq"
         ),
-        {"probe": f"%{PLAN_OPTIONS_TOOL}%"},
+        {"probe": f"%{PLAN_OPTIONS_TOOL}%", "pending": META_PENDING},
     ).mappings()
 
     pendings: dict[Any, list[str]] = {}

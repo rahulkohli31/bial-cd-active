@@ -592,7 +592,9 @@ def _plan_argument(args: Any) -> str | None:
     if not isinstance(args, dict):
         return None
     plan = args.get("plan")
-    return plan.strip() or None if isinstance(plan, str) else None
+    if not isinstance(plan, str):
+        return None
+    return plan.strip() or None
 
 
 def _project_response_parts(

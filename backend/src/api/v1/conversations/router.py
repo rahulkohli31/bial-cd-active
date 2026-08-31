@@ -9,9 +9,10 @@ camelCase timestamps, and the `{error:{message}}` envelope. Identity is ALWAYS t
 authenticated caller; every query is scoped by `user_id` (a dropped predicate is a cross-user
 leak). The conversation read API grows the projection + `active_turn` in U6.
 
-`POST /{id}/mode` (U13) is the explicit mode switch — atomic with the hidden marker row; it
-retires with the canonical-thread model itself in U13 (the root box then always mints a new
-chat).
+THERE IS NO ROUTE HERE THAT CHANGES WHAT A CHAT IS. The explicit mode switch this file used
+to serve is retired with the vocabulary it switched (R14/R17): a chat is a Plan chat or a Build
+chat, chosen at creation and fixed. Building from a plan does not mutate the plan chat either —
+`transition.py`'s handoff creates a SECOND chat and starts its turn there.
 """
 
 from __future__ import annotations

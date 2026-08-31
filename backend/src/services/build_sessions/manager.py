@@ -1187,13 +1187,17 @@ class SessionManager:
         token = await acquire_lock(redis, user_id)
         if token is None:
             raise BuildSessionConflictError(self._active_by_user.get(user_id))
-        # U13 — from here until the scope exits, a poll of `project_preview_state` for
-        # `project_id` answers `starting` rather than whatever it would otherwise have said
-        # (a stale `asleep`, or a ghost `slot_taken`). Written AFTER the lock is held so a
-        # request that loses the race to acquire it never claims a start it did not win.
-        await write_starting_marker(redis, user_id, project_id)
         scope = _LockScope(token=token)
         try:
+            # U13 — from here until the scope exits, a poll of `project_preview_state` for
+            # `project_id` answers `starting` rather than whatever it would otherwise have said
+            # (a stale `asleep`, or a ghost `slot_taken`). Written AFTER the lock is held so a
+            # request that loses the race to acquire it never claims a start it did not win,
+            # and INSIDE the try because by this point a lock IS held: a Redis blip on this one
+            # `SET`, raised from above the try, would have unwound past the compensation arm and
+            # left that lock in place for its full 900s — every later start, relaunch and turn
+            # for this user answered "already building" with nothing building.
+            await write_starting_marker(redis, user_id, project_id)
             yield scope
             # Clean exit — the body either released control back to us (RELEASE below) or
             # adopted the lock (a session now owns the container). Either way the start this

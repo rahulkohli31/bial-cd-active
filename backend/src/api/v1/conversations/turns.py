@@ -487,9 +487,9 @@ async def turn_events(
 
 
 class ResolvePlanOptionsBody(CamelModel):
-    """The user's click. Only `refine` resolves HERE — `build` goes through U12's atomic
-    Build-it transition endpoint (record + flip mode + lock + start, one operation), so a
-    resolved-build can never exist without its build."""
+    """The user's click. Only `refine` resolves HERE — `build` goes through the Build-it
+    handoff endpoint, which creates the new Build chat and starts its turn BEFORE it answers
+    the offer, so a resolved-build can never exist without the build it names."""
 
     choice: Literal["refine"]
 

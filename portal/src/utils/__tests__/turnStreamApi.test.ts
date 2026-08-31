@@ -80,8 +80,27 @@ describe('the known-frame narrowing (a cast is not a parse)', () => {
     expect(frame).toMatchObject({
       type: 'step',
       phase: 'finished',
-      item: { tool: 'read_file', state: 'ok', hidden: true, detail: { result: 'ok' } },
+      item: { tool: 'read_file', state: 'ok', hidden: true },
     })
+  })
+
+  it('drops a tool\'s arguments and result even when a frame still carries them', () => {
+    // THE FRAME ABOVE FEEDS THIS ONE ON PURPOSE: it is the same wire text, including a
+    // `detail` object holding the tool's args and result. The server stopped sending that
+    // (U14 — a step is a label and a state, never the payload behind it), but a frame from an
+    // older server, a replayed fixture, or a hand-crafted request can still contain it, and
+    // the parse is the seam that decides whether it reaches a component. `toMatchObject`
+    // above cannot catch a field arriving; only an explicit key check can.
+    const [frame] = parseOne(
+      '{"type":"step","seq":2,"toolCallId":"t1","phase":"finished","item":' +
+        '{"type":"step","seq":2,"mode":"ask","tool":"read_file","label":"Read app/page.tsx",' +
+        '"state":"ok","hidden":true,"detail":{"args":"{}","result":"ok"}}}',
+    )
+    const item = (frame as unknown as { item: Record<string, unknown> }).item
+    // Liveness first — an empty or undefined item would satisfy every absence assertion below.
+    expect(item.tool).toBe('read_file')
+    expect(Object.keys(item).sort()).toEqual(['hidden', 'label', 'seq', 'state', 'tool', 'type'])
+    expect(JSON.stringify(frame)).not.toContain('detail')
   })
 
   it('fails SAFE on unrecognized enum values rather than passing them through', () => {
