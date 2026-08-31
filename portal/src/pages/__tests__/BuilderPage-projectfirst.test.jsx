@@ -226,6 +226,25 @@ describe('BuilderPage — the preview is fed NO app credentials (C9 server-side,
   })
 })
 
+describe('BuilderPage — the preview is handed R104\u2019s stop-clock (U4)', () => {
+  it('\u2605 passes LivePreview a reveal callback \u2014 without it the first-view measurement is dead', async () => {
+    // THIS MOUNT IS THE ONLY PRODUCTION MOUNT OF LivePreview IN THE TREE, so a callback added to
+    // the component and never passed here is a counter that never fires and a test suite that
+    // never notices. Asserted against the RECORDED PROPS rather than by reading the file, and
+    // this suite already stubs the pane to record them.
+    //
+    // Deliberately not asserting what the callback DOES: that decision lives in `observe.ts` and
+    // is pinned there. What can only be checked here is that the wire exists.
+    renderHandoff()
+    await screen.findByPlaceholderText(/describe what you need/i)
+
+    expect(h.previewProps.length).toBeGreaterThan(0)
+    for (const props of h.previewProps) {
+      expect(typeof props.onRevealed).toBe('function')
+    }
+  })
+})
+
 describe('BuilderPage — the composer is not shared across a chat navigation', () => {
   function BuilderHost() {
     const { chatId } = useParams()

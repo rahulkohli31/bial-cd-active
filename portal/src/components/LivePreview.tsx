@@ -366,6 +366,12 @@ export interface LivePreviewProps {
   saveError?: string | null
   toolbarLeading?: ReactNode
   toolbarTrailing?: ReactNode
+  // R104's stop-clock, and the ONLY honest one: `revealed` is the frame loaded AND the cover
+  // down, which is the exact moment a citizen is looking at their own app rather than at a
+  // spinner, a cover, or a blank card. Optional and fire-and-forget — this pane owes the caller
+  // nothing if the caller does not care. Fires at most once per FRAME KEY, the same discipline
+  // the load and stall verdicts follow.
+  onRevealed?: () => void
 }
 
 export default function LivePreview({
@@ -415,6 +421,7 @@ export default function LivePreview({
   // build finishes is the moment someone wants to put it out — making them navigate to the
   // project page to find the button is asking them to leave the room to use the light switch.
   toolbarTrailing = null,
+  onRevealed,
 }: LivePreviewProps) {
   const [viewport, setViewport] = useState<DeviceName>('Desktop')
 
@@ -720,6 +727,18 @@ export default function LivePreview({
   // app on its next provision or restore, and the reveal gets teeth at the same moment the cover
   // does — the same trade the cover already documents.
   const revealed = frameLoaded && !covered
+  // Announce that reveal ONCE per document. Keyed on the frame key rather than on `revealed`
+  // alone, because a verdict that flips to failed RETRACTS the reveal and a later re-reveal of
+  // the same document is not a second first-view. A reload (a new nonce, so a new key) does
+  // announce again; the caller's own mark is idempotent, so the two guards agree rather than
+  // either one having to be perfect.
+  const announcedRevealOf = useRef<string | null>(null)
+  useEffect(() => {
+    if (!revealed || !frameKey) return
+    if (announcedRevealOf.current === frameKey) return
+    announcedRevealOf.current = frameKey
+    onRevealed?.()
+  }, [revealed, frameKey, onRevealed])
   const framePending = showFrame && !frameLoaded && !frameStalled
   const showLoading =
     framePending || (!isTerminal && !relaunching && !previewUrl && (status === 'provisioning' || status === 'building'))

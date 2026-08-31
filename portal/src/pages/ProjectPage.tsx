@@ -44,6 +44,7 @@ import { ApiError, isRecord } from '../utils/apiError'
 import { listProjectConversations, deleteConversation } from '../utils/conversationApi'
 import { relativeTime } from '../utils/chatHistory'
 import { chatKindFor } from '../utils/chatKind'
+import { markProjectOpened } from '../utils/observe'
 
 /** The chat-row shape the home renders; narrowed at the JS-module boundary. */
 interface ChatSummary {
@@ -100,6 +101,12 @@ export default function ProjectPage() {
         if (!active) return
         setProject(loaded)
         setLoadError(null)
+        // R105's denominator, and the R104 clock's start. Marked HERE rather than on the raw
+        // mount because `hasApp` is only knowable once the project has loaded — a project with
+        // nothing built has no app to first-see, and starting a clock for it would make this
+        // number and the sandbox-first number answer different questions. `markProjectOpened`
+        // is idempotent per project id per page load, which is also the StrictMode guard.
+        markProjectOpened(loaded.id, { hasApp: loaded.appId !== null })
       } catch (err) {
         if (!active) return
         if (err instanceof ApiError && err.status === 404) {

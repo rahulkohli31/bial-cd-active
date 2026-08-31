@@ -11,6 +11,16 @@ import { MemoryRouter, Routes, Route, useNavigate } from 'react-router-dom'
 const h = vi.hoisted(() => ({
   getConversation: vi.fn(),
   getProject: vi.fn(),
+  authFetch: vi.fn(),
+}))
+
+// The REAL `observe` module runs here — its deep-link guard IS what these tests are about, and a
+// mocked module would prove only that a function was called. Only the transport is replaced.
+// Each test uses its OWN project id: module state is per page load, so a shared id would let one
+// test's mark silence the next one's.
+vi.mock('../../utils/api', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../utils/api')>()),
+  authFetch: h.authFetch,
 }))
 
 vi.mock('../../utils/conversationApi.js', () => ({ getConversation: h.getConversation }))
@@ -39,6 +49,14 @@ vi.mock('../BuilderPage', () => ({
 }))
 
 import ChatRoute from '../ChatRoute'
+import { markProjectOpened } from '../../utils/observe'
+
+/** The observation bodies this render actually posted, in order. */
+function beacons(): unknown[] {
+  return h.authFetch.mock.calls
+    .filter(([url]) => url === '/api/observations')
+    .map(([, opts]) => JSON.parse(String(opts.body)))
+}
 
 /**
  * `state` is the freshly-minted marker's carrier. Entries without one stay plain strings so the
@@ -68,6 +86,7 @@ const conversation = (over: Record<string, unknown> = {}) => ({
 
 beforeEach(() => {
   vi.clearAllMocks()
+  h.authFetch.mockResolvedValue({ ok: true } as Response)
   h.getProject.mockResolvedValue({ id: 'p1', name: 'VIP Movement', description: null, appId: null, appStatus: null, createdAt: '', updatedAt: '' })
 })
 afterEach(() => cleanup())
@@ -260,5 +279,58 @@ describe('ChatRoute — the page is never torn down mid-turn', () => {
 
     resolveSecond?.({ id: 'c2', kind: 'planning', projectId: 'p1', messages: [] })
     await waitFor(() => expect(screen.getByTestId('chat-page').textContent).toContain('|c2|'))
+  })
+})
+
+describe('ChatRoute — the chat-open mark (U4; R105)', () => {
+  it('marks a chat open for a project whose page this load opened', async () => {
+    // R105's numerator, taken at THE resolution seam rather than on the three handlers that
+    // navigate here — those live in components other work is mid-rewrite of.
+    markProjectOpened('p-open', { hasApp: false })
+    h.authFetch.mockClear()
+    h.getConversation.mockResolvedValue(conversation({ projectId: 'p-open' }))
+
+    renderRoute('/chat/c1')
+
+    await screen.findByTestId('chat-page')
+    await waitFor(() => expect(beacons()).toEqual([{ name: 'project_opened_chat' }]))
+  })
+
+  it('counts one visit, not two chats', async () => {
+    markProjectOpened('p-two', { hasApp: false })
+    h.authFetch.mockClear()
+    h.getConversation.mockResolvedValue(conversation({ id: 'c1', projectId: 'p-two' }))
+    renderRoute('/chat/c1')
+    await screen.findByTestId('chat-page')
+    await waitFor(() => expect(beacons()).toHaveLength(1))
+
+    cleanup()
+    h.getConversation.mockResolvedValue(conversation({ id: 'c2', projectId: 'p-two' }))
+    renderRoute('/chat/c2')
+    await screen.findByTestId('chat-page')
+
+    expect(beacons()).toEqual([{ name: 'project_opened_chat' }])
+  })
+
+  it('★ marks nothing for a deep link into a project this load never opened', async () => {
+    // A bookmark, a shared link or a browser restore resolves a project whose page was never on
+    // screen. Counting it would push R105's ratio above 1 — a denominator smaller than its
+    // numerator is not a bias, it is a broken number. And it must not invent the denominator
+    // either: no `project_opened` appears here.
+    h.getConversation.mockResolvedValue(conversation({ projectId: 'p-deep-link' }))
+
+    renderRoute('/chat/c1')
+
+    await screen.findByTestId('chat-page')
+    expect(beacons()).toEqual([])
+  })
+
+  it('marks nothing for a chat that resolves with no project behind it', async () => {
+    h.getConversation.mockResolvedValue(conversation({ projectId: null }))
+
+    renderRoute('/chat/c1')
+
+    await screen.findByTestId('chat-page')
+    expect(beacons()).toEqual([])
   })
 })

@@ -28,6 +28,7 @@
  *  (owner surface gone; pinned by appRegistryApi.test.js).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { StrictMode } from 'react'
 import { render, screen, fireEvent, waitFor, cleanup, within } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
 import ProjectPage from '../ProjectPage'
@@ -35,6 +36,7 @@ import { ApiError } from '../../utils/apiError'
 import type { Project } from '../../utils/projectApi'
 
 const h = vi.hoisted(() => ({
+  authFetch: vi.fn(),
   getProject: vi.fn(),
   patchProject: vi.fn(),
   generateDescription: vi.fn(),
@@ -42,6 +44,14 @@ const h = vi.hoisted(() => ({
   deleteConversation: vi.fn(),
 }))
 
+// The REAL `observe` module runs in these tests — its once-per-project-id-per-page-load guard IS
+// the thing under test, and a mocked module would prove only that a function was called. Only the
+// transport is replaced. Every test below therefore uses its OWN project id: module state is
+// per page load, and a shared id would make one test's mark silence the next one's.
+vi.mock('../../utils/api', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../utils/api')>()),
+  authFetch: h.authFetch,
+}))
 vi.mock('../../utils/projectApi', () => ({
   getProject: h.getProject,
   patchProject: h.patchProject,
@@ -90,8 +100,16 @@ function renderProjectPage(projectId = 'p1') {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  h.authFetch.mockResolvedValue({ ok: true } as Response)
   h.listProjectConversations.mockResolvedValue([])
 })
+
+/** The observation bodies this render actually posted, in order. */
+function beacons(): unknown[] {
+  return h.authFetch.mock.calls
+    .filter(([url]) => url === '/api/observations')
+    .map(([, opts]) => JSON.parse(String(opts.body)))
+}
 afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
@@ -354,5 +372,79 @@ describe('ProjectPage — identity + guard rails carried over', () => {
     renderProjectPage()
 
     await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('/projects'))
+  })
+})
+
+describe('ProjectPage — the project-open mark (U4; R104, R105)', () => {
+  /** The page under React's development double-mount, which is how it actually runs in dev. */
+  function renderTwiceOver(projectId: string) {
+    return render(
+      <StrictMode>
+        <MemoryRouter initialEntries={[`/projects/${projectId}`]}>
+          <Routes>
+            <Route path="/projects/:projectId" element={<ProjectPage />} />
+            <Route path="*" element={<LocationProbe />} />
+          </Routes>
+        </MemoryRouter>
+      </StrictMode>,
+    )
+  }
+
+  it('marks the project open ONCE under StrictMode’s double mount', async () => {
+    // R105's denominator, in the mode the app actually runs in during development.
+    //
+    // TWO THINGS PROTECT THIS AND THEY ARE NOT THE SAME THING, which is worth saying so nobody
+    // reads a green here as proof of the guard: the load effect's own `active` flag already
+    // drops the first invocation's continuation, so this passes with the module guard removed.
+    // What it pins is the OUTCOME, and the guard itself is pinned by the next test and by
+    // `observe.test.ts` — where removing it goes red.
+    h.getProject.mockResolvedValue(makeProject({ id: 'p-strict', appId: 'a1' }))
+    renderTwiceOver('p-strict')
+
+    await screen.findByRole('heading', { name: 'VIP Movement' })
+    await waitFor(() => expect(beacons()).toEqual([{ name: 'project_opened' }]))
+  })
+
+  it('★ counts ONE visit when the citizen comes back to the same project in one page load', async () => {
+    // The case the `active` flag above does NOT cover, and the reason the guard lives in the
+    // module rather than in the page: a real second mount, with its own effect that runs to
+    // completion. "A visit" is one project id per page LOAD — a citizen who opens a project,
+    // goes to their list, and comes back has visited once.
+    //
+    // Mutation check: remove the once-per-project-id guard and this goes red.
+    h.getProject.mockResolvedValue(makeProject({ id: 'p-return', appId: 'a1' }))
+    renderProjectPage('p-return')
+    await screen.findByRole('heading', { name: 'VIP Movement' })
+    await waitFor(() => expect(beacons()).toEqual([{ name: 'project_opened' }]))
+
+    cleanup()
+    renderProjectPage('p-return')
+    await screen.findByRole('heading', { name: 'VIP Movement' })
+
+    expect(beacons()).toEqual([{ name: 'project_opened' }])
+  })
+
+  it('★ starts no first-view clock for a project with nothing built', async () => {
+    // The project is still OPENED — it belongs in R105's denominator — but it has no app to
+    // first-see, so a later reveal must record nothing. Emitting for it would make this number
+    // and the sandbox-first number answer different questions.
+    h.getProject.mockResolvedValue(makeProject({ id: 'p-noapp', appId: null }))
+    renderProjectPage('p-noapp')
+
+    await screen.findByRole('heading', { name: 'VIP Movement' })
+    await waitFor(() => expect(beacons()).toEqual([{ name: 'project_opened' }]))
+
+    const { markAppVisible } = await import('../../utils/observe')
+    markAppVisible('p-noapp')
+    expect(beacons()).toEqual([{ name: 'project_opened' }])
+  })
+
+  it('marks nothing at all when the project cannot be loaded', async () => {
+    // A visit that never resolved a project is not a visit to one.
+    h.getProject.mockRejectedValue(new ApiError('boom', 500))
+    renderProjectPage('p-broken')
+
+    await screen.findByText(/couldn.t load this project/i)
+    expect(beacons()).toEqual([])
   })
 })
