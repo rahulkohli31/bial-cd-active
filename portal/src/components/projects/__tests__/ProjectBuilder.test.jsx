@@ -1,15 +1,19 @@
 /**
- * ProjectBuilder (U13): the root Build box of the unified chat.
+ * ProjectBuilder: the root Build box of the unified chat.
  *
  * What this pins:
- *  - the shared ModeSwitcher (F5/U6) renders with PLAN as the default;
- *  - every submit MINTS A FRESH conversation at /chat/{uuid}?projectId=&kind=builder,
- *    carrying { prompt, mode, pendingAttachments } — the canonical-thread resolve is gone,
- *    and so is the per-mode send label (the action is mode-neutral). `theme` left this
- *    payload with the Select Theme control in #157 B1: nothing downstream ever read it;
- *  - that theme selector is GONE, and its absence is pinned below;
+ *  - every submit MINTS A FRESH conversation at /chat/{uuid}?projectId=&kind=build, carrying
+ *    { prompt, pendingAttachments }. `theme` left this payload with the Select Theme control
+ *    in #157 B1 and `mode` left it with the mode chooser, for the same reason in both cases:
+ *    nothing downstream reads a key that no longer describes anything;
+ *  - the theme selector and the mode chooser are both GONE, and both absences are pinned;
  *  - NO generic idea-starter cards render inside a dedicated project (F6);
  *  - a blocked prompt opens the guardrail modal instead of navigating.
+ *
+ * THE MODE CASES ARE INERTNESS GUARDS NOW (L8), not deletions. This composer used to open a
+ * chat in one of three per-send settings, and the two tests below pinned the default and the
+ * Write entry. A chat's kind is fixed when it is created and there is one kind this composer
+ * mints, so the claim that replaces them is that no chooser is on the surface at all.
  */
 import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
@@ -29,7 +33,7 @@ import ProjectBuilder from '../ProjectBuilder'
 
 const FIXED_UUID = h.FIXED_UUID
 
-// jsdom lacks these; Radix's menu (the ModeSwitcher dropdown) calls them on open / focus.
+// jsdom lacks these; Radix's menus call them on open / focus.
 beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn()
   Element.prototype.hasPointerCapture = vi.fn(() => false)
@@ -68,15 +72,22 @@ afterEach(() => {
 })
 
 describe('ProjectBuilder', () => {
-  it('renders the mode switcher with Plan as the default', () => {
+  it('offers NO mode chooser — the composer mints one kind and says so nowhere', () => {
     renderBuilder()
 
-    // The compact in-composer switcher shows the sticky default, Plan (the plan's lock).
-    expect(screen.getByRole('button', { name: /Mode: Plan/i })).toBeTruthy()
-
+    // LIVENESS FIRST: an absence test with no positive assertion cannot tell "the chooser is
+    // gone" from "the component threw and rendered nothing".
     expect(screen.getByRole('button', { name: /Upload File/i })).toBeTruthy()
     const start = screen.getByRole('button', { name: /Start Chat/i })
     expect(start.disabled).toBe(true) // disabled until typed
+
+    // The chooser itself, its keyboard opener, and the three helper lines that changed with it.
+    expect(screen.queryByRole('button', { name: /Mode:/i })).toBeNull()
+    fireEvent.keyDown(document, { code: 'KeyP', altKey: true })
+    expect(screen.queryByRole('menuitemradio')).toBeNull()
+    expect(screen.queryByText(/Ask questions about your app/i)).toBeNull()
+    expect(screen.queryByText(/Work out what to build together first/i)).toBeNull()
+    expect(screen.queryByText(/no plan step/i)).toBeNull()
   })
 
   it('offers NO theme selector — it changed nothing downstream (#157 B1)', () => {
@@ -90,7 +101,7 @@ describe('ProjectBuilder', () => {
     // ProjectBuilder threw or early-returned, i.e. if it rendered NOTHING — an absence test
     // with no positive assertion cannot tell "the control is gone" from "the page is gone."
     // Its F6 sibling below already does this; this one missed it (#157 review).
-    expect(screen.getByRole('button', { name: /Mode: Plan/i })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Upload File/i })).toBeTruthy()
 
     expect(screen.queryByRole('button', { name: /Bangalore Airport Theme/i })).toBeNull()
     expect(screen.queryByText('App Style (iOS/Android)')).toBeNull()
@@ -102,55 +113,42 @@ describe('ProjectBuilder', () => {
     renderBuilder()
 
     // A dedicated project already has an established purpose, so the generic Sandbox
-    // idea-cards are gone; the composer + mode-helper copy carry first-run guidance.
+    // idea-cards are gone; the composer's placeholder carries first-run guidance.
     expect(screen.queryByText('Resource Management')).toBeNull()
     expect(screen.queryByText('Staff Coordination')).toBeNull()
     expect(screen.queryByText('Flight Metrics')).toBeNull()
     // the composer itself still works without the removed fillPrompt path
-    const textarea = screen.getByPlaceholderText(/we.ll shape the plan together/i)
+    const textarea = screen.getByPlaceholderText(/Describe the app you want built/i)
     fireEvent.change(textarea, { target: { value: 'a gate tracker' } })
     expect(textarea.value).toBe('a gate tracker')
     expect(screen.getByRole('button', { name: /Start Chat/i }).disabled).toBe(false)
   })
 
-  it('a submit mints a FRESH builder chat carrying { prompt, mode, pendingAttachments }', async () => {
+  it('a submit mints a FRESH build chat carrying { prompt, pendingAttachments }', async () => {
     renderBuilder()
 
-    const textarea = screen.getByPlaceholderText(/we.ll shape the plan together/i)
+    const textarea = screen.getByPlaceholderText(/Describe the app you want built/i)
     fireEvent.change(textarea, { target: { value: 'a gate tracker' } })
     fireEvent.click(screen.getByRole('button', { name: /Start Chat/i }))
 
     await waitFor(() =>
       expect(screen.getByTestId('chat-path').textContent).toBe(
-        `${FIXED_UUID}?projectId=p1&kind=builder`,
+        `${FIXED_UUID}?projectId=p1&kind=build`,
       ),
     )
     const state = JSON.parse(screen.getByTestId('chat-state').textContent)
     expect(state.prompt).toBe('a gate tracker')
-    expect(state.mode).toBe('plan')
-    // The key is gone from the payload entirely, not merely defaulted.
+    // Both keys are gone from the payload entirely, not merely defaulted — `theme` because
+    // nothing read it, `mode` because there is no longer a thing for it to name.
     expect(state.theme).toBeUndefined()
+    expect(state.mode).toBeUndefined()
     expect(state.pendingAttachments).toEqual([])
-  })
-
-  it('a WRITE-mode submit carries mode: write (direct build entry)', async () => {
-    renderBuilder()
-
-    // Open the mode switcher (⌥P) and choose Write.
-    fireEvent.keyDown(document, { code: 'KeyP', altKey: true })
-    fireEvent.click(await screen.findByRole('menuitemradio', { name: /Write/i }))
-    const textarea = screen.getByPlaceholderText(/Describe the app you want built/i)
-    fireEvent.change(textarea, { target: { value: 'a visitors app' } })
-    fireEvent.click(screen.getByRole('button', { name: /Start Chat/i }))
-
-    await waitFor(() => expect(screen.queryByTestId('chat-state')).toBeTruthy())
-    expect(JSON.parse(screen.getByTestId('chat-state').textContent).mode).toBe('write')
   })
 
   it('a blocked prompt opens the guardrail modal instead of navigating', () => {
     renderBuilder()
 
-    const textarea = screen.getByPlaceholderText(/we.ll shape the plan together/i)
+    const textarea = screen.getByPlaceholderText(/Describe the app you want built/i)
     fireEvent.change(textarea, {
       target: { value: 'build a tool for unauthorized access to gate systems' },
     })

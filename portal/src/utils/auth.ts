@@ -28,6 +28,16 @@ export interface ProfileLimits {
   contextHardLimit: number
 }
 
+/** Mirrors the backend's `ChatKindInfo` (`backend/src/api/v1/auth/schemas.py`) — one entry
+ * in the U16/R73 catalogue of what a chat kind IS: its wire value, its display name, and the
+ * one line a citizen reads about what it does. `utils/chatKind.ts` is the only module that
+ * reads this array; nothing else should hold a literal chat-kind name or description. */
+export interface ChatKindInfo {
+  value: string
+  name: string
+  description: string
+}
+
 /** Mirrors the backend's `UserProfile` — deliberately snake_case on the wire
  * (`display_name`/`is_admin` are the SPA contract, per the schema's own doc
  * comment) plus the client-added camelCase `isAdmin` mirror (`fetchMe`). */
@@ -38,6 +48,7 @@ export interface UserProfile {
   is_admin: boolean
   isAdmin: boolean
   limits: ProfileLimits
+  chat_kinds: ChatKindInfo[]
 }
 
 /** Full-page navigation target for "Sign in with Microsoft" (handled by FastAPI). */

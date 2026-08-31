@@ -190,7 +190,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     try {
       const isHeader = (c: ConversationHeader | null): c is ConversationHeader => c !== null
       const list = projectId
-        ? (await listProjectConversations(projectId)).filter(isHeader).filter((c) => c.kind === 'planning')
+        ? (await listProjectConversations(projectId)).filter(isHeader).filter((c) => c.kind === 'plan')
         : (await loadHistory()).filter(isHeader)
       setHistory(list.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()))
     } catch {
@@ -552,7 +552,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
       return
     }
     // `freshlyMinted` — see handleLaunchBuilder below for why the marker lives in router state.
-    navigate(`/chat/${newConversation()}?projectId=${encodeURIComponent(projectId)}&kind=planning`, {
+    navigate(`/chat/${newConversation()}?projectId=${encodeURIComponent(projectId)}&kind=plan`, {
       state: { freshlyMinted: true },
     })
   }
@@ -618,9 +618,9 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
       navigate('/projects')
       return
     }
-    // U13: every launch MINTS A NEW chat (the canonical builder thread is retired). The
-    // refined brief rides as the first message of a Plan-mode conversation — the unified
-    // chat plans it there and Build it starts the build.
+    // Every launch MINTS A NEW chat (the canonical builder thread is retired), and the
+    // refined brief rides as its first message. The kind is fixed HERE, at the mint, because
+    // that is the only moment it can be chosen: a chat cannot change what it is afterwards.
     setShowPromptModal(false)
     // Mint through the SHARED `uuidv7`, never an inline `crypto.randomUUID()`. Two sites once
     // duplicated that one-liner, so when the store's mint moved to v7 (ADR-0006) they silently
@@ -630,8 +630,8 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     // can only 404. It rides in router STATE on purpose: state dies on reload and never travels
     // in a shared link, so a bookmarked `/chat/{id}?kind=…` still asks the server for the truth.
     navigate(
-      `/chat/${uuidv7()}?projectId=${encodeURIComponent(projectId)}&kind=builder`,
-      { state: { prompt: builderPrompt, mode: 'plan', uploadedFiles: [], freshlyMinted: true } },
+      `/chat/${uuidv7()}?projectId=${encodeURIComponent(projectId)}&kind=build`,
+      { state: { prompt: builderPrompt, uploadedFiles: [], freshlyMinted: true } },
     )
   }, [builderPrompt, navigate, projectId])
 

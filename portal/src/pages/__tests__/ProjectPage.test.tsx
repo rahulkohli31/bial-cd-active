@@ -70,6 +70,21 @@ vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 // ProjectPage no longer mounts LivePreview (the passive View-app preview is hidden, U6).
 // A null stub keeps the `queryByTestId('live-preview')` inertness assertions meaningful.
 vi.mock('../../components/LivePreview', () => ({ default: () => null }))
+// THE BADGE'S WORDS COME FROM THE SERVER NOW (U16): `chatKindFor` reads the kind catalogue off
+// the cached bootstrap profile, so a suite that does not stand one up gets the honest fallback
+// ("Chat") on every row and every badge assertion below fails for a reason that has nothing to
+// do with this page. The words are DELIBERATELY the product ones here — these tests assert what
+// a citizen reads on the row, and `chatKind.test.ts` is the suite that proves the sourcing is
+// dynamic by mocking words the product does not use.
+vi.mock('../../utils/auth', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../utils/auth')>()),
+  getStoredUser: () => ({
+    chat_kinds: [
+      { value: 'plan', name: 'Plan', description: 'Shape a plan first.' },
+      { value: 'build', name: 'Build', description: 'Change the live app.' },
+    ],
+  }),
+}))
 
 const makeProject = (over: Partial<Project> = {}): Project => ({
   id: 'p1',
@@ -121,7 +136,7 @@ describe('ProjectPage — the builder is unconditional', () => {
     expect(await screen.findByRole('heading', { name: 'VIP Movement' })).toBeTruthy()
     // The builder is present: its composer renders. (F6: no idea-starter cards inside a
     // dedicated project — the composer + mode helper are the first-run guidance.)
-    expect(screen.getByPlaceholderText(/we.ll shape the plan together/i)).toBeTruthy()
+    expect(screen.getByPlaceholderText(/Describe the app you want built/i)).toBeTruthy()
     // The description rail — a read view with an Edit button (U7: the pop-up editor).
     expect(within(screen.getByTestId('description-rail')).getByRole('button', { name: /edit/i })).toBeTruthy()
     // No app affordances for a project with no app: no "View app", no preview, no Continue building.
@@ -133,13 +148,13 @@ describe('ProjectPage — the builder is unconditional', () => {
   it('built project: builder still on top (composer) — and NO "View app" / lifecycle badge / Continue building / inline preview', async () => {
     h.getProject.mockResolvedValue(makeProject({ appId: 'a1', appStatus: 'draft' }))
     h.listProjectConversations.mockResolvedValue([
-      { id: 'c2', kind: 'builder', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
+      { id: 'c2', kind: 'build', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
     ])
     renderProjectPage()
 
     await screen.findByRole('heading', { name: 'VIP Movement' })
     // The builder is NOT collapsed — this is the reverted regression the fold must avoid.
-    expect(screen.getByPlaceholderText(/we.ll shape the plan together/i)).toBeTruthy()
+    expect(screen.getByPlaceholderText(/Describe the app you want built/i)).toBeTruthy()
     // U6: the passive "View app" preview is HIDDEN — a stored app is not a running sandbox.
     const rail = screen.getByTestId('description-rail')
     expect(within(rail).queryByRole('button', { name: /view app/i })).toBeNull()
@@ -154,7 +169,7 @@ describe('ProjectPage — the passive app preview is hidden (U6)', () => {
   it('a built project renders NO "View app" affordance and NO modal', async () => {
     h.getProject.mockResolvedValue(makeProject({ appId: 'a1', appStatus: 'draft' }))
     h.listProjectConversations.mockResolvedValue([
-      { id: 'built', kind: 'builder', projectId: 'p1', title: 'Build it', updatedAt: '2026-07-09T00:00:00Z' },
+      { id: 'built', kind: 'build', projectId: 'p1', title: 'Build it', updatedAt: '2026-07-09T00:00:00Z' },
     ])
     renderProjectPage()
 
@@ -167,7 +182,7 @@ describe('ProjectPage — the passive app preview is hidden (U6)', () => {
   it('renders the landing path without any stored-app read (the getAppSource export is retired)', async () => {
     h.getProject.mockResolvedValue(makeProject({ appId: 'a1', appStatus: 'draft' }))
     h.listProjectConversations.mockResolvedValue([
-      { id: 'hi', kind: 'builder', projectId: 'p1', title: 'hi', updatedAt: '2026-07-11T00:00:00Z' },
+      { id: 'hi', kind: 'build', projectId: 'p1', title: 'hi', updatedAt: '2026-07-11T00:00:00Z' },
     ])
     renderProjectPage()
 
@@ -227,8 +242,8 @@ describe('ProjectPage — conversations as a plain recents list (U3)', () => {
   it('renders icon · title · kind badge · relative date · ⋮ with no new-chat buttons', async () => {
     h.getProject.mockResolvedValue(makeProject())
     h.listProjectConversations.mockResolvedValue([
-      { id: 'c1', kind: 'planning', projectId: 'p1', title: 'Scope the fields', updatedAt: '2026-07-10T00:00:00Z' },
-      { id: 'c2', kind: 'builder', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
+      { id: 'c1', kind: 'plan', projectId: 'p1', title: 'Scope the fields', updatedAt: '2026-07-10T00:00:00Z' },
+      { id: 'c2', kind: 'build', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
     ])
     renderProjectPage()
 
@@ -253,8 +268,8 @@ describe('ProjectPage — conversations as a plain recents list (U3)', () => {
     // completion is the mutant this catches.
     h.getProject.mockResolvedValue(makeProject())
     h.listProjectConversations.mockResolvedValue([
-      { id: 'c1', kind: 'planning', projectId: 'p1', title: 'Scope the fields', updatedAt: '2026-07-10T00:00:00Z' },
-      { id: 'c2', kind: 'builder', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
+      { id: 'c1', kind: 'plan', projectId: 'p1', title: 'Scope the fields', updatedAt: '2026-07-10T00:00:00Z' },
+      { id: 'c2', kind: 'build', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
     ])
     renderProjectPage()
 
@@ -263,13 +278,13 @@ describe('ProjectPage — conversations as a plain recents list (U3)', () => {
     expect(within(rowFor('Scope the fields')).getByText('Plan').textContent).toBe('Plan chat')
   })
 
-  it('an "assistant" chat gets the fallback word, not the Plan word', async () => {
+  it('a kind this vocabulary does not have gets the fallback word, not the Plan word', async () => {
     // ASM5, the live defect the badge exposes. `ConversationKind` has THREE values and the old
     // `kind === 'builder'` test put `assistant` in the Plan arm — invisible behind an icon,
     // a lie behind a word.
     h.getProject.mockResolvedValue(makeProject())
     h.listProjectConversations.mockResolvedValue([
-      { id: 'c3', kind: 'assistant', projectId: 'p1', title: 'Ask about gates', updatedAt: '2026-07-11T00:00:00Z' },
+      { id: 'c3', kind: 'assistant', projectId: 'p1', title: 'Ask about gates', updatedAt: '2026-07-11T00:00:00Z' }, // a retired value, still on old rows
     ])
     renderProjectPage()
 
@@ -296,7 +311,7 @@ describe('ProjectPage — conversations as a plain recents list (U3)', () => {
   it('clicking a row title navigates to /chat/{id}', async () => {
     h.getProject.mockResolvedValue(makeProject())
     h.listProjectConversations.mockResolvedValue([
-      { id: 'c2', kind: 'builder', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
+      { id: 'c2', kind: 'build', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
     ])
     renderProjectPage()
 
@@ -307,7 +322,7 @@ describe('ProjectPage — conversations as a plain recents list (U3)', () => {
   it('the ⋮ menu exposes Open and Delete; Delete removes the row optimistically', async () => {
     h.getProject.mockResolvedValue(makeProject())
     h.listProjectConversations.mockResolvedValue([
-      { id: 'c2', kind: 'builder', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
+      { id: 'c2', kind: 'build', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
     ])
     h.deleteConversation.mockResolvedValue(true)
     renderProjectPage()
@@ -324,7 +339,7 @@ describe('ProjectPage — conversations as a plain recents list (U3)', () => {
   it('the ⋮ button is a SIBLING of the title button, not an interactive descendant (F-10)', async () => {
     h.getProject.mockResolvedValue(makeProject())
     h.listProjectConversations.mockResolvedValue([
-      { id: 'c2', kind: 'builder', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
+      { id: 'c2', kind: 'build', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
     ])
     renderProjectPage()
 

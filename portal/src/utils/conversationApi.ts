@@ -11,16 +11,19 @@
 import { authFetch } from './api'
 import type { AuthFetchDeps } from './api'
 import { readApiError } from './apiError'
-import type { ConversationMode } from './turnStreamApi'
 import { toPlanOptionsItem, toStepItem } from './turnStreamApi'
 import type { ChatMessage } from './messageTypes'
 
-/** The in-memory header shape pages expect, normalized from the server's raw doc. */
+/** The in-memory header shape pages expect, normalized from the server's raw doc.
+ *
+ * `kind` is the WHOLE of what a chat is now — `plan` or `build`, fixed when the chat is created.
+ * The header used to carry a second field beside it, a per-thread setting the citizen could move
+ * mid-conversation; there is no such field on the wire any more, and nothing here should look for
+ * one. A chat that needs to do the other thing is a different chat. */
 export interface ConversationHeader {
   id: string
   kind: string
   projectId: string
-  mode?: ConversationMode
   title: string
   createdAt: string
   updatedAt: string
@@ -42,7 +45,6 @@ function normalizeHeader(doc: unknown): ConversationHeader | null {
     _id: string
     kind: string
     projectId: string
-    mode?: ConversationMode
     title?: string
     createdAt: string
     updatedAt: string
@@ -52,7 +54,6 @@ function normalizeHeader(doc: unknown): ConversationHeader | null {
     id: d._id,
     kind: d.kind,
     projectId: d.projectId,
-    mode: d.mode, // the server-owned sticky chat mode (U4)
     title: d.title || '',
     createdAt: d.createdAt,
     updatedAt: d.updatedAt,
@@ -75,11 +76,19 @@ function normalizeHeader(doc: unknown): ConversationHeader | null {
  *   - `plan_options` — the Build it / Keep refining card, carried with its STORED
  *     resolution state so live and reload agree.
  */
-/** The six raw projection item shapes read here — one union, discriminated on
+/** The raw projection item shapes read here — one union, discriminated on
  * `type` like everything else, but kept LOCAL (not exported) since this is the
  * server-projection wire shape, not the message-parts shape (`messageTypes.ts`)
  * it gets mapped into. UNCHECKED (matches pre-migration behavior): asserted per
- * `item.type`, not validated. */
+ * `item.type`, not validated.
+ *
+ * THE SERVER SENDS ONE MORE KIND THAN THIS MAPS, and the fall-through is deliberate rather
+ * than an oversight. `turn_terminal` is a durable record of HOW a turn ended, written so a
+ * transcript rebuilt without the live stream can tell a finished turn from a running one; it
+ * carries no prose and draws nothing, and what a surface makes of it — a group that stops
+ * spinning, a control that stops being offered — is a design decision no unit has taken yet.
+ * An unrecognised type pushes no message at all, so it costs an empty bubble rather than
+ * rendering one. */
 type RawProjectionItem = { type: string; seq: number } & Record<string, unknown>
 
 export function messagesFromProjection(projection: RawProjectionItem[] | undefined): ChatMessage[] {
@@ -257,25 +266,25 @@ export async function getConversation(id: string, deps: AuthFetchDeps = {}): Pro
  */
 export interface CreateConversationArgs {
   projectId: string
+  /** REQUIRED, and the server has no default: what a chat is has to be decided by whoever opens
+   *  it, because it can never be changed afterwards. */
   kind: string
   title?: string
   context?: unknown
-  mode?: ConversationMode
 }
 
 export async function createConversation(
   id: string,
-  { projectId, kind, title, context, mode }: CreateConversationArgs,
+  { projectId, kind, title, context }: CreateConversationArgs,
   deps: AuthFetchDeps = {},
 ): Promise<ConversationHeader | null> {
-  const body: { id: string; projectId: string; kind: string; title?: string; context?: unknown; mode?: ConversationMode } = {
+  const body: { id: string; projectId: string; kind: string; title?: string; context?: unknown } = {
     id,
     projectId,
     kind,
   }
   if (title !== undefined) body.title = title
   if (context !== undefined) body.context = context
-  if (mode !== undefined) body.mode = mode // the starting chat mode (U13); server defaults 'plan'
   const res = await authFetch(
     '/api/conversations',
     { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
@@ -345,7 +354,7 @@ export function deriveTitle(text: string): string {
 }
 
 /**
- * Build an async store for one conversation `kind` (planning | builder),
+ * Build an async store for one conversation `kind` (plan | build),
  * preserving the names the pages import from chatHistory/builderHistory.
  * `newConversation` stays SYNCHRONOUS — it mints a UUID with no network; U7 moves
  * row creation to an explicit `createConversation` call the send path makes BEFORE

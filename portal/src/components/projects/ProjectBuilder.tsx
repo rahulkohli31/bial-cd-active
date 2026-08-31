@@ -4,14 +4,22 @@
  *
  * The one structural change from Sandbox: there is no `ProjectPicker`. Sandbox had no
  * project, so it gated every handoff behind "pick a project first". Here the project is
- * a required prop, so `startChat` mints a chat in the selected mode and hands off directly —
- * mirroring the exact router-state shape `BuilderPage` / `ChatPage` already read
+ * a required prop, so `startChat` mints a chat and hands off directly — mirroring the exact
+ * router-state shape `BuilderPage` / `ChatPage` already read
  * (`{ prompt, pendingAttachments }` for a build, `{ initialMessage }` for a plan).
+ *
+ * IT MINTS ONE KIND, AND NOTHING HERE CHOOSES. This composer used to carry an in-line
+ * Ask/Plan/Write chooser, three helper lines and a placeholder that changed with it. Those
+ * three settings were a property of the CONVERSATION that the citizen could move mid-thread;
+ * a chat now is a plan chat or a build chat, decided once when it is minted and never again.
+ * The kind this composer mints is unchanged — it is the build kind, as it has always been —
+ * and the surface that offers a citizen the OTHER kind is a picker nobody has designed yet.
+ * Inventing one here would be a product decision made in a diff.
  *
  * Rendered UNCONDITIONALLY by `ProjectPage` (D-fold): the composer is present whether or
  * not the project already has an app. There are no generic idea-starter cards here (F6) — a
- * dedicated project already has an established purpose; the mode helper copy + the mode-aware
- * placeholder are the first-run guidance.
+ * dedicated project already has an established purpose, and the placeholder is the first-run
+ * guidance.
  */
 import { useState, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
@@ -21,8 +29,6 @@ import type { PromptViolation } from '../../utils/promptGuardrails'
 import { uuidv7 } from '../../utils/conversationApi'
 import { usePendingAttachments } from '../../hooks/usePendingAttachments'
 import { ACCEPT_ATTR, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../../utils/attachmentInput'
-import { ModeSwitcher } from '../chat/ModeSwitcher'
-import type { ConversationMode } from '../../utils/turnStreamApi'
 
 export interface ProjectBuilderProps {
   /** The project this composer builds/plans into. Required: it is what removes
@@ -41,12 +47,10 @@ export default function ProjectBuilder({ projectId }: ProjectBuilderProps) {
   // pending attachments and feed the FIRST generation turn via buildUserParts.
   const { pendingAttachments, handleFileSelect, removePending, attachToast } = usePendingAttachments()
 
-  // U13: the Ask/Plan/Write toggle — DEFAULT PLAN. Every submit mints a NEW conversation
-  // in the chosen mode (the canonical builder thread is retired; continuity lives in the
-  // app + its snapshots, not in one blessed chat).
-  const [mode, setMode] = useState<ConversationMode>('plan')
   const [guardRailModal, setGuardRailModal] = useState<PromptViolation | null>(null)
-  /** Mint a fresh unified chat in the selected mode and hand the draft off to it. */
+  /** Mint a fresh chat and hand the draft off to it. Every submit mints a NEW conversation
+   *  (the canonical builder thread is retired; continuity lives in the app + its snapshots,
+   *  not in one blessed chat). */
   const startChat = () => {
     if (!prompt.trim()) return
     const guardResult = validatePrompt(prompt)
@@ -63,40 +67,13 @@ export default function ProjectBuilder({ projectId }: ProjectBuilderProps) {
     // only 404. Router state — not a query param — because state dies on reload and never travels
     // in a shared link: a bookmarked `/chat/{id}?kind=…` must still take its kind from the server.
     navigate(
-      `/chat/${uuidv7()}?projectId=${encodeURIComponent(projectId)}&kind=builder`,
-      { state: { prompt, mode, pendingAttachments, freshlyMinted: true } },
+      `/chat/${uuidv7()}?projectId=${encodeURIComponent(projectId)}&kind=build`,
+      { state: { prompt, pendingAttachments, freshlyMinted: true } },
     )
   }
 
   return (
     <div className="font-manrope">
-      {/* The Ask / Plan / Write mode switch (U13/F5) — default Plan. Local DRAFT state:
-          the chosen mode rides to the minted chat on submit; no server call here. */}
-      <div className="mb-4">
-        <ModeSwitcher value={mode} onSelect={setMode} composerRef={textareaRef} />
-      </div>
-
-      {mode === 'ask' && (
-        <p className="text-xs text-neutral max-w-md mb-4">
-          Ask questions about your app — the assistant reads its real code to answer.
-        </p>
-      )}
-      {mode === 'plan' && (
-        <p className="text-xs text-neutral max-w-md mb-4">
-          Work out what to build together first — you confirm before anything is built.
-        </p>
-      )}
-      {/* Write had NO helper line at all, because before U5 it was not a mode a user could
-          usefully pick — it was where Build-it parked the thread. It is an ordinary mode
-          now, so it needs the same one-line promise the other two make: this one builds
-          straight away, which is exactly the thing a citizen should know before typing. */}
-      {mode === 'write' && (
-        <p className="text-xs text-neutral max-w-md mb-4">
-          Describe a change and it gets built right away — no plan step. Changes stay in your
-          workspace until you click Save to keep them.
-        </p>
-      )}
-
       {/* Prompt card */}
       <div className="w-full bg-white rounded-2xl border border-bial-border shadow-sm">
         <textarea
@@ -106,13 +83,7 @@ export default function ProjectBuilder({ projectId }: ProjectBuilderProps) {
           onKeyDown={(e) => {
             if (e.key === 'Enter' && e.metaKey) startChat()
           }}
-          placeholder={
-            mode === 'ask'
-              ? 'Ask anything about your app… (e.g. "What does the visitors form validate?")'
-              : mode === 'plan'
-                ? "Describe what you're thinking… we'll shape the plan together before building."
-                : "Describe the app you want built... (e.g. 'Create a dashboard to track terminal 2 ground staff assignments with real-time delay alerts')"
-          }
+          placeholder="Describe the app you want built... (e.g. 'Create a dashboard to track terminal 2 ground staff assignments with real-time delay alerts')"
           rows={5}
           className="w-full p-5 text-sm text-tertiary placeholder:text-gray-300 resize-none focus:outline-none rounded-t-2xl font-manrope leading-relaxed"
         />

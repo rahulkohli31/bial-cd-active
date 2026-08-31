@@ -19,7 +19,7 @@ const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
-  switchMode: vi.fn(), resolvePlanOptions: vi.fn(),
+  resolvePlanOptions: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(), relaunchPreview: vi.fn(),
   notifyUsageChanged: vi.fn(),
   messageContentRender: vi.fn(),
@@ -39,7 +39,6 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
   startTurn: (...a) => h.startTurn(...a),
   readTurnStream: (...a) => h.readTurnStream(...a),
   buildFromPlan: (...a) => h.buildFromPlan(...a),
-  switchMode: (...a) => h.switchMode(...a),
   resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
 // A spy standing in for the real renderer — records one call per actual render of the row it's

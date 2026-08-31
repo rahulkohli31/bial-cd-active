@@ -5,15 +5,22 @@
  * React state as they arrive (never a remount); and while the agent keeps working AFTER the
  * preview frames, the live preview is NOT blanked (KTD-8b).
  *
- * The build begins when the user confirms the model's brief card (003-U4), not on Send — so that
- * click is the moment these tests measure immediacy from. What changed underneath it is only the
- * source: the frames come off the turn stream the click subscribes to, not a C7 session feed.
+ * CHAT-KIND MIGRATION (sfw-002). The build used to begin when the user confirmed the model's
+ * brief card (003-U4), and that click was the moment these tests measured immediacy from. It is
+ * not any more: this page renders ONLY a `build` chat (a chat's kind is fixed at creation), so
+ * EVERY composer send already holds the write toolset and runs directly against the sandbox —
+ * there is no card-confirm gate in front of it (BuilderPage.tsx's routing-rule docblock).
+ * `handleBuildIt`'s plan-options card still exists, but pressing it now creates a SECOND,
+ * different build chat and navigates away to it — it cannot be what these tests drive a build
+ * through any more, since the turn it starts never touches this page. `startBuild` below
+ * measures immediacy from the ordinary send instead, which is both the honest trigger and a
+ * simpler one.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { screen, waitFor, cleanup, within } from '@testing-library/react'
+import { screen, waitFor, cleanup, within, act, fireEvent } from '@testing-library/react'
 import {
   FakeEventSource, PREVIEW_URL, makeClient, primeClient, renderBuilder,
-  primeTurn, sendAndConfirm, scriptBuildTurn, T_STEP, T_PREVIEW,
+  waitForGateOpen, composer, T_STEP, T_WORKSPACE, T_PREVIEW,
 } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
@@ -21,7 +28,7 @@ const h = vi.hoisted(() => ({
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   sendMessage: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
-  switchMode: vi.fn(), resolvePlanOptions: vi.fn(),
+  resolvePlanOptions: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
 }))
 
@@ -33,12 +40,15 @@ vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.list
 vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
+// `switchMode` is GONE — a chat's kind is fixed at creation, so there is nothing left for a
+// per-thread setting to switch. `resolvePlanOptions` is a real export, kept mocked only because
+// `PlanOptionsCard` (still imported by BuilderPage.tsx) reaches for it — never exercised here,
+// since this suite never renders that card.
 vi.mock('../../utils/turnStreamApi', async (orig) => ({
   ...(await orig()),
   startTurn: (...a) => h.startTurn(...a),
   readTurnStream: (...a) => h.readTurnStream(...a),
   buildFromPlan: (...a) => h.buildFromPlan(...a),
-  switchMode: (...a) => h.switchMode(...a),
   resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
 
@@ -48,16 +58,48 @@ function deps() {
 }
 
 /**
- * Send a turn, confirm the brief the relay answers with, and wait until the build turn is
- * genuinely subscribed — `readTurnStream` called WITH a turnId is what "the build is underway"
- * means now, and it is the socket every frame below is pushed into.
+ * Script an ordinary send's own turn stream as an OPEN socket a test can push frames into by
+ * hand. `_builderSession.jsx`'s `scriptBuildTurn` still branches on whether `readTurnStream` was
+ * called WITH a `turnId` — the old Build-it watch's way of telling itself apart from an ordinary
+ * send. That distinction is gone: `fireRelayTurn` never passes a `turnId`, and never asks the
+ * chat's kind either — every send on this BUILD-chat page opens the one plain subscription, and
+ * that IS the build. The opening snapshot mirrors what every real subscribe gets first
+ * (`backend/src/api/v1/conversations/turns.py`): the consolidating frame before any model byte,
+ * carrying the `turnId` this page uses to know a turn is live.
+ */
+function scriptTurn(opening = [{ type: 'snapshot', seq: 1, turnId: 't1', turnStatus: 'running', items: [], textSoFar: '', steps: [] }, T_WORKSPACE(undefined, 2)]) {
+  const live = { emit: null, close: null }
+  const impl = async ({ onFrame }) => {
+    live.emit = onFrame
+    for (const frame of opening) onFrame(frame)
+    return new Promise((resolve) => { live.close = resolve })
+  }
+  return {
+    impl,
+    frame: async (...frames) => {
+      await act(async () => { for (const frame of frames) live.emit?.(frame) })
+    },
+    end: async (outcome = 'completed') => {
+      await act(async () => { live.close?.(outcome); await Promise.resolve() })
+    },
+  }
+}
+
+/** Type into the composer and send — no plan, no card, no `Build it` press. */
+async function send(text = 'a visitor app') {
+  await waitForGateOpen()
+  fireEvent.change(composer(), { target: { value: text } })
+  fireEvent.keyDown(composer(), { key: 'Enter' })
+}
+
+/**
+ * Send an ordinary message and wait until its turn is genuinely open — `readTurnStream` having
+ * been called is what "the build is underway" means now, and it is the socket every frame below
+ * is pushed into.
  */
 async function startBuild(text = 'build me a tool') {
-  await sendAndConfirm(text)
-  await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
-  await waitFor(() =>
-    expect(h.readTurnStream).toHaveBeenCalledWith(expect.objectContaining({ turnId: expect.any(String) })),
-  )
+  await send(text)
+  await waitFor(() => expect(h.readTurnStream).toHaveBeenCalled())
 }
 
 beforeEach(() => {
@@ -68,17 +110,15 @@ beforeEach(() => {
   h.createBuild.mockResolvedValue({ ok: true })
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
-  h.listProjectConversations.mockResolvedValue([{ id: 'build-X', kind: 'builder', title: 'My build', updatedAt: new Date().toISOString() }])
+  h.listProjectConversations.mockResolvedValue([{ id: 'build-X', kind: 'build', title: 'My build', updatedAt: new Date().toISOString() }])
   h.buildUserParts.mockImplementation(async (text) => [{ type: 'text', text }])
-  // A scripted relay that always answers with a ready-to-build brief, so a single send reaches the
-  // card these suites confirm. Whether the model asks or briefs is pinned server-side.
-  primeTurn(h)
+  h.startTurn.mockResolvedValue({ turnId: 't1' })
 })
 afterEach(() => cleanup())
 
 describe('BuilderPage — build turn visible without a refresh', () => {
-  it('shows the live status line immediately on confirming the brief, and the feed as frames arrive — no remount', async () => {
-    const turn = scriptBuildTurn()
+  it('shows the live status line immediately on sending, and the feed as frames arrive — no remount', async () => {
+    const turn = scriptTurn()
     h.readTurnStream.mockImplementation(turn.impl)
     renderBuilder({ deps: deps().deps })
     await startBuild()
@@ -97,7 +137,7 @@ describe('BuilderPage — build turn visible without a refresh', () => {
   })
 
   it('flips the status line to "preview is live" once the preview frame arrives', async () => {
-    const turn = scriptBuildTurn()
+    const turn = scriptTurn()
     h.readTurnStream.mockImplementation(turn.impl)
     renderBuilder({ deps: deps().deps })
     await startBuild()
@@ -107,7 +147,7 @@ describe('BuilderPage — build turn visible without a refresh', () => {
   })
 
   it('does NOT blank the live preview while the agent keeps working after the preview frames (KTD-8b)', async () => {
-    const turn = scriptBuildTurn()
+    const turn = scriptTurn()
     h.readTurnStream.mockImplementation(turn.impl)
     renderBuilder({ deps: deps().deps })
     await startBuild()

@@ -21,7 +21,7 @@ const h = vi.hoisted(() => ({
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   sendMessage: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
-  switchMode: vi.fn(), resolvePlanOptions: vi.fn(),
+  resolvePlanOptions: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
 }))
 
@@ -30,19 +30,26 @@ vi.mock('../../utils/builderHistory', () => ({
   getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
-vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
+// SPREAD THE ORIGINAL — `handleBuildIt` mints the new build chat's id through the shared
+// `uuidv7` (ADR-0006), and a factory naming only `listProjectConversations` leaves every other
+// export (including that one) undefined; Vitest now warns the moment a real caller reaches for
+// it, which every Build-it press in this suite does.
+vi.mock('../../utils/conversationApi', async (importOriginal) => ({
+  ...(await importOriginal()),
+  listProjectConversations: h.listProjectConversations,
+}))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../components/LivePreview', () => ({ default: () => null }))
 // A rendered file-part message would mount AttachmentChips, which fetches the object URL over the
 // real (relative-URL) network — stub it so the transcript render triggers no unhandled fetch.
 vi.mock('../../components/AttachmentChips', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
+// `switchMode` is GONE from this list (U1/U19): the route it posted to no longer exists.
 vi.mock('../../utils/turnStreamApi', async (orig) => ({
   ...(await orig()),
   startTurn: (...a) => h.startTurn(...a),
   readTurnStream: (...a) => h.readTurnStream(...a),
   buildFromPlan: (...a) => h.buildFromPlan(...a),
-  switchMode: (...a) => h.switchMode(...a),
   resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
 
@@ -52,7 +59,7 @@ function renderBuilder(chatId = 'build-X') {
   const fake = new FakeEventSource(chatId)
   const deps = { client: makeClient(h), eventSourceFactory: () => fake }
   const view = render(
-    <MemoryRouter initialEntries={[`/chat/${chatId}?projectId=p1&kind=builder`]}>
+    <MemoryRouter initialEntries={[`/chat/${chatId}?projectId=p1&kind=build`]}>
       <Routes>
         <Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="VIP Movement" buildSessionDeps={deps} />} />
         <Route path="/projects/:projectId" element={<div>project home</div>} />
@@ -123,7 +130,9 @@ describe('BuilderPage — the attachment user-turn is persisted before the build
     await startBuild('use the attached sheet')
 
     // The transition names the THREAD (the server reads the plan + its attachments from it).
-    expect(h.buildFromPlan).toHaveBeenCalledWith('build-X', PLAN_CARD_ID)
+    // Third arg is the client-minted id of the NEW build chat the handoff creates (U5/U12) —
+    // a real `uuidv7()`, so only its shape is pinned here, not its value.
+    expect(h.buildFromPlan).toHaveBeenCalledWith('build-X', PLAN_CARD_ID, expect.any(String))
   })
 
   it('ABORTS the send when the upload fails — never starts a text-only build (R3)', async () => {

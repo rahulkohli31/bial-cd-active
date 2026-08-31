@@ -177,6 +177,30 @@ describe('LivePreview — the four states a workspace can be in', () => {
     fireEvent.load(container.querySelector('iframe') as HTMLIFrameElement)
     expect(screen.getByRole('status').textContent).toMatch(/could not check on your preview/i)
   })
+
+  it('STARTING (U13) parses as its own state, not a coerced "unknown", and is never treated as gone', async () => {
+    // The closed-list defect this state exists to catch: an unwidened `PREVIEW_LIFE_STATES`
+    // would fall through `asPreviewLifeState`'s fallback straight to 'unknown' (`alive` is
+    // false), which is a confident-sounding "nothing to report" for a fact the server DID
+    // report — a start is already under way. Distinguished from `unknown` at the assertion,
+    // not merely by the parse: `unknown` gets "could not check"; this state must not.
+    const verdict = await asTheBrowserSeesIt({
+      state: 'starting',
+      alive: false,
+      previewUrl: null,
+      restorable: null,
+    })
+    expect(verdict.state).toBe('starting')
+
+    const { container } = paneFor(verdict)
+    // Not routed through the "gone" card: a start in flight is the opposite of gone, and
+    // `GONE_TITLE`/`goneBody` would tell a citizen to "send a prompt" over a container the
+    // platform is already bringing up.
+    expect(container.querySelector('iframe')).toBeTruthy()
+    expect(container.textContent).not.toMatch(/asleep|nothing has been built here yet|another project has your workspace/i)
+    fireEvent.load(container.querySelector('iframe') as HTMLIFrameElement)
+    expect(screen.getByRole('status').textContent).not.toMatch(/could not check on your preview/i)
+  })
 })
 
 describe('LivePreview — a reclaimed container is never an error (R17)', () => {

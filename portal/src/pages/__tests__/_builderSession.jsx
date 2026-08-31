@@ -10,7 +10,7 @@
  * stream); the plan streams as text and `present_plan_options` renders the card; a build starts
  * only through the atomic Build-it transition. So a suite that wants a build must (a) mock
  * `../../utils/turnStreamApi` onto its `h` bag (startTurn / readTurnStream / buildFromPlan /
- * switchMode / resolvePlanOptions / stopTurn), (b) prime it with `primeTurn(h)`, and (c) drive
+ * resolvePlanOptions / stopTurn), (b) prime it with `primeTurn(h)`, and (c) drive
  * `sendAndConfirm()`. `turnStreaming` scripts the frame feed; `planReply()` is the standard
  * text-plus-card turn.
  *

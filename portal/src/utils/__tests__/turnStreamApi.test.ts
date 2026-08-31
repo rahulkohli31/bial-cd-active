@@ -16,9 +16,9 @@ import {
   resolvePlanOptions,
   startTurn,
   stopTurn,
-  switchMode,
   type TurnFrame,
 } from '../turnStreamApi'
+import * as turnStreamApi from '../turnStreamApi'
 
 const SNAPSHOT =
   '{"type":"snapshot","seq":3,"turnId":"t1","turnStatus":"running","items":[],"textSoFar":"hi ","steps":[]}'
@@ -336,16 +336,50 @@ describe('base-path contract (F2 regression guard) — every call hits /api/conv
     expectUnPrefixed(urlOf(fetchFn))
   })
 
-  it('switchMode → /api/conversations/{id}/mode', async () => {
-    const fetchFn = vi.fn(async () => json({ mode: 'plan' }))
-    await switchMode('c1', 'plan', { fetchImpl: fetchFn })
-    expectUnPrefixed(urlOf(fetchFn))
+  it('this module exports NO mode-switch call at all', () => {
+    // AN INERTNESS GUARD, not a deleted test (L8). `switchMode` posted to
+    // `/api/conversations/{id}/mode` — a route that no longer exists, because what a chat is
+    // is decided when it is created and cannot be moved afterwards. A base-path assertion
+    // cannot express that; the absence of the transport itself is the whole claim.
+    expect(Object.keys(turnStreamApi)).not.toContain('switchMode')
+    expect(turnStreamApi as Record<string, unknown>).not.toHaveProperty('switchMode')
+    // And no OTHER export smuggles the route back in under a different name.
+    for (const [name, value] of Object.entries(turnStreamApi)) {
+      if (typeof value !== 'function') continue
+      expect(value.toString(), name).not.toContain('/mode')
+    }
   })
 
   it('buildFromPlan → /api/conversations/{id}/plan-options/{toolCallId}/build', async () => {
-    const fetchFn = vi.fn(async () => json({ outcome: 'started' }))
-    await buildFromPlan('c1', 'tc1', {}, { fetchImpl: fetchFn })
+    const fetchFn = vi.fn(async () => json({ outcome: 'started', chatId: 'new-1' }))
+    await buildFromPlan('c1', 'tc1', 'new-1', { fetchImpl: fetchFn })
     expectUnPrefixed(urlOf(fetchFn))
+  })
+
+  it('buildFromPlan posts the CLIENT-MINTED chat id and no force flag', async () => {
+    // The id is what makes a double-press idempotent, so it has to actually reach the wire; and
+    // `force` was the stale-plan override, which died with the pin that produced it.
+    const fetchFn = vi.fn(async () => json({ outcome: 'started', chatId: 'minted-7' }))
+    const outcome = await buildFromPlan('c1', 'tc1', 'minted-7', { fetchImpl: fetchFn })
+    const init = (fetchFn.mock.calls[0] as unknown[])[1] as RequestInit
+    expect(JSON.parse(init.body as string)).toEqual({ chatId: 'minted-7' })
+    expect(outcome.chatId).toBe('minted-7')
+  })
+
+  it('buildFromPlan surfaces the refusal CODE, not just a sentence', async () => {
+    // R98 / the one-slot rule reach the browser as four different remedies on three statuses.
+    // A bare `Error` collapses them into one string, and the string is wrong for three of them.
+    const fetchFn = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ error: { message: 'Another chat is building', code: 'already_building_here' } }),
+          { status: 409 },
+        ),
+    )
+    await expect(buildFromPlan('c1', 'tc1', 'minted-8', { fetchImpl: fetchFn })).rejects.toMatchObject({
+      status: 409,
+      code: 'already_building_here',
+    })
   })
 
   it('resolvePlanOptions → /api/conversations/{id}/plan-options/{toolCallId}/resolve', async () => {
@@ -366,10 +400,10 @@ describe('base-path contract (F2 regression guard) — every call hits /api/conv
   })
 })
 
-// F1 REGRESSION GUARD (turn transport). These five MUTATING calls ride the signed double-submit
+// F1 REGRESSION GUARD (turn transport). These four MUTATING calls ride the signed double-submit
 // X-CSRF-Token, and every one of their routes enforces RequireCsrf server-side — so a dropped header
-// would 403 every mode-switch / turn-start in prod (the P0 class) while the base-path guard above
-// stays fully green. Since U1 the header comes from `authFetch` rather than a second copy in this
+// would 403 every turn-start and every Build-it press in prod (the P0 class) while the base-path
+// guard above stays fully green. Since U1 the header comes from `authFetch` rather than a second copy in this
 // module; the assertion is unchanged because the observable contract is. The read path
 // (readTurnStream) is a safe GET and carries none.
 describe('CSRF double-submit (F1 regression guard) — every MUTATING turn call rides X-CSRF-Token', () => {
@@ -396,15 +430,9 @@ describe('CSRF double-submit (F1 regression guard) — every MUTATING turn call 
     expect(headersOf(fetchFn)['X-CSRF-Token']).toBe('signed-turn-csrf')
   })
 
-  it('switchMode rides X-CSRF-Token', async () => {
-    const fetchFn = vi.fn(async () => json({ mode: 'plan' }))
-    await switchMode('c1', 'plan', { fetchImpl: fetchFn })
-    expect(headersOf(fetchFn)['X-CSRF-Token']).toBe('signed-turn-csrf')
-  })
-
   it('buildFromPlan rides X-CSRF-Token', async () => {
-    const fetchFn = vi.fn(async () => json({ outcome: 'started' }))
-    await buildFromPlan('c1', 'tc1', {}, { fetchImpl: fetchFn })
+    const fetchFn = vi.fn(async () => json({ outcome: 'started', chatId: 'new-1' }))
+    await buildFromPlan('c1', 'tc1', 'new-1', { fetchImpl: fetchFn })
     expect(headersOf(fetchFn)['X-CSRF-Token']).toBe('signed-turn-csrf')
   })
 
@@ -460,14 +488,9 @@ describe('session expiry recovery (N11) — every turn call refreshes once and r
       run: (deps) => stopTurn('c1', 't1', deps),
     },
     {
-      name: 'switchMode',
-      ok: () => json({ mode: 'write' }),
-      run: (deps) => switchMode('c1', 'write', deps),
-    },
-    {
       name: 'buildFromPlan',
-      ok: () => json({ outcome: 'started' }),
-      run: (deps) => buildFromPlan('c1', 'tc1', {}, deps),
+      ok: () => json({ outcome: 'started', chatId: 'new-1' }),
+      run: (deps) => buildFromPlan('c1', 'tc1', 'new-1', deps),
     },
     {
       name: 'resolvePlanOptions',
@@ -527,12 +550,14 @@ describe('session expiry recovery (N11) — every turn call refreshes once and r
     // per-attempt CSRF read would trade every 401 for a 403. Pin the pairing from this side too —
     // api.test.js owns the wrapper-level proof.
     document.cookie = 'csrf=before-refresh'
-    const fetchImpl = expiredThen(() => json({ mode: 'write' }))
+    const fetchImpl = expiredThen(() => json({ outcome: 'started', chatId: 'new-1' }))
     const refresh = vi.fn(async () => {
       document.cookie = 'csrf=after-refresh' // /auth/refresh rotates the cookie
       return true
     })
-    await switchMode('c1', 'write', { fetchImpl: fetchImpl as unknown as typeof fetch, refresh })
+    // Any mutating call proves the pairing; this one is the Build-it press, which is the most
+    // expensive thing on this transport to have 403 on a retry.
+    await buildFromPlan('c1', 'tc1', 'new-1', { fetchImpl: fetchImpl as unknown as typeof fetch, refresh })
     const headersOfCall = (i: number) =>
       ((fetchImpl.mock.calls[i] as unknown[])[1] as RequestInit).headers as Record<string, string>
     expect(headersOfCall(0)['X-CSRF-Token']).toBe('before-refresh')

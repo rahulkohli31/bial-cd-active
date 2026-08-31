@@ -1,10 +1,14 @@
 /**
- * The planning chat's "Launch Builder" handoff MINTS A FRESH conversation (U13).
+ * The plan chat's "Launch Builder" handoff MINTS A FRESH conversation (U13).
  *
  * The canonical-thread model this test used to pin is retired with the unified chat:
- * every launch now creates a new Plan-mode builder chat, carrying the summarized brief as
- * its first message. What matters now: the minted id is fresh (never a reused thread),
- * the query names the project + kind, and the state carries `{ prompt, mode: 'plan' }`.
+ * every launch now creates a new build chat (`?kind=build`), carrying the summarized brief
+ * as its first message. What matters now: the minted id is fresh (never a reused thread),
+ * the query names the project + kind, and the state carries `{ prompt, uploadedFiles,
+ * freshlyMinted }`. `mode` does NOT ride along any more — `ConversationMode` (ask/plan/write)
+ * was a second axis the composer switched independently of the stored kind; U19 deleted it
+ * along with the composer's mode-switching control, since a chat's kind is now fixed once, at
+ * the mint.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup, within } from '@testing-library/react'
@@ -94,7 +98,7 @@ beforeEach(() => {
 afterEach(cleanup)
 
 describe('ChatPage → Launch Builder', () => {
-  it('mints a FRESH Plan-mode builder chat under the project', async () => {
+  it('mints a FRESH build chat under the project', async () => {
     renderChat()
     await openBuilderPrompt()
 
@@ -102,13 +106,13 @@ describe('ChatPage → Launch Builder', () => {
 
     await waitFor(() => expect(screen.queryByTestId('location')).toBeTruthy())
     const location = screen.getByTestId('location').textContent
-    // A fresh id from the SHARED mint — never the planning chat's own id, never a resolved old
+    // A fresh id from the SHARED mint — never the plan chat's own id, never a resolved old
     // thread, and never an inline `crypto.randomUUID()` (which the stubbed mint cannot produce).
-    expect(location).toBe(`/chat/${FIXED_UUID}?projectId=p1&kind=builder`)
+    expect(location).toBe(`/chat/${FIXED_UUID}?projectId=p1&kind=build`)
     expect(location).not.toContain('plan-1')
   })
 
-  it('stages the summarized brief + plan mode in the handoff state', async () => {
+  it('stages the summarized brief in the handoff state — no mode field rides along', async () => {
     renderChat()
     await openBuilderPrompt()
 
@@ -118,10 +122,14 @@ describe('ChatPage → Launch Builder', () => {
     const state = JSON.parse(screen.getByTestId('state').textContent)
     expect(state).toMatchObject({
       prompt: 'Build an application for BIAL that tracks visitors.',
-      mode: 'plan',
       // ChatRoute skips this chat's guaranteed-404 GET only because the marker is here.
       freshlyMinted: true,
     })
+    // `mode` USED TO ride here too (`{ prompt, mode: 'plan' }`) — it is gone from the payload
+    // entirely, not renamed: ConversationMode was a second axis (ask/plan/write) the composer
+    // switched independently of the stored kind, and U19 retired it along with the control that
+    // switched it. The chat's kind is fixed once, at the mint, via `?kind=build` alone.
+    expect(state.mode).toBeUndefined()
     // toMatchObject passes on EXTRA keys, so it cannot see `theme` coming back. The consumer
     // side (ProjectBuilder) asserts its absence explicitly; this is the producer, and the pair
     // is only symmetric with this line (#157 B1 / review).
@@ -140,7 +148,7 @@ describe('ChatPage → New Chat', () => {
     fireEvent.click(await screen.findByRole('button', { name: /new chat/i }))
 
     await waitFor(() => expect(screen.queryByTestId('location')).toBeTruthy())
-    expect(screen.getByTestId('location').textContent).toBe('/chat/fresh-plan-id?projectId=p1&kind=planning')
+    expect(screen.getByTestId('location').textContent).toBe('/chat/fresh-plan-id?projectId=p1&kind=plan')
     expect(JSON.parse(screen.getByTestId('state').textContent)).toEqual({ freshlyMinted: true })
   })
 })

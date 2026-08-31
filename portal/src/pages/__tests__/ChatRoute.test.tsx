@@ -72,7 +72,7 @@ function renderRoute(entry: string, state?: unknown) {
 
 const conversation = (over: Record<string, unknown> = {}) => ({
   id: 'c1',
-  kind: 'planning',
+  kind: 'plan',
   projectId: 'p1',
   title: 'T',
   messages: [],
@@ -90,23 +90,30 @@ afterEach(() => cleanup())
 const beacons = () => beaconsFrom(h.authFetch)
 
 describe('ChatRoute — kind dispatch', () => {
-  it('renders ChatPage for a planning conversation', async () => {
-    h.getConversation.mockResolvedValue(conversation({ kind: 'planning' }))
+  it('renders ChatPage for a plan conversation', async () => {
+    h.getConversation.mockResolvedValue(conversation({ kind: 'plan' }))
     renderRoute('/chat/c1')
     expect(await screen.findByTestId('chat-page')).toBeTruthy()
     expect(screen.queryByTestId('builder-page')).toBeNull()
   })
 
-  it('renders BuilderPage for a builder conversation', async () => {
-    h.getConversation.mockResolvedValue(conversation({ kind: 'builder' }))
+  // Was "renders BuilderPage for a builder conversation": `builder` was the OLD three-valued
+  // ConversationKind's word. It collapsed into the two-valued ChatKind's `build` (U1) — renamed
+  // here too, not just in the fixture, so this name doesn't go on describing a kind that no
+  // longer exists.
+  it('renders BuilderPage for a build conversation', async () => {
+    h.getConversation.mockResolvedValue(conversation({ kind: 'build' }))
     renderRoute('/chat/c1')
     expect(await screen.findByTestId('builder-page')).toBeTruthy()
   })
 
   it('lets the SERVER win when its kind disagrees with ?kind=', async () => {
-    h.getConversation.mockResolvedValue(conversation({ kind: 'planning' }))
-    renderRoute('/chat/c1?kind=builder')
-    // A stale or hand-edited query must never render a builder over a planning transcript.
+    h.getConversation.mockResolvedValue(conversation({ kind: 'plan' }))
+    // The query has to name the REAL opt-in value to be a genuine disagreement — `?kind=builder`
+    // (the retired word) matches neither branch of `kindFromQuery`'s `raw === 'build'` check, so
+    // both the query and the server would have resolved to `plan` regardless of which one won.
+    renderRoute('/chat/c1?kind=build')
+    // A stale or hand-edited query must never render a build page over a plan transcript.
     expect(await screen.findByTestId('chat-page')).toBeTruthy()
     expect(screen.queryByTestId('builder-page')).toBeNull()
   })
@@ -122,13 +129,13 @@ describe('ChatRoute — kind dispatch', () => {
 describe('ChatRoute — a conversation whose row does not exist yet', () => {
   it('renders the ?kind= page when the id 404s but a ?projectId= is present', async () => {
     h.getConversation.mockResolvedValue(null)
-    renderRoute('/chat/new-uuid?projectId=p1&kind=builder')
+    renderRoute('/chat/new-uuid?projectId=p1&kind=build')
     // The row appears on the first appendMessage; until then only the query knows the project.
     expect(await screen.findByTestId('builder-page')).toBeTruthy()
     expect(screen.getByTestId('builder-page').textContent).toContain('|new-uuid|p1|')
   })
 
-  it('defaults an unrecognised ?kind= to planning rather than trusting it', async () => {
+  it('defaults an unrecognised ?kind= to plan rather than trusting it', async () => {
     h.getConversation.mockResolvedValue(null)
     renderRoute('/chat/new-uuid?projectId=p1&kind=wat')
     expect(await screen.findByTestId('chat-page')).toBeTruthy()
@@ -154,7 +161,7 @@ describe('ChatRoute — the GET that cannot succeed', () => {
   // `getConversation` is a guaranteed 404 on every cold new-chat open — and it is not the only
   // one: both pages keep their own hydration fetch, and StrictMode doubles the pair again in dev.
   it('a freshly-minted open issues NO getConversation and renders from the query', async () => {
-    renderRoute('/chat/fresh-id?projectId=p1&kind=builder', { freshlyMinted: true })
+    renderRoute('/chat/fresh-id?projectId=p1&kind=build', { freshlyMinted: true })
 
     expect(await screen.findByTestId('builder-page')).toBeTruthy()
     expect(screen.getByTestId('builder-page').textContent).toContain('|fresh-id|p1|')
@@ -164,12 +171,12 @@ describe('ChatRoute — the GET that cannot succeed', () => {
   // THE IMPORTANT ONE. Keying the skip on "the URL has query params" would be a security
   // regression, not just a wrong optimisation: `?kind=` is user-controllable, and a saved chat's
   // URL only loses its query after the FIRST append — so a shared or bookmarked
-  // `/chat/{id}?kind=builder` for an already-saved planning chat is an ordinary URL that MUST
+  // `/chat/{id}?kind=build` for an already-saved plan chat is an ordinary URL that MUST
   // still be resolved by the server. Router state does not survive a reload and does not travel
   // in a link, which is exactly what makes the marker safe to trust.
   it('an open WITHOUT the marker still fetches, and the server beats a conflicting ?kind=', async () => {
-    h.getConversation.mockResolvedValue(conversation({ kind: 'planning' }))
-    renderRoute('/chat/c1?projectId=p1&kind=builder')
+    h.getConversation.mockResolvedValue(conversation({ kind: 'plan' }))
+    renderRoute('/chat/c1?projectId=p1&kind=build')
 
     expect(await screen.findByTestId('chat-page')).toBeTruthy()
     expect(h.getConversation).toHaveBeenCalledWith('c1')
@@ -179,7 +186,7 @@ describe('ChatRoute — the GET that cannot succeed', () => {
   it('falls back to the fetch when the marker arrives with no projectId to resolve from', async () => {
     // Fail-safe direction: the skip only ever removes a request whose answer the query already
     // holds. No project in the query means nothing to render from, so ask the server.
-    h.getConversation.mockResolvedValue(conversation({ kind: 'planning' }))
+    h.getConversation.mockResolvedValue(conversation({ kind: 'plan' }))
     renderRoute('/chat/c1', { freshlyMinted: true })
 
     expect(await screen.findByTestId('chat-page')).toBeTruthy()
@@ -214,7 +221,7 @@ describe('ChatRoute — the project breadcrumb', () => {
 describe('ChatRoute — load failure', () => {
   it('falls back to the query rather than stranding the user on a spinner', async () => {
     h.getConversation.mockRejectedValue(new Error('boom'))
-    renderRoute('/chat/c1?projectId=p1&kind=builder')
+    renderRoute('/chat/c1?projectId=p1&kind=build')
     expect(await screen.findByTestId('builder-page')).toBeTruthy()
   })
 
@@ -233,7 +240,7 @@ describe('ChatRoute — the page is never torn down mid-turn', () => {
   it('dropping the transient query does not re-resolve the conversation or unmount the page', async () => {
     h.getConversation.mockResolvedValue(conversation())
     render(
-      <MemoryRouter initialEntries={['/chat/c1?projectId=p1&kind=planning']}>
+      <MemoryRouter initialEntries={['/chat/c1?projectId=p1&kind=plan']}>
         <Routes>
           <Route path="/chat/:chatId" element={<ChatRoute />} />
         </Routes>
@@ -275,7 +282,7 @@ describe('ChatRoute — the page is never torn down mid-turn', () => {
     expect(screen.queryByRole('status', { name: /loading chat/i })).toBeNull()
     expect(screen.getByTestId('chat-page').textContent).toContain('|c1|')
 
-    resolveSecond?.({ id: 'c2', kind: 'planning', projectId: 'p1', messages: [] })
+    resolveSecond?.({ id: 'c2', kind: 'plan', projectId: 'p1', messages: [] })
     await waitFor(() => expect(screen.getByTestId('chat-page').textContent).toContain('|c2|'))
   })
 })

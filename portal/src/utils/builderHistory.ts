@@ -1,5 +1,5 @@
 /**
- * Builder-session store, server-backed (kind 'builder'). Mirrors chatHistory.js
+ * Builder-session store, server-backed (kind 'build'). Mirrors chatHistory.js
  * via the shared async factory. U7: the server persists turns itself — the page
  * creates the row before the first turn (`createBuild`) and reloads via the
  * projection read (`getBuild` → derived display messages). The legacy `code`
@@ -12,7 +12,9 @@
  */
 import { createConversationStore, deriveTitle } from './conversationApi'
 
-const store = createConversationStore('builder')
+// U1 collapsed the old three-value ConversationKind + ask/plan/write ConversationMode into one
+// two-valued ChatKind (plan | build); the server 422s on the retired 'builder' string.
+const store = createConversationStore('build')
 
 export const loadBuilds = store.loadHistory
 export const getBuild = store.getConversation

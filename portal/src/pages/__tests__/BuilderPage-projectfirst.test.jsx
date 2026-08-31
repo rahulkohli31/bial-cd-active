@@ -28,7 +28,7 @@ const h = vi.hoisted(() => ({
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   sendMessage: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
-  switchMode: vi.fn(), resolvePlanOptions: vi.fn(),
+  resolvePlanOptions: vi.fn(),
   previewProps: [],
   authFetch: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
@@ -38,7 +38,14 @@ vi.mock('../../utils/builderHistory', () => ({
   loadBuilds: h.loadBuilds, newBuild: h.newBuild, createBuild: h.createBuild,
   getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
-vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
+// SPREAD THE ORIGINAL — `handleBuildIt` mints the new build chat's id through the shared
+// `uuidv7` (ADR-0006), and a factory naming only `listProjectConversations` leaves every other
+// export (including that one) undefined; Vitest now warns the moment a real caller reaches for
+// it, which every confirmed brief in this suite does.
+vi.mock('../../utils/conversationApi', async (importOriginal) => ({
+  ...(await importOriginal()),
+  listProjectConversations: h.listProjectConversations,
+}))
 // The REAL observe module runs for the reveal test below \u2014 only the transport is replaced, so the
 // assertion is about the beacon that actually goes out, not about a mock being called.
 vi.mock('../../utils/api', async (orig) => ({ ...(await orig()), authFetch: h.authFetch }))
@@ -47,12 +54,13 @@ vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 // Capture EVERY prop the preview is handed — the isolation assertion is about what it is fed.
 vi.mock('../../components/LivePreview', () => ({ default: (props) => { h.previewProps.push(props); return null } }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
+// `switchMode` is GONE from this list (U1/U19): the route it posted to no longer exists, and a
+// chat's kind can't change after creation, so there is nothing left for a mock to intercept.
 vi.mock('../../utils/turnStreamApi', async (orig) => ({
   ...(await orig()),
   startTurn: (...a) => h.startTurn(...a),
   readTurnStream: (...a) => h.readTurnStream(...a),
   buildFromPlan: (...a) => h.buildFromPlan(...a),
-  switchMode: (...a) => h.switchMode(...a),
   resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
 
@@ -66,7 +74,7 @@ function makeDeps() {
 
 function renderHandoff({ chatId = 'build-X', prompt = 'build me a gate tracker' } = {}) {
   return render(
-    <MemoryRouter initialEntries={[{ pathname: `/chat/${chatId}`, search: '?projectId=p1&kind=builder', state: { prompt, theme: 'bial' } }]}>
+    <MemoryRouter initialEntries={[{ pathname: `/chat/${chatId}`, search: '?projectId=p1&kind=build', state: { prompt, theme: 'bial' } }]}>
       <Routes>
         <Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="VIP Movement" buildSessionDeps={makeDeps()} />} />
         <Route path="/projects/:projectId" element={<div>project home</div>} />
@@ -113,7 +121,7 @@ describe('BuilderPage — the seed turn is filed under a project', () => {
     // and what builds is the model's REFINED brief, not the raw handoff text.
     expect(h.buildFromPlan).not.toHaveBeenCalled()
     await confirmBrief()
-    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledWith('build-X', PLAN_CARD_ID))
+    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledWith('build-X', PLAN_CARD_ID, expect.any(String)))
   })
 
   it('persists the user turn BEFORE the relay reads it, and so before any build', async () => {
@@ -167,7 +175,7 @@ describe('BuilderPage — an append failure aborts the turn', () => {
     h.buildUserParts.mockImplementation(async (text) => [{ type: 'text', text }])
     await sendAndConfirm('try again without the file')
 
-    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledWith('build-X', PLAN_CARD_ID))
+    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledWith('build-X', PLAN_CARD_ID, expect.any(String)))
   })
 
   it('leaves for /projects when the append 404s (project deleted)', async () => {
@@ -197,7 +205,7 @@ describe('BuilderPage — the project breadcrumb', () => {
 
 describe('BuilderPage — a refine turn', () => {
   it('sends projectId (no title) on a subsequent turn and starts with {projectId, prompt}', async () => {
-    h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'builder', messages: [{ id: 'm0', role: 'user', parts: [{ type: 'text', text: 'hi' }], seq: 0 }] })
+    h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [{ id: 'm0', role: 'user', parts: [{ type: 'text', text: 'hi' }], seq: 0 }] })
     render(
       <MemoryRouter initialEntries={['/chat/build-X']}>
         <Routes>
@@ -211,7 +219,7 @@ describe('BuilderPage — a refine turn', () => {
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
     // U7: a subsequent turn on an existing thread creates nothing — the row already exists.
     expect(h.createBuild).not.toHaveBeenCalled()
-    expect(h.buildFromPlan).toHaveBeenCalledWith('build-X', PLAN_CARD_ID)
+    expect(h.buildFromPlan).toHaveBeenCalledWith('build-X', PLAN_CARD_ID, expect.any(String))
   })
 })
 
@@ -287,12 +295,12 @@ describe('BuilderPage — the composer is not shared across a chat navigation', 
     // chat the seed started in. If the user navigated away while the upload was in flight, writing
     // them would wipe the transcript of the chat now on screen.
     h.getBuild.mockImplementation(async (id) =>
-      id === 'chat-B' ? { id: 'chat-B', kind: 'builder', messages: [{ id: 'm0', role: 'assistant', parts: [{ type: 'text', text: 'CHAT B TRANSCRIPT' }], seq: 0 }] } : null,
+      id === 'chat-B' ? { id: 'chat-B', kind: 'build', messages: [{ id: 'm0', role: 'assistant', parts: [{ type: 'text', text: 'CHAT B TRANSCRIPT' }], seq: 0 }] } : null,
     )
     let failUpload
     h.buildUserParts.mockReturnValue(new Promise((_resolve, reject) => { failUpload = reject }))
     render(
-      <MemoryRouter initialEntries={[{ pathname: '/chat/chat-A', search: '?projectId=p1&kind=builder', state: { prompt: 'seed for A', theme: 'bial' } }]}>
+      <MemoryRouter initialEntries={[{ pathname: '/chat/chat-A', search: '?projectId=p1&kind=build', state: { prompt: 'seed for A', theme: 'bial' } }]}>
         <GoToB />
         <Routes>
           <Route path="/chat/:chatId" element={<BuilderHost />} />
@@ -330,7 +338,7 @@ describe('BuilderPage — the composer is not shared across a chat navigation', 
 })
 
 describe('BuilderPage — the StrictMode load strand (U7)', () => {
-  const SAVED = { id: 'build-X', kind: 'builder', messages: [{ id: 'm0', role: 'assistant', parts: [{ type: 'text', text: 'SAVED TRANSCRIPT LINE' }], seq: 0 }] }
+  const SAVED = { id: 'build-X', kind: 'build', messages: [{ id: 'm0', role: 'assistant', parts: [{ type: 'text', text: 'SAVED TRANSCRIPT LINE' }], seq: 0 }] }
 
   it('renders a saved transcript under <StrictMode>', async () => {
     h.getBuild.mockResolvedValue(SAVED)
@@ -350,7 +358,7 @@ describe('BuilderPage — the StrictMode load strand (U7)', () => {
     h.getBuild.mockResolvedValue(null)
     render(
       <StrictMode>
-        <MemoryRouter initialEntries={[{ pathname: '/chat/build-X', search: '?projectId=p1&kind=builder', state: { prompt: 'build me a gate tracker', theme: 'bial' } }]}>
+        <MemoryRouter initialEntries={[{ pathname: '/chat/build-X', search: '?projectId=p1&kind=build', state: { prompt: 'build me a gate tracker', theme: 'bial' } }]}>
           <Routes>
             <Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="VIP" buildSessionDeps={makeDeps()} />} />
           </Routes>
@@ -368,7 +376,7 @@ describe('BuilderPage — the StrictMode load strand (U7)', () => {
 
 describe('BuilderPage — a send blocked by an in-flight reply explains itself', () => {
   it('toasts instead of silently dropping the Enter while the assistant is still replying', async () => {
-    h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'builder', messages: [{ id: 'm0', role: 'user', parts: [{ type: 'text', text: 'hi' }], seq: 0 }] })
+    h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [{ id: 'm0', role: 'user', parts: [{ type: 'text', text: 'hi' }], seq: 0 }] })
     h.readTurnStream.mockImplementation(() => new Promise(() => {})) // the reply never lands → `generating` stays true
 
     render(
@@ -421,7 +429,7 @@ describe('BuilderPage — the hand-off does not replay on reload (N1)', () => {
 
   const HANDOFF_ENTRY = {
     pathname: '/chat/build-X',
-    search: '?projectId=p1&kind=builder',
+    search: '?projectId=p1&kind=build',
     state: { prompt: 'reply with exactly the word OK', theme: 'bial', pendingAttachments: [] },
   }
 
@@ -446,8 +454,7 @@ describe('BuilderPage — the hand-off does not replay on reload (N1)', () => {
     const dropped = { pathname: sink.current.pathname, search: sink.current.search, state: sink.current.state }
     h.getBuild.mockResolvedValue({
       id: 'build-X',
-      kind: 'builder',
-      mode: 'plan',
+      kind: 'build',
       messages: [{ id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'reply with exactly the word OK' }] }],
     })
     cleanup()

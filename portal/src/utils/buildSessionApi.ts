@@ -431,17 +431,22 @@ export function asReclaimBlocked(err: unknown): ReclaimBlocked | null {
 
 /** What is (or is not) serving a project's preview right now — C3 §8.3.
  *
- *  FOUR STATES AND AN UNKNOWN, because `alive: false` used to mean all five at once and one
+ *  FIVE STATES AND AN UNKNOWN, because `alive: false` used to mean all five at once and one
  *  of them was not a state at all but an error:
  *
  *   - `alive`       — a container is serving this project; `previewUrl` is framable.
  *   - `asleep`      — built before, nothing serving it now. The next prompt brings it back
  *                     from the durable copy. NOT a failure, and nothing may style it as one.
+ *   - `starting`    — U13: a build, a relaunch, or a turn's sandbox start is IN FLIGHT for this
+ *                     project right now. Not `alive` (no container yet) and not `asleep` (a
+ *                     start is actively under way) — the server's own action mapping (C3 §10.3)
+ *                     groups it with `alive` as "nothing to offer, just a wait", so it must NOT
+ *                     be treated as a "gone" state that invites a remedy.
  *   - `slot_taken`  — another of this user's projects holds the one-per-user workspace.
  *   - `never_built` — nothing has ever been built here.
  *   - `unknown`     — the server could not read its coordination store, so it claims NOTHING.
  *                     A client that renders this as "gone" has put the bug back. */
-export const PREVIEW_LIFE_STATES = ['alive', 'asleep', 'slot_taken', 'never_built', 'unknown'] as const
+export const PREVIEW_LIFE_STATES = ['alive', 'asleep', 'starting', 'slot_taken', 'never_built', 'unknown'] as const
 export type PreviewLifeState = (typeof PREVIEW_LIFE_STATES)[number]
 
 export interface PreviewState {
