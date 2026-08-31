@@ -43,7 +43,7 @@
  * against the nearest scroll container and that container has moved.
  */
 import { Outlet } from 'react-router-dom'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import Navbar from '../layout/Navbar'
 import ReclaimWorkspaceDialog from '../projects/ReclaimWorkspaceDialog'
 import AppPaneHost from './AppPaneHost'
@@ -170,11 +170,11 @@ function ShellFrame() {
 
 export default function WorkspaceShell() {
   // Created once and never replaced, so the context value is stable for the life of the shell and
-  // the provider itself never re-renders anybody. Everything that moves lives in the cells.
+  // the provider itself never re-renders anybody. Everything that moves lives in the cells, which
+  // is what lets a save-state publish reach the unload warning without touching the pane.
   const [channel] = useState(createWorkspaceChannel)
-  const value = useMemo(() => channel, [channel])
   return (
-    <WorkspaceChannelProvider value={value}>
+    <WorkspaceChannelProvider value={channel}>
       <ShellFrame />
     </WorkspaceChannelProvider>
   )

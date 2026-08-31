@@ -77,30 +77,18 @@ export default function AppPaneHost() {
         // NO `key`. The frame's identity is the URL plus `LivePreview`'s own reload nonce, and
         // adding one here — on the route, on the chat, on anything else — is exactly how a pane
         // that is meant to outlive a navigation gets remounted by one.
+        //
+        // SPREAD, NOT TRANSCRIBED. `PaneView` is a subset of this component's props, so listing
+        // them again here would be a second copy of every default — twenty-odd `?? false` and
+        // `?? null` clauses, each free to drift from the one `LivePreview` already declares in its
+        // own signature. Spreading nothing when no surface has published is exactly right: the
+        // frame needs only an address to keep running, and the pane's own defaults are the correct
+        // resting state for a departed conversation's chrome. TypeScript is what keeps the two
+        // shapes honest — a field on `PaneView` that this component does not accept is an error
+        // here rather than a prop silently going nowhere.
+        {...(pane ?? {})}
         previewUrl={address.url}
         status={address.status}
-        toolbarLeading={pane?.toolbarLeading ?? null}
-        toolbarTrailing={pane?.toolbarTrailing ?? null}
-        iterating={pane?.iterating ?? false}
-        reconnecting={pane?.reconnecting ?? false}
-        onRelaunch={pane?.onRelaunch}
-        relaunching={pane?.relaunching ?? false}
-        relaunchError={pane?.relaunchError ?? null}
-        lastBuildFailed={pane?.lastBuildFailed ?? false}
-        restoredFromFailedBuild={pane?.restoredFromFailedBuild ?? false}
-        completedLive={pane?.completedLive ?? false}
-        hasSavedBuild={pane?.hasSavedBuild ?? null}
-        previewState={pane?.previewState ?? null}
-        occupyingProjectName={pane?.occupyingProjectName ?? null}
-        turnRunning={pane?.turnRunning ?? false}
-        compileState={pane?.compileState ?? null}
-        workspaceLost={pane?.workspaceLost ?? false}
-        saveDirty={pane?.saveDirty ?? null}
-        saving={pane?.saving ?? false}
-        saveError={pane?.saveError ?? null}
-        onSave={pane?.onSave}
-        onFrameMessage={pane?.onFrameMessage}
-        onRevealed={pane?.onRevealed}
       />
     </div>
   )
