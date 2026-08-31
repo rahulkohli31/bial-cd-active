@@ -19,6 +19,7 @@
  *     outlive the handlers they call.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
+import { readFileSync } from 'node:fs'
 import { useState, type ReactNode } from 'react'
 import { render, screen, fireEvent, cleanup } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
@@ -62,6 +63,19 @@ function renderShell(child: ReactNode) {
   )
 }
 
+/**
+ * EVERY SURFACE THE SHELL FRAMES, by path. The shell's two routes (`App.tsx`) plus the components
+ * they render inside its outlet column. A new in-shell surface belongs on this list.
+ */
+const IN_SHELL_SURFACES = [
+  'pages/ChatRoute.tsx',
+  'pages/ChatPage.tsx',
+  'pages/BuilderPage.tsx',
+  'pages/ProjectPage.tsx',
+  'components/workspace/ConversationSlot.tsx',
+  'components/workspace/AppPaneHost.tsx',
+] as const
+
 const grid = () => screen.getByTestId('workspace-grid')
 const shellRoot = () => grid().parentElement as HTMLElement
 
@@ -103,6 +117,31 @@ describe('WorkspaceShell — one height model, one frame, one grid', () => {
     // inline style on any surface the shell frames.
     const { container } = renderShell(<div data-testid="surface" />)
     expect(container.innerHTML).not.toMatch(/100vh/)
+  })
+
+  it('and no surface the shell frames asserts a viewport height in its source', () => {
+    // READ AS SOURCE, not as a render, and that is the point. The scenario above can only see what
+    // the stub surface it mounts happens to emit, so it was blind to `ChatRoute`'s loading arm —
+    // a `min-h-screen` box inside a column that is 100vh MINUS the navbar and `overflow-hidden`,
+    // which cannot shrink to fit, so it overflowed and pushed its spinner below the visible centre
+    // on every cold chat open. One class on a branch no shell test renders.
+    //
+    // Every surface the shell frames is checked instead, by path, so a new one has to be added to
+    // the list and a returning `h-screen` is caught wherever it lands. Surfaces OUTSIDE the shell
+    // (`Dashboard`, `LoginPage`, `AdminPage`, `HelpPage`, the pre-shell `AuthLoading`) keep their
+    // own viewport heights and are correctly not listed — they are their own document.
+    const offending = IN_SHELL_SURFACES.flatMap((file) =>
+      readFileSync(`src/${file}`, 'utf8')
+        .split('\n')
+        .flatMap((line, i) => {
+          // Prose about the height model is the whole point of several of these files, so only
+          // code lines count — a comment saying "not `min-h-screen`" must not fail its own guard.
+          const code = line.trimStart()
+          if (code.startsWith('//') || code.startsWith('*') || code.startsWith('/*')) return []
+          return /\b(?:min-h-screen|h-screen)\b/.test(line) ? [`${file}:${i + 1}`] : []
+        }),
+    )
+    expect(offending).toEqual([])
   })
 })
 

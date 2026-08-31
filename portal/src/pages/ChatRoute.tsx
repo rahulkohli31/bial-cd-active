@@ -174,8 +174,13 @@ export default function ChatRoute() {
   if (resolution.status === 'gone') return <Navigate to="/projects" replace />
 
   if (resolution.status === 'loading') {
+    // `flex-1 min-h-0`, NOT `min-h-screen`. This arm renders inside the workspace shell's outlet
+    // column, which is 100vh minus the navbar and `overflow-hidden`; a child asserting a full
+    // viewport height cannot shrink into it, so it overflows and the spinner is clipped low by the
+    // navbar's height on every cold chat open. The shell owns the one height model now — surfaces
+    // fill the column they are given.
     return (
-      <div className="min-h-screen flex items-center justify-center bg-bial-bg">
+      <div className="flex-1 min-h-0 flex items-center justify-center bg-bial-bg">
         <div className="flex gap-1.5" role="status" aria-label="Loading chat">
           {[0, 1, 2].map((i) => (
             <div
