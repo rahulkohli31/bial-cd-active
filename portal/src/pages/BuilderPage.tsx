@@ -18,6 +18,7 @@ import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
 import { listProjectConversations } from '../utils/conversationApi'
 import type { ConversationHeader } from '../utils/conversationApi'
 import { ApiError } from '../utils/apiError'
+import { markAppVisible } from '../utils/observe'
 import { describeSaveFailure, describeModeSwitchFailure, isConversationGone } from '../utils/chatErrors'
 import { readDraft, writeDraft, clearDraft } from '../utils/composerDraft'
 import { notifyUsageChanged } from '../utils/usage'
@@ -1803,6 +1804,13 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     },
     [projectId, framedPreviewUrl],
   )
+  // R104's stop-clock, handed to the pane below. The pane knows WHEN a citizen is looking at
+  // their app; only this page knows WHICH project it is. `markAppVisible` is idempotent per
+  // project and silently does nothing when no clock was started — a project with nothing built,
+  // or a deep link straight into a chat, which never opened the project page that starts it.
+  const handlePreviewRevealed = useCallback(() => {
+    markAppVisible(projectId ?? null)
+  }, [projectId])
   const framedStatus = turnBuildStatus ?? (relaunchedUrl ? 'ready' : (previewStatus ?? (newestOutcome ? 'ended' : null)))
   // The build bubble's two sources, resolved ONCE — the turn wins when it has something to say.
   // Naming them here is what lets the wrapper ask `hasBuildNarrative` the same question
@@ -2579,6 +2587,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
               (generatingChatId === buildId || builds.some((b) => b.id === generatingChatId))
             }
             onFrameMessage={handleFrameMessage}
+            /* R104's stop-clock. THIS MOUNT IS LOAD-BEARING: it is the only production mount of
+               LivePreview in the tree, so the prop is dead without it and
+               `project_to_app_visible_ms` never fires. Whoever re-hosts this pane carries the
+               prop forward rather than re-deriving it. */
+            onRevealed={handlePreviewRevealed}
           />
         </div>
       </div>

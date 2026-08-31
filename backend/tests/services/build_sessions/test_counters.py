@@ -29,18 +29,14 @@ from src.services.build_sessions.counters import count
 
 
 @pytest.fixture(autouse=True)
-async def _empty_table() -> None:
+async def _empty_table(empty_harness_counts: None) -> None:
     """Clear the table in its OWN session, because `count` writes in one too.
 
     That is not a test smell, it is the feature: a count is a historical fact about something that
     HAPPENED and must not disappear because the surrounding transaction rolled back. The
     consequence is that these rows escape the test transaction, so each test has to start from a
-    known-empty table rather than relying on a rollback that cannot reach them."""
-    from src.db.base import async_session_factory
-
-    async with async_session_factory() as db:
-        await db.execute(sa.delete(HarnessCount))
-        await db.commit()
+    known-empty table rather than relying on a rollback that cannot reach them. The clearing
+    itself lives in `tests/conftest.py`, shared with the two suites that read these rows back."""
 
 
 APP = uuid.UUID("0198f2c0-3333-7000-8000-00000000c007")

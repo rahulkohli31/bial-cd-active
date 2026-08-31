@@ -16,6 +16,11 @@ function setup(props = {}) {
   return { ...view, iframe }
 }
 
+/** The device card that carries the reveal's opacity — the handle every reveal assertion uses. */
+function card(container) {
+  return container.querySelector('[data-testid="device-card"]')
+}
+
 // A message that passes BOTH halves of the C8 §3 guard: the sandbox origin AND the window of the
 // frame this pane actually rendered. Origin alone stopped being sufficient once every generated
 // app began sharing one hostname, so `source` is no longer optional decoration on these events.
@@ -542,11 +547,106 @@ describe('LivePreview — dev-server crash: reconnecting is distinct from buildi
 
 const FRAME_LOAD_CAP_MS = 20000 // mirrors LivePreview's own cap; the tests step over it deliberately
 
-describe('LivePreview — the frame is revealed on load, never on a timer (U5/R3)', () => {
-  function card(container) {
-    return container.querySelector('[data-testid="device-card"]')
-  }
+describe('LivePreview — R104\u2019s stop-clock: `onRevealed` (U4)', () => {
+  it('\u2605 fires when the citizen is actually LOOKING at the app, and not a moment before', () => {
+    // The mark has to mean "the app is on screen". A `load` alone does not: it fires for a 500,
+    // and it fires under a raised cover. Only `revealed` \u2014 frame loaded AND cover down \u2014 is the
+    // honest instant, which is exactly why the effect hangs off that value and nothing else.
+    const onRevealed = vi.fn()
+    const { container } = render(
+      <LivePreview previewUrl={SANDBOX_URL} status="ready" onRevealed={onRevealed} />,
+    )
 
+    expect(onRevealed).not.toHaveBeenCalled()
+    fireEvent.load(container.querySelector('iframe'))
+
+    expect(card(container).className).toMatch(/opacity-100/)
+    expect(onRevealed).toHaveBeenCalledTimes(1)
+  })
+
+  it('\u2605 does NOT fire while the cover is up over a broken app', () => {
+    // A failed compile keeps the cover down over an error screen. The document loaded; the
+    // citizen is looking at a cover, not at their app. Mutation check: hang the effect off
+    // `frameLoaded` instead of `revealed` and this goes red.
+    const onRevealed = vi.fn()
+    const { container, rerender } = render(
+      <LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="failed" onRevealed={onRevealed} />,
+    )
+    fireEvent.load(container.querySelector('iframe'))
+
+    expect(card(container).className).toMatch(/opacity-0/)
+    expect(onRevealed).not.toHaveBeenCalled()
+
+    // \u2026and it fires the moment the app actually comes up clean.
+    rerender(
+      <LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="clean" onRevealed={onRevealed} />,
+    )
+    expect(onRevealed).toHaveBeenCalledTimes(1)
+  })
+
+  it('\u2605 fires ONCE for one document, even when the reveal is retracted and re-earned', () => {
+    // The reveal is not monotonic: a verdict that flips to failed RETRACTS it (R4), and a later
+    // clean verdict earns it back on the SAME document. That is one first-view, not two \u2014 and it
+    // is the only path that re-enters this effect with the same frame key, so it is the one that
+    // pins the guard. Mutation check: drop the per-frame-key guard and this goes red.
+    const onRevealed = vi.fn()
+    const { container, rerender } = render(
+      <LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="clean" onRevealed={onRevealed} />,
+    )
+    fireEvent.load(container.querySelector('iframe'))
+    expect(onRevealed).toHaveBeenCalledTimes(1)
+
+    rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="failed" onRevealed={onRevealed} />)
+    expect(card(container).className).toMatch(/opacity-0/) // retracted
+    rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" compileState="clean" onRevealed={onRevealed} />)
+    expect(card(container).className).toMatch(/opacity-100/) // and back
+
+    expect(onRevealed).toHaveBeenCalledTimes(1)
+  })
+
+  it('\u2605 does NOT fire when the workspace-lost cover is up over the frame', () => {
+    // `revealed` is NOT "the cover is down". `showCover` is `covered || workspaceLost` while
+    // `revealed` reads only `covered`, so a confirmed reversion leaves the frame at full opacity
+    // UNDERNEATH a cover that says the app stopped running. Firing here reports a first view of
+    // an app the citizen cannot see \u2014 and reports it as FAST, since the frame loaded fine.
+    //
+    // Mutation check: drop `workspaceLost` from the effect's guard and this goes red.
+    const onRevealed = vi.fn()
+    const { container } = render(
+      <LivePreview previewUrl={SANDBOX_URL} status="ready" workspaceLost onRevealed={onRevealed} />,
+    )
+    fireEvent.load(container.querySelector('iframe'))
+
+    expect(container.textContent).toMatch(/stopped running/i) // the cover really is up
+    expect(onRevealed).not.toHaveBeenCalled()
+  })
+
+  it('\u2605 a callback that throws does not take the preview pane down with it', () => {
+    // There is no ErrorBoundary anywhere in this portal, so an unguarded throw out of this effect
+    // white-screens the builder \u2014 a measurement failing the thing it measures, which is the one
+    // outcome this surface exists to avoid.
+    const { container } = render(
+      <LivePreview
+        previewUrl={SANDBOX_URL}
+        status="ready"
+        onRevealed={() => {
+          throw new Error('the beacon module blew up')
+        }}
+      />,
+    )
+
+    expect(() => fireEvent.load(container.querySelector('iframe'))).not.toThrow()
+    expect(card(container).className).toMatch(/opacity-100/) // and the app is still shown
+  })
+
+  it('is optional \u2014 a caller that does not measure anything still reveals normally', () => {
+    const { container } = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" />)
+    fireEvent.load(container.querySelector('iframe'))
+    expect(card(container).className).toMatch(/opacity-100/)
+  })
+})
+
+describe('LivePreview — the frame is revealed on load, never on a timer (U5/R3)', () => {
   it('keeps the labelled wait up when previewUrl arrives, and swaps it for the frame on load', () => {
     const { container } = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" />)
     const iframe = container.querySelector('iframe')

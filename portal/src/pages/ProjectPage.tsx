@@ -15,8 +15,11 @@
  *     comes only from a per-session C3 build (`BuilderPage`). A passive stored-app view is
  *     genuinely unavailable until Track DEPLOY provides a live app URL.
  *   - the project's conversations list below the builder as a plain recents list
- *     (no BUILD/PLAN badges, no new-chat buttons). Build and chat happen inline here,
- *     so there is no separate "continue building" reroute and no app lifecycle badge.
+ *     (no new-chat buttons). Build and chat happen inline here, so there is no separate
+ *     "continue building" reroute and no app lifecycle badge. Each row DOES say which kind
+ *     of chat it is, in words (R16) — the two icons alone left a non-technical reader
+ *     inferring the difference from a wrench. The word comes from `utils/chatKind.ts`, the
+ *     single frontend source of what a kind is called; this page states none of its own.
  *
  * Identity model (memory: app identity + flat URL model):
  *   - `appId`/`appStatus` are READ off the project (a LEFT JOIN on the backend); the
@@ -28,8 +31,9 @@
  */
 import { useCallback, useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { ArrowLeft, Pencil, Check, X, MessageSquare, Wrench, MoreVertical } from 'lucide-react'
+import { ArrowLeft, Pencil, Check, X, MoreVertical } from 'lucide-react'
 import Navbar from '../components/layout/Navbar'
+import { Badge } from '../components/ui/badge'
 import ProjectBuilder from '../components/projects/ProjectBuilder'
 import ProjectDescriptionEditor from '../components/projects/ProjectDescriptionEditor'
 import DeployControl from '../components/DeployControl'
@@ -39,6 +43,8 @@ import type { Project } from '../utils/projectApi'
 import { ApiError, isRecord } from '../utils/apiError'
 import { listProjectConversations, deleteConversation } from '../utils/conversationApi'
 import { relativeTime } from '../utils/chatHistory'
+import { chatKindFor } from '../utils/chatKind'
+import { markProjectOpened } from '../utils/observe'
 
 /** The chat-row shape the home renders; narrowed at the JS-module boundary. */
 interface ChatSummary {
@@ -95,6 +101,12 @@ export default function ProjectPage() {
         if (!active) return
         setProject(loaded)
         setLoadError(null)
+        // R105's denominator, and the R104 clock's start. Marked HERE rather than on the raw
+        // mount because `hasApp` is only knowable once the project has loaded — a project with
+        // nothing built has no app to first-see, and starting a clock for it would make this
+        // number and the sandbox-first number answer different questions. `markProjectOpened`
+        // is idempotent per project id per page load, which is also the StrictMode guard.
+        markProjectOpened(loaded.id, { hasApp: loaded.appId !== null })
       } catch (err) {
         if (!active) return
         if (err instanceof ApiError && err.status === 404) {
@@ -295,7 +307,9 @@ export default function ProjectPage() {
               ) : (
                 <div className="space-y-2">
                   {chats.map((chat) => {
-                    const isBuild = chat.kind === 'builder'
+                    // One lookup, not a two-way test on a three-valued field: an `assistant`
+                    // row used to draw the Plan icon, which a word cannot get away with.
+                    const kind = chatKindFor(chat.kind)
                     const menuOpen = menuOpenId === chat.id
                     return (
                       // F-10: the row is a plain container. The title is a real <button> whose
@@ -307,15 +321,9 @@ export default function ProjectPage() {
                         className="group relative flex items-center gap-3 bg-white border border-bial-border rounded-xl px-4 py-3 hover:border-primary/40 hover:shadow-sm transition"
                       >
                         <div
-                          className={`w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0 ${
-                            isBuild ? 'bg-secondary/10' : 'bg-primary/10'
-                          }`}
+                          className={`w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0 ${kind.tint}`}
                         >
-                          {isBuild ? (
-                            <Wrench size={15} className="text-secondary" />
-                          ) : (
-                            <MessageSquare size={15} className="text-primary" />
-                          )}
+                          <kind.Icon size={15} className={kind.iconTint} />
                         </div>
                         <h3 className="min-w-0 flex-1">
                           <button
@@ -326,6 +334,16 @@ export default function ProjectPage() {
                             <span className="block truncate">{chat.title || 'Untitled'}</span>
                           </button>
                         </h3>
+                        {/* F-10 again: a SIBLING of the title button, never a descendant —
+                            the same layering rule the ⋮ menu below follows. */}
+                        <Badge variant="outline" className="flex-shrink-0 border-bial-border bg-white">
+                          {/* The word is shown; the completion is read but not seen, so the
+                              screen says "Build" and the element's text says "Build chat". An
+                              `aria-label` on a role-less span is not reliably exposed — it would
+                              satisfy a test and help nobody — so the name is built from text. */}
+                          {kind.word}
+                          {kind.completion && <span className="sr-only">{kind.completion}</span>}
+                        </Badge>
                         <span className="text-[11px] text-neutral flex-shrink-0 tabular-nums">
                           {relativeTime(chat.updatedAt)}
                         </span>

@@ -4,6 +4,42 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.20] - 2026-08-31
+
+### Added
+
+- Every conversation on a project page now says which kind it is, in words. The list drew
+  two different icons and never named either, so telling a Plan chat from a Build chat
+  meant knowing what a wrench stands for. Rows now read "Build", "Plan" or "Chat", and a
+  screen reader hears the whole phrase rather than a bare noun.
+- The platform started measuring four things about the citizen's journey that nobody could
+  previously observe: how long a cold start actually takes, how many starts reach a running
+  app, how long it takes to first see your app after opening a project, and how often a
+  project is opened without any chat being opened. Until now every claim about any of these
+  was unfalsifiable. An administrator reads them through the counters endpoint that already
+  existed; no new screen was added, and no number reaches a citizen's screen.
+- A single narrow endpoint for the two of those measurements only a browser can see. It
+  accepts three named observations and nothing else, refuses a value outside the range an
+  honest one can occupy rather than quietly trimming it to fit, and stores no record of who
+  sent it.
+
+### Changed
+
+- The chat list no longer decides what a row is by testing for one value. There are three
+  kinds of conversation and the old test knew about one, so an assistant chat was labelled
+  as a plan. Every kind now comes from one table, and a kind nobody has invented yet gets an
+  honest word instead of the wrong one.
+
+### Fixed
+
+- A conversation whose kind collided with a built-in JavaScript property name would crash
+  its row instead of rendering. Reachable from ordinary API data, not just from mischief.
+- The preview pane reported that a citizen was looking at their app at moments when a cover
+  was over it saying the app had stopped running.
+- A measurement failing can no longer slow down or break the thing it is measuring: the
+  counter writes moved out from under the lock that a citizen's next build waits on, and a
+  measurement that throws is contained instead of taking the builder's screen down with it.
+
 ## [1.6.19] - 2026-08-29
 
 ### Added

@@ -36,6 +36,7 @@ import ChatPage from './ChatPage'
 import BuilderPage from './BuilderPage'
 import { getConversation } from '../utils/conversationApi'
 import { getProject } from '../utils/projectApi'
+import { markChatOpened } from '../utils/observe'
 import type { Project } from '../utils/projectApi'
 
 export type ChatKind = 'planning' | 'builder'
@@ -94,6 +95,15 @@ export default function ChatRoute() {
     setResolution((prev) => (prev.status === 'ready' ? prev : { status: 'loading' }))
 
     const ready = (kind: ChatKind, projectId: string | null): void => {
+      // R105's numerator, marked at THE one seam every arm passes through — freshly-minted,
+      // server-resolved, query fallback and load failure alike — rather than on the three
+      // handlers that navigate here. Those live in two components that other work is mid-rewrite
+      // of, and three chances to drop one is three too many for a counter whose whole purpose is
+      // a before/after comparison across those same rewrites. This seam also knows the
+      // SERVER-AUTHORITATIVE project id, and it fires exactly once per chat open, deep links
+      // included — which is precisely the case `markChatOpened` refuses, because a project this
+      // load never opened has no denominator to be the numerator of.
+      markChatOpened(projectId)
       setResolution({ status: 'ready', chatId, kind, projectId })
     }
 

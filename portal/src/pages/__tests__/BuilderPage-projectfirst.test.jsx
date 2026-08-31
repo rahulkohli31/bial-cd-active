@@ -30,6 +30,7 @@ const h = vi.hoisted(() => ({
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
   switchMode: vi.fn(), resolvePlanOptions: vi.fn(),
   previewProps: [],
+  authFetch: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
 }))
 
@@ -38,6 +39,9 @@ vi.mock('../../utils/builderHistory', () => ({
   getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
+// The REAL observe module runs for the reveal test below \u2014 only the transport is replaced, so the
+// assertion is about the beacon that actually goes out, not about a mock being called.
+vi.mock('../../utils/api', async (orig) => ({ ...(await orig()), authFetch: h.authFetch }))
 vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 // Capture EVERY prop the preview is handed — the isolation assertion is about what it is fed.
@@ -80,6 +84,7 @@ async function confirmBrief() {
 beforeEach(() => {
   vi.clearAllMocks()
   h.previewProps.length = 0
+  h.authFetch.mockResolvedValue({ ok: true })
   Element.prototype.scrollIntoView = vi.fn()
   primeClient(h)
   h.newBuild.mockReturnValue('build-N')
@@ -223,6 +228,47 @@ describe('BuilderPage — the preview is fed NO app credentials (C9 server-side,
       expect(props.accessToken).toBeUndefined()
       expect(props.previewCode).toBeUndefined()
     }
+  })
+})
+
+describe('BuilderPage — the preview is handed R104\u2019s stop-clock (U4)', () => {
+  it('\u2605 passes LivePreview a reveal callback \u2014 without it the first-view measurement is dead', async () => {
+    // THIS MOUNT IS THE ONLY PRODUCTION MOUNT OF LivePreview IN THE TREE, so a callback added to
+    // the component and never passed here is a counter that never fires and a test suite that
+    // never notices. Asserted against the RECORDED PROPS rather than by reading the file, and
+    // this suite already stubs the pane to record them.
+    //
+    // Deliberately not asserting what the callback DOES: that decision lives in `observe.ts` and
+    // is pinned there. What can only be checked here is that the wire exists.
+    renderHandoff()
+    await screen.findByPlaceholderText(/describe what you need/i)
+
+    expect(h.previewProps.length).toBeGreaterThan(0)
+    for (const props of h.previewProps) {
+      expect(typeof props.onRevealed).toBe('function')
+    }
+  })
+
+  it('\u2605 and the callback it passes marks THIS project\u2019s app as seen', async () => {
+    // Asserting the prop is a function only proves a wire exists; it does not prove the wire is
+    // connected to anything, and \u2018connected to the wrong project id\u2019 is a silent corruption of
+    // the only R104 number there is. So: open the project for real through the observe module,
+    // then INVOKE the callback the mount actually handed the pane.
+    const { markProjectOpened } = await import('../../utils/observe')
+    markProjectOpened('p1', { hasApp: true })
+    h.authFetch.mockClear()
+
+    renderHandoff()
+    await screen.findByPlaceholderText(/describe what you need/i)
+    const { onRevealed } = h.previewProps[h.previewProps.length - 1]
+    onRevealed()
+
+    const sent = h.authFetch.mock.calls
+      .filter(([url]) => url === '/api/observations')
+      .map(([, opts]) => JSON.parse(String(opts.body)))
+    expect(sent).toHaveLength(1)
+    expect(sent[0].name).toBe('project_to_app_visible_ms')
+    expect(sent[0].value).toBeGreaterThanOrEqual(0)
   })
 })
 

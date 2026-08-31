@@ -162,3 +162,30 @@ def fake_storage():
     _storage_accessor._backend_singleton = store
     yield store
     _storage_accessor._backend_singleton = None
+
+
+async def forget_every_harness_count() -> None:
+    """Empty `harness_counts` in its OWN session, because `count(...)` writes in one too.
+
+    That is not a test smell, it is the feature under test: a count is a historical fact about
+    something that HAPPENED and must not disappear because the surrounding transaction rolled
+    back. The consequence is that these rows escape the per-test transaction entirely, so a test
+    that reads them has to start from a known-empty table rather than from a rollback that cannot
+    reach them.
+    """
+    from sqlalchemy import delete
+
+    from src.db.base import async_session_factory
+    from src.db.models.harness_counter import HarnessCount
+
+    async with async_session_factory() as db:
+        await db.execute(delete(HarnessCount))
+        await db.commit()
+
+
+@pytest.fixture
+async def empty_harness_counts():
+    """An empty `harness_counts`, before and after. See `forget_every_harness_count`."""
+    await forget_every_harness_count()
+    yield
+    await forget_every_harness_count()

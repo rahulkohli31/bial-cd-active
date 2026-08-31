@@ -22,19 +22,14 @@ from src.api.deps import CurrentUser, DbSession
 from src.api.v1.feedback.schemas import FeedbackRequest
 from src.core.errors import AppApiError
 from src.db.models.feedback import Feedback
-from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses
+from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses, raw_body_doc
 from src.services.ratelimit import rate_limit
 
 router = APIRouter(prefix="/feedback", tags=["feedback"])
 
 # The raw-parse route takes a JSON body FastAPI never sees (no Pydantic param), so its
 # request shape is documented explicitly from the model — without enabling the 422 path.
-_REQUEST_BODY_DOC: dict[str, Any] = {
-    "requestBody": {
-        "required": True,
-        "content": {"application/json": {"schema": FeedbackRequest.model_json_schema()}},
-    }
-}
+_REQUEST_BODY_DOC = raw_body_doc(FeedbackRequest)
 
 # Message byte cap (UTF-8, on the trimmed value) — Express `MAX_FEEDBACK_CHARS`.
 MAX_FEEDBACK_BYTES = 4000

@@ -82,6 +82,41 @@ class HarnessCounter(enum.StrEnum):
     #: the sequence. So one hand-rolled sequence scores one, exactly as one composite call does,
     #: and the two numbers can be read against each other without a correction factor.
     SCHEMA_CHANGE_BY_HAND = "schema_change_by_hand"
+    #: ── The citizen-journey counters (R102–R106) ────────────────────────────────────────────
+    #: Added as NAMES ONLY, no migration, each introduced by the unit that EMITS it. Three names
+    #: already in this vocabulary have no production writer anywhere in the tree, which is
+    #: decoration; the rule these follow is that a counter name ships in the same change as its
+    #: writer or it does not ship.
+    #:
+    #: One per press of the explicit start control, at entry, REFUSALS INCLUDED — the one-slot
+    #: conflict and the reclaim refusal are presses that could have started something and did
+    #: not, and excluding them would make the ratio below read flatteringly high. Carries no
+    #: `app_id`: at entry no app is resolved yet, and a complete denominator is worth more than
+    #: attribution on a row that only ever means "someone pressed" (R103's denominator).
+    APP_START_ATTEMPTED = "app_start_attempted"
+    #: One per start that reached a SERVING page. Never written for the attach arm's fail-open
+    #: `ready=False` outcome — that is a framable URL, not a running app, and counting it would
+    #: make R103 measure nothing. R103's numerator; the ratio of the two is R103.
+    APP_START_REACHED_RUNNING = "app_start_reached_running"
+    #: Milliseconds from the platform DECIDING to restore to the app answering — the restore arm
+    #: only (R102). The attach arm writes no duration at all: a 15-second attach budget and a
+    #: 120-second cold budget averaged together produce a number that describes neither.
+    #: SCOPE, because a later reader will want to quote it: this is the explicit start CONTROL's
+    #: number. A first build provisions through a different path and is not in it.
+    APP_COLD_START_MS = "app_cold_start_ms"
+    #: ── The browser-observed half of the same four questions (R104, R105) ───────────────────
+    #: Written only through `POST /v1/observations`, whose server-side allowlist is these three
+    #: names and nothing else — a browser cannot invent a counter.
+    #: Milliseconds from opening a project to the citizen actually LOOKING at their own app
+    #: (R104). Browser-measured, so bounded by a server-side ceiling rather than trusted; the
+    #: user-facing "roughly how long" estimate is sourced from `app_cold_start_ms`, never here.
+    PROJECT_TO_APP_VISIBLE_MS = "project_to_app_visible_ms"
+    #: One per project-page visit, and one per visit in which a chat was then opened.
+    #: `1 - (project_opened_chat / project_opened)` is R105 — counted from the positive and
+    #: subtracted, because "a visit where no chat was opened" means waiting for a visit to END,
+    #: which no browser reports reliably.
+    PROJECT_OPENED = "project_opened"
+    PROJECT_OPENED_CHAT = "project_opened_chat"
 
 
 class HarnessCount(Base, UUIDv7PrimaryKeyMixin, TimestampMixin):

@@ -20,6 +20,7 @@ from src.api.v1.deploy.router import router as deploy_router
 from src.api.v1.feedback.router import router as feedback_router
 from src.api.v1.health.router import router as health_router
 from src.api.v1.marketplace.router import router as marketplace_router
+from src.api.v1.observations.router import router as observations_router
 from src.api.v1.projects.router import router as projects_router
 from src.api.v1.usage.router import router as usage_router
 from src.schemas import AUTH_403_SUSPENDED, DetailBody, error_responses
@@ -39,6 +40,7 @@ v1_router.include_router(health_router)
 v1_router.include_router(auth_router)
 v1_router.include_router(usage_router)
 v1_router.include_router(feedback_router)
+v1_router.include_router(observations_router)
 v1_router.include_router(projects_router)
 v1_router.include_router(marketplace_router)
 v1_router.include_router(deploy_router)
