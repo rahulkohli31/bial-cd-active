@@ -56,6 +56,7 @@ vi.mock('../../utils/conversationApi', () => ({
 
 import ChatPage from '../ChatPage'
 import { ApiError } from '../../utils/apiError'
+import { readDraft } from '../../utils/composerDraft'
 
 // Flat chat URL, as ChatRoute renders it. A brand-new chat carries its project in a
 // transient query; the props are what ChatRoute would inject.
@@ -130,6 +131,15 @@ describe('ChatPage — send-path guards (U10)', () => {
     expect(creates()).toHaveLength(1)
     // The stream was never started — no orphan turn reaches the server.
     expect(h.sendMessage).not.toHaveBeenCalled()
+
+    // …AND THE MESSAGE COMES BACK. The toast says "try again", but `doSend` had already cleared
+    // both the composer and the persisted draft on the click, so without the restore the user is
+    // asked to retry a message that no longer exists anywhere — and a reload could not recover it
+    // either. Both halves are asserted: the composer for the retry that is offered now, the store
+    // for the reload that might come instead. The upload-failure arm in the same function has
+    // restored both since it shipped; this arm is the other await and needed the same treatment.
+    await waitFor(() => expect(textarea.value).toBe('hello'))
+    expect(readDraft('chat-1')).toBe('hello')
   })
 
   it('a conversation switch mid-stream does not write the assistant turn onto the previous conversation', async () => {

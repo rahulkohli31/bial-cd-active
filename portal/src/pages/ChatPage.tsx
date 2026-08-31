@@ -426,7 +426,22 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
         setGenerating(false)
         setStreamingChatId(null)
         showAttachToast(describeSaveFailure(err))
-        if (isConversationGone(err)) navigate('/projects', { replace: true })
+        if (isConversationGone(err)) {
+          navigate('/projects', { replace: true })
+          return
+        }
+        // The row never got written, so the toast says "try again" — but `doSend` cleared the
+        // composer AND the persisted draft before calling us, so without this the user is asked to
+        // retry a message that no longer exists anywhere, and a reload cannot bring it back either.
+        // Exactly the loss the upload-failure arm above restores from; this arm is the other await
+        // in the same function and needs the same treatment, including the same
+        // still-on-screen guard, since `createConversation` is awaited and a chat switch is
+        // ordinary. Not restored when the conversation is GONE: we navigate away, and there is no
+        // composer left to restore into.
+        if (activeChatIdRef.current !== currentChatId) return
+        runtime.thread.composer.setText(rawText)
+        writeDraft(currentChatId, rawText)
+        restorePending(attachments)
         return
       }
     }
