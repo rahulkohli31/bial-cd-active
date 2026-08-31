@@ -12,8 +12,12 @@
  *     the live preview now comes only from a per-session C3 build in the builder;
  *   - the removed doors stay gone: no "Continue building" reroute, no "Open app" link;
  *   - the description sits in a right rail with Save + Generate and NO attach control (R3);
- *   - conversations are a plain recents list (icon · title · date · ⋮), no BUILD/PLAN badges,
- *     no new-chat buttons; the ⋮ menu opens + deletes optimistically;
+ *   - conversations are a plain recents list (icon · title · KIND BADGE · date · ⋮) with no
+ *     new-chat buttons; the ⋮ menu opens + deletes optimistically. The badge's ABSENCE used to
+ *     be pinned here as an invariant; R16 inverted that decision deliberately — a reader should
+ *     not have to infer "Build" from a wrench — so the assertion was flipped and this sentence
+ *     rewritten rather than the test quietly deleted. The liveness assertions beside it stay,
+ *     because a negative assertion also passes on a render that threw;
  *   - a 404 (deleted elsewhere) bounces to /projects, and rename is blocked before any request.
  *
  * projectApi + conversationApi + builderHistory are mocked at the module boundary; the REAL
@@ -195,8 +199,16 @@ describe('ProjectPage — the description rail (R3, U7 pop-up editor)', () => {
   })
 })
 
+/** The row container a chat title sits in — the kind badge is its SIBLING (F-10), so this is
+ *  what makes "the right badge on the right row" assertable instead of merely "a badge exists". */
+function rowFor(title: string): HTMLElement {
+  const row = screen.getByRole('button', { name: title }).closest('div.group')
+  expect(row, `no conversation row for "${title}"`).toBeTruthy()
+  return row as HTMLElement
+}
+
 describe('ProjectPage — conversations as a plain recents list (U3)', () => {
-  it('renders icon · title · relative date · ⋮ with no BUILD/PLAN badges and no new-chat buttons', async () => {
+  it('renders icon · title · kind badge · relative date · ⋮ with no new-chat buttons', async () => {
     h.getProject.mockResolvedValue(makeProject())
     h.listProjectConversations.mockResolvedValue([
       { id: 'c1', kind: 'planning', projectId: 'p1', title: 'Scope the fields', updatedAt: '2026-07-10T00:00:00Z' },
@@ -207,12 +219,62 @@ describe('ProjectPage — conversations as a plain recents list (U3)', () => {
     expect(await screen.findByText('Scope the fields')).toBeTruthy()
     expect(h.listProjectConversations).toHaveBeenCalledWith('p1')
     const list = screen.getByTestId('conversations')
+    // Liveness first: the rest of the row is still there, so nothing below can pass on a
+    // half-rendered list.
     expect(within(list).getAllByText('1h ago').length).toBe(2)
-    // No BUILD/PLAN badge chips in the list, and no New-chat buttons anywhere.
-    expect(within(list).queryByText('Build')).toBeNull()
-    expect(within(list).queryByText('Plan')).toBeNull()
+    expect(within(list).getByRole('button', { name: /actions for build the screen/i })).toBeTruthy()
+    // R16 — each row SAYS which kind it is, on the row that is that kind.
+    expect(within(rowFor('Build the screen')).getByText('Build')).toBeTruthy()
+    expect(within(rowFor('Scope the fields')).getByText('Plan')).toBeTruthy()
+    // …and still no New-chat buttons anywhere: the other half of the old assertion.
     expect(screen.queryByRole('button', { name: /new build chat/i })).toBeNull()
     expect(screen.queryByRole('button', { name: /new plan chat/i })).toBeNull()
+  })
+
+  it('the badge reads as the full phrase, not a bare noun', async () => {
+    // The visible word is half of it: the badge's COMPLETE text is what a screen reader says,
+    // and "Build" alone is not a sentence about anything. A badge with no visually-hidden
+    // completion is the mutant this catches.
+    h.getProject.mockResolvedValue(makeProject())
+    h.listProjectConversations.mockResolvedValue([
+      { id: 'c1', kind: 'planning', projectId: 'p1', title: 'Scope the fields', updatedAt: '2026-07-10T00:00:00Z' },
+      { id: 'c2', kind: 'builder', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
+    ])
+    renderProjectPage()
+
+    await screen.findByText('Scope the fields')
+    expect(within(rowFor('Build the screen')).getByText('Build').textContent).toBe('Build chat')
+    expect(within(rowFor('Scope the fields')).getByText('Plan').textContent).toBe('Plan chat')
+  })
+
+  it('an "assistant" chat gets the fallback word, not the Plan word', async () => {
+    // ASM5, the live defect the badge exposes. `ConversationKind` has THREE values and the old
+    // `kind === 'builder'` test put `assistant` in the Plan arm — invisible behind an icon,
+    // a lie behind a word.
+    h.getProject.mockResolvedValue(makeProject())
+    h.listProjectConversations.mockResolvedValue([
+      { id: 'c3', kind: 'assistant', projectId: 'p1', title: 'Ask about gates', updatedAt: '2026-07-11T00:00:00Z' },
+    ])
+    renderProjectPage()
+
+    await screen.findByText('Ask about gates')
+    const row = rowFor('Ask about gates')
+    expect(within(row).getByText('Chat')).toBeTruthy()
+    expect(within(row).queryByText('Plan')).toBeNull()
+    expect(within(row).queryByText('Build')).toBeNull()
+  })
+
+  it('a malformed row (kind coerced to "") still renders, with the fallback word', async () => {
+    // `narrowChat` legitimately produces `kind: ''` for a row the API sent malformed. The
+    // lookup must answer it rather than throw or invent a kind.
+    h.getProject.mockResolvedValue(makeProject())
+    h.listProjectConversations.mockResolvedValue([
+      { id: 'c4', kind: 42, projectId: 'p1', title: 'Malformed row', updatedAt: '2026-07-11T00:00:00Z' },
+    ])
+    renderProjectPage()
+
+    await screen.findByText('Malformed row')
+    expect(within(rowFor('Malformed row')).getByText('Chat')).toBeTruthy()
   })
 
   it('clicking a row title navigates to /chat/{id}', async () => {
