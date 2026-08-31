@@ -38,7 +38,7 @@ from pydantic_ai.messages import ModelResponse, TextPart
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus
-from src.db.models.conversation import Conversation, ConversationMode
+from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.services.messages.store import (
     SeqContentionError,
@@ -181,7 +181,7 @@ async def write_build_started(
             conversation_id=conversation_id,
             messages=[],
             entry_kind=MessageEntryKind.SYSTEM_EVENT,
-            mode=ConversationMode.WRITE,
+            kind=ChatKind.BUILD,
             visibility=MessageVisibility.HIDDEN,
             meta={
                 "kind": "build_started",
@@ -250,7 +250,7 @@ async def write_build_outcome(
             conversation_id=conversation_id,
             messages=[payload],
             entry_kind=MessageEntryKind.SYSTEM_EVENT,
-            mode=ConversationMode.WRITE,
+            kind=ChatKind.BUILD,
             meta=meta,
         )
     except SeqContentionError:

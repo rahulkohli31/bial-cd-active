@@ -21,7 +21,7 @@ from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from src.db.models.conversation import ConversationMode
+from src.db.models.conversation import ChatKind
 from src.services.agent.read_tools import (
     LIST_MAX_ENTRIES,
     SEARCH_MAX_HITS,
@@ -29,7 +29,7 @@ from src.services.agent.read_tools import (
     ReadOnlyWorkspace,
     WorkspacePathError,
 )
-from src.services.agent.toolsets import ReadDeps, toolsets_for_mode, workspace_from_read_deps
+from src.services.agent.toolsets import ReadDeps, toolsets_for_kind, workspace_from_read_deps
 from src.services.orchestrator.deps import SandboxSession
 from src.services.sandbox import ExecResult
 from tests.services.orchestrator.fake_sandbox import FAKE_SUPERVISOR_TOKEN, FakeSandbox
@@ -270,7 +270,7 @@ async def _tool_feed(workspace: LiveSandboxWorkspace, tool: str, args: dict[str,
         "have a look",
         deps=ReadDeps(workspace=workspace, user_id=uuid.uuid4()),
         model=FunctionModel(respond),
-        toolsets=toolsets_for_mode(ConversationMode.ASK, workspace_from_read_deps),
+        toolsets=toolsets_for_kind(ChatKind.PLAN, workspace_from_read_deps).toolsets,
     )
     return captured[1]
 

@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 import sqlalchemy as sa
+from pydantic import SecretStr
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -23,12 +24,16 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, DeltaToolCalls, FunctionModel
 
-from src.db.models.conversation import ConversationMode
-from src.db.models.message import Message, MessageEntryKind
+from src.config import settings
+from src.db.models.conversation import ChatKind
+from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.db.models.token_usage import TokenUsage
 from src.services.agent.mode_prompts import PromptContext
 from src.services.build_sessions.manager import SessionManager
+from src.services.messages.projection import PLAN_OPTIONS_TOOL
+from src.services.sandbox.config import SandboxConfig
 from src.services.turns import engine as engine_module
+from src.services.turns.copy import WRITING_UP_THE_PLAN_LABEL
 from src.services.turns.engine import (
     TurnEngine,
     _persistable_messages,
@@ -36,8 +41,40 @@ from src.services.turns.engine import (
 )
 from src.services.turns.guard import ConversationBusyError, _mid_reply
 from tests.factories import ConversationFactory, UserFactory
+from tests.fakes import FakeSandboxClient
 
 _CTX = PromptContext(user_name="Ada", project_name="Visitors", project_description=None)
+
+
+@pytest.fixture(autouse=True)
+def _sandbox_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Every kind pins the project's LIVE container now (R18) — Plan and Ask attach a sandbox
+    # exactly like Build does, so these engine-level tests need a configured deployment the
+    # same way `test_write_turn.py` already does, or every turn dies at the workspace pin
+    # before the model ever runs.
+    monkeypatch.setattr(
+        settings,
+        "sandbox",
+        SandboxConfig(
+            subscription_id="s",
+            resource_group="r",
+            region="westeurope",
+            managed_environment_name="aca-env",
+            acr_server="acr.azurecr.io",
+            acr_username="acr-user",
+            acr_password=SecretStr("acr-pass"),
+            image_ref="acr/img:latest",
+        ),
+    )
+
+
+@pytest.fixture(autouse=True)
+async def _sandbox_dependencies(fake_redis, fake_storage) -> None:
+    """The R10 liveness lease (Redis) and the sandbox attach's storage reads both need a
+    backing fake now that every turn attaches a live container. Pulled in as an autouse
+    wrapper around the shared `fake_redis`/`fake_storage` fixtures (`tests/conftest.py`)
+    rather than added to every test signature — same effect, none of the churn."""
+    return None
 
 
 @pytest.fixture(autouse=True)
@@ -59,9 +96,9 @@ def session_factory(db_session):
     return lambda: _session()
 
 
-async def _conversation(db_session, mode: ConversationMode = ConversationMode.ASK):
+async def _conversation(db_session, kind: ChatKind = ChatKind.PLAN):
     user = await UserFactory.create(db_session)
-    conv = await ConversationFactory.create(db_session, user.id, mode=mode)
+    conv = await ConversationFactory.create(db_session, user.id, kind=kind)
     return user, conv
 
 
@@ -73,10 +110,8 @@ def _streaming_text(*chunks: str):
     return FunctionModel(stream_function=_stream)
 
 
-async def _start(
-    engine: TurnEngine, db_session, session_factory, model, *, mode=ConversationMode.ASK
-):
-    user, conv = await _conversation(db_session, mode)
+async def _start(engine: TurnEngine, db_session, session_factory, model, *, kind=ChatKind.PLAN):
+    user, conv = await _conversation(db_session, kind)
     turn_id = await engine.start_turn(
         conversation=conv,
         user_id=user.id,
@@ -89,6 +124,7 @@ async def _start(
         session_factory=session_factory,
         persist_user_turn=_noop_persist,
         manager=SessionManager(),
+        sandbox_client=FakeSandboxClient(),
     )
     return user, conv, turn_id
 
@@ -120,12 +156,34 @@ async def test_text_turn_streams_deltas_then_terminal(
     # U17 — EVERY turn now opens with the harness's acknowledgement, emitted synchronously at
     # `start_turn` before the detached run exists. It is a transient feed row (never persisted,
     # never in `state.steps`), so it shows up here in the ring and nowhere durable.
-    assert [f.type for f in frames] == ["step", "text_delta", "text_delta", "turn_ended"]
+    #
+    # R18 — every kind now pins the project's LIVE container (Plan/Ask attach a sandbox
+    # exactly like Build), so the ack is followed by the workspace lifecycle pair
+    # (preparing/ready), a compile-state read and a preview-url announce, all BEFORE the
+    # model's own text — the same boilerplate a Build turn always carried.
+    assert [f.type for f in frames] == [
+        "step",
+        "workspace",
+        "workspace",
+        "compile",
+        "preview",
+        "text_delta",
+        "text_delta",
+        "turn_ended",
+    ]
     # A NONZERO cursor still inside the ring is the resume case the `?turn=&cursor=` route
     # leans on: the tail only, no gap, and nothing at or before the cursor re-delivered.
     tail, tail_gap = engine.frames_since(state, frames[0].seq)
     assert not tail_gap
-    assert [f.type for f in tail] == ["text_delta", "text_delta", "turn_ended"]
+    assert [f.type for f in tail] == [
+        "workspace",
+        "workspace",
+        "compile",
+        "preview",
+        "text_delta",
+        "text_delta",
+        "turn_ended",
+    ]
     assert all(frame.seq > frames[0].seq for frame in tail)
     # …and a cursor past the ring's newest frame yields nothing at all (settled, replayed).
     assert engine.frames_since(state, frames[-1].seq) == ([], False)
@@ -137,11 +195,27 @@ async def test_text_turn_streams_deltas_then_terminal(
             sa.select(Message).where(Message.conversation_id == conv.id).order_by(Message.seq)
         )
     ).all()
-    assert len(rows) == 1
-    assert rows[0].entry_kind is MessageEntryKind.TURN
+    # TWO ROWS, and the second is U20's durable terminal. The reply is the turn; the terminal
+    # is a hidden, payload-less record saying HOW it ended, so a transcript rebuilt without the
+    # live stream can tell a finished turn from a running one.
+    assert [row.entry_kind for row in rows] == [
+        MessageEntryKind.TURN,
+        MessageEntryKind.SYSTEM_EVENT,
+    ]
     assert rows[0].payload[0]["kind"] == "response"
-    # The composed mode instructions never reach the row (U9's dump-seam strip).
+    # The composed instructions never reach the row (U9's dump-seam strip).
     assert rows[0].payload[0].get("instructions") is None
+    assert rows[1].visibility is MessageVisibility.HIDDEN
+    # EMPTY PAYLOAD, checked here rather than only in the projection's tests: `load_history`
+    # flattens every row's payload including hidden ones, so a terminal row with a message in
+    # it would put a blank assistant turn into every later prompt of this conversation.
+    assert rows[1].payload == []
+    assert rows[1].meta == {
+        "kind": "turn_terminal",
+        "turnId": str(state.turn_id),
+        "status": "completed",
+        "reason": None,
+    }
 
 
 async def test_read_tool_calls_become_step_frames(
@@ -151,8 +225,9 @@ async def test_read_tool_calls_become_step_frames(
 
     async def _stream(messages: list[ModelMessage], info: AgentInfo):
         if len(messages) == 1:
-            # First request: call read_file (hidden read; EmptyProjectWorkspace answers
-            # the truthful no-app-yet result, state ok).
+            # First request: call read_file against the freshly-provisioned (empty) fake
+            # container — R18 gives even a brand-new project a real one, so this reads the
+            # golden template's page, not a synthetic "no app yet" placeholder.
             yield DeltaToolCalls(
                 {
                     0: DeltaToolCall(
@@ -189,7 +264,6 @@ async def test_read_tool_calls_become_step_frames(
     # reload read one translator, and a drift between them is the failure this pair catches.
     assert "app/page.tsx" not in steps[1].item.label
     assert steps[1].item.label == "Looking at your app's main page"
-    assert "No app exists yet" in (steps[1].item.detail.result or "")
     # A RESUME must not lose them: `hidden` is a render hint the client applies, not a payload
     # filter. Dropping hidden steps here meant a mid-turn reconnect saw fewer steps than a tab
     # that stayed connected, and fewer than the same turn shows on reload.
@@ -197,6 +271,111 @@ async def test_read_tool_calls_become_step_frames(
     assert all("app/page.tsx" not in item.label for item in snapshot.steps)
     assert [item.label for item in snapshot.steps] == ["Looking at your app's main page"]
     assert snapshot.steps[0].hidden is True
+
+
+async def test_the_offer_tools_part_start_event_emits_a_started_step_the_card_then_replaces(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    """U5 — the plan now rides the tool's own argument, so thousands of tokens can stream
+    between the block opening and the call resolving. The screen must not go dark for that
+    whole window: the provider's `content_block_start` puts the tool's NAME on the wire
+    before any argument does, which pydantic-ai surfaces as a `PartStartEvent` carrying a
+    `ToolCallPart` with an empty argument — and the engine turns that into a started status
+    step. `FunctionToolCallEvent` then REPLACES it with the card, on the SAME `tool_call_id`,
+    never both at once: a late subscriber's catch-up snapshot must show the card's row and
+    nothing left behind describing the status that preceded it.
+
+    Mutation-check: delete the `ToolCallPart` branch from `_on_event`'s `PartStartEvent` arm
+    and the started-step assertions below go red while the completed-run assertions (status,
+    card) stay green — proving this test exercises that branch specifically, not just the
+    happy path the other plan-options tests already cover."""
+    engine = _fresh_engine
+
+    async def _stream(messages: list[ModelMessage], info: AgentInfo):
+        # Split across two deltas: the name arrives with an EMPTY argument first — exactly
+        # the provider's content_block_start shape — and the argument completes after.
+        yield DeltaToolCalls(
+            {0: DeltaToolCall(name="present_plan_options", json_args="", tool_call_id="opt-1")}
+        )
+        yield DeltaToolCalls(
+            {
+                0: DeltaToolCall(
+                    json_args=json.dumps({"plan": "Ship the visitor log."}), tool_call_id="opt-1"
+                )
+            }
+        )
+
+    user, conv, _ = await _start(
+        engine, db_session, session_factory, FunctionModel(stream_function=_stream)
+    )
+    await _settle(engine, conv.id)
+
+    state = engine.peek(conv.id)
+    assert state is not None and state.status == "completed"
+    ring = list(state.ring)
+
+    step_frames = [f for f in ring if f.type == "step" and f.tool_call_id == "opt-1"]
+    plan_frames = [f for f in ring if f.type == "plan_options" and f.item.tool_call_id == "opt-1"]
+
+    # Exactly one started step, never a 'finished' counterpart — the offer DEFERS rather than
+    # resolving through the ordinary step lifecycle, so nothing ever closes it out that way.
+    assert [f.phase for f in step_frames] == ["started"]
+    assert step_frames[0].item.label == WRITING_UP_THE_PLAN_LABEL
+    # The frame that opens the block carries no plan text — and now cannot: a step has no
+    # field a plan could ride in (U14). Asserted on the plan's own words rather than on the
+    # substring "plan", which the tool's name and its label both legitimately contain.
+    assert "Ship the visitor log." not in json.dumps(step_frames[0].item.model_dump(mode="json"))
+
+    # The card follows, on the same call id, strictly after the status in wire order.
+    assert len(plan_frames) == 1
+    assert ring.index(step_frames[0]) < ring.index(plan_frames[0])
+
+    # REPLACED, not accumulated: a client that only ever sees the catch-up snapshot (a late
+    # subscribe, or a resume) finds the card's row and nothing describing the status it
+    # superseded — never both at once on the same id.
+    snapshot = engine.build_snapshot(state)
+    assert not any(item.tool == PLAN_OPTIONS_TOOL for item in snapshot.steps)
+
+
+async def test_a_part_start_event_for_a_non_offer_tool_emits_no_extra_frame(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    """Deliberately NOT widened to every tool (U5): the other tools resolve fast and already
+    emit at `FunctionToolCallEvent`, so widening this branch would double every step row in
+    the transcript. Pinned on the RING'S TOTAL FRAME COUNT, not just the step phases, so a
+    silent extra frame of any type sneaking in from `PartStartEvent` would be caught too."""
+    call_id = "call-1"
+
+    async def _stream(messages: list[ModelMessage], info: AgentInfo):
+        if len(messages) == 1:
+            yield DeltaToolCalls(
+                {
+                    0: DeltaToolCall(
+                        name="read_file",
+                        json_args='{"path": "app/page.tsx"}',
+                        tool_call_id=call_id,
+                    )
+                }
+            )
+        else:
+            yield "done"
+
+    engine = _fresh_engine
+    _, conv, _ = await _start(
+        engine, db_session, session_factory, FunctionModel(stream_function=_stream)
+    )
+    await _settle(engine, conv.id)
+
+    state = engine.peek(conv.id)
+    assert state is not None and state.status == "completed"
+    # Ack + started + finished = three step frames, one text delta (the "done" reply) and the
+    # terminal — nothing extra rides in from the PartStartEvent that opened this tool's block.
+    # The workspace/compile/preview boilerplate (R18 — every kind pins a live container now)
+    # is filtered out here: it is unrelated to what THIS test is pinning, and hard-coding its
+    # exact shape would make this test fail on a change to that machinery instead of a change
+    # to the PartStartEvent branch it actually guards.
+    non_lifecycle = [f for f in state.ring if f.type not in {"workspace", "compile", "preview"}]
+    assert [f.type for f in non_lifecycle] == ["step", "step", "step", "text_delta", "turn_ended"]
 
 
 async def test_live_step_frames_are_redacted_like_the_persisted_rows(
@@ -231,9 +410,25 @@ async def test_live_step_frames_are_redacted_like_the_persisted_rows(
     assert state is not None
     steps = [f for f in state.ring if f.type == "step"]
     assert steps, "no step frames were emitted"
-    wire = " ".join(f"{s.item.detail.args} {s.item.detail.result}" for s in steps)
+
+    # THIS TEST USED TO PIN A REDACTOR; IT NOW PINS AN ABSENCE, which is the stronger claim and
+    # the reason U14 exists. The live frame carried the tool call's arguments, run through
+    # `redact_secrets` HERE at the frame boundary so the stream would not show a secret the
+    # persistence seam had already masked — and the assertion was that the mask was applied
+    # (`"***" in wire`). A boundary redactor is only ever as good as its pattern list, and the
+    # thing it was protecting was a payload the browser parsed and rendered nowhere. The
+    # arguments are simply not on the frame now, so the secret cannot be masked wrongly, only
+    # not sent.
+    #
+    # `redact_secrets` is NOT retired — `services/messages/store.py` still runs it over every
+    # string in the persisted tree, which is where it belongs, and `test_store_roundtrip.py`
+    # is what pins that.
+    wire = json.dumps([s.item.model_dump(mode="json") for s in steps], ensure_ascii=False)
     assert "sup3rs3cretpw" not in wire
-    assert "***" in wire
+    assert "/etc/secrets" not in wire  # nor the path the call named
+    # LIVENESS: the steps genuinely rendered, so the two absences above are about the payload
+    # and not about an empty ring.
+    assert all(s.item.label.strip() for s in steps)
 
 
 async def test_stop_cancels_and_leaves_truthful_record(
@@ -263,7 +458,13 @@ async def test_stop_cancels_and_leaves_truthful_record(
     rows = (
         await db_session.scalars(sa.select(Message).where(Message.conversation_id == conv.id))
     ).all()
-    assert rows == []
+    # THE USER TURN IS ABSENT (the no-op persister) and no reply row was written — nothing
+    # finished. What IS here is U20's terminal, saying the turn stopped: the one durable record
+    # a reload can read to know this turn is over rather than still going.
+    assert [row.entry_kind for row in rows] == [MessageEntryKind.SYSTEM_EVENT]
+    assert rows[0].meta is not None
+    assert rows[0].meta["status"] == "stopped"
+    assert rows[0].meta["reason"] == "stopped_by_user"
     assert conv.id not in _mid_reply  # the guard released with the task
     # Stopping the already-settled turn is a no-op, not an error.
     assert await engine.stop_turn(conv.id, turn_id) is False
@@ -446,7 +647,7 @@ async def test_write_mode_now_runs_on_the_engine_like_any_other_mode(
     and carries the sandbox six, so the engine must accept it. The behaviour of the run itself
     lives in `test_write_turn.py`; this pins only that the door is open."""
     engine = _fresh_engine
-    user, conv = await _conversation(db_session, ConversationMode.WRITE)
+    user, conv = await _conversation(db_session, ChatKind.BUILD)
     assert engine.peek(conv.id) is None
     turn_id = await engine.start_turn(
         conversation=conv,
@@ -749,8 +950,9 @@ def test_every_error_class_reaches_the_citizen_with_a_sentence_and_an_action() -
         assert copy.action.strip(), source
 
         # A producer that knows only the model's half — every producer today — still emits a
-        # frame carrying both citizen-facing fields, filled from the class.
-        frame = DiagnosticFrame(seq=1, source=source, title="raw", cleaned_stack="raw")
+        # frame carrying both citizen-facing fields, filled from the class. It cannot pass the
+        # model's half at all: `title` and `cleaned_stack` are not fields on this frame (U14).
+        frame = DiagnosticFrame(seq=1, source=source)
         assert frame.user_message == copy.message
         assert frame.user_action == copy.action
 
@@ -770,8 +972,6 @@ def test_a_producer_may_speak_for_itself_without_losing_the_action() -> None:
     frame = DiagnosticFrame(
         seq=1,
         source=ErrorSource.SERVER,
-        title="raw",
-        cleaned_stack="raw",
         user_message="Your visitor list couldn't load.",
     )
     assert frame.user_message == "Your visitor list couldn't load."
@@ -796,3 +996,97 @@ def test_the_client_report_never_rides_out_on_the_frame() -> None:
     dumped = error.model_dump()
     assert "agent_only_detail" not in dumped
     assert "page-8f2.js" not in json.dumps(dumped)
+
+
+# --- U20: exactly one durable terminal, per turn -------------------------------------------
+
+
+async def _terminal_rows(db_session, conversation_id) -> list[Message]:
+    """Every turn-terminal row on a conversation, in seq order — matched on `meta.kind` rather
+    than on position, because the point of the assertion is HOW MANY there are."""
+    rows = (
+        await db_session.scalars(
+            sa.select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.seq)
+        )
+    ).all()
+    return [
+        row
+        for row in rows
+        if isinstance(row.meta, dict) and row.meta.get("kind") == "turn_terminal"
+    ]
+
+
+async def test_a_stopped_turn_leaves_exactly_one_terminal_even_when_stopped_twice(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    """★ U20's integration scenario: no turn writes two terminal rows.
+
+    THE SECOND STOP IS THE INTERESTING HALF. `stop_turn` answers False the second time — the
+    task is already gone — but a design that wrote the row from each terminal ARM rather than
+    from the single `finally` would be one refactor away from two rows for one turn, and a
+    consumer counting terminals to decide whether a turn is over would then be reading a
+    conversation with more endings than turns."""
+    gate = asyncio.Event()
+
+    async def _stall(messages: list[ModelMessage], info: AgentInfo):
+        yield "partial "
+        await gate.wait()
+        yield "never"
+
+    engine = _fresh_engine
+    _, conv, turn_id = await _start(
+        engine, db_session, session_factory, FunctionModel(stream_function=_stall)
+    )
+    state = engine.peek(conv.id)
+    assert state is not None
+    while not state.text_parts:
+        await asyncio.sleep(0)
+
+    assert await engine.stop_turn(conv.id, turn_id) is True
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(state.task, timeout=10)
+    assert await engine.stop_turn(conv.id, turn_id) is False
+    gate.set()
+
+    terminals = await _terminal_rows(db_session, conv.id)
+    assert len(terminals) == 1
+    assert terminals[0].meta is not None
+    assert terminals[0].meta["turnId"] == str(turn_id)
+    assert terminals[0].meta["status"] == "stopped"
+
+
+async def test_a_turn_that_never_reaches_a_terminal_writes_no_row(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    """The ended-unknown case, produced rather than simulated.
+
+    A turn still in flight has no terminal row — which is exactly what a process killed
+    mid-turn leaves behind, because the code that would write one never runs. The absence IS
+    the signal, so it has to be true of a genuinely-running turn and not only of a fixture that
+    forgot to write one."""
+    gate = asyncio.Event()
+
+    async def _stall(messages: list[ModelMessage], info: AgentInfo):
+        yield "partial "
+        await gate.wait()
+
+    engine = _fresh_engine
+    _, conv, turn_id = await _start(
+        engine, db_session, session_factory, FunctionModel(stream_function=_stall)
+    )
+    state = engine.peek(conv.id)
+    assert state is not None
+    while not state.text_parts:  # LIVENESS: the run really is mid-flight
+        await asyncio.sleep(0)
+
+    assert await _terminal_rows(db_session, conv.id) == []
+
+    # …and once it does end, exactly one appears — the same assertion from the other side, so
+    # this cannot pass by never writing a terminal at all.
+    assert await engine.stop_turn(conv.id, turn_id) is True
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(state.task, timeout=10)
+    gate.set()
+    assert len(await _terminal_rows(db_session, conv.id)) == 1

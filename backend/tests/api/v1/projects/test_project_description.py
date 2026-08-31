@@ -15,9 +15,9 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from sqlalchemy import delete, select
 
-from src.api.v1.claude.prompts import PLANNING_SYSTEM_PROMPT, PORTAL_SELF_DESCRIPTION
+from src.api.v1.claude.prompts import ASSISTANT_IDENTITY_PROMPT, PORTAL_SELF_DESCRIPTION
 from src.config import settings
-from src.db.models.conversation import ConversationKind
+from src.db.models.conversation import ChatKind
 from src.db.models.project import Project
 from src.db.models.token_usage import TokenUsage
 from src.db.models.user_limit import UserLimit
@@ -355,7 +355,7 @@ async def test_description_injected_into_chat_context(client, db_session, set_ch
         db_session, user.id, name="VIP", description="Tracks VIP movements at BIAL."
     )
     conv = await ConversationFactory.create(
-        db_session, user.id, project_id=project.id, kind=ConversationKind.PLANNING
+        db_session, user.id, project_id=project.id, kind=ChatKind.PLAN
     )
 
     resp = await client.post(
@@ -373,7 +373,7 @@ async def test_null_description_adds_no_project_block(client, db_session, set_ch
     headers, user = await _auth(db_session)
     project = await ProjectFactory.create(db_session, user.id)  # NULL description
     conv = await ConversationFactory.create(
-        db_session, user.id, project_id=project.id, kind=ConversationKind.PLANNING
+        db_session, user.id, project_id=project.id, kind=ChatKind.PLAN
     )
 
     resp = await client.post(
@@ -383,8 +383,13 @@ async def test_null_description_adds_no_project_block(client, db_session, set_ch
     )
     assert resp.status_code == 200
     # No PROJECT additions for a null description — the composition is exactly the
-    # server-selected planning base (U7) + the unconditional portal self-description (#6).
-    assert captured["instructions"] == PLANNING_SYSTEM_PROMPT + "\n\n" + PORTAL_SELF_DESCRIPTION
+    # server-composed base (U7) + the unconditional portal self-description (#6).
+    #
+    # THE PER-KIND BASE-PROMPT SELECTION IS GONE with the three-valued kind enum this test
+    # used to pin against (`PLANNING_SYSTEM_PROMPT`) — every conversation, Plan included,
+    # gets `ASSISTANT_IDENTITY_PROMPT` now (toolset gating, not the relay prompt, is what a
+    # Plan kind actually restricts).
+    assert captured["instructions"] == ASSISTANT_IDENTITY_PROMPT + "\n\n" + PORTAL_SELF_DESCRIPTION
 
 
 async def test_unknown_conversation_id_is_a_404(client, db_session, set_chat_model) -> None:
@@ -412,7 +417,7 @@ async def test_two_conversations_share_the_same_description(
     seen: list[str] = []
     for _ in range(2):
         conv = await ConversationFactory.create(
-            db_session, user.id, project_id=project.id, kind=ConversationKind.PLANNING
+            db_session, user.id, project_id=project.id, kind=ChatKind.PLAN
         )
         model, captured = _capturing_stream_model()
         set_chat_model(model)

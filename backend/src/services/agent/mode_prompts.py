@@ -1,4 +1,4 @@
-"""Mode prompt system (U9 / D4 / R13): one BASE + a positive per-mode segment, per run.
+"""Chat-kind prompt system (U9 / D4 / R13): one BASE + a positive per-kind segment, per run.
 
 Authoring is grounded in the U9 research pass
 (`docs/brainstorms/bial-walkthrough-2026-07-22-refs/mode-prompt-research.md` — untracked
@@ -6,9 +6,9 @@ reference doc, patterns cited by number below):
 
 - Pattern 3: every segment LEADS with a purpose/identity sentence, tool talk second
   (OpenHands' Planning Agent, Copilot's "optimized for ..." one-liners).
-- Pattern 1: tool surfaces are stated as facts about the mode's world ("you have read
-  tools ...") — never as bans on tools the mode doesn't have. The registry
-  (`toolsets.py`) makes wrong-mode tools structurally uncallable, which is the "clean
+- Pattern 1: tool surfaces are stated as facts about the kind's world ("you have read
+  tools ...") — never as bans on tools the kind doesn't have. The registry
+  (`toolsets.py`) makes absent tools structurally uncallable, which is the "clean
   removal" case even prohibition-heavy systems (Cline's editor tool) treat as needing
   no ban text (pattern 2). A test pins the segments prohibition-free.
 - Patterns 4/5: Plan mode's output contract is a NAMED tool call (`present_plan_options`,
@@ -24,9 +24,9 @@ reference doc, patterns cited by number below):
   are stated ONCE, in BASE — imported from the single source `DATA_INTEGRITY_RULES`
   (U1), never copied.
 
-The Write→Ask/Plan downgrade clarification deliberately does NOT live here: it rides the
-direction-aware mode-switch marker rows (U4), which fire exactly when the history
-contradicts the toolset. Static segments stay clean.
+There is no downgrade clarification any more and there is nothing for one to say: a chat's
+kind is fixed at creation, so a conversation's history can never contradict the toolset it is
+running under. The direction-aware marker rows that carried it are gone with the switch.
 
 Delivery is per-run `@agent.instructions` (`agent.py`) — composed text is never persisted
 (pydantic-ai keeps instructions out of message parts; pinned by test).
@@ -43,7 +43,7 @@ from src.core.prompt_blocks import (
     PORTAL_SURFACES,
     WRITE_IDENTITY,
 )
-from src.db.models.conversation import ConversationMode
+from src.db.models.conversation import ChatKind
 
 
 @dataclass(frozen=True)
@@ -73,27 +73,6 @@ def _base(context: PromptContext) -> str:
     # retired — it belongs in BASE, where every mode carries it.
     return f"{identity}\n\n{PORTAL_SURFACES}\n\n{DATA_INTEGRITY_RULES}"
 
-
-_ASK_SEGMENT = """\
-ASK MODE — you answer the user's questions about their app and help them understand what \
-it does and how. You have read tools for exactly that: `read_file`, `list_files`, \
-`search_files`, and read-only shell commands through `run_command` (ls / cat / grep and \
-friends). Read the real files and ground every answer in what you find — name the actual \
-files and quote the actual code, and when the app holds no answer, say so plainly. A \
-project whose app has not been built yet still has the starter template in place, so what \
-you read there is the template rather than this user's app — say which one you are looking \
-at, and talk about what could be built for them. When the user wants the app changed, \
-point them to Plan mode (to shape the change together first) or Write mode (to build it \
-directly)."""
-"""U20 / R26 — THE EMPTINESS SIGNAL THIS USED TO PROMISE NEVER ARRIVES, so it stopped being
-promised. The old sentence was "If there is no app yet, your tools will tell you truthfully."
-`EmptyProjectWorkspace` — the workspace that answers every read with "No app exists yet" — is
-reachable from exactly one branch of `turns/engine._workspace_for`, and that branch requires
-`sandbox_client is None`, i.e. NO SANDBOX SERVICE CONFIGURED. In the configured deployment a
-brand-new project gets the live container like everybody else (the deliberate 2026-07-30
-decision recorded in that method), and the container holds the golden template — so the tools
-answer with template files, and a model told to expect a "there is no app" signal spends a
-round-trip looking for one. The truth is cheaper to say: a new project reads as the template."""
 
 _PLAN_SEGMENT = """\
 PLAN MODE — you and the user work out WHAT to build before anything gets built. You have \
@@ -134,8 +113,26 @@ they keep refining, revise the plan and present again."""
 # The reminder that enforced the deleted instruction went with it —
 # `orchestrator/tools._note_write_and_maybe_remind` and `SandboxSession.uncommitted_writes`.
 
+_RECONCILE_WITH_REALITY = """\
+A message may describe a plan that was written some time ago. Where the code on disk differs \
+from what the plan assumed, follow the code's reality and tell the user plainly what you found \
+and what you did differently."""
+"""R25's second half, and it lives HERE because the thing that used to carry it is gone.
+
+It was a prefix the Build-it endpoint glued onto a hidden seed message — so it only ever reached
+a build started from a plan, and only in the same conversation. The handoff now posts the plan as
+an ordinary user message in a new chat, byte-identical to the citizen having pasted it, and there
+is nowhere in that message for a platform instruction to hide. Putting it in the segment is
+strictly better than where it was: a plan can be built weeks after it was written, and the agent
+in a fresh Build chat has LESS context to notice a divergence with, not more.
+
+The wording is this plan's to preserve, not to perfect — the voice work owns how it is phrased,
+and may reword it. It may not drop it."""
+
 _WRITE_SEGMENT = f"""\
 {WRITE_IDENTITY}
+
+{_RECONCILE_WITH_REALITY}
 
 {BUILD_WORKING_RULES_HEAD}
 
@@ -156,84 +153,33 @@ here while the build prompt printed it once — the two Write prompts drifting i
 the shared blocks exist to keep identical. A test counts it in the composed prompt."""
 
 
-# --- U14 (D3): ephemeral mode reminders ---------------------------------------------
+# --- THE PER-TURN RESTATEMENT IS GONE, and nothing replaced it (R17) ------------------
 #
-# Long conversations bury the per-run instructions at the TOP of context; these notes
-# re-anchor the active mode near the tail, where attention lands. Same authoring rules
-# as the segments (positive voice, purpose + expected next action, no absent-tool
-# prose), attributed and XML-delimited so the model reads them as system guidance, not
-# user words. Delivery is the ENGINE's business (`services/turns/engine.py`): they ride
-# `message_history` only and are never persisted or rendered.
+# There used to be a cadence here: a full restatement of "which mode you are in" every eighth
+# turn, a one-line nudge every fourth between, re-anchored by the mode-switch marker rows. It
+# went with the thing it was restating. A chat's kind is fixed at creation, and having a
+# different set of ABILITIES is what carries "which chat this is" — the model cannot call a
+# tool it was not handed, whatever it was last told.
+#
+# The research is not one-sided and the deletion is not a claim that it is: a short refresher
+# every several turns, at system role, phrased as context, is explicitly endorsed for
+# standing-permission modes. This one was neither — it restated a mode that no longer exists,
+# and it was delivered as a `user`-role message on a per-turn cadence, which is the wrong tier
+# and a named cache-breaking action.
+#
+# `_PRIVATE` below OUTLIVES them, and deliberately: it is composed into the workspace note's
+# tail as well, so deleting it with the reminders would break the one ephemeral note this plan
+# is protecting.
 
-# N9(a) — EVERY reminder says it is private. The walkthrough caught the model quoting one of these
-# notes back at the citizen ("I want to flag that note…"), so the user watched the assistant argue
-# with an instruction they never wrote and could not see. Nothing told the model the note was
-# private, and "it is obviously internal" is not an instruction.
+# N9(a) — the note says it is private. The walkthrough caught the model quoting one of these
+# notes back at the citizen ("I want to flag that note…"), so the user watched the assistant
+# argue with an instruction they never wrote and could not see. Nothing told the model the note
+# was private, and "it is obviously internal" is not an instruction.
 #
-# Phrased in POSITIVE VOICE, like everything else here (R13 / pattern 1-2, pinned by
-# `test_reminders_speak_no_forbidden_fruit`): "keep it out of your reply" is the same instruction
-# as "never mention it" without teaching the model to reason in prohibitions. Stated on each
-# constant rather than appended once at the injection site, because the constants are what a
-# future author copies.
+# Phrased in POSITIVE VOICE, like everything else here (R13 / pattern 1-2): "keep it out of
+# your reply" is the same instruction as "never mention it" without teaching the model to
+# reason in prohibitions.
 _PRIVATE = " This note is between you and the platform — keep it out of your reply."
-
-_ASK_REMINDER_FULL = (
-    "<system-note>Ask mode is active. Answer the user's questions about their app from "
-    "its real files — read them with your read tools and ground every answer in what "
-    "you find. When the user wants the app changed, point them to Plan mode (to shape "
-    "the change together) or Write mode (to build it directly)." + _PRIVATE + "</system-note>"
-)
-_ASK_REMINDER_NUDGE = (
-    "<system-note>Ask mode is active — ground every answer in the app's real files."
-    + _PRIVATE
-    + "</system-note>"
-)
-_PLAN_REMINDER_FULL = (
-    "<system-note>Plan mode is active. Keep shaping WHAT to build with the user: read "
-    "the relevant files, then describe the plan in plain, everyday words — what the app "
-    "will DO for them, what they will SEE and be able to DO, what it will remember for "
-    "them, and any choice that changes their experience (as a plain question) — with the "
-    "tools, file names, and data-storage details kept behind the scenes. End a planning "
-    "turn by asking a clarifying question, or — when the plan feels ready — by calling "
-    "present_plan_options to put the Build it / Keep refining buttons in front of the "
-    "user, then wait for their click." + _PRIVATE + "</system-note>"
-)
-_PLAN_REMINDER_NUDGE = (
-    "<system-note>Plan mode is active — describe the plan in plain, everyday words, then "
-    "call present_plan_options when it is ready to show the confirmation buttons."
-    + _PRIVATE
-    + "</system-note>"
-)
-
-# N9(b) — the SAME mode anchor, minus the call-the-tool instruction, for the turns where that
-# instruction would be actively wrong: a card is already on screen unresolved, or the user has
-# just answered one. Firing "call present_plan_options" immediately after the citizen clicked
-# **Keep refining** burned a whole turn — and the user's tokens — on the model correctly
-# resisting an instruction the platform should not have sent. Suppressing the reminder outright
-# would throw away its real job (keep the plan in plain language), so only the wrong sentence goes.
-_PLAN_REMINDER_FULL_HOLDING = (
-    "<system-note>Plan mode is active. Keep shaping WHAT to build with the user: read "
-    "the relevant files, then describe the plan in plain, everyday words — what the app "
-    "will DO for them, what they will SEE and be able to DO, what it will remember for "
-    "them, and any choice that changes their experience (as a plain question) — with the "
-    "tools, file names, and data-storage details kept behind the scenes. The confirmation "
-    "buttons are already with the user, so keep refining the plan and wait for their "
-    "choice." + _PRIVATE + "</system-note>"
-)
-_PLAN_REMINDER_NUDGE_HOLDING = (
-    "<system-note>Plan mode is active — describe the plan in plain, everyday words. The "
-    "confirmation buttons are already with the user." + _PRIVATE + "</system-note>"
-)
-
-_WRITE_REMINDER_FULL = (
-    "<system-note>Write mode is active. Keep building in the app's live sandbox until "
-    "the app type-checks and renders, keeping every existing feature working through "
-    "your changes." + _PRIVATE + "</system-note>"
-)
-_WRITE_REMINDER_NUDGE = (
-    "<system-note>Write mode is active — keep building until the app type-checks and "
-    "renders." + _PRIVATE + "</system-note>"
-)
 
 
 # --- U8 (R14): the ephemeral workspace note ------------------------------------------
@@ -246,11 +192,11 @@ _WRITE_REMINDER_NUDGE = (
 # cannot know. This hands it the fact instead, so answering from stale history stops being
 # forbidden and starts being unnecessary.
 #
-# IT RIDES THE HISTORY TAIL AND IS NEVER PERSISTED, exactly like the reminders above and for the
-# same structural reason: `_persistable_messages` drops requests carrying a `UserPromptPart`, so
-# nothing downstream has to remember to strip it. It is emphatically NOT part of `_reminder_text`,
-# which is cadence-gated and returns `None` between anchors — riding that would inject the
-# workspace state on roughly one turn in four, while this exists precisely to hold on all of them.
+# IT RIDES THE HISTORY TAIL AND IS NEVER PERSISTED: `_persistable_messages` drops requests
+# carrying a `UserPromptPart`, so nothing downstream has to remember to strip it. It is injected
+# UNCONDITIONALLY, on every turn that pinned a workspace, in both kinds — never on a cadence.
+# That distinction is why it survived the deletion of the restatement machinery above it: a note
+# that arrives on one turn in four cannot be what makes answering from stale history unnecessary.
 
 _WORKSPACE_NOTE_HEAD = "<system-note>The platform checked this app's workspace just now: "
 
@@ -301,54 +247,15 @@ def workspace_note(*, serving: bool | None, still_the_template: bool | None) -> 
     return f"{_WORKSPACE_NOTE_HEAD}{body}{_WORKSPACE_NOTE_TAIL}"
 
 
-def mode_reminder(
-    mode: ConversationMode, *, full: bool, plan_options_outstanding: bool = False
-) -> str:
-    """The mode's reminder text: FULL restates purpose + the expected next action (the
-    cadence anchors and post-switch turns); the NUDGE is the one-line touch between.
+def compose_kind_prompt(kind: ChatKind, context: PromptContext) -> str:
+    """BASE + exactly one segment, for both kinds.
 
-    `plan_options_outstanding` is Plan-only and means a confirmation card is already with the
-    user — unresolved, or resolved on the turn that just ran. It swaps the "call
-    present_plan_options" sentence for "the buttons are already there", because telling the model
-    to present buttons that are on screen is how the platform burned a turn arguing with itself
-    (N9b). Ask and Write ignore it: neither has the tool."""
-    match mode:
-        case ConversationMode.ASK:
-            return _ASK_REMINDER_FULL if full else _ASK_REMINDER_NUDGE
-        case ConversationMode.PLAN:
-            if plan_options_outstanding:
-                return _PLAN_REMINDER_FULL_HOLDING if full else _PLAN_REMINDER_NUDGE_HOLDING
-            return _PLAN_REMINDER_FULL if full else _PLAN_REMINDER_NUDGE
-        case ConversationMode.WRITE:
-            return _WRITE_REMINDER_FULL if full else _WRITE_REMINDER_NUDGE
-
-
-def compose_mode_prompt(
-    mode: ConversationMode,
-    context: PromptContext,
-    *,
-    approved_plan: str | None = None,
-) -> str:
-    """BASE + exactly one mode segment (D4) — for EVERY mode, Write included.
-
-    A mode switch swaps the segment and nothing else happens (KTD-5). The Write refusal that
-    used to live here was not a design statement: no `_WRITE_SEGMENT` had been authored, to avoid
-    duplicating `orchestrator/prompt.py`. A shared import solves that, so the seam is finished
-    rather than worked around.
-
-    `approved_plan` still has nowhere to go — the plan a user approves is seeded as an ordinary
-    Write message on the same conversation (KTD-6), not spliced into the system prompt — so
-    accepting it silently would paper over a mis-wired caller."""
-    if approved_plan is not None:
-        raise ValueError(
-            "approved_plan has no home in the mode prompt — an approved plan is seeded as the "
-            "first Write MESSAGE on the conversation (api/v1/conversations/transition.py)."
-        )
-    match mode:
-        case ConversationMode.ASK:
-            segment = _ASK_SEGMENT
-        case ConversationMode.PLAN:
+    `_base` is invariant across kinds and always has been; only the segment varies. Which
+    segment a run gets follows from what it can DO, so this selection sits one file away from
+    the toolset registry that decides that."""
+    match kind:
+        case ChatKind.PLAN:
             segment = _PLAN_SEGMENT
-        case ConversationMode.WRITE:
+        case ChatKind.BUILD:
             segment = _WRITE_SEGMENT
     return f"{_base(context)}\n\n{segment}"

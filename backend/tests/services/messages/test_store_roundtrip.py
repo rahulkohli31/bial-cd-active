@@ -38,8 +38,9 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import FunctionModel
 
-from src.db.models.conversation import ConversationMode
+from src.db.models.conversation import ChatKind
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
+from src.services.agent.mode_prompts import workspace_note
 from src.services.messages import store
 from src.services.messages.store import (
     ATTACHMENT_REF_KIND,
@@ -47,12 +48,10 @@ from src.services.messages.store import (
     SeqContentionError,
     UnattributedBinaryError,
     append_batch,
-    append_mode_switch_marker,
     attachment_rehydrator,
     dump_for_row,
     load_history,
     load_rows,
-    mode_switch_marker_text,
     repair_dangling_tool_calls,
 )
 from tests.factories import ConversationFactory, UserFactory
@@ -103,7 +102,7 @@ async def test_multi_turn_history_round_trips_identically(db_session, thread):
         conversation_id=conversation.id,
         messages=history,
         entry_kind=MessageEntryKind.TURN,
-        mode=ConversationMode.PLAN,
+        kind=ChatKind.PLAN,
     )
     loaded = await load_history(
         db_session, user_id=user.id, conversation_id=conversation.id, rehydrate=_no_refs
@@ -131,7 +130,7 @@ async def test_batches_concatenate_in_seq_order(db_session, thread):
         conversation_id=conversation.id,
         messages=first,
         entry_kind=MessageEntryKind.TURN,
-        mode=ConversationMode.ASK,
+        kind=ChatKind.PLAN,
     )
     await append_batch(
         db_session,
@@ -139,7 +138,7 @@ async def test_batches_concatenate_in_seq_order(db_session, thread):
         conversation_id=conversation.id,
         messages=second,
         entry_kind=MessageEntryKind.STEP,
-        mode=ConversationMode.WRITE,
+        kind=ChatKind.BUILD,
     )
     loaded = await load_history(
         db_session, user_id=user.id, conversation_id=conversation.id, rehydrate=_no_refs
@@ -172,7 +171,7 @@ async def test_dsn_in_tool_return_is_stored_redacted(db_session, thread):
         conversation_id=conversation.id,
         messages=history,
         entry_kind=MessageEntryKind.STEP,
-        mode=ConversationMode.WRITE,
+        kind=ChatKind.BUILD,
     )
     row = await db_session.get(Message, stored.id)
     assert row is not None
@@ -203,7 +202,7 @@ async def test_dsn_in_tool_args_is_stored_redacted(db_session, thread):
         conversation_id=conversation.id,
         messages=history,
         entry_kind=MessageEntryKind.STEP,
-        mode=ConversationMode.WRITE,
+        kind=ChatKind.BUILD,
     )
     row = await db_session.get(Message, stored.id)
     assert row is not None
@@ -251,7 +250,7 @@ async def test_binary_stores_reference_not_bytes_and_rehydrates(db_session, thre
         conversation_id=conversation.id,
         messages=history,
         entry_kind=MessageEntryKind.TURN,
-        mode=ConversationMode.PLAN,
+        kind=ChatKind.PLAN,
     )
     row = await db_session.get(Message, stored.id)
     assert row is not None
@@ -316,7 +315,7 @@ async def test_many_attachments_rehydrate_in_one_query_and_concurrent_reads(
         conversation_id=conversation.id,
         messages=history,
         entry_kind=MessageEntryKind.TURN,
-        mode=ConversationMode.PLAN,
+        kind=ChatKind.PLAN,
     )
 
     in_flight = {"now": 0, "peak": 0}
@@ -359,7 +358,7 @@ async def test_a_row_from_a_future_schema_version_is_refused_not_guessed_at(db_s
         conversation_id=conversation.id,
         messages=[ModelResponse(parts=[TextPart(content="written by a newer server")])],
         entry_kind=MessageEntryKind.TURN,
-        mode=ConversationMode.ASK,
+        kind=ChatKind.PLAN,
     )
     await db_session.execute(
         sa.update(Message).where(Message.id == stored.id).values(schema_version=SCHEMA_VERSION + 1)
@@ -387,7 +386,7 @@ async def test_binary_without_identifier_is_a_producer_bug(db_session, thread):
                 )
             ],
             entry_kind=MessageEntryKind.TURN,
-            mode=ConversationMode.PLAN,
+            kind=ChatKind.PLAN,
         )
 
 
@@ -409,7 +408,7 @@ async def test_missing_attachment_row_fails_rehydration_loudly(db_session, threa
             )
         ],
         entry_kind=MessageEntryKind.TURN,
-        mode=ConversationMode.PLAN,
+        kind=ChatKind.PLAN,
     )
     with pytest.raises(AttachmentRehydrationError):
         await load_history(
@@ -686,7 +685,7 @@ async def test_orphaned_tool_result_in_stored_history_loads_unbricked(db_session
             ModelResponse(parts=[TextPart(content="I added the filter.")]),
         ],
         entry_kind=MessageEntryKind.STEP,
-        mode=ConversationMode.WRITE,
+        kind=ChatKind.BUILD,
     )
     loaded = await load_history(
         db_session, user_id=user.id, conversation_id=conversation.id, rehydrate=_no_refs
@@ -724,7 +723,7 @@ async def test_read_tool_return_survives_persist_and_reload(db_session, thread):
             ModelResponse(parts=[TextPart(content="The file exports a default.")]),
         ],
         entry_kind=MessageEntryKind.TURN,
-        mode=ConversationMode.ASK,
+        kind=ChatKind.PLAN,
     )
     loaded = await load_history(
         db_session, user_id=user.id, conversation_id=conversation.id, rehydrate=_no_refs
@@ -752,7 +751,7 @@ async def test_dangling_call_in_stored_history_loads_repaired(db_session, thread
             )
         ],
         entry_kind=MessageEntryKind.STEP,
-        mode=ConversationMode.WRITE,
+        kind=ChatKind.BUILD,
     )
     loaded = await load_history(
         db_session, user_id=user.id, conversation_id=conversation.id, rehydrate=_no_refs
@@ -778,7 +777,7 @@ async def test_stale_seq_retries_without_silent_loss(db_session, thread, monkeyp
         conversation_id=conversation.id,
         messages=[ModelRequest(parts=[UserPromptPart(content="first")])],
         entry_kind=MessageEntryKind.TURN,
-        mode=ConversationMode.PLAN,
+        kind=ChatKind.PLAN,
     )
 
     real_head = store._head_seq
@@ -798,7 +797,7 @@ async def test_stale_seq_retries_without_silent_loss(db_session, thread, monkeyp
         conversation_id=conversation.id,
         messages=[ModelRequest(parts=[UserPromptPart(content="second")])],
         entry_kind=MessageEntryKind.TURN,
-        mode=ConversationMode.PLAN,
+        kind=ChatKind.PLAN,
     )
     assert stored.seq == 1  # gap-free: retried onto the real head, nothing lost
     rows = await load_rows(db_session, user_id=user.id, conversation_id=conversation.id)
@@ -815,7 +814,7 @@ async def test_seq_contention_budget_exhausted_raises_with_nothing_written(
         conversation_id=conversation.id,
         messages=[ModelRequest(parts=[UserPromptPart(content="first")])],
         entry_kind=MessageEntryKind.TURN,
-        mode=ConversationMode.PLAN,
+        kind=ChatKind.PLAN,
     )
 
     async def always_stale(db, conversation_id):
@@ -829,7 +828,7 @@ async def test_seq_contention_budget_exhausted_raises_with_nothing_written(
             conversation_id=conversation.id,
             messages=[ModelRequest(parts=[UserPromptPart(content="doomed")])],
             entry_kind=MessageEntryKind.TURN,
-            mode=ConversationMode.PLAN,
+            kind=ChatKind.PLAN,
         )
     rows = await load_rows(db_session, user_id=user.id, conversation_id=conversation.id)
     assert [row.seq for row in rows] == [0]  # the loser wrote nothing
@@ -838,7 +837,14 @@ async def test_seq_contention_budget_exhausted_raises_with_nothing_written(
 # --- mode-switch markers ------------------------------------------------------
 
 
-async def test_marker_round_trips_hidden_from_projection_visible_to_model(db_session, thread):
+async def test_a_hidden_row_is_hidden_by_the_row_predicate_not_by_its_payload(db_session, thread):
+    """The property the retired mode-switch marker used to demonstrate here, kept.
+
+    Hiddenness lives on the ROW (`visibility`), never in the payload — so the model sees a
+    hidden row like any other message while the projection filters it with a WHERE clause. The
+    marker is gone with the switch that wrote it (its inertness guard is
+    `tests/api/v1/conversations/test_mode_switch.py`); a hidden system row makes the same point
+    and is still written today."""
     user, conversation = thread
     await append_batch(
         db_session,
@@ -846,39 +852,29 @@ async def test_marker_round_trips_hidden_from_projection_visible_to_model(db_ses
         conversation_id=conversation.id,
         messages=[ModelRequest(parts=[UserPromptPart(content="hello")])],
         entry_kind=MessageEntryKind.TURN,
-        mode=ConversationMode.ASK,
+        kind=ChatKind.PLAN,
     )
-    await append_mode_switch_marker(
+    await append_batch(
         db_session,
         user_id=user.id,
         conversation_id=conversation.id,
-        old_mode=ConversationMode.ASK,
-        new_mode=ConversationMode.WRITE,
+        messages=[ModelRequest(parts=[UserPromptPart(content="a private aside")])],
+        entry_kind=MessageEntryKind.TURN,
+        kind=ChatKind.PLAN,
+        visibility=MessageVisibility.HIDDEN,
     )
-    # The MODEL sees the marker (load_history includes hidden rows)…
+    # The MODEL sees it (load_history ignores visibility)…
     history = await load_history(
         db_session, user_id=user.id, conversation_id=conversation.id, rehydrate=_no_refs
     )
-    assert "[mode changed: ask → write]" in str(_dump(history))
-    # …the UI projection does not (hiddenness is the ROW predicate, not a payload property).
+    assert "a private aside" in str(_dump(history))
+    # …the UI read does not, unless it asks for hidden rows explicitly.
     visible = await load_rows(db_session, user_id=user.id, conversation_id=conversation.id)
-    assert all(row.entry_kind is not MessageEntryKind.MODE_SWITCH for row in visible)
+    assert all(row.visibility is MessageVisibility.VISIBLE for row in visible)
     everything = await load_rows(
         db_session, user_id=user.id, conversation_id=conversation.id, include_hidden=True
     )
-    marker_rows = [row for row in everything if row.entry_kind is MessageEntryKind.MODE_SWITCH]
-    assert len(marker_rows) == 1
-    assert marker_rows[0].visibility is MessageVisibility.HIDDEN
-
-
-def test_marker_text_is_direction_aware():
-    up = mode_switch_marker_text(ConversationMode.PLAN, ConversationMode.WRITE)
-    assert up == "[mode changed: plan → write]"  # upgrades stay minimal
-    down = mode_switch_marker_text(ConversationMode.WRITE, ConversationMode.ASK)
-    # The downgrade names the capability change factually (the one sanctioned exception to
-    # "no absent-tool prose" — the contradiction exists exactly here).
-    assert "build tools" in down and "not available" in down.lower()
-    assert "switch back to Write mode" in down
+    assert len(everything) == len(visible) + 1
 
 
 # --- pinned upstream behaviors (pydantic-ai 2.5.0 tripwires) ------------------
@@ -931,40 +927,43 @@ def test_unswapped_ref_marker_fails_loud_not_silent():
         ModelMessagesTypeAdapter.validate_python(raw)
 
 
-async def test_marker_then_prompt_maps_to_ordered_user_messages_on_the_anthropic_wire():
-    """The wire contract the marker design rests on: a marker request followed by the next
-    user request maps to consecutive user-role messages IN ORDER (marker first). The Anthropic
-    API accepts and folds consecutive same-role messages, so the model reads the marker as
-    part of the same turn, positioned exactly where the switch happened."""
+async def test_an_injected_note_then_the_prompt_maps_to_ordered_user_messages_on_the_wire():
+    """The wire contract every EPHEMERAL INJECTED NOTE rests on, re-pointed from the retired
+    mode-switch marker to the note that actually rides today.
+
+    The turn engine appends the workspace note to `message_history` as a `user`-role request and
+    then passes this turn's prompt separately, so two consecutive user-role messages reach the
+    wire. The Anthropic API accepts and folds them, IN ORDER — which is what makes the note read
+    as context for the prompt that follows rather than as a message the user sent afterwards.
+    The marker is gone; this contract is not, because the note uses it."""
     from pydantic_ai.models import ModelRequestParameters
     from pydantic_ai.models.anthropic import AnthropicModel
     from pydantic_ai.providers.anthropic import AnthropicProvider
 
     model = AnthropicModel("claude-sonnet-4-5", provider=AnthropicProvider(api_key="offline"))
+    note = workspace_note(serving=True, still_the_template=False)
     messages: list[ModelMessage] = [
         ModelRequest(parts=[UserPromptPart(content="build me an app")]),
         ModelResponse(parts=[TextPart(content="done")]),
-        ModelRequest(
-            parts=[
-                UserPromptPart(
-                    content=mode_switch_marker_text(ConversationMode.PLAN, ConversationMode.WRITE)
-                )
-            ]
-        ),
+        ModelRequest(parts=[UserPromptPart(content=note)]),
         ModelRequest(parts=[UserPromptPart(content="add a dashboard")]),
     ]
     params = model.customize_request_parameters(ModelRequestParameters())
     _, wire = await model._map_message(messages, params, {})  # noqa: SLF001 — pinned-version seam
     roles = [message["role"] for message in wire]
     assert roles == ["user", "assistant", "user", "user"]
-    assert "mode changed" in str(wire[2])
+    assert "checked this app's workspace just now" in str(wire[2])
     assert "add a dashboard" in str(wire[3])
 
 
-async def test_no_prompt_run_adopts_trailing_marker_as_prompt():
-    """THE GOTCHA (pinned): running with no user prompt while a marker is the last history
-    message makes the model answer the MARKER. The turn engine must always pass a real user
-    prompt; this test is the tripwire that keeps that rule honest."""
+async def test_no_prompt_run_adopts_a_trailing_injected_note_as_the_prompt():
+    """THE GOTCHA (pinned), re-pointed from the retired marker to the note that rides today.
+
+    Running with no user prompt while an injected note is the last history message makes the
+    model answer the NOTE. The turn engine must always pass a real user prompt; this is the
+    tripwire that keeps that rule honest, and it matters more now than it did with the marker,
+    because the workspace note is appended on EVERY turn that pinned a workspace rather than
+    only at a switch."""
     seen: list[list[ModelMessage]] = []
 
     def capture(messages, info):
@@ -972,17 +971,13 @@ async def test_no_prompt_run_adopts_trailing_marker_as_prompt():
         return ModelResponse(parts=[TextPart(content="ok")])
 
     agent = Agent(FunctionModel(capture))
-    marker = ModelRequest(
-        parts=[
-            UserPromptPart(
-                content=mode_switch_marker_text(ConversationMode.ASK, ConversationMode.WRITE)
-            )
-        ]
+    note = ModelRequest(
+        parts=[UserPromptPart(content=workspace_note(serving=False, still_the_template=None))]
     )
     history: list[ModelMessage] = [
         ModelRequest(parts=[UserPromptPart(content="real question")]),
         ModelResponse(parts=[TextPart(content="answer")]),
-        marker,
+        note,
     ]
     result = await agent.run(None, message_history=history)
     assert result is not None
@@ -990,8 +985,8 @@ async def test_no_prompt_run_adopts_trailing_marker_as_prompt():
     assert isinstance(last, ModelRequest)
     (part,) = last.parts
     assert isinstance(part, UserPromptPart)
-    # The marker IS the effective prompt — exactly what a caller must never let happen.
-    assert "mode changed" in str(part.content)
+    # The note IS the effective prompt — exactly what a caller must never let happen.
+    assert "checked this app's workspace just now" in str(part.content)
 
 
 def test_dump_strips_run_instructions_from_the_payload():

@@ -32,7 +32,7 @@ from src.api.v1.build_sessions.schemas import (
 from src.config import settings
 from src.db.models.app_registry import AppRegistry
 from src.db.models.attachment import Attachment
-from src.db.models.conversation import ConversationKind
+from src.db.models.conversation import ChatKind
 from src.db.models.user import User
 from src.services.build_sessions.appdata import build_app_env, resolve_app_for_project
 from src.services.build_sessions.attachments import BuildAttachmentError
@@ -1838,7 +1838,7 @@ async def test_start_carries_resolved_attachments_onto_the_session(
     where `_live_session_spec` reads them to build BRAIN's multimodal prompt."""
     user, project_id = await _mk(db_session, "m-att1@rvaiglobal.com")
     conv = await ConversationFactory.create(
-        db_session, user.id, project_id=project_id, kind=ConversationKind.BUILDER
+        db_session, user.id, project_id=project_id, kind=ChatKind.BUILD
     )
     from pydantic_ai.messages import ModelRequest, UserPromptPart
 
@@ -1928,7 +1928,7 @@ async def test_unusable_attachment_aborts_start_before_any_sandbox(
     attachment leaves nothing to compensate — no sandbox, no held lock, no registered session."""
     user, project_id = await _mk(db_session, "m-att3@rvaiglobal.com")
     conv = await ConversationFactory.create(
-        db_session, user.id, project_id=project_id, kind=ConversationKind.BUILDER
+        db_session, user.id, project_id=project_id, kind=ChatKind.BUILD
     )
     from pydantic_ai.messages import ModelRequest, UserPromptPart
 
@@ -2313,7 +2313,7 @@ async def test_relaunch_after_a_failed_build_flags_last_saved_version(
     manager = SessionManager()
     await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
     conv = await ConversationFactory.create(
-        db_session, user.id, project_id=project_id, kind=ConversationKind.BUILDER
+        db_session, user.id, project_id=project_id, kind=ChatKind.BUILD
     )
     await write_build_outcome(
         db_session,
@@ -2925,7 +2925,7 @@ async def test_an_attached_relaunch_never_claims_it_restored_the_last_saved_vers
     app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
     await _the_container_is_already_up(client, fake_redis, user.id, app_id)
     conv = await ConversationFactory.create(
-        db_session, user.id, project_id=project_id, kind=ConversationKind.BUILDER
+        db_session, user.id, project_id=project_id, kind=ChatKind.BUILD
     )
     await write_build_outcome(
         db_session,

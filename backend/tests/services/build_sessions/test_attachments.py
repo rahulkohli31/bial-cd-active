@@ -19,7 +19,7 @@ from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserProm
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.attachment import Attachment
-from src.db.models.conversation import ConversationKind
+from src.db.models.conversation import ChatKind
 from src.db.models.message import MessageEntryKind
 from src.services.build_sessions.attachments import (
     BuildAttachmentError,
@@ -39,7 +39,7 @@ async def _owner(db: AsyncSession, email: str):
     user = await UserFactory.create(db, email=email)
     project = await ProjectFactory.create(db, user.id)
     conv = await ConversationFactory.create(
-        db, user.id, project_id=project.id, kind=ConversationKind.BUILDER
+        db, user.id, project_id=project.id, kind=ChatKind.BUILD
     )
     return user, project, conv
 

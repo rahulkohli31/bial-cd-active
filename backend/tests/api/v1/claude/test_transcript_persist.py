@@ -66,7 +66,7 @@ async def test_turn_persists_user_prompt_then_responses(
     rows = await _rows(db_session, conversation.id)
     assert [row.entry_kind for row in rows] == [MessageEntryKind.TURN, MessageEntryKind.TURN]
     assert [row.seq for row in rows] == [0, 1]
-    assert [row.mode for row in rows] == [conversation.mode, conversation.mode]
+    assert [row.kind for row in rows] == [conversation.kind, conversation.kind]
 
     user_batch = rows[0].payload
     assert len(user_batch) == 1

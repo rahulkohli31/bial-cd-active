@@ -8,7 +8,7 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus
-from src.db.models.conversation import ConversationKind
+from src.db.models.conversation import ChatKind
 from src.db.models.message import MessageEntryKind
 from src.services.build_sessions.outcome import (
     newest_build_outcome_status,
@@ -21,7 +21,7 @@ async def _project_with_thread(db: AsyncSession, email: str):
     user = await UserFactory.create(db, email=email)
     project = await ProjectFactory.create(db, user.id)
     conv = await ConversationFactory.create(
-        db, user.id, project_id=project.id, kind=ConversationKind.BUILDER
+        db, user.id, project_id=project.id, kind=ChatKind.BUILD
     )
     return user, project, conv
 
@@ -67,7 +67,7 @@ async def test_scoped_to_the_owner_and_the_project(db_session: AsyncSession) -> 
 
     other_project = await ProjectFactory.create(db_session, user.id)
     own_other_conv = await ConversationFactory.create(
-        db_session, user.id, project_id=other_project.id, kind=ConversationKind.BUILDER
+        db_session, user.id, project_id=other_project.id, kind=ChatKind.BUILD
     )
     await _record(db_session, user, own_other_conv, BuildSessionStatus.FAILED, "build_failed")
 

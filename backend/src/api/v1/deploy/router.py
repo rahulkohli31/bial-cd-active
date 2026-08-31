@@ -71,7 +71,9 @@ from src.api.v1.deploy.schemas import (
     DeployRequest,
     DeployRoutedResponse,
     DeployStartedResponse,
+    PublishState,
     UnpublishResponse,
+    compute_publish_state,
 )
 from src.api.v1.live_build import refuse_while_build_session_live
 from src.core.errors import AppApiError
@@ -99,7 +101,12 @@ from src.services.deploy.gate import (
     review_at_head,
 )
 from src.services.deploy.names import published_app_name
-from src.services.deploy.service import DeployNotPossibleError, VersionRecheck, deployment_for_app
+from src.services.deploy.service import (
+    FAIL_NO_SNAPSHOT,
+    DeployNotPossibleError,
+    VersionRecheck,
+    deployment_for_app,
+)
 from src.services.deploy.teardown import sweep_published_apps
 from src.services.projects.resolve import owned_project_or_404
 from src.services.sandbox import SandboxClient
@@ -293,7 +300,13 @@ async def deploy_project(
         )
     ).scalar_one_or_none()
     if app_row is None:
-        raise AppApiError(status.HTTP_409_CONFLICT, _NOTHING_TO_DEPLOY)
+        # U15: the SAME code `_shipping_head` raises below for the other "nothing saved"
+        # site, and the same string the pipeline itself settles a `Deployment` row with
+        # when it extracts a snapshot that turns out not to exist (`FAIL_SNAPSHOT_MOVED`'s
+        # own precedent for sharing one string across an immediate refusal and a later
+        # settlement of the same fact) — so a client asserts on `error.code` once,
+        # rather than parsing this sentence at two call sites that mean the same thing.
+        raise AppApiError(status.HTTP_409_CONFLICT, _NOTHING_TO_DEPLOY, code=FAIL_NO_SNAPSHOT)
 
     flags = body.answers.classification_flags()
     # ASM15: the citizen's explanation passes through the shared redactor before it is
@@ -663,8 +676,9 @@ async def _shipping_head(storage: ObjectStorage, app_id: uuid.UUID) -> str | Non
     if meta is None:
         # Nothing saved at all — the pipeline would fail on the missing bundle and the
         # queue copy has nothing to fork, so this is the same "build something first"
-        # refusal the resolver used to give.
-        raise AppApiError(status.HTTP_409_CONFLICT, _NOTHING_TO_DEPLOY)
+        # refusal the resolver used to give. U15: coded, same string as the other
+        # "nothing saved" site above — see the comment there.
+        raise AppApiError(status.HTTP_409_CONFLICT, _NOTHING_TO_DEPLOY, code=FAIL_NO_SNAPSHOT)
     return head_sha_from_metadata(meta.metadata)
 
 
@@ -851,6 +865,42 @@ async def _audit_gate(
     )
 
 
+async def _saved_head_for_publish_state(
+    storage: ObjectStorage | None, app_id: uuid.UUID
+) -> str | None:
+    """U15's one object-store read for the publish-state chip: the same metadata `head()`
+    `_shipping_head` above and `classification/router.py`'s `_saved_version` already
+    take, copied deliberately and NOT the whole-bundle read
+    `build_sessions/manager.py:683-695` uses to answer the same question — that
+    distinction (a small header vs. the app's entire git bundle pulled through the API
+    process, on a route a client polls on mount, on focus and after every publish) is
+    the unit's whole cost argument.
+
+    A NAMED DEPARTURE FROM ASM21, HERE ONLY: both `_shipping_head` above and
+    `classification`'s reader turn a `StorageError` into a 503, and they are right to —
+    each is about to ACT on the bundle it names. This read never acts on anything; Plan
+    G makes this endpoint the ONLY publishing surface in the product, so a storage blip
+    answering "is there newer work" must not blank the rest of the response — the
+    status, the approval block, the rejection note, the address — over a question that
+    was only ever a hint. So a raise here is caught and folds into `None`, same as an
+    unconfigured store (`storage is None`, the supported dev/test posture this whole
+    route already accommodates) and same as a bundle saved before the metadata stamp
+    existed: all three are "cannot tell", which `compute_publish_state` reads as
+    `live_drift_unknown`, never as "up to date". If a later reader "fixes" this back to
+    match its two neighbours, that is the regression — the difference is deliberate and
+    the reason lives here rather than only in the plan."""
+    if storage is None:
+        return None
+    try:
+        meta = await storage.head(snapshot_key(app_id))
+    except StorageError:
+        _log.warning("publish_state_saved_head_unavailable", app_id=str(app_id))
+        return None
+    if meta is None:
+        return None
+    return head_sha_from_metadata(meta.metadata)
+
+
 @router.get(
     "/{project_id}/deployment",
     response_model=DeploymentResponse,
@@ -863,6 +913,7 @@ async def latest_deployment(
     project_id: uuid.UUID,
     user: CurrentUser,
     db: DbSession,
+    storage: OptionalStorage,
 ) -> DeploymentResponse:
     """The latest deploy attempt for this project — what the client polls.
 
@@ -890,7 +941,14 @@ async def latest_deployment(
 
     Publishing is where the pipeline is genuinely required, and `deploy_project` still
     refuses there — checked once a branch actually needs it, which is the same rule this
-    now follows."""
+    now follows.
+
+    U15 ADDS `publish_state`, computed from the two rows above PLUS exactly one
+    object-store metadata HEAD (`_saved_head_for_publish_state`) — never a download, and
+    never a second query. Storage stays as optional here as everything else on this
+    route: an unconfigured store reads the same as one that raised (see that helper),
+    so this endpoint keeps needing nothing but the database, exactly as the paragraph
+    above already promises for the deploy pipeline."""
     await owned_project_or_404(db, user.id, project_id)
 
     app_row = (
@@ -902,13 +960,21 @@ async def latest_deployment(
         )
     ).scalar_one_or_none()
     if app_row is None:
-        return DeploymentResponse()
+        # The one `PublishState` member with no app row behind it at all — computed
+        # here rather than in `compute_publish_state`, whose signature takes a
+        # registry row as a required input precisely because every OTHER member needs
+        # one.
+        return DeploymentResponse(publish_state=PublishState.NOTHING_BUILT)
 
     approval = ApprovalState.of(app_row)
     row = await deployment_for_app(db, app_id=app_row.id)
+    saved_head = await _saved_head_for_publish_state(storage, app_row.id)
+    publish_state = compute_publish_state(app_row, row, saved_head)
     if row is None:
-        return DeploymentResponse(app_id=str(app_row.id), approval=approval)
-    return DeploymentResponse.of(row, approval=approval)
+        return DeploymentResponse(
+            app_id=str(app_row.id), approval=approval, publish_state=publish_state
+        )
+    return DeploymentResponse.of(row, approval=approval, publish_state=publish_state)
 
 
 @admin_router.post(

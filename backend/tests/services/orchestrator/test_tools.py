@@ -23,7 +23,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from src.api.v1.conversations.schemas import StepFrame
 from src.core import prompt_blocks
-from src.db.models.conversation import ConversationMode
+from src.db.models.conversation import ChatKind
 from src.db.models.harness_counter import HarnessCounter
 from src.services.messages.projection import long_operation_line
 from src.services.orchestrator import build_agent, constants
@@ -66,7 +66,7 @@ _TOOL_NAMES = {
     "run_command",
     # U22: the slice handle is a REGISTERED TOOL, not a capability described in a prompt — and it
     # is registered here, on the sandbox toolset, because Write is the only mode that runs
-    # commands. `test_toolsets.py` asserts the mode half against `toolsets_for_mode` directly.
+    # commands. `test_toolsets.py` asserts the mode half against `toolsets_for_kind` directly.
     "fetch_output_slice",
     # U23: the composite is registered here too — one call for the generate + migrate sequence
     # the DATABASE block used to dictate step by step.
@@ -1408,7 +1408,7 @@ async def test_the_composite_gets_the_long_operation_status_line(
         turn_id=uuid.uuid7(),
         conversation_id=uuid.uuid7(),
         user_id=uuid.uuid7(),
-        mode=ConversationMode.WRITE,
+        kind=ChatKind.BUILD,
     )
 
     engine._on_event(

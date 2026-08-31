@@ -33,36 +33,20 @@ point the user somewhere or describe what the portal can do, name only surfaces 
 list; if you are unsure whether something exists in the portal, say so plainly rather than \
 directing the user to it."""
 
-# --- base prompts, selected server-side by conversation kind (U7) ---------------------------
+# --- base prompts for the legacy relay -------------------------------------------------------
 #
-# Until U7 these three lived in the SPA (`ChatPage.jsx` / `BuilderPage.jsx`) and rode every
-# request in the `system` field — which R9 retired along with the rest of the browser payload.
-# The server now selects the base prompt from the conversation's KIND (its own column), so a
-# caller can neither drop it nor swap it. Wording moved verbatim; tune here, not in the SPA.
-
-PLANNING_SYSTEM_PROMPT = """\
-You are Citizen Developer AI, a planning assistant for the Bengaluru International Airport \
-(BIAL) Citizen Developer Portal, powered by Anthropic Claude.
-
-Your PRIMARY role is to help airport staff plan and define their app requirements through \
-conversation — NOT to generate code yet.
-
-Guidelines:
-- Ask clarifying questions to understand the user's operational need
-- Help them articulate what their app should do, who will use it, and what data it needs
-- Suggest features based on airport operations context (flight tracking, staff rostering, \
-baggage, gate management, etc.)
-- Keep responses concise and practical — staff are busy
-- If the user attaches images (screenshots, mockups, photos), PDFs (specs, sample data), or \
-Word/Excel documents (requirements, sample datasets — provided to you as extracted text and \
-tables), examine them and use what they actually show to inform the plan — you can see \
-attachments, so refer to their real content
-- When you feel the requirements are well-defined, summarise the plan and suggest moving to \
-the builder
-- For general questions unrelated to app planning, answer them helpfully and concisely, then \
-gently guide the conversation back to planning if appropriate
-
-Do not output code or JSX during the planning phase."""
+# Until U7 these lived in the SPA (`ChatPage.jsx` / `BuilderPage.jsx`) and rode every request in
+# the `system` field — which R9 retired along with the rest of the browser payload. Wording moved
+# verbatim; tune here, not in the SPA.
+#
+# THE PER-KIND SELECTION IS GONE, and `PLANNING_SYSTEM_PROMPT` went with it. It was the only
+# thing the retired three-valued chat-kind enum decided anywhere: `planning` got a planning
+# prompt, anything else the assistant one, and the relay carries no toolset for either to gate.
+# What a chat kind means now lives in the tool surface a run is handed
+# (`services/agent/toolsets.py`), and the planning voice this constant carried belongs to the
+# Plan segment in `services/agent/mode_prompts.py`, where the model actually has the tools it
+# describes. Deleting the constant rather than leaving it unreferenced is the point: an unused
+# prompt is how a retired vocabulary comes back.
 
 # The builder/assistant identity line (ex-`THREAD_SYSTEM_PROMPT`). The builder thread gets the
 # interview protocol appended on top of this by `_project_context_system`.

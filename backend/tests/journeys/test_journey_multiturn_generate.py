@@ -105,7 +105,7 @@ async def test_stateless_multiturn_journey_with_reload_parity(
         json={
             "id": conversation_id,
             "projectId": str(project.id),
-            "kind": "planning",
+            "kind": "plan",
             "title": "Gate tracker",
         },
     )
@@ -116,7 +116,7 @@ async def test_stateless_multiturn_journey_with_reload_parity(
     again = await client.post(
         "/v1/conversations",
         headers=headers,
-        json={"id": conversation_id, "projectId": str(project.id), "kind": "planning"},
+        json={"id": conversation_id, "projectId": str(project.id), "kind": "plan"},
     )
     assert again.status_code == 200
     assert again.json()["conversation"]["_id"] == conversation_id

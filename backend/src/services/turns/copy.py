@@ -23,6 +23,60 @@ from __future__ import annotations
 
 from typing import Final
 
+WORKSPACE_UNAVAILABLE_TEXT: Final = (
+    "Your workspace isn't available right now, so this message wasn't sent. Try again in a moment."
+)
+"""R98 — there is no working workspace service, said at the moment of sending.
+
+WHAT IT REPLACED WAS A BRANCH, NOT A MESSAGE. A turn with no sandbox service configured used
+to quietly answer from the last SAVED copy of the app instead of the running one — a
+degradation nobody asked for and nobody was told about, wearing a branch on the chat's mode
+even though the condition it read was a deployment fact. Both kinds read the live app and only
+the live app now, so where there is nothing to read from, the honest answer is to say so before
+the message is spent rather than after.
+
+IT SAYS THE TWO THINGS THE PERSON NEEDS: that their message did not go, and that trying again
+is worth doing. It names no container, no sandbox and no orchestrator, because none of those
+are words they have. The machine-readable code beside it is what lets the browser tell this
+apart from the workspace CONFLICTS that share its status family — the two have different
+remedies and a client that reads only the status cannot tell them apart."""
+
+WORKSPACE_UNAVAILABLE_CODE: Final = "workspace_unavailable"
+"""The code the R98 refusal carries. See `WORKSPACE_UNAVAILABLE_TEXT`."""
+
+ALREADY_BUILDING_HERE_CODE: Final = "already_building_here"
+"""R19's first refusal: this user's one workspace is committed to another chat of their own.
+
+The remedy is "finish or stop what is running there". The OTHER 409 on this route —
+`sandbox_reclaim_blocked` — means somebody's work in a DIFFERENT project is in the way, and its
+remedy is a choice about that project. Two refusals, two remedies, one status code: without a
+machine code on each, a client can only tell them apart by reading prose, which is how a bug
+of exactly this shape has already shipped here once."""
+
+WRITING_UP_THE_PLAN_LABEL: Final = "Writing up the plan"
+"""What the screen says between the model beginning the offer call and the plan arriving.
+
+IT EXISTS BECAUSE THE PLAN BECAME A TOOL ARGUMENT. When the offer took no arguments the call
+was instantaneous and nothing had to fill the gap; now thousands of tokens stream between the
+block opening and the call resolving, with nothing else on screen for the whole of it. A
+present-participle phrase like every other step label, so the long-operation narrator can
+restate it ("Still writing up the plan — this one takes a little longer.") without a second
+table to keep in step."""
+
+PLAN_NOT_KEPT_TEXT: Final = (
+    "That plan didn't arrive in a form we could keep, so there's nothing to build from yet. "
+    "Ask for it again and it should come through whole."
+)
+"""R28a / R44 — the offer carried no plan, or one past what a message can hold.
+
+ONE SENTENCE FOR BOTH, because they are one thing from where the citizen sits: they asked for a
+plan and there is nothing to press. It says so, and says what to do, and never mentions a limit,
+a tool or a character count — the number is the platform's problem, not theirs.
+
+WHAT IT REPLACES IS WORSE THAN NOTHING: a Build it button under an empty or half-written plan.
+The long plan is REFUSED rather than trimmed, deliberately — a plan cut mid-sentence is one the
+citizen would agree to and the build would never see the end of."""
+
 STILL_SHOWING_TEMPLATE: Final = "the starting template"
 """The app responds, and its home page is still the one the workspace was created with."""
 

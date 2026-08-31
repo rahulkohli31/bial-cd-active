@@ -27,21 +27,31 @@ import redis.asyncio as aioredis
 from src.api.v1.build_sessions.schemas import (
     RELAUNCH_PREVIEW_STAY_SECONDS,
     SERVED_TRAFFIC_STAY_SECONDS,
+    TURN_ENDED_UNCHANGED_STAY_SECONDS,
+    BuildSessionStatus,
 )
 from src.services.build_sessions import locks
 from src.services.build_sessions.locks import DeadlineWriter, grant_stay_of_execution
+from src.services.build_sessions.manager import BuildSession, SessionManager
+from src.services.build_sessions.reaper import reconcile_user
 from src.services.redis import registry_key
 from src.services.redis.keys import (
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
     REGISTRY_FIELD_STAY_WRITER,
 )
+from src.services.sandbox import SandboxHandle
+from tests.fakes import FakeSandboxClient, a_sandbox_name
 
 USER = uuid.uuid4()
 
 
+async def _register_as(redis: aioredis.Redis, user_id: uuid.UUID) -> None:
+    await redis.hset(registry_key(user_id), mapping={REGISTRY_FIELD_APP_NAME: "sbx-x"})
+
+
 async def _register(redis: aioredis.Redis) -> None:
-    await redis.hset(registry_key(USER), mapping={REGISTRY_FIELD_APP_NAME: "sbx-x"})
+    await _register_as(redis, USER)
 
 
 def _text(value: bytes | str | None) -> str | None:
@@ -51,8 +61,10 @@ def _text(value: bytes | str | None) -> str | None:
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
-async def _stay(redis: aioredis.Redis) -> tuple[datetime | None, str | None]:
-    reg = await redis.hgetall(registry_key(USER))
+async def _stay_for(
+    redis: aioredis.Redis, user_id: uuid.UUID
+) -> tuple[datetime | None, str | None]:
+    reg = await redis.hgetall(registry_key(user_id))
     raw = _text(reg.get(REGISTRY_FIELD_PREVIEW_STAY_UNTIL))
     return (
         datetime.fromisoformat(raw) if raw else None,
@@ -60,18 +72,34 @@ async def _stay(redis: aioredis.Redis) -> tuple[datetime | None, str | None]:
     )
 
 
+async def _stay(redis: aioredis.Redis) -> tuple[datetime | None, str | None]:
+    return await _stay_for(redis, USER)
+
+
 # --- the writer set is closed, and named ------------------------------------------
 
 
-def test_the_writer_set_is_exactly_three() -> None:
-    """A CLOSED SET is the requirement, not a side effect. Adding a fourth way to keep a container
-    alive should be a deliberate act with a review attached — the failure this unit exists to
-    prevent is a deadline nobody can attribute."""
+def test_the_writer_set_is_exactly_four() -> None:
+    """A CLOSED SET is the requirement, not a side effect. Adding a way to keep a container alive
+    should be a deliberate act with a review attached — the failure this unit exists to prevent
+    is a deadline nobody can attribute. U12/R100 adds the fourth member, `turn_ended_unchanged`,
+    for a turn that held the workspace but wrote nothing to it — still a reviewed member of the
+    closed set, not an anonymous extension."""
     assert {w.value for w in DeadlineWriter} == {
         "turn_in_flight",
         "app_served_traffic",
         "builder_acted",
+        "turn_ended_unchanged",
     }
+
+
+def test_a_turn_that_changed_nothing_buys_the_least_of_the_four() -> None:
+    """R100's whole point, stated as an ordering rather than a single number: the weakest
+    evidence — a turn that pinned the workspace and produced nothing — buys the shortest
+    reprieve of any writer in the set, strictly less than either bounded-but-real-activity
+    writer above it."""
+    assert TURN_ENDED_UNCHANGED_STAY_SECONDS < SERVED_TRAFFIC_STAY_SECONDS
+    assert TURN_ENDED_UNCHANGED_STAY_SECONDS < RELAUNCH_PREVIEW_STAY_SECONDS
 
 
 async def test_a_grant_records_which_writer_made_it(fake_redis: aioredis.Redis) -> None:
@@ -186,3 +214,156 @@ async def test_no_writer_can_buy_more_than_its_own_ceiling(
     await grant_stay_of_execution(fake_redis, USER, writer=writer)
 
     assert await locks.stay_of_execution_is_current(fake_redis, USER) is True
+
+
+# --- U12/R100: `_pardon_the_container` picks the writer from what the turn DID -----
+# `_pardon_the_container` is the one place `finish_turn_sandbox` (an ordinary chat turn's end)
+# and `_do_finalize` (a completed build's end) hand a container its keep-alive stay. These
+# tests drive it directly — no HTTP layer, no database, no sandbox client beyond the fake C2
+# stub the sweep needs — because the fact under test is entirely a Redis-visible one: which
+# writer, and which deadline, `grant_stay_of_execution` ends up recording.
+
+
+def _pardoned_session(*, user_id: uuid.UUID) -> BuildSession:
+    """A minimal `BuildSession` — only `user_id` and `lock_token` are read by
+    `_pardon_the_container`; the rest of the dataclass exists for other callers and is filled
+    with harmless placeholders so the type stays honest about what a real session carries."""
+    return BuildSession(
+        session_id=uuid.uuid7(),
+        user_id=user_id,
+        project_id=uuid.uuid4(),
+        app_id=uuid.uuid4(),
+        prompt="",
+        lock_token="tok",
+        handle=SandboxHandle(
+            fqdn="x.example",
+            token="t",
+            app_name=a_sandbox_name("x"),
+            preview_url="https://x.example/",
+            ready=True,
+        ),
+    )
+
+
+async def test_a_turn_that_wrote_files_grants_the_long_stay_under_the_existing_writer(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """Happy path. `touched=True` changes NOTHING about today's behaviour — the same writer,
+    the same TTL a build or a writing turn has always earned."""
+    user_id = uuid.uuid4()
+    await _register_as(fake_redis, user_id)
+    manager = SessionManager()
+    session = _pardoned_session(user_id=user_id)
+
+    await manager._pardon_the_container(fake_redis, session, touched=True)
+
+    deadline, writer = await _stay_for(fake_redis, user_id)
+    assert writer == DeadlineWriter.TURN_IN_FLIGHT.value
+    assert deadline is not None
+    assert deadline - datetime.now(UTC) <= timedelta(seconds=RELAUNCH_PREVIEW_STAY_SECONDS + 5)
+    assert deadline - datetime.now(UTC) > timedelta(seconds=TURN_ENDED_UNCHANGED_STAY_SECONDS)
+
+
+async def test_a_turn_that_wrote_nothing_against_a_fresh_container_grants_the_short_stay(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """Happy path, and the qualifier in its own name is load-bearing (see the next test): this
+    is a container with NO STANDING STAY, so the short stay is what actually lands and the
+    registry records the NEW writer as the reason — an operator asking "what is holding this
+    open?" gets `turn_ended_unchanged`, not a guess."""
+    user_id = uuid.uuid4()
+    await _register_as(fake_redis, user_id)
+    manager = SessionManager()
+    session = _pardoned_session(user_id=user_id)
+
+    await manager._pardon_the_container(fake_redis, session, touched=False)
+
+    deadline, writer = await _stay_for(fake_redis, user_id)
+    assert writer == DeadlineWriter.TURN_ENDED_UNCHANGED.value
+    assert deadline is not None
+    assert deadline - datetime.now(UTC) <= timedelta(seconds=TURN_ENDED_UNCHANGED_STAY_SECONDS + 5)
+
+
+async def test_a_read_only_turn_inside_a_write_turns_stay_leaves_it_untouched(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """Edge case, and the one the monotonic guarantee exists for. A write turn ends and stamps
+    the long stay; a read-only turn ends moments later, INSIDE that stay. R100 must not mean a
+    weaker writer can shorten a stronger one's reprieve — `grant_stay_of_execution`'s own
+    `max(existing, computed)` is what this pins, applied through the exact call
+    `_pardon_the_container` makes rather than assumed."""
+    user_id = uuid.uuid4()
+    await _register_as(fake_redis, user_id)
+    manager = SessionManager()
+    write_session = _pardoned_session(user_id=user_id)
+    await manager._pardon_the_container(fake_redis, write_session, touched=True)
+    long_deadline, _ = await _stay_for(fake_redis, user_id)
+
+    read_only_session = _pardoned_session(user_id=user_id)
+    await manager._pardon_the_container(fake_redis, read_only_session, touched=False)
+
+    deadline, writer = await _stay_for(fake_redis, user_id)
+    assert deadline == long_deadline, "the longer deadline must not be truncated"
+    assert writer == DeadlineWriter.TURN_IN_FLIGHT.value, "provenance still names who bought it"
+
+
+async def test_a_turn_that_failed_after_writing_files_still_grants_the_long_stay(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """Edge case: WHAT was done, not how the turn ended. `_pardon_the_container` reads only
+    `touched` — a session left in a FAILED-looking state that nonetheless wrote to the tree
+    still earns the long stay, because the citizen still has something on screen worth keeping
+    the container alive to look at."""
+    user_id = uuid.uuid4()
+    await _register_as(fake_redis, user_id)
+    manager = SessionManager()
+    session = _pardoned_session(user_id=user_id)
+    session.status = BuildSessionStatus.FAILED  # the turn did not end cleanly...
+
+    await manager._pardon_the_container(fake_redis, session, touched=True)  # ...but it wrote.
+
+    _, writer = await _stay_for(fake_redis, user_id)
+    assert writer == DeadlineWriter.TURN_IN_FLIGHT.value
+
+
+async def test_the_sweep_spares_a_container_inside_the_short_stay_and_reaps_through_it_after(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """Integration: the short stay is honoured by the SAME sweep predicate as any other writer's
+    — no special-casing for the new member — and once it lapses the container is reaped exactly
+    as an expired `builder_acted`/`app_served_traffic` stay already is. Nothing else about the
+    sweep changes; this pins that `TURN_ENDED_UNCHANGED` is a value in an existing mechanism,
+    not a second one."""
+    user_id = uuid.uuid4()
+    app_name = a_sandbox_name("unchanged")
+    await fake_redis.hset(registry_key(user_id), REGISTRY_FIELD_APP_NAME, app_name)
+    manager = SessionManager()
+    session = _pardoned_session(user_id=user_id)
+    sandbox = FakeSandboxClient()
+
+    await manager._pardon_the_container(fake_redis, session, touched=False)
+
+    # Inside the short stay: the background sweep (`honor_stay=True`) spares it. No lock, no
+    # heartbeat and no lease are held after a pardon (that is the whole point of the pardon —
+    # see `_pardon_the_container`'s docstring), so the stay is the ONLY thing standing between
+    # this container and the sweep.
+    reaped = await reconcile_user(
+        fake_redis, user_id, sandbox, has_live_session=False, honor_stay=True
+    )
+    assert reaped is False
+    assert sandbox.torn_down == []
+    assert await fake_redis.exists(registry_key(user_id)) == 1
+
+    # Past it: the same predicate the sweep already trusted for every other writer now reads
+    # the deadline as lapsed, and the sweep reaps through it exactly as it would a lapsed
+    # `builder_acted` stay — a fact written directly, since waiting out 300 real seconds is not
+    # what this test is about.
+    lapsed = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+    await fake_redis.hset(registry_key(user_id), REGISTRY_FIELD_PREVIEW_STAY_UNTIL, lapsed)
+
+    reaped_after = await reconcile_user(
+        fake_redis, user_id, sandbox, has_live_session=False, honor_stay=True
+    )
+    assert reaped_after is True
+    assert sandbox.torn_down == [app_name]
+    assert await fake_redis.exists(registry_key(user_id)) == 0

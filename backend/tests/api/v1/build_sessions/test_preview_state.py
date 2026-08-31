@@ -1,20 +1,26 @@
-"""`GET /v1/build-sessions/projects/{id}/preview-state` — four states, not one boolean.
+"""`GET /v1/build-sessions/projects/{id}/preview-state` — five states, not one boolean.
 
 C3 §8.3 / R16–R18. The route used to answer `alive: false` identically for *never built*,
 *another project took the slot*, *asleep*, and *the registry read threw* — and the portal
 rendered all four as "your preview is gone", including the one that was an ERROR rather than a
-fact about anything.
+fact about anything. U13 adds a fifth: *a start is in flight right now*, which used to be
+indistinguishable from `asleep` and invited a second press to provision a second container.
 
-Two invariants are load-bearing here and each has its own test:
+Invariants load-bearing here, each with its own test:
 
 * **An unknown is its own answer.** A registry read that failed decided nothing, so it is
   `unknown` — never `asleep`, never `never_built`, and above all never an error the citizen has
   to read. Same rule for `restorable`, which is tri-state for the same reason `dirty` is.
 * **The poll stays cheap.** The caller is a browser tab on a 45-second timer. C3 §8.3 freezes
-  the budget: one registry hash read, at most two user-scoped rows, at most two object-store
-  HEADs, and NO container command or attach — which R14 forbids outright, because a poll that
-  touched the container would make every framed preview look busy forever and nothing would
-  ever be reclaimed.
+  the budget: one ROUND TRIP to Redis (two commands, pipelined: the registry hash and the U13
+  starting marker), at most two user-scoped rows, at most two object-store HEADs, and NO
+  container command or attach — which R14 forbids outright, because a poll that touched the
+  container would make every framed preview look busy forever and nothing would ever be
+  reclaimed.
+* **R5 — starting is never destructive.** The signal→action mapping (`PREVIEW_STATE_ACTION`)
+  is total over the enum and no ambiguous or timed-out signal may map to the one action that can
+  destroy or restore — proved directly against the recorded incident this rule exists because of
+  (`docs/solutions/logic-errors/readiness-timeout-triggers-destructive-sandbox-restore-2026-08-02.md`).
 """
 
 from __future__ import annotations
@@ -28,7 +34,13 @@ from httpx import AsyncClient
 from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.v1.build_sessions.schemas import (
+    PREVIEW_STATE_ACTION,
+    PreviewLifeState,
+    PreviewStateAction,
+)
 from src.services.build_sessions.appdata import resolve_app_for_project
+from src.services.build_sessions.locks import write_starting_marker
 from src.services.build_sessions.manager import app_name_for
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
@@ -41,7 +53,9 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_FQDN,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_TOKEN_REF,
+    starting_key,
 )
+from src.services.sandbox import SandboxHandle, SandboxNotReadyError
 from src.services.storage import StorageError, recovery_key, snapshot_key
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.factories import ProjectFactory, UserFactory
@@ -292,9 +306,13 @@ async def test_a_registry_read_failure_is_unknown_not_gone(
     from src.services.build_sessions import manager as manager_module
 
     async def the_store_will_not_answer(*_args: object, **_kwargs: object) -> None:
-        raise RedisConnectionError("connection refused (hgetall)")
+        raise RedisConnectionError("connection refused (pipeline)")
 
-    monkeypatch.setattr(manager_module, "read_registry", the_store_will_not_answer)
+    # U13 — the route reads through `read_registry_and_starting_marker` (the pipelined
+    # registry + marker read), not a bare `read_registry`, so that is the seam to fail.
+    monkeypatch.setattr(
+        manager_module, "read_registry_and_starting_marker", the_store_will_not_answer
+    )
 
     body = await _probe(client, user, project)
 
@@ -363,6 +381,139 @@ async def test_one_readable_key_is_enough_to_answer_even_when_the_other_is_not(
     body = await _probe(client, user, project)
 
     assert body["restorable"] is True
+
+
+# --------------------------------------------------------------------------------------
+# `starting` — a start in flight is a fact the platform holds (U13)
+# --------------------------------------------------------------------------------------
+
+
+async def test_a_start_in_flight_reads_as_starting_from_a_different_request_and_after_reload(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """Covers AE54a. The marker is a fact in Redis, not a tab's own memory: a fresh HTTP
+    request (standing in for a different browser tab) and a repeated probe of the same request
+    (standing in for a reload thirty seconds later) both read `starting`, because neither reads
+    anything a browser ever held."""
+    user, project = await _user_project(db_session, "ps-starting@rvaiglobal.com")
+    await write_starting_marker(fake_redis, user.id, project.id)
+
+    first = await _probe(client, user, project)  # a different session's request
+    second = await _probe(client, user, project)  # the simulated reload, moments later
+
+    assert first["state"] == "starting"
+    assert second["state"] == "starting"
+    assert first["previewUrl"] is None
+    assert first["restorable"] is None  # no claim — a start offers no restore affordance
+
+
+async def test_a_completed_start_clears_the_marker_and_the_next_read_answers_alive(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    user, project = await _user_project(db_session, "ps-start-done@rvaiglobal.com")
+    app_id = await _built(db_session, user, project)
+    await write_starting_marker(fake_redis, user.id, project.id)
+
+    assert (await _probe(client, user, project))["state"] == "starting"
+
+    # The start completes: `_holding_user_lock`'s clean exit clears the marker and the
+    # container is now registered and serving — exactly what a real completion leaves behind.
+    await fake_redis.delete(starting_key(user.id))
+    await _register_container(
+        fake_redis, user.id, app_name_for(app_id), state=REGISTRY_STATE_READY
+    )
+
+    body = await _probe(client, user, project)
+    assert body["state"] == "alive"
+
+
+async def test_a_failed_start_clears_the_marker_through_compensation_and_reads_asleep(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    wire,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Edge case, driven through the REAL start path rather than by hand-clearing the marker:
+    a provisioning failure inside `ensure_sandbox` (the turn's door into `_holding_user_lock`,
+    same skeleton as a build start or a relaunch) must leave no marker behind, or a citizen
+    whose start genuinely failed would see `starting` forever instead of the truthful `asleep`
+    that invites a retry."""
+    from src.services.sandbox import SandboxError
+
+    user, project = await _user_project(db_session, "ps-start-failed@rvaiglobal.com")
+
+    async def provisioning_blows_up(*_args: object, **_kwargs: object) -> SandboxHandle:
+        raise SandboxError("the container never came up")
+
+    monkeypatch.setattr(wire.sbx, "provision_new", provisioning_blows_up)
+
+    with pytest.raises(SandboxError):
+        await wire.manager.ensure_sandbox(
+            db_session, user, project.id, sandbox_client=wire.sbx, may_write=True
+        )
+
+    assert await fake_redis.exists(starting_key(user.id)) == 0  # compensation cleared it
+
+    body = await _probe(client, user, project)
+    assert body["state"] == "asleep"  # not "starting forever"
+
+
+async def test_an_abandoned_marker_expires_and_the_next_read_falls_back_to_the_registry(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """Edge case: a marker with no writer left to clear it (the process died) is a BOUNDED
+    claim, not a pardon — past its TTL the read falls straight through to whatever the
+    registry says, exactly as if the marker had never existed. Simulated by deleting the key
+    directly (fakeredis has no fast-forward clock); from a reader's side that is indistinguishable
+    from the TTL having done it."""
+    user, project = await _user_project(db_session, "ps-abandoned@rvaiglobal.com")
+    await _built(db_session, user, project)
+    await write_starting_marker(fake_redis, user.id, project.id)
+    assert (await _probe(client, user, project))["state"] == "starting"
+
+    await fake_redis.delete(starting_key(user.id))  # the TTL lapsing
+
+    body = await _probe(client, user, project)
+    assert body["state"] == "asleep"  # the registry's own answer, nothing left claiming a start
+
+
+async def test_a_marker_naming_another_project_is_slot_taken_and_names_it(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """Edge case. Better than today's ghost: the marker already carries the occupying
+    project's id, so naming it needs no inversion of a container name and no registry entry to
+    exist yet — this is reachable BEFORE the starting build has provisioned anything."""
+    user, mine = await _user_project(db_session, "ps-marker-taken@rvaiglobal.com")
+    theirs = await ProjectFactory.create(db_session, user.id, name="Runway Allocation")
+    await write_starting_marker(fake_redis, user.id, theirs.id)
+
+    body = await _probe(client, user, mine)
+
+    assert body["state"] == "slot_taken"
+    assert body["occupyingProjectId"] == str(theirs.id)
+    assert body["occupyingProjectName"] == "Runway Allocation"
+
+
+async def test_a_marker_naming_this_project_while_the_registry_already_serves_it_is_alive(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """Edge case, and the precedence rule this pins directly: a STALE marker must never hide a
+    running app. If a completion's marker-clear were lost (a Redis blip in the compensation
+    arm) but the container came up anyway, the citizen must still see their live app, not a
+    spinner for a start that already finished."""
+    user, project = await _user_project(db_session, "ps-stale-marker@rvaiglobal.com")
+    app_id = await _built(db_session, user, project)
+    await _register_container(
+        fake_redis, user.id, app_name_for(app_id), state=REGISTRY_STATE_READY
+    )
+    await write_starting_marker(fake_redis, user.id, project.id)
+
+    body = await _probe(client, user, project)
+
+    assert body["state"] == "alive"
+    assert body["alive"] is True
 
 
 # --------------------------------------------------------------------------------------
@@ -480,7 +631,7 @@ async def test_every_state_is_reachable_and_they_are_all_different(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
 ) -> None:
     """The round-trip anchor: drive one user through the whole ladder and assert the wire
-    values are four distinct answers. A regression that collapses two of them back into one
+    values are five distinct answers. A regression that collapses two of them back into one
     boolean fails here even if every single-state test above were somehow still green."""
     user, mine = await _user_project(db_session, "ps-ladder@rvaiglobal.com")
 
@@ -488,6 +639,10 @@ async def test_every_state_is_reachable_and_they_are_all_different(
 
     app_id = await _built(db_session, user, mine)
     seen.append((await _probe(client, user, mine))["state"])  # asleep
+
+    await write_starting_marker(fake_redis, user.id, mine.id)
+    seen.append((await _probe(client, user, mine))["state"])  # starting
+    await fake_redis.delete(starting_key(user.id))
 
     await _register_container(
         fake_redis, user.id, app_name_for(app_id), state=REGISTRY_STATE_READY
@@ -501,5 +656,167 @@ async def test_every_state_is_reachable_and_they_are_all_different(
     )
     seen.append((await _probe(client, user, mine))["state"])  # slot_taken
 
-    assert seen == ["never_built", "asleep", "alive", "slot_taken"]
-    assert len(set(seen)) == 4, "four states, not one boolean"
+    assert seen == ["never_built", "asleep", "starting", "alive", "slot_taken"]
+    assert len(set(seen)) == 5, "five states, not one boolean"
+
+
+# --------------------------------------------------------------------------------------
+# U13's cost budget amendment — one round trip, two pipelined commands
+# --------------------------------------------------------------------------------------
+
+
+async def test_the_registry_and_marker_are_read_in_one_pipelined_round_trip(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    wire,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The amended budget (C3 §8.3): the poll spends ONE round trip on the coordination store —
+    a pipeline carrying two commands (the registry hash and the starting marker) — never two
+    sequential awaits. Asserted on the client's own call log, because "pipelined" is a claim
+    about *how many round trips*, and only the transport itself can say that.
+
+    Mutation-check: replace `read_registry_and_starting_marker`'s pipeline with two sequential
+    `redis.hgetall` / `redis.get` calls and `pipelines` goes to `[]` while `bare_reads` goes to
+    `2` — this test catches exactly that regression."""
+    user, project = await _user_project(db_session, "ps-pipeline@rvaiglobal.com")
+    app_id = await _built(db_session, user, project)
+    await _register_container(
+        fake_redis, user.id, app_name_for(app_id), state=REGISTRY_STATE_READY
+    )
+
+    pipelines: list[object] = []
+    bare_reads: list[str] = []
+    real_pipeline = fake_redis.pipeline
+    real_hgetall = fake_redis.hgetall
+    real_get = fake_redis.get
+
+    def recording_pipeline(*args: object, **kwargs: object):
+        pipe = real_pipeline(*args, **kwargs)
+        pipelines.append(pipe)
+        return pipe
+
+    async def recording_hgetall(*args: object, **kwargs: object):
+        bare_reads.append("hgetall")
+        return await real_hgetall(*args, **kwargs)
+
+    async def recording_get(*args: object, **kwargs: object):
+        bare_reads.append("get")
+        return await real_get(*args, **kwargs)
+
+    monkeypatch.setattr(fake_redis, "pipeline", recording_pipeline)
+    monkeypatch.setattr(fake_redis, "hgetall", recording_hgetall)
+    monkeypatch.setattr(fake_redis, "get", recording_get)
+
+    body = await _probe(client, user, project)
+
+    assert body["state"] == "alive"
+    assert len(pipelines) == 1, "one round trip, not two sequential ones"
+    assert bare_reads == [], "the registry and marker travel inside the pipeline, not beside it"
+
+
+# --------------------------------------------------------------------------------------
+# R5 — starting is never destructive (U13)
+# --------------------------------------------------------------------------------------
+
+
+def test_every_preview_life_state_maps_to_exactly_one_action() -> None:
+    """R5, first half, as a table over the enum rather than a claim in a docstring: a state
+    added later with no entry in `PREVIEW_STATE_ACTION` fails this test loudly instead of
+    quietly rendering a button whose meaning nobody chose."""
+    assert set(PREVIEW_STATE_ACTION) == set(PreviewLifeState)
+    for state in PreviewLifeState:
+        assert PREVIEW_STATE_ACTION[state] in set(PreviewStateAction)
+
+
+def test_no_ambiguous_state_maps_to_the_remedy_action() -> None:
+    """R5, second half — the one that matters. `REMEDY` is the one bucket that can be
+    consequential (releasing ANOTHER project's container), and `UNKNOWN` — the state built
+    from a read that decided nothing — must never map to it. `STARTING` is the other state a
+    reader might expect to gate something; it maps to `NEITHER`, because nothing may be
+    offered on top of a start already in flight."""
+    assert PREVIEW_STATE_ACTION[PreviewLifeState.UNKNOWN] is not PreviewStateAction.REMEDY
+    assert PREVIEW_STATE_ACTION[PreviewLifeState.UNKNOWN] == PreviewStateAction.RETRY
+    assert PREVIEW_STATE_ACTION[PreviewLifeState.STARTING] == PreviewStateAction.NEITHER
+
+
+async def test_a_readiness_timeout_on_the_attach_arm_is_non_destructive_and_the_triple_holds(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    wire,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R5, second half, asserted against L3's own recorded incident rather than the enum table
+    alone — this is the scenario Plan F's start button rests on
+    (`docs/solutions/logic-errors/readiness-timeout-triggers-destructive-sandbox-restore-2026-08-02.md`).
+
+    A readiness TIMEOUT is not a death certificate: the attach arm fails OPEN (`ready=False`,
+    no registry `ending` mark), and L3's confirmation triple — the thing that tells a rollback
+    apart from every innocent explanation — still holds afterwards: nothing was torn down or
+    re-provisioned (the fake's own "planted marker" — its call counts survive untouched), the
+    save-state answer is byte-for-byte the same, and the saved snapshot's bytes and write time
+    are unchanged (this fake's `etag` is always `None`, so the write time is what stands in for
+    it — a `put` bumps it on every write, so an unchanged value IS the unchanged-etag claim)."""
+    user, project = await _user_project(db_session, "ps-timeout-confirm@rvaiglobal.com")
+    app_id = await resolve_app_for_project(db_session, user.id, project.id)
+    await db_session.commit()
+    await fake_storage.put(snapshot_key(app_id), b"SAVED-BUNDLE")
+
+    # A cold relaunch first, to leave a real container up and registered for this app, and
+    # ATTACHABLE from here on — set before either save-state baseline so "before" and "after"
+    # differ only in whether the second relaunch's wait timed out, never in what the fake is
+    # newly capable of answering.
+    cold = await client.post(
+        "/v1/build-sessions/relaunch",
+        json={"projectId": str(project.id)},
+        headers=auth_headers(user),
+    )
+    assert cold.status_code == 200
+    wire.sbx.attach_handle = SandboxHandle(
+        fqdn="live.example",
+        token="tok",
+        app_name=app_name_for(app_id),
+        preview_url="https://live.example",
+        ready=True,
+    )
+
+    save_state_url = f"/v1/build-sessions/projects/{project.id}/save-state"
+    before_save_state = (await client.get(save_state_url, headers=auth_headers(user))).json()
+    provisioned_before = list(wire.sbx.provisioned)
+    restored_before = list(wire.sbx.restored)
+    torn_down_before = list(wire.sbx.torn_down)
+    snapshot_before = fake_storage.objects[snapshot_key(app_id)]
+    mtime_before = fake_storage.mtimes[snapshot_key(app_id)]
+
+    # …then relaunch again with a dev server that never comes back ready — the exact shape of
+    # the incident: the container is alive, the citizen's own root route is merely slow.
+    async def the_dev_server_never_answers(handle: SandboxHandle, *, timeout_s: float = 120.0):
+        raise SandboxNotReadyError("the app root never served")
+
+    monkeypatch.setattr(wire.sbx, "wait_ready", the_dev_server_never_answers)
+
+    timed_out = await client.post(
+        "/v1/build-sessions/relaunch",
+        json={"projectId": str(project.id)},
+        headers=auth_headers(user),
+    )
+
+    # THE NON-DESTRUCTIVE ANSWER: fails open, never a 503, never claims to be serving.
+    assert timed_out.status_code == 200
+    assert timed_out.json()["ready"] is False
+    reg = await fake_redis.hgetall(registry_key(user.id))
+    assert reg.get(REGISTRY_FIELD_STATE) != REGISTRY_STATE_ENDING
+
+    # THE CONFIRMATION TRIPLE (L3): nothing that could destroy work actually ran, the platform's
+    # belief about unsaved work did not move, and the saved bundle was READ, never rewritten.
+    assert wire.sbx.provisioned == provisioned_before
+    assert wire.sbx.restored == restored_before
+    assert wire.sbx.torn_down == torn_down_before  # "the planted marker is present"
+    after_save_state = (await client.get(save_state_url, headers=auth_headers(user))).json()
+    assert after_save_state == before_save_state  # dirty (and everything else) unchanged
+    assert fake_storage.objects[snapshot_key(app_id)] == snapshot_before
+    assert fake_storage.mtimes[snapshot_key(app_id)] == mtime_before  # the etag proxy

@@ -10,7 +10,7 @@ import uuid
 from sqlalchemy import select
 
 from src.config import settings
-from src.db.models.conversation import Conversation, ConversationKind
+from src.db.models.conversation import ChatKind, Conversation
 from src.services.auth.session_jwt import mint_session_jwt
 from tests.factories import ConversationFactory, UserFactory
 
@@ -40,17 +40,17 @@ async def test_list_scoped_to_caller(client, db_session) -> None:
     assert resp.status_code == 200
     convs = resp.json()["conversations"]
     assert [c["_id"] for c in convs] == [str(mine.id)]
-    assert convs[0]["kind"] == "planning"
+    assert convs[0]["kind"] == "build"  # the factory's default, and every migrated chat's
     assert convs[0]["title"] == "mine"
     assert convs[0]["createdAt"].endswith("Z")
 
 
 async def test_list_kind_filter(client, db_session) -> None:
     headers, user = await _auth(db_session)
-    builder = await ConversationFactory.create(db_session, user.id, kind=ConversationKind.BUILDER)
-    await ConversationFactory.create(db_session, user.id, kind=ConversationKind.PLANNING)
+    builder = await ConversationFactory.create(db_session, user.id, kind=ChatKind.BUILD)
+    await ConversationFactory.create(db_session, user.id, kind=ChatKind.PLAN)
 
-    resp = await client.get("/v1/conversations?kind=builder", headers=headers)
+    resp = await client.get("/v1/conversations?kind=build", headers=headers)
     assert resp.status_code == 200
     convs = resp.json()["conversations"]
     assert [c["_id"] for c in convs] == [str(builder.id)]
@@ -78,16 +78,17 @@ async def test_list_newest_first(client, db_session) -> None:
 # --- get with messages --------------------------------------------------------
 
 
-async def test_get_returns_header_with_server_owned_mode(client, db_session) -> None:
+async def test_get_returns_header_with_the_chats_kind(client, db_session) -> None:
     headers, user = await _auth(db_session)
-    conv = await ConversationFactory.create(db_session, user.id)
+    conv = await ConversationFactory.create(db_session, user.id, kind=ChatKind.PLAN)
 
     resp = await client.get(f"/v1/conversations/{conv.id}", headers=headers)
     assert resp.status_code == 200
     body = resp.json()
     assert body["conversation"]["_id"] == str(conv.id)
-    # The sticky server-owned mode surfaces on the header (default: plan).
-    assert body["conversation"]["mode"] == "plan"
+    # What the chat IS (R16's server half), and nothing beside it.
+    assert body["conversation"]["kind"] == "plan"
+    assert "mode" not in body["conversation"]
     # The legacy message read died with the reset — the projection arrives in U6.
     assert "messages" not in body
 
@@ -136,7 +137,7 @@ async def test_patch_code_is_retired_400(client, db_session) -> None:
     """The `code` column died in 0024 — a client still sending a snapshot gets a 400 naming
     the retirement (never a silent ignore that looks like a saved snapshot)."""
     headers, user = await _auth(db_session)
-    conv = await ConversationFactory.create(db_session, user.id, kind=ConversationKind.BUILDER)
+    conv = await ConversationFactory.create(db_session, user.id, kind=ChatKind.BUILD)
     resp = await client.patch(
         f"/v1/conversations/{conv.id}",
         headers=headers,
@@ -204,14 +205,16 @@ def test_conversations_openapi_documents_models_and_codes() -> None:
     header = schema["components"]["schemas"]["HeaderOut"]["properties"]
     assert "_id" in header
     assert "createdAt" in header
+    # `mode` is gone from the required set, not merely absent from a response body: the schema
+    # is the contract the portal's hand-written mirror is read against.
     assert set(schema["components"]["schemas"]["HeaderOut"]["required"]) == {
         "_id",
         "projectId",
         "kind",
-        "mode",
         "createdAt",
         "updatedAt",
     }
+    assert "mode" not in header
 
 
 # --- documented-only wire-shape characterization ------------------------------
@@ -221,7 +224,7 @@ def test_conversations_openapi_documents_models_and_codes() -> None:
 # ABSENT when unset, PRESENT when set. A regression emitting them as `null` (e.g. someone
 # wiring `response_model` enforcement) would pass the schema test but fail here.
 
-_BASE_HEADER_KEYS = {"_id", "projectId", "kind", "mode", "createdAt", "updatedAt"}
+_BASE_HEADER_KEYS = {"_id", "projectId", "kind", "createdAt", "updatedAt"}
 
 
 async def test_list_omits_unset_optional_header_keys(client, db_session) -> None:

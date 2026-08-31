@@ -48,14 +48,13 @@ from pydantic_ai.messages import (
     RetryPromptPart,
     ToolCallPart,
     ToolReturnPart,
-    UserPromptPart,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.redaction import redact_secrets
 from src.db.models.attachment import Attachment
-from src.db.models.conversation import ConversationMode
+from src.db.models.conversation import ChatKind
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.services.media.magic import bytes_match_declared
 from src.services.storage import ObjectStorage, StorageError, assert_owned
@@ -65,7 +64,17 @@ _log = structlog.get_logger()
 # The payload serialization contract this code writes (pydantic-ai 2.5.0 native batch +
 # attachment-ref externalization). Readers of a row with a HIGHER version than they know
 # must refuse rather than guess.
-SCHEMA_VERSION: Final = 1
+#
+# 1 -> 2 WITH REVISION 0035, AND THAT BUMP IS A CORRECTNESS REQUIREMENT, NOT HOUSEKEEPING.
+# The payload shape did not change; what changed is what the row's own `kind` stamp MEANS.
+# 0035 rewrites every historical row to `build`, and the projection's narration drop reads
+# that stamp — so without a way to tell a rewritten row from a natively-written one, prose
+# that renders today would silently stop rendering on reload for every migrated transcript
+# (a Plan turn that read files and then wrote prose in one response is the ordinary shape,
+# not an edge case). `services/messages/projection.py` therefore gates the drop on
+# `schema_version >= SCHEMA_VERSION`: a fact about WHEN a row was written, never a per-row
+# exemption keyed on the migrated stamp.
+SCHEMA_VERSION: Final = 2
 
 # The attachment reference marker's discriminator value. The serialized `BinaryContent` uses
 # `kind: "binary"`; the externalized reference uses this kind so the two can never be confused.
@@ -466,9 +475,18 @@ async def load_history(
     rehydrate: Rehydrator,
 ) -> list[ModelMessage]:
     """The conversation's full native history, ready for `message_history`: every row's
-    payload (hidden marker rows INCLUDED — the model must see where the mode changed) in seq
-    order, references rehydrated, validated, dangling calls repaired. Owner-scoped
-    (ADR-0004)."""
+    payload in seq order, references rehydrated, validated, dangling calls repaired.
+    Owner-scoped (ADR-0004).
+
+    HIDDEN ROWS ARE INCLUDED, and the reason is not the one that used to be written here. It
+    said "the model must see where the mode changed" — there are no mode changes any more. The
+    reason it still holds is different and stronger: a hidden row can carry the `ToolReturnPart`
+    that ANSWERS a deferred call (the plan-options resolution overlay is exactly that), and
+    dropping it would hand the model a call with no return. Hiddenness is a RENDER predicate;
+    it was never a statement about what the model may see.
+
+    A row that must not reach the model therefore carries an EMPTY payload rather than relying
+    on being hidden — the durable turn-terminal row is the one that does."""
     stored = (
         await db.execute(
             sa.select(Message.schema_version, Message.payload)
@@ -507,8 +525,10 @@ async def load_rows(
     include_hidden: bool = False,
 ) -> Sequence[Message]:
     """The conversation's rows in seq order — the projection/audit read (U6 builds on this).
-    Hidden rows (mode-switch markers) are excluded unless asked for: hiddenness is this SQL
-    predicate, never a payload property."""
+    Hidden rows are excluded unless asked for: hiddenness is this SQL predicate, never a payload
+    property. (The example that used to be named here was the mode-switch marker, which is gone;
+    the build-started overlay, the plan-options resolution and the turn-terminal row are the
+    ones this predicate covers today.)"""
     query = (
         sa.select(Message)
         .where(Message.conversation_id == conversation_id, Message.user_id == user_id)
@@ -539,7 +559,7 @@ async def append_batch(
     conversation_id: uuid.UUID,
     messages: Sequence[ModelMessage],
     entry_kind: MessageEntryKind,
-    mode: ConversationMode,
+    kind: ChatKind,
     visibility: MessageVisibility = MessageVisibility.VISIBLE,
     meta: dict[str, Any] | None = None,
 ) -> StoredBatch:
@@ -565,7 +585,7 @@ async def append_batch(
                 schema_version=SCHEMA_VERSION,
                 entry_kind=entry_kind,
                 visibility=visibility,
-                mode=mode,
+                kind=kind,
                 payload=payload,
                 meta=safe_meta,
             )
@@ -589,54 +609,8 @@ async def append_batch(
     )
 
 
-# --- mode-switch markers ------------------------------------------------------
-
-
-def mode_switch_marker_text(old_mode: ConversationMode, new_mode: ConversationMode) -> str:
-    """The direction-aware marker prose (U4 decision). Upgrades stay minimal; a downgrade OUT
-    of Write adds the capability clarification — because post-Write history contains
-    successful write/run tool calls that contradict the current toolset, and that contradiction
-    exists exactly (and only) at this point in the history. The static mode prompts stay free
-    of absent-tool prose (R13); this marker is the one sanctioned exception."""
-    if old_mode is ConversationMode.WRITE and new_mode is not ConversationMode.WRITE:
-        follow_up = (
-            "read the app's files to answer questions."
-            if new_mode is ConversationMode.ASK
-            else "read the app's files and discuss what to change."
-        )
-        return (
-            f"[mode changed: {old_mode.value} → {new_mode.value}. The build tools used "
-            f"earlier in this conversation are not available in {new_mode.value.capitalize()} "
-            f"mode; {follow_up} The user can switch back to Write mode to make changes.]"
-        )
-    return f"[mode changed: {old_mode.value} → {new_mode.value}]"
-
-
-async def append_mode_switch_marker(
-    db: AsyncSession,
-    *,
-    user_id: uuid.UUID,
-    conversation_id: uuid.UUID,
-    old_mode: ConversationMode,
-    new_mode: ConversationMode,
-) -> StoredBatch:
-    """Persist the hidden mode-switch marker row: a pure native user message (payload) whose
-    hiddenness lives on the ROW (`entry_kind`/`visibility` — never in the payload). Written
-    directly by the switch endpoint, never through an agent run (`new_messages()` structurally
-    excludes injected history, so a run could never save it for us).
-
-    GOTCHA (pinned by test): never start a run with NO user prompt while a marker is the last
-    history message — pydantic-ai adopts the trailing request as the prompt, and the model
-    would be asked to answer the marker."""
-    marker = ModelRequest(
-        parts=[UserPromptPart(content=mode_switch_marker_text(old_mode, new_mode))]
-    )
-    return await append_batch(
-        db,
-        user_id=user_id,
-        conversation_id=conversation_id,
-        messages=[marker],
-        entry_kind=MessageEntryKind.MODE_SWITCH,
-        mode=new_mode,
-        visibility=MessageVisibility.HIDDEN,
-    )
+# THE MODE-SWITCH MARKER IS GONE, and nothing replaced it. It was a hidden `[mode changed: …]`
+# row written so the model could see where in the history its toolset changed. A chat's kind is
+# fixed at creation now (R14/R17), so there are no mode boundaries for a marker to name;
+# revision 0035 deleted every such row and the `mode_switch` entry kind went with the endpoint
+# that wrote them.

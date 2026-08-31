@@ -14,11 +14,11 @@ from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserProm
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus
 from src.config import settings
-from src.db.models.conversation import ConversationMode
+from src.db.models.conversation import ChatKind
 from src.db.models.message import MessageEntryKind
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.build_sessions.outcome import write_build_outcome
-from src.services.messages.store import append_batch, append_mode_switch_marker
+from src.services.messages.store import append_batch
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
@@ -43,7 +43,7 @@ async def _seeded_conversation(db_session, user):
         conversation_id=conversation.id,
         messages=[ModelRequest(parts=[UserPromptPart(content="what does my app do?")])],
         entry_kind=MessageEntryKind.TURN,
-        mode=ConversationMode.ASK,
+        kind=ChatKind.PLAN,
     )
     await append_batch(
         db_session,
@@ -51,7 +51,7 @@ async def _seeded_conversation(db_session, user):
         conversation_id=conversation.id,
         messages=[ModelResponse(parts=[TextPart(content="It tracks visitors.")])],
         entry_kind=MessageEntryKind.TURN,
-        mode=ConversationMode.ASK,
+        kind=ChatKind.PLAN,
     )
     return conversation
 
@@ -75,7 +75,10 @@ async def test_get_returns_header_projection_and_null_active_turn(client, db_ses
     body = resp.json()
 
     assert body["conversation"]["_id"] == str(conversation.id)
-    assert body["conversation"]["mode"] == "plan"  # the server-owned sticky mode (U4 default)
+    # What the chat IS, chosen at creation and never changed (R14/R16). There is no second
+    # field beside it: `mode` came off the header with the concept.
+    assert body["conversation"]["kind"] == "build"
+    assert "mode" not in body["conversation"]
     assert body["activeTurn"] is None  # the U10 seam: present, and null until the engine lands
 
     projection = body["projection"]
@@ -84,25 +87,11 @@ async def test_get_returns_header_projection_and_null_active_turn(client, db_ses
     assert projection[1]["text"] == "It tracks visitors."
     assert projection[2]["banner"] == "completed"
     assert projection[2]["previewUrl"] == PREVIEW  # camelCase on the wire
-    assert all("seq" in item and "mode" in item for item in projection)
-
-
-async def test_hidden_marker_rows_never_reach_the_wire(client, db_session) -> None:
-    headers, user = await _auth(db_session)
-    conversation = await _seeded_conversation(db_session, user)
-    await append_mode_switch_marker(
-        db_session,
-        user_id=user.id,
-        conversation_id=conversation.id,
-        old_mode=ConversationMode.ASK,
-        new_mode=ConversationMode.WRITE,
-    )
-
-    resp = await client.get(f"/v1/conversations/{conversation.id}", headers=headers)
-    assert resp.status_code == 200
-    body = resp.json()
-    assert [item["type"] for item in body["projection"]] == ["user_text", "assistant_text"]
-    assert "mode changed" not in resp.text  # the marker prose never leaves the server
+    # `seq` still identifies the row. The per-item kind stamp is GONE from the wire rather than
+    # renamed: nothing ever rendered it, no requirement asks for a per-message kind (R16 is
+    # about CHATS being listed, and the header carries that), and every item type carried one.
+    assert all("seq" in item for item in projection)
+    assert all("mode" not in item and "kind" not in item for item in projection)
 
 
 async def test_empty_conversation_projects_an_empty_list(client, db_session) -> None:

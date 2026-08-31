@@ -28,9 +28,9 @@ from __future__ import annotations
 
 import enum
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
-from typing import Annotated, Literal, Protocol
+from typing import Annotated, Final, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -115,6 +115,21 @@ LIVENESS_LEASE_RENEW_CADENCE_SECONDS = 30
 # milliseconds puts the deadline ~120_000 s out, not 30.
 LIVENESS_LEASE_CLOCK_SKEW_GRACE_SECONDS = 30
 
+# --- U13: the start-in-flight marker (C5 family 5, R4c/R3a) ------------------
+# A start in flight is a fact the platform holds, not one a tab remembers: `_holding_user_lock`
+# (the one skeleton behind the build start, the relaunch, and the turn's `ensure_sandbox`) writes
+# this marker for the duration of provisioning, so every tab, every session and a reloaded page
+# read the SAME answer instead of each guessing from its own request history.
+#
+# The TTL is MANDATORY, not a default — a marker with no expiry is the registry hash's own
+# mistake (ADR-0029) repeated in a new key. Bounded by the cold-start budget plus margin for the
+# provisioning that runs BEFORE the wait even starts (container create, the snapshot pull, one
+# retry of either): `_COLD_READY_BUDGET_SECONDS` (120s) covers only the final `wait_ready` leg,
+# and `_RESTORE_ATTEMPTS` (2) means a transient blip can pay that leg's setup twice. 300s (5 min)
+# is double the wait budget plus that margin, and still well inside `LOCK_TTL_SECONDS` (900s) —
+# the marker is a bounded claim on top of the lock, never a longer-lived one.
+STARTING_MARKER_TTL_SECONDS = 300  # 5 min
+
 # --- R14: what the generated app actually served ------------------------------
 # Requests the app served to real users buy a BOUNDED extension, never indefinite life.
 # Shorter than a deliberate builder action, because it is weaker evidence of intent: a
@@ -122,6 +137,18 @@ LIVENESS_LEASE_CLOCK_SKEW_GRACE_SECONDS = 30
 # Bounded means bounded — each report buys this much from now, and a container with
 # nothing but background chatter still lapses inside the idle band.
 SERVED_TRAFFIC_STAY_SECONDS = 900
+
+# --- U12: a turn that changed nothing (R100) ----------------------------------
+# The WEAKEST evidence of the four `DeadlineWriter`s, deliberately: it is pure keyboard, with
+# nothing on the container side to show for it — no file changed, no tool ran that could have.
+# Bounds the cost of R18 (both chat kinds pin the whole workspace, per turn) without a branch
+# on kind: a Plan-kind chat's ordinary Q&A, or a Build-kind chat's question that wrote nothing,
+# both land here. Long enough to read the reply and ask a follow-up without paying a cold
+# restore on the very next message; far short of the stay a write or a deliberate action earns
+# (`RELAUNCH_PREVIEW_STAY_SECONDS`/`SERVED_TRAFFIC_STAY_SECONDS` above). Monotonic extension
+# (`grant_stay_of_execution`'s `max(existing, computed)`) is what keeps this from ever
+# SHORTENING a longer stay a prior write turn already bought — see `locks.py`.
+TURN_ENDED_UNCHANGED_STAY_SECONDS = 300  # 5 min
 
 
 class PreviewLifeState(enum.StrEnum):
@@ -143,6 +170,11 @@ class PreviewLifeState(enum.StrEnum):
     # Built before, nothing serving it now. The next prompt brings it back from the durable
     # copy on Blob. NOT an error, NOT a loss — which is why no surface may style it as one.
     ASLEEP = "asleep"
+    # U13 — a build start, a relaunch or a turn's `ensure_sandbox` is IN FLIGHT for this project
+    # right now: the `starting` Redis marker names it. Not `alive` (there is no container yet)
+    # and not `asleep` (a start is actively under way) — a citizen watching this deserves a
+    # third word, not one of the other two stretched to also mean this.
+    STARTING = "starting"
     # Another of this user's projects holds the one-per-user workspace. `occupying_project_name`
     # names it, or is null when the live container matches no app this user owns (a ghost —
     # say nothing rather than guess a name into a sentence about someone's work).
@@ -151,6 +183,46 @@ class PreviewLifeState(enum.StrEnum):
     # The coordination store could not be read. Claims NOTHING in either direction; a client
     # that renders this as "gone" has reintroduced the bug this enum was written to kill.
     UNKNOWN = "unknown"
+
+
+class PreviewStateAction(enum.StrEnum):
+    """What a citizen may be OFFERED in response to a `PreviewLifeState` — R5's readiness→action
+    mapping (U13), written down here as data rather than left as a claim in a docstring, because
+    two of Plan F's units are hard-gated on it and this is the one path in the codebase with a
+    recorded data-loss incident
+    (`docs/solutions/logic-errors/readiness-timeout-triggers-destructive-sandbox-restore-2026-08-02.md`).
+
+    THREE BUCKETS, and `REMEDY` is the one that matters. `RETRY` is "press start/relaunch again" —
+    by this plan's own premise (R5) starting is never destructive, so it costs nothing to offer on
+    an ambiguous read. `NEITHER` is "nothing to offer" — already alive, already starting, or
+    nothing was ever built. `REMEDY` is the one bucket that can be consequential: SLOT_TAKEN's
+    remedy is releasing ANOTHER project's container, which is `release_project_sandbox` — "the
+    only route that destroys a container on purpose" (C3 §8.1) — taken on a CONFIRMED fact (the
+    marker or the registry names the occupying project outright), never a guess.
+
+    THE RULE THIS ENUM EXISTS TO LET A TEST ENFORCE: no state built from an ambiguous or
+    timed-out read may map to `REMEDY`. `UNKNOWN` maps to `RETRY`, never `REMEDY` — the exact
+    discipline the incident above was missing, where a readiness TIMEOUT was read as a death
+    certificate and routed straight into a teardown-then-restore."""
+
+    RETRY = "retry"  # try again; by construction this can never destroy anything (R5).
+    REMEDY = "remedy"  # a specific, nameable fix exists — and it may be consequential.
+    NEITHER = "neither"  # nothing to offer: already settled, or nothing exists to act on.
+
+
+PREVIEW_STATE_ACTION: Final[Mapping[PreviewLifeState, PreviewStateAction]] = {
+    PreviewLifeState.ALIVE: PreviewStateAction.NEITHER,
+    PreviewLifeState.ASLEEP: PreviewStateAction.RETRY,
+    PreviewLifeState.STARTING: PreviewStateAction.NEITHER,
+    PreviewLifeState.SLOT_TAKEN: PreviewStateAction.REMEDY,
+    PreviewLifeState.NEVER_BUILT: PreviewStateAction.NEITHER,
+    PreviewLifeState.UNKNOWN: PreviewStateAction.RETRY,
+}
+"""A TOTAL FUNCTION over the enum, by construction rather than by convention: a `PreviewLifeState`
+added later with no entry here raises `KeyError` on lookup rather than silently rendering a button
+whose meaning nobody chose (R5, first half — `tests/api/v1/build_sessions/test_preview_state.py`
+asserts every member is present). See `PreviewStateAction` for what each bucket may do and the one
+rule (`UNKNOWN` never maps to `REMEDY`) that R5's second half is actually about."""
 
 
 # --- Control operations: start / stop / status (C3 §2) -----------------------

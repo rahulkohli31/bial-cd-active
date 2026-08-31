@@ -25,7 +25,7 @@ from src.api.v1.build_sessions.deps import (
 from src.api.v1.build_sessions.schemas import BuildSessionStatus
 from src.db.base import async_session_factory
 from src.db.models.app_registry import AppRegistry
-from src.db.models.conversation import ConversationKind
+from src.db.models.conversation import ChatKind
 from src.db.models.harness_counter import HarnessCount, HarnessCounter
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.build_sessions.locks import lock_is_held
@@ -118,7 +118,7 @@ async def test_relaunch_after_failed_build_signals_last_saved_version(
     user, project = await _user_project(db_session, "rl6@rvaiglobal.com")
     await _seed_snapshot(db_session, user, project, fake_storage)
     conv = await ConversationFactory.create(
-        db_session, user.id, project_id=project.id, kind=ConversationKind.BUILDER
+        db_session, user.id, project_id=project.id, kind=ChatKind.BUILD
     )
     await write_build_outcome(
         db_session,

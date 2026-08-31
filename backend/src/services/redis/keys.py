@@ -6,7 +6,7 @@ break (a lock written under one format is invisible to a reaper reading another)
 `uuid.UUID` and enforce it at RUNTIME, not just in the annotation: a canonical UUID cannot contain
 a `:`, so the `user_id` axis can never forge a different family, and the type IS the boundary.
 
-Four sandbox families share the environment-scoped root `bial:{environment}:sandbox:`; the segment
+Five sandbox families share the environment-scoped root `bial:{environment}:sandbox:`; the segment
 after it is the family discriminator (C5):
 
     bial:{env}:sandbox:lock:{user_id}        string  — one-per-user lock (SET NX EX)
@@ -15,8 +15,10 @@ after it is the family discriminator (C5):
                                                         state, preview_stay_until?}
     bial:{env}:sandbox:lease:{user_id}       string  — R10 liveness lease (wall-clock deadline,
                                                         epoch seconds, TTL mandatory)
+    bial:{env}:sandbox:starting:{user_id}    string  — U13 start-in-flight marker (the project id
+                                                        being started, TTL mandatory)
 
-The fifth C5 family is the taskiq queue, built in `src/broker.py`: `bial:{env}:taskiq:stream` plus
+The sixth C5 family is the taskiq queue, built in `src/broker.py`: `bial:{env}:taskiq:stream` plus
 the library-derived `autoclaim:<group>:<stream>`, whose literal prefix cannot be moved under
 `bial:` and therefore sits outside the environment-scoping guarantee by construction.
 
@@ -64,6 +66,7 @@ FAMILY_LOCK: Final = "lock"
 FAMILY_HEARTBEAT: Final = "heartbeat"
 FAMILY_REGISTRY: Final = "registry"
 FAMILY_LEASE: Final = "lease"
+FAMILY_STARTING: Final = "starting"
 
 
 def _environment() -> str:
@@ -138,6 +141,22 @@ def lease_key(user_id: uuid.UUID) -> str:
     one is the root cause of ADR-0029, and a lease that never expires is a container that can
     never be reclaimed. `build_sessions/locks.py` owns the three primitives (U12)."""
     return ns(FAMILY_LEASE, user_id)
+
+
+def starting_key(user_id: uuid.UUID) -> str:
+    """`bial:{env}:sandbox:starting:{user_id}` — the U13 start-in-flight marker (C5 family 5).
+
+    The value is the `project_id` (str(uuid.UUID)) being started, and it **must** carry a TTL
+    bounded by the cold-start budget plus margin: a marker with no expiry is the registry hash's
+    mistake (ADR-0029) repeated in a new key. Written once, by `_holding_user_lock` — the one
+    skeleton behind the build start, the relaunch and the turn's `ensure_sandbox` — and cleared
+    on the same scope exit that releases or adopts the lock, and in the compensation arm.
+
+    DELIBERATELY NOT A REGISTRY FIELD. A registry entry written before a container exists is
+    exactly the "registered ⇒ spared" hazard ADR-0029 exists to remove, and it would be visible
+    to the sweep, the reconciler and the ARM reconciliation as a container that does not exist.
+    `build_sessions/locks.py` owns the write/read/clear primitives (U13)."""
+    return ns(FAMILY_STARTING, user_id)
 
 
 def legacy_registry_key(user_id: uuid.UUID) -> str:

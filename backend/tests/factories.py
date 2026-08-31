@@ -20,7 +20,7 @@ from pydantic_ai.messages import ModelRequest, UserPromptPart
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.app_registry import AppRegistry, AppStatus, mint_app_key
-from src.db.models.conversation import Conversation, ConversationKind, ConversationMode
+from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.db.models.project import Project
 from src.db.models.user import User
@@ -96,14 +96,18 @@ class AppRegistryFactory:
 
 class ConversationFactory:
     """Builds a conversation row. `user_id` is required (ownership). The id defaults to a
-    fresh v4 uuid — the SPA mints client-side ids, so tests do too."""
+    fresh v4 uuid — the SPA mints client-side ids, so tests do too.
+
+    The default kind is BUILD, matching what every migrated conversation became and what a
+    test that does not care about the kind almost always wants: the surface with tools. A test
+    about a Plan chat passes `kind=ChatKind.PLAN` and says so."""
 
     @staticmethod
     def build(user_id: uuid.UUID, **overrides: Any) -> Conversation:
         data: dict[str, Any] = {
             "id": uuid.uuid4(),
             "user_id": user_id,
-            "kind": ConversationKind.PLANNING,
+            "kind": ChatKind.BUILD,
         }
         data.update(overrides)
         return Conversation(**data)
@@ -137,7 +141,7 @@ class MessageFactory:
             "seq": 0,
             "entry_kind": MessageEntryKind.TURN,
             "visibility": MessageVisibility.VISIBLE,
-            "mode": ConversationMode.PLAN,
+            "kind": ChatKind.BUILD,
             "payload": dump_for_row([ModelRequest(parts=[UserPromptPart(content="hi")])]),
         }
         data.update(overrides)

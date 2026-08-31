@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.deps import run_build_dependency
 from src.db.models.attachment import Attachment
-from src.db.models.conversation import ConversationKind
+from src.db.models.conversation import ChatKind
 from src.services.messages.store import dump_for_row
 from src.services.storage import attachment_key
 from tests.api.v1.build_sessions.conftest import auth_headers, drain
@@ -29,7 +29,7 @@ async def _owner(db: AsyncSession, email: str):
     user = await UserFactory.create(db, email=email)
     project = await ProjectFactory.create(db, user.id)
     conv = await ConversationFactory.create(
-        db, user.id, project_id=project.id, kind=ConversationKind.BUILDER
+        db, user.id, project_id=project.id, kind=ChatKind.BUILD
     )
     return user, project, conv
 

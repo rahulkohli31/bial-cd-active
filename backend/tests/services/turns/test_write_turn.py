@@ -53,7 +53,7 @@ from src.api.v1.build_sessions.schemas import BuildError, ErrorSource
 from src.api.v1.conversations.schemas import StepFrame, TextDeltaFrame
 from src.config import settings
 from src.core.integrity_types import BaselineIdentity
-from src.db.models.conversation import ConversationMode
+from src.db.models.conversation import ChatKind
 from src.db.models.message import Message, MessageEntryKind
 from src.db.models.token_usage import TokenUsage
 from src.services.agent.mode_prompts import PromptContext, workspace_note
@@ -134,7 +134,7 @@ async def _write_conversation(db: AsyncSession, email: str):
     user = await UserFactory.create(db, email=email)
     project = await ProjectFactory.create(db, user.id)
     conv = await ConversationFactory.create(
-        db, user.id, project_id=project.id, mode=ConversationMode.WRITE
+        db, user.id, project_id=project.id, kind=ChatKind.BUILD
     )
     return user, project, conv
 
@@ -872,7 +872,7 @@ async def test_a_genuinely_empty_delta_still_noops(
         turn_id=uuid.uuid4(),
         conversation_id=conv.id,
         user_id=user.id,
-        mode=ConversationMode.WRITE,
+        kind=ChatKind.BUILD,
     )
     history: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content="x")])]
 
@@ -1154,7 +1154,7 @@ def _a_turn_state() -> _TurnState:
         turn_id=uuid.uuid4(),
         conversation_id=uuid.uuid4(),
         user_id=uuid.uuid4(),
-        mode=ConversationMode.WRITE,
+        kind=ChatKind.BUILD,
     )
 
 
@@ -1543,22 +1543,30 @@ def test_no_sentence_this_plan_shows_a_citizen_carries_developer_jargon() -> Non
             assert term not in sentence, f"{term!r} reached a citizen in {sentence!r}"
 
 
-async def test_the_workspace_note_rides_every_turn_even_off_cadence(
+async def test_the_workspace_note_rides_a_build_turn_too(
     _fresh_engine,
     db_session,
     session_factory,
     fake_redis: aioredis.Redis,
     fake_storage,
 ) -> None:
-    """★ COVERS AE9, and this is the assertion that pins the MECHANISM rather than the outcome.
+    """★ COVERS AE9 — the BUILD half of the workspace note, and the reason it lives here.
 
-    The obvious home for the workspace note was `_reminder_text`, which already injects private
-    guidance into the same tail. It is cadence-gated — full every eighth turn in the mode, a nudge
-    every fourth, silence between — so riding it would have told the model what its app was doing
-    on roughly one turn in four, while U8's whole claim is that answering from stale history is
-    structurally impossible. A turn OFF the cadence still carries the note, or the claim is false.
+    The note is injected once, ABOVE the branch that picks the run loop, so both kinds get the
+    same message. Proving that for a Plan turn is cheap and
+    `test_reminders.py::test_the_workspace_note_still_rides_a_turn_off_any_anchor` does it; a
+    Build turn takes the node loop and needs a provisioned container to reach its first model
+    request, which is the harness this file already stands up. Two halves, one claim, asserted
+    where each harness lives.
 
-    Mutation check: fold the note into `_reminder_text` and the off-cadence turn goes red."""
+    IT ALSO USED TO PIN A MECHANISM THAT IS GONE. The obvious home for the note was the
+    per-turn restatement's injector, which was cadence-gated — a full restatement every eighth
+    turn in the mode, a nudge every fourth, silence between — so riding it would have told the
+    model what its app was doing on roughly one turn in four, while the claim is that answering
+    from stale history is structurally impossible. That injector and its cadence are retired
+    (`test_reminders.py` is their inertness guard), so "off cadence" no longer names anything;
+    the history length below is kept as-is because a note that rides EVERY turn rides that one
+    too, and shortening the fixture would only make the test weaker."""
     engine = _fresh_engine
     user, project, conv = await _write_conversation(db_session, "wt-note@rvaiglobal.com")
     manager, client = SessionManager(), FakeSandboxClient()
@@ -1568,8 +1576,8 @@ async def test_the_workspace_note_rides_every_turn_even_off_cadence(
         seen.append(list(messages))
         yield "noted."
 
-    # THREE prior turns: `_turns_since_mode_anchor` counts three user prompts, and neither 3 % 8
-    # nor 3 % 4 is zero — so `_reminder_text` is silent on this one.
+    # THREE prior turns — the length that used to fall between both cadence anchors, kept so
+    # this stays the same fixture the claim was originally made against.
     history: list[ModelMessage] = [
         message
         for n in range(3)
@@ -2067,14 +2075,14 @@ async def test_a_red_verdict_after_declare_done_still_goes_to_repair(
 # =============================================================================
 
 
-def _bare_state(mode: ConversationMode = ConversationMode.WRITE) -> _TurnState:
+def _bare_state(kind: ChatKind = ChatKind.BUILD) -> _TurnState:
     """A turn state with nothing but its identity — enough to drive `_on_event`, which is the
     seam where a tool call becomes a step frame and where the stillness narrator is armed."""
     return _TurnState(
         turn_id=uuid.uuid7(),
         conversation_id=uuid.uuid7(),
         user_id=uuid.uuid7(),
-        mode=mode,
+        kind=kind,
     )
 
 
@@ -2265,7 +2273,7 @@ def test_ask_mode_prose_is_never_held(_fresh_engine) -> None:
     """The hold is WRITE's alone: in Ask/Plan the prose IS the deliverable, and holding it would
     be a dead screen for the length of the answer."""
     engine = _fresh_engine
-    state = _bare_state(ConversationMode.ASK)
+    state = _bare_state(ChatKind.PLAN)
 
     engine._on_event(state, _narrated("The visitor list lives in app/visitors/page.tsx."))
 

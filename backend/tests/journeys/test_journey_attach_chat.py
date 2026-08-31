@@ -170,7 +170,7 @@ async def test_uploaded_image_reaches_the_model_as_binary_content(
     created = await client.post(
         "/v1/conversations",
         headers=headers,
-        json={"id": conversation_id, "projectId": str(project.id), "kind": "planning"},
+        json={"id": conversation_id, "projectId": str(project.id), "kind": "plan"},
     )
     assert created.status_code == 201, created.text
 

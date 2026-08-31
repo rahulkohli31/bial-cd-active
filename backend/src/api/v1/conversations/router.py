@@ -30,24 +30,21 @@ from sqlalchemy.orm.exc import StaleDataError
 from src.api.deps import CurrentUser, DbSession
 from src.api.deps_csrf import RequireCsrf
 from src.api.v1.attachments.router import storage_dependency
-from src.api.v1.build_sessions.deps import SessionManagerDep
 from src.api.v1.conversations.schemas import (
     ConversationCreateRequest,
     ConversationCreateResponse,
     ConversationDetailResponse,
     ConversationListResponse,
-    ModeSwitchResponse,
 )
 from src.core.errors import AppApiError
-from src.db.models.conversation import Conversation, ConversationKind, ConversationMode
-from src.schemas import AUTH_401, CamelModel, ErrorEnvelope, OkResponse, error_responses
+from src.db.models.conversation import ChatKind, Conversation
+from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses
 from src.services.conversations import gather_and_delete_conversation
 from src.services.messages.projection import project_rows
-from src.services.messages.store import append_mode_switch_marker, load_rows
+from src.services.messages.store import load_rows
 from src.services.projects import owned_project_or_404
 from src.services.storage import ObjectStorage, sweep_blobs
 from src.services.turns.engine import get_turn_engine
-from src.services.turns.guard import conversation_is_mid_reply
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
@@ -57,8 +54,8 @@ router = APIRouter(prefix="/conversations", tags=["conversations"])
 
 # Client-minted id shape (Express `ID_RE`) — a safe key token, no `/` or `..`.
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-# The valid `?kind` values (Express `KINDS`).
-_KINDS = {k.value for k in ConversationKind}
+# The valid `?kind` values.
+_KINDS = {k.value for k in ChatKind}
 # Newest-first list cap (Express limit).
 _LIST_LIMIT = 200
 # A conversation-owned storage handle for the delete sweep (swappable in tests).
@@ -96,9 +93,6 @@ def _header_dict(conv: Conversation) -> dict[str, Any]:
         # ("ProjectName / chat title"); the chat itself stays addressed flat by its own id.
         "projectId": str(conv.project_id),
         "kind": conv.kind.value,
-        # The server-owned sticky chat mode (U4) — the toggle renders from THIS, never from
-        # client state.
-        "mode": conv.mode.value,
         "createdAt": _iso(conv.created_at),
         "updatedAt": _iso(conv.updated_at),
     }
@@ -128,7 +122,7 @@ async def list_conversations(
         raise AppApiError(400, "Unknown kind.")
     query = sa.select(Conversation).where(Conversation.user_id == user.id)
     if kind is not None:
-        query = query.where(Conversation.kind == ConversationKind(kind))
+        query = query.where(Conversation.kind == ChatKind(kind))
     # Optional project scope (R6). Already user-scoped, so a cross-user project_id simply
     # returns nothing — no leak, no separate ownership check needed.
     if project_id is not None:
@@ -175,12 +169,10 @@ async def create_conversation(
             title=body.title,
             context=body.context,
         )
-        if body.mode is not None:
-            row.mode = body.mode
         db.add(row)
         try:
-            # Refresh through the flush before projecting (server-default timestamps/mode
-            # would MissingGreenlet on a fresh row otherwise — the builder-thread pattern).
+            # Refresh through the flush before projecting (server-default timestamps would
+            # MissingGreenlet on a fresh row otherwise — the builder-thread pattern).
             await db.flush()
         except IntegrityError:
             # Two tabs raced the same mint — the winner's row is the truth; fall through to
@@ -202,64 +194,11 @@ async def create_conversation(
     raise AppApiError(409, "This conversation id is already in use.")
 
 
-class ModeSwitchRequest(CamelModel):
-    """The explicit mode switch (U13/R6). Mode is server-owned sticky state — this is the
-    ONE writer besides the Build-it transition."""
-
-    mode: ConversationMode
-
-
-@router.post(
-    "/{conversation_id}/mode",
-    response_model=ModeSwitchResponse,
-    dependencies=[RequireCsrf],
-    responses=error_responses(
-        (400, ErrorEnvelope, "Invalid conversation id or mode"),
-        AUTH_401,
-        (403, ErrorEnvelope, "CSRF check failed"),
-        (404, ErrorEnvelope, "Conversation not found"),
-        (409, ErrorEnvelope, "The agent is working in this conversation — switch between turns"),
-    ),
-)
-async def switch_mode(
-    conversation_id: str,
-    body: ModeSwitchRequest,
-    user: CurrentUser,
-    db: DbSession,
-    manager: SessionManagerDep,
-) -> JSONResponse:
-    """Switch the conversation's mode — only BETWEEN turns (never mid-stream), atomically
-    with the hidden mode-switch marker row (U4's shape): the model sees exactly where in
-    the history the mode changed, the UI never renders it, and U14's reminder cadence gets
-    its deterministic reset anchor. Same-mode is an idempotent no-op (no marker spam).
-
-    "Between turns" now includes builds: while a build is live in this thread the mode is
-    frozen. Without that, a reloaded tab could switch Write → Plan mid-build and walk straight
-    around the turn route's Write refusal — and the end sequence's mode restore would then have
-    a stale entry mode to argue with."""
-    owned = await _load_owned(db, user.id, conversation_id)
-    if owned.mode == body.mode:
-        return JSONResponse(content={"mode": owned.mode.value})
-    if conversation_is_mid_reply(owned.id):
-        raise AppApiError(409, "A reply is being generated — switch modes between turns.")
-    if manager.live_session_for_conversation(owned.id) is not None:
-        raise AppApiError(
-            409,
-            "The assistant is building your app right now. You can change this "
-            "once the build finishes.",
-        )
-    old_mode = owned.mode
-    owned.mode = body.mode
-    db.add(owned)
-    await append_mode_switch_marker(
-        db,
-        user_id=user.id,
-        conversation_id=owned.id,
-        old_mode=old_mode,
-        new_mode=body.mode,
-    )
-    await db.commit()
-    return JSONResponse(content={"mode": body.mode.value})
+# THERE IS NO MODE-SWITCH ROUTE, and there is no route that changes a chat's kind at all.
+# A chat is one thing or the other from the moment it is created (R14/R15/R17), so the control
+# that let a conversation become something else — and the hidden marker row it appended to tell
+# the model where its toolset changed — are both gone. What used to be a switch is now a choice
+# made once, at creation, on `POST /conversations`.
 
 
 async def _load_owned(db: DbSession, user_id: uuid.UUID, conversation_id: str) -> Conversation:

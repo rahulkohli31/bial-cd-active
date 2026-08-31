@@ -1,7 +1,25 @@
-"""U14 (D3): ephemeral mode reminders — cadence, switch reset, and the persistence
-boundary. The reminder rides `message_history` only; `new_messages()` structurally
-excludes injected history, so the DB must stay reminder-free by CONSTRUCTION — the
-engine-level tests here prove both sides (the model saw it, the rows never did)."""
+"""THE PER-TURN RESTATEMENT IS GONE — this file is its inertness guard (R17).
+
+WHAT USED TO BE HERE. A cadence: a full restatement of "which mode you are in" every eighth
+turn in the mode, a one-line nudge every fourth between, anchored on the hidden mode-switch
+marker rows so a switch reset the count and the new mode's first turn got an immediate full
+reminder. Eight reminder strings, two engine constants, a marker scanner, and a card-state
+gate that decided which of the Plan variants was safe to send.
+
+WHY IT WENT. It was restating a thing that no longer exists. A chat's kind is fixed when it is
+created, so there is no mode to be in and no boundary to re-anchor on; and having a different
+set of ABILITIES is what carries "which chat this is" — the model cannot call a tool it was not
+handed, whatever it was last told. The delivery was also the wrong tier: a `user`-role message
+on a per-turn cadence, which is a named cache-breaking action.
+
+WHY THIS FILE STAYS. Deleting a test suite deletes the evidence that the thing is gone. The
+repo's convention (`docs/solutions/conventions/cleanly-removing-dead-ui-controls-2026-06-23.md`)
+is that the last link of a removal trace is a guard, not an absence. So: a long conversation
+runs through the real engine and no restatement rides it — and the workspace note, which shares
+the same envelope and the same injection mechanism but is a different claim entirely, still
+rides EVERY turn. That second half is what stops this guard from passing for the wrong reason,
+because "nothing was injected at all" would satisfy the first half on its own.
+"""
 
 from __future__ import annotations
 
@@ -12,36 +30,71 @@ import uuid
 
 import pytest
 import sqlalchemy as sa
+from pydantic import SecretStr
 from pydantic_ai.messages import (
     ModelMessage,
     ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
     TextPart,
-    ToolCallPart,
-    ToolReturnPart,
     UserPromptPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from src.db.models.conversation import ConversationMode
+from src.config import settings
+from src.db.models.conversation import ChatKind
 from src.db.models.message import Message
-from src.services.agent.mode_prompts import PromptContext, mode_reminder
+from src.services.agent import mode_prompts
+from src.services.agent.mode_prompts import PromptContext
 from src.services.build_sessions.manager import SessionManager
-from src.services.messages.store import mode_switch_marker_text
-from src.services.turns.engine import (
-    REMINDER_FULL_EVERY,
-    REMINDER_NUDGE_EVERY,
-    TurnEngine,
-    _reminder_text,
-    set_turn_engine_for_tests,
-)
+from src.services.sandbox.config import SandboxConfig
+from src.services.turns import engine as engine_module
+from src.services.turns.engine import TurnEngine, set_turn_engine_for_tests
 from src.services.turns.guard import _mid_reply
 from tests.factories import ConversationFactory, UserFactory
+from tests.fakes import FakeSandboxClient
 
 _CTX = PromptContext(user_name="Ada", project_name="Visitors", project_description=None)
 
-# --- history builders ----------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _sandbox_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every kind pins the project's LIVE container now (R18) — a Plan turn attaches a sandbox
+    exactly like a Build turn — so a turn dies at the workspace pin before the model ever runs
+    unless a deployment is configured. Same wiring `test_engine.py` and `test_write_turn.py`
+    carry, for the same reason.
+
+    THIS IS WHAT MAKES THE GUARD BELOW HONEST rather than vacuously green: without it every
+    assertion about "what reached the model" would be asserting over an empty list, because
+    nothing reached the model at all."""
+    monkeypatch.setattr(
+        settings,
+        "sandbox",
+        SandboxConfig(
+            subscription_id="s",
+            resource_group="r",
+            region="westeurope",
+            managed_environment_name="aca-env",
+            acr_server="acr.azurecr.io",
+            acr_username="acr-user",
+            acr_password=SecretStr("acr-pass"),
+            image_ref="acr/img:latest",
+        ),
+    )
+
+
+@pytest.fixture(autouse=True)
+async def _sandbox_dependencies(fake_redis, fake_storage) -> None:
+    """The R10 liveness lease (Redis) and the attach's storage reads both need a backing fake
+    now that every turn attaches a live container. One deployment fact, two fixtures."""
+    return None
+
+
+# What the retired cadence's anchors were. Kept as literals rather than imported — importing
+# them is what this file exists to prove is impossible — so "run a long conversation" means the
+# same lengths it always did, including the two that used to be guaranteed to speak.
+_RETIRED_NUDGE_EVERY = 4
+_RETIRED_FULL_EVERY = 8
 
 
 def _turn(n: int) -> list[ModelMessage]:
@@ -55,92 +108,50 @@ def _turns(count: int) -> list[ModelMessage]:
     return [message for n in range(count) for message in _turn(n)]
 
 
-def _marker(
-    old: ConversationMode = ConversationMode.ASK,
-    new: ConversationMode = ConversationMode.PLAN,
-) -> ModelRequest:
-    """The real marker prose (store.py's), so the detector is tested against what the
-    switch endpoint actually persists."""
-    return ModelRequest(parts=[UserPromptPart(content=mode_switch_marker_text(old, new))])
+# --- the symbols themselves ------------------------------------------------------------
 
 
-# --- the cadence ---------------------------------------------------------------------
+def test_no_restatement_machinery_survives_anywhere() -> None:
+    """The named symbols are gone from both modules that carried them.
+
+    Named one by one rather than as a `dir()` sweep: each of these was a separate decision to
+    delete, and an implementer working from a "six reminders" description would leave the two
+    HOLDING variants behind, unreferenced, where nothing would ever notice them."""
+    for retired in (
+        "mode_reminder",
+        "_ASK_SEGMENT",
+        "_ASK_REMINDER_FULL",
+        "_ASK_REMINDER_NUDGE",
+        "_PLAN_REMINDER_FULL",
+        "_PLAN_REMINDER_NUDGE",
+        "_PLAN_REMINDER_FULL_HOLDING",
+        "_PLAN_REMINDER_NUDGE_HOLDING",
+        "_WRITE_REMINDER_FULL",
+        "_WRITE_REMINDER_NUDGE",
+    ):
+        assert not hasattr(mode_prompts, retired), retired
+    for retired in (
+        "_reminder_text",
+        "REMINDER_FULL_EVERY",
+        "REMINDER_NUDGE_EVERY",
+        "_turns_since_mode_anchor",
+        "_MODE_MARKER_PREFIX",
+    ):
+        assert not hasattr(engine_module, retired), retired
 
 
-def test_fresh_conversation_first_turn_is_silent() -> None:
-    # The per-run instructions are right there — no reminder on top of them.
-    assert _reminder_text(ConversationMode.ASK, []) is None
+def test_the_private_note_marker_outlived_them_and_still_composes_the_workspace_note() -> None:
+    """`_PRIVATE` is the one constant from that block that stays, and this says why.
+
+    It is composed into the workspace note's tail as well, so an implementer deleting "the
+    reminder constants" as a group takes with it the sentence that tells the model the
+    workspace note is internal — and the model narrates it back at the citizen, which is the
+    recorded defect that put the sentence there."""
+    note = mode_prompts.workspace_note(serving=True, still_the_template=False)
+    assert "between you and the platform" in note
 
 
-@pytest.mark.parametrize("ordinal", [1, 2, 3, 5, 7, 9])
-def test_between_cadence_points_is_silent(ordinal: int) -> None:
-    assert _reminder_text(ConversationMode.PLAN, _turns(ordinal)) is None
-
-
-@pytest.mark.parametrize("ordinal", [REMINDER_NUDGE_EVERY, 12, 20])
-def test_nudge_rides_every_fourth_turn(ordinal: int) -> None:
-    assert _reminder_text(ConversationMode.PLAN, _turns(ordinal)) == mode_reminder(
-        ConversationMode.PLAN, full=False
-    )
-
-
-@pytest.mark.parametrize("ordinal", [REMINDER_FULL_EVERY, 16, 24])
-def test_full_reminder_rides_every_eighth_turn(ordinal: int) -> None:
-    assert _reminder_text(ConversationMode.ASK, _turns(ordinal)) == mode_reminder(
-        ConversationMode.ASK, full=True
-    )
-
-
-def test_mode_switch_gets_an_immediate_full_reminder() -> None:
-    # The new mode's FIRST turn: history actively contradicts the fresh toolset.
-    history = [*_turns(3), _marker()]
-    assert _reminder_text(ConversationMode.PLAN, history) == mode_reminder(
-        ConversationMode.PLAN, full=True
-    )
-
-
-def test_mode_switch_resets_the_cadence() -> None:
-    # 7 turns, switch, 1 turn: without the reset this would be the 8th turn (full);
-    # with it, it is turn 1 of the new mode — silence.
-    history = [*_turns(7), _marker(), *_turn(7)]
-    assert _reminder_text(ConversationMode.PLAN, history) is None
-    # …and the NEWEST marker wins when the user switched twice.
-    twice = [*_turns(2), _marker(), *_turns(REMINDER_NUDGE_EVERY), _marker()]
-    assert _reminder_text(ConversationMode.ASK, twice) == mode_reminder(
-        ConversationMode.ASK, full=True
-    )
-
-
-def test_tool_return_requests_do_not_advance_the_cadence() -> None:
-    # Plan-options resolutions persist as ToolReturnPart-only requests — mechanics,
-    # not conversation. Three of them on top of 4 real turns still reads as turn 4.
-    resolutions: list[ModelMessage] = [
-        ModelRequest(
-            parts=[
-                ToolReturnPart(
-                    tool_name="present_plan_options", content="refine", tool_call_id=f"c{n}"
-                )
-            ]
-        )
-        for n in range(3)
-    ]
-    history = [*_turns(REMINDER_NUDGE_EVERY), *resolutions]
-    assert _reminder_text(ConversationMode.PLAN, history) == mode_reminder(
-        ConversationMode.PLAN, full=False
-    )
-
-
-def test_reminders_speak_no_forbidden_fruit() -> None:
-    # Same R13 bar as the static segments: positive voice only — a reminder that bans
-    # absent tools would teach the model to reason about capabilities it doesn't have.
-    for mode in ConversationMode:
-        for full in (True, False):
-            lowered = mode_reminder(mode, full=full).lower()
-            for phrase in ("do not", "don't", "never", "cannot", "can't", "must not"):
-                assert phrase not in lowered, f"{phrase!r} crept into {mode.value} reminder"
-
-
-# --- the engine seam: injected into the run, never into a row ------------------------
+# --- the engine seam -------------------------------------------------------------------
 
 
 @pytest.fixture(autouse=True)
@@ -174,10 +185,16 @@ async def _settle(engine: TurnEngine, conversation_id: uuid.UUID) -> None:
 
 
 async def _run_with_history(
-    engine: TurnEngine, db_session, session_factory, history: list[ModelMessage]
+    engine: TurnEngine,
+    db_session,
+    session_factory,
+    history: list[ModelMessage],
 ) -> tuple[list[list[ModelMessage]], uuid.UUID]:
-    """One Ask turn through the real engine with a capturing model: returns every
-    request-message list the model saw, and the conversation id."""
+    """One Plan turn through the real engine with a capturing model: returns every
+    request-message list the model saw, and the conversation id.
+
+    Run through the real engine rather than by calling the injection helper directly, because
+    the thing being proved is what reaches the model — not what a helper returns."""
     seen: list[list[ModelMessage]] = []
 
     async def _stream(messages: list[ModelMessage], info: AgentInfo):
@@ -185,7 +202,7 @@ async def _run_with_history(
         yield "noted."
 
     user = await UserFactory.create(db_session)
-    conv = await ConversationFactory.create(db_session, user.id, mode=ConversationMode.ASK)
+    conv = await ConversationFactory.create(db_session, user.id, kind=ChatKind.PLAN)
     await engine.start_turn(
         conversation=conv,
         user_id=user.id,
@@ -198,57 +215,83 @@ async def _run_with_history(
         model=FunctionModel(stream_function=_stream),
         session_factory=session_factory,
         persist_user_turn=_noop_persist,
+        sandbox_client=FakeSandboxClient(),
     )
     await _settle(engine, conv.id)
     return seen, conv.id
 
 
-async def test_cadence_turn_rides_the_reminder_into_the_model_request(
-    _fresh_engine, db_session, session_factory
-) -> None:
-    seen, _ = await _run_with_history(
-        _fresh_engine, db_session, session_factory, _turns(REMINDER_NUDGE_EVERY)
-    )
-    prompts = [
+def _injected_prompts(messages: list[ModelMessage]) -> list[str]:
+    return [
         part.content
-        for message in seen[0]
+        for message in messages
         if isinstance(message, ModelRequest)
         for part in message.parts
-        if isinstance(part, UserPromptPart)
+        if isinstance(part, UserPromptPart) and isinstance(part.content, str)
     ]
-    # The reminder sits near the tail of history, just before this turn's prompt — with U8's
-    # workspace note between the two, because that one rides EVERY turn and this one does not.
-    assert prompts[-3] == mode_reminder(ConversationMode.ASK, full=False)
-    assert prompts[-1] == "and one more thing"
 
 
-async def test_between_cadence_points_the_model_sees_no_reminder(
+@pytest.mark.parametrize("length", [0, 1, 3, _RETIRED_NUDGE_EVERY, _RETIRED_FULL_EVERY, 40])
+async def test_no_turn_at_any_length_carries_a_restatement(
+    _fresh_engine, db_session, session_factory, length: int
+) -> None:
+    """Including at both retired anchors, and including a forty-turn conversation.
+
+    The two middle lengths are the ones that used to be GUARANTEED to speak — a nudge at four,
+    a full restatement at eight — so a cadence left half-deleted would still fire here. Forty
+    covers the "long conversation" the cadence existed for in the first place."""
+    seen, _ = await _run_with_history(_fresh_engine, db_session, session_factory, _turns(length))
+    dumped = ModelMessagesTypeAdapter.dump_json(seen[0]).decode()
+    assert "mode is active" not in dumped
+    assert "Plan mode" not in dumped
+    assert "Write mode" not in dumped
+    assert "Ask mode" not in dumped
+
+
+async def test_exactly_one_thing_is_injected_and_it_is_the_workspace_note(
     _fresh_engine, db_session, session_factory
 ) -> None:
-    """The CADENCE holds: off an anchor, no mode reminder rides.
+    """At what used to be a cadence anchor: one extra history message, not two.
 
-    Narrowed from "no `<system-note>` at all" when U8 landed, and the narrowing is the point
-    rather than an accommodation. Both notes wear the same private-guidance envelope, and they
-    have opposite delivery rules on purpose: the mode reminder is cadence-gated because repeating
-    it every turn makes it wallpaper, and the workspace note is unconditional because its whole
-    claim is that answering from stale history is impossible — a fact delivered on one turn in
-    four would not be one. Asserting on the envelope would have made the cadence test go red the
-    moment anything else private was ever said."""
+    A count, not a substring search. "No reminder" is satisfied by a reminder whose wording
+    changed; "exactly one injected message, and it is the note" is not."""
+    seen, _ = await _run_with_history(
+        _fresh_engine, db_session, session_factory, _turns(_RETIRED_FULL_EVERY)
+    )
+    prompts = _injected_prompts(seen[0])
+    # The history's own user turns, then the note, then this turn's prompt.
+    assert prompts[-1] == "and one more thing"
+    assert "checked this app's workspace just now" in prompts[-2]
+    assert len(prompts) == _RETIRED_FULL_EVERY + 2
+
+
+async def test_the_workspace_note_still_rides_a_turn_off_any_anchor(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    """This is the half that keeps the guard honest: a change that stopped injecting anything
+    at all would pass every assertion above.
+
+    A PLAN CHAT, and the Build half is asserted where the Build harness lives
+    (`test_write_turn.py::test_the_workspace_note_rides_a_build_turn_too`) rather than here.
+    The note is injected once, above the branch that picks the run loop, so both kinds get the
+    same message — but a Build turn takes the node loop and needs a provisioned container to
+    reach its first model request, and standing that up in this file to re-prove one line would
+    duplicate a harness rather than test anything new."""
     seen, _ = await _run_with_history(_fresh_engine, db_session, session_factory, _turns(3))
     dumped = ModelMessagesTypeAdapter.dump_json(seen[0]).decode()
-    assert "mode is active" not in dumped, "no mode reminder off a cadence anchor"
-    # …and the workspace note IS there, which is what proves the assertion above narrowed rather
-    # than simply stopped testing anything.
     assert "checked this app's workspace just now" in dumped
 
 
-async def test_reminders_never_reach_a_persisted_row(
+async def test_nothing_ephemeral_reaches_a_persisted_row(
     _fresh_engine, db_session, session_factory
 ) -> None:
-    # Run AT a cadence point (the reminder demonstrably rode the request above) and
-    # prove the durable side stayed clean — the `new_messages()` boundary, not a filter.
+    """The durable side, at what used to be a cadence point.
+
+    `new_messages()` structurally excludes injected history, so this holds by construction
+    rather than by a filter — and it is worth keeping now that the note is the only passenger,
+    because the note is the one thing left that a future author could be tempted to persist."""
     _, conversation_id = await _run_with_history(
-        _fresh_engine, db_session, session_factory, _turns(REMINDER_NUDGE_EVERY)
+        _fresh_engine, db_session, session_factory, _turns(_RETIRED_FULL_EVERY)
     )
     rows = (
         await db_session.scalars(
@@ -259,104 +302,3 @@ async def test_reminders_never_reach_a_persisted_row(
     dumped = json.dumps([row.payload for row in rows])
     assert "system-note" not in dumped
     assert "mode is active" not in dumped
-
-
-# --- N9: the note is private, and it does not talk over a card already on screen -------
-#
-# Two independent defects, both seen live in one conversation. (a) Nothing told the model these
-# notes were internal, so it narrated one back at the citizen — "I want to flag that note…" — and
-# the user watched the assistant argue with an instruction they never wrote and could not see.
-# (b) The cadence was state-BLIND: it fired "call present_plan_options" immediately after the user
-# clicked **Keep refining**, burning a whole turn, and the user's tokens, on the model correctly
-# resisting an instruction the platform should not have sent.
-
-
-def _options_call(tool_call_id: str = "c1") -> ModelResponse:
-    """The assistant presenting the confirmation card."""
-    return ModelResponse(
-        parts=[ToolCallPart(tool_name="present_plan_options", args={}, tool_call_id=tool_call_id)]
-    )
-
-
-def _options_return(state: str = "refine", tool_call_id: str = "c1") -> ModelRequest:
-    """The user's CLICK — stored as the tool result, which is why it is not a user prompt."""
-    return ModelRequest(
-        parts=[
-            ToolReturnPart(
-                tool_name="present_plan_options", content=state, tool_call_id=tool_call_id
-            )
-        ]
-    )
-
-
-@pytest.mark.parametrize("mode", list(ConversationMode))
-@pytest.mark.parametrize("full", [True, False], ids=["full", "nudge"])
-def test_every_reminder_says_it_is_private(mode: ConversationMode, full: bool) -> None:
-    assert "keep it out of your reply" in mode_reminder(mode, full=full).lower()
-
-
-@pytest.mark.parametrize("full", [True, False], ids=["full", "nudge"])
-def test_the_holding_plan_reminders_say_it_too(full: bool) -> None:
-    reminder = mode_reminder(ConversationMode.PLAN, full=full, plan_options_outstanding=True)
-    assert "keep it out of your reply" in reminder.lower()
-
-
-def test_the_bug_a_just_resolved_card_quiets_the_call_the_tool_instruction() -> None:
-    # The exact live sequence: the model presented options, the user clicked Keep refining, and
-    # the very next turn's reminder told the model to present them again.
-    history = [*_turns(REMINDER_NUDGE_EVERY), _options_call(), _options_return("refine")]
-    reminder = _reminder_text(ConversationMode.PLAN, history)
-    assert reminder is not None
-    assert "present_plan_options" not in reminder
-    assert "already with the user" in reminder
-
-
-def test_a_still_pending_card_withholds_it_too() -> None:
-    # Buttons are on screen and unanswered — telling the model to present them again would
-    # re-present buttons the user is looking at.
-    history = [*_turns(REMINDER_NUDGE_EVERY), _options_call()]
-    reminder = _reminder_text(ConversationMode.PLAN, history)
-    assert reminder is not None
-    assert "present_plan_options" not in reminder
-
-
-def test_the_gate_is_not_a_blanket_suppression() -> None:
-    # With no card anywhere the normal Plan reminder still fires, tool contract and all — this
-    # is what separates "do not talk over a card" from "stop reminding the model how Plan works".
-    history = _turns(REMINDER_NUDGE_EVERY)
-    assert _reminder_text(ConversationMode.PLAN, history) == mode_reminder(
-        ConversationMode.PLAN, full=False
-    )
-
-
-def test_a_user_prompt_after_the_card_means_we_have_moved_on() -> None:
-    # The card was resolved and the conversation carried on. The instruction is useful again.
-    history = [
-        *_turns(2),
-        _options_call(),
-        _options_return("refine"),
-        *_turns(REMINDER_NUDGE_EVERY - 2),
-    ]
-    reminder = _reminder_text(ConversationMode.PLAN, history)
-    assert reminder is not None
-    assert "present_plan_options" in reminder
-
-
-@pytest.mark.parametrize("mode", [ConversationMode.ASK, ConversationMode.WRITE])
-def test_ask_and_write_are_untouched_by_the_card_state(mode: ConversationMode) -> None:
-    # Neither mode has the tool, so neither reminder ever mentioned it — the gate must not
-    # accidentally reshape them.
-    history = [*_turns(REMINDER_NUDGE_EVERY), _options_call()]
-    assert _reminder_text(mode, history) == mode_reminder(mode, full=False)
-
-
-@pytest.mark.parametrize("full", [True, False], ids=["full", "nudge"])
-def test_the_holding_variants_are_held_to_the_same_r13_bar(full: bool) -> None:
-    # The existing forbidden-fruit guard only parametrizes the two ORIGINAL plan reminders, so a
-    # new variant could quietly reintroduce prohibition voice. Same bar, same words.
-    lowered = mode_reminder(
-        ConversationMode.PLAN, full=full, plan_options_outstanding=True
-    ).lower()
-    for phrase in ("do not", "don't", "never", "cannot", "can't", "must not"):
-        assert phrase not in lowered, f"{phrase!r} crept into the holding plan reminder"
-    assert "plain, everyday words" in lowered

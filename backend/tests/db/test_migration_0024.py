@@ -43,7 +43,12 @@ _PRE_RESET_REVISION = "0023_drop_data_records"
 _COLUMNS_SQL = "SELECT column_name FROM information_schema.columns WHERE table_name = :table"
 _ENUM_SQL = "SELECT 1 FROM pg_type WHERE typname = :name"
 
-_NATIVE_COLUMNS = frozenset({"entry_kind", "visibility", "mode", "payload", "meta"})
+# WHAT 0024's RESET PUT ON `messages`, spelled as it stands TODAY. The per-row stamp is named
+# `kind` here, not `mode`: revision 0035 renamed the column in place when the two enums collapsed
+# into one two-valued `chat_kind`. The rename is what this set has to follow — 0024 is still the
+# revision that introduced the column, and a round trip through it still has to arrive at the
+# shape head actually has.
+_NATIVE_COLUMNS = frozenset({"entry_kind", "visibility", "kind", "payload", "meta"})
 _LEGACY_COLUMNS = frozenset({"role", "parts"})
 
 
@@ -164,11 +169,15 @@ def test_messages_native_reset_round_trip() -> None:
     at_head = _snapshot()
     assert _NATIVE_COLUMNS <= at_head["messages_columns"]
     assert at_head["messages_columns"].isdisjoint(_LEGACY_COLUMNS)
-    assert "mode" in at_head["conversations_columns"]
+    # `conversations.mode` is GONE at head — 0035 dropped it when a chat's kind became a single
+    # value fixed at creation. `kind` is what carries the whole of what a chat is now.
+    assert "mode" not in at_head["conversations_columns"]
+    assert "kind" in at_head["conversations_columns"]
     assert "code" not in at_head["conversations_columns"]
     assert at_head["enums"] == {
         "message_role": False,
-        "conversation_mode": True,
+        # Dropped by 0035 along with `conversation_kind`; `chat_kind` replaced both.
+        "conversation_mode": False,
         "message_entry_kind": True,
         "message_visibility": True,
     }
@@ -181,6 +190,9 @@ def test_messages_native_reset_round_trip() -> None:
         assert _LEGACY_COLUMNS <= legacy["messages_columns"]
         assert legacy["messages_columns"].isdisjoint(_NATIVE_COLUMNS)
         assert "code" in legacy["conversations_columns"]
+        # Still absent at 0023 — it is added by 0025 and removed again by 0035, so a full round
+        # trip sees it at neither end. Asserted at BOTH ends deliberately: a downgrade that
+        # forgot to drop it would leave the column here and pass the head-side check alone.
         assert "mode" not in legacy["conversations_columns"]
         assert legacy["enums"]["message_role"] is True
 

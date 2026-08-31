@@ -75,7 +75,7 @@ async def _seed_turns(db_session, user, conversation, exchanges: list[tuple[str,
             conversation_id=conversation.id,
             messages=[ModelRequest(parts=[UserPromptPart(content=question)])],
             entry_kind=MessageEntryKind.TURN,
-            mode=conversation.mode,
+            kind=conversation.kind,
         )
         await append_batch(
             db_session,
@@ -83,7 +83,7 @@ async def _seed_turns(db_session, user, conversation, exchanges: list[tuple[str,
             conversation_id=conversation.id,
             messages=[ModelResponse(parts=[TextPart(content=answer)])],
             entry_kind=MessageEntryKind.TURN,
-            mode=conversation.mode,
+            kind=conversation.kind,
         )
 
 
@@ -170,7 +170,7 @@ async def test_attachment_reference_rehydrates_to_bytes_at_send(
             )
         ],
         entry_kind=MessageEntryKind.TURN,
-        mode=conversation.mode,
+        kind=conversation.kind,
     )
 
     model, captured = _capturing_model()

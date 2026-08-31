@@ -24,7 +24,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 import src.services.turns.engine as engine_mod
 from src.config import settings
-from src.db.models.conversation import ConversationMode
+from src.db.models.conversation import ChatKind
 from src.services.agent.mode_prompts import PromptContext
 from src.services.build_sessions.manager import SessionManager
 from src.services.orchestrator.deps import SandboxSession
@@ -55,7 +55,7 @@ def _framed_state(client: FakeSandboxClient) -> _TurnState:
         turn_id=uuid.uuid4(),
         conversation_id=uuid.uuid4(),
         user_id=uuid.uuid4(),
-        mode=ConversationMode.WRITE,
+        kind=ChatKind.BUILD,
     )
     fqdn = "sbx-test.westeurope.azurecontainerapps.io"
     state.sandbox = SandboxSession(
@@ -203,7 +203,7 @@ async def test_an_ask_turn_stops_the_watcher_it_started(
         user = await UserFactory.create(db_session, email="pw-ask@rvaiglobal.com")
         project = await ProjectFactory.create(db_session, user.id)
         conv = await ConversationFactory.create(
-            db_session, user.id, project_id=project.id, mode=ConversationMode.ASK
+            db_session, user.id, project_id=project.id, kind=ChatKind.PLAN
         )
 
         async def _answer(_messages: list[ModelMessage], _info: AgentInfo):

@@ -1,24 +1,39 @@
-"""The atomic Build-it transition (U12 / R6 / R7): one endpoint flips the conversation to
-Write, starts the build, and records the choice — or restores the mode and records a typed
-failure that RE-ARMS the card. Resolved-with-no-build is impossible by ORDERING: the "build"
-resolution is written only after `SessionManager.start` returned a live session. The mode
-flip, by contrast, is committed BEFORE the start, because the build's own end sequence is
-what hands the mode back and it can run before the start call returns (see the flip below).
+"""The Plan → Build handoff (R25–R29, N3): pressing Build it creates a NEW Build chat whose
+first visible message is the plan, verbatim, and records no association in either direction.
 
-Business outcomes travel as a typed 200 union (`started` / `already_built` /
-`stale_plan` / `build_failed`) — they are decisions, not transport errors; 4xx stays for
-ownership and card-identity problems. Failures are recorded as SYSTEM overlays (never a
-ToolReturnPart), so a later retry's success can still write the call's ONE true return.
+WHAT THIS REPLACED. One endpoint used to flip the conversation it was called on into Write
+mode, append a hidden "execute the approved plan" seed reconstructed by walking backwards
+through the transcript for assistant prose, write a marker so the model could see where its
+toolset changed, and start a build in the same thread. A chat's kind is fixed at creation now,
+so there is nothing to flip; the plan is the offer tool call's own argument, so there is
+nothing to reconstruct; and the build belongs in its own chat, so the planning conversation is
+left exactly as it was.
 
-The stale-plan check (plan Key Decision): the card carries the snapshot head SHA pinned
-at Plan time; if the app moved since (another build landed), Build-it answers
-`stale_plan` and the card STAYS pending — the user decides (`force=true` proceeds. The
-warn-or-replan choice is theirs, not the server's).
+NO LINKAGE IS STORED, IN EITHER DIRECTION. No column, no marker, no back-reference, no
+"built from" record. Idempotency comes from the client-minted conversation id colliding with
+itself: one press produces one Build chat, a double press or a reload collides on the primary
+key, and next week's press mints a new id and gets a second, different Build chat — which is
+what makes "pressing the same offer again a week later builds again" true without anything
+remembering that the first press happened.
 
-Warm sessions note (U12): the refine loop's warmth is the U2 pardon + U3 reap-through —
-a completed build's container stays live under its lease; the next Build-it reaps
-through and restores from the snapshot written seconds earlier. Same-container re-attach
-(skipping the restore) is a named follow-up, not this endpoint's concern.
+THE ORDER IS THE UNIT, and the reason is issue #72. `append_batch` owns its commit and this
+route holds ONE session for both conversations, so every write here is a commit and where each
+one sits decides whether a failure can strand an empty Build chat:
+
+  1. every refusal first, all side-effect free;
+  2. insert the new conversation and FLUSH — deliberately not committing;
+  3. the shared turn starter, whose first durable write commits the conversation row and the
+     first user message TOGETHER. Any failure before that point rolls both back and no Build
+     chat exists (R29);
+  4. ONLY THEN the answer to the offer's own deferred call, in the Plan chat.
+
+Step 4 is last because it carries its own commit. Written before the turn starter it would
+commit the flushed Build-chat row, and a turn-start failure afterwards would leave an empty
+Build chat with no message — issue #72's exact shape, in the route that exists to close it.
+Written after, a failure of the answer itself leaves a Build chat that is correct and complete
+and a Plan chat with an unanswered call, which is already handled twice over: the Plan chat's
+next send resolves the card as `refine`, and `repair_dangling_tool_calls` stitches the history
+valid regardless. One is recoverable and self-healing; the other is a permanent orphan.
 """
 
 from __future__ import annotations
@@ -29,6 +44,7 @@ from typing import Literal
 import structlog
 from fastapi import APIRouter, status
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.deps_csrf import RequireCsrf
@@ -37,32 +53,31 @@ from src.api.v1.conversations._shared import (
     BUILD_IN_FLIGHT_MSG,
     ModelDep,
     SessionFactoryDep,
-    StorageDep,
-    history_rehydrator,
     resolve_conversation_or_404,
 )
 from src.api.v1.conversations.turns import _app_id_for_project, start_conversation_turn
+from src.api.v1.live_build import reclaim_blocked_response
 from src.core.errors import AppApiError
-from src.db.models.conversation import ConversationMode
-from src.db.models.message import MessageVisibility
+from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.project import Project
 from src.schemas import AUTH_401, CamelModel, ErrorEnvelope, error_responses
 from src.services.agent.mode_prompts import PromptContext
-from src.services.messages.store import (
-    AttachmentRehydrationError,
-    append_mode_switch_marker,
-    load_history,
-    load_rows,
+from src.services.build_sessions import SandboxReclaimBlockedError
+from src.services.build_sessions.counters import count
+from src.services.messages.store import load_rows
+from src.services.redis import build_coordination_or_503
+from src.services.turns.copy import (
+    ALREADY_BUILDING_HERE_CODE,
+    WORKSPACE_UNAVAILABLE_CODE,
+    WORKSPACE_UNAVAILABLE_TEXT,
 )
-from src.services.storage import ObjectStorage, StorageNotFoundError, parse_bundle_head_sha
-from src.services.storage.keys import snapshot_key
-from src.services.turns.engine import get_turn_engine
+from src.services.turns.engine import get_turn_engine, plan_from_call
 from src.services.turns.plan_options import (
-    approved_plan_text,
     newest_card,
     pending_card,
     record_build_started,
     resolution_of,
+    stored_call,
 )
 from src.services.usage.gate import DailyTokenLimitExceededError, enforce_daily_limit
 
@@ -70,83 +85,97 @@ logger = structlog.get_logger()
 
 router = APIRouter(prefix="/conversations", tags=["turns"])
 
-_SANDBOX_UNAVAILABLE_MSG = "The build environment is temporarily unavailable."
+BUILD_HANDOFF_PRESSED = "build_handoff_pressed"
+"""The one thing this handoff counts, and it is a bare OCCURRENCE.
 
-# The approved-plan framing the build prompt opens with (mirrors U9's Write segment).
-_EXECUTE_PLAN_PREFIX = (
-    "Execute the approved plan below. Where the code on disk differs from what the plan "
-    "assumed, follow the code's reality and tell the user what changed.\n\n"
+No conversation id, no plan reference, no id of the chat it created — recording any of those
+would be exactly the linkage this route exists not to store. The counter's name, its storage
+and its reading belong to the measurement work; this is only the emit point."""
+
+NO_PLAN_CODE = "offer_has_no_plan"
+"""The stored offer carries no plan argument the platform can use.
+
+EVERY CARD PRESENTED BEFORE THE PLAN BECAME THE TOOL'S ARGUMENT LOOKS LIKE THIS, and refusing
+by name is the point. The previous implementation fell back to a stand-in — "Build what the
+user planned in this conversation" — so a build could start from a sentence nobody wrote,
+against a plan nobody could point to. A named refusal is a worse experience and a better
+outcome: the citizen asks for the plan again and gets one that can actually be built."""
+
+PLAN_TOO_LONG_CODE = "plan_too_long"
+"""The stored plan is past what a message can hold. REFUSED, never truncated — a plan cut
+mid-sentence is one the citizen agreed to and the build would never see the end of."""
+
+_NO_PLAN_MESSAGE = (
+    "This plan can't be built from — ask for the plan again and the button will work."
+)
+_PLAN_TOO_LONG_MESSAGE = (
+    "This plan is too long to build from in one go. Ask for a shorter version of it."
 )
 
 
-class BuildTransitionBody(CamelModel):
-    """`force=true` proceeds past a stale-plan warning (the user chose to build anyway)."""
+class BuildHandoffBody(CamelModel):
+    """The press names the chat it is about to create.
 
-    force: bool = False
+    A CLIENT-MINTED ID IS THE WHOLE IDEMPOTENCY MECHANISM, which is why it is required rather
+    than convenient. The browser holds one id per press, so a double press, a retry or a reload
+    carries the same id and collides on the primary key. Nothing is recorded against the plan to
+    make that work, and nothing has to be cleaned up when the press never happens."""
+
+    chat_id: uuid.UUID
 
 
-class BuildTransitionResponse(CamelModel):
-    """The typed outcome union. `started` carries the TURN to subscribe to — a build is a
-    turn now, and the turn id is the only identity the client needs. `stale_plan` carries
-    both SHAs so the client can say what moved.
+class BuildHandoffResponse(CamelModel):
+    """IDS ONLY, and that is deliberate rather than minimal.
 
-    `build_failed` is gone, and so is every reason it carried. Each of those cases is now a
-    typed HTTP status the client's fetch layer already understands: 429 for the daily cap,
-    409 for a busy workspace, 503 for an unconfigured engine. Collapsing them into a 200
-    meant the browser had to re-implement error handling it already had, and a genuine bug
-    arrived looking exactly like a quota refusal."""
+    The new conversation row is flushed and not committed when this is built, so projecting a
+    header off it would touch server-defaulted attributes on an un-refreshed row — which raises
+    `MissingGreenlet` asynchronously and, on one recorded occasion, spun the log formatter at
+    99% CPU. The create route refreshes through its flush before projecting; this one dodges the
+    question by not projecting at all. If it ever grows a header, it refreshes first.
 
-    outcome: Literal["started", "already_started", "stale_plan"]
+    `already_started` is the collision arm: the same press arriving twice. It carries whatever
+    turn is live on the chat that already exists, so a second tab attaches to that run rather
+    than starting a rival one."""
+
+    outcome: Literal["started", "already_started"]
+    chat_id: str
     turn_id: str | None = None
-    app_id: str | None = None
-    plan_head_sha: str | None = None
-    current_head_sha: str | None = None
-
-
-async def _current_snapshot_head(
-    storage: ObjectStorage | None, app_id: uuid.UUID | None
-) -> str | None:
-    """The app's snapshot head right now — None when no app/snapshot exists (or storage
-    is unconfigured, a dev-only boot where the build itself would fail first anyway)."""
-    if storage is None or app_id is None:
-        return None
-    try:
-        data = await storage.get(snapshot_key(app_id))
-    except StorageNotFoundError:
-        return None
-    return parse_bundle_head_sha(data)
 
 
 @router.post(
     "/{conversation_id}/plan-options/{tool_call_id}/build",
-    response_model=BuildTransitionResponse,
+    response_model=BuildHandoffResponse,
     dependencies=[RequireCsrf],
     responses=error_responses(
-        (400, ErrorEnvelope, "Unknown card"),
+        (400, ErrorEnvelope, "Unknown card, or an offer with no usable plan"),
         AUTH_401,
         (403, ErrorEnvelope, "CSRF check failed"),
         (404, ErrorEnvelope, "Conversation not found"),
-        (409, ErrorEnvelope, "The card is superseded"),
-        (503, ErrorEnvelope, "Build engine, sandbox, or coordination unavailable"),
+        (409, ErrorEnvelope, "The card is superseded, the id is taken, or a workspace is busy"),
+        (429, ErrorEnvelope, "Daily token limit reached"),
+        (503, ErrorEnvelope, "Build engine or workspace unavailable"),
     ),
 )
 async def build_it(
     conversation_id: uuid.UUID,
     tool_call_id: str,
-    body: BuildTransitionBody,
+    body: BuildHandoffBody,
     user: CurrentUser,
     db: DbSession,
     sandbox: OptionalSandbox,
     manager: SessionManagerDep,
-    storage: StorageDep,
     model: ModelDep,
     factory: SessionFactoryDep,
-) -> BuildTransitionResponse | JSONResponse:
-    conversation = await resolve_conversation_or_404(db, user.id, conversation_id)
+) -> BuildHandoffResponse | JSONResponse:
+    plan_chat = await resolve_conversation_or_404(db, user.id, conversation_id)
     rows = list(
-        await load_rows(db, user_id=user.id, conversation_id=conversation.id, include_hidden=True)
+        await load_rows(db, user_id=user.id, conversation_id=plan_chat.id, include_hidden=True)
     )
 
+    # --- every refusal first, and every one of them side-effect free ------------------------
+    #
+    # Nothing below writes, claims or creates until the last of these has passed, so a refusal
+    # can never leave a half-started build to compensate for.
     card = pending_card(rows, tool_call_id)
     if card is None:
         raise AppApiError(400, "No such plan options card.")
@@ -154,34 +183,17 @@ async def build_it(
     if newest is None or newest.tool_call_id != tool_call_id:
         raise AppApiError(409, "A newer plan supersedes these options.")
 
-    stored = resolution_of(rows, tool_call_id)
-    if stored == "build":
-        # A double click / second tab — the build already started; answer idempotently with
-        # whatever turn is live on this thread, so the second tab attaches to the same run
-        # instead of starting a rival one.
-        live_turn = get_turn_engine().peek(conversation.id)
-        return BuildTransitionResponse(
-            outcome="already_started",
-            turn_id=str(live_turn.turn_id) if live_turn is not None else None,
-        )
-    if stored is not None and not stored.startswith("build_failed"):
-        raise AppApiError(409, "These options were already resolved.")
+    # THE PLAN COMES FROM THE OFFER'S OWN STORED CALL, never from the request body. That is what
+    # R44 asks for, and it is also what stops a stale second tab writing stale requirements into
+    # a permanent first message: the browser cannot post a plan at all.
+    call = stored_call(rows, tool_call_id)
+    plan = plan_from_call(call) if call is not None else None
+    if plan is None:
+        message, code = _refusal_for(call)
+        raise AppApiError(400, message, code=code)
 
-    app_id = await _app_id_for_project(db, user.id, conversation.project_id)
-    if not body.force:
-        current_head = await _current_snapshot_head(storage, app_id)
-        if current_head != card.head_sha:
-            # The app moved since Plan time (or appeared/vanished) — warn, don't build.
-            # The card STAYS pending; the user forces or replans.
-            return BuildTransitionResponse(
-                outcome="stale_plan",
-                plan_head_sha=card.head_sha,
-                current_head_sha=current_head,
-            )
-
-    # 429 with its byte-stable body, and the card STAYS PENDING — nothing has been written
-    # yet, so there is no half-started build to compensate for and the user can simply click
-    # Build again tomorrow.
+    # 429 with its byte-stable body, and the card STAYS PRESSABLE — nothing has been written, so
+    # there is no half-started build and the citizen can simply press again tomorrow.
     try:
         await enforce_daily_limit(db, user.id)
     except DailyTokenLimitExceededError as exc:
@@ -189,78 +201,77 @@ async def build_it(
 
     if model is None:
         raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, "Claude client not configured.")
+    # R98, identically to the send route: no workspace service means nothing for the build to
+    # read or write, said before anything is created rather than inside the detached turn.
     if sandbox is None:
-        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG)
-    # The cheap conflict check, same question `POST /turns` asks: one sandbox per user, and
-    # it is not this thread's to take if another conversation is mid-build.
+        raise AppApiError(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            WORKSPACE_UNAVAILABLE_TEXT,
+            code=WORKSPACE_UNAVAILABLE_CODE,
+        )
+
+    # R19's two refusals, in the same order and carrying the same codes the send route uses:
+    # one workspace per user, and it is not this press's to take if another of the user's own
+    # chats holds it — or if unsaved work in a different project is in the way.
     active = manager.active_session_for(user.id)
-    if active is not None and active.conversation_id != conversation.id:
-        raise AppApiError(409, BUILD_IN_FLIGHT_MSG)
+    if active is not None and active.conversation_id != plan_chat.id:
+        raise AppApiError(409, BUILD_IN_FLIGHT_MSG, code=ALREADY_BUILDING_HERE_CODE)
+    with build_coordination_or_503():
+        try:
+            await manager.reclaim_preflight(db, user, plan_chat.project_id, sandbox_client=sandbox)
+        except SandboxReclaimBlockedError as exc:
+            return reclaim_blocked_response(exc)
 
-    plan_text = approved_plan_text(rows, card)
-    prompt = (
-        _EXECUTE_PLAN_PREFIX + plan_text
-        if plan_text
-        else ("Build what the user planned in this conversation.")
-    )
-
-    # THE FLIP, committed before the turn starts. Write is where the thread STAYS now — there
-    # is no end-sequence restore to race, because the mode is no longer a dead end someone has
-    # to rescue the user out of. That was the whole point of the convergence: a citizen who
-    # built something can keep talking to it in the same mode.
-    entry_mode = conversation.mode
-    conversation.mode = ConversationMode.WRITE
-    db.add(conversation)
-    if entry_mode is not ConversationMode.WRITE:
-        # The marker is how the MODEL learns where its toolset changed; it stays.
-        await append_mode_switch_marker(
-            db,
-            user_id=user.id,
-            conversation_id=conversation.id,
-            old_mode=entry_mode,
-            new_mode=ConversationMode.WRITE,
-        )
-    await db.commit()
-
-    # The card resolution, BEFORE the turn: everything above is side-effect-free, so there is
-    # no arm left that can burn a card without starting anything. Re-read the rows first —
-    # a concurrent free-text send may have resolved this same card as `refine` in the window,
-    # and two ToolReturnParts for one call id would wedge the thread on its next load.
-    fresh_rows = list(
-        await load_rows(db, user_id=user.id, conversation_id=conversation.id, include_hidden=True)
-    )
-    prior = resolution_of(fresh_rows, tool_call_id)
-    await record_build_started(
-        db,
-        user_id=user.id,
-        conversation_id=conversation.id,
-        pending=card,
-        answered_already=prior is not None and not prior.startswith("build_failed"),
-    )
-
-    rehydrate = history_rehydrator(db, storage, user.id)
-    try:
-        history = await load_history(
-            db, user_id=user.id, conversation_id=conversation.id, rehydrate=rehydrate
-        )
-    except AttachmentRehydrationError as exc:
-        raise AppApiError(400, str(exc)) from None
-
-    project = await db.get(Project, conversation.project_id)
-    if project is None:  # FK guarantees this; fail loudly if it ever breaks
+    project = await db.get(Project, plan_chat.project_id)
+    if project is None:  # the FK guarantees this; fail loudly if it ever breaks
         raise AppApiError(404, "Conversation not found.")
+    app_id = await _app_id_for_project(db, user.id, plan_chat.project_id)
 
-    # NOT wrapped in `build_coordination_or_503`. That helper SKIPS its block when Redis is
-    # unconfigured — correct for a coordination CHECK ("nothing can hold a lock, proceed"),
-    # catastrophic for the start itself, which would leave `turn_id` unbound and 500. The
-    # sandbox attach happens inside the detached turn now and reports its own failure as a
-    # `workspace unavailable` frame, so there is no coordination read left on this path.
+    # --- the idempotency arm, asked FIRST and caught SECOND ---------------------------------
+    #
+    # THE ORDINARY DOUBLE PRESS IS A READ. A second press, a retry and a reload all carry the id
+    # the browser minted for that press, so the chat is already there and answering takes one
+    # SELECT — no failed INSERT, no savepoint, and no session left holding a rejected object
+    # that the arm's own re-read would try to flush again.
+    #
+    # THE CATCH BELOW IS THE RACE BACKSTOP, not the mechanism: two presses genuinely in flight at
+    # once both find nothing here and one of them loses the insert. It is the same answer either
+    # way, which is what makes the fast path safe to take.
+    if await db.get(Conversation, body.chat_id) is not None:
+        return await _already_started(db, user.id, body.chat_id, plan_chat.project_id)
+
+    # --- the new chat: FLUSHED, deliberately not committed ----------------------------------
+    build_chat = Conversation(
+        id=body.chat_id,
+        user_id=user.id,
+        project_id=plan_chat.project_id,
+        kind=ChatKind.BUILD,
+    )
+    db.add(build_chat)
+    try:
+        await db.flush()
+    except IntegrityError:
+        # The genuine race. `rollback` rather than a savepoint because this is the one path
+        # where the session is holding an object the database refused: it has to go, and nothing
+        # this request has done so far is a write, so there is nothing else to lose.
+        await db.rollback()
+        return await _already_started(db, user.id, body.chat_id, plan_chat.project_id)
+
+    # --- the turn: its first durable write is what commits the conversation row -------------
     turn_id = await start_conversation_turn(
         db=db,
         user=user,
-        conversation=conversation,
-        prompt=prompt,
-        history=history,
+        conversation=build_chat,
+        # THE PLAN, VERBATIM, AS AN ORDINARY VISIBLE USER MESSAGE. No prefix, no wrapper, no
+        # planning history — byte-identical to the citizen having pasted it themselves, which
+        # is what makes a handoff-built chat indistinguishable in storage from a typed one.
+        #
+        # The instruction the retired prefix carried — follow the code's reality where it
+        # differs from what the plan assumed, and say what changed — moved into the Build
+        # chat's own prompt segment, where it applies to a plan built weeks later as well as to
+        # one built a minute after it was written.
+        prompt=plan,
+        history=[],
         prompt_context=PromptContext(
             user_name=user.display_name or user.email,
             project_name=project.name,
@@ -271,23 +282,76 @@ async def build_it(
         factory=factory,
         manager=manager,
         sandbox=sandbox,
-        # THE SEED IS HIDDEN. It is the platform telling the model to execute the plan,
-        # not something the citizen typed, and rendering it as a user bubble is exactly
-        # the "I never said that" moment the transcript must never produce. Hidden gives
-        # the model its instruction and the reader their honest history in one row.
-        visibility=MessageVisibility.HIDDEN,
-        meta={"kind": "write_seed"},
         # AND IT OWES A FILE CHANGE. This is the one entry point where "the model touched
-        # nothing" is not a legitimate outcome: the citizen clicked Build on an approved
-        # plan, so a run that writes nothing is a failed build and must be reported as one.
-        # Without this flag the engine's mutation guard reads the turn as an ordinary chat
-        # reply and ends it `completed` — which is how a build that produced zero files once
-        # announced itself as "Build complete".
+        # nothing" is not a legitimate outcome: the citizen pressed Build on a plan, so a run
+        # that writes nothing is a failed build and must be reported as one.
         expects_mutation=True,
     )
 
-    return BuildTransitionResponse(
-        outcome="started",
-        turn_id=str(turn_id),
-        app_id=str(app_id) if app_id else None,
+    # --- ONLY NOW: the one write in the Plan chat -------------------------------------------
+    #
+    # ANYONE MOVING THIS WRITE, OR ADDING A COMMIT BETWEEN THE FLUSH ABOVE AND THE TURN
+    # STARTER, REINTRODUCES ISSUE #72. `append_batch` owns its commit and both conversations
+    # share one session, so a write here before the turn started would make the flushed Build
+    # chat durable, and a later failure would strand it empty.
+    #
+    # ITS CONTENT IS THE CHOICE AND NOTHING ELSE — never the new chat's id, never its url,
+    # never a count. That is what makes "no stored field references both conversations" a fact
+    # about the row rather than an aspiration.
+    #
+    # SKIPPED WHEN THE CALL IS ALREADY ANSWERED, which is the week-later press: the offer stays
+    # pressable after a build (nothing archives it), and a second `ToolReturnPart` for one call
+    # id would wedge the thread on its next load.
+    if resolution_of(rows, tool_call_id) is None:
+        await record_build_started(db, user_id=user.id, conversation_id=plan_chat.id, pending=card)
+    await count(BUILD_HANDOFF_PRESSED)
+    return BuildHandoffResponse(
+        outcome="started", chat_id=str(build_chat.id), turn_id=str(turn_id)
+    )
+
+
+def _refusal_for(call: object) -> tuple[str, str]:
+    """(message, code) for an offer that cannot be built from.
+
+    TWO CODES, because the two causes have different remedies. "There is no plan in this offer"
+    is what every pre-migration card looks like and is fixed by asking for the plan again; "the
+    plan is longer than a message may be" is fixed by asking for a shorter one. A single code
+    would leave the browser saying one of those to someone in the other situation."""
+    from pydantic_ai.messages import ToolCallPart  # local: keeps the wire types off this seam
+
+    if isinstance(call, ToolCallPart):
+        try:
+            plan = call.args_as_dict().get("plan")
+        except Exception:
+            plan = None
+        if isinstance(plan, str) and plan.strip():
+            return _PLAN_TOO_LONG_MESSAGE, PLAN_TOO_LONG_CODE
+    return _NO_PLAN_MESSAGE, NO_PLAN_CODE
+
+
+async def _already_started(
+    db: DbSession, user_id: uuid.UUID, chat_id: uuid.UUID, project_id: uuid.UUID
+) -> BuildHandoffResponse:
+    """The collision arm, GUARDED BY OWNERSHIP AND PARENTAGE rather than by existence alone.
+
+    The conversation id is client-minted, so an unguarded arm would hand any caller who guesses
+    a colliding id the existence of — and a live turn id for — somebody else's conversation. The
+    predicate is the create route's: same owner, same project, same kind, or a flat 409 with one
+    message, so existence under another owner is not distinguishable (ADR-0004).
+
+    It starts NOTHING. The chat that already exists has whatever turn is already live on it, and
+    that is what a second tab should attach to."""
+    existing = await db.get(Conversation, chat_id)
+    if (
+        existing is None
+        or existing.user_id != user_id
+        or existing.project_id != project_id
+        or existing.kind is not ChatKind.BUILD
+    ):
+        raise AppApiError(409, "This conversation id is already in use.")
+    live = get_turn_engine().peek(existing.id)
+    return BuildHandoffResponse(
+        outcome="already_started",
+        chat_id=str(existing.id),
+        turn_id=str(live.turn_id) if live is not None else None,
     )

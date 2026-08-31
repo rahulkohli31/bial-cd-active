@@ -72,6 +72,8 @@ from src.api.v1.build_sessions.schemas import (
     LOCK_TTL_SECONDS,
     RELAUNCH_PREVIEW_STAY_SECONDS,
     SERVED_TRAFFIC_STAY_SECONDS,
+    STARTING_MARKER_TTL_SECONDS,
+    TURN_ENDED_UNCHANGED_STAY_SECONDS,
 )
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
@@ -86,6 +88,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_STAY_WRITER,
+    starting_key,
 )
 
 _log = structlog.get_logger()
@@ -323,6 +326,102 @@ async def release_liveness_lease(redis: aioredis.Redis, user_uuid: uuid.UUID) ->
     await redis.delete(lease_key(user_uuid))
 
 
+# --- the U13 start-in-flight marker (C5 family 5) -----------------------------
+# A start in flight is a fact the platform holds, not one a tab remembers. `_holding_user_lock`
+# (`manager.py`) is the ONE writer — the single skeleton behind the build start, the relaunch,
+# and the turn's `ensure_sandbox` — so every door into a container reports "starting" the same
+# way, and a second press or a turn arriving mid-start finds the same marker rather than racing
+# a second provision (R3a).
+#
+# NOT a registry field, on purpose: a registry entry written before a container exists is
+# exactly the "registered ⇒ spared" hazard ADR-0029 exists to remove, and it would be visible to
+# the sweep, the reconciler and the ARM reconciliation as a container that does not exist.
+
+
+async def write_starting_marker(
+    redis: aioredis.Redis, user_uuid: uuid.UUID, project_id: uuid.UUID
+) -> None:
+    """`SET starting <project_id> EX STARTING_MARKER_TTL_SECONDS` — the one write, issued once
+    the one-per-user lock is held (so a marker can only ever name a start this process actually
+    committed to). The TTL is MANDATORY: past it the container is reapable again exactly as if
+    no marker had ever been written — a bounded claim, not a pardon (see the module docstring's
+    TTL discussion for the liveness lease, which this repeats for a different family).
+
+    BARE on Redis errors, per the module's REDIS-ERROR POLICY: this call sits inside
+    `_holding_user_lock`'s protected region, before the lock is yielded to the caller, so a
+    failure here is caught by the SAME `except BaseException` that would compensate a failed
+    `acquire_lock` — there is no live container yet for the marker to protect, so tearing
+    nothing down and releasing the lock is exactly right."""
+    await redis.set(starting_key(user_uuid), str(project_id), ex=STARTING_MARKER_TTL_SECONDS)
+
+
+async def read_starting_marker(redis: aioredis.Redis, user_uuid: uuid.UUID) -> uuid.UUID | None:
+    """The project id a start names for this user, or `None` when nothing is starting.
+
+    Fails toward `None` on a value this process cannot parse (a hand-edited key, a future writer
+    using a different shape) rather than treating garbage as a claim — the same fail-closed
+    reading `liveness_lease_is_held` gives an unparseable deadline, applied here to a marker
+    whose only job is to ANSWER, never to spare on the strength of a value nobody can account
+    for. U11 reads this (or the pipelined form below) to add the marker as a fourth disjunct to
+    the reclamation spare predicate."""
+    raw = await redis.get(starting_key(user_uuid))
+    if raw is None:
+        return None
+    value = raw.decode() if isinstance(raw, bytes) else str(raw)
+    try:
+        return uuid.UUID(value)
+    except ValueError:
+        _log.warning("unreadable starting marker; treating as absent", user_id=str(user_uuid))
+        return None
+
+
+async def clear_starting_marker(redis: aioredis.Redis, user_uuid: uuid.UUID) -> None:
+    """Unconditional `DEL`. Idempotent, and issued from two places for two reasons: the clean
+    exit of `_holding_user_lock` (the scope that RELEASES the lock, and the scope that ADOPTS
+    it — a start in flight is over the instant either happens, whichever door it came through),
+    and the compensation arm (the body failed, so there is no start left to claim).
+
+    Both call sites GUARD this at the call site rather than let it propagate, deliberately —
+    unlike `release_lock_as_holder` and `write_heartbeat`, whose raise inside the protected
+    region IS the mechanism that triggers compensation. A marker that fails to clear is not a
+    reason to tear down a container that just finished provisioning successfully, or to skip
+    the teardown a failed one still needs: its TTL is the backstop either way (`ADR-0029`)."""
+    await redis.delete(starting_key(user_uuid))
+
+
+async def read_registry_and_starting_marker(
+    redis: aioredis.Redis, user_uuid: uuid.UUID
+) -> tuple[dict[str, str] | None, uuid.UUID | None]:
+    """The one round trip `project_preview_state` spends on Redis (C3 §8.3): the registry hash
+    and the U13 starting marker, read as ONE PIPELINE (two commands) rather than two sequential
+    round trips. This is what keeps the frozen cost budget honest — it was "one registry hash
+    read"; adding the marker as a second, separate `GET` would have doubled the round trips on
+    every poll rather than adding one command to the one already in flight.
+
+    Falls back to `read_registry`'s legacy-prefix adoption ONLY when the pipelined `HGETALL`
+    comes back empty — that migration is itself a second round trip (`_adopt_a_pre_cutover_
+    record`), so it stays off the hot path exactly as it already was, rare rather than routine.
+
+    A `RedisError` propagates from `pipe.execute()` exactly as a bare `hgetall` would have, so
+    every existing caller's error handling (`project_preview_state`'s `except RedisError`)
+    keeps working unchanged."""
+    pipe = redis.pipeline(transaction=False)
+    pipe.hgetall(registry_key(user_uuid))
+    pipe.get(starting_key(user_uuid))
+    raw_registry, raw_starting = await pipe.execute()
+    registry = {str(k): str(v) for k, v in raw_registry.items()} if raw_registry else None
+    if registry is None:
+        registry = await _adopt_a_pre_cutover_record(redis, user_uuid)
+    starting: uuid.UUID | None = None
+    if raw_starting:
+        value = raw_starting.decode() if isinstance(raw_starting, bytes) else str(raw_starting)
+        try:
+            starting = uuid.UUID(value)
+        except ValueError:
+            _log.warning("unreadable starting marker; treating as absent", user_id=str(user_uuid))
+    return registry, starting
+
+
 # --- the lingering preview's stay of execution (#43, #13) --------------------
 # A relaunched preview (#43) and a COMPLETED build's pardoned preview (#13/R2, granted by
 # `manager._pardon_the_container`) deliberately do NOT occupy the one-per-user build slot:
@@ -356,14 +455,25 @@ class DeadlineWriter(enum.StrEnum):
     #: those already calls a project-scoped endpoint, so the extension is a side effect of the
     #: request the builder was making anyway.
     BUILDER_ACTED = "builder_acted"
+    #: A turn ended having WRITTEN NOTHING (`workspace_touched` is False — U13 plan's U12). The
+    #: weakest evidence in the set on purpose: it is pure keyboard, with nothing on the container
+    #: side to show for it — no file changed, no tool ran that could have. Bounds the cost of a
+    #: chat-only (Plan-kind) session that pins the workspace on every turn (R93) without ever
+    #: producing anything to keep it pinned for. Never chosen for a FAILED turn's write attempt —
+    #: `_pardon_the_container` keys on WHAT the turn did, not on how it ended.
+    TURN_ENDED_UNCHANGED = "turn_ended_unchanged"
 
 
 #: How long each writer's evidence is worth. Traffic buys less than a deliberate action because it
 #: is weaker evidence of intent — a background poll from a left-open app tab is still traffic.
+#: `TURN_ENDED_UNCHANGED` buys the least of all four: enough to read the reply and ask a follow-up
+#: without paying a cold restore on the very next message, far short of the stay a write or a
+#: deliberate action earns.
 DEADLINE_WRITER_TTL_SECONDS: Final[Mapping[DeadlineWriter, int]] = {
     DeadlineWriter.TURN_IN_FLIGHT: RELAUNCH_PREVIEW_STAY_SECONDS,
     DeadlineWriter.APP_SERVED_TRAFFIC: SERVED_TRAFFIC_STAY_SECONDS,
     DeadlineWriter.BUILDER_ACTED: RELAUNCH_PREVIEW_STAY_SECONDS,
+    DeadlineWriter.TURN_ENDED_UNCHANGED: TURN_ENDED_UNCHANGED_STAY_SECONDS,
 }
 
 

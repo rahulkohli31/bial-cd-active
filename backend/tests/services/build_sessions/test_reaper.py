@@ -37,6 +37,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_TOKEN_REF,
+    starting_key,
 )
 from src.services.sandbox import SandboxError, SandboxHandle
 from src.services.sandbox.base import ExecResult
@@ -984,3 +985,103 @@ def test_no_worker_module_may_certify_death() -> None:
                     f"{module.name} certifies death, and that certification rests on the "
                     "single-replica contract a worker removes (C5 §Liveness lease)"
                 )
+
+
+# --- U11 / R99: the pre-adopt window, and the one signal that can cover it ------------------
+#
+# A turn's life splits into three intervals, and the point of this section is that each needs a
+# signal that can ACTUALLY BE HELD in it — "at least one spare signal is held" is only checkable
+# interval by interval.
+#
+#   1. claim → a registry hash exists. Nothing can be written here and nothing needs to be:
+#      `reconcile_user` returns above without reaping when there is no registry, and both write
+#      primitives refuse in this window on purpose (a lease written for a user with no record
+#      would spare whatever container that user gets NEXT).
+#   2. registry hash → adopt-and-seed-the-heartbeat. THIS ONE. The lock/heartbeat disjunct is an
+#      AND, so lock-held-with-no-heartbeat is reapable, and the turn's own door grants nothing
+#      across it. The starting marker spans exactly this interval.
+#   3. adopt → terminal. The R10 liveness lease, covered above and in `test_liveness_lease.py`.
+
+
+async def test_the_starting_marker_spares_a_container_mid_cold_start(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """★ INTERVAL 2. The registry hash has landed and the heartbeat has not been seeded yet —
+    the shape a sweep sees when it lands in the middle of a cold start.
+
+    Asserted through `reconcile_user` itself rather than by mocking the predicate, because what
+    is being tested is the ORDER of its arms as much as the disjunct."""
+    await _seed(fake_redis, USER, with_lock=True, with_heartbeat=False)
+    await locks.write_starting_marker(fake_redis, USER, uuid.uuid4())
+    client = FakeSandboxClient()
+
+    assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is False
+    assert client.torn_down == []
+    assert await locks.read_registry(fake_redis, USER) is not None
+
+
+async def test_the_same_container_without_the_marker_is_reaped(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """THE DISCRIMINATOR, and without it the test above proves nothing.
+
+    Identical state, marker absent: reaped. So the sparing above is the marker's doing and not
+    some other arm quietly answering first."""
+    await _seed(fake_redis, USER, with_lock=True, with_heartbeat=False)
+    client = FakeSandboxClient()
+
+    assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is True
+    assert SBX in client.torn_down
+
+
+async def test_a_marker_that_outlives_its_start_stops_sparing(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """★ A BOUNDED CLAIM, NOT A PARDON. Past its TTL the container is reapable again exactly as
+    if nothing had been written.
+
+    This is the assertion that keeps the marker from becoming the registry hash's mistake under
+    a new name: "registered ⇒ spared" is the failure mode the whole reclamation design exists to
+    remove, and a claim with no expiry is that failure mode with an extra step."""
+    await _seed(fake_redis, USER, with_lock=True, with_heartbeat=False)
+    await locks.write_starting_marker(fake_redis, USER, uuid.uuid4())
+    assert (
+        await reaper.reconcile_user(fake_redis, USER, FakeSandboxClient(), has_live_session=False)
+        is False
+    )
+
+    # The TTL lapses — expressed as the key expiring, which is what a wall clock does to it.
+    await fake_redis.delete(starting_key(USER))
+
+    client = FakeSandboxClient()
+    assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is True
+    assert SBX in client.torn_down
+
+
+async def test_a_marker_alone_does_not_conjure_a_container_to_spare(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """INTERVAL 1, stated as the absence it is. With no registry record there is nothing to
+    reap and nothing to spare, so the marker changes no outcome — which is why interval 1 needs
+    no signal rather than needing one nobody wrote."""
+    await locks.write_starting_marker(fake_redis, USER, uuid.uuid4())
+    client = FakeSandboxClient()
+
+    assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is False
+    assert client.torn_down == []
+
+
+async def test_the_reclamation_passes_own_predicate_agrees(fake_redis: aioredis.Redis) -> None:
+    """THE SECOND READER. `reconcile_user` is the per-user sweep; the fleet pass builds a
+    `RegistryClaim` and asks `spares_the_container`. Both must count the marker, or a container
+    spared by one is destroyed by the other — and the fleet pass is the one that destroys."""
+    from src.services.build_sessions.reclamation_pass import claim_for_container
+
+    await _seed(fake_redis, USER, with_lock=True, with_heartbeat=False)
+    unspared = await claim_for_container(fake_redis, app_name=SBX)
+    assert unspared is not None and unspared.spares_the_container is False
+
+    await locks.write_starting_marker(fake_redis, USER, uuid.uuid4())
+    spared = await claim_for_container(fake_redis, app_name=SBX)
+    assert spared is not None and spared.starting is True
+    assert spared.spares_the_container is True

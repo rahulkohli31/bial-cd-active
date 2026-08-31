@@ -113,18 +113,44 @@ class RegistryClaim:
     heartbeat_alive: bool
     stay_current: bool
     lease_held: bool
+    starting: bool
 
     @property
     def spares_the_container(self) -> bool:
-        """`(lock held AND heartbeat alive) OR stay current OR liveness lease held`.
+        """`(lock held AND heartbeat alive) OR stay current OR liveness lease held OR starting`.
 
         The lock and the heartbeat are ONE signal, not two: a held lock whose owner stopped
         breathing is the crashed builder the reaper exists for.
 
-        MUTATION-CHECKED. Reverting this to `True` — "registered ⇒ spared" — silently disables
-        essentially all reclamation while every other test stays green, which is exactly the kind
-        of regression that ships."""
-        return (self.lock_held and self.heartbeat_alive) or self.stay_current or self.lease_held
+        THE FOURTH DISJUNCT COVERS ONE NARROW INTERVAL, and it is worth naming exactly which.
+        A turn's life splits into three, and each needs a signal that can actually be held in it:
+
+          1. **the turn claims the workspace → a registry hash exists.** Nothing can be written
+             here and nothing needs to be: `reconcile_user` reads the registry first and returns
+             without reaping when there is none, so there is nothing to spare. Both write
+             primitives refuse in this window on purpose — a lease or a stay written for a user
+             with no record would spare whatever container that user gets NEXT.
+          2. **the registry hash is written → the container is adopted and its heartbeat seeded.**
+             THIS ONE. The lock/heartbeat disjunct above is an AND, so lock-held-with-no-heartbeat
+             is reapable, and the turn's door (`ensure_sandbox`) grants nothing across it. The
+             starting marker spans exactly this interval — it is written by `_holding_user_lock`,
+             which is the scope — so one predicate closes it rather than a second renewal loop.
+          3. **adopt → terminal.** The R10 liveness lease, renewed for the whole turn and honoured
+             unconditionally by the sweep.
+
+        AND IT IS A BOUNDED CLAIM, NOT A PARDON. The marker carries a mandatory wall-clock TTL, so
+        past it the container is reapable again exactly as if nothing had ever been written. That
+        is what keeps it from becoming the registry hash's mistake — "registered ⇒ spared" — under
+        a new name.
+
+        MUTATION-CHECKED. Reverting this to `True` silently disables essentially all reclamation
+        while every other test stays green, which is exactly the kind of regression that ships."""
+        return (
+            (self.lock_held and self.heartbeat_alive)
+            or self.stay_current
+            or self.lease_held
+            or self.starting
+        )
 
     def combined_with(self, other: RegistryClaim) -> RegistryClaim:
         """One container, two records naming it: the record that SPARES wins.

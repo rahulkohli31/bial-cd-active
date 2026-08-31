@@ -20,7 +20,7 @@ from pydantic_ai.toolsets.function import FunctionToolset
 
 from src.api.v1.build_sessions.schemas import BuildError, ErrorSource
 from src.core.prompt_blocks import APPLY_SCHEMA_CHANGE_TOOL, WRITE_TOOL_SURFACE
-from src.db.models.conversation import ConversationMode
+from src.db.models.conversation import ChatKind
 from src.services.agent.toolsets import (
     first_sentence,
     registered_tool_definitions,
@@ -31,7 +31,7 @@ from src.services.orchestrator.prompt import BUILD_SYSTEM_PROMPT, build_repair_p
 from src.services.orchestrator.tools import sandbox_toolset
 
 _THE_SANDBOX_FACTORY = "src.services.agent.toolsets.sandbox_toolset"
-"""The name `toolsets_for_mode` reaches the sandbox six through — the seam the two
+"""The name `toolsets_for_kind` reaches the sandbox six through — the seam the two
 deliberate mutations below swap out. Patched by dotted path so the test never has to
 reach through the registry module for a name it only re-imports."""
 
@@ -658,7 +658,7 @@ async def test_the_composite_is_offered_and_its_line_is_its_own_first_sentence()
 
     The generic drift check covers every tool at once; this names the one this unit adds, so a
     failure reads as "the composite fell out of the prompt" rather than as a snapshot mismatch."""
-    definitions = await registered_tool_definitions(ConversationMode.WRITE)
+    definitions = await registered_tool_definitions(ChatKind.BUILD)
     assert APPLY_SCHEMA_CHANGE_TOOL in definitions, "the composite is not registered for Write"
     described = definitions[APPLY_SCHEMA_CHANGE_TOOL].description or ""
     line = f"- `{APPLY_SCHEMA_CHANGE_TOOL}` \u2014 {first_sentence(described)}"
@@ -676,7 +676,7 @@ async def test_the_composite_is_offered_and_its_line_is_its_own_first_sentence()
 # `declare_done` does while the sentence describing it still promised a follow-up round-trip, and
 # every name-based assertion in this repo stayed green. So the block is rendered from the tool
 # definitions pydantic-ai hands the model at registration, and the drift check is a snapshot
-# assertion over that rendering plus a per-mode membership assertion against `toolsets_for_mode`.
+# assertion over that rendering plus a per-mode membership assertion against `toolsets_for_kind`.
 
 
 def _tool_surface_block(prompt: str) -> str:
@@ -690,7 +690,7 @@ async def _the_drift_check() -> None:
     An equality assertion proves the snapshot is right today; it does not prove the assertion
     would notice if it stopped being — which is exactly the property that failed under U18. The
     two mutation tests below run THIS function against a deliberately-mutated registry."""
-    generated = await render_tool_surface(ConversationMode.WRITE)
+    generated = await render_tool_surface(ChatKind.BUILD)
     assert WRITE_TOOL_SURFACE == generated, (
         "the TOOL SURFACE block in `core/prompt_blocks.py` no longer matches the tools the Write "
         "arm registers. Regenerate it with the one-liner in `services/agent/toolsets.py`'s U20 "
@@ -706,13 +706,13 @@ async def test_the_tool_surface_is_generated_from_the_tools_the_write_arm_regist
 
 
 async def test_the_prompts_tool_list_is_exactly_what_the_write_arm_registers() -> None:
-    """★ THE MEMBERSHIP HALF, asserted against `toolsets_for_mode` rather than a hand-kept list.
+    """★ THE MEMBERSHIP HALF, asserted against `toolsets_for_kind` rather than a hand-kept list.
 
     The hand-written block named six tools while the Write arm handed the model eight: the two
     structured reads it borrows off `read_only_toolset` (`_WRITE_STRUCTURED_READS`) were absent
     from the prompt for their entire life, so the model was never told it could list or search
     the tree and paid for that in `run_command` round-trips."""
-    registered = set(await registered_tool_definitions(ConversationMode.WRITE))
+    registered = set(await registered_tool_definitions(ChatKind.BUILD))
     named = set(re.findall(r"^- `(\w+)` \u2014 ", _tool_surface_block(BUILD_SYSTEM_PROMPT), re.M))
     assert named == registered
     # The two the old prose omitted, named explicitly so the failure reads as itself.
@@ -726,7 +726,7 @@ async def test_every_tool_line_is_its_registered_descriptions_first_sentence() -
 
     Each line must be the tool's OWN words, not a paraphrase of them, so the prompt and the tool
     schema cannot say different things about the same tool."""
-    for name, definition in (await registered_tool_definitions(ConversationMode.WRITE)).items():
+    for name, definition in (await registered_tool_definitions(ChatKind.BUILD)).items():
         assert definition.description, f"`{name}` reaches the model with no description"
         line = f"- `{name}` \u2014 {first_sentence(definition.description)}"
         assert line in BUILD_SYSTEM_PROMPT, f"the prompt paraphrases `{name}`; expected {line!r}"
@@ -752,7 +752,7 @@ async def test_the_drift_check_fails_when_a_tool_joins_a_mode(
         return toolset
 
     monkeypatch.setattr(_THE_SANDBOX_FACTORY, registers_a_seventh)
-    assert "summon_a_pony" in await render_tool_surface(ConversationMode.WRITE)
+    assert "summon_a_pony" in await render_tool_surface(ChatKind.BUILD)
     with pytest.raises(AssertionError, match="no longer matches the tools"):
         await _the_drift_check()
 
@@ -775,7 +775,7 @@ async def test_the_drift_check_fails_when_a_tools_docstring_is_reworded(
         return toolset
 
     monkeypatch.setattr(_THE_SANDBOX_FACTORY, describes_declare_done_the_old_way)
-    reworded = await render_tool_surface(ConversationMode.WRITE)
+    reworded = await render_tool_surface(ChatKind.BUILD)
     # Same eight tools — a membership check sees nothing at all here.
     assert set(re.findall(r"^- `(\w+)`", reworded, re.M)) == set(
         re.findall(r"^- `(\w+)`", WRITE_TOOL_SURFACE, re.M)
@@ -797,7 +797,7 @@ async def test_a_tool_without_a_docstring_fails_the_render_rather_than_shipping_
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(_THE_SANDBOX_FACTORY, registers_a_mute_tool)
         with pytest.raises(ValueError, match="registered with no description"):
-            await render_tool_surface(ConversationMode.WRITE)
+            await render_tool_surface(ChatKind.BUILD)
 
 
 async def test_run_commands_dev_server_rule_is_registered_copy_as_well_as_prompt_copy() -> None:
@@ -807,7 +807,7 @@ async def test_run_commands_dev_server_rule_is_registered_copy_as_well_as_prompt
     covers the agent starting a dev server through `/exec` without U14's marker — the supervisor's
     child env carries nothing that would tell a second `next dev` apart from the real one — so it
     must survive in BOTH voices: the tool's own description, and the ENVIRONMENT block."""
-    definitions = await registered_tool_definitions(ConversationMode.WRITE)
+    definitions = await registered_tool_definitions(ChatKind.BUILD)
     described = (definitions["run_command"].description or "").lower()
     assert "do not start or restart the dev server" in described
     assert "already running" in described

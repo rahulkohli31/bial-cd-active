@@ -13,7 +13,7 @@ catch-up snapshot (live) in U10 — never a second source of truth. The input is
 Hidden rows are excluded from RENDERING but still inform derived state: an unclosed
 `build_started` marker (no `build_outcome` with the same sessionId anywhere after it)
 projects a truthful "a build was running here" anchor — the crashed/mid-build reload story
-(R8). Mode-switch markers render nothing, ever.
+(R8).
 
 Inside a build session's step rows, only the FIRST row's user prompt renders as a user
 bubble: that is the instruction the user actually sent. Later step-row prompts are the
@@ -30,20 +30,29 @@ from typing import Any, Final, Literal
 from pydantic import Field
 
 from src.core.prompt_blocks import APPLY_SCHEMA_CHANGE_TOOL
-from src.db.models.conversation import ConversationMode
+from src.db.models.conversation import ChatKind
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.schemas import CamelModel
-from src.services.messages.store import ATTACHMENT_REF_KIND
+from src.services.messages.store import ATTACHMENT_REF_KIND, SCHEMA_VERSION
 
 # The Plan-mode options tool (U8 stub, U11 mechanics). The projection derives the card's
 # resolution state from this tool's stored call/return pair.
 PLAN_OPTIONS_TOOL: Final = "present_plan_options"
 
-# Details-expander cap per block (args / result). Wire-size bound only — the content is
-# already redacted and producer-bounded; this just keeps one giant tool return from bloating
-# every reload of the conversation.
-_DETAIL_CAP_CHARS: Final = 4_000
-_TRUNCATION_MARK: Final = " …[truncated]"
+TURN_TERMINAL_KIND: Final = "turn_terminal"
+"""`meta.kind` of the durable turn-terminal row. Named here, beside the arm that reads it, and
+imported by the engine that writes it — one spelling, because a writer and a reader that each
+hold their own string literal are one typo away from a row nobody projects."""
+
+# THERE IS NO DETAILS-EXPANDER CAP HERE ANY MORE, because there is no expander material to
+# cap. A step used to carry the raw arguments and the raw result of its tool call, redacted and
+# clipped to four thousand characters, on every frame and every reload item INCLUDING hidden
+# steps — parsed by the browser and rendered nowhere. The friendly label is safe by
+# construction (`_classify_command` fails closed and never puts raw argv on screen); the
+# arguments beside it were not, and "it is not rendered" is a property of today's client, not
+# of the wire. Redaction that lives at the draw site is a promise; redaction that lives here is
+# a fact — the field is gone, so no future expander can reach it. See `test_projection.py`'s
+# field-set guard, which is where the guarantee actually lives.
 
 # Read-only commands (U8's guest list) render as hidden inspection steps — same rule as the
 # structured read tools: reads are noise until the user opens the Details expander.
@@ -91,17 +100,9 @@ _AREA_GENERIC: Final = "a part of your app"
 _FILE_MUTATORS: Final = frozenset({"write_file", "edit_file", "insert_lines"})
 
 
-class StepDetail(CamelModel):
-    """The Details expander's raw (stored, already-redacted) material for one step."""
-
-    args: str | None = None
-    result: str | None = None
-
-
 class UserTextItem(CamelModel):
     type: Literal["user_text"] = "user_text"
     seq: int
-    mode: str
     text: str
     # Attachment reference ids found in the prompt content — the UI renders chips; the bytes
     # never travel on this read.
@@ -111,7 +112,6 @@ class UserTextItem(CamelModel):
 class AssistantTextItem(CamelModel):
     type: Literal["assistant_text"] = "assistant_text"
     seq: int
-    mode: str
     text: str
 
 
@@ -123,12 +123,39 @@ class StepItem(CamelModel):
 
     type: Literal["step"] = "step"
     seq: int
-    mode: str
     tool: str
     label: str
     state: Literal["ok", "failed", "pending"]
     hidden: bool
-    detail: StepDetail
+
+
+class TurnTerminalItem(CamelModel):
+    """One turn ended, said durably — the row a transcript rebuilt WITHOUT the live stream
+    reads to know a turn is over.
+
+    WHY A STORED ROW AND NOT THE LIVE FRAME. `TurnEndedFrame` says the same thing, and it says
+    it exactly once, to whoever happened to be subscribed. A tab that reloads afterwards — or a
+    process that restarts mid-turn — has no frame to read and no way to tell "this turn
+    finished" from "this turn is still going": the last thing in the transcript is a reply, and
+    a reply looks identical either way. Anything that renders a turn as a unit (a group that
+    can be collapsed, a spinner, a control that only makes sense while a turn runs) is then
+    stuck on the wrong answer with nothing to press.
+
+    `terminal` REUSES `_banner_kind`'s vocabulary rather than inventing a parallel one, so the
+    word a reload shows and the word the live frame carried are derived from the same mapping
+    of the same stored meta. Two spellings of "the turn stopped" is how a client ends up with
+    two states for one fact.
+
+    ENDED-UNKNOWN IS THE ABSENCE OF THIS ITEM, deliberately — there is no `unknown` member. A
+    turn killed by a restart writes no row at all, because the process that would have written
+    it is gone; a consumer that finds a turn's rows with no terminal among them knows the turn
+    did not finish cleanly, and that is a stronger signal than a value some future writer could
+    forget to set."""
+
+    type: Literal["turn_terminal"] = "turn_terminal"
+    seq: int
+    turn_id: str
+    terminal: Literal["completed", "failed", "stopped", "quota"]
 
 
 class BannerItem(CamelModel):
@@ -138,7 +165,6 @@ class BannerItem(CamelModel):
 
     type: Literal["banner"] = "banner"
     seq: int
-    mode: str
     banner: Literal["completed", "failed", "stopped", "quota"]
     text: str
     preview_url: str | None = None
@@ -151,22 +177,20 @@ class BuildInProgressItem(CamelModel):
 
     type: Literal["build_in_progress"] = "build_in_progress"
     seq: int
-    mode: str
     session_id: str
 
 
 class PlanOptionsItem(CamelModel):
-    """The Build it / Keep refining card (U11 consumes this). State derives from the stored
-    tool RETURN: absent or unresolved → pending; `refine` / `build` / `build_failed:<reason>`
-    are U11's three stored resolutions. `build_failed` re-arms the card (never
-    resolved-with-no-build)."""
+    """The Build it / Keep refining card. State derives from the stored tool RETURN: absent or
+    unresolved → pending; `refine` and `build` are the two a user can produce, and there is no
+    third. `build_failed` used to be one, re-arming a card a failed press had burned — the
+    handoff answers the offer after the turn has started, so a failure burns nothing and there
+    is nothing to re-arm."""
 
     type: Literal["plan_options"] = "plan_options"
     seq: int
-    mode: str
     tool_call_id: str
-    state: Literal["pending", "refine", "build", "build_failed"]
-    reason: str | None = None
+    state: Literal["pending", "refine", "build"]
 
 
 DisplayItem = (
@@ -176,18 +200,17 @@ DisplayItem = (
     | BannerItem
     | BuildInProgressItem
     | PlanOptionsItem
+    | TurnTerminalItem
 )
 
 
-def _clip(value: str) -> str:
-    if len(value) <= _DETAIL_CAP_CHARS:
-        return value
-    return value[:_DETAIL_CAP_CHARS] + _TRUNCATION_MARK
-
-
 def _stringify(value: Any) -> str:
-    """A stored args/content value as display text. Values are already redacted; this only
-    flattens shape (dict args vs JSON-string args vs structured retry content)."""
+    """A stored tool-return value as a plain string, for COMPARISON — never for display.
+
+    Its display reader went with the Details expander; this one survives because the card's
+    resolution is stored as a tool return whose content has to be read back (`"build"` vs
+    anything else). It only flattens shape: dict content vs JSON-string content vs a structured
+    retry body."""
     if isinstance(value, str):
         return value
     try:
@@ -199,7 +222,8 @@ def _stringify(value: Any) -> str:
 def _args_dict(raw: Any) -> dict[str, Any]:
     """Tool args as a dict for classification. pydantic-ai stores args either as a dict or a
     JSON string (provider-dependent); anything unparseable classifies as empty rather than
-    raising — the label falls back, the Details expander still shows the raw string."""
+    raising — the label falls back to its generic form, which is the whole of what a step says
+    now."""
     if isinstance(raw, dict):
         return raw
     if isinstance(raw, str):
@@ -409,15 +433,6 @@ def classify_tool_call(tool_name: str, args_json: str) -> tuple[str, bool]:
     return _step_label(tool_name, parsed if isinstance(parsed, dict) else {})
 
 
-def step_detail(args: str | None, result: str | None) -> StepDetail:
-    """A Details-expander block from already-redacted stored/live values, clipped to the
-    same cap the reload projection applies."""
-    return StepDetail(
-        args=_clip(args) if args else None,
-        result=_clip(result) if result else None,
-    )
-
-
 def _is_attachment_fence(text: str) -> bool:
     """A client-built `<attachment …>…</attachment>` content block (U7): DATA riding in the
     prompt, not prose. The bubble must show what the user TYPED — a 200 KB inlined CSV in the
@@ -544,23 +559,40 @@ def _payload_text(payload: list[Any]) -> str:
 
 def _plan_options_state(
     stored: tuple[str, bool] | None,
-) -> tuple[Literal["pending", "refine", "build", "build_failed"], str | None]:
+) -> Literal["pending", "refine", "build"]:
     """U11's three stored resolutions (+ pending). Anything unrecognized — including the U8
     stub's wait-for-choice ack — reads as pending: the card must re-render actionable rather
     than invent a resolution that was never stored."""
     if stored is None:
-        return ("pending", None)
+        return "pending"
     content, was_retry = stored
     if was_retry:
-        return ("pending", None)
+        return "pending"
     if content == "build":
-        return ("build", None)
-    if content == "refine":
-        return ("refine", None)
-    if content.startswith("build_failed"):
-        _, _, reason = content.partition(":")
-        return ("build_failed", reason or None)
-    return ("pending", None)
+        return "build"
+    # ANYTHING ELSE READS AS SPENT, not as pending, and the distinction matters for exactly
+    # one input: a `build_failed:<reason>` overlay written before that state was retired. Those
+    # cards are resolved and their build did not happen; showing them as live would offer a
+    # button with nothing behind it.
+    return "refine"
+
+
+def _plan_argument(args: Any) -> str | None:
+    """The plan out of an offer call's stored arguments, or None when it carries none.
+
+    Tolerant of both stored shapes — pydantic-ai persists a tool call's `args` as a JSON string
+    or as an object depending on the provider — and of neither being parseable. A malformed
+    argument is the same answer as a missing one here: there is no plan to show, and a
+    projection that raised would take a whole transcript down over one row."""
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except ValueError:
+            return None
+    if not isinstance(args, dict):
+        return None
+    plan = args.get("plan")
+    return plan.strip() or None if isinstance(plan, str) else None
 
 
 def _project_response_parts(
@@ -571,11 +603,10 @@ def _project_response_parts(
 ) -> None:
     """One stored ModelResponse → assistant text + friendly steps + plan-options cards, in
     part order (text streamed before a tool call renders before it, matching the live feed)."""
-    mode = row.mode.value
     parts = [p for p in message.get("parts", []) if isinstance(p, dict)]
-    # U15/R20 — WRITE-MODE NARRATION BETWEEN TOOLS IS NOT THE CITIZEN'S MESSAGE.
+    # U15/R20 — BUILD NARRATION BETWEEN TOOLS IS NOT THE CITIZEN'S MESSAGE.
     #
-    # A Write response that ALSO calls a tool is doing the work, and its prose is the model
+    # A Build response that ALSO calls a tool is doing the work, and its prose is the model
     # talking to itself on the way there ("let me check the server logs", "drizzle's generic
     # wrapper"). The work already has a citizen-readable account — the friendly step label
     # this same loop emits below — so dropping the prose loses nothing and removes the whole
@@ -589,8 +620,18 @@ def _project_response_parts(
     # it" keeps that answer and drops only narration; `kind == "write_completion"` would
     # silently eat it. Mirrored live in `engine._stream_text` — change both or reload and
     # the live feed disagree.
-    narrating_between_tools = row.mode is ConversationMode.WRITE and any(
-        p.get("part_kind") == "tool-call" for p in parts
+    #
+    # AND IT IS GATED ON WHEN THE ROW WAS WRITTEN, which is the half revision 0035 forced.
+    # 0035 rewrites every historical row's stamp to `build`, so without this guard the drop
+    # would become RETROACTIVE: a migrated Plan or Ask turn that read files and then wrote
+    # prose — the ordinary shape, not an edge case — would silently stop rendering its prose
+    # on reload. `schema_version` is a fact about when a row was written, never a per-row
+    # exemption keyed on the migrated stamp, so it costs the "behaviour lives in the toolset"
+    # claim nothing. Rows written before 0035 keep rendering exactly as they always did.
+    narrating_between_tools = (
+        row.schema_version >= SCHEMA_VERSION
+        and row.kind is ChatKind.BUILD
+        and any(p.get("part_kind") == "tool-call" for p in parts)
     )
     for part in parts:
         part_kind = part.get("part_kind")
@@ -599,7 +640,7 @@ def _project_response_parts(
                 continue
             content = part.get("content")
             if isinstance(content, str) and content.strip():
-                items.append(AssistantTextItem(seq=row.seq, mode=mode, text=content))
+                items.append(AssistantTextItem(seq=row.seq, text=content))
         elif part_kind == "tool-call":
             tool_name = part.get("tool_name")
             if not isinstance(tool_name, str):
@@ -607,20 +648,37 @@ def _project_response_parts(
             call_id = part.get("tool_call_id")
             stored = results.get(call_id) if isinstance(call_id, str) else None
             if tool_name == PLAN_OPTIONS_TOOL:
-                options_state, reason = _plan_options_state(stored)
+                # THE PLAN, THEN THE CARD BENEATH IT — read out of the call's own stored
+                # `args`, which is the single authoritative copy. The live stream pushes the
+                # same string from the same call at `FunctionToolCallEvent`, so a reloaded
+                # transcript is byte-identical to what the citizen watched arrive; and because
+                # both sides read one field rather than agreeing to keep two in step, they
+                # cannot drift.
+                #
+                # NOT A SECOND STORED ROW, deliberately. Rendering the plan as its own durable
+                # assistant message would put it in the conversation TWICE — once as the text
+                # row and once inside the tool call the model actually made — and every
+                # subsequent turn in that chat would carry both copies into the model's
+                # context. A plan is long by design; paying for it twice on every turn, on a
+                # platform whose token meter the citizen can see, is not a rounding error.
+                #
+                # A call with no plan in it renders no text and still renders its card: that is
+                # every offer presented before the plan became the argument, and their cards
+                # were resolved by revision 0035 rather than deleted, so a migrated transcript
+                # reads exactly as it always did.
+                plan = _plan_argument(part.get("args"))
+                if plan:
+                    items.append(AssistantTextItem(seq=row.seq, text=plan))
                 items.append(
                     PlanOptionsItem(
                         seq=row.seq,
-                        mode=mode,
                         tool_call_id=call_id if isinstance(call_id, str) else "",
-                        state=options_state,
-                        reason=reason,
+                        state=_plan_options_state(stored),
                     )
                 )
                 continue
             args = _args_dict(part.get("args"))
             label, hidden = _step_label(tool_name, args)
-            raw_args = part.get("args")
             state: Literal["ok", "failed", "pending"]
             if stored is None:
                 state = "pending"
@@ -629,15 +687,10 @@ def _project_response_parts(
             items.append(
                 StepItem(
                     seq=row.seq,
-                    mode=mode,
                     tool=tool_name,
                     label=label,
                     state=state,
                     hidden=hidden,
-                    detail=StepDetail(
-                        args=_clip(_stringify(raw_args)) if raw_args is not None else None,
-                        result=_clip(stored[0]) if stored is not None else None,
-                    ),
                 )
             )
         # thinking / builtin-tool / file / compaction parts render nothing (reasoning and
@@ -668,20 +721,13 @@ def project_rows(rows: Sequence[Message]) -> list[DisplayItem]:
     items: list[DisplayItem] = []
 
     for row in rows:
-        if row.entry_kind is MessageEntryKind.MODE_SWITCH:
-            continue
-
         if row.entry_kind is MessageEntryKind.SYSTEM_EVENT:
             meta = row.meta if isinstance(row.meta, dict) else {}
             kind = meta.get("kind")
             session_id = meta.get("sessionId")
             if kind == "build_started":
                 if isinstance(session_id, str) and session_id not in closed:
-                    items.append(
-                        BuildInProgressItem(
-                            seq=row.seq, mode=row.mode.value, session_id=session_id
-                        )
-                    )
+                    items.append(BuildInProgressItem(seq=row.seq, session_id=session_id))
                 continue
             if kind == "plan_options_pending" and meta.get("synthesized"):
                 # The retry-cap fallback card (U11): hidden row, visible card — its state
@@ -689,21 +735,29 @@ def project_rows(rows: Sequence[Message]) -> list[DisplayItem]:
                 call_id = meta.get("toolCallId")
                 if isinstance(call_id, str):
                     recorded = synthetic.get(call_id)
-                    options_state, reason = _plan_options_state(
-                        (recorded[0], False) if recorded is not None else None
-                    )
                     items.append(
                         PlanOptionsItem(
                             seq=row.seq,
-                            mode=row.mode.value,
                             tool_call_id=call_id,
-                            state=options_state,
-                            reason=reason,
+                            state=_plan_options_state(
+                                (recorded[0], False) if recorded is not None else None
+                            ),
                         )
                     )
                 continue
             if kind == "plan_options_resolved":
                 continue  # the companion record renders through its pending card
+            if kind == TURN_TERMINAL_KIND:
+                # HIDDEN, and rendered anyway — the one system row that does. It carries no
+                # sentence for anyone to read; it is structure, and the arm below would drop it
+                # on the way to "hidden rows render nothing". Placed ABOVE that line for exactly
+                # that reason.
+                turn_id = meta.get("turnId")
+                if isinstance(turn_id, str):
+                    items.append(
+                        TurnTerminalItem(seq=row.seq, turn_id=turn_id, terminal=_banner_kind(meta))
+                    )
+                continue
             if row.visibility is MessageVisibility.HIDDEN:
                 continue  # hidden system rows render nothing
             if kind == "build_outcome" and isinstance(session_id, str):
@@ -711,7 +765,6 @@ def project_rows(rows: Sequence[Message]) -> list[DisplayItem]:
                 items.append(
                     BannerItem(
                         seq=row.seq,
-                        mode=row.mode.value,
                         banner=_banner_kind(meta),
                         text=_payload_text(row.payload) or "Build finished.",
                         preview_url=preview if isinstance(preview, str) else None,
@@ -723,7 +776,7 @@ def project_rows(rows: Sequence[Message]) -> list[DisplayItem]:
             # lifecycle entry should degrade to prose, not vanish).
             text = _payload_text(row.payload)
             if text:
-                items.append(AssistantTextItem(seq=row.seq, mode=row.mode.value, text=text))
+                items.append(AssistantTextItem(seq=row.seq, text=text))
             continue
 
         if row.visibility is MessageVisibility.HIDDEN:
@@ -743,7 +796,6 @@ def project_rows(rows: Sequence[Message]) -> list[DisplayItem]:
                             items.append(
                                 UserTextItem(
                                     seq=row.seq,
-                                    mode=row.mode.value,
                                     text=text,
                                     attachment_ids=refs,
                                 )

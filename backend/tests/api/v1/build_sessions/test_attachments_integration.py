@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
 from src.db.models.attachment import Attachment
-from src.db.models.conversation import ConversationKind
+from src.db.models.conversation import ChatKind
 from src.services.build_sessions.attachments import resolve_build_attachments
 from src.services.storage import attachment_key, get_storage, reset_storage_for_tests
 from src.services.storage.azure_backend import AzureBlobStorage
@@ -59,7 +59,7 @@ async def test_materialization_reads_real_blob_bytes_through_the_real_store(
     user = await UserFactory.create(db_session, email="r3int@rvaiglobal.com")
     project = await ProjectFactory.create(db_session, user.id)
     conv = await ConversationFactory.create(
-        db_session, user.id, project_id=project.id, kind=ConversationKind.BUILDER
+        db_session, user.id, project_id=project.id, kind=ChatKind.BUILD
     )
     # Upload the bytes exactly as `/v1/attachments` would: real store, real owner-scoped key.
     key = attachment_key(user.id, uuid.uuid7())

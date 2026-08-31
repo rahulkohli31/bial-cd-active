@@ -22,7 +22,7 @@ from sqlalchemy import select
 
 from src.config import settings
 from src.db.models.app_registry import AppRegistry
-from src.db.models.conversation import ConversationKind
+from src.db.models.conversation import ChatKind
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.build_sessions.appdata import resolve_app_for_project
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
@@ -51,7 +51,7 @@ def _capturing_stream_model():
 
 async def _builder_conv(db_session, user_id, project_id):
     return await ConversationFactory.create(
-        db_session, user_id, project_id=project_id, kind=ConversationKind.BUILDER
+        db_session, user_id, project_id=project_id, kind=ChatKind.BUILD
     )
 
 

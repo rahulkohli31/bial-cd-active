@@ -360,13 +360,13 @@ async def test_a_second_send_at_the_limit_is_refused_before_any_turn_exists(
     goes red."""
     import sqlalchemy as sa
 
-    from src.db.models.conversation import ConversationMode
+    from src.db.models.conversation import ChatKind
     from src.db.models.message import Message
     from src.services.auth.csrf import issue_csrf_token
     from src.services.auth.session_jwt import mint_session_jwt
 
     user = await UserFactory.create(db_session)
-    conv = await ConversationFactory.create(db_session, user.id, mode=ConversationMode.ASK)
+    conv = await ConversationFactory.create(db_session, user.id, kind=ChatKind.PLAN)
     db_session.add(UserLimit(user_id=user.id, daily_token_limit=10))
     await db_session.flush()
     await record_usage(db_session, user.id, input_tokens=10, output_tokens=0)
@@ -393,12 +393,12 @@ async def test_the_route_level_refusal_body_stays_byte_stable(client, db_session
 
     Mutation check: drop `remaining` from `DailyTokenLimitExceededError.as_response` and this goes
     red."""
-    from src.db.models.conversation import ConversationMode
+    from src.db.models.conversation import ChatKind
     from src.services.auth.csrf import issue_csrf_token
     from src.services.auth.session_jwt import mint_session_jwt
 
     user = await UserFactory.create(db_session)
-    conv = await ConversationFactory.create(db_session, user.id, mode=ConversationMode.ASK)
+    conv = await ConversationFactory.create(db_session, user.id, kind=ChatKind.PLAN)
     db_session.add(UserLimit(user_id=user.id, daily_token_limit=10))
     await db_session.flush()
     await record_usage(db_session, user.id, input_tokens=10, output_tokens=0)

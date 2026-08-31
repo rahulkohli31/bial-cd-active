@@ -30,7 +30,7 @@ from pydantic import (
 )
 
 from src.api.v1.build_sessions.schemas import ErrorSource
-from src.db.models.conversation import ConversationKind, ConversationMode
+from src.db.models.conversation import ChatKind
 from src.schemas import CamelModel
 from src.services.messages.projection import DisplayItem, PlanOptionsItem, StepItem
 from src.services.orchestrator.errors import user_facing
@@ -39,15 +39,15 @@ from src.services.sandbox.base import CompileState
 
 class HeaderOut(CamelModel):
     """One conversation header. `title`/`context` are omitted when unset — the route's
-    `_header_dict` builds them in only when present. `mode` is the server-owned sticky chat
-    mode (U4). This model is documented-only (the route returns a pre-built `JSONResponse`),
-    so no exclude-unset serialization flag is involved; the `= None` defaults are what
-    document those fields as non-required."""
+    `_header_dict` builds them in only when present. `kind` is what the chat IS, fixed when it
+    was created (R14/R16) — there is no second field beside it, because there is no longer a
+    second concept. This model is documented-only (the route returns a pre-built
+    `JSONResponse`), so no exclude-unset serialization flag is involved; the `= None` defaults
+    are what document those fields as non-required."""
 
     id: str = Field(alias="_id")
     project_id: str
     kind: str
-    mode: str
     created_at: str
     updated_at: str
     title: str | None = None
@@ -66,12 +66,12 @@ class ConversationCreateRequest(CamelModel):
 
     id: uuid.UUID
     project_id: uuid.UUID
-    kind: ConversationKind
+    # REQUIRED, and the only place a chat's kind is ever set (R15). There is no route that
+    # changes it afterwards; a value outside the enum is refused at this boundary rather than
+    # coerced to a default, because "which chat is this" decides what the model can do.
+    kind: ChatKind
     title: str | None = None
     context: Any = None
-    # The starting chat mode (U13): the root box mints Ask/Plan/Write chats. Optional so
-    # older callers keep the server default ('plan').
-    mode: ConversationMode | None = None
 
 
 class ConversationCreateResponse(CamelModel):
@@ -239,15 +239,17 @@ class DiagnosticFrame(CamelModel):
     """An in-narrative build diagnostic. Deliberately NOT an `error` frame: the turn is not
     failing — a repair run follows.
 
-    TWO AUDIENCES RIDE ON ONE FRAME (U16), and they must not be confused for each other:
+    ONE AUDIENCE RIDES THIS FRAME, and it did not used to be that way. `title` and
+    `cleaned_stack` — the compiler's own first meaningful line and the de-noised log — travelled
+    here beside the citizen's half, described in this very docstring as "safe to transmit; NOT a
+    product surface". That distinction is not one a wire format can hold: the sentence "safe to
+    render verbatim" is what once put a stack trace under a file-path title in a citizen's chat,
+    and the note warning against it was already in place when that happened.
 
-    * `title` / `cleaned_stack` are the MODEL's half, carried unchanged from `BuildError` —
-      `title` is the compiler's own first meaningful line and `cleaned_stack` the de-noised,
-      secret-redacted log. Safe to transmit; NOT a product surface. The portal does not render
-      either, and the sentence "safe to render verbatim" that used to sit here is what produced
-      a stack trace under a file-path title in a citizen's chat.
-    * `user_message` / `user_action` are the CITIZEN's half — a plain sentence about their app
-      and something they can do about it. This is what the feed renders.
+    So the model's half stays SERVER-SIDE, where the repair run reads it off the `BuildError`
+    that produced it. It is not lost, it is not redacted, and it is not sent. What crosses is
+    `user_message` / `user_action`: a plain sentence about the citizen's app and something they
+    can do about it, which is the only half any surface ever rendered.
     """
 
     type: Literal["diagnostic"] = "diagnostic"
@@ -255,9 +257,12 @@ class DiagnosticFrame(CamelModel):
     # The build's OWN enum, not a re-spelled Literal. `ErrorSource` is a StrEnum, so the
     # wire shape is identical either way — but a second copy of the member list is a copy
     # that can drift, and the producer already holds a `BuildError.source`.
+    #
+    # KEPT, and it is worth saying why when its two neighbours went: `source` is a closed
+    # vocabulary of error CLASSES this schema already publishes, it is what the citizen-facing
+    # pair is derived from below, and it carries nothing out of the build — a class name is not
+    # a stack.
     source: ErrorSource
-    title: str
-    cleaned_stack: str
     # DERIVED FROM `source` WHEN THE PRODUCER SUPPLIES NOTHING, which is the whole safety
     # property: the pair cannot be forgotten into emptiness by a caller that only knows about
     # the model's half, so every diagnostic that reaches a person carries a sentence AND a next
@@ -386,11 +391,3 @@ class TurnStopResponse(CamelModel):
     already settled — stopping twice is not an error)."""
 
     status: Literal["stopping", "already_settled"]
-
-
-class ModeSwitchResponse(CamelModel):
-    """`POST /conversations/{id}/mode` → the conversation's mode AFTER the switch (the same
-    value on an idempotent same-mode call). Documentation-only: the route hand-builds this
-    body as a `JSONResponse`, so declaring it changes the schema, never the bytes."""
-
-    mode: ConversationMode

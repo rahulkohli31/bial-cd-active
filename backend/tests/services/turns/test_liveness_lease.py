@@ -34,7 +34,7 @@ from src.api.v1.build_sessions.schemas import (
     LIVENESS_LEASE_RENEW_CADENCE_SECONDS,
     LIVENESS_LEASE_TTL_SECONDS,
 )
-from src.db.models.conversation import ConversationMode
+from src.db.models.conversation import ChatKind
 from src.services.build_sessions import locks, reaper
 from src.services.orchestrator.deps import SandboxSession
 from src.services.redis import (
@@ -91,7 +91,7 @@ def _turn_state(user: uuid.UUID, client: FakeSandboxClient) -> _TurnState:
         turn_id=uuid.uuid4(),
         conversation_id=uuid.uuid4(),
         user_id=user,
-        mode=ConversationMode.WRITE,
+        kind=ChatKind.BUILD,
     )
     fqdn = "sbx-x.westeurope.azurecontainerapps.io"
     state.sandbox = SandboxSession(
@@ -327,7 +327,7 @@ async def test_a_turn_that_never_attached_a_container_publishes_nothing(
         turn_id=uuid.uuid4(),
         conversation_id=uuid.uuid4(),
         user_id=USER,
-        mode=ConversationMode.ASK,
+        kind=ChatKind.PLAN,
     )
     engine = TurnEngine()
     state.lease_task = asyncio.create_task(engine._hold_liveness_lease(state))
@@ -351,7 +351,7 @@ async def test_a_turn_that_published_nothing_revokes_nothing(
         turn_id=uuid.uuid4(),
         conversation_id=uuid.uuid4(),
         user_id=USER,
-        mode=ConversationMode.ASK,
+        kind=ChatKind.PLAN,
     )
     assert state.lease_task is None
     await TurnEngine()._stop_liveness_lease(state)

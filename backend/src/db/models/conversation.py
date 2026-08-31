@@ -30,38 +30,36 @@ from src.db.base import Base
 from src.db.mixins import OwnedByUserMixin, TimestampMixin, UUIDv7PrimaryKeyMixin
 
 
-class ConversationKind(StrEnum):
-    """The three chat kinds (Express `KINDS`, verbatim strings). Native PG enum labels —
-    stable, professional, safe in API responses."""
+class ChatKind(StrEnum):
+    """What a chat IS — chosen when it is created and never changed (R14/R15).
 
-    PLANNING = "planning"
-    ASSISTANT = "assistant"
-    BUILDER = "builder"
+    This replaced two independent three-valued enums that between them decided one thing: what
+    a run is allowed to do. One of them (planning / assistant / builder) gated nothing but a
+    legacy relay's base prompt. The other (ask / plan / write) gated the toolset — correctly —
+    and also selected prompt segments, drove a per-turn restatement cadence, decided whether
+    narration reached the screen, decided which copy of the app a turn read, and was stamped on
+    every stored row.
 
+    THE KIND HAS EXACTLY TWO READERS AND BOTH ARE NAMED, because "one module reads it" would be
+    nearly-true rather than true. `services/agent/toolsets.py` reads it to decide what the model
+    CAN DO — the guardrail. A Plan chat cannot change the app because `write_file`, `edit_file`,
+    `insert_lines`, `apply_schema_change`, the sandbox-routed `run_command` and `declare_done`
+    are not in the list handed to that run, never because something downstream notices which
+    kind of chat it is. `services/turns/engine.py` reads it once more, to select a HARNESS
+    SHAPE: the node loop with its per-step billing fold versus a single `chat_agent.run`, and
+    with it the run's `output_type`. Everything else that holds a kind is stamping a row.
+    """
 
-class ConversationMode(StrEnum):
-    """The unified chat's three modes (D1). Server-owned, sticky between turns: the per-mode
-    toolset registry (U8) keys on this value, so a wrong-mode tool is structurally absent —
-    never merely prompt-forbidden."""
-
-    ASK = "ask"
     PLAN = "plan"
-    WRITE = "write"
+    BUILD = "build"
 
 
-# Native PG enums, shared by the model columns and the Alembic migrations. `create_type=False`:
+# Native PG enum, shared by the model columns and the Alembic migrations. `create_type=False`:
 # the owning migration runs CREATE/DROP TYPE explicitly (so a downgrade drops it) — the column
 # must not try to create the type itself. Mirrors `app_registry.app_status_enum`.
-conversation_kind_enum = sa.Enum(
-    ConversationKind,
-    name="conversation_kind",
-    values_callable=lambda enum: [member.value for member in enum],
-    create_type=False,
-)
-
-conversation_mode_enum = sa.Enum(
-    ConversationMode,
-    name="conversation_mode",
+chat_kind_enum = sa.Enum(
+    ChatKind,
+    name="chat_kind",
     values_callable=lambda enum: [member.value for member in enum],
     create_type=False,
 )
@@ -81,15 +79,10 @@ class Conversation(UUIDv7PrimaryKeyMixin, TimestampMixin, OwnedByUserMixin, Base
         nullable=False,
         index=True,
     )
-    kind: Mapped[ConversationKind] = mapped_column(conversation_kind_enum, nullable=False)
-    # The sticky server-owned chat mode (D1). Defaults to `plan` — the root Build box mints
-    # new chats in Plan mode (U13), and a mode the server never recorded must still be a
-    # DEFINED mode (fail-first: no nullable "unknown" state for a gating input).
-    mode: Mapped[ConversationMode] = mapped_column(
-        conversation_mode_enum,
-        nullable=False,
-        server_default=sa.text("'plan'::conversation_mode"),
-    )
+    # Fixed at creation and never changed: there is no route that mutates it (R14/R15), and
+    # no server default — a chat whose kind the creator did not choose is a programming error,
+    # not a chat that quietly becomes one of them (fail-first).
+    kind: Mapped[ChatKind] = mapped_column(chat_kind_enum, nullable=False)
     # Derived client-side from the first message; mutable via PATCH. TEXT (short in
     # practice — the SPA caps it ~40 chars — but unbounded here).
     title: Mapped[str | None] = mapped_column(sa.Text, nullable=True)

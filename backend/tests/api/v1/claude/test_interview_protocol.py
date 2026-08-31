@@ -1,9 +1,11 @@
 """The relay's server-composed system prompt.
 
-`_compose_system` selects the base prompt by conversation KIND and folds in the truthful portal
-self-description (#6/R5) plus the project's own description — tamper-proof, because there is no
-client `system` field left to omit or replace (R9). Asserted against the system prompt the faked
-model actually receives, the site that makes the decision, not a passthrough.
+`_compose_system` picks the base prompt (ephemeral-summarize vs. everything else — the
+per-KIND selection retired with the three-valued chat-kind enum, see `prompts.py`) and folds
+in the truthful portal self-description (#6/R5) plus the project's own description —
+tamper-proof, because there is no client `system` field left to omit or replace (R9).
+Asserted against the system prompt the faked model actually receives, the site that makes
+the decision, not a passthrough.
 
 The 003-U2 ask-then-brief interview protocol is GONE (builder threads run on the U10 turn engine
 and their plan surfaces as the `present_plan_options` card), so its assertions went with it.
@@ -15,11 +17,10 @@ from pydantic_ai.models.function import FunctionModel
 
 from src.api.v1.claude.prompts import (
     ASSISTANT_IDENTITY_PROMPT,
-    PLANNING_SYSTEM_PROMPT,
     PORTAL_SELF_DESCRIPTION,
 )
 from src.config import settings
-from src.db.models.conversation import ConversationKind
+from src.db.models.conversation import ChatKind
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.build_sessions.appdata import resolve_app_for_project
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
@@ -59,7 +60,7 @@ async def _turn(client, db_session, set_chat_model, kind, *, description=None):
     return captured["instructions"]
 
 
-# --- the base prompt is selected by kind, server-side --------------------------
+# --- the base prompt is composed server-side, the same for every kind ----------
 
 
 async def test_builder_turn_carries_identity_and_project_context(
@@ -69,12 +70,12 @@ async def test_builder_turn_carries_identity_and_project_context(
         client,
         db_session,
         set_chat_model,
-        ConversationKind.BUILDER,
+        ChatKind.BUILD,
         description="Visitor management for T1.",
     )
 
-    # U7: the server SELECTS the base prompt by kind — a builder thread opens with the
-    # assistant identity line (the ex-client THREAD_SYSTEM_PROMPT, now server-owned).
+    # U7: the server SELECTS the base prompt — a builder thread opens with the assistant
+    # identity line (the ex-client THREAD_SYSTEM_PROMPT, now server-owned).
     assert instructions.startswith(ASSISTANT_IDENTITY_PROMPT)
     assert "Visitor management for T1." in instructions
 
@@ -84,15 +85,21 @@ async def test_planning_turn_keeps_its_grounding(client, db_session, set_chat_mo
         client,
         db_session,
         set_chat_model,
-        ConversationKind.PLANNING,
+        ChatKind.PLAN,
         description="Visitor management for T1.",
     )
 
-    # #6/R5: the truthful portal self-description rides on EVERY turn, planning included —
-    # the walkthrough's invented-features answer came from a non-builder chat. Exact
-    # composition pinned: base-by-kind, self-description, project grounding — nothing else.
+    # #6/R5: the truthful portal self-description rides on EVERY turn, Plan included — the
+    # walkthrough's invented-features answer came from a non-builder chat. Exact composition
+    # pinned: base prompt, self-description, project grounding — nothing else.
+    #
+    # THE PER-KIND BASE-PROMPT SELECTION IS GONE with the three-valued kind enum this test
+    # used to name (`ConversationKind.PLANNING` picked `PLANNING_SYSTEM_PROMPT`). The relay
+    # now hands every non-ephemeral conversation the same `ASSISTANT_IDENTITY_PROMPT` — a
+    # Plan chat's toolset gating lives in `services/agent/toolsets.py`, not in the relay's
+    # base prompt — so this assertion is pinned against that constant instead.
     assert instructions == (
-        PLANNING_SYSTEM_PROMPT
+        ASSISTANT_IDENTITY_PROMPT
         + f"\n\n{PORTAL_SELF_DESCRIPTION}"
         + "\n\nProject context — Test Project:\nVisitor management for T1."
     )
@@ -104,7 +111,7 @@ async def test_planning_turn_keeps_its_grounding(client, db_session, set_chat_mo
 async def test_builder_turn_also_carries_the_self_description(
     client, db_session, set_chat_model
 ) -> None:
-    instructions = await _turn(client, db_session, set_chat_model, ConversationKind.BUILDER)
+    instructions = await _turn(client, db_session, set_chat_model, ChatKind.BUILD)
 
     assert PORTAL_SELF_DESCRIPTION in instructions
     # Identity precedes the project grounding: the model learns what it is part of before it
@@ -154,7 +161,7 @@ async def test_builder_interview_turn_does_not_carry_the_code_seed(
     headers, user = await _auth(db_session)
     project = await ProjectFactory.create(db_session, user.id)
     conv = await ConversationFactory.create(
-        db_session, user.id, project_id=project.id, kind=ConversationKind.BUILDER
+        db_session, user.id, project_id=project.id, kind=ChatKind.BUILD
     )
     app_id = await resolve_app_for_project(db_session, user.id, project.id)
     # Seed `current_code` directly: the conversations-PATCH mirror died with 0024, and the
