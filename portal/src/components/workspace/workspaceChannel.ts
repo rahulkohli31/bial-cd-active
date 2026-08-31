@@ -50,7 +50,7 @@
  * The context carries the CHANNEL HANDLE, which is created once and never replaced. That handle is
  * stable for the life of the shell, so the context itself never re-renders anybody.
  */
-import { createContext, useContext, useLayoutEffect, useSyncExternalStore, type ComponentProps, type ReactNode } from 'react'
+import { createContext, useContext, useLayoutEffect, useRef, useSyncExternalStore, type ComponentProps, type ReactNode } from 'react'
 // TYPE-ONLY, so this stays a leaf at runtime: the import is erased and the channel keeps no
 // dependency on the component it describes.
 import type LivePreview from '../LivePreview'
@@ -337,11 +337,13 @@ export function useRailSlot(): RailSlot {
 //                         from the chat to the project screen, which is the exact coverage the
 //                         hoist to the shell exists to add.
 
-function usePublish<T>(cell: Cell<T> | undefined, value: T, onUnmount?: T): void {
+function usePublish<T>(cell: Cell<T> | undefined, value: T, onUnmount?: T, abstain = false): void {
   // LAYOUT effect, not a passive one. The host is a sibling that re-renders from the store, so a
   // passive publish would leave it one committed frame behind its surface — visible on mount as a
   // pane that appears hidden and then shows itself.
-  const publish = () => cell?.set(value)
+  const publish = () => {
+    if (!abstain) cell?.set(value)
+  }
   useLayoutEffect(publish)
   useLayoutEffect(
     () => () => {
@@ -360,10 +362,46 @@ export function useWorkspaceProject(projectId: string | null): void {
   usePublish(useWorkspaceChannel()?.project, projectId)
 }
 
-/** Publish what to frame. Survives this surface's unmount — see the table above. */
+/**
+ * Publish what to frame. Survives this surface's unmount — see the table above.
+ *
+ * ═══ "I HAVE NOTHING YET" IS NOT "THERE IS NOTHING" ═══
+ *
+ * Keeping the address across an unmount only buys R8 the OUTBOUND leg. The return leg mounts a
+ * BRAND NEW surface, and a surface's address arms are all cold on its first commit — a session
+ * hook starts at `null`, a turn narrative ref starts unset, a transcript starts empty, and the
+ * real URL only arrives after a hydrate/reattach round trip. `usePublish` runs on every render
+ * with no dependency list, so without this rule that first commit would hand the cell a bare
+ * `{url: null}` and retire the very address the outbound leg went to such lengths to keep. The
+ * citizen would watch their running app reload on the way BACK into the chat — the exact failure
+ * the shell was extracted to remove, arriving through the other door.
+ *
+ * So a publisher that has said nothing yet says nothing at all: it abstains, and the held address
+ * stands until this publisher has an answer of its own.
+ *
+ * THE RETIRE PATH STAYS OPEN, and that is the half a blanket "ignore nulls" would break. Once a
+ * publisher HAS resolved something — a URL, or a status with no URL yet, which is the provisioning
+ * case and a real claim — it has standing, and every later publish lands, `{url: null}` included.
+ * That is how a container that dies, a relaunch that fails, or a workspace that is lost still
+ * clears the frame while its surface stays mounted.
+ *
+ * A ref rather than state, and assigned during render rather than in an effect: `usePublish`'s
+ * layout effect reads this on the SAME commit that first carries an address, so a value that only
+ * became true in a later effect would abstain one commit too long and drop the first real publish.
+ */
 export function usePublishAddress(address: PreviewAddress, projectId: string | null): void {
   const channel = useWorkspaceChannel()
-  usePublish(channel?.address, { url: address.url, status: address.status, projectId })
+  const hasStanding = useRef(false)
+  // Both null is the only shape that means "not resolved yet". A status with no URL is the
+  // loading state — a publisher saying "a build is coming up here" — and must not be swallowed.
+  const saysNothing = address.url === null && address.status === null
+  if (!saysNothing) hasStanding.current = true
+  usePublish(
+    channel?.address,
+    { url: address.url, status: address.status, projectId },
+    undefined,
+    saysNothing && !hasStanding.current,
+  )
 }
 
 /** Publish the pane's chrome and its props. Cleared on unmount. */

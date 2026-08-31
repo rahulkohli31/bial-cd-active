@@ -38,7 +38,7 @@
  * Every continuity assertion here is therefore paired with a discontinuity one.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { useState, type ReactNode } from 'react'
+import { useState, useEffect, type ReactNode } from 'react'
 import { render, screen, fireEvent, cleanup, act } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, Link, useParams } from 'react-router-dom'
 import WorkspaceShell from '../WorkspaceShell'
@@ -50,6 +50,7 @@ import {
   useWorkspaceProject,
   type PaneView,
 } from '../workspaceChannel'
+import type { BuildSessionStatus } from '../../../utils/buildSessionTypes'
 
 vi.mock('../../layout/Navbar', () => ({ default: () => <div data-testid="navbar" /> }))
 
@@ -72,16 +73,41 @@ function ChatSurface({
   url = APP_URL as string | null,
   visible = true,
   pane,
+  status,
 }: {
   projectId?: string
   url?: string | null
   visible?: boolean
   pane?: Partial<PaneView>
+  /** Overrides the default live `ready`. The TERMINAL statuses are what `completedLive` guards. */
+  status?: BuildSessionStatus
 }) {
+  useWorkspaceProject(projectId)
+  usePublishAddress({ url, status: url ? (status ?? 'ready') : null }, projectId)
+  usePublishPaneView({ ...EMPTY_PANE, ...pane })
+  useAppPaneVisible(visible)
+  return <div data-testid="chat-surface" />
+}
+
+/**
+ * THE SAME SURFACE, MOUNTING COLD — and the distinction the suite above cannot make.
+ *
+ * `ChatSurface` takes its url as a constant prop, so a remount republishes the SAME address and the
+ * return leg of a round trip is never actually tested. The real `BuilderPage` has no constant: every
+ * arm of `resolvePreviewAddress` reads hook state or a ref that is fresh per mount (a session hook
+ * starts null, a turn-narrative ref starts unset, a transcript starts empty), and the URL only
+ * arrives after a hydrate/reattach round trip. So its FIRST commit resolves nothing, and that is the
+ * commit that used to retire the held address and tear the frame down on the way back in.
+ */
+function ColdChatSurface({ projectId = 'pA', pane }: { projectId?: string; pane?: Partial<PaneView> }) {
+  const [url, setUrl] = useState<string | null>(null)
+  useEffect(() => {
+    setUrl(APP_URL)
+  }, [])
   useWorkspaceProject(projectId)
   usePublishAddress({ url, status: url ? 'ready' : null }, projectId)
   usePublishPaneView({ ...EMPTY_PANE, ...pane })
-  useAppPaneVisible(visible)
+  useAppPaneVisible(true)
   return <div data-testid="chat-surface" />
 }
 
@@ -188,6 +214,54 @@ describe('AppPaneHost — the frame outlives a move between the two addresses (A
     // event that had not happened. That is R8 broken in the one transition this host exists for,
     // and it is why `iterating` is held by the host rather than treated as chrome.
     render(<Workspace chatSurface={<ChatSurface pane={{ iterating: true }} />} />)
+    const original = frame()
+    expect(original).toBeTruthy()
+
+    fireEvent.click(screen.getByText('to project'))
+
+    expect(frame()).toBe(original)
+    expect(frame()?.getAttribute('src')).toBe(APP_URL)
+  })
+
+  it('survives the RETURN leg, when the remounted surface has not resolved an address yet', () => {
+    // THE OTHER HALF OF R8, and the half every scenario above was structurally unable to see: they
+    // all hand `ChatSurface` a constant url, so their remount republishes the same address and the
+    // return leg is asserted without ever being exercised.
+    //
+    // A real surface mounts COLD. Its first commit resolves `{url: null, status: null}`, and the
+    // publish ran on every render with no gate — so coming BACK into the build chat retired the
+    // address the outbound leg had just gone to such lengths to keep, unmounted the iframe, and
+    // then mounted a brand-new one once the reattach landed. The citizen watched their running app
+    // reload on the way back in: R8 broken through the opposite door from the one it was fixed at.
+    //
+    // A publisher with nothing to say now abstains until it has an answer of its own.
+    render(<Workspace chatSurface={<ColdChatSurface />} />)
+    const original = frame()
+    expect(original).toBeTruthy()
+    expect(original?.getAttribute('src')).toBe(APP_URL)
+
+    fireEvent.click(screen.getByText('to project'))
+    expect(frame()).toBe(original) // outbound: the leg that already worked
+
+    fireEvent.click(screen.getByText('to chat'))
+    expect(frame()).toBe(original) // return: the leg that did not
+    expect(frame()?.getAttribute('src')).toBe(APP_URL)
+  })
+
+  it('leaves the frame alone when the conversation unmounts right after a build SUCCEEDS', () => {
+    // The sibling of the mid-build scenario, on the more common exit. A finished build's container
+    // is PARDONED — alive under an idle lease — and `completedLive` is the pane field carrying that
+    // claim; it is what lets `keepFramed` outrank the address's terminal `ended` status.
+    //
+    // `completedLive` rode on the pane view, which is CLEARED on unmount, so it fell back to
+    // `LivePreview`'s `false` default over an address whose `ended` status is deliberately KEPT.
+    // `frameContext` collapsed and the iframe was unmounted — leaving a build chat at the moment a
+    // citizen is most likely to leave one destroyed an app the server was still serving.
+    // `ended` is the address status a completed build rests at, and the address KEEPS it. Without
+    // it this scenario would false-green: a non-terminal status frames regardless of `completedLive`.
+    render(
+      <Workspace chatSurface={<ChatSurface status="ended" pane={{ completedLive: true }} />} />,
+    )
     const original = frame()
     expect(original).toBeTruthy()
 

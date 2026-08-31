@@ -58,24 +58,41 @@ export default function AppPaneHost() {
   const pane = useWorkspacePane()
   const visible = useWorkspacePaneVisible()
 
-  // `iterating` IS FRAME IDENTITY, NOT CHROME, AND THAT IS WHY IT IS HELD HERE.
+  // TWO PANE FIELDS ARE FRAME IDENTITY RATHER THAN CHROME, AND THAT IS WHY THEY ARE HELD HERE.
   //
   // The pane view is cleared when its publisher unmounts, which is right for everything else on it:
-  // a departed conversation's toolbar and handlers are not this pane's business. But `LivePreview`
-  // turns a true→false edge on `iterating` into a reload nonce — that is its "a turn just ended over
-  // a live preview, re-request the document" signal — so letting this one field fall back to the
-  // prop default when the surface goes away FABRICATES a turn-ended edge and remounts the iframe.
+  // a departed conversation's toolbar and handlers are not this pane's business. These two are not
+  // chrome — each one, left to fall back to `LivePreview`'s prop default, tears down the very frame
+  // this host exists to keep alive, on a different leave:
   //
-  // The transition that breaks is the exact one this host exists to survive: leave a build chat for
-  // the project screen WHILE A BUILD IS RUNNING, and the app reloads. Silently, and semantically
-  // wrongly — the turn had not ended. Every scenario in this suite was blind to it because they all
-  // pinned `iterating: false`.
+  //   iterating      `LivePreview` turns a true→false edge into a reload nonce — its "a turn just
+  //                  ended over a live preview, re-request the document" signal. Defaulting it
+  //                  FABRICATES that edge, so leaving a build chat WHILE A BUILD IS RUNNING reloads
+  //                  the app: silently, and semantically wrongly, because the turn had not ended.
+  //   completedLive  the #13/R2 pardon — "this container is alive under an idle lease". It is what
+  //                  makes `keepFramed` outrank a terminal status (`LivePreview.tsx:500`, `:521`).
+  //                  The address KEEPS its status, and for a finished build that status is `ended`,
+  //                  so defaulting this one to `false` collapses `frameContext` and UNMOUNTS the
+  //                  iframe — leaving a build chat right after the build SUCCEEDS, which is the
+  //                  most common moment to leave one, destroys an app the server is still serving.
   //
-  // Holding the last published value keeps the leave side inert. The RETURN side still re-frames,
-  // and that is correct and unchanged: the surface remounts with a fresh session whose `iterating`
-  // starts false, and that falling edge is the legitimate repair re-frame.
+  // These are the only two. Every other pane field that reaches the frame chain — `relaunching`,
+  // `reconnecting`, `previewState` — defaults to the permissive value, so losing it cannot unmount
+  // anything. Adding a restrictive-by-default field to `PaneView` means adding it here too.
+  //
+  // Holding the last published value keeps the leave side inert. The RETURN side still re-frames
+  // where it should, and that is correct and unchanged: a remounted surface publishes its own pane
+  // view on its first commit, which replaces both held values before they can be read again.
+  //
+  // (The tidier end state is to move `completedLive` onto the ADDRESS, where it belongs — it is a
+  // fact about what is framed, not about the conversation's chrome. That is a `PreviewAddress`
+  // change with its own resolver arms and tests, so it is named here rather than smuggled in.)
   const lastIterating = useRef(false)
-  if (pane) lastIterating.current = pane.iterating
+  const lastCompletedLive = useRef(false)
+  if (pane) {
+    lastIterating.current = pane.iterating
+    lastCompletedLive.current = pane.completedLive
+  }
 
   // NOTHING TO HOST AT ALL. Not the same as "hidden": there is no address and no surface asking
   // for a pane, so there is no element to keep alive and none to hide. This is the project screen
@@ -113,11 +130,10 @@ export default function AppPaneHost() {
         {...(pane ?? {})}
         previewUrl={address.url}
         status={address.status}
-        // AFTER the spread, deliberately: this one field must not be allowed to fall back to the
-        // component default when the publisher is gone. See `lastIterating` above.
+        // AFTER the spread, deliberately: these two must not be allowed to fall back to the
+        // component defaults when the publisher is gone. See the hold above for what each breaks.
         iterating={pane ? pane.iterating : lastIterating.current}
-        // AFTER the spread, deliberately: this one field must not be allowed to fall back to the
-        // component default when the publisher is gone. See `lastIterating` above.
+        completedLive={pane ? pane.completedLive : lastCompletedLive.current}
       />
     </div>
   )
