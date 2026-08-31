@@ -26,6 +26,7 @@ import {
   usePublishAddress,
   usePublishPaneView,
   usePublishReclaim,
+  usePublishSaveState,
   useWorkspaceProject,
 } from '../components/workspace/workspaceChannel'
 import { notifyUsageChanged } from '../utils/usage'
@@ -714,19 +715,14 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     void refreshSaveState(projectId)
   }, [projectId, refreshSaveState])
 
-  // The one warning the save model owes the user. Work that is never saved IS lost when the
-  // container is reclaimed — that is the accepted product decision — so leaving with unsaved
-  // work must not be silent. Armed ONLY on a definite `true`: on `null` (unknown) there is
-  // nothing honest to claim, and a spurious prompt is how users learn to dismiss them.
-  useEffect(() => {
-    if (saveDirty !== true) return undefined
-    const warn = (event: BeforeUnloadEvent) => {
-      event.preventDefault()
-      event.returnValue = ''
-    }
-    window.addEventListener('beforeunload', warn)
-    return () => window.removeEventListener('beforeunload', warn)
-  }, [saveDirty])
+  // THE PRODUCER STAYS HERE; THE WARNING DOES NOT (Plan A, U7). `refreshSaveState` above is still
+  // the only thing that asks the server, and this is still the only surface that asks it — no new
+  // caller was added anywhere. What moved is the browser-unload effect, to the shell, because this
+  // page is an outlet child now and unmounts on every move to the project screen: left here, the
+  // warning would disarm exactly when the citizen navigated away from the conversation that knew
+  // about the unsaved work. The TRI-STATE is carried, never collapsed — `null` means "could not
+  // check", and the shell arms on a definite `true` alone.
+  usePublishSaveState(saveDirty)
 
   // A genuine unmount must cancel the in-flight turn-stream reader — a chat switch already
   // aborts it before resubscribing, but nothing did on unmount, leaking the reader (and its

@@ -43,7 +43,7 @@
  * against the nearest scroll container and that container has moved.
  */
 import { Outlet } from 'react-router-dom'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import Navbar from '../layout/Navbar'
 import ReclaimWorkspaceDialog from '../projects/ReclaimWorkspaceDialog'
 import AppPaneHost from './AppPaneHost'
@@ -52,7 +52,49 @@ import {
   createWorkspaceChannel,
   useRailSlot,
   useWorkspaceReclaim,
+  useWorkspaceSaveState,
 } from './workspaceChannel'
+
+/**
+ * THE ONE WARNING THE SAVE MODEL OWES THE CITIZEN (Plan A, U7).
+ *
+ * Work that is never saved IS lost when the container is reclaimed — that is the accepted product
+ * decision — so leaving with unsaved work must not be silent.
+ *
+ * WHAT THE EXTRACTION FORCED, AND THE WHOLE OF WHAT CHANGED. The handler lived on the builder page,
+ * which is now an outlet child that unmounts on every move to the project screen; hoisting it here
+ * keeps it armed while the citizen is anywhere in the workspace instead of only while a builder
+ * chat is open. Nothing else about the guard is built here: no in-app dialog, no guarded exit
+ * function, no enumeration of departing controls. Every exit from the workspace after this plan is
+ * still a route change, exactly as before it — the plan adds no rail and no in-place transition —
+ * so there is nothing yet for an in-place guard to catch. Plan F introduces those transitions and
+ * owns the dialog that covers them, and it has nothing here to delete.
+ *
+ * ARMED ONLY ON A DEFINITE `true`, AND THE `null` SILENCE IS DELIBERATE. The save state is
+ * tri-state and its `null` means "could not check", never "clean". R62 says the platform must SAY
+ * when it could not tell — but the browser's unload prompt renders fixed text the page cannot
+ * supply a "we could not check" sentence to, so arming on `null` produces a prompt with nothing
+ * answerable behind it, which is how people learn to dismiss prompts. That sentence lands in Plan
+ * F's in-app dialog instead. Nothing here reports "nothing unsaved" from an unknown state either:
+ * the pane's Save block already renders only when the state is known.
+ *
+ * NO NEW PRODUCER AND NO NEW TRAFFIC. The shell reads whatever the mounted surface last published
+ * and treats "nobody has published" as `null`. The check costs two `git` executions inside the
+ * container and compares container-HEAD against saved-bundle-HEAD, so a project screen with no
+ * conversation mounted has nothing to compare anyway — and pays for nothing.
+ */
+function useUnsavedWorkWarning(): void {
+  const saveDirty = useWorkspaceSaveState()
+  useEffect(() => {
+    if (saveDirty !== true) return undefined
+    const warn = (event: BeforeUnloadEvent) => {
+      event.preventDefault()
+      event.returnValue = ''
+    }
+    window.addEventListener('beforeunload', warn)
+    return () => window.removeEventListener('beforeunload', warn)
+  }, [saveDirty])
+}
 
 /**
  * The cross-project reclaim dialog, mounted at shell level.
@@ -82,6 +124,7 @@ function ReclaimSlot() {
 
 /** Everything inside the provider, so it can read the channel it is mounted under. */
 function ShellFrame() {
+  useUnsavedWorkWarning()
   const rail = useRailSlot()
 
   return (

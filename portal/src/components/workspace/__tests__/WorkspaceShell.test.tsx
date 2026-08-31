@@ -179,6 +179,95 @@ describe('WorkspaceShell — the reclaim dialog is mounted here, its handlers st
   })
 })
 
+describe('WorkspaceShell — the unsaved-work warning, hoisted here (U7, AE33\'s leaving-the-page half)', () => {
+  /** Ask the browser to leave, and report whether anything objected. */
+  const tryToLeave = (): boolean => {
+    const event = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(event)
+    return event.defaultPrevented
+  }
+
+  function Surface({ dirty }: { dirty: boolean | null }) {
+    useWorkspaceProject('p1')
+    usePublishSaveState(dirty)
+    return <div data-testid="surface" />
+  }
+
+  /** A conversation that publishes, then a project screen that does not — the hoist's whole point. */
+  function Workspace({ conversationMounted, dirty }: { conversationMounted: boolean; dirty: boolean | null }) {
+    return (
+      <MemoryRouter initialEntries={['/projects/p1']}>
+        <Routes>
+          <Route element={<WorkspaceShell />}>
+            <Route
+              path="/projects/:projectId"
+              element={conversationMounted ? <Surface dirty={dirty} /> : <div data-testid="project-only" />}
+            />
+          </Route>
+        </Routes>
+      </MemoryRouter>
+    )
+  }
+
+  it('warns on a definite `true`, and GOES ON warning after the conversation unmounts', () => {
+    // THE COVERAGE THAT DID NOT EXIST BEFORE THE HOIST, and the only user-visible consequence of
+    // this unit. The effect used to live on the builder page, so it disarmed the moment the
+    // citizen navigated from the chat to the project screen — which is precisely when they have
+    // stopped looking at the conversation that knows about the unsaved work, and exactly the
+    // moment they are most likely to close the tab.
+    const view = render(<Workspace conversationMounted dirty />)
+    expect(tryToLeave()).toBe(true)
+
+    view.rerender(<Workspace conversationMounted={false} dirty />)
+
+    expect(screen.getByTestId('project-only')).toBeTruthy()
+    expect(tryToLeave()).toBe(true)
+  })
+
+  it('says nothing when the state is definitely clean', () => {
+    render(<Workspace conversationMounted dirty={false} />)
+    expect(tryToLeave()).toBe(false)
+  })
+
+  it('says nothing when the state is UNKNOWN, and claims nothing either way', () => {
+    // `null` is "could not check", never "clean", and the silence is deliberate rather than an
+    // oversight: the browser renders fixed text the page cannot supply a "we could not check"
+    // sentence to, so a prompt armed on an unknown is a prompt with nothing answerable behind it —
+    // which is how people learn to dismiss them. Plan F's in-app dialog is where that sentence
+    // lands. What must NOT happen is the other failure: claiming there is nothing unsaved.
+    const { container } = render(<Workspace conversationMounted dirty={null} />)
+
+    expect(tryToLeave()).toBe(false)
+    expect(container.textContent).not.toMatch(/no unsaved|nothing unsaved|all saved|up to date/i)
+  })
+
+  it('says nothing when NOBODY has published, and asks nothing to find out', () => {
+    // A project address with no conversation mounted. "Nobody has reported" is the same `null` as
+    // "the check failed", and this plan adds no caller of the save-state endpoint anywhere — the
+    // check costs two `git` executions inside the container and compares container-HEAD against
+    // saved-bundle-HEAD, which a screen with no conversation has nothing to compare.
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    try {
+      render(<Workspace conversationMounted={false} dirty={null} />)
+      expect(tryToLeave()).toBe(false)
+      expect(fetchSpy).not.toHaveBeenCalled()
+    } finally {
+      fetchSpy.mockRestore()
+    }
+  })
+
+  it('disarms when the state goes from dirty back to clean', () => {
+    // The listener has to come off, not merely stop mattering: a stale one left bound would warn
+    // about a container that has since been saved, for the life of the tab.
+    const view = render(<Workspace conversationMounted dirty />)
+    expect(tryToLeave()).toBe(true)
+
+    view.rerender(<Workspace conversationMounted dirty={false} />)
+
+    expect(tryToLeave()).toBe(false)
+  })
+})
+
 describe('the workspace channel — a publish wakes only what it concerns', () => {
   const renders = { pane: 0, save: 0 }
 
