@@ -4,7 +4,6 @@ import {
   Send, Sparkles, User, Paperclip, FileText, FileSpreadsheet, Presentation, X,
   CheckCircle2, XCircle, ExternalLink, PanelLeftOpen, PanelLeftClose,
 } from 'lucide-react'
-import LivePreview from '../components/LivePreview'
 import PublishButton from '../components/PublishButton'
 import BuildProgress, { hasBuildNarrative, StepHistoryCollapsible } from '../components/chat/BuildProgress'
 import type { StepHistoryItem } from '../components/chat/BuildProgress'
@@ -21,7 +20,13 @@ import { markAppVisible } from '../utils/observe'
 import { describeSaveFailure, describeModeSwitchFailure, isConversationGone } from '../utils/chatErrors'
 import { readDraft, writeDraft, clearDraft } from '../utils/composerDraft'
 import { resolvePreviewAddress } from '../utils/previewAddress'
-import { usePublishReclaim } from '../components/workspace/workspaceChannel'
+import {
+  useAppPaneVisible,
+  usePublishAddress,
+  usePublishPaneView,
+  usePublishReclaim,
+  useWorkspaceProject,
+} from '../components/workspace/workspaceChannel'
 import { notifyUsageChanged } from '../utils/usage'
 import { createBuildLock, openBuildLockChannel } from '../utils/buildLock'
 import type { BuildLock } from '../utils/buildLock'
@@ -1836,7 +1841,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const handlePreviewRevealed = useCallback(() => {
     markAppVisible(projectId ?? null)
   }, [projectId])
-  const framedStatus = address.status
   // The build bubble's two sources, resolved ONCE — the turn wins when it has something to say.
   // Naming them here is what lets the wrapper ask `hasBuildNarrative` the same question
   // BuildProgress asks itself, instead of rendering chrome around a `null`.
@@ -2185,6 +2189,90 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     (sessionProjectMatches && session.blocked) ||
     (showSession && (session.feedDisconnected || session.quota)),
   )
+
+  // ─── THE APP PANE, PUBLISHED UPWARD (Plan A, U4) ─────────────────────────────────────────────
+  //
+  // This used to be a twenty-three-prop `<LivePreview>` mount in the right-hand column, and the
+  // pane existed only because this page rendered it — which is why leaving a build chat destroyed
+  // the running app. The pane is now hosted by the shell and this surface DECLARES rather than
+  // renders: what to frame, what chrome to put on it, and whether it wants it seen.
+  //
+  // THE PROPS KEEP THEIR SCOPES, verbatim, and the reasons travel with them — the whole hazard of
+  // a move like this is that someone narrows the app-scoped ones "for consistency" on the way past.
+  useWorkspaceProject(projectId)
+  usePublishAddress(address, projectId)
+  // A Build chat wants the pane seen, exactly as today. Plan F is what gives the project screen a
+  // reason to say this too; until then the surface `ChatRoute` picked by kind is the only caller.
+  useAppPaneVisible(true)
+  usePublishPaneView({
+    /* Publish, right where the build just finished. Only once the route resolved a project — a
+       chat with no project behind it has nothing to publish. */
+    toolbarTrailing: projectId ? <PublishButton projectId={projectId} /> : null,
+    /* The chat-panel toggle renders IN-FLOW in the pane's leading slot rather than floating
+       absolutely over it — it used to sit in the same top-left corner as the pane's own
+       device-width toolbar group and visibly overlap it. */
+    toolbarLeading: (
+      <button
+        type="button"
+        onClick={() => setChatCollapsed((collapsed) => !collapsed)}
+        aria-expanded={!chatCollapsed}
+        aria-controls="chat-panel"
+        aria-label={
+          chatCollapsed
+            ? chatNeedsAttention
+              ? 'Show chat panel — needs attention'
+              : 'Show chat panel'
+            : 'Hide chat panel'
+        }
+        title={chatCollapsed ? 'Show chat panel' : 'Hide chat panel'}
+        className="relative p-1.5 rounded-lg text-neutral hover:text-primary hover:bg-bial-bg transition"
+      >
+        {chatCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
+        {/* A silent toggle would otherwise hide session banners (reclaim/quota/errors) with no
+            cue — collapsing to watch a build at full width is exactly when those are most likely
+            and least visible. */}
+        {chatCollapsed && chatNeedsAttention && (
+          <span aria-hidden="true" className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-danger rounded-full" />
+        )}
+      </button>
+    ),
+    iterating: showSession && session.iterating,
+    onRelaunch: handleRelaunch,
+    relaunching: sessionProjectMatches && session.relaunching,
+    relaunchError: sessionProjectMatches ? session.relaunchError : null,
+    lastBuildFailed: newestOutcome?.status === 'failed',
+    restoredFromFailedBuild: relaunchedUrl != null && session.relaunchedFromFailedBuild,
+    completedLive,
+    hasSavedBuild,
+    saveDirty,
+    onSave: handleSave,
+    saving,
+    saveError,
+    previewState: previewState?.state ?? null,
+    occupyingProjectName: previewState?.occupyingProjectName ?? null,
+    reconnecting: (turnNarrativeIsThisChat && turnPreview.state === 'reconnecting') || (showSession && session.reconnecting),
+    /* NOT gated on `turnNarrativeIsThisChat`, unlike the narrative values above it. This is a fact
+       about the PROJECT'S APP — one app per project — not about which conversation happens to be
+       open, and it now has a producer that outlives the turn (the preview probe above). Gating it
+       would blank the signal the moment the user opened a sibling chat, and blanking it is what
+       leaves an error screen uncovered. */
+    compileState: turnCompile,
+    /* Which of the cover's sentences is true — see `turnRunning` below. SCOPED TO THIS PROJECT,
+       not merely to "some turn somewhere". One BuilderPage instance survives a project switch and
+       `generatingChatId` is cleared only by the finishing chat's own handler, so the bare
+       `!== null` form kept project B's pane claiming "putting the latest change together" about a
+       turn running on project A. `builds` is this project's conversations; the open chat is
+       checked separately because a brand-new one is not in that list yet. */
+    workspaceLost,
+    turnRunning:
+      generatingChatId !== null &&
+      (generatingChatId === buildId || builds.some((b) => b.id === generatingChatId)),
+    onFrameMessage: handleFrameMessage,
+    /* R104's stop-clock. IT TRAVELS AS A PAYLOAD RATHER THAN A PROP so it survives Plan D's
+       deletion of this page: without it `project_to_app_visible_ms` stops being produced and
+       nothing announces that, which is the one failure a measurement cannot detect. */
+    onRevealed: handlePreviewRevealed,
+  })
 
   return (
     // NO PAGE FRAME AND NO NAVBAR. Both belong to the workspace shell now, which is what lets this
@@ -2544,88 +2632,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
           </div>
         </div>
 
-        {/* The right pane is the APP (U15): LivePreview is its sole child. The build
-            narrative lives in the chat's BuildProgress bubble; the lifecycle banners sit
-            above the composer. The cockpit (ActivityFeed + SessionControls) is retired. The
-            chat-panel toggle renders IN-FLOW via LivePreview's `toolbarLeading` slot rather
-            than floating absolutely over the pane — it used to sit in the same top-left
-            corner as LivePreview's own device-width toolbar group and visibly overlap it. */}
-        <div className="flex-1 overflow-hidden">
-          <LivePreview
-            /* Publish, right where the build just finished. Only once the route resolved a
-               project — a chat with no project behind it has nothing to publish. */
-            toolbarTrailing={projectId ? <PublishButton projectId={projectId} /> : null}
-            toolbarLeading={
-              <button
-                type="button"
-                onClick={() => setChatCollapsed((collapsed) => !collapsed)}
-                aria-expanded={!chatCollapsed}
-                aria-controls="chat-panel"
-                aria-label={
-                  chatCollapsed
-                    ? chatNeedsAttention
-                      ? 'Show chat panel — needs attention'
-                      : 'Show chat panel'
-                    : 'Hide chat panel'
-                }
-                title={chatCollapsed ? 'Show chat panel' : 'Hide chat panel'}
-                className="relative p-1.5 rounded-lg text-neutral hover:text-primary hover:bg-bial-bg transition"
-              >
-                {chatCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
-                {/* A silent toggle would otherwise hide session banners (reclaim/quota/errors)
-                    with no cue — collapsing to watch a build at full width is exactly when
-                    those are most likely and least visible. */}
-                {chatCollapsed && chatNeedsAttention && (
-                  <span
-                    aria-hidden="true"
-                    className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-danger rounded-full"
-                  />
-                )}
-              </button>
-            }
-            previewUrl={framedPreviewUrl}
-            status={framedStatus}
-            iterating={showSession && session.iterating}
-            onRelaunch={handleRelaunch}
-            relaunching={sessionProjectMatches && session.relaunching}
-            relaunchError={sessionProjectMatches ? session.relaunchError : null}
-            lastBuildFailed={newestOutcome?.status === 'failed'}
-            restoredFromFailedBuild={relaunchedUrl != null && session.relaunchedFromFailedBuild}
-            completedLive={completedLive}
-            hasSavedBuild={hasSavedBuild}
-            saveDirty={saveDirty}
-            onSave={handleSave}
-            saving={saving}
-            saveError={saveError}
-            previewState={previewState?.state ?? null}
-            occupyingProjectName={previewState?.occupyingProjectName ?? null}
-            reconnecting={(turnNarrativeIsThisChat && turnPreview.state === 'reconnecting') || (showSession && session.reconnecting)}
-            /* NOT gated on `turnNarrativeIsThisChat`, unlike the narrative props above it. This
-               is a fact about the PROJECT'S APP — one app per project — not about which
-               conversation happens to be open, and it now has a producer that outlives the turn
-               (the preview probe above). Gating it would blank the signal the moment the user
-               opened a sibling chat, and blanking it is what leaves an error screen uncovered. */
-            compileState={turnCompile}
-            /* Which of the cover's sentences is true — see `turnRunning` on the pane.
-               SCOPED TO THIS PROJECT, not merely to "some turn somewhere". One BuilderPage
-               instance survives a project switch and `generatingChatId` is cleared only by the
-               finishing chat's own handler, so the bare `!== null` form kept project B's pane
-               claiming "putting the latest change together" about a turn running on project A.
-               `builds` is this project's conversations; the open chat is checked separately
-               because a brand-new one is not in that list yet. */
-            workspaceLost={workspaceLost}
-            turnRunning={
-              generatingChatId !== null &&
-              (generatingChatId === buildId || builds.some((b) => b.id === generatingChatId))
-            }
-            onFrameMessage={handleFrameMessage}
-            /* R104's stop-clock. THIS MOUNT IS LOAD-BEARING: it is the only production mount of
-               LivePreview in the tree, so the prop is dead without it and
-               `project_to_app_visible_ms` never fires. Whoever re-hosts this pane carries the
-               prop forward rather than re-deriving it. */
-            onRevealed={handlePreviewRevealed}
-          />
-        </div>
       </div>
 
       {/* Attachment validation / cap toast. Announced, because KTD-2 deliberately keeps the send

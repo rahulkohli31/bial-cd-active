@@ -34,6 +34,23 @@ import BuilderPage from '../BuilderPage'
 // render, which is the failure mode a stub cannot show you.
 import WorkspaceShell from '../../components/workspace/WorkspaceShell'
 
+/**
+ * Nest routes under the REAL workspace shell, for the suites that build their own route tables.
+ *
+ * The surface is an outlet child now: it renders no page frame, no navbar and — from U4 — no pane
+ * of its own, publishing what to frame upward instead. A table that mounts it bare therefore has
+ * no pane at all, so every assertion about the preview silently asserts against something the
+ * product does not render. This is one line at each such table rather than a stub, because a stub
+ * is exactly what would hide the mistake.
+ *
+ * Usage: `<Routes>{inWorkspace(<Route path="/chat/:chatId" element={…} />)}<Route … /></Routes>`
+ */
+export const inWorkspace = (...routes) => (
+  <Route key="workspace" element={<WorkspaceShell />}>
+    {routes}
+  </Route>
+)
+
 export { FakeEventSource } from '../../utils/buildSessionMock'
 
 export const PREVIEW_URL = 'https://app-xyz.example.azurecontainerapps.io/'

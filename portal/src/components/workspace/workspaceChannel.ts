@@ -42,7 +42,7 @@
  * The context carries the CHANNEL HANDLE, which is created once and never replaced. That handle is
  * stable for the life of the shell, so the context itself never re-renders anybody.
  */
-import { createContext, useContext, useEffect, useSyncExternalStore, type ReactNode } from 'react'
+import { createContext, useContext, useLayoutEffect, useSyncExternalStore, type ReactNode } from 'react'
 import type { PreviewAddress } from '../../utils/previewAddress'
 import type { CompileState } from '../../utils/compileState'
 import type { PreviewLifeState, ReclaimBlocked } from '../../utils/buildSessionApi'
@@ -304,9 +304,12 @@ export function useRailSlot(): RailSlot {
 //                         hoist to the shell exists to add.
 
 function usePublish<T>(cell: Cell<T> | undefined, value: T, onUnmount?: T): void {
+  // LAYOUT effect, not a passive one. The host is a sibling that re-renders from the store, so a
+  // passive publish would leave it one committed frame behind its surface — visible on mount as a
+  // pane that appears hidden and then shows itself.
   const publish = () => cell?.set(value)
-  useEffect(publish)
-  useEffect(
+  useLayoutEffect(publish)
+  useLayoutEffect(
     () => () => {
       if (onUnmount !== undefined) cell?.set(onUnmount)
     },

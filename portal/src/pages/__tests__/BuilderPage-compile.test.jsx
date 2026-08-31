@@ -16,6 +16,7 @@ import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import {
   FakeEventSource, makeClient, primeClient, primeTurn,
   waitForGateOpen, scriptBuildTurn, BUILD_TURN_ID, T_STEP, T_PREVIEW, T_BUILD_END, T_DELTA, PREVIEW_URL,
+  inWorkspace,
 } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
@@ -80,7 +81,7 @@ function renderThread(chatId = 'thread-1') {
   return render(
     <MemoryRouter initialEntries={[`/chat/${chatId}`]}>
       <Routes>
-        <Route path="/chat/:chatId" element={<BuilderPage projectId="p1" buildSessionDeps={deps} />} />
+        {inWorkspace(<Route path="/chat/:chatId" element={<BuilderPage projectId="p1" buildSessionDeps={deps} />} />)}
       </Routes>
     </MemoryRouter>,
   )

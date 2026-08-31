@@ -46,6 +46,7 @@ import { Outlet } from 'react-router-dom'
 import { useMemo, useState } from 'react'
 import Navbar from '../layout/Navbar'
 import ReclaimWorkspaceDialog from '../projects/ReclaimWorkspaceDialog'
+import AppPaneHost from './AppPaneHost'
 import {
   WorkspaceChannelProvider,
   createWorkspaceChannel,
@@ -100,8 +101,9 @@ function ShellFrame() {
         <div className="flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden">
           <Outlet />
         </div>
-        {/* The pane column. U4 mounts the app pane host here — a SIBLING of the Outlet, which is
-            what stops any route change from reaching it. Empty until then. */}
+        {/* The pane column — a SIBLING of the Outlet, which is what stops any route change from
+            reaching it. This is the whole of R8's mechanism, in one line of JSX. */}
+        <AppPaneHost />
       </div>
     </div>
   )
