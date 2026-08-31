@@ -71,7 +71,7 @@ from src.services.turns.copy import (
     WORKSPACE_UNAVAILABLE_CODE,
     WORKSPACE_UNAVAILABLE_TEXT,
 )
-from src.services.turns.engine import get_turn_engine, plan_from_call
+from src.services.turns.engine import get_turn_engine, plan_argument_of, plan_from_call
 from src.services.turns.plan_options import (
     newest_card,
     pending_card,
@@ -316,16 +316,15 @@ def _refusal_for(call: object) -> tuple[str, str]:
     TWO CODES, because the two causes have different remedies. "There is no plan in this offer"
     is what every pre-migration card looks like and is fixed by asking for the plan again; "the
     plan is longer than a message may be" is fixed by asking for a shorter one. A single code
-    would leave the browser saying one of those to someone in the other situation."""
+    would leave the browser saying one of those to someone in the other situation.
+
+    ASKS THE SAME QUESTION `plan_from_call` ASKS rather than re-deriving it. The ceiling is the
+    only thing separating the two refusals, so "the call carries a plan argument at all" IS
+    "the plan is too long" — and it stays true if a third rejection is ever added there."""
     from pydantic_ai.messages import ToolCallPart  # local: keeps the wire types off this seam
 
-    if isinstance(call, ToolCallPart):
-        try:
-            plan = call.args_as_dict().get("plan")
-        except Exception:
-            plan = None
-        if isinstance(plan, str) and plan.strip():
-            return _PLAN_TOO_LONG_MESSAGE, PLAN_TOO_LONG_CODE
+    if isinstance(call, ToolCallPart) and plan_argument_of(call) is not None:
+        return _PLAN_TOO_LONG_MESSAGE, PLAN_TOO_LONG_CODE
     return _NO_PLAN_MESSAGE, NO_PLAN_CODE
 
 

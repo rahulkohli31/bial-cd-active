@@ -274,22 +274,22 @@ def _deferred_call(output: object) -> ToolCallPart | None:
     return None
 
 
-def plan_from_call(part: ToolCallPart) -> str | None:
-    """The plan an offer carries, or None when the call cannot be honoured (R28a / R44).
+def plan_argument_of(part: ToolCallPart) -> str | None:
+    """The `plan` argument an offer was called with, stripped — WITHOUT the length ceiling.
 
-    TWO REFUSALS, AND BOTH ARE STRUCTURAL RATHER THAN CHECKS SOMEBODY REMEMBERS. An empty
-    argument means the offer would carry nothing to build — the defect the retired prose
-    heuristic used to manufacture, a Build it button under a plan nobody wrote. An argument
-    past the stored-message ceiling is REFUSED, never trimmed: a plan cut mid-sentence is one
-    the citizen agrees to and the build never sees the end of.
-
-    A PRE-MIGRATION CALL TOOK NO ARGUMENTS AT ALL and reads as empty here, which is correct —
+    A PRE-MIGRATION CALL TOOK NO ARGUMENTS AT ALL and reads as absent here, which is correct —
     there is no plan in it to find. Those cards were all resolved by revision 0035, so nothing
     live depends on this answer; the handoff refuses them by name.
 
     Deliberately tolerant of a malformed argument object rather than raising: this runs on the
     turn's own path, and a model that emitted unparseable JSON has produced no plan, which is
-    the same answer as an empty one and not a reason to fail a turn that otherwise worked."""
+    the same answer as an empty one and not a reason to fail a turn that otherwise worked.
+
+    SPLIT OUT SO THE REFUSAL COPY CAN ASK THE QUESTION RATHER THAN INFER THE ANSWER.
+    `transition._refusal_for` has to tell "there is no plan here" from "the plan is too long",
+    and it used to do that by reverse-engineering which of `plan_from_call`'s branches returned
+    `None` — correct only while there are exactly two. A third rejection reason added below
+    would have silently reported itself as "too long" to the one person it is not true for."""
     try:
         args = part.args_as_dict()
     except Exception:
@@ -297,8 +297,19 @@ def plan_from_call(part: ToolCallPart) -> str | None:
     plan = args.get("plan")
     if not isinstance(plan, str):
         return None
-    plan = plan.strip()
-    if not plan or len(plan) > MAX_MESSAGE_TEXT_CHARS:
+    return plan.strip() or None
+
+
+def plan_from_call(part: ToolCallPart) -> str | None:
+    """The plan an offer carries, or None when the call cannot be honoured (R28a / R44).
+
+    TWO REFUSALS, AND BOTH ARE STRUCTURAL RATHER THAN CHECKS SOMEBODY REMEMBERS. An empty
+    argument means the offer would carry nothing to build — the defect the retired prose
+    heuristic used to manufacture, a Build it button under a plan nobody wrote. An argument
+    past the stored-message ceiling is REFUSED, never trimmed: a plan cut mid-sentence is one
+    the citizen agrees to and the build never sees the end of."""
+    plan = plan_argument_of(part)
+    if plan is None or len(plan) > MAX_MESSAGE_TEXT_CHARS:
         return None
     return plan
 
@@ -944,7 +955,7 @@ class TurnEngine:
                         ]
 
                     batches: list[tuple[list[ModelMessage], dict[str, Any] | None]] = [
-                        (persistable, self._pending_meta(state, deferred))
+                        (persistable, self._pending_meta(deferred))
                     ]
 
                     # NO SECOND MODEL REQUEST IS ISSUED HERE, and none is issued anywhere as a
@@ -2285,9 +2296,7 @@ class TurnEngine:
         with suppress(Exception):
             await asyncio.shield(release_liveness_lease(get_redis(), state.user_id))
 
-    def _pending_meta(
-        self, _state: _TurnState, deferred: ToolCallPart | None
-    ) -> dict[str, Any] | None:
+    def _pending_meta(self, deferred: ToolCallPart | None) -> dict[str, Any] | None:
         """The row meta for a batch that carries the pending options call: the card's id, and
         nothing else.
 

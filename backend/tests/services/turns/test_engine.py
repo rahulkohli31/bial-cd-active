@@ -30,7 +30,7 @@ from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.db.models.token_usage import TokenUsage
 from src.services.agent.mode_prompts import PromptContext
 from src.services.build_sessions.manager import SessionManager
-from src.services.messages.projection import PLAN_OPTIONS_TOOL
+from src.services.messages.projection import PLAN_OPTIONS_TOOL, TURN_TERMINAL_KIND
 from src.services.sandbox.config import SandboxConfig
 from src.services.turns import engine as engine_module
 from src.services.turns.copy import WRITING_UP_THE_PLAN_LABEL
@@ -211,7 +211,7 @@ async def test_text_turn_streams_deltas_then_terminal(
     # it would put a blank assistant turn into every later prompt of this conversation.
     assert rows[1].payload == []
     assert rows[1].meta == {
-        "kind": "turn_terminal",
+        "kind": TURN_TERMINAL_KIND,
         "turnId": str(state.turn_id),
         "status": "completed",
         "reason": None,
@@ -1014,7 +1014,7 @@ async def _terminal_rows(db_session, conversation_id) -> list[Message]:
     return [
         row
         for row in rows
-        if isinstance(row.meta, dict) and row.meta.get("kind") == "turn_terminal"
+        if isinstance(row.meta, dict) and row.meta.get("kind") == TURN_TERMINAL_KIND
     ]
 
 

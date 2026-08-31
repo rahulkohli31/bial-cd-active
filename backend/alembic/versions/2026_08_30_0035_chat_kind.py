@@ -88,10 +88,15 @@ _OVERLAY_SCHEMA_VERSION = 2
 
 def _is_open(resolution: str | None) -> bool:
     """A card is still ACTIONABLE — and so still presses a dead button after the migration —
-    when it has no resolution at all, OR its resolution is a `build_failed`, which RE-ARMS the
-    card (`plan_options._is_open_resolution`). Both must be closed here, and closing only the
-    newest per conversation would not be enough: an older unresolved card projects as `pending`
-    too, so it draws its own live offer."""
+    when it has no resolution at all. Closing only the newest per conversation would not be
+    enough: an older unresolved card projects as `pending` too, so it draws its own live offer.
+
+    THE `build_failed` ARM IS BELT AND BRACES, not load-bearing, and it is kept deliberately. A
+    `build_failed:<reason>` string left by the retired recorder already reads as TERMINAL at
+    every live reader (`plan_options._is_open_resolution`, `projection._plan_options_state`), so
+    those cards draw no button and need no overlay. But this revision is a one-way door that
+    cannot be re-run against a database it has already passed over, and the extra hidden row it
+    writes for one is inert — the wrong side to err on is the one that leaves a dead button."""
     return resolution is None or resolution.startswith("build_failed")
 
 
@@ -101,16 +106,30 @@ def _resolve_outstanding_plan_options() -> None:
     Done in Python rather than as one statement because the resolutions live in two places —
     row `meta` for synthesized/overlay records and a `ToolReturnPart` inside the native JSONB
     payload for real ones — and walking the payload in SQL would encode `_scan`'s reading of
-    the wire shape into a second, unversioned place. The row count is small (a dev database
-    returned 32 conversations), and `messages.id` carries a `uuidv7()` server default, so the
-    ids these inserts mint are UUIDv7 without the revision minting them itself.
+    the wire shape into a second, unversioned place. `messages.id` carries a `uuidv7()` server
+    default, so the ids these inserts mint are UUIDv7 without the revision minting them itself.
+
+    THE PAYLOAD COMES BACK ONLY FOR ROWS THAT COULD CONTAIN AN ANSWER, and that is a memory
+    bound rather than a nicety. `payload` is a whole turn's model messages — a build's rows
+    carry every `write_file` argument and result — and this is one buffered result set, so
+    selecting the column unconditionally would pull the entire history of every conversation
+    into the migration process at once. The probe is a plain substring test on the serialized
+    JSON, which is a strict SUPERSET of what the walk below matches: a row holding a
+    `present_plan_options` return necessarily contains the tool's name. Rows failing it come
+    back with `NULL` and skip the walk exactly as an empty payload always did.
+
+    Every row is still READ, because `head_seq` needs the whole conversation's high-water mark
+    and `meta` carries the other half of the resolutions — it is the 100 KB payloads, not the
+    rows, that had to stop travelling.
     """
     bind = op.get_bind()
     rows = bind.execute(
         sa.text(
-            "SELECT id, user_id, conversation_id, seq, meta, payload "
+            "SELECT user_id, conversation_id, seq, meta, "
+            "  CASE WHEN payload::text LIKE :probe THEN payload END AS payload "
             "FROM messages ORDER BY conversation_id, seq"
-        )
+        ),
+        {"probe": f"%{PLAN_OPTIONS_TOOL}%"},
     ).mappings()
 
     pendings: dict[Any, list[str]] = {}

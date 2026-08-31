@@ -1170,24 +1170,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       setMessages((prev) => prev.filter((m) => m.id !== assistantId))
       seqRef.current = assistantSeq
     }
-    // THE OUTCOME CARD, drawn by whatever watched the turn.
-    //
-    // It used to be drawn by the build-watcher `Build it` started, which is gone: a build runs
-    // in a chat this page ARRIVES at now, so the only thing that can announce it is whatever
-    // ends up watching the turn there. Both watchers on this page do — an ordinary send, and
-    // the reattach a reload or a handoff arrival takes — because on a build chat every turn IS
-    // a build. `showBuildOutcome` dedupes on the turn id and scans the transcript first, so a
-    // reload that already holds the server's own row renders nothing here.
-    if (sink.terminal) {
-      showBuildOutcome({
-        status: sink.terminal === 'completed' ? 'ended' : 'failed',
-        turnId: sink.turnId ?? undefined,
-        previewUrl: turnPreviewRef.current.url,
-        endedAt: new Date().toISOString(),
-        snapshotCommitted: sink.snapshotCommitted,
-        reason: sink.reason,
-      })
-    }
+    announceTerminal(sink)
     refreshBuilds()
   }
 
@@ -1362,24 +1345,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         setMessages((prev) => prev.filter((m) => m.id !== assistantId))
         seqRef.current = assistantSeq
       }
-      // THE OUTCOME CARD, drawn by whatever watched the turn.
-      //
-      // It used to be drawn by the build-watcher `Build it` started, which is gone: a build runs
-      // in a chat this page ARRIVES at now, so the only thing that can announce it is whatever
-      // ends up watching the turn there. Both watchers on this page do — an ordinary send, and
-      // the reattach a reload or a handoff arrival takes — because on a build chat every turn IS
-      // a build. `showBuildOutcome` dedupes on the turn id and scans the transcript first, so a
-      // reload that already holds the server's own row renders nothing here.
-      if (sink.terminal) {
-        showBuildOutcome({
-          status: sink.terminal === 'completed' ? 'ended' : 'failed',
-          turnId: sink.turnId ?? undefined,
-          previewUrl: turnPreviewRef.current.url,
-          endedAt: new Date().toISOString(),
-          snapshotCommitted: sink.snapshotCommitted,
-          reason: sink.reason,
-        })
-      }
+      announceTerminal(sink)
       refreshBuilds()
     }
   }
@@ -1435,6 +1401,34 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     setMessages((prev) => [...prev, { id: `local_${Date.now()}_b`, role: 'assistant', parts, seq: seqRef.current, createdAt: new Date().toISOString() }])
     refreshBuilds()
   }, [refreshBuilds])
+
+  /**
+   * THE OUTCOME CARD, drawn by whatever watched the turn.
+   *
+   * It used to be drawn by the build-watcher `Build it` started, which is gone: a build runs in
+   * a chat this page ARRIVES at now, so the only thing that can announce it is whatever ends up
+   * watching the turn there. BOTH watchers on this page call this — an ordinary send, and the
+   * reattach a reload or a handoff arrival takes — because on a build chat every turn IS a
+   * build. One helper rather than two copies, because the two watchers announcing the same
+   * turn differently is the failure this is guarding against.
+   *
+   * `showBuildOutcome` dedupes on the turn id and scans the transcript first, so a reload that
+   * already holds the server's own row renders nothing here.
+   */
+  const announceTerminal = useCallback(
+    (sink: TurnSink) => {
+      if (!sink.terminal) return
+      showBuildOutcome({
+        status: sink.terminal === 'completed' ? 'ended' : 'failed',
+        turnId: sink.turnId ?? undefined,
+        previewUrl: turnPreviewRef.current.url,
+        endedAt: new Date().toISOString(),
+        snapshotCommitted: sink.snapshotCommitted,
+        reason: sink.reason,
+      })
+    },
+    [showBuildOutcome],
+  )
 
   /**
    * Watch the live session for its terminal and surface the outcome once.

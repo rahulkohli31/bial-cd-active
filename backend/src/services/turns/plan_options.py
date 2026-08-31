@@ -3,7 +3,8 @@
 `present_plan_options` DEFERS (the run ends with the call unanswered); the choice arrives
 minutes later as a button click — or implicitly, when the user keeps typing instead
 (free text while options are pending resolves them as `refine`). The stored resolution is
-a plain `ToolReturnPart` row (`refine` / `build` / `build_failed:<reason>`), so the next
+a plain `ToolReturnPart` row (`refine` or `build` — a migrated row may still hold a
+`build_failed:<reason>` string from the retired recorder, which reads as resolved), so the next
 run's history carries call + return natively, and the U6 projection derives the card
 state from exactly what the model will see — one record, no drift.
 
@@ -76,12 +77,7 @@ class PendingPlanOptions:
 class Resolution:
     tool_call_id: str
     choice: PlanChoice
-    reason: str | None
     already_resolved: bool
-
-
-def _resolution_content(choice: PlanChoice, _reason: str | None) -> str:
-    return choice
 
 
 def _is_open_resolution(resolution: str | None) -> bool:
@@ -150,7 +146,6 @@ async def resolve(
     conversation_id: uuid.UUID,
     tool_call_id: str,
     choice: PlanChoice,
-    reason: str | None = None,
 ) -> Resolution:
     """Record the user's choice as the tool result — idempotent on the call id: a second
     click (or second tab) answers with the ALREADY-stored resolution, never a rewrite."""
@@ -165,12 +160,7 @@ async def resolve(
     # build did not happen, and the card is spent.
     if stored is not None:
         stored_choice: PlanChoice = "build" if stored == "build" else "refine"
-        return Resolution(
-            tool_call_id=tool_call_id,
-            choice=stored_choice,
-            reason=None,
-            already_resolved=True,
-        )
+        return Resolution(tool_call_id=tool_call_id, choice=stored_choice, already_resolved=True)
 
     by_id = {pending.tool_call_id: pending for pending in calls}
     target = by_id.get(tool_call_id)
@@ -182,7 +172,6 @@ async def resolve(
     if newest_open is None or newest_open.tool_call_id != tool_call_id:
         raise PlanOptionsExpiredError
 
-    content = _resolution_content(choice, reason)
     if target.synthesized:
         # No real call to answer: the retired synthesizer's cards have no `ToolCallPart` on the
         # wire, so their choice is recorded as a system overlay instead. Migrated rows only —
@@ -195,7 +184,7 @@ async def resolve(
             entry_kind=MessageEntryKind.SYSTEM_EVENT,
             kind=ChatKind.PLAN,
             visibility=MessageVisibility.HIDDEN,
-            meta={"kind": META_RESOLVED, "toolCallId": tool_call_id, "choice": content},
+            meta={"kind": META_RESOLVED, "toolCallId": tool_call_id, "choice": choice},
         )
     else:
         await append_batch(
@@ -208,18 +197,16 @@ async def resolve(
                         ToolReturnPart(
                             tool_name=PLAN_OPTIONS_TOOL,
                             tool_call_id=tool_call_id,
-                            content=content,
+                            content=choice,
                         )
                     ]
                 )
             ],
             entry_kind=MessageEntryKind.TURN,
             kind=ChatKind.PLAN,
-            meta={"kind": META_RESOLUTION, "toolCallId": tool_call_id, "choice": content},
+            meta={"kind": META_RESOLUTION, "toolCallId": tool_call_id, "choice": choice},
         )
-    return Resolution(
-        tool_call_id=tool_call_id, choice=choice, reason=reason, already_resolved=False
-    )
+    return Resolution(tool_call_id=tool_call_id, choice=choice, already_resolved=False)
 
 
 async def resolve_pending_as_refine(

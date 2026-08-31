@@ -355,16 +355,20 @@ async def write_starting_marker(
     await redis.set(starting_key(user_uuid), str(project_id), ex=STARTING_MARKER_TTL_SECONDS)
 
 
-async def read_starting_marker(redis: aioredis.Redis, user_uuid: uuid.UUID) -> uuid.UUID | None:
-    """The project id a start names for this user, or `None` when nothing is starting.
+def _parse_starting_marker(raw: object, user_uuid: uuid.UUID) -> uuid.UUID | None:
+    """The ONE reading of a marker's value, shared by both readers below.
 
     Fails toward `None` on a value this process cannot parse (a hand-edited key, a future writer
     using a different shape) rather than treating garbage as a claim — the same fail-closed
     reading `liveness_lease_is_held` gives an unparseable deadline, applied here to a marker
     whose only job is to ANSWER, never to spare on the strength of a value nobody can account
-    for. U11 reads this (or the pipelined form below) to add the marker as a fourth disjunct to
-    the reclamation spare predicate."""
-    raw = await redis.get(starting_key(user_uuid))
+    for.
+
+    SHARED BECAUSE THE TWO READERS FEED ONE PREDICATE. The direct read and the pipelined read
+    answer the same question — is a start in flight — from two call sites (`reaper.
+    reconcile_user` and `reclamation_pass._claim_of` through the first, `project_preview_state`
+    through the second). A value one of them called garbage and the other called a claim would
+    spare a container on one path and destroy it on the other."""
     if raw is None:
         return None
     value = raw.decode() if isinstance(raw, bytes) else str(raw)
@@ -373,6 +377,14 @@ async def read_starting_marker(redis: aioredis.Redis, user_uuid: uuid.UUID) -> u
     except ValueError:
         _log.warning("unreadable starting marker; treating as absent", user_id=str(user_uuid))
         return None
+
+
+async def read_starting_marker(redis: aioredis.Redis, user_uuid: uuid.UUID) -> uuid.UUID | None:
+    """The project id a start names for this user, or `None` when nothing is starting.
+
+    U11 reads this (or the pipelined form below) to add the marker as a fourth disjunct to the
+    reclamation spare predicate."""
+    return _parse_starting_marker(await redis.get(starting_key(user_uuid)), user_uuid)
 
 
 async def clear_starting_marker(redis: aioredis.Redis, user_uuid: uuid.UUID) -> None:
@@ -412,14 +424,7 @@ async def read_registry_and_starting_marker(
     registry = {str(k): str(v) for k, v in raw_registry.items()} if raw_registry else None
     if registry is None:
         registry = await _adopt_a_pre_cutover_record(redis, user_uuid)
-    starting: uuid.UUID | None = None
-    if raw_starting:
-        value = raw_starting.decode() if isinstance(raw_starting, bytes) else str(raw_starting)
-        try:
-            starting = uuid.UUID(value)
-        except ValueError:
-            _log.warning("unreadable starting marker; treating as absent", user_id=str(user_uuid))
-    return registry, starting
+    return registry, _parse_starting_marker(raw_starting, user_uuid)
 
 
 # --- the lingering preview's stay of execution (#43, #13) --------------------
