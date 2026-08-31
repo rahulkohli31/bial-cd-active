@@ -4,8 +4,6 @@ import {
   Send, Sparkles, User, Paperclip, FileText, FileSpreadsheet, Presentation, X,
   CheckCircle2, XCircle, ExternalLink, PanelLeftOpen, PanelLeftClose,
 } from 'lucide-react'
-import Navbar from '../components/layout/Navbar'
-import LivePreview from '../components/LivePreview'
 import PublishButton from '../components/PublishButton'
 import BuildProgress, { hasBuildNarrative, StepHistoryCollapsible } from '../components/chat/BuildProgress'
 import type { StepHistoryItem } from '../components/chat/BuildProgress'
@@ -21,6 +19,16 @@ import { ApiError } from '../utils/apiError'
 import { markAppVisible } from '../utils/observe'
 import { describeSaveFailure, describeModeSwitchFailure, isConversationGone } from '../utils/chatErrors'
 import { readDraft, writeDraft, clearDraft } from '../utils/composerDraft'
+import { resolvePreviewAddress } from '../utils/previewAddress'
+import { HIDDEN_BUT_MOUNTED } from '../components/workspace/hiddenSubtree'
+import {
+  useAppPaneVisible,
+  usePublishAddress,
+  usePublishPaneView,
+  usePublishReclaim,
+  usePublishSaveState,
+  useWorkspaceProject,
+} from '../components/workspace/workspaceChannel'
 import { notifyUsageChanged } from '../utils/usage'
 import { createBuildLock, openBuildLockChannel } from '../utils/buildLock'
 import type { BuildLock } from '../utils/buildLock'
@@ -40,7 +48,6 @@ import { narrativeEnvelopes, narrativeStatus } from '../utils/turnNarrative'
 import type { TurnNarrative } from '../utils/turnNarrative'
 import { fetchSaveState, saveProject, releaseProject, stopActiveBuild, asReclaimBlocked, fetchPreviewState, fetchCompileState, checkWorkspace } from '../utils/buildSessionApi'
 import type { ReclaimBlocked, PreviewState, PreviewLifeState } from '../utils/buildSessionApi'
-import ReclaimWorkspaceDialog from '../components/projects/ReclaimWorkspaceDialog'
 import { PlanOptionsCard } from '../components/chat/PlanOptionsCard'
 import { ModeSwitcher } from '../components/chat/ModeSwitcher'
 import { wireMessageFromParts, buildUserParts, partsToText, attachmentsFromParts, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
@@ -708,19 +715,14 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     void refreshSaveState(projectId)
   }, [projectId, refreshSaveState])
 
-  // The one warning the save model owes the user. Work that is never saved IS lost when the
-  // container is reclaimed — that is the accepted product decision — so leaving with unsaved
-  // work must not be silent. Armed ONLY on a definite `true`: on `null` (unknown) there is
-  // nothing honest to claim, and a spurious prompt is how users learn to dismiss them.
-  useEffect(() => {
-    if (saveDirty !== true) return undefined
-    const warn = (event: BeforeUnloadEvent) => {
-      event.preventDefault()
-      event.returnValue = ''
-    }
-    window.addEventListener('beforeunload', warn)
-    return () => window.removeEventListener('beforeunload', warn)
-  }, [saveDirty])
+  // THE PRODUCER STAYS HERE; THE WARNING DOES NOT (Plan A, U7). `refreshSaveState` above is still
+  // the only thing that asks the server, and this is still the only surface that asks it — no new
+  // caller was added anywhere. What moved is the browser-unload effect, to the shell, because this
+  // page is an outlet child now and unmounts on every move to the project screen: left here, the
+  // warning would disarm exactly when the citizen navigated away from the conversation that knew
+  // about the unsaved work. The TRI-STATE is carried, never collapsed — `null` means "could not
+  // check", and the shell arms on a definite `true` alone.
+  usePublishSaveState(saveDirty)
 
   // A genuine unmount must cancel the in-flight turn-stream reader — a chat switch already
   // aborts it before resubscribing, but nothing did on unmount, leaking the reader (and its
@@ -747,12 +749,24 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     }
   }, [session.status, session.sessionId, projectId])
 
-  // "Recent builds" lists THIS project's build chats.
+  // THIS PROJECT'S CONVERSATIONS — all of them, and the kind filter that used to narrow this to
+  // builder chats is gone with the in-chat list (R54).
+  //
+  // The list itself has no reader any more; these two do, and neither is a list:
+  //   - `buildBlockedMessage` names the OTHER conversation holding this project's build;
+  //   - the pane's `turnRunning` asks whether a turn is running anywhere in THIS PROJECT.
+  //
+  // Both of those questions are wrong the moment a Plan turn is the one running, which is what
+  // made the filter worth removing rather than merely unnecessary. It is a no-op today — a project
+  // has only ever created builder chats — and it becomes a defect the day Plan B makes Plan turns
+  // ordinary: a Plan turn in this project would be invisible to both readers, so the refusal would
+  // say "another build chat" about a conversation it could not name and the pane would claim
+  // nothing was running over an app being written.
   const refreshBuilds = useCallback(async () => {
     try {
       const isHeader = (c: ConversationHeader | null): c is ConversationHeader => c !== null
       const list = projectId
-        ? (await listProjectConversations(projectId)).filter(isHeader).filter((c) => c.kind === 'builder')
+        ? (await listProjectConversations(projectId)).filter(isHeader)
         : (await loadBuilds()).filter(isHeader)
       setBuilds(list.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()))
     } catch {
@@ -1703,7 +1717,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     inputRef.current?.focus()
   }
 
-  const previewStatus = showSession ? session.status : null
   // U15: the live session's stored half. While the LIVE bubble below re-tells exactly this
   // session (reattach replays its envelopes), the hydrated step/in-progress rows that belong
   // to it are suppressed — one narrative, told once. Rows from OLDER builds always render.
@@ -1780,15 +1793,41 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     }
     return items
   }, [messages, liveStoryAnchorSeq])
-  // A relaunched preview (#43) is a framed URL with NO build lifecycle: it takes precedence over the
-  // (ended) session's dead preview so the pane frames the RESTORED app — while `buildActive`/`previewStatus`
-  // keep reading the session's own `ended` status, so Stop / delete-gate never light up on a relaunch.
+  // WHAT GETS FRAMED, and what the pane says about it — resolved in `utils/previewAddress.ts` and
+  // nowhere else (Plan A, U2). The precedence and its two scoping predicates used to be spelled
+  // out inline at each of the framing sites, which is why they could not be asked from ABOVE the
+  // chat; the shell mounts one iframe for the whole workspace and needs exactly this answer.
+  //
+  // The predicates travel INTO the module as arguments rather than being read there as free
+  // variables. That is the point: the comment beside their declaration above already records that
+  // a gate depending on declaration order is one reorder away from silently opening, and this
+  // removes the ordering dependency for the address.
+  //
+  // `buildActive` still reads the session's own status, so Stop and the delete-gate never light up
+  // on a relaunch, which has no build lifecycle at all.
+  const address = resolvePreviewAddress({
+    turnPreviewUrl: turnPreview.url,
+    turnStatus: turnBuildStatus,
+    narratingChatIsOpenChat: turnNarrativeIsThisChat,
+    relaunchedUrl: session.relaunchedPreviewUrl,
+    sessionUrl: session.previewUrl,
+    sessionStatus: session.status,
+    sessionId: session.sessionId,
+    // NOT `previewState?.previewUrl`, and the reason is a cycle rather than an oversight: this
+    // page's preview-state poll only runs while an address is ALREADY framed (see its effect
+    // below), so feeding its answer back in could never bootstrap one and would only widen the
+    // window in which a dropped address keeps framing. The arm exists for the caller that has a
+    // project and no chat — the project surface — which is Plan F's.
+    projectPreviewUrl: null,
+    sessionBelongsToOpenProject: sessionProjectMatches,
+    transcriptHasBuildOutcome: newestOutcome !== null,
+  })
+  const framedPreviewUrl = address.url
+  // NOT an address derivation, and deliberately left here: `restoredFromFailedBuild` below asks
+  // whether a restore happened in this project, which is a different question from which arm won
+  // the precedence — a live turn can outrank the relaunch while the restore remains the reason
+  // the app on screen is the last saved one.
   const relaunchedUrl = sessionProjectMatches ? session.relaunchedPreviewUrl : null
-  // A live Write turn's preview outranks both: it is the app the user is watching being
-  // built right now, and the session's url (when there is one at all) describes the previous
-  // build. Keyed on the url so a NEW sandbox remounts the iframe rather than showing a frame
-  // pointing at a container that no longer exists.
-  const framedPreviewUrl = (turnNarrativeIsThisChat ? turnPreview.url : null) ?? relaunchedUrl ?? (showSession ? session.previewUrl : null)
 
   // The receiving end of the app's own error reporter (see `clientErrorRelayRef` above). Declared
   // HERE rather than beside the ref because it reads `framedPreviewUrl`, which is derived further
@@ -1811,7 +1850,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const handlePreviewRevealed = useCallback(() => {
     markAppVisible(projectId ?? null)
   }, [projectId])
-  const framedStatus = turnBuildStatus ?? (relaunchedUrl ? 'ready' : (previewStatus ?? (newestOutcome ? 'ended' : null)))
   // The build bubble's two sources, resolved ONCE — the turn wins when it has something to say.
   // Naming them here is what lets the wrapper ask `hasBuildNarrative` the same question
   // BuildProgress asks itself, instead of rendering chrome around a `null`.
@@ -2115,6 +2153,20 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     setReclaim(null)
   }
 
+  // The dialog itself is mounted by the shell, so a refusal has somewhere to appear that is not
+  // owned by whichever surface happened to make the call. Only the OPEN STATE travels; the
+  // classification (`captureReclaim` above) and every handler stay here, because they are this
+  // surface's knowledge and a second classifier is how a refusal loses its one authority.
+  usePublishReclaim(
+    useMemo(
+      () => (reclaim ? { blocked: reclaim.blocked, resolve: resolveReclaim, cancel: () => setReclaim(null) } : null),
+      // `resolveReclaim` is redefined every render and is not worth memoising on its own — it
+      // reads `reclaim` directly. Keyed on the refusal itself, which is what the dialog renders.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      [reclaim],
+    ),
+  )
+
   const handleRelaunch = () => {
     if (!projectId) return
     // Stamp the project so the relaunch surfaces (Restoring…, the framed URL, its errors) render:
@@ -2147,33 +2199,109 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     (showSession && (session.feedDisconnected || session.quota)),
   )
 
-  return (
-    <div className="h-screen flex flex-col font-manrope bg-bial-bg overflow-hidden">
-      {reclaim ? (
-        <ReclaimWorkspaceDialog
-          blocked={reclaim.blocked}
-          onSaveAndSwitch={() => resolveReclaim(true)}
-          onSwitchAnyway={() => resolveReclaim(false)}
-          onCancel={() => setReclaim(null)}
-        />
-      ) : null}
-      <Navbar />
+  // ─── THE APP PANE, PUBLISHED UPWARD (Plan A, U4) ─────────────────────────────────────────────
+  //
+  // This used to be a twenty-three-prop `<LivePreview>` mount in the right-hand column, and the
+  // pane existed only because this page rendered it — which is why leaving a build chat destroyed
+  // the running app. The pane is now hosted by the shell and this surface DECLARES rather than
+  // renders: what to frame, what chrome to put on it, and whether it wants it seen.
+  //
+  // THE PROPS KEEP THEIR SCOPES, verbatim, and the reasons travel with them — the whole hazard of
+  // a move like this is that someone narrows the app-scoped ones "for consistency" on the way past.
+  useWorkspaceProject(projectId)
+  usePublishAddress(address, projectId)
+  // A Build chat wants the pane seen, exactly as today. Plan F is what gives the project screen a
+  // reason to say this too; until then the surface `ChatRoute` picked by kind is the only caller.
+  useAppPaneVisible(true)
+  usePublishPaneView({
+    /* Publish, right where the build just finished. Only once the route resolved a project — a
+       chat with no project behind it has nothing to publish. */
+    toolbarTrailing: projectId ? <PublishButton projectId={projectId} /> : null,
+    /* The chat-panel toggle renders IN-FLOW in the pane's leading slot rather than floating
+       absolutely over it — it used to sit in the same top-left corner as the pane's own
+       device-width toolbar group and visibly overlap it. */
+    toolbarLeading: (
+      <button
+        type="button"
+        onClick={() => setChatCollapsed((collapsed) => !collapsed)}
+        aria-expanded={!chatCollapsed}
+        aria-controls="chat-panel"
+        aria-label={
+          chatCollapsed
+            ? chatNeedsAttention
+              ? 'Show chat panel — needs attention'
+              : 'Show chat panel'
+            : 'Hide chat panel'
+        }
+        title={chatCollapsed ? 'Show chat panel' : 'Hide chat panel'}
+        className="relative p-1.5 rounded-lg text-neutral hover:text-primary hover:bg-bial-bg transition"
+      >
+        {chatCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
+        {/* A silent toggle would otherwise hide session banners (reclaim/quota/errors) with no
+            cue — collapsing to watch a build at full width is exactly when those are most likely
+            and least visible. */}
+        {chatCollapsed && chatNeedsAttention && (
+          <span aria-hidden="true" className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-danger rounded-full" />
+        )}
+      </button>
+    ),
+    iterating: showSession && session.iterating,
+    onRelaunch: handleRelaunch,
+    relaunching: sessionProjectMatches && session.relaunching,
+    relaunchError: sessionProjectMatches ? session.relaunchError : null,
+    lastBuildFailed: newestOutcome?.status === 'failed',
+    restoredFromFailedBuild: relaunchedUrl != null && session.relaunchedFromFailedBuild,
+    completedLive,
+    hasSavedBuild,
+    saveDirty,
+    onSave: handleSave,
+    saving,
+    saveError,
+    previewState: previewState?.state ?? null,
+    occupyingProjectName: previewState?.occupyingProjectName ?? null,
+    reconnecting: (turnNarrativeIsThisChat && turnPreview.state === 'reconnecting') || (showSession && session.reconnecting),
+    /* NOT gated on `turnNarrativeIsThisChat`, unlike the narrative values above it. This is a fact
+       about the PROJECT'S APP — one app per project — not about which conversation happens to be
+       open, and it now has a producer that outlives the turn (the preview probe above). Gating it
+       would blank the signal the moment the user opened a sibling chat, and blanking it is what
+       leaves an error screen uncovered. */
+    compileState: turnCompile,
+    /* Which of the cover's sentences is true — see `turnRunning` below. SCOPED TO THIS PROJECT,
+       not merely to "some turn somewhere". One BuilderPage instance survives a project switch and
+       `generatingChatId` is cleared only by the finishing chat's own handler, so the bare
+       `!== null` form kept project B's pane claiming "putting the latest change together" about a
+       turn running on project A. `builds` is this project's conversations; the open chat is
+       checked separately because a brand-new one is not in that list yet. */
+    workspaceLost,
+    turnRunning:
+      generatingChatId !== null &&
+      (generatingChatId === buildId || builds.some((b) => b.id === generatingChatId)),
+    onFrameMessage: handleFrameMessage,
+    /* R104's stop-clock. IT TRAVELS AS A PAYLOAD RATHER THAN A PROP so it survives Plan D's
+       deletion of this page: without it `project_to_app_visible_ms` stops being produced and
+       nothing announces that, which is the one failure a measurement cannot detect. */
+    onRevealed: handlePreviewRevealed,
+  })
 
-      <div className="flex flex-1 overflow-hidden">
+  return (
+    // NO PAGE FRAME AND NO NAVBAR. Both belong to the workspace shell now, which is what lets this
+    // surface be replaced by another without the app pane going with it. The reclaim dialog moved
+    // there too — its open state is published above, its classification stayed here.
+    <>
+      <div className="flex flex-1 min-h-0 overflow-hidden">
         {/* Chat panel — stays mounted when collapsed (CSS width:0), so the composer draft and
-            scroll position survive a hide/show cycle rather than resetting on remount.
-            `invisible` (not just `w-0 overflow-hidden`) is load-bearing: zero width and
-            overflow:hidden clip the panel visually but do NOT remove its descendants from the
-            tab order, so `aria-hidden` alone left the composer/Send/attach controls keyboard-
-            reachable while collapsed — a WCAG 4.1.2 violation. `visibility:hidden` drops the
-            whole subtree from both the tab order and the accessibility tree while staying
-            mounted, so the draft/scroll preservation below is unaffected. */}
+            scroll position survive a hide/show cycle rather than resetting on remount. The
+            hidden-but-mounted treatment itself comes from `HIDDEN_BUT_MOUNTED`, which carries the
+            WCAG reasoning: zero width and overflow:hidden clip the panel visually but do NOT
+            remove its descendants from the tab order, so `aria-hidden` alone left the
+            composer/Send/attach controls keyboard-reachable while collapsed. This surface is that
+            constant's first caller; Plan F's rail modes are its second. */}
         <div
           id="chat-panel"
           data-testid="chat-panel"
           aria-hidden={chatCollapsed}
           className={`flex flex-col bg-white border-r border-bial-border flex-shrink-0 overflow-hidden transition-[width] duration-200 ${
-            chatCollapsed ? 'w-0 border-r-0 invisible' : 'w-72 xl:w-80'
+            chatCollapsed ? `w-0 border-r-0 ${HIDDEN_BUT_MOUNTED}` : 'w-72 xl:w-80'
           }`}
         >
           {/* Chat header: back-navigation + project name ONLY (F7/F10). The redundant in-rail
@@ -2512,88 +2640,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
           </div>
         </div>
 
-        {/* The right pane is the APP (U15): LivePreview is its sole child. The build
-            narrative lives in the chat's BuildProgress bubble; the lifecycle banners sit
-            above the composer. The cockpit (ActivityFeed + SessionControls) is retired. The
-            chat-panel toggle renders IN-FLOW via LivePreview's `toolbarLeading` slot rather
-            than floating absolutely over the pane — it used to sit in the same top-left
-            corner as LivePreview's own device-width toolbar group and visibly overlap it. */}
-        <div className="flex-1 overflow-hidden">
-          <LivePreview
-            /* Publish, right where the build just finished. Only once the route resolved a
-               project — a chat with no project behind it has nothing to publish. */
-            toolbarTrailing={projectId ? <PublishButton projectId={projectId} /> : null}
-            toolbarLeading={
-              <button
-                type="button"
-                onClick={() => setChatCollapsed((collapsed) => !collapsed)}
-                aria-expanded={!chatCollapsed}
-                aria-controls="chat-panel"
-                aria-label={
-                  chatCollapsed
-                    ? chatNeedsAttention
-                      ? 'Show chat panel — needs attention'
-                      : 'Show chat panel'
-                    : 'Hide chat panel'
-                }
-                title={chatCollapsed ? 'Show chat panel' : 'Hide chat panel'}
-                className="relative p-1.5 rounded-lg text-neutral hover:text-primary hover:bg-bial-bg transition"
-              >
-                {chatCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
-                {/* A silent toggle would otherwise hide session banners (reclaim/quota/errors)
-                    with no cue — collapsing to watch a build at full width is exactly when
-                    those are most likely and least visible. */}
-                {chatCollapsed && chatNeedsAttention && (
-                  <span
-                    aria-hidden="true"
-                    className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-danger rounded-full"
-                  />
-                )}
-              </button>
-            }
-            previewUrl={framedPreviewUrl}
-            status={framedStatus}
-            iterating={showSession && session.iterating}
-            onRelaunch={handleRelaunch}
-            relaunching={sessionProjectMatches && session.relaunching}
-            relaunchError={sessionProjectMatches ? session.relaunchError : null}
-            lastBuildFailed={newestOutcome?.status === 'failed'}
-            restoredFromFailedBuild={relaunchedUrl != null && session.relaunchedFromFailedBuild}
-            completedLive={completedLive}
-            hasSavedBuild={hasSavedBuild}
-            saveDirty={saveDirty}
-            onSave={handleSave}
-            saving={saving}
-            saveError={saveError}
-            previewState={previewState?.state ?? null}
-            occupyingProjectName={previewState?.occupyingProjectName ?? null}
-            reconnecting={(turnNarrativeIsThisChat && turnPreview.state === 'reconnecting') || (showSession && session.reconnecting)}
-            /* NOT gated on `turnNarrativeIsThisChat`, unlike the narrative props above it. This
-               is a fact about the PROJECT'S APP — one app per project — not about which
-               conversation happens to be open, and it now has a producer that outlives the turn
-               (the preview probe above). Gating it would blank the signal the moment the user
-               opened a sibling chat, and blanking it is what leaves an error screen uncovered. */
-            compileState={turnCompile}
-            /* Which of the cover's sentences is true — see `turnRunning` on the pane.
-               SCOPED TO THIS PROJECT, not merely to "some turn somewhere". One BuilderPage
-               instance survives a project switch and `generatingChatId` is cleared only by the
-               finishing chat's own handler, so the bare `!== null` form kept project B's pane
-               claiming "putting the latest change together" about a turn running on project A.
-               `builds` is this project's conversations; the open chat is checked separately
-               because a brand-new one is not in that list yet. */
-            workspaceLost={workspaceLost}
-            turnRunning={
-              generatingChatId !== null &&
-              (generatingChatId === buildId || builds.some((b) => b.id === generatingChatId))
-            }
-            onFrameMessage={handleFrameMessage}
-            /* R104's stop-clock. THIS MOUNT IS LOAD-BEARING: it is the only production mount of
-               LivePreview in the tree, so the prop is dead without it and
-               `project_to_app_visible_ms` never fires. Whoever re-hosts this pane carries the
-               prop forward rather than re-deriving it. */
-            onRevealed={handlePreviewRevealed}
-          />
-        </div>
       </div>
 
       {/* Attachment validation / cap toast. Announced, because KTD-2 deliberately keeps the send
@@ -2613,6 +2659,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       {viewer && (
         <AttachmentLightbox name={viewer.name} src={viewer.src} onClose={() => setViewer(null)} />
       )}
-    </div>
+    </>
   )
 }

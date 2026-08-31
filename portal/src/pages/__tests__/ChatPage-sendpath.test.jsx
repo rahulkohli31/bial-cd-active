@@ -14,7 +14,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
-import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
+import { MemoryRouter, Routes, Route, useLocation, Link } from 'react-router-dom'
 
 const h = vi.hoisted(() => ({
   sendMessage: vi.fn(),
@@ -56,6 +56,7 @@ vi.mock('../../utils/conversationApi', () => ({
 
 import ChatPage from '../ChatPage'
 import { ApiError } from '../../utils/apiError'
+import { readDraft } from '../../utils/composerDraft'
 
 // Flat chat URL, as ChatRoute renders it. A brand-new chat carries its project in a
 // transient query; the props are what ChatRoute would inject.
@@ -64,10 +65,32 @@ function LocationProbe() {
   return <div data-testid="location">{`${loc.pathname}${loc.search}`}</div>
 }
 
+/**
+ * Move between chats WITHOUT the in-chat list, which R54 removed.
+ *
+ * These suites are about what a chat switch does — the abort, the composer reset, where a late
+ * assistant write lands — not about what the user clicked to cause one. The list was that trigger;
+ * after R54 the trigger is the project page's row, and Plan F's history rail after that. A link in
+ * the harness is the honest stand-in for whichever it is, and it keeps every one of these
+ * assertions pointed at the behaviour rather than at departed chrome.
+ */
+const switchTo = (chatId) => fireEvent.click(screen.getByText(`go ${chatId}`))
+
+function ChatSwitcher() {
+  return (
+    <>
+      {['chat-1', 'chat-2'].map((id) => (
+        <Link key={id} to={`/chat/${id}`}>{`go ${id}`}</Link>
+      ))}
+    </>
+  )
+}
+
 function renderChat(entry) {
   return render(
     <MemoryRouter initialEntries={[entry]}>
       <LocationProbe />
+      <ChatSwitcher />
       <Routes>
         <Route path="/chat/:chatId" element={<ChatPage projectId="p1" projectName="VIP Movement" />} />
         <Route path="/projects/:projectId" element={<div>project home</div>} />
@@ -108,6 +131,15 @@ describe('ChatPage — send-path guards (U10)', () => {
     expect(creates()).toHaveLength(1)
     // The stream was never started — no orphan turn reaches the server.
     expect(h.sendMessage).not.toHaveBeenCalled()
+
+    // …AND THE MESSAGE COMES BACK. The toast says "try again", but `doSend` had already cleared
+    // both the composer and the persisted draft on the click, so without the restore the user is
+    // asked to retry a message that no longer exists anywhere — and a reload could not recover it
+    // either. Both halves are asserted: the composer for the retry that is offered now, the store
+    // for the reload that might come instead. The upload-failure arm in the same function has
+    // restored both since it shipped; this arm is the other await and needed the same treatment.
+    await waitFor(() => expect(textarea.value).toBe('hello'))
+    expect(readDraft('chat-1')).toBe('hello')
   })
 
   it('a conversation switch mid-stream does not write the assistant turn onto the previous conversation', async () => {
@@ -131,7 +163,7 @@ describe('ChatPage — send-path guards (U10)', () => {
     await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
 
     // Switch to chat-2 while chat-1's reply is still streaming.
-    fireEvent.click(screen.getByText('Second'))
+    switchTo('chat-2')
     await waitFor(() => expect(h.getConversation).toHaveBeenCalledWith('chat-2'))
 
     // The stream completes after the switch — the superseded resolve must render nothing
@@ -284,7 +316,7 @@ describe('ChatPage — the composer is not shared across a chat navigation', () 
     expect(textarea.value).toBe('a draft meant only for chat-1')
 
     // Switch to chat-2 in the same instance; the hydrate effect must reset the composer.
-    fireEvent.click(screen.getByText('Second'))
+    switchTo('chat-2')
     await waitFor(() => expect(h.getConversation).toHaveBeenCalledWith('chat-2'))
 
     await waitFor(() => {
@@ -293,55 +325,38 @@ describe('ChatPage — the composer is not shared across a chat navigation', () 
   })
 })
 
-describe('ChatPage — deleting a streaming chat is gated (F-1)', () => {
-  it('disables delete for the streaming chat but still allows deleting a different one', async () => {
-    // Belt over the activeChatIdRef write-path guard (which the mid-stream-switch test above
-    // already proves no-ops a late assistant write): while chat-1 streams, its own delete
-    // control is disabled so the resurrecting delete can't be issued in-chat — but a different,
-    // non-streaming chat stays deletable (no over-gating).
-    h.listProjectConversations.mockResolvedValue([
-      { id: 'chat-1', kind: 'planning', title: 'First', updatedAt: new Date().toISOString() },
-      { id: 'chat-2', kind: 'planning', title: 'Second', updatedAt: new Date(Date.now() - 1000).toISOString() },
-    ])
+describe('ChatPage — the in-chat delete gate is GONE, and so is the situation it guarded (R54)', () => {
+  // INERTNESS GUARDS, not deletions. Two tests used to live here: the streaming chat's own delete
+  // control was disabled while its reply was in flight, and a sibling's stayed enabled. Both were
+  // about the in-chat conversation LIST, and R54 removed it.
+  //
+  // WHAT THAT COSTS, ANSWERED RATHER THAN ASSUMED. The gate existed because the list sat in the
+  // same surface as a live stream, so a user could delete the very conversation this tab was
+  // streaming into and a late assistant write could resurrect it. Deleting now happens from the
+  // project page — and reaching it unmounts this surface, which aborts the stream
+  // (`useClaudeAPI`'s unmount cleanup, and the F7 abort asserted below on any chat switch). The
+  // dangerous moment is not merely gated any more; it cannot be arrived at. That is the removal's
+  // actual argument, and it is asserted rather than asserted away.
+  const twoChats = () => {
     h.getConversation.mockImplementation(async (id) => ({
       id, kind: 'planning', title: id, messages: [], updatedAt: new Date().toISOString(),
     }))
-    let resolveSend
-    h.sendMessage.mockImplementation(() => new Promise((res) => { resolveSend = res }))
+  }
 
+  it('renders no conversation list, and no delete control for any chat, inside a chat', async () => {
+    twoChats()
     renderChat('/chat/chat-1')
     expect(await screen.findByText(/Plan your next app/i)).toBeTruthy()
 
-    const textarea = screen.getByPlaceholderText(/Describe what you're thinking/i)
-    fireEvent.change(textarea, { target: { value: 'hi' } })
-    fireEvent.keyDown(textarea, { key: 'Enter' })
-    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
-
-    // chat-1 is the active, streaming chat → its delete is disabled...
-    expect(screen.getByLabelText('Delete First').disabled).toBe(true)
-    // ...while chat-2 (not streaming) stays deletable.
-    const delTwo = screen.getByLabelText('Delete Second')
-    expect(delTwo.disabled).toBe(false)
-    fireEvent.click(delTwo)
-    await waitFor(() => expect(h.deleteConversation).toHaveBeenCalledWith('chat-2'))
-    expect(h.deleteConversation).not.toHaveBeenCalledWith('chat-1')
-
-    // chat-1 was never deleted — let its stream finish cleanly.
-    await act(async () => { resolveSend('assistant reply'); await Promise.resolve() })
+    expect(screen.queryByLabelText(/^Delete /)).toBeNull()
+    expect(screen.queryByRole('button', { name: /^new chat$/i })).toBeNull()
+    expect(screen.queryByText(/no conversations yet/i)).toBeNull()
+    // The liveness half — the surface itself is up, so the absences above mean something.
+    expect(screen.getByPlaceholderText(/Describe what you're thinking/i)).toBeTruthy()
   })
 
-  it('a mid-stream navigate ABORTS the stream, so NO chat stays delete-gated afterwards (F7)', async () => {
-    // Superseded semantics, deliberately: the gate used to FOLLOW the still-streaming chat after
-    // a navigate, because the stream kept running in the background. Since the chat switch now
-    // aborts the stream (F7), there is nothing left that could resurrect chat-1 — so both deletes
-    // are correctly enabled the moment the switch lands, and the late resolve writes nothing.
-    h.listProjectConversations.mockResolvedValue([
-      { id: 'chat-1', kind: 'planning', title: 'First', updatedAt: new Date().toISOString() },
-      { id: 'chat-2', kind: 'planning', title: 'Second', updatedAt: new Date(Date.now() - 1000).toISOString() },
-    ])
-    h.getConversation.mockImplementation(async (id) => ({
-      id, kind: 'planning', title: id, messages: [], updatedAt: new Date().toISOString(),
-    }))
+  it('and a mid-stream switch still aborts the stream, which is what makes the missing gate safe', async () => {
+    twoChats()
     let resolveSend
     h.sendMessage.mockImplementation(() => new Promise((res) => { resolveSend = res }))
 
@@ -351,17 +366,13 @@ describe('ChatPage — deleting a streaming chat is gated (F-1)', () => {
     fireEvent.change(textarea, { target: { value: 'hi' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
     await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
-    expect(screen.getByLabelText('Delete First').disabled).toBe(true) // gated WHILE streaming
 
-    // Navigate to chat-2: the switch aborts chat-1's stream (h.abort) and clears the gate.
     const abortsBefore = h.abort.mock.calls.length
-    fireEvent.click(screen.getByText('Second'))
+    switchTo('chat-2')
     await waitFor(() => expect(h.getConversation).toHaveBeenCalledWith('chat-2'))
     expect(h.abort.mock.calls.length).toBeGreaterThan(abortsBefore)
-    expect(screen.getByLabelText('Delete First').disabled).toBe(false)
-    expect(screen.getByLabelText('Delete Second').disabled).toBe(false)
 
-    // The aborted stream's late resolve renders nothing — deleting chat-1 now is safe.
+    // The aborted stream's late resolve renders nothing, so nothing can resurrect chat-1.
     await act(async () => { resolveSend('assistant reply'); await Promise.resolve() })
     expect(screen.queryByText('assistant reply')).toBeNull()
   })
@@ -483,7 +494,7 @@ describe('ChatPage — a chat switch aborts the stream and leaks nothing cross-c
     expect(sendButton().getAttribute('aria-disabled')).toBe('true')
 
     const abortsBefore = h.abort.mock.calls.length
-    fireEvent.click(screen.getByText('Second'))
+    switchTo('chat-2')
     await waitFor(() => expect(h.getConversation).toHaveBeenCalledWith('chat-2'))
 
     // The switch ABORTED the in-flight stream (the request must not keep billing into a void)…
@@ -513,9 +524,9 @@ describe('ChatPage — a chat switch aborts the stream and leaks nothing cross-c
 
     // Away and back before the stream settles — A is rehydrated from the server, WITHOUT the
     // stream's optimistic bubble, so a late resolve has nowhere honest to land.
-    fireEvent.click(screen.getByText('Second'))
+    switchTo('chat-2')
     await waitFor(() => expect(h.getConversation).toHaveBeenCalledWith('chat-2'))
-    fireEvent.click(screen.getByText('First'))
+    switchTo('chat-1')
     await waitFor(() => expect(h.getConversation).toHaveBeenCalledTimes(3)) // mount + B + A again
 
     // The stream resolves WITH text after the round trip: the generation fence must drop it —
@@ -614,7 +625,7 @@ describe('ChatPage — Regenerate after a stall (F1)', () => {
     await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
 
     // Navigate to chat-2, then click the (statically-mocked) Try again banner.
-    fireEvent.click(screen.getByText('Second'))
+    switchTo('chat-2')
     await waitFor(() => expect(h.getConversation).toHaveBeenCalledWith('chat-2'))
     fireEvent.click(await screen.findByRole('button', { name: /try again/i }))
     await act(async () => { await Promise.resolve() })

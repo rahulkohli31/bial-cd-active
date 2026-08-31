@@ -1,31 +1,23 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import type { MouseEvent as ReactMouseEvent, FormEvent as ReactFormEvent, KeyboardEvent as ReactKeyboardEvent } from 'react'
+import type { FormEvent as ReactFormEvent, KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { useNavigate, useParams, useLocation } from 'react-router-dom'
 import { AssistantRuntimeProvider, ComposerPrimitive, useExternalStoreRuntime, useAuiState } from '@assistant-ui/react'
 import type { ThreadMessage, AppendMessage } from '@assistant-ui/react'
-import { Sparkles, User, Send, Plus, MessageSquare, Trash2, Hammer, Paperclip, X, FileText, FileSpreadsheet, Presentation } from 'lucide-react'
-import Navbar from '../components/layout/Navbar'
+import { Sparkles, User, Send, Hammer, Paperclip, X, FileText, FileSpreadsheet, Presentation } from 'lucide-react'
 import MessageContent from '../components/chat/MessageContent'
 import AttachmentLightbox from '../components/AttachmentLightbox'
 import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
-import { listProjectConversations, uuidv7 } from '../utils/conversationApi'
-import type { ConversationHeader } from '../utils/conversationApi'
+import { uuidv7 } from '../utils/conversationApi'
 import { useClaudeAPI, getContextLimits, estimateConversationTokens } from '../hooks/useClaudeAPI'
 import { usePendingAttachments } from '../hooks/usePendingAttachments'
-import {
-  loadHistory,
-  newConversation,
-  createConversation,
-  getConversation,
-  deleteConversation,
-  relativeTime,
-  deriveTitle,
-} from '../utils/chatHistory'
+import { newConversation, createConversation, getConversation, deriveTitle } from '../utils/chatHistory'
 import { wireMessageFromParts, buildUserParts, partsToText, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
 import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../utils/attachmentInput'
 import type { PendingAttachment } from '../utils/attachmentInput'
 import { openPdf } from '../utils/attachmentViewer'
 import { describeSaveFailure, isConversationGone } from '../utils/chatErrors'
+import { useWorkspaceProject } from '../components/workspace/workspaceChannel'
+import { readDraft, writeDraft, clearDraft } from '../utils/composerDraft'
 import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
 import type { ChatMessage } from '../utils/messageTypes'
 
@@ -67,15 +59,23 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   const params = useParams()
   const chatId = chatIdProp ?? params.chatId
   const location = useLocation()
+  // Declared HERE and not in the slot above: layout effects run child-before-parent, so a
+  // parent-level declaration would land AFTER a sibling surface's address publish and open a commit
+  // in which a new address is judged against the old project. `null` while the route is still
+  // resolving is a no-op by design.
+  useWorkspaceProject(projectId)
 
-  const [history, setHistory] = useState<ConversationHeader[]>([])
   const [activeChatId, setActiveChatId] = useState<string | null>(null)
   const [messages, setMessages] = useState<ChatUIMessage[]>([])
   const [generating, setGenerating] = useState(false)
   // The id of the chat whose turn is in flight — tracked separately from `generating`, which is
-  // a page-global flag, so the delete gate follows the actual STREAM, not the current view. This
-  // keeps the streaming chat's delete disabled (and every OTHER chat's enabled) even after a
-  // mid-stream navigate to a sibling chat. Cleared on both send-exit paths.
+  // a page-global flag, so the composer lock and the streaming indicator follow the actual STREAM
+  // rather than the current view. After a mid-stream navigate a sibling chat's composer stays
+  // usable and only the owning chat shows dots. Cleared on both send-exit paths.
+  //
+  // It gated the in-chat delete control too, until R54 removed the list that control lived on.
+  // Deleting a conversation happens from the project page now — which is a different component
+  // that cannot read this state, and reaching it unmounts this surface and aborts the stream.
   const [streamingChatId, setStreamingChatId] = useState<string | null>(null)
   const [hydrating, setHydrating] = useState(false) // loading a saved transcript over the network
   const [showBuildModal, setShowBuildModal] = useState(false)
@@ -128,9 +128,9 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   const messagesRef = useRef(messages)
   messagesRef.current = messages
 
-  // The composer/indicator gates scope to the chat that OWNS the in-flight turn (matching the
-  // per-chat delete gate below): after a mid-stream navigate, a sibling chat's Send/attach must
-  // not be locked — and its transcript must not show dots — for a stream that isn't its own (F7).
+  // The composer/indicator gates scope to the chat that OWNS the in-flight turn: after a mid-stream
+  // navigate, a sibling chat's Send/attach must not be locked — and its transcript must not show
+  // dots — for a stream that isn't its own (F7).
   const streamingHere = generating && streamingChatId === activeChatId
 
   // Running context-length estimate → 'ok' | 'warn' | 'full'. Drives the
@@ -182,27 +182,6 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     setActiveChatId(id)
   }, [])
 
-  // The sidebar lists this PROJECT's planning chats, not every planning chat the user
-  // owns — a chat belongs to its project, and cross-project recents would re-introduce
-  // the flat all-chats model this phase replaces. Falls back to the flat list only when
-  // the project is not yet known (a chat rendered without ChatRoute).
-  const refreshHistory = useCallback(async () => {
-    try {
-      const isHeader = (c: ConversationHeader | null): c is ConversationHeader => c !== null
-      const list = projectId
-        ? (await listProjectConversations(projectId)).filter(isHeader).filter((c) => c.kind === 'planning')
-        : (await loadHistory()).filter(isHeader)
-      setHistory(list.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()))
-    } catch {
-      // Keep the current sidebar on a transient error; the next refresh recovers.
-    }
-  }, [projectId])
-
-  // Load sidebar history on mount and when activeChatId changes
-  useEffect(() => {
-    refreshHistory()
-  }, [refreshHistory, activeChatId])
-
   // Hydrate the routed conversation. Async (server round-trip) with a stale-response
   // guard so a fast conversation switch can't let an older fetch clobber the newer view.
   //
@@ -223,7 +202,12 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     // changed the route rather than one fetch later.
     setActive(chatId)
     setMessages([])
-    runtime.thread.composer.setText('') // the composer draft belongs to the OLD chat — never carry it into this one
+    // THE OLD CHAT'S DRAFT MUST NOT CARRY INTO THIS ONE — but blanking was the wrong way to
+    // ensure it, and this line was the whole of why a planning draft died on a reload: the effect
+    // runs on the FIRST mount too, so a cold open cleared a composer that had just been restored
+    // from nothing. Read this chat's own draft instead. Same store, same key discipline and same
+    // semantics the builder surface has used all along (R72).
+    runtime.thread.composer.setText(readDraft(chatId))
     clearPending() // and neither do its staged attachments (no key={chatId} remount clears them)
     // A stalled turn's error banner + its Regenerate context belong to the OLD chat. ChatPage
     // stays mounted across chat navigations (no key={chatId}), so without this the banner's "Try
@@ -349,9 +333,6 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
       }
       lastTurnRef.current = null // succeeded — nothing to regenerate
 
-      // U7: the SERVER persisted both sides of the turn before [DONE] — no client append.
-      if (activeChatIdRef.current === currentChatId) refreshHistory()
-
       // Check if we should suggest moving to builder
       const allMessages = [...messagesRef.current]
       const shouldSuggest =
@@ -374,7 +355,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
         setStreamingChatId(null)
       }
     }
-  }, [sendMessage, refreshHistory])
+  }, [sendMessage])
 
   const fireMessage = useCallback(async (rawText: string, attachments: PendingAttachment[] = [], explicitChatId?: string) => {
     if (generating) return
@@ -413,6 +394,9 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
       // guard streamAssistant already uses for the identical race.
       if (activeChatIdRef.current !== currentChatId) return
       runtime.thread.composer.setText(rawText)
+      // …and the STORE follows the composer, or a reload after a failed upload would lose the
+      // message the restore just handed back. A failed send is exactly when the text is worth most.
+      writeDraft(currentChatId, rawText)
       restorePending(attachments)
       return
     }
@@ -420,7 +404,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     const userMsg: ChatUIMessage = { id: `local_${Date.now()}`, role: 'user', parts, seq: baseSeq, createdAt: new Date().toISOString() }
     setMessages((prev) => [...prev, userMsg])
     setGenerating(true)
-    setStreamingChatId(currentChatId) // gate THIS chat's delete for the turn's lifetime
+    setStreamingChatId(currentChatId) // scope the composer/send lock to the chat that owns this turn
 
     // U7: the conversation row must EXIST before the first turn — the stateless relay 404s
     // an unknown id (the legacy appears-on-first-append upsert is gone; the server persists
@@ -442,17 +426,31 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
         setGenerating(false)
         setStreamingChatId(null)
         showAttachToast(describeSaveFailure(err))
-        if (isConversationGone(err)) navigate('/projects', { replace: true })
+        if (isConversationGone(err)) {
+          navigate('/projects', { replace: true })
+          return
+        }
+        // The row never got written, so the toast says "try again" — but `doSend` cleared the
+        // composer AND the persisted draft before calling us, so without this the user is asked to
+        // retry a message that no longer exists anywhere, and a reload cannot bring it back either.
+        // Exactly the loss the upload-failure arm above restores from; this arm is the other await
+        // in the same function and needs the same treatment, including the same
+        // still-on-screen guard, since `createConversation` is awaited and a chat switch is
+        // ordinary. Not restored when the conversation is GONE: we navigate away, and there is no
+        // composer left to restore into.
+        if (activeChatIdRef.current !== currentChatId) return
+        runtime.thread.composer.setText(rawText)
+        writeDraft(currentChatId, rawText)
+        restorePending(attachments)
         return
       }
     }
     dropTransientQuery(currentChatId)
-    refreshHistory()
 
     // The stateless wire message: typed prose + fenced attachment text + owned binary refs.
     // No transcript, no bytes — the server loads history and rehydrates references (R9).
     await streamAssistant(wireMessageFromParts(parts), baseSeq, currentChatId)
-  }, [activeChatId, generating, streamAssistant, refreshHistory, showAttachToast, projectId, navigate, dropTransientQuery, restorePending, runtime.thread.composer])
+  }, [activeChatId, generating, streamAssistant, showAttachToast, projectId, navigate, dropTransientQuery, restorePending, runtime.thread.composer])
 
   // Re-request the last turn's reply after a stall/error. User-initiated ONLY (never auto-fired):
   // the first turn bills server-side regardless of the client outcome, so a regenerate is a SECOND
@@ -503,6 +501,10 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     }
 
     runtime.thread.composer.setText('')
+    // The store moves with the composer. `clearDraft` is keyed on the ROUTED chat for the same
+    // reason `fireMessage` is passed it explicitly below: under flat routing the route's id is
+    // known from the first render while `activeChatId` only commits once hydration resolves.
+    clearDraft(chatId)
     clearPending()
 
     // Pass the route's chat id explicitly. Under flat routing it is known from the
@@ -536,15 +538,16 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     doSend(runtime.thread.composer.getState().text.trim())
   }
 
-  const handleSelectChat = (id: string) => {
-    setViewer(null)
-    navigate(`/chat/${id}`)
-    buildSuggestionFiredRef.current = false
-  }
-
   // A new chat is always filed under THIS chat's project — there is no Default project
   // and no project-less chat. The id is minted client-side; the row appears on the
   // first append, so the project rides a transient query until then.
+  //
+  // IT SURVIVED R54, AND THAT WAS THE POINT. This was the conversation list's New Chat button as
+  // well as the context guardrail's escape hatch, and the two look identical from the outside —
+  // but the guardrail is a HARD SEND STOP whose only exit is this call. Deleting it with the list
+  // would have left a planning conversation permanently unsendable, with copy still telling the
+  // reader to start a new chat and no control to do it. It is also the third mint site and the
+  // only producer of planning conversations: the project screen's composer mints builders.
   const handleNewChat = () => {
     setViewer(null)
     if (!projectId) {
@@ -555,26 +558,6 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     navigate(`/chat/${newConversation()}?projectId=${encodeURIComponent(projectId)}&kind=planning`, {
       state: { freshlyMinted: true },
     })
-  }
-
-  const handleDeleteChat = async (e: ReactMouseEvent, id: string) => {
-    e.stopPropagation()
-    // If the active conversation is being deleted, clear the active id FIRST so any
-    // in-flight stream's assistant write no-ops (the guard sees the id change) — an
-    // in-flight reply can't resurrect the just-deleted conversation.
-    if (activeChatIdRef.current === id) {
-      setMessages([])
-      setActive(null)
-      navigate(projectId ? `/projects/${projectId}` : '/projects', { replace: true })
-    }
-    setHistory((prev) => prev.filter((c) => c.id !== id)) // optimistic removal
-    try {
-      await deleteConversation(id)
-    } catch {
-      refreshHistory() // reconcile — the row reappears if the delete didn't land
-      return
-    }
-    refreshHistory()
   }
 
   const handleBuildApp = useCallback(async () => {
@@ -636,66 +619,18 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   }, [builderPrompt, navigate, projectId])
 
   return (
-    <div className="h-screen overflow-hidden bg-bial-bg font-manrope flex flex-col">
-      <Navbar />
-
-      <div className="flex flex-1 overflow-hidden" style={{ height: 'calc(100vh - 56px)' }}>
-        {/* Sidebar */}
-        <aside className="w-64 flex-shrink-0 bg-white border-r border-bial-border flex flex-col overflow-hidden">
-          <div className="p-3 border-b border-bial-border">
-            <button
-              onClick={handleNewChat}
-              className="w-full flex items-center justify-center gap-2 bg-primary hover:bg-primary-dark text-white text-sm font-bold rounded-xl px-4 py-2.5 transition"
-            >
-              <Plus size={15} />
-              New Chat
-            </button>
-          </div>
-
-          <div className="flex-1 overflow-y-auto scrollbar-thin py-2">
-            {history.length === 0 ? (
-              <div className="px-4 py-8 text-center">
-                <MessageSquare size={28} className="text-bial-border mx-auto mb-2" />
-                <p className="text-xs text-neutral">No conversations yet</p>
-              </div>
-            ) : (
-              history.map((conv) => (
-                <div
-                  key={conv.id}
-                  onClick={() => handleSelectChat(conv.id)}
-                  className={`group relative mx-2 my-0.5 rounded-xl px-3 py-2.5 cursor-pointer transition flex flex-col gap-0.5 ${
-                    conv.id === activeChatId
-                      ? 'bg-bial-bg border-l-2 border-primary'
-                      : 'hover:bg-surface-muted border-l-2 border-transparent'
-                  }`}
-                >
-                  <p className={`text-xs font-semibold truncate pr-6 ${conv.id === activeChatId ? 'text-primary' : 'text-tertiary'}`}>
-                    {conv.title}
-                  </p>
-                  <p className="text-[10px] text-neutral">{relativeTime(conv.updatedAt)}</p>
-                  <button
-                    onClick={(e) => handleDeleteChat(e, conv.id)}
-                    disabled={conv.id === streamingChatId}
-                    aria-label={`Delete ${conv.title || 'chat'}`}
-                    title={
-                      conv.id === streamingChatId
-                        ? 'Finishing a reply — you can delete this chat once it completes'
-                        : 'Delete chat'
-                    }
-                    className={`absolute right-2 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition p-1 ${
-                      conv.id === streamingChatId
-                        ? 'text-neutral/40 cursor-not-allowed'
-                        : 'text-neutral hover:text-danger'
-                    }`}
-                  >
-                    <Trash2 size={11} />
-                  </button>
-                </div>
-              ))
-            )}
-          </div>
-        </aside>
-
+    // NO PAGE FRAME, NO NAVBAR, AND NO VIEWPORT ARITHMETIC. All three belong to the workspace
+    // shell now. The `calc(100vh - 56px)` that used to sit here was the codebase's only one — the
+    // navbar's `h-14` transcribed into a second file, one Tailwind edit away from a scrollbar
+    // nobody could explain. It dies here rather than being copied into a third place.
+    <>
+      <div className="flex flex-1 min-h-0 overflow-hidden">
+        {/* R54 — THE CHAT LIST IS GONE FROM INSIDE A CHAT. The workspace lists chats; an open
+            chat is a conversation, not a file manager. Nothing is lost: the project page already
+            lists every conversation with Open and Delete on each row, and the history rail that
+            replaces this is Plan F's. What did NOT go with it is the only control here that was
+            never list chrome — the new-chat mint, which is also the context guardrail's one
+            escape hatch and lives beside its sentence below. */}
         {/* Chat area */}
         <div className="flex-1 flex flex-col overflow-hidden">
           {/* Chat toolbar: back-navigation + project name only (F10 — the AI branding block
@@ -940,6 +875,11 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                     maxRows={10}
                     onHeightChange={setComposerHeight}
                     onKeyDown={handleComposerKeyDown}
+                    /* A keystroke writes the draft, the same rhythm the builder surface has. The
+                       primitive composes this with its own handler (ours runs first), so the
+                       library's text state is unaffected. Programmatic `setText` calls do not fire
+                       it, which is why the three sites above move the store explicitly. */
+                    onChange={(e) => writeDraft(chatId, e.target.value)}
                     addAttachmentOnPaste={false}
                     placeholder="Describe what you're thinking… (Shift+Enter for new line)"
                     className="flex-1 resize-none text-sm text-tertiary bg-bial-bg border border-bial-border rounded-xl px-4 py-3 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary/20 transition placeholder:text-gray-300"
@@ -1054,7 +994,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
           </div>
         </div>
       )}
-    </div>
+    </>
   )
 }
 

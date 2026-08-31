@@ -27,6 +27,29 @@ import { act, fireEvent, screen, render, waitFor } from '@testing-library/react'
 import { expect } from 'vitest'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import BuilderPage from '../BuilderPage'
+// THE REAL SHELL, not a stub, and both helpers below mount the page THROUGH it as a layout route.
+// After the extraction the surface is an outlet child rather than a root: it renders no page frame
+// and no navbar, and — from U4 — no pane of its own. A harness that kept mounting it bare would
+// leave every preview assertion in fifteen suites asserting against something the product does not
+// render, which is the failure mode a stub cannot show you.
+import WorkspaceShell from '../../components/workspace/WorkspaceShell'
+
+/**
+ * Nest routes under the REAL workspace shell, for the suites that build their own route tables.
+ *
+ * The surface is an outlet child now: it renders no page frame, no navbar and — from U4 — no pane
+ * of its own, publishing what to frame upward instead. A table that mounts it bare therefore has
+ * no pane at all, so every assertion about the preview silently asserts against something the
+ * product does not render. This is one line at each such table rather than a stub, because a stub
+ * is exactly what would hide the mistake.
+ *
+ * Usage: `<Routes>{inWorkspace(<Route path="/chat/:chatId" element={…} />)}<Route … /></Routes>`
+ */
+export const inWorkspace = (...routes) => (
+  <Route key="workspace" element={<WorkspaceShell />}>
+    {routes}
+  </Route>
+)
 
 export { FakeEventSource } from '../../utils/buildSessionMock'
 
@@ -224,10 +247,100 @@ export function renderBuilder({ deps, projectId = 'p1', hasSavedBuild = null, in
   return render(
     <MemoryRouter initialEntries={initialEntries}>
       <Routes>
-        <Route path="/chat/:chatId" element={<BuilderPage projectId={projectId} projectName="VIP Movement" projectHasSavedBuild={hasSavedBuild} buildSessionDeps={deps} />} />
+        <Route element={<WorkspaceShell />}>
+          <Route path="/chat/:chatId" element={<BuilderPage projectId={projectId} projectName="VIP Movement" projectHasSavedBuild={hasSavedBuild} buildSessionDeps={deps} />} />
+        </Route>
         <Route path="/projects" element={<div>projects index</div>} />
         <Route path="/projects/:pid" element={<div>project page</div>} />
       </Routes>
     </MemoryRouter>,
   )
+}
+
+// ─── Plan A / U1: fixtures for the PREVIEW ADDRESS and its two scoping predicates ─────────────
+//
+// The address has three sources and two predicates, and a predicate is only OBSERVABLE when the
+// chat or the project on screen differs from the one the signal was attributed to. `renderBuilder`
+// cannot express that: it mounts one identity and never moves. These two fixtures supply the
+// missing halves — a transcript that attributes a SESSION to whatever project is on screen, and a
+// render helper that can move the SAME BuilderPage instance to a sibling chat or another project.
+
+/**
+ * A transcript whose newest assistant part anchors a build with no recorded outcome.
+ *
+ * This is all a reattach needs (`reattachToLiveBuild`): the page reads the session id off the
+ * anchor, stamps `sessionChatRef`/`sessionProjectRef` with the identities it is CURRENTLY mounted
+ * at, and calls `getStatus`. Pair it with a `getStatus` that answers with a `previewUrl` and the
+ * session arm of the address is live, attributed to the project that was on screen.
+ */
+export const withLiveBuildAnchor = (sessionId = 'live-7', over = {}) => ({
+  id: 'build-X',
+  kind: 'builder',
+  mode: 'plan',
+  messages: [
+    { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'a visitor app' }] },
+    { id: 'srv_1_g', role: 'assistant', seq: 1, parts: [{ type: 'build_in_progress', sessionId }] },
+  ],
+  ...over,
+})
+
+/**
+ * Render BuilderPage at an EXPLICIT chat/project identity, and hand back a `moveTo` that changes
+ * it without remounting.
+ *
+ * Flat routing means one BuilderPage instance survives every chat and project move — only its
+ * props change — so `moveTo` is what the product actually does, not a test shortcut. The router
+ * entry is deliberately constant and the identities arrive as PROPS (`chatId` wins over
+ * `useParams`): a MemoryRouter reads `initialEntries` once at mount, so re-rendering with a new
+ * one would change nothing and the test would silently assert against the original identity.
+ *
+ * @param {{
+ *   chatId?: string,
+ *   projectId?: string,
+ *   projectName?: string,
+ *   hasSavedBuild?: boolean | null,
+ *   deps?: object,
+ * }} [opts]
+ */
+export function renderBuilderAt({
+  chatId = 'chat-A',
+  projectId = 'pA',
+  projectName = 'VIP Movement',
+  hasSavedBuild = null,
+  deps,
+} = {}) {
+  const at = { chatId, projectId, projectName }
+  const tree = () => (
+    <MemoryRouter initialEntries={['/chat/routed']}>
+      <Routes>
+        <Route element={<WorkspaceShell />}>
+          <Route
+            path="/chat/:chatId"
+            element={
+              <BuilderPage
+                chatId={at.chatId}
+                projectId={at.projectId}
+                projectName={at.projectName}
+                projectHasSavedBuild={hasSavedBuild}
+                buildSessionDeps={deps}
+              />
+            }
+          />
+        </Route>
+        <Route path="/projects" element={<div>projects index</div>} />
+        <Route path="/projects/:pid" element={<div>project page</div>} />
+      </Routes>
+    </MemoryRouter>
+  )
+  const view = render(tree())
+  return {
+    ...view,
+    /** Move the SAME instance to another chat and/or project. */
+    moveTo: (next) => {
+      Object.assign(at, next)
+      view.rerender(tree())
+    },
+    /** Re-render at the SAME identity — the no-op move an identity assertion needs. */
+    rerenderSame: () => view.rerender(tree()),
+  }
 }
