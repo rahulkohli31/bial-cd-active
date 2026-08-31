@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
@@ -2118,7 +2119,19 @@ class SessionManager:
         The snapshot gate stays ABOVE both arms and above the commit, unmoved: a project with
         nothing saved is a 404 whether or not a container happens to be up, and that answer
         must not persist the speculative DRAFT app row.
+
+        MEASURED HERE (R102/R103), and the placement of the first emit is the whole of the
+        denominator's honesty. `app_start_attempted` fires at ENTRY, above every refusal — the
+        one-slot conflict below, the reclaim refusal below that, and the nothing-to-restore 404
+        under both. Each of those is a press that could have started something and did not, and
+        R103 is "the difference between pressing the control and seeing the app"; excluding them
+        would make the ratio read flatteringly high, which is the one failure mode a measurement
+        cannot afford. The cost, stated: at this point no app is resolved yet
+        (`resolve_app_for_project` runs inside the user lock), so the attempted row carries no
+        `app_id`. A complete denominator is worth more than attribution on a row that only ever
+        means "someone pressed".
         """
+        await count(HarnessCounter.APP_START_ATTEMPTED)
         async with self._start_lock_for(user.id):
             redis = get_redis()
             user_id = user.id
@@ -2175,6 +2188,18 @@ class SessionManager:
                 # deploy still pays a full restore). All four fall through to the untouched
                 # restore arm below.
                 attached = False
+                # R102's clock, and its two instants are named because the plausible choices
+                # differ by tens of seconds. It starts when the RESTORE ARM IS ENTERED (below,
+                # in the `NoLiveSandboxError` handler — the attach attempt has just failed and
+                # the platform has decided to restore) and stops when `wait_ready` returns.
+                # Everything before that first instant — the slot check, the reclaim refusal, the
+                # lock wait, app resolution, the snapshot gate, the commit, the attach attempt
+                # itself — is OUTSIDE the number, because none of it is a citizen waiting for a
+                # container to come up. That is what makes the number quotable as "roughly how
+                # long a cold start takes", and it is why it is bounded by
+                # `_COLD_READY_BUDGET_SECONDS` rather than by the whole request.
+                cold_started_at: float | None = None
+                cold_elapsed_ms: int | None = None
                 try:
                     scope.handle = await self._attach_for_read(user_id, app_id, sandbox_client)
                     # Compensation must now spare this container: it was up before this
@@ -2182,6 +2207,9 @@ class SessionManager:
                     attached = True
                     scope.spare()
                 except NoLiveSandboxError:
+                    # THE COLD CLOCK STARTS HERE — see `cold_started_at` above for why this
+                    # instant and not function entry.
+                    cold_started_at = time.monotonic()
                     # The FIVE injected vars (the two always-present BIAL_* + the two blob
                     # coordinates with a freshly rotated SAS + the per-project DSN), exactly as
                     # a start's birth arm builds them. Deliberately written twice — this must
@@ -2282,6 +2310,12 @@ class SessionManager:
                             else _COLD_READY_BUDGET_SECONDS
                         ),
                     )
+                    # …AND IT STOPS HERE, on the statement after the wait returns, so the reading
+                    # is the restore-and-wait interval and nothing else. Only the cold arm ever
+                    # armed it: a 15-second attach budget and a 120-second cold budget averaged
+                    # together produce a number that describes neither.
+                    if cold_started_at is not None:
+                        cold_elapsed_ms = int((time.monotonic() - cold_started_at) * 1000)
                 except SandboxNotReadyError:
                     # R6, AND WE PAID FOR THIS ONE IN LOST WORK.
                     #
@@ -2363,6 +2397,15 @@ class SessionManager:
                 # as the heartbeat: a failure here tears the container down rather than
                 # leaving it running with no owner at all.
                 await grant_stay_of_execution(redis, user_id, writer=DeadlineWriter.BUILDER_ACTED)
+            # R103's numerator, and it fires ONLY on a verdict that proves a serving page. The
+            # attach arm now deliberately fails open and hands back a framable URL with
+            # `ready=False` (the SL-20 fix above); that is not a reached-running outcome, and
+            # counting it would make the ratio measure nothing. Written out here, after the lock
+            # scope has cleanly exited, because that is the point at which the start is a fact.
+            if ready:
+                await count(HarnessCounter.APP_START_REACHED_RUNNING, app_id=app_id)
+            if cold_elapsed_ms is not None:
+                await count(HarnessCounter.APP_COLD_START_MS, value=cold_elapsed_ms, app_id=app_id)
             return RelaunchedPreview(
                 app_id=app_id,
                 preview_url=preview_url,

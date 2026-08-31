@@ -3,6 +3,7 @@ fresh, READY sandbox (cookie auth + CSRF, owner-scoping, Decision-6 no-build-slo
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -22,8 +23,10 @@ from src.api.v1.build_sessions.deps import (
     sandbox_or_none_dependency,
 )
 from src.api.v1.build_sessions.schemas import BuildSessionStatus
+from src.db.base import async_session_factory
 from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import ConversationKind
+from src.db.models.harness_counter import HarnessCount, HarnessCounter
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.build_sessions.locks import lock_is_held
 from src.services.build_sessions.manager import app_name_for
@@ -35,6 +38,12 @@ from src.services.redis import (
 )
 from src.services.redis.keys import REGISTRY_FIELD_STATE
 from src.services.sandbox.aca import AcaControlPlane, AcaTransientError
+from src.services.sandbox.base import (
+    SandboxError,
+    SandboxGoneError,
+    SandboxHandle,
+    SandboxNotReadyError,
+)
 from src.services.sandbox.client import AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import recovery_key, snapshot_key
@@ -822,3 +831,239 @@ async def test_preview_state_is_owner_scoped(
         f"/v1/build-sessions/projects/{project.id}/preview-state", headers=auth_headers(stranger)
     )
     assert resp.status_code == 404
+
+
+# --- U2: what the start path records (R102, R103, R106) --------------------------------------
+#
+# R103 is "the difference between pressing the control and seeing the app", so the denominator
+# has to hold every press including the refused ones — which is what most of the scenarios below
+# are actually about. R102 is the cold arm's own clock, and the boundary test at the end is what
+# stops it quietly becoming "how long the whole request took".
+#
+# These rows escape the test transaction on purpose: `count(...)` owns its own session and
+# COMMITS, so a count survives a rolled-back transaction (the property
+# `tests/services/build_sessions/test_counters.py` pins). The consequence is that a test reading
+# them starts from a known-empty table rather than from a rollback that cannot reach them.
+
+
+async def _forget_every_count() -> None:
+    async with async_session_factory() as db:
+        await db.execute(sa.delete(HarnessCount))
+        await db.commit()
+
+
+@pytest.fixture
+async def counted() -> AsyncIterator[None]:
+    """An empty `harness_counts`, before and after. See the note above for why a rollback is not
+    enough."""
+    await _forget_every_count()
+    yield
+    await _forget_every_count()
+
+
+async def _counter_values(counter: HarnessCounter) -> list[int]:
+    """Every value recorded under one counter name. Read as columns, not ORM rows: the session
+    that read them is closed by the time the assertion runs."""
+    async with async_session_factory() as db:
+        rows = (
+            await db.execute(
+                sa.select(HarnessCount.value).where(HarnessCount.name == counter.value)
+            )
+        ).all()
+    return [int(v) for (v,) in rows]
+
+
+async def test_a_cold_relaunch_records_the_press_the_arrival_and_the_wait(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire, counted
+) -> None:
+    """The whole of R102/R103 on the happy path: one press, one arrival, one duration."""
+    user, project = await _user_project(db_session, "rl-count-cold@rvaiglobal.com")
+    await _seed_snapshot(db_session, user, project, fake_storage)
+
+    assert (await _relaunch(client, user, project)).status_code == 200
+
+    assert await _counter_values(HarnessCounter.APP_START_ATTEMPTED) == [1]
+    assert await _counter_values(HarnessCounter.APP_START_REACHED_RUNNING) == [1]
+    cold = await _counter_values(HarnessCounter.APP_COLD_START_MS)
+    assert len(cold) == 1
+    # Bounded by the cold budget it is measuring — a duration outside it is a clock reading
+    # something else entirely, which is the failure this number cannot survive.
+    assert 0 <= cold[0] < 120_000
+
+
+async def test_the_attach_arm_records_the_press_and_the_arrival_but_no_duration(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, aca_wire, counted
+) -> None:
+    """★ A 15-second attach budget and a 120-second cold budget averaged together produce a
+    number that describes neither, so only the restore arm writes a duration.
+
+    Two presses: the first is genuinely cold, the second attaches to what it left up (the same
+    shape `…touches_no_aca_lifecycle` pins). Both are starts from the citizen's side, so both
+    land in the pair — and there is still exactly ONE duration."""
+    user, project = await _user_project(db_session, "rl-count-attach@rvaiglobal.com")
+    await _seed_snapshot(db_session, user, project, fake_storage)
+
+    assert (await _relaunch(client, user, project)).status_code == 200
+    assert (await _relaunch(client, user, project)).status_code == 200
+
+    assert len(await _counter_values(HarnessCounter.APP_START_ATTEMPTED)) == 2
+    assert len(await _counter_values(HarnessCounter.APP_START_REACHED_RUNNING)) == 2
+    assert len(await _counter_values(HarnessCounter.APP_COLD_START_MS)) == 1
+
+
+async def test_an_attach_that_fails_open_unready_is_a_press_that_never_arrived(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire, counted
+) -> None:
+    """★ THE MUTANT THIS EXISTS FOR. The attach arm deliberately fails open and hands back a
+    framable URL with `ready=False` (the SL-20 fix). That is not a running app, and an emit that
+    fired unconditionally beside the response would make R103 measure nothing at all.
+
+    Mutation check: move the reached-running emit out from under `if ready:` and this goes red.
+    """
+    user, project = await _user_project(db_session, "rl-count-unready@rvaiglobal.com")
+    app_id = await _seed_snapshot(db_session, user, project, fake_storage)
+
+    # One cold relaunch to leave a container up and a registry naming THIS app…
+    assert (await _relaunch(client, user, project)).status_code == 200
+    # …then attach to it, with a dev server that never comes back ready.
+    wire.sbx.attach_handle = SandboxHandle(
+        fqdn="live.example",
+        token="tok",
+        app_name=app_name_for(app_id),
+        preview_url="https://live.example",
+        ready=True,
+    )
+
+    async def the_dev_server_never_answers(handle, *, timeout_s: float = 120.0):
+        raise SandboxNotReadyError("the app root never served")
+
+    wire.sbx.wait_ready = the_dev_server_never_answers
+
+    assert (await _relaunch(client, user, project)).status_code == 200  # fails OPEN, not 503
+
+    assert len(await _counter_values(HarnessCounter.APP_START_ATTEMPTED)) == 2
+    assert len(await _counter_values(HarnessCounter.APP_START_REACHED_RUNNING)) == 1
+    assert len(await _counter_values(HarnessCounter.APP_COLD_START_MS)) == 1
+
+
+async def test_a_press_refused_by_the_one_slot_conflict_still_counts_as_a_press(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire, counted
+) -> None:
+    """★ ONE OF THE TWO REFUSALS THAT SIT ABOVE THE 404 GATE, and the reason the emit is at
+    function entry rather than after it. A live build owns the one-per-user slot; the citizen
+    pressed the control and did not see their app, which is exactly what R103 measures.
+
+    Mutation check: move the attempted emit below the snapshot gate and this goes red."""
+    brain = BlockingBrain()
+    wire.app.dependency_overrides[run_build_dependency] = lambda: brain
+    user, project = await _user_project(db_session, "rl-count-409@rvaiglobal.com")
+    await _seed_snapshot(db_session, user, project, fake_storage)
+
+    started = await client.post(
+        "/v1/build-sessions",
+        json={"projectId": str(project.id), "prompt": "build it"},
+        headers=auth_headers(user),
+    )
+    assert started.status_code == 201
+
+    assert (await _relaunch(client, user, project)).status_code == 409
+
+    assert await _counter_values(HarnessCounter.APP_START_ATTEMPTED) == [1]
+    assert await _counter_values(HarnessCounter.APP_START_REACHED_RUNNING) == []
+    assert await _counter_values(HarnessCounter.APP_COLD_START_MS) == []
+
+    brain.release()
+    await drain(wire.manager, started.json()["sessionId"])
+
+
+async def test_a_press_refused_because_reclaiming_would_destroy_work_still_counts(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, aca_wire, counted
+) -> None:
+    """★ THE OTHER REFUSAL ABOVE THE 404 GATE (#83). Project A holds the one container and it is
+    holding unsaved work, so B's press is refused rather than reclaiming it — a press that could
+    have started something and did not."""
+    user, project_a = await _user_project(db_session, "rl-count-reclaim@rvaiglobal.com")
+    project_b = await ProjectFactory.create(db_session, user.id)
+    app_a = await _seed_snapshot(db_session, user, project_a, fake_storage)
+    await _seed_snapshot(db_session, user, project_b, fake_storage)
+    await _seed_worked_on(fake_storage, app_a)
+
+    assert (await _relaunch(client, user, project_a)).status_code == 200
+    assert (await _relaunch(client, user, project_b)).status_code == 409
+
+    assert len(await _counter_values(HarnessCounter.APP_START_ATTEMPTED)) == 2
+    assert len(await _counter_values(HarnessCounter.APP_START_REACHED_RUNNING)) == 1
+    assert len(await _counter_values(HarnessCounter.APP_COLD_START_MS)) == 1
+
+
+async def test_a_press_with_nothing_to_restore_still_counts_as_a_press(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire, counted
+) -> None:
+    """The 404 gate. A never-built project has nothing to relaunch, and the citizen still
+    pressed."""
+    user, project = await _user_project(db_session, "rl-count-404@rvaiglobal.com")
+
+    assert (await _relaunch(client, user, project)).status_code == 404
+
+    assert await _counter_values(HarnessCounter.APP_START_ATTEMPTED) == [1]
+    assert await _counter_values(HarnessCounter.APP_START_REACHED_RUNNING) == []
+    assert await _counter_values(HarnessCounter.APP_COLD_START_MS) == []
+
+
+async def test_a_relaunch_that_dies_after_the_arm_is_chosen_records_no_arrival(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire, counted
+) -> None:
+    """A failure past the point where the cold clock started: the press is in the denominator,
+    nothing is in the numerator, and — because the arm never reached `wait_ready` — no duration
+    is written for a wait that never finished."""
+    user, project = await _user_project(db_session, "rl-count-dies@rvaiglobal.com")
+    await _seed_snapshot(db_session, user, project, fake_storage)
+
+    async def the_dev_server_will_not_start(handle, *, cmd=None, cwd=None) -> int:
+        raise SandboxError("supervisor refused /dev/start")
+
+    wire.sbx.dev_start = the_dev_server_will_not_start
+
+    assert (await _relaunch(client, user, project)).status_code != 200
+
+    assert await _counter_values(HarnessCounter.APP_START_ATTEMPTED) == [1]
+    assert await _counter_values(HarnessCounter.APP_START_REACHED_RUNNING) == []
+    assert await _counter_values(HarnessCounter.APP_COLD_START_MS) == []
+
+
+async def test_the_cold_clock_times_the_restore_not_the_whole_request(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire, counted
+) -> None:
+    """★ THE CLOCK'S BOUNDARY, and the reason both instants are named in the method's docstring.
+
+    Everything before the restore arm is entered — the slot check, the reclaim refusal, the lock
+    wait, app resolution, the snapshot gate, the commit, and THE ATTACH ATTEMPT ITSELF — is
+    outside the number, because none of it is a citizen waiting for a container to come up. Here
+    the attach attempt is made to take a full second before it gives up; the recorded duration
+    must not contain it.
+
+    Mutation check: move the clock's start to function entry and this goes red."""
+    user, project = await _user_project(db_session, "rl-count-boundary@rvaiglobal.com")
+    await _seed_snapshot(db_session, user, project, fake_storage)
+
+    # A first cold relaunch, so the registry names this app and the attach attempt below is
+    # actually MADE rather than skipped by the registry check.
+    assert (await _relaunch(client, user, project)).status_code == 200
+    await _forget_every_count()
+
+    slow_attach_seconds = 1.0
+
+    async def a_slow_goodbye(user_id: str):
+        await asyncio.sleep(slow_attach_seconds)
+        raise SandboxGoneError("took a while to be sure it is gone")
+
+    wire.sbx.attach_existing = a_slow_goodbye
+
+    assert (await _relaunch(client, user, project)).status_code == 200
+
+    cold = await _counter_values(HarnessCounter.APP_COLD_START_MS)
+    assert len(cold) == 1
+    assert cold[0] < slow_attach_seconds * 1000 / 2, (
+        f"{cold[0]}ms contains the {slow_attach_seconds}s attach attempt — the clock is timing "
+        "the request, not the restore"
+    )
