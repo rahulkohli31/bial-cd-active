@@ -27,6 +27,12 @@ import { act, fireEvent, screen, render, waitFor } from '@testing-library/react'
 import { expect } from 'vitest'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import BuilderPage from '../BuilderPage'
+// THE REAL SHELL, not a stub, and both helpers below mount the page THROUGH it as a layout route.
+// After the extraction the surface is an outlet child rather than a root: it renders no page frame
+// and no navbar, and — from U4 — no pane of its own. A harness that kept mounting it bare would
+// leave every preview assertion in fifteen suites asserting against something the product does not
+// render, which is the failure mode a stub cannot show you.
+import WorkspaceShell from '../../components/workspace/WorkspaceShell'
 
 export { FakeEventSource } from '../../utils/buildSessionMock'
 
@@ -224,7 +230,9 @@ export function renderBuilder({ deps, projectId = 'p1', hasSavedBuild = null, in
   return render(
     <MemoryRouter initialEntries={initialEntries}>
       <Routes>
-        <Route path="/chat/:chatId" element={<BuilderPage projectId={projectId} projectName="VIP Movement" projectHasSavedBuild={hasSavedBuild} buildSessionDeps={deps} />} />
+        <Route element={<WorkspaceShell />}>
+          <Route path="/chat/:chatId" element={<BuilderPage projectId={projectId} projectName="VIP Movement" projectHasSavedBuild={hasSavedBuild} buildSessionDeps={deps} />} />
+        </Route>
         <Route path="/projects" element={<div>projects index</div>} />
         <Route path="/projects/:pid" element={<div>project page</div>} />
       </Routes>
@@ -288,18 +296,20 @@ export function renderBuilderAt({
   const tree = () => (
     <MemoryRouter initialEntries={['/chat/routed']}>
       <Routes>
-        <Route
-          path="/chat/:chatId"
-          element={
-            <BuilderPage
-              chatId={at.chatId}
-              projectId={at.projectId}
-              projectName={at.projectName}
-              projectHasSavedBuild={hasSavedBuild}
-              buildSessionDeps={deps}
-            />
-          }
-        />
+        <Route element={<WorkspaceShell />}>
+          <Route
+            path="/chat/:chatId"
+            element={
+              <BuilderPage
+                chatId={at.chatId}
+                projectId={at.projectId}
+                projectName={at.projectName}
+                projectHasSavedBuild={hasSavedBuild}
+                buildSessionDeps={deps}
+              />
+            }
+          />
+        </Route>
         <Route path="/projects" element={<div>projects index</div>} />
         <Route path="/projects/:pid" element={<div>project page</div>} />
       </Routes>

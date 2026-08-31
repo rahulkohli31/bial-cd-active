@@ -4,7 +4,6 @@ import {
   Send, Sparkles, User, Paperclip, FileText, FileSpreadsheet, Presentation, X,
   CheckCircle2, XCircle, ExternalLink, PanelLeftOpen, PanelLeftClose,
 } from 'lucide-react'
-import Navbar from '../components/layout/Navbar'
 import LivePreview from '../components/LivePreview'
 import PublishButton from '../components/PublishButton'
 import BuildProgress, { hasBuildNarrative, StepHistoryCollapsible } from '../components/chat/BuildProgress'
@@ -22,6 +21,7 @@ import { markAppVisible } from '../utils/observe'
 import { describeSaveFailure, describeModeSwitchFailure, isConversationGone } from '../utils/chatErrors'
 import { readDraft, writeDraft, clearDraft } from '../utils/composerDraft'
 import { resolvePreviewAddress } from '../utils/previewAddress'
+import { usePublishReclaim } from '../components/workspace/workspaceChannel'
 import { notifyUsageChanged } from '../utils/usage'
 import { createBuildLock, openBuildLockChannel } from '../utils/buildLock'
 import type { BuildLock } from '../utils/buildLock'
@@ -41,7 +41,6 @@ import { narrativeEnvelopes, narrativeStatus } from '../utils/turnNarrative'
 import type { TurnNarrative } from '../utils/turnNarrative'
 import { fetchSaveState, saveProject, releaseProject, stopActiveBuild, asReclaimBlocked, fetchPreviewState, fetchCompileState, checkWorkspace } from '../utils/buildSessionApi'
 import type { ReclaimBlocked, PreviewState, PreviewLifeState } from '../utils/buildSessionApi'
-import ReclaimWorkspaceDialog from '../components/projects/ReclaimWorkspaceDialog'
 import { PlanOptionsCard } from '../components/chat/PlanOptionsCard'
 import { ModeSwitcher } from '../components/chat/ModeSwitcher'
 import { wireMessageFromParts, buildUserParts, partsToText, attachmentsFromParts, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
@@ -2141,6 +2140,20 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     setReclaim(null)
   }
 
+  // The dialog itself is mounted by the shell, so a refusal has somewhere to appear that is not
+  // owned by whichever surface happened to make the call. Only the OPEN STATE travels; the
+  // classification (`captureReclaim` above) and every handler stay here, because they are this
+  // surface's knowledge and a second classifier is how a refusal loses its one authority.
+  usePublishReclaim(
+    useMemo(
+      () => (reclaim ? { blocked: reclaim.blocked, resolve: resolveReclaim, cancel: () => setReclaim(null) } : null),
+      // `resolveReclaim` is redefined every render and is not worth memoising on its own — it
+      // reads `reclaim` directly. Keyed on the refusal itself, which is what the dialog renders.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      [reclaim],
+    ),
+  )
+
   const handleRelaunch = () => {
     if (!projectId) return
     // Stamp the project so the relaunch surfaces (Restoring…, the framed URL, its errors) render:
@@ -2174,18 +2187,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   )
 
   return (
-    <div className="h-screen flex flex-col font-manrope bg-bial-bg overflow-hidden">
-      {reclaim ? (
-        <ReclaimWorkspaceDialog
-          blocked={reclaim.blocked}
-          onSaveAndSwitch={() => resolveReclaim(true)}
-          onSwitchAnyway={() => resolveReclaim(false)}
-          onCancel={() => setReclaim(null)}
-        />
-      ) : null}
-      <Navbar />
-
-      <div className="flex flex-1 overflow-hidden">
+    // NO PAGE FRAME AND NO NAVBAR. Both belong to the workspace shell now, which is what lets this
+    // surface be replaced by another without the app pane going with it. The reclaim dialog moved
+    // there too — its open state is published above, its classification stayed here.
+    <>
+      <div className="flex flex-1 min-h-0 overflow-hidden">
         {/* Chat panel — stays mounted when collapsed (CSS width:0), so the composer draft and
             scroll position survive a hide/show cycle rather than resetting on remount.
             `invisible` (not just `w-0 overflow-hidden`) is load-bearing: zero width and
@@ -2639,6 +2645,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       {viewer && (
         <AttachmentLightbox name={viewer.name} src={viewer.src} onClose={() => setViewer(null)} />
       )}
-    </div>
+    </>
   )
 }

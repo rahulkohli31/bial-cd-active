@@ -8,6 +8,7 @@ import ChatRoute from './pages/ChatRoute'
 import MarketplacePage from './pages/MarketplacePage'
 import ProjectsPage from './pages/ProjectsPage'
 import ProjectPage from './pages/ProjectPage'
+import WorkspaceShell from './components/workspace/WorkspaceShell'
 import { isAuthenticated, bootstrapSession } from './utils/auth'
 
 // Full-screen silent-refresh spinner. Reuses the app's inline-SVG animate-spin
@@ -80,15 +81,29 @@ export default function App() {
         <Route path="/projects" element={<RequireAuth><ProjectsPage /></RequireAuth>} />
         {/* Cross-user by design (#145): every signed-in BIAL user sees the same catalog. */}
         <Route path="/marketplace" element={<RequireAuth><MarketplacePage /></RequireAuth>} />
-        <Route path="/projects/:projectId" element={<RequireAuth><ProjectPage /></RequireAuth>} />
+        {/* THE WORKSPACE. A pathless layout route wrapping both addresses inside a project, so
+            the shell — and above all the running app it holds — is preserved across a move
+            between them: React Router renders the same layout element at the same position
+            through a sibling route change, and only the outlet content is replaced.
 
-        {/* One flat chat URL for both kinds. ChatRoute reads the conversation's `kind`
-            and renders ChatPage (planning) or BuilderPage (builder). The project is a
-            breadcrumb resolved from the chat, never a path segment.
-            NOTE: `/apps/:appId` is deliberately NOT a route here — nginx proxies /apps/
-            to the backend runner, and the Vite dev proxy does not, so an SPA route there
-            would work locally and 404 in the deployed container. */}
-        <Route path="/chat/:chatId" element={<RequireAuth><ChatRoute /></RequireAuth>} />
+            THE URLS DO NOT NEST. `/projects/:projectId` and `/chat/:chatId` keep the flat
+            addressing they have; the layout route adds a shared frame, not a path segment.
+
+            THE AUTH WRAPPER IS ABOVE THE SHELL, not around each child. `RequireAuth` is a
+            component re-run per `location.key`, so one instance here is one guard for the whole
+            workspace rather than one per address re-running its effect on every move between
+            them.
+
+            NOTE: `/apps/:appId` is deliberately NOT a route here, and deliberately not part of
+            this layout — nginx proxies /apps/ to the backend runner, and the Vite dev proxy does
+            not, so an SPA route there would work locally and 404 in the deployed container. */}
+        <Route element={<RequireAuth><WorkspaceShell /></RequireAuth>}>
+          <Route path="/projects/:projectId" element={<ProjectPage />} />
+          {/* One flat chat URL for both kinds. ChatRoute reads the conversation's `kind` and
+              renders ChatPage (planning) or BuilderPage (builder). The project is a breadcrumb
+              resolved from the chat, never a path segment. */}
+          <Route path="/chat/:chatId" element={<ChatRoute />} />
+        </Route>
 
         <Route path="/help" element={<RequireAuth><HelpPage /></RequireAuth>} />
         <Route path="/admin" element={<RequireAuth><AdminPage /></RequireAuth>} />

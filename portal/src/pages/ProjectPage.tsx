@@ -32,7 +32,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { ArrowLeft, Pencil, Check, X, MoreVertical } from 'lucide-react'
-import Navbar from '../components/layout/Navbar'
 import { Badge } from '../components/ui/badge'
 import ProjectBuilder from '../components/projects/ProjectBuilder'
 import ProjectDescriptionEditor from '../components/projects/ProjectDescriptionEditor'
@@ -201,21 +200,19 @@ export default function ProjectPage() {
 
   if (loading) {
     return (
-      <div className="min-h-screen font-manrope flex flex-col bg-bial-bg">
-        <Navbar />
-        <main className="flex-1 max-w-6xl mx-auto w-full px-6 py-10">
+      <main className="flex-1 min-h-0 overflow-y-auto">
+        <div className="max-w-6xl mx-auto w-full px-6 py-10">
           <div className="h-6 w-48 bg-gray-100 rounded animate-pulse mb-4" />
           <div className="h-24 bg-gray-100 rounded-2xl animate-pulse" />
-        </main>
-      </div>
+        </div>
+      </main>
     )
   }
 
   if (loadError || !project) {
     return (
-      <div className="min-h-screen font-manrope flex flex-col bg-bial-bg">
-        <Navbar />
-        <main className="flex-1 max-w-6xl mx-auto w-full px-6 py-10">
+      <main className="flex-1 min-h-0 overflow-y-auto">
+        <div className="max-w-6xl mx-auto w-full px-6 py-10">
           <button
             onClick={goToProjects}
             className="flex items-center gap-1 text-sm text-neutral hover:text-primary transition mb-4"
@@ -226,15 +223,18 @@ export default function ProjectPage() {
             <p className="text-sm font-semibold text-tertiary">Couldn’t load this project</p>
             <p className="text-xs text-neutral mt-1">{loadError || 'It may have been deleted.'}</p>
           </div>
-        </main>
-      </div>
+        </div>
+      </main>
     )
   }
 
   return (
-    <div className="min-h-screen font-manrope flex flex-col bg-bial-bg">
-      <Navbar />
-      <main className="flex-1 max-w-6xl mx-auto w-full px-6 py-10">
+    // AN OUTLET CHILD, NOT A ROOT. The page frame and the navbar belong to the workspace shell,
+    // which is a full-height frame with no document scroll — so this surface declares its OWN
+    // scroller. That also re-bases the description rail below: sticky resolves against the
+    // nearest scroll container, and the container has moved.
+    <main className="flex-1 min-h-0 overflow-y-auto">
+      <div className="max-w-6xl mx-auto w-full px-6 py-10">
         <button
           onClick={goToProjects}
           className="flex items-center gap-1 text-sm text-neutral hover:text-primary transition mb-4"
@@ -395,7 +395,12 @@ export default function ProjectPage() {
               "View app" preview is HIDDEN in Phase-1 — a stored app is not a running sandbox, so
               there is nothing live to frame here until Track DEPLOY provides a deployed app URL.
               The live preview now comes only from a per-session C3 build in the builder. */}
-          <aside data-testid="description-rail" className="lg:sticky lg:top-20 self-start space-y-4">
+          {/* RE-BASED, not left alone. Sticky resolves against the nearest SCROLL CONTAINER, and
+              this page's is now its own `<main>` rather than the document — so the old `top-20`,
+              which was the navbar's 56px plus a 24px gap measured from the viewport, would leave
+              an 80px hole below a navbar that is no longer inside anything this rail can see.
+              `top-6` is the same 24px gap, measured from the container that now exists. */}
+          <aside data-testid="description-rail" className="lg:sticky lg:top-6 self-start space-y-4">
             <div className="bg-white border border-bial-border rounded-2xl p-5">
               <ProjectDescriptionEditor
                 projectId={project.id}
@@ -412,7 +417,7 @@ export default function ProjectPage() {
             {project.appId && <SubmitControl projectId={project.id} />}
           </aside>
         </div>
-      </main>
-    </div>
+      </div>
+    </main>
   )
 }

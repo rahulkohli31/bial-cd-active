@@ -4,7 +4,6 @@ import { useNavigate, useParams, useLocation } from 'react-router-dom'
 import { AssistantRuntimeProvider, ComposerPrimitive, useExternalStoreRuntime, useAuiState } from '@assistant-ui/react'
 import type { ThreadMessage, AppendMessage } from '@assistant-ui/react'
 import { Sparkles, User, Send, Plus, MessageSquare, Trash2, Hammer, Paperclip, X, FileText, FileSpreadsheet, Presentation } from 'lucide-react'
-import Navbar from '../components/layout/Navbar'
 import MessageContent from '../components/chat/MessageContent'
 import AttachmentLightbox from '../components/AttachmentLightbox'
 import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
@@ -636,10 +635,12 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   }, [builderPrompt, navigate, projectId])
 
   return (
-    <div className="h-screen overflow-hidden bg-bial-bg font-manrope flex flex-col">
-      <Navbar />
-
-      <div className="flex flex-1 overflow-hidden" style={{ height: 'calc(100vh - 56px)' }}>
+    // NO PAGE FRAME, NO NAVBAR, AND NO VIEWPORT ARITHMETIC. All three belong to the workspace
+    // shell now. The `calc(100vh - 56px)` that used to sit here was the codebase's only one — the
+    // navbar's `h-14` transcribed into a second file, one Tailwind edit away from a scrollbar
+    // nobody could explain. It dies here rather than being copied into a third place.
+    <>
+      <div className="flex flex-1 min-h-0 overflow-hidden">
         {/* Sidebar */}
         <aside className="w-64 flex-shrink-0 bg-white border-r border-bial-border flex flex-col overflow-hidden">
           <div className="p-3 border-b border-bial-border">
@@ -1054,7 +1055,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
           </div>
         </div>
       )}
-    </div>
+    </>
   )
 }
 
