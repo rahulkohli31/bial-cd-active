@@ -49,14 +49,9 @@ vi.mock('../BuilderPage', () => ({
 }))
 
 import ChatRoute from '../ChatRoute'
+import { beaconsFrom } from './_observeBeacons'
 import { markProjectOpened } from '../../utils/observe'
 
-/** The observation bodies this render actually posted, in order. */
-function beacons(): unknown[] {
-  return h.authFetch.mock.calls
-    .filter(([url]) => url === '/api/observations')
-    .map(([, opts]) => JSON.parse(String(opts.body)))
-}
 
 /**
  * `state` is the freshly-minted marker's carrier. Entries without one stay plain strings so the
@@ -90,6 +85,9 @@ beforeEach(() => {
   h.getProject.mockResolvedValue({ id: 'p1', name: 'VIP Movement', description: null, appId: null, appStatus: null, createdAt: '', updatedAt: '' })
 })
 afterEach(() => cleanup())
+
+/** The observation bodies this render posted — see `_observeBeacons` for the mock contract. */
+const beacons = () => beaconsFrom(h.authFetch)
 
 describe('ChatRoute — kind dispatch', () => {
   it('renders ChatPage for a planning conversation', async () => {

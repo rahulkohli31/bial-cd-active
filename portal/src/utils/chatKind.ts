@@ -11,9 +11,14 @@
  * is about to click — and not "Assistant", which is a schema word, not a product word. "Chat" is
  * true of every value this field can carry, including ones that do not exist yet.
  *
- * THIS IS THE SINGLE FRONTEND SOURCE of what a kind is CALLED (R73). Every surface that names a
- * kind — the history list, the composer, the help page — reads it from here; nothing states the
- * kinds in its own words. Narrowing or renaming the vocabulary is an edit to this table.
+ * THIS IS THE SINGLE FRONTEND SOURCE of what a kind is CALLED (R73) — and today it has exactly
+ * ONE reader, the project page's chat list. Said plainly rather than as an aspiration, because
+ * two surfaces still spell the words themselves: the composer's mode chooser
+ * (`components/chat/ModeSwitcher.tsx`, a different axis — ask/plan/write, not the stored kind)
+ * and the help page's prose. Both are named deferrals, not oversights: the picker is out of this
+ * work's scope, and the help-page copy rides the release that narrows attachments. When they do
+ * come, they read from here rather than restating. Narrowing or renaming the vocabulary is an
+ * edit to this table.
  *
  * `kind` arrives as a plain `string` (`conversationApi` types it that way, and `ProjectPage`'s
  * `narrowChat` legitimately coerces a malformed row's kind to `''`), so the lookup is keyed on a
@@ -24,8 +29,14 @@ import { MessageSquare, Wrench, type LucideIcon } from 'lucide-react'
 export interface ChatKindPresentation {
   /** The word on the badge — what a citizen reads. Never the storage value (`builder`). */
   word: string
-  /** The badge's COMPLETE text, so a screen reader says "Build chat" and not a bare noun. */
-  phrase: string
+  /**
+   * The rest of the badge's text, shown to a screen reader but not to the eye, so the element
+   * reads as a phrase ("Build chat") and not as a bare noun. Stored rather than sliced off a
+   * separate `phrase` field: a derivation would carry an unchecked invariant (that the phrase
+   * starts with the word), and editing one half without the other would silently produce wrong
+   * screen-reader text with nothing to catch it.
+   */
+  completion: string
   Icon: LucideIcon
   /** The icon plate's background tint. */
   tint: string
@@ -36,15 +47,17 @@ export interface ChatKindPresentation {
 /** One record per kind the API can send. Keyed on the wire value, not on a display name. */
 export const CHAT_KINDS: Readonly<Record<string, ChatKindPresentation>> = {
   builder: {
+    // "Build chat"
     word: 'Build',
-    phrase: 'Build chat',
+    completion: ' chat',
     Icon: Wrench,
     tint: 'bg-secondary/10',
     iconTint: 'text-secondary',
   },
   planning: {
+    // "Plan chat"
     word: 'Plan',
-    phrase: 'Plan chat',
+    completion: ' chat',
     Icon: MessageSquare,
     tint: 'bg-primary/10',
     iconTint: 'text-primary',
@@ -53,11 +66,11 @@ export const CHAT_KINDS: Readonly<Record<string, ChatKindPresentation>> = {
 
 /**
  * The named fallback: `assistant`, `''`, and any value this vocabulary does not have yet. Its
- * phrase is its word, so the badge has no hidden half to read out.
+ * word is the whole phrase, so the badge has no hidden half to read out.
  */
 export const UNKNOWN_CHAT_KIND: ChatKindPresentation = {
   word: 'Chat',
-  phrase: 'Chat',
+  completion: '',
   Icon: MessageSquare,
   tint: 'bg-neutral/10',
   iconTint: 'text-neutral',

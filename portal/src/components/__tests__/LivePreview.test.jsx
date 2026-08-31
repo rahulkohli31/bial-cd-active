@@ -16,6 +16,11 @@ function setup(props = {}) {
   return { ...view, iframe }
 }
 
+/** The device card that carries the reveal's opacity — the handle every reveal assertion uses. */
+function card(container) {
+  return container.querySelector('[data-testid="device-card"]')
+}
+
 // A message that passes BOTH halves of the C8 §3 guard: the sandbox origin AND the window of the
 // frame this pane actually rendered. Origin alone stopped being sufficient once every generated
 // app began sharing one hostname, so `source` is no longer optional decoration on these events.
@@ -543,10 +548,6 @@ describe('LivePreview — dev-server crash: reconnecting is distinct from buildi
 const FRAME_LOAD_CAP_MS = 20000 // mirrors LivePreview's own cap; the tests step over it deliberately
 
 describe('LivePreview — R104\u2019s stop-clock: `onRevealed` (U4)', () => {
-  function card(container) {
-    return container.querySelector('[data-testid="device-card"]')
-  }
-
   it('\u2605 fires when the citizen is actually LOOKING at the app, and not a moment before', () => {
     // The mark has to mean "the app is on screen". A `load` alone does not: it fires for a 500,
     // and it fires under a raised cover. Only `revealed` \u2014 frame loaded AND cover down \u2014 is the
@@ -611,10 +612,6 @@ describe('LivePreview — R104\u2019s stop-clock: `onRevealed` (U4)', () => {
 })
 
 describe('LivePreview — the frame is revealed on load, never on a timer (U5/R3)', () => {
-  function card(container) {
-    return container.querySelector('[data-testid="device-card"]')
-  }
-
   it('keeps the labelled wait up when previewUrl arrives, and swaps it for the frame on load', () => {
     const { container } = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" />)
     const iframe = container.querySelector('iframe')

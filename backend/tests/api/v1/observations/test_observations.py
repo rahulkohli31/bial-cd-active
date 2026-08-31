@@ -12,8 +12,6 @@ cannot reach these rows.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-
 import pytest
 import sqlalchemy as sa
 from httpx import AsyncClient
@@ -38,17 +36,9 @@ def _headers(user: User, *, with_csrf: bool = True) -> dict[str, str]:
     return {"Cookie": f"session={jwt}; csrf={csrf}", "X-CSRF-Token": csrf}
 
 
-async def _forget_every_count() -> None:
-    async with async_session_factory() as db:
-        await db.execute(sa.delete(HarnessCount))
-        await db.commit()
-
-
 @pytest.fixture(autouse=True)
-async def _empty_counts() -> AsyncIterator[None]:
-    await _forget_every_count()
-    yield
-    await _forget_every_count()
+async def _empty_counts(empty_harness_counts: None) -> None:
+    """Every test in this file starts from an empty table — see `tests/conftest.py`."""
 
 
 async def _rows() -> list[tuple[str, int, object, object]]:

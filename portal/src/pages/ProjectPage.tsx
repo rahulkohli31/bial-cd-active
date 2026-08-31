@@ -310,11 +310,6 @@ export default function ProjectPage() {
                     // One lookup, not a two-way test on a three-valued field: an `assistant`
                     // row used to draw the Plan icon, which a word cannot get away with.
                     const kind = chatKindFor(chat.kind)
-                    // The half of the phrase the badge keeps but does not show, so the screen
-                    // reads "Build" and the element's text reads "Build chat". An `aria-label`
-                    // on a role-less span is not reliably exposed — it would satisfy a test and
-                    // help nobody — so the accessible name is built from text.
-                    const kindCompletion = kind.phrase.slice(kind.word.length)
                     const menuOpen = menuOpenId === chat.id
                     return (
                       // F-10: the row is a plain container. The title is a real <button> whose
@@ -342,8 +337,12 @@ export default function ProjectPage() {
                         {/* F-10 again: a SIBLING of the title button, never a descendant —
                             the same layering rule the ⋮ menu below follows. */}
                         <Badge variant="outline" className="flex-shrink-0 border-bial-border bg-white">
+                          {/* The word is shown; the completion is read but not seen, so the
+                              screen says "Build" and the element's text says "Build chat". An
+                              `aria-label` on a role-less span is not reliably exposed — it would
+                              satisfy a test and help nobody — so the name is built from text. */}
                           {kind.word}
-                          {kindCompletion && <span className="sr-only">{kindCompletion}</span>}
+                          {kind.completion && <span className="sr-only">{kind.completion}</span>}
                         </Badge>
                         <span className="text-[11px] text-neutral flex-shrink-0 tabular-nums">
                           {relativeTime(chat.updatedAt)}

@@ -53,7 +53,7 @@ from src.api.deps_csrf import RequireCsrf
 from src.api.v1.observations.schemas import ObservationRequest
 from src.core.errors import AppApiError
 from src.db.models.harness_counter import HarnessCounter
-from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses
+from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses, raw_body_doc
 from src.services.build_sessions.counters import count
 from src.services.ratelimit import rate_limit
 
@@ -61,12 +61,7 @@ router = APIRouter(prefix="/observations", tags=["observations"])
 
 # The raw-parse route takes a JSON body FastAPI never sees (no Pydantic param), so its request
 # shape is documented explicitly from the model — without enabling the 422 path.
-_REQUEST_BODY_DOC: dict[str, Any] = {
-    "requestBody": {
-        "required": True,
-        "content": {"application/json": {"schema": ObservationRequest.model_json_schema()}},
-    }
-}
+_REQUEST_BODY_DOC = raw_body_doc(ObservationRequest)
 
 # The longest a first view of an app can honestly take, in milliseconds.
 #

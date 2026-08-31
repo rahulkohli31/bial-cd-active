@@ -18,3 +18,4 @@ from src.schemas.responses import DetailBody as DetailBody
 from src.schemas.responses import ErrorEnvelope as ErrorEnvelope
 from src.schemas.responses import OkResponse as OkResponse
 from src.schemas.responses import error_responses as error_responses
+from src.schemas.responses import raw_body_doc as raw_body_doc

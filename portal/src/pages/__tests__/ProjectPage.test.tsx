@@ -33,6 +33,7 @@ import { render, screen, fireEvent, waitFor, cleanup, within } from '@testing-li
 import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
 import ProjectPage from '../ProjectPage'
 import { ApiError } from '../../utils/apiError'
+import { beaconsFrom } from './_observeBeacons'
 import type { Project } from '../../utils/projectApi'
 
 const h = vi.hoisted(() => ({
@@ -104,16 +105,13 @@ beforeEach(() => {
   h.listProjectConversations.mockResolvedValue([])
 })
 
-/** The observation bodies this render actually posted, in order. */
-function beacons(): unknown[] {
-  return h.authFetch.mock.calls
-    .filter(([url]) => url === '/api/observations')
-    .map(([, opts]) => JSON.parse(String(opts.body)))
-}
 afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
 })
+
+/** The observation bodies this render posted — see `_observeBeacons` for the mock contract. */
+const beacons = () => beaconsFrom(h.authFetch)
 
 describe('ProjectPage — the builder is unconditional', () => {
   it('no-app project: renders the builder (composer), recents, and the description rail — no app affordances', async () => {

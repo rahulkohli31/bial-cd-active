@@ -122,3 +122,24 @@ def error_responses(
             raise ValueError(f"duplicate status {code} in error_responses()")
         responses[code] = {"model": model, "description": description}
     return responses
+
+
+def raw_body_doc(model: type[BaseModel]) -> dict[str, Any]:
+    """The `openapi_extra=` entry documenting a RAW-PARSED request body from its model.
+
+    A route that parses `await request.json()` itself — so that a malformed body renders the
+    data-plane `{"error": {...}}` envelope instead of FastAPI's `422 {"detail": [...]}` — declares
+    no Pydantic body parameter, and FastAPI therefore documents no request body at all. This puts
+    the shape back in the schema WITHOUT re-enabling the 422 path, which is the whole reason the
+    body is parsed by hand.
+
+    Shared rather than copied because it is the same six lines at every such route, and a schema
+    entry that drifts between two of them is a lie in exactly the document people read to learn
+    the contract.
+    """
+    return {
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": model.model_json_schema()}},
+        }
+    }

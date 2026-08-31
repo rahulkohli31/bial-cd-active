@@ -53,6 +53,7 @@ from tests.api.v1.build_sessions.conftest import (
     drain,
     seed_live_sandbox_state,
 )
+from tests.conftest import forget_every_harness_count
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 
 
@@ -846,21 +847,6 @@ async def test_preview_state_is_owner_scoped(
 # them starts from a known-empty table rather than from a rollback that cannot reach them.
 
 
-async def _forget_every_count() -> None:
-    async with async_session_factory() as db:
-        await db.execute(sa.delete(HarnessCount))
-        await db.commit()
-
-
-@pytest.fixture
-async def counted() -> AsyncIterator[None]:
-    """An empty `harness_counts`, before and after. See the note above for why a rollback is not
-    enough."""
-    await _forget_every_count()
-    yield
-    await _forget_every_count()
-
-
 async def _counter_values(counter: HarnessCounter) -> list[int]:
     """Every value recorded under one counter name. Read as columns, not ORM rows: the session
     that read them is closed by the time the assertion runs."""
@@ -874,7 +860,12 @@ async def _counter_values(counter: HarnessCounter) -> list[int]:
 
 
 async def test_a_cold_relaunch_records_the_press_the_arrival_and_the_wait(
-    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire, counted
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    wire,
+    empty_harness_counts,
 ) -> None:
     """The whole of R102/R103 on the happy path: one press, one arrival, one duration."""
     user, project = await _user_project(db_session, "rl-count-cold@rvaiglobal.com")
@@ -892,7 +883,12 @@ async def test_a_cold_relaunch_records_the_press_the_arrival_and_the_wait(
 
 
 async def test_the_attach_arm_records_the_press_and_the_arrival_but_no_duration(
-    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, aca_wire, counted
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    aca_wire,
+    empty_harness_counts,
 ) -> None:
     """★ A 15-second attach budget and a 120-second cold budget averaged together produce a
     number that describes neither, so only the restore arm writes a duration.
@@ -912,7 +908,12 @@ async def test_the_attach_arm_records_the_press_and_the_arrival_but_no_duration(
 
 
 async def test_an_attach_that_fails_open_unready_is_a_press_that_never_arrived(
-    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire, counted
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    wire,
+    empty_harness_counts,
 ) -> None:
     """★ THE MUTANT THIS EXISTS FOR. The attach arm deliberately fails open and hands back a
     framable URL with `ready=False` (the SL-20 fix). That is not a running app, and an emit that
@@ -947,7 +948,12 @@ async def test_an_attach_that_fails_open_unready_is_a_press_that_never_arrived(
 
 
 async def test_a_press_refused_by_the_one_slot_conflict_still_counts_as_a_press(
-    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire, counted
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    wire,
+    empty_harness_counts,
 ) -> None:
     """★ ONE OF THE TWO REFUSALS THAT SIT ABOVE THE 404 GATE, and the reason the emit is at
     function entry rather than after it. A live build owns the one-per-user slot; the citizen
@@ -977,7 +983,12 @@ async def test_a_press_refused_by_the_one_slot_conflict_still_counts_as_a_press(
 
 
 async def test_a_press_refused_because_reclaiming_would_destroy_work_still_counts(
-    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, aca_wire, counted
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    aca_wire,
+    empty_harness_counts,
 ) -> None:
     """★ THE OTHER REFUSAL ABOVE THE 404 GATE (#83). Project A holds the one container and it is
     holding unsaved work, so B's press is refused rather than reclaiming it — a press that could
@@ -997,7 +1008,12 @@ async def test_a_press_refused_because_reclaiming_would_destroy_work_still_count
 
 
 async def test_a_press_with_nothing_to_restore_still_counts_as_a_press(
-    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire, counted
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    wire,
+    empty_harness_counts,
 ) -> None:
     """The 404 gate. A never-built project has nothing to relaunch, and the citizen still
     pressed."""
@@ -1011,7 +1027,12 @@ async def test_a_press_with_nothing_to_restore_still_counts_as_a_press(
 
 
 async def test_a_relaunch_that_dies_after_the_arm_is_chosen_records_no_arrival(
-    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire, counted
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    wire,
+    empty_harness_counts,
 ) -> None:
     """A failure past the point where the cold clock started: the press is in the denominator,
     nothing is in the numerator, and — because the arm never reached `wait_ready` — no duration
@@ -1032,7 +1053,12 @@ async def test_a_relaunch_that_dies_after_the_arm_is_chosen_records_no_arrival(
 
 
 async def test_the_cold_clock_times_the_restore_not_the_whole_request(
-    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire, counted
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    wire,
+    empty_harness_counts,
 ) -> None:
     """★ THE CLOCK'S BOUNDARY, and the reason both instants are named in the method's docstring.
 
@@ -1049,7 +1075,7 @@ async def test_the_cold_clock_times_the_restore_not_the_whole_request(
     # A first cold relaunch, so the registry names this app and the attach attempt below is
     # actually MADE rather than skipped by the registry check.
     assert (await _relaunch(client, user, project)).status_code == 200
-    await _forget_every_count()
+    await forget_every_harness_count()
 
     slow_attach_seconds = 1.0
 

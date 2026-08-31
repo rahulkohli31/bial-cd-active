@@ -26,6 +26,11 @@
  * no app to first-see, and emitting for it would make today's number and the sandbox-first
  * number answer different questions.
  *
+ * THE GUARDS GROW, AND THAT IS THE POINT. They hold one entry per distinct project id visited in
+ * this page load, and nothing evicts them — eviction would BE the double-count, since forgetting a
+ * project id is exactly what makes its second visit look like a first. A reload clears them. The
+ * ceiling is therefore "projects one person opened without reloading", which is a handful.
+ *
  * IT LIVES IN MEMORY, and the two biases that follow are recorded rather than hidden: a reload
  * mid-journey abandons the measurement (so the sample tilts toward smooth journeys), and a
  * backgrounded tab inflates one (up to the server-side ceiling, which refuses the rest). There is
