@@ -21,6 +21,7 @@ import { ApiError } from '../utils/apiError'
 import { markAppVisible } from '../utils/observe'
 import { describeSaveFailure, describeModeSwitchFailure, isConversationGone } from '../utils/chatErrors'
 import { readDraft, writeDraft, clearDraft } from '../utils/composerDraft'
+import { resolvePreviewAddress } from '../utils/previewAddress'
 import { notifyUsageChanged } from '../utils/usage'
 import { createBuildLock, openBuildLockChannel } from '../utils/buildLock'
 import type { BuildLock } from '../utils/buildLock'
@@ -1703,7 +1704,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     inputRef.current?.focus()
   }
 
-  const previewStatus = showSession ? session.status : null
   // U15: the live session's stored half. While the LIVE bubble below re-tells exactly this
   // session (reattach replays its envelopes), the hydrated step/in-progress rows that belong
   // to it are suppressed — one narrative, told once. Rows from OLDER builds always render.
@@ -1780,15 +1780,41 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     }
     return items
   }, [messages, liveStoryAnchorSeq])
-  // A relaunched preview (#43) is a framed URL with NO build lifecycle: it takes precedence over the
-  // (ended) session's dead preview so the pane frames the RESTORED app — while `buildActive`/`previewStatus`
-  // keep reading the session's own `ended` status, so Stop / delete-gate never light up on a relaunch.
+  // WHAT GETS FRAMED, and what the pane says about it — resolved in `utils/previewAddress.ts` and
+  // nowhere else (Plan A, U2). The precedence and its two scoping predicates used to be spelled
+  // out inline at each of the framing sites, which is why they could not be asked from ABOVE the
+  // chat; the shell mounts one iframe for the whole workspace and needs exactly this answer.
+  //
+  // The predicates travel INTO the module as arguments rather than being read there as free
+  // variables. That is the point: the comment beside their declaration above already records that
+  // a gate depending on declaration order is one reorder away from silently opening, and this
+  // removes the ordering dependency for the address.
+  //
+  // `buildActive` still reads the session's own status, so Stop and the delete-gate never light up
+  // on a relaunch, which has no build lifecycle at all.
+  const address = resolvePreviewAddress({
+    turnPreviewUrl: turnPreview.url,
+    turnStatus: turnBuildStatus,
+    narratingChatIsOpenChat: turnNarrativeIsThisChat,
+    relaunchedUrl: session.relaunchedPreviewUrl,
+    sessionUrl: session.previewUrl,
+    sessionStatus: session.status,
+    sessionId: session.sessionId,
+    // NOT `previewState?.previewUrl`, and the reason is a cycle rather than an oversight: this
+    // page's preview-state poll only runs while an address is ALREADY framed (see its effect
+    // below), so feeding its answer back in could never bootstrap one and would only widen the
+    // window in which a dropped address keeps framing. The arm exists for the caller that has a
+    // project and no chat — the project surface — which is Plan F's.
+    projectPreviewUrl: null,
+    sessionBelongsToOpenProject: sessionProjectMatches,
+    transcriptHasBuildOutcome: newestOutcome !== null,
+  })
+  const framedPreviewUrl = address.url
+  // NOT an address derivation, and deliberately left here: `restoredFromFailedBuild` below asks
+  // whether a restore happened in this project, which is a different question from which arm won
+  // the precedence — a live turn can outrank the relaunch while the restore remains the reason
+  // the app on screen is the last saved one.
   const relaunchedUrl = sessionProjectMatches ? session.relaunchedPreviewUrl : null
-  // A live Write turn's preview outranks both: it is the app the user is watching being
-  // built right now, and the session's url (when there is one at all) describes the previous
-  // build. Keyed on the url so a NEW sandbox remounts the iframe rather than showing a frame
-  // pointing at a container that no longer exists.
-  const framedPreviewUrl = (turnNarrativeIsThisChat ? turnPreview.url : null) ?? relaunchedUrl ?? (showSession ? session.previewUrl : null)
 
   // The receiving end of the app's own error reporter (see `clientErrorRelayRef` above). Declared
   // HERE rather than beside the ref because it reads `framedPreviewUrl`, which is derived further
@@ -1811,7 +1837,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const handlePreviewRevealed = useCallback(() => {
     markAppVisible(projectId ?? null)
   }, [projectId])
-  const framedStatus = turnBuildStatus ?? (relaunchedUrl ? 'ready' : (previewStatus ?? (newestOutcome ? 'ended' : null)))
+  const framedStatus = address.status
   // The build bubble's two sources, resolved ONCE — the turn wins when it has something to say.
   // Naming them here is what lets the wrapper ask `hasBuildNarrative` the same question
   // BuildProgress asks itself, instead of rendering chrome around a `null`.
