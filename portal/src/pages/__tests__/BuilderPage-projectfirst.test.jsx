@@ -21,6 +21,7 @@ import { MemoryRouter, Routes, Route, useParams, useNavigate, useLocation } from
 import {
   FakeEventSource, makeClient, primeClient,
   PLAN_CARD_ID, primeTurn, send, sendAndConfirm,
+  inWorkspace,
 } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
@@ -76,7 +77,7 @@ function renderHandoff({ chatId = 'build-X', prompt = 'build me a gate tracker' 
   return render(
     <MemoryRouter initialEntries={[{ pathname: `/chat/${chatId}`, search: '?projectId=p1&kind=build', state: { prompt, theme: 'bial' } }]}>
       <Routes>
-        <Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="VIP Movement" buildSessionDeps={makeDeps()} />} />
+        {inWorkspace(<Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="VIP Movement" buildSessionDeps={makeDeps()} />} />)}
         <Route path="/projects/:projectId" element={<div>project home</div>} />
         <Route path="/projects" element={<div data-testid="projects-index">projects index</div>} />
       </Routes>
@@ -209,7 +210,7 @@ describe('BuilderPage — a refine turn', () => {
     render(
       <MemoryRouter initialEntries={['/chat/build-X']}>
         <Routes>
-          <Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="VIP Movement" buildSessionDeps={makeDeps()} />} />
+          {inWorkspace(<Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="VIP Movement" buildSessionDeps={makeDeps()} />} />)}
         </Routes>
       </MemoryRouter>,
     )
@@ -303,7 +304,7 @@ describe('BuilderPage — the composer is not shared across a chat navigation', 
       <MemoryRouter initialEntries={[{ pathname: '/chat/chat-A', search: '?projectId=p1&kind=build', state: { prompt: 'seed for A', theme: 'bial' } }]}>
         <GoToB />
         <Routes>
-          <Route path="/chat/:chatId" element={<BuilderHost />} />
+          {inWorkspace(<Route path="/chat/:chatId" element={<BuilderHost />} />)}
         </Routes>
       </MemoryRouter>,
     )
@@ -324,7 +325,7 @@ describe('BuilderPage — the composer is not shared across a chat navigation', 
       <MemoryRouter initialEntries={['/chat/chat-A']}>
         <GoToB />
         <Routes>
-          <Route path="/chat/:chatId" element={<BuilderHost />} />
+          {inWorkspace(<Route path="/chat/:chatId" element={<BuilderHost />} />)}
         </Routes>
       </MemoryRouter>,
     )
@@ -346,7 +347,7 @@ describe('BuilderPage — the StrictMode load strand (U7)', () => {
       <StrictMode>
         <MemoryRouter initialEntries={['/chat/build-X']}>
           <Routes>
-            <Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="P" buildSessionDeps={makeDeps()} />} />
+            {inWorkspace(<Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="P" buildSessionDeps={makeDeps()} />} />)}
           </Routes>
         </MemoryRouter>
       </StrictMode>,
@@ -360,7 +361,7 @@ describe('BuilderPage — the StrictMode load strand (U7)', () => {
       <StrictMode>
         <MemoryRouter initialEntries={[{ pathname: '/chat/build-X', search: '?projectId=p1&kind=build', state: { prompt: 'build me a gate tracker', theme: 'bial' } }]}>
           <Routes>
-            <Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="VIP" buildSessionDeps={makeDeps()} />} />
+            {inWorkspace(<Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="VIP" buildSessionDeps={makeDeps()} />} />)}
           </Routes>
         </MemoryRouter>
       </StrictMode>,
@@ -382,7 +383,7 @@ describe('BuilderPage — a send blocked by an in-flight reply explains itself',
     render(
       <MemoryRouter initialEntries={['/chat/build-X']}>
         <Routes>
-          <Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="P" buildSessionDeps={makeDeps()} />} />
+          {inWorkspace(<Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="P" buildSessionDeps={makeDeps()} />} />)}
         </Routes>
       </MemoryRouter>,
     )
@@ -418,10 +419,12 @@ describe('BuilderPage — the hand-off does not replay on reload (N1)', () => {
       <MemoryRouter initialEntries={[entry]}>
         <LocationProbe sink={sink} />
         <Routes>
-          <Route
-            path="/chat/:chatId"
-            element={<BuilderPage projectId="p1" projectName="VIP Movement" buildSessionDeps={makeDeps()} />}
-          />
+          {inWorkspace(
+            <Route
+              path="/chat/:chatId"
+              element={<BuilderPage projectId="p1" projectName="VIP Movement" buildSessionDeps={makeDeps()} />}
+            />,
+          )}
           <Route path="/projects" element={<div data-testid="projects-index">projects index</div>} />
         </Routes>
       </MemoryRouter>,

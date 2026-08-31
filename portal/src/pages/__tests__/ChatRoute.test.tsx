@@ -109,7 +109,7 @@ describe('ChatRoute — kind dispatch', () => {
 
   it('lets the SERVER win when its kind disagrees with ?kind=', async () => {
     h.getConversation.mockResolvedValue(conversation({ kind: 'plan' }))
-    // The query has to name the REAL opt-in value to be a genuine disagreement — `?kind=builder`
+    // The query has to name the REAL opt-in value to be a genuine disagreement — `?kind=build`
     // (the retired word) matches neither branch of `kindFromQuery`'s `raw === 'build'` check, so
     // both the query and the server would have resolved to `plan` regardless of which one won.
     renderRoute('/chat/c1?kind=build')

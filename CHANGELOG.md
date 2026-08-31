@@ -22,6 +22,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   accepts three named observations and nothing else, refuses a value outside the range an
   honest one can occupy rather than quietly trimming it to fit, and stores no record of who
   sent it.
+- The warning about unsaved work now follows you across the whole workspace. Closing the tab
+  with changes that were never saved into the app asks you to confirm wherever you are in a
+  project, not only while the build chat happens to be the thing on screen.
 
 ### Changed
 
@@ -29,6 +32,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   kinds of conversation and the old test knew about one, so an assistant chat was labelled
   as a plan. Every kind now comes from one table, and a kind nobody has invented yet gets an
   honest word instead of the wrong one.
+- The running app is now part of the workspace itself rather than something each screen draws
+  for itself. It used to exist only because the build chat was the page you happened to be on,
+  which is why walking away from that page took the app down with it.
+- Conversations are opened and deleted from the project page. The list that used to sit inside
+  a chat — beside the chat you were already reading — is gone, so there is one place that
+  answers "what is in this project" instead of two that could disagree.
+- The workspace has one height model. Every screen inside it now fills the space it is given
+  rather than asserting a full window height of its own and being clipped.
 
 ### Fixed
 
@@ -39,6 +50,20 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A measurement failing can no longer slow down or break the thing it is measuring: the
   counter writes moved out from under the lock that a citizen's next build waits on, and a
   measurement that throws is contained instead of taking the builder's screen down with it.
+- Going from a build chat to its project page and back no longer reloads the running app.
+  Leaving was already safe; returning was not, and the app restarted underneath the citizen
+  every single time they came back to the conversation that built it.
+- Leaving a build chat while the build is still running no longer reloads the app. The pane
+  read the departure as "the turn just finished" and re-requested the page, about an event
+  that had not happened.
+- Leaving a build chat immediately after a build succeeds no longer shuts down the app. A
+  finished build's app stays up and serving, and walking away from the conversation was
+  destroying it at the moment a citizen is most likely to walk away.
+- A first message that fails to save no longer takes the typed text with it. The notice asking
+  the citizen to try again appeared over an empty box, offering a retry of something that no
+  longer existed on screen or in storage, so reloading could not recover it either.
+- The spinner shown while a conversation loads is no longer pushed below centre and clipped by
+  the navigation bar.
 
 ## [1.6.19] - 2026-08-29
 

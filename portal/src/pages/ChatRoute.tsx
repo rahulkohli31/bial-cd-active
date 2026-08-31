@@ -32,8 +32,7 @@
  */
 import { useEffect, useRef, useState } from 'react'
 import { Navigate, useLocation, useParams, useSearchParams } from 'react-router-dom'
-import ChatPage from './ChatPage'
-import BuilderPage from './BuilderPage'
+import ConversationSlot from '../components/workspace/ConversationSlot'
 import { getConversation } from '../utils/conversationApi'
 import { getProject } from '../utils/projectApi'
 import { markChatOpened } from '../utils/observe'
@@ -67,9 +66,10 @@ export default function ChatRoute() {
   const queryRef = useRef({ projectId: search.get('projectId'), kind: search.get('kind') })
   queryRef.current = { projectId: search.get('projectId'), kind: search.get('kind') }
 
-  // "THIS session just minted this id", set by every mint site (ChatPage's New Chat and Launch
-  // Builder, ProjectBuilder's Start Chat). Its row does not exist until the send path creates it,
-  // so its `getConversation` is a guaranteed 404 — the only request worth skipping.
+  // "THIS session just minted this id", set by every mint site (the planning surface's
+  // context-guardrail new-chat control and its Launch Builder, ProjectBuilder's Start Chat). Its
+  // row does not exist until the send path creates it, so its `getConversation` is a guaranteed
+  // 404 — the only request worth skipping.
   //
   // WHY ROUTER STATE AND NOT THE QUERY. `?kind=` is user-controllable, and a saved chat's URL is
   // rewritten to the bare `/chat/{id}` only after its FIRST append — so a shared or bookmarked
@@ -174,8 +174,13 @@ export default function ChatRoute() {
   if (resolution.status === 'gone') return <Navigate to="/projects" replace />
 
   if (resolution.status === 'loading') {
+    // `flex-1 min-h-0`, NOT `min-h-screen`. This arm renders inside the workspace shell's outlet
+    // column, which is 100vh minus the navbar and `overflow-hidden`; a child asserting a full
+    // viewport height cannot shrink into it, so it overflows and the spinner is clipped low by the
+    // navbar's height on every cold chat open. The shell owns the one height model now — surfaces
+    // fill the column they are given.
     return (
-      <div className="min-h-screen flex items-center justify-center bg-bial-bg">
+      <div className="flex-1 min-h-0 flex items-center justify-center bg-bial-bg">
         <div className="flex gap-1.5" role="status" aria-label="Loading chat">
           {[0, 1, 2].map((i) => (
             <div
@@ -197,28 +202,32 @@ export default function ChatRoute() {
   // a chat the app id of a DIFFERENT project: this component stays mounted across chat
   // navigations, so a stale `project` would otherwise outlive the chat it was read for.
   const resolved = project !== null && project.id === resolution.projectId ? project : null
-  const shared = {
-    chatId: resolution.chatId,
-    projectId: resolution.projectId,
-    projectName: resolved?.name ?? null,
-    // Finding #1: the builder's Relaunch affordance derives from PROJECT-level state, so a
-    // fresh conversation in a project with a saved build can still restore its preview.
-    //
-    // N7: what travels is whether a Relaunch would actually FIND something — not `appId`.
-    // The app row is minted by provision, before anything is built, so keying the claim on
-    // its existence advertised a saved build for every project whose first build failed.
-    // `null` while the project is still resolving is the same "cannot say" the server sends,
-    // and it withholds the claim rather than guessing.
-    //
-    // R18: the server now answers this from the recovery copy OR the saved bundle (the pair a
-    // restore actually consults), so the builder who never pressed Save is offered their work
-    // back. This is the COLD-LOAD value; once the preview poll lands, BuilderPage prefers its
-    // `restorable`, which is the same predicate asked more recently.
-    projectHasSavedBuild: resolved?.hasRelaunchableSnapshot ?? null,
-  }
-  return resolution.kind === 'build' ? (
-    <BuilderPage {...shared} />
-  ) : (
-    <ChatPage {...shared} />
+  // THE KIND BRANCH MOVED, IT DID NOT GO AWAY. This route still resolves the conversation and now
+  // hands the resolution — kind included — to the one slot that mounts a body for it, so the
+  // largest kind comparison in the product has exactly one home instead of being the reason two
+  // page components exist. Plan D deletes it from the slot when the unified surface lands.
+  return (
+    <ConversationSlot
+      conversation={{
+        chatId: resolution.chatId,
+        kind: resolution.kind,
+        projectId: resolution.projectId,
+        projectName: resolved?.name ?? null,
+        // Finding #1: the builder's Relaunch affordance derives from PROJECT-level state, so a
+        // fresh conversation in a project with a saved build can still restore its preview.
+        //
+        // N7: what travels is whether a Relaunch would actually FIND something — not `appId`.
+        // The app row is minted by provision, before anything is built, so keying the claim on
+        // its existence advertised a saved build for every project whose first build failed.
+        // `null` while the project is still resolving is the same "cannot say" the server sends,
+        // and it withholds the claim rather than guessing.
+        //
+        // R18: the server now answers this from the recovery copy OR the saved bundle (the pair a
+        // restore actually consults), so the builder who never pressed Save is offered their work
+        // back. This is the COLD-LOAD value; once the preview poll lands, BuilderPage prefers its
+        // `restorable`, which is the same predicate asked more recently.
+        projectHasSavedBuild: resolved?.hasRelaunchableSnapshot ?? null,
+      }}
+    />
   )
 }

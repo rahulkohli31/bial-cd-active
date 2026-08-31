@@ -1,9 +1,16 @@
 /**
- * The composer draft, per conversation (G3).
+ * The composer draft, per conversation (G3) — THE ONE STORE, FOR BOTH CHAT KINDS.
  *
  * Under the mode-free composer contract the user is invited to keep typing while the assistant
  * works — so the text they type has to survive the three things that used to destroy it: a
  * reload, a chat switch, and a refinement chip. Two of those are this module's job.
+ *
+ * BOTH KINDS USE IT NOW (Plan A, U5). Only the builder surface did; the planning surface kept its
+ * text in assistant-ui's in-memory composer and cleared it on every chat change including the
+ * first mount after a reload, so a planning draft died on a reload and on a round trip to a
+ * sibling chat. R72 asks for one surface whose draft survives the same way in each kind, and this
+ * is the half of that which is a store rather than a component. Plan A owns this module; Plan D
+ * CONSUMES it and specifies none of it, so there is exactly one writer per key.
  *
  * SEMANTICS, stated because they are user-visible:
  *  - `sessionStorage`, not `localStorage`: a draft is tab-scoped work-in-progress, and dying with

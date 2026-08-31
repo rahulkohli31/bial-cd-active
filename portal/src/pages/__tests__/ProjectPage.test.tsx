@@ -230,6 +230,46 @@ describe('ProjectPage — the description rail (R3, U7 pop-up editor)', () => {
   })
 })
 
+describe('ProjectPage — an outlet child that owns its own scroller (Plan A, U3)', () => {
+  // THE RISK THIS GUARDS. This surface used to be a `min-h-screen` document scroller with a page
+  // frame and a navbar of its own. Inside the workspace shell it is a flex child of a full-height
+  // frame that does not scroll — so if it does not declare a scroller, a project with twenty
+  // conversations clips its list with no way to reach the bottom, and if the rail keeps its old
+  // sticky offset it hangs 80px below a navbar that is no longer inside anything it can see.
+  //
+  // jsdom does no layout, so what is assertable is the model rather than the pixels: the classes
+  // that encode it, and the absence of the frame this surface must no longer bring.
+  it('declares its own scroller and brings no page frame of its own', async () => {
+    h.getProject.mockResolvedValue(makeProject())
+    const { container } = renderProjectPage()
+    await screen.findByRole('heading', { name: 'VIP Movement' })
+
+    const main = container.querySelector('main') as HTMLElement
+    expect(main).toBeTruthy()
+    expect(main.className).toMatch(/overflow-y-auto/)
+    // `min-h-0` is what actually lets a flex child scroll: without it the child's min-content
+    // height wins and the overflow never has anywhere to happen.
+    expect(main.className).toMatch(/min-h-0/)
+    // No second full-height frame inside the shell's own.
+    expect(container.innerHTML).not.toMatch(/min-h-screen/)
+    expect(container.innerHTML).not.toMatch(/100vh/)
+  })
+
+  it('the description rail\'s sticky offset is re-based on the scroller that now exists', async () => {
+    h.getProject.mockResolvedValue(makeProject())
+    renderProjectPage()
+    await screen.findByRole('heading', { name: 'VIP Movement' })
+
+    const rail = screen.getByTestId('description-rail')
+    expect(rail.className).toMatch(/lg:sticky/)
+    // `top-20` was the navbar's 56px plus a 24px gap, measured from the VIEWPORT. Sticky resolves
+    // against the nearest scroll container, and that container starts below the navbar now — so
+    // the offset is the 24px gap alone.
+    expect(rail.className).toMatch(/lg:top-6/)
+    expect(rail.className).not.toMatch(/lg:top-20/)
+  })
+})
+
 /** The row container a chat title sits in — the kind badge is its SIBLING (F-10), so this is
  *  what makes "the right badge on the right row" assertable instead of merely "a badge exists". */
 function rowFor(title: string): HTMLElement {

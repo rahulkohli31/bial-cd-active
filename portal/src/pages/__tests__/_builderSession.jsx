@@ -27,6 +27,29 @@ import { act, fireEvent, screen, render, waitFor } from '@testing-library/react'
 import { expect } from 'vitest'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import BuilderPage from '../BuilderPage'
+// THE REAL SHELL, not a stub, and both helpers below mount the page THROUGH it as a layout route.
+// After the extraction the surface is an outlet child rather than a root: it renders no page frame
+// and no navbar, and — from U4 — no pane of its own. A harness that kept mounting it bare would
+// leave every preview assertion in fifteen suites asserting against something the product does not
+// render, which is the failure mode a stub cannot show you.
+import WorkspaceShell from '../../components/workspace/WorkspaceShell'
+
+/**
+ * Nest routes under the REAL workspace shell, for the suites that build their own route tables.
+ *
+ * The surface is an outlet child now: it renders no page frame, no navbar and — from U4 — no pane
+ * of its own, publishing what to frame upward instead. A table that mounts it bare therefore has
+ * no pane at all, so every assertion about the preview silently asserts against something the
+ * product does not render. This is one line at each such table rather than a stub, because a stub
+ * is exactly what would hide the mistake.
+ *
+ * Usage: `<Routes>{inWorkspace(<Route path="/chat/:chatId" element={…} />)}<Route … /></Routes>`
+ */
+export const inWorkspace = (...routes) => (
+  <Route key="workspace" element={<WorkspaceShell />}>
+    {routes}
+  </Route>
+)
 
 export { FakeEventSource } from '../../utils/buildSessionMock'
 
@@ -97,6 +120,9 @@ export const turnStreaming = (frames, outcome = 'completed') =>
 
 /** The turn a Build-it starts. `sessionId` is gone from the transition's answer entirely. */
 export const BUILD_TURN_ID = 'bt-1'
+/** The chat a handoff CREATES — a different conversation from the one Build it was pressed
+ *  in, which is the whole shape of the press now. */
+export const BUILD_CHAT_ID = 'bc-1'
 
 /** The sandbox lifecycle. `narrativeStatus` returns null until one of these lands, so a build
  *  test that omits it renders no bubble at all — the workspace frame IS the build's beginning. */
@@ -127,18 +153,23 @@ export const T_BUILD_END = (over = {}) => ({
 })
 
 /**
- * The two sockets a build now needs, scripted as one `readTurnStream` implementation.
+ * A `readTurnStream` implementation that can hold a socket OPEN, so a test can push frames into a
+ * running turn by hand and assert on it mid-flight. Close it with `end()`.
  *
- * An ordinary send subscribes with NO `turnId` and gets `plan` — the streamed brief plus its
- * options card. The Build-it watch subscribes WITH one (`watchBuildTurn` resubscribes at cursor 0),
- * and THAT socket is held OPEN: a running build is precisely an open socket, so a test that wants
- * to assert anything about one mid-flight has to hold it there and push frames in by hand. Close it
- * with `end()` when the build is meant to be over.
+ * TWO SUBSCRIBE SHAPES, AND WHICH ONE IS "THE BUILD" HAS CHANGED. A send subscribes with NO
+ * `turnId` — it is joining the turn its own POST just started, so the id is the server's to know
+ * — and a RE-ATTACH subscribes WITH one, because it is joining a turn it did not start. The
+ * Build-it press used to be a third shape: it started a build in THIS chat and watched it with an
+ * id. It is a handoff now, so that shape is gone, and on a build chat the plain send IS the build.
+ *
+ * By default the no-`turnId` branch replays `plan` and completes, which is what a suite driving a
+ * PLAN chat's reply wants. Pass `hold: true` when the send is the build being asserted on, and the
+ * same socket is held open instead — one helper, both shapes, rather than a local copy per suite.
  */
-export function scriptBuildTurn({ plan = planReply(), opening = [T_WORKSPACE()] } = {}) {
+export function scriptBuildTurn({ plan = planReply(), opening = [T_WORKSPACE()], hold = false } = {}) {
   const live = { emit: null, close: null }
   const impl = async ({ turnId, onFrame }) => {
-    if (!turnId) {
+    if (!turnId && !hold) {
       for (const frame of plan) onFrame(frame)
       return 'completed'
     }
@@ -163,9 +194,14 @@ export function scriptBuildTurn({ plan = planReply(), opening = [T_WORKSPACE()] 
 export function primeTurn(h, frames = planReply()) {
   h.startTurn.mockResolvedValue({ turnId: 't1' })
   h.readTurnStream.mockImplementation(turnStreaming(frames))
-  // U5: the transition starts a WRITE TURN. `turnId` is what the page subscribes to; `sessionId`,
-  // `reason` and the `build_failed` / `already_built` outcomes are all gone from the contract.
-  h.buildFromPlan.mockResolvedValue({ outcome: 'started', turnId: BUILD_TURN_ID, appId: 'a1' })
+  // THE HANDOFF'S ANSWER: `chatId` is the chat it CREATED and the one the press navigates to, so
+  // it is the field the caller actually acts on. `sessionId`, `appId`, `reason` and the
+  // `build_failed` / `already_built` / `stale_plan` outcomes are all gone from the contract.
+  h.buildFromPlan.mockResolvedValue({
+    outcome: 'started',
+    chatId: BUILD_CHAT_ID,
+    turnId: BUILD_TURN_ID,
+  })
   h.stopTurn?.mockResolvedValue('stopping')
 }
 
@@ -191,11 +227,16 @@ export async function send(text = 'a visitor app') {
 }
 
 /**
- * The full trigger path: send a turn, wait for the plan-options card, click Build it.
+ * The full PRESS path: send a turn, wait for the plan-options card, click Build it.
  *
- * This is what a build looks like from the user's side (U11/U12): the plan streams, the card
- * presents, the click runs the atomic transition. A test that only sends is asserting a chat
- * turn, not a build.
+ * WHAT THIS IS FOR HAS NARROWED. It used to be how a test reached a build at all — the plan
+ * streamed, the card presented, the click flipped this thread into Write and streamed the build
+ * here. The click is a HANDOFF now: it creates a second chat, starts the turn there and
+ * navigates, so nothing after it streams into the chat the button was in.
+ *
+ * So use this when the press ITSELF is the subject (that `buildFromPlan` is called, with the
+ * minted id, and where it lands). For a test that needs a build STREAMING on this page, send
+ * ordinarily — this page renders a build chat, and every send on one is a build turn.
  */
 export async function sendAndConfirm(text = 'a visitor app') {
   await send(text)
@@ -220,14 +261,104 @@ export const findPlanCard = () => screen.findByRole('button', { name: /^Build it
  *   initialEntries?: string[],
  * }} [opts]
  */
-export function renderBuilder({ deps, projectId = 'p1', hasSavedBuild = null, initialEntries = ['/chat/build-X?projectId=p1&kind=builder'] } = {}) {
+export function renderBuilder({ deps, projectId = 'p1', hasSavedBuild = null, initialEntries = ['/chat/build-X?projectId=p1&kind=build'] } = {}) {
   return render(
     <MemoryRouter initialEntries={initialEntries}>
       <Routes>
-        <Route path="/chat/:chatId" element={<BuilderPage projectId={projectId} projectName="VIP Movement" projectHasSavedBuild={hasSavedBuild} buildSessionDeps={deps} />} />
+        <Route element={<WorkspaceShell />}>
+          <Route path="/chat/:chatId" element={<BuilderPage projectId={projectId} projectName="VIP Movement" projectHasSavedBuild={hasSavedBuild} buildSessionDeps={deps} />} />
+        </Route>
         <Route path="/projects" element={<div>projects index</div>} />
         <Route path="/projects/:pid" element={<div>project page</div>} />
       </Routes>
     </MemoryRouter>,
   )
+}
+
+// ─── Plan A / U1: fixtures for the PREVIEW ADDRESS and its two scoping predicates ─────────────
+//
+// The address has three sources and two predicates, and a predicate is only OBSERVABLE when the
+// chat or the project on screen differs from the one the signal was attributed to. `renderBuilder`
+// cannot express that: it mounts one identity and never moves. These two fixtures supply the
+// missing halves — a transcript that attributes a SESSION to whatever project is on screen, and a
+// render helper that can move the SAME BuilderPage instance to a sibling chat or another project.
+
+/**
+ * A transcript whose newest assistant part anchors a build with no recorded outcome.
+ *
+ * This is all a reattach needs (`reattachToLiveBuild`): the page reads the session id off the
+ * anchor, stamps `sessionChatRef`/`sessionProjectRef` with the identities it is CURRENTLY mounted
+ * at, and calls `getStatus`. Pair it with a `getStatus` that answers with a `previewUrl` and the
+ * session arm of the address is live, attributed to the project that was on screen.
+ */
+export const withLiveBuildAnchor = (sessionId = 'live-7', over = {}) => ({
+  id: 'build-X',
+  kind: 'builder',
+  mode: 'plan',
+  messages: [
+    { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'a visitor app' }] },
+    { id: 'srv_1_g', role: 'assistant', seq: 1, parts: [{ type: 'build_in_progress', sessionId }] },
+  ],
+  ...over,
+})
+
+/**
+ * Render BuilderPage at an EXPLICIT chat/project identity, and hand back a `moveTo` that changes
+ * it without remounting.
+ *
+ * Flat routing means one BuilderPage instance survives every chat and project move — only its
+ * props change — so `moveTo` is what the product actually does, not a test shortcut. The router
+ * entry is deliberately constant and the identities arrive as PROPS (`chatId` wins over
+ * `useParams`): a MemoryRouter reads `initialEntries` once at mount, so re-rendering with a new
+ * one would change nothing and the test would silently assert against the original identity.
+ *
+ * @param {{
+ *   chatId?: string,
+ *   projectId?: string,
+ *   projectName?: string,
+ *   hasSavedBuild?: boolean | null,
+ *   deps?: object,
+ * }} [opts]
+ */
+export function renderBuilderAt({
+  chatId = 'chat-A',
+  projectId = 'pA',
+  projectName = 'VIP Movement',
+  hasSavedBuild = null,
+  deps,
+} = {}) {
+  const at = { chatId, projectId, projectName }
+  const tree = () => (
+    <MemoryRouter initialEntries={['/chat/routed']}>
+      <Routes>
+        <Route element={<WorkspaceShell />}>
+          <Route
+            path="/chat/:chatId"
+            element={
+              <BuilderPage
+                chatId={at.chatId}
+                projectId={at.projectId}
+                projectName={at.projectName}
+                projectHasSavedBuild={hasSavedBuild}
+                buildSessionDeps={deps}
+              />
+            }
+          />
+        </Route>
+        <Route path="/projects" element={<div>projects index</div>} />
+        <Route path="/projects/:pid" element={<div>project page</div>} />
+      </Routes>
+    </MemoryRouter>
+  )
+  const view = render(tree())
+  return {
+    ...view,
+    /** Move the SAME instance to another chat and/or project. */
+    moveTo: (next) => {
+      Object.assign(at, next)
+      view.rerender(tree())
+    },
+    /** Re-render at the SAME identity — the no-op move an identity assertion needs. */
+    rerenderSame: () => view.rerender(tree()),
+  }
 }

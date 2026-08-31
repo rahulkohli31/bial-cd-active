@@ -16,13 +16,14 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, cleanup, within } from '@testing-library/react'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import BuilderPage from '../BuilderPage'
 import {
   FakeEventSource, PREVIEW_URL, makeClient, primeClient, renderBuilder, statusResp,
   PLAN_CARD_ID, planReply, primeTurn, turnStreaming, send, T_DELTA,
   scriptBuildTurn, BUILD_TURN_ID, T_STEP, T_PREVIEW, T_QUOTA, T_BUILD_END, T_WORKSPACE, T_END,
   T_DIAGNOSTIC,
+  inWorkspace,
 } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
@@ -606,7 +607,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     scriptedBuild()
     const { rerender } = render(
       <MemoryRouter initialEntries={['/x']}>
-        <BuilderPage chatId="chat-A" projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} />
+        <Routes>{inWorkspace(<Route path="*" element=<BuilderPage chatId="chat-A" projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} /> />)}</Routes>
       </MemoryRouter>,
     )
     await screen.findByPlaceholderText(/describe what you need/i)
@@ -629,7 +630,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     h.readTurnStream.mockImplementation(turnStreaming(planReply('A sibling plan.', 'opt-S')))
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <BuilderPage chatId="chat-B" projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} />
+        <Routes>{inWorkspace(<Route path="*" element=<BuilderPage chatId="chat-B" projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} /> />)}</Routes>
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
@@ -669,7 +670,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     const turn = scriptedBuild()
     const { rerender } = render(
       <MemoryRouter initialEntries={['/x']}>
-        <BuilderPage chatId="chat-A" projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} />
+        <Routes>{inWorkspace(<Route path="*" element=<BuilderPage chatId="chat-A" projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} /> />)}</Routes>
       </MemoryRouter>,
     )
     // Build + frame a preview in project A.
@@ -680,10 +681,13 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     await waitFor(() =>
       expect(h.buildFromPlan).toHaveBeenCalledWith('chat-A', PLAN_CARD_ID, expect.any(String)),
     )
-
+    // `inWorkspace`, like every other mount in this test: the app pane is a SIBLING of the
+    // router outlet now, so a bare `<BuilderPage>` has no host to frame the preview into and
+    // the iframe assertion below would fail for a reason that has nothing to do with the
+    // teardown this test is about.
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <BuilderPage chatId={CHAT_A_LIVE} projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} />
+        <Routes>{inWorkspace(<Route path="*" element=<BuilderPage chatId={CHAT_A_LIVE} projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} /> />)}</Routes>
       </MemoryRouter>,
     )
     await awaitBuildTurn(BUILD_TURN_ID, CHAT_A_LIVE)
@@ -696,7 +700,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     h.readTurnStream.mockImplementation(turnStreaming(planReply('Build B, please.', 'opt-B')))
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <BuilderPage chatId="chat-B" projectId="pB" projectName="Project B" buildSessionDeps={sessionDeps} />
+        <Routes>{inWorkspace(<Route path="*" element=<BuilderPage chatId="chat-B" projectId="pB" projectName="Project B" buildSessionDeps={sessionDeps} /> />)}</Routes>
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))

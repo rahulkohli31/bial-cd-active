@@ -19,14 +19,14 @@ const ok = (json) => ({ ok: true, status: 200, json: async () => json })
 
 describe('listConversations', () => {
   it('GETs ?kind= and normalizes _id → id', async () => {
-    const fetchImpl = vi.fn(async () => ok({ conversations: [{ _id: 'c1', kind: 'planning', title: 'T', updatedAt: '2026-06-20T00:00:00Z' }] }))
-    const list = await listConversations('planning', deps(fetchImpl))
-    expect(fetchImpl.mock.calls[0][0]).toBe('/api/conversations?kind=planning')
-    expect(list).toEqual([{ id: 'c1', kind: 'planning', title: 'T', createdAt: undefined, updatedAt: '2026-06-20T00:00:00Z' }])
+    const fetchImpl = vi.fn(async () => ok({ conversations: [{ _id: 'c1', kind: 'plan', title: 'T', updatedAt: '2026-06-20T00:00:00Z' }] }))
+    const list = await listConversations('plan', deps(fetchImpl))
+    expect(fetchImpl.mock.calls[0][0]).toBe('/api/conversations?kind=plan')
+    expect(list).toEqual([{ id: 'c1', kind: 'plan', title: 'T', createdAt: undefined, updatedAt: '2026-06-20T00:00:00Z' }])
   })
   it('throws the server message on failure', async () => {
     const fetchImpl = vi.fn(async () => ({ ok: false, status: 500, json: async () => ({ error: { message: 'boom' } }) }))
-    await expect(listConversations('planning', deps(fetchImpl))).rejects.toThrow('boom')
+    await expect(listConversations('plan', deps(fetchImpl))).rejects.toThrow('boom')
   })
 })
 
@@ -35,14 +35,14 @@ describe('listProjectConversations', () => {
     const fetchImpl = vi.fn(async () =>
       ok({
         conversations: [
-          { _id: 'c1', kind: 'planning', projectId: 'p1', title: 'Plan' },
-          { _id: 'c2', kind: 'builder', projectId: 'p1', title: 'Build' },
+          { _id: 'c1', kind: 'plan', projectId: 'p1', title: 'Plan' },
+          { _id: 'c2', kind: 'build', projectId: 'p1', title: 'Build' },
         ],
       }),
     )
     const list = await listProjectConversations('p1', deps(fetchImpl))
     expect(fetchImpl.mock.calls[0][0]).toBe('/api/conversations?projectId=p1')
-    expect(list.map((c) => c.kind)).toEqual(['planning', 'builder'])
+    expect(list.map((c) => c.kind)).toEqual(['plan', 'build'])
     expect(list.every((c) => c.projectId === 'p1')).toBe(true)
   })
   it('url-encodes the project id', async () => {
@@ -89,7 +89,7 @@ describe('getConversation', () => {
   // caller read `undefined`. ChatRoute's kind dispatch and the chat breadcrumb both
   // depend on this surviving hydration.
   it('surfaces conversation.projectId', async () => {
-    const fetchImpl = vi.fn(async () => ok({ conversation: { _id: 'c1', kind: 'builder', projectId: 'p1' }, projection: [] }))
+    const fetchImpl = vi.fn(async () => ok({ conversation: { _id: 'c1', kind: 'build', projectId: 'p1' }, projection: [] }))
     expect((await getConversation('c1', deps(fetchImpl))).projectId).toBe('p1')
   })
 })
@@ -177,18 +177,18 @@ describe('createConversation / patchConversation / deleteConversation', () => {
     // ends here, not merely by asserting the new shape: a stray `mode` on the CALL never reaches
     // the wire body (createConversation destructures only the named fields it still has), and a
     // `mode` on the SERVER doc never survives normalizeHeader into the returned header.
-    const fetchImpl = vi.fn(async () => ({ ok: true, status: 201, json: async () => ({ conversation: { _id: 'c1', kind: 'planning', projectId: 'p1', mode: 'plan' } }) }))
-    const header = await createConversation('c1', { projectId: 'p1', kind: 'planning', title: 'T', mode: 'plan' }, deps(fetchImpl))
+    const fetchImpl = vi.fn(async () => ({ ok: true, status: 201, json: async () => ({ conversation: { _id: 'c1', kind: 'plan', projectId: 'p1', mode: 'plan' } }) }))
+    const header = await createConversation('c1', { projectId: 'p1', kind: 'plan', title: 'T', mode: 'plan' }, deps(fetchImpl))
     const [url, opts] = fetchImpl.mock.calls[0]
     expect(url).toBe('/api/conversations')
     expect(opts.method).toBe('POST')
-    expect(JSON.parse(opts.body)).toEqual({ id: 'c1', projectId: 'p1', kind: 'planning', title: 'T' })
-    expect(header).toMatchObject({ id: 'c1', kind: 'planning', projectId: 'p1' })
+    expect(JSON.parse(opts.body)).toEqual({ id: 'c1', projectId: 'p1', kind: 'plan', title: 'T' })
+    expect(header).toMatchObject({ id: 'c1', kind: 'plan', projectId: 'p1' })
     expect(header).not.toHaveProperty('mode')
   })
   it('createConversation rejects on failure (no silent drop)', async () => {
     const fetchImpl = vi.fn(async () => ({ ok: false, status: 409, json: async () => ({ error: { message: 'id already in use' } }) }))
-    await expect(createConversation('c1', { projectId: 'p1', kind: 'planning' }, deps(fetchImpl))).rejects.toThrow('id already in use')
+    await expect(createConversation('c1', { projectId: 'p1', kind: 'plan' }, deps(fetchImpl))).rejects.toThrow('id already in use')
   })
   it('patchConversation PATCHes the body; deleteConversation DELETEs (404 tolerated)', async () => {
     const patchFetch = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) }))
@@ -235,7 +235,7 @@ describe('uuidv7', () => {
 
 describe('createConversationStore', () => {
   it('newConversation mints a client UUIDv7 synchronously (no network)', () => {
-    const store = createConversationStore('planning')
+    const store = createConversationStore('plan')
     const a = store.newConversation()
     expect(a).toMatch(/^[0-9a-f-]{36}$/i)
     // The wiring, asserted where the decision is made: the store's mint IS `uuidv7`, so a

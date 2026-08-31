@@ -23,14 +23,18 @@ const h = vi.hoisted(() => ({
   deleteConversation: vi.fn(),
   listProjectConversations: vi.fn(),
   uuidv7: vi.fn(),
+  // The context guardrail's two inputs. `warn` and `full` are the only states in which the
+  // planning surface still offers a new-chat control at all, now that the sidebar's is gone.
+  contextLimits: { soft: 1e9, hard: 1e9 },
+  conversationTokens: 0,
 }))
 
 const FIXED_UUID = '01900000-0000-7000-8000-000000000000'
 
 vi.mock('../../hooks/useClaudeAPI', () => ({
   useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null, clearError: vi.fn(), abort: vi.fn() }),
-  getContextLimits: () => ({ soft: 1e9, hard: 1e9 }),
-  estimateConversationTokens: () => 0,
+  getContextLimits: () => h.contextLimits,
+  estimateConversationTokens: () => h.conversationTokens,
 }))
 vi.mock('../../utils/chatHistory', () => ({
   loadHistory: h.loadHistory,
@@ -82,7 +86,10 @@ async function openBuilderPrompt() {
 
 beforeEach(() => {
   Element.prototype.scrollIntoView = vi.fn() // jsdom has no layout (suite-wide convention)
-  Object.values(h).forEach((fn) => fn.mockReset())
+  // Guarded: `h` now also carries two plain guardrail knobs, which have no mockReset.
+  Object.values(h).forEach((fn) => { if (typeof fn?.mockReset === 'function') fn.mockReset() })
+  h.contextLimits = { soft: 1e9, hard: 1e9 }
+  h.conversationTokens = 0
   h.loadHistory.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
   h.uuidv7.mockReturnValue(FIXED_UUID)
@@ -137,15 +144,28 @@ describe('ChatPage → Launch Builder', () => {
   })
 })
 
-describe('ChatPage → New Chat', () => {
+describe('ChatPage → New Chat, now minted from the context guardrail (R54)', () => {
+  it('the sidebar\'s New Chat is gone, and no other new-chat control stands in an ordinary chat', async () => {
+    // The first half of the removal, as an inertness guard. What is NOT gone is the handler: it is
+    // the third mint site and the only producer of planning conversations, and it moved from
+    // sidebar chrome to the one place it is genuinely load-bearing.
+    renderChat()
+    await screen.findByPlaceholderText(/Describe what you're thinking/i)
+
+    expect(screen.queryByRole('button', { name: /new chat/i })).toBeNull()
+  })
+
   it('marks the minted chat freshlyMinted so ChatRoute skips its guaranteed 404', async () => {
-    // The sidebar's New Chat is the THIRD mint site. Its row does not exist until the send path
-    // creates it either, so it needs the same marker — and the marker rides in router state,
-    // which dies on reload, so a later shared link still resolves against the server.
+    // RE-POINTED, NOT DELETED. The mint is the same handler; only its trigger moved. Driving it
+    // from the guardrail is the stronger test anyway: this is the state in which a conversation
+    // has NO other way forward, so the marker mattering here is what stops a dead end becoming a
+    // dead end with a broken exit.
+    h.contextLimits = { soft: 10, hard: 20 }
+    h.conversationTokens = 999
     h.newConversation.mockReturnValue('fresh-plan-id')
     renderChat()
 
-    fireEvent.click(await screen.findByRole('button', { name: /new chat/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /start new chat/i }))
 
     await waitFor(() => expect(screen.queryByTestId('location')).toBeTruthy())
     expect(screen.getByTestId('location').textContent).toBe('/chat/fresh-plan-id?projectId=p1&kind=plan')
