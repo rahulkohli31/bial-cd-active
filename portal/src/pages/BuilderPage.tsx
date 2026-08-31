@@ -753,12 +753,24 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     }
   }, [session.status, session.sessionId, projectId])
 
-  // "Recent builds" lists THIS project's build chats.
+  // THIS PROJECT'S CONVERSATIONS — all of them, and the kind filter that used to narrow this to
+  // builder chats is gone with the in-chat list (R54).
+  //
+  // The list itself has no reader any more; these two do, and neither is a list:
+  //   - `buildBlockedMessage` names the OTHER conversation holding this project's build;
+  //   - the pane's `turnRunning` asks whether a turn is running anywhere in THIS PROJECT.
+  //
+  // Both of those questions are wrong the moment a Plan turn is the one running, which is what
+  // made the filter worth removing rather than merely unnecessary. It is a no-op today — a project
+  // has only ever created builder chats — and it becomes a defect the day Plan B makes Plan turns
+  // ordinary: a Plan turn in this project would be invisible to both readers, so the refusal would
+  // say "another build chat" about a conversation it could not name and the pane would claim
+  // nothing was running over an app being written.
   const refreshBuilds = useCallback(async () => {
     try {
       const isHeader = (c: ConversationHeader | null): c is ConversationHeader => c !== null
       const list = projectId
-        ? (await listProjectConversations(projectId)).filter(isHeader).filter((c) => c.kind === 'builder')
+        ? (await listProjectConversations(projectId)).filter(isHeader)
         : (await loadBuilds()).filter(isHeader)
       setBuilds(list.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()))
     } catch {

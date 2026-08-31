@@ -1,25 +1,16 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import type { MouseEvent as ReactMouseEvent, FormEvent as ReactFormEvent, KeyboardEvent as ReactKeyboardEvent } from 'react'
+import type { FormEvent as ReactFormEvent, KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { useNavigate, useParams, useLocation } from 'react-router-dom'
 import { AssistantRuntimeProvider, ComposerPrimitive, useExternalStoreRuntime, useAuiState } from '@assistant-ui/react'
 import type { ThreadMessage, AppendMessage } from '@assistant-ui/react'
-import { Sparkles, User, Send, Plus, MessageSquare, Trash2, Hammer, Paperclip, X, FileText, FileSpreadsheet, Presentation } from 'lucide-react'
+import { Sparkles, User, Send, Hammer, Paperclip, X, FileText, FileSpreadsheet, Presentation } from 'lucide-react'
 import MessageContent from '../components/chat/MessageContent'
 import AttachmentLightbox from '../components/AttachmentLightbox'
 import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
-import { listProjectConversations, uuidv7 } from '../utils/conversationApi'
-import type { ConversationHeader } from '../utils/conversationApi'
+import { uuidv7 } from '../utils/conversationApi'
 import { useClaudeAPI, getContextLimits, estimateConversationTokens } from '../hooks/useClaudeAPI'
 import { usePendingAttachments } from '../hooks/usePendingAttachments'
-import {
-  loadHistory,
-  newConversation,
-  createConversation,
-  getConversation,
-  deleteConversation,
-  relativeTime,
-  deriveTitle,
-} from '../utils/chatHistory'
+import { newConversation, createConversation, getConversation, deriveTitle } from '../utils/chatHistory'
 import { wireMessageFromParts, buildUserParts, partsToText, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
 import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../utils/attachmentInput'
 import type { PendingAttachment } from '../utils/attachmentInput'
@@ -68,7 +59,6 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   const chatId = chatIdProp ?? params.chatId
   const location = useLocation()
 
-  const [history, setHistory] = useState<ConversationHeader[]>([])
   const [activeChatId, setActiveChatId] = useState<string | null>(null)
   const [messages, setMessages] = useState<ChatUIMessage[]>([])
   const [generating, setGenerating] = useState(false)
@@ -181,27 +171,6 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     activeChatIdRef.current = id
     setActiveChatId(id)
   }, [])
-
-  // The sidebar lists this PROJECT's planning chats, not every planning chat the user
-  // owns — a chat belongs to its project, and cross-project recents would re-introduce
-  // the flat all-chats model this phase replaces. Falls back to the flat list only when
-  // the project is not yet known (a chat rendered without ChatRoute).
-  const refreshHistory = useCallback(async () => {
-    try {
-      const isHeader = (c: ConversationHeader | null): c is ConversationHeader => c !== null
-      const list = projectId
-        ? (await listProjectConversations(projectId)).filter(isHeader).filter((c) => c.kind === 'planning')
-        : (await loadHistory()).filter(isHeader)
-      setHistory(list.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()))
-    } catch {
-      // Keep the current sidebar on a transient error; the next refresh recovers.
-    }
-  }, [projectId])
-
-  // Load sidebar history on mount and when activeChatId changes
-  useEffect(() => {
-    refreshHistory()
-  }, [refreshHistory, activeChatId])
 
   // Hydrate the routed conversation. Async (server round-trip) with a stale-response
   // guard so a fast conversation switch can't let an older fetch clobber the newer view.
@@ -354,9 +323,6 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
       }
       lastTurnRef.current = null // succeeded — nothing to regenerate
 
-      // U7: the SERVER persisted both sides of the turn before [DONE] — no client append.
-      if (activeChatIdRef.current === currentChatId) refreshHistory()
-
       // Check if we should suggest moving to builder
       const allMessages = [...messagesRef.current]
       const shouldSuggest =
@@ -379,7 +345,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
         setStreamingChatId(null)
       }
     }
-  }, [sendMessage, refreshHistory])
+  }, [sendMessage])
 
   const fireMessage = useCallback(async (rawText: string, attachments: PendingAttachment[] = [], explicitChatId?: string) => {
     if (generating) return
@@ -455,12 +421,11 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
       }
     }
     dropTransientQuery(currentChatId)
-    refreshHistory()
 
     // The stateless wire message: typed prose + fenced attachment text + owned binary refs.
     // No transcript, no bytes — the server loads history and rehydrates references (R9).
     await streamAssistant(wireMessageFromParts(parts), baseSeq, currentChatId)
-  }, [activeChatId, generating, streamAssistant, refreshHistory, showAttachToast, projectId, navigate, dropTransientQuery, restorePending, runtime.thread.composer])
+  }, [activeChatId, generating, streamAssistant, showAttachToast, projectId, navigate, dropTransientQuery, restorePending, runtime.thread.composer])
 
   // Re-request the last turn's reply after a stall/error. User-initiated ONLY (never auto-fired):
   // the first turn bills server-side regardless of the client outcome, so a regenerate is a SECOND
@@ -548,15 +513,16 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     doSend(runtime.thread.composer.getState().text.trim())
   }
 
-  const handleSelectChat = (id: string) => {
-    setViewer(null)
-    navigate(`/chat/${id}`)
-    buildSuggestionFiredRef.current = false
-  }
-
   // A new chat is always filed under THIS chat's project — there is no Default project
   // and no project-less chat. The id is minted client-side; the row appears on the
   // first append, so the project rides a transient query until then.
+  //
+  // IT SURVIVED R54, AND THAT WAS THE POINT. This was the conversation list's New Chat button as
+  // well as the context guardrail's escape hatch, and the two look identical from the outside —
+  // but the guardrail is a HARD SEND STOP whose only exit is this call. Deleting it with the list
+  // would have left a planning conversation permanently unsendable, with copy still telling the
+  // reader to start a new chat and no control to do it. It is also the third mint site and the
+  // only producer of planning conversations: the project screen's composer mints builders.
   const handleNewChat = () => {
     setViewer(null)
     if (!projectId) {
@@ -567,26 +533,6 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     navigate(`/chat/${newConversation()}?projectId=${encodeURIComponent(projectId)}&kind=planning`, {
       state: { freshlyMinted: true },
     })
-  }
-
-  const handleDeleteChat = async (e: ReactMouseEvent, id: string) => {
-    e.stopPropagation()
-    // If the active conversation is being deleted, clear the active id FIRST so any
-    // in-flight stream's assistant write no-ops (the guard sees the id change) — an
-    // in-flight reply can't resurrect the just-deleted conversation.
-    if (activeChatIdRef.current === id) {
-      setMessages([])
-      setActive(null)
-      navigate(projectId ? `/projects/${projectId}` : '/projects', { replace: true })
-    }
-    setHistory((prev) => prev.filter((c) => c.id !== id)) // optimistic removal
-    try {
-      await deleteConversation(id)
-    } catch {
-      refreshHistory() // reconcile — the row reappears if the delete didn't land
-      return
-    }
-    refreshHistory()
   }
 
   const handleBuildApp = useCallback(async () => {
@@ -654,62 +600,12 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     // nobody could explain. It dies here rather than being copied into a third place.
     <>
       <div className="flex flex-1 min-h-0 overflow-hidden">
-        {/* Sidebar */}
-        <aside className="w-64 flex-shrink-0 bg-white border-r border-bial-border flex flex-col overflow-hidden">
-          <div className="p-3 border-b border-bial-border">
-            <button
-              onClick={handleNewChat}
-              className="w-full flex items-center justify-center gap-2 bg-primary hover:bg-primary-dark text-white text-sm font-bold rounded-xl px-4 py-2.5 transition"
-            >
-              <Plus size={15} />
-              New Chat
-            </button>
-          </div>
-
-          <div className="flex-1 overflow-y-auto scrollbar-thin py-2">
-            {history.length === 0 ? (
-              <div className="px-4 py-8 text-center">
-                <MessageSquare size={28} className="text-bial-border mx-auto mb-2" />
-                <p className="text-xs text-neutral">No conversations yet</p>
-              </div>
-            ) : (
-              history.map((conv) => (
-                <div
-                  key={conv.id}
-                  onClick={() => handleSelectChat(conv.id)}
-                  className={`group relative mx-2 my-0.5 rounded-xl px-3 py-2.5 cursor-pointer transition flex flex-col gap-0.5 ${
-                    conv.id === activeChatId
-                      ? 'bg-bial-bg border-l-2 border-primary'
-                      : 'hover:bg-surface-muted border-l-2 border-transparent'
-                  }`}
-                >
-                  <p className={`text-xs font-semibold truncate pr-6 ${conv.id === activeChatId ? 'text-primary' : 'text-tertiary'}`}>
-                    {conv.title}
-                  </p>
-                  <p className="text-[10px] text-neutral">{relativeTime(conv.updatedAt)}</p>
-                  <button
-                    onClick={(e) => handleDeleteChat(e, conv.id)}
-                    disabled={conv.id === streamingChatId}
-                    aria-label={`Delete ${conv.title || 'chat'}`}
-                    title={
-                      conv.id === streamingChatId
-                        ? 'Finishing a reply — you can delete this chat once it completes'
-                        : 'Delete chat'
-                    }
-                    className={`absolute right-2 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition p-1 ${
-                      conv.id === streamingChatId
-                        ? 'text-neutral/40 cursor-not-allowed'
-                        : 'text-neutral hover:text-danger'
-                    }`}
-                  >
-                    <Trash2 size={11} />
-                  </button>
-                </div>
-              ))
-            )}
-          </div>
-        </aside>
-
+        {/* R54 — THE CHAT LIST IS GONE FROM INSIDE A CHAT. The workspace lists chats; an open
+            chat is a conversation, not a file manager. Nothing is lost: the project page already
+            lists every conversation with Open and Delete on each row, and the history rail that
+            replaces this is Plan F's. What did NOT go with it is the only control here that was
+            never list chrome — the new-chat mint, which is also the context guardrail's one
+            escape hatch and lives beside its sentence below. */}
         {/* Chat area */}
         <div className="flex-1 flex flex-col overflow-hidden">
           {/* Chat toolbar: back-navigation + project name only (F10 — the AI branding block

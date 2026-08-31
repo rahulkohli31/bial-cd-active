@@ -13,18 +13,19 @@
  * read as gains now, and the diff that made them so is one line in the hydration effect plus the
  * three sites that keep the store in step with the composer.
  *
- * THE CONTEXT GUARDRAIL IS HERE AS THE THING U6 MUST NOT TAKE WITH THE SIDEBAR. At
- * `ctxLevel === 'full'` the send is a hard stop whose ONLY escape is the two "start a new chat"
- * controls — and those call `handleNewChat`, which is also the sidebar's New Chat button. Deleting
- * the handler along with the sidebar would leave a planning conversation permanently unsendable,
- * with copy still telling the reader to start a new chat and no control to do it: the dead-UI
- * removal trace inverted, the control gone and the sentence left. These scenarios stay green
- * through U6 unchanged, and their queries are scoped to the banner so that they cannot have been
- * passing on the sidebar's button all along.
+ * THE CONTEXT GUARDRAIL WAS HERE AS THE THING R54 MUST NOT TAKE WITH THE SIDEBAR, AND IT DID NOT.
+ * At `ctxLevel === 'full'` the send is a hard stop whose ONLY escape is the two "start a new chat"
+ * controls — and those called `handleNewChat`, which was also the sidebar's New Chat button.
+ * Deleting the handler along with the sidebar would have left a planning conversation permanently
+ * unsendable, with copy still telling the reader to start a new chat and no control to do it: the
+ * dead-UI removal trace inverted, the control gone and the sentence left. These scenarios passed
+ * before the removal and pass after it unchanged, and their queries are scoped to the banner so
+ * they cannot have been passing on the sidebar's button all along. That handler is now the
+ * planning surface's only new-chat control, and its only producer of planning conversations.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup, within } from '@testing-library/react'
-import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
+import { MemoryRouter, Routes, Route, useLocation, Link } from 'react-router-dom'
 
 const h = vi.hoisted(() => ({
   sendMessage: vi.fn(), abort: vi.fn(), clearError: vi.fn(),
@@ -63,11 +64,32 @@ function LocationProbe() {
   return <div data-testid="location">{`${loc.pathname}${loc.search}`}</div>
 }
 
+/**
+ * Move between chats without the in-chat list, which R54 removed.
+ *
+ * The draft's whole claim is per-conversation, so it needs two conversations and a way between
+ * them. The list was that way; after R54 it is the project page's row, and Plan F's history rail
+ * after that. A link is the honest stand-in for whichever, and it keeps the assertion pointed at
+ * the draft rather than at departed chrome.
+ */
+const switchTo = (chatId: string) => fireEvent.click(screen.getByText(`go ${chatId}`))
+
+function ChatSwitcher() {
+  return (
+    <>
+      {['chat-1', 'chat-2'].map((id) => (
+        <Link key={id} to={`/chat/${id}`}>{`go ${id}`}</Link>
+      ))}
+    </>
+  )
+}
+
 /** Mount the planning surface at a flat chat URL, exactly as `ChatRoute` renders it. */
 function renderChat(entry = '/chat/chat-1') {
   return render(
     <MemoryRouter initialEntries={[entry]}>
       <LocationProbe />
+      <ChatSwitcher />
       <Routes>
         <Route path="/chat/:chatId" element={<ChatPage projectId="p1" projectName="VIP Movement" />} />
         <Route path="/projects/:projectId" element={<div>project home</div>} />
@@ -83,11 +105,11 @@ const here = () => screen.getByTestId('location').textContent
 /**
  * The control that sits BESIDE a guardrail sentence.
  *
- * Scoped to the banner rather than queried globally, and that scoping is the assertion: the
- * sidebar carries a "New Chat" of its own today, so a global query would match either and would go
- * on passing after U6 deleted the sidebar's — or, worse, would have been passing on the sidebar's
- * all along. What R54 must not cost is the escape hatch, and the escape hatch is the button in
- * this banner.
+ * Scoped to the banner rather than queried globally, and the scoping is load-bearing in both
+ * directions. Before R54 the sidebar carried a "New Chat" of its own, so a global query could have
+ * been passing on that button all along and would have gone on passing after the sidebar was
+ * deleted. After R54 this banner's button is the only one left — which is precisely why it had to
+ * be the one under test.
  */
 const escapeHatchBesides = (sentence: RegExp) => {
   const banner = screen.getByText(sentence).closest('div')
@@ -137,10 +159,6 @@ describe('ChatPage — the composer draft, now the same store the builder surfac
   })
 
   it('each conversation shows its OWN draft across a round trip, and neither sees the other\'s', async () => {
-    h.listProjectConversations.mockResolvedValue([
-      { id: 'chat-1', kind: 'planning', title: 'First', updatedAt: new Date().toISOString() },
-      { id: 'chat-2', kind: 'planning', title: 'Second', updatedAt: new Date(Date.now() - 1000).toISOString() },
-    ])
     h.getConversation.mockImplementation(async (id: string) => ({
       id, kind: 'planning', title: id, messages: [], updatedAt: new Date().toISOString(),
     }))
@@ -148,14 +166,14 @@ describe('ChatPage — the composer draft, now the same store the builder surfac
     await screen.findByText(/Plan your next app/i)
     fireEvent.change(composer(), { target: { value: 'a visitor pass tracker' } })
 
-    fireEvent.click(screen.getByText('Second'))
+    switchTo('chat-2')
     await waitFor(() => expect(h.getConversation).toHaveBeenCalledWith('chat-2'))
     // The half that was already correct, and the half a shared store is most likely to break:
     // chat-1's text must not leak into chat-2.
     expect(composer().value).toBe('')
     fireEvent.change(composer(), { target: { value: 'something else entirely' } })
 
-    fireEvent.click(screen.getByText('First'))
+    switchTo('chat-1')
     await waitFor(() => expect(h.getConversation).toHaveBeenCalledWith('chat-1'))
 
     await waitFor(() => expect(composer().value).toBe('a visitor pass tracker'))

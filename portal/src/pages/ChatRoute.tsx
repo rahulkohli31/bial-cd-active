@@ -66,9 +66,10 @@ export default function ChatRoute() {
   const queryRef = useRef({ projectId: search.get('projectId'), kind: search.get('kind') })
   queryRef.current = { projectId: search.get('projectId'), kind: search.get('kind') }
 
-  // "THIS session just minted this id", set by every mint site (ChatPage's New Chat and Launch
-  // Builder, ProjectBuilder's Start Chat). Its row does not exist until the send path creates it,
-  // so its `getConversation` is a guaranteed 404 — the only request worth skipping.
+  // "THIS session just minted this id", set by every mint site (the planning surface's
+  // context-guardrail new-chat control and its Launch Builder, ProjectBuilder's Start Chat). Its
+  // row does not exist until the send path creates it, so its `getConversation` is a guaranteed
+  // 404 — the only request worth skipping.
   //
   // WHY ROUTER STATE AND NOT THE QUERY. `?kind=` is user-controllable, and a saved chat's URL is
   // rewritten to the bare `/chat/{id}` only after its FIRST append — so a shared or bookmarked
