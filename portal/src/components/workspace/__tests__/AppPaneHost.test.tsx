@@ -177,6 +177,26 @@ describe('AppPaneHost — the frame outlives a move between the two addresses (A
     expect(wrapper?.getAttribute('aria-hidden')).toBe('true')
   })
 
+  it('leaves the frame alone when the conversation unmounts MID-BUILD', () => {
+    // THE REGRESSION THIS SUITE WAS BLIND TO, and it was blind for a reason worth writing down:
+    // every other scenario here pins `iterating: false`, so none of them could see it.
+    //
+    // The pane view is cleared when its publisher unmounts. `iterating` rode along with it, fell
+    // back to `LivePreview`'s prop default, and the pane read that true→false edge as "a turn just
+    // ended over a live preview" — its signal to re-request the document. So leaving a build chat
+    // for the project screen WHILE A BUILD WAS RUNNING reloaded the app: silently, and about an
+    // event that had not happened. That is R8 broken in the one transition this host exists for,
+    // and it is why `iterating` is held by the host rather than treated as chrome.
+    render(<Workspace chatSurface={<ChatSurface pane={{ iterating: true }} />} />)
+    const original = frame()
+    expect(original).toBeTruthy()
+
+    fireEvent.click(screen.getByText('to project'))
+
+    expect(frame()).toBe(original)
+    expect(frame()?.getAttribute('src')).toBe(APP_URL)
+  })
+
   it('but leaving for ANOTHER project\'s screen takes the frame down', () => {
     // The other side of "the address outlives its publisher", and the reason it needed bounding at
     // all. Kept for the whole life of the tab, a held address means a frame quietly holding one

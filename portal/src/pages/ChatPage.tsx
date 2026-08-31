@@ -16,6 +16,7 @@ import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFIC
 import type { PendingAttachment } from '../utils/attachmentInput'
 import { openPdf } from '../utils/attachmentViewer'
 import { describeSaveFailure, isConversationGone } from '../utils/chatErrors'
+import { useWorkspaceProject } from '../components/workspace/workspaceChannel'
 import { readDraft, writeDraft, clearDraft } from '../utils/composerDraft'
 import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
 import type { ChatMessage } from '../utils/messageTypes'
@@ -58,14 +59,23 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   const params = useParams()
   const chatId = chatIdProp ?? params.chatId
   const location = useLocation()
+  // Declared HERE and not in the slot above: layout effects run child-before-parent, so a
+  // parent-level declaration would land AFTER a sibling surface's address publish and open a commit
+  // in which a new address is judged against the old project. `null` while the route is still
+  // resolving is a no-op by design.
+  useWorkspaceProject(projectId)
 
   const [activeChatId, setActiveChatId] = useState<string | null>(null)
   const [messages, setMessages] = useState<ChatUIMessage[]>([])
   const [generating, setGenerating] = useState(false)
   // The id of the chat whose turn is in flight — tracked separately from `generating`, which is
-  // a page-global flag, so the delete gate follows the actual STREAM, not the current view. This
-  // keeps the streaming chat's delete disabled (and every OTHER chat's enabled) even after a
-  // mid-stream navigate to a sibling chat. Cleared on both send-exit paths.
+  // a page-global flag, so the composer lock and the streaming indicator follow the actual STREAM
+  // rather than the current view. After a mid-stream navigate a sibling chat's composer stays
+  // usable and only the owning chat shows dots. Cleared on both send-exit paths.
+  //
+  // It gated the in-chat delete control too, until R54 removed the list that control lived on.
+  // Deleting a conversation happens from the project page now — which is a different component
+  // that cannot read this state, and reaching it unmounts this surface and aborts the stream.
   const [streamingChatId, setStreamingChatId] = useState<string | null>(null)
   const [hydrating, setHydrating] = useState(false) // loading a saved transcript over the network
   const [showBuildModal, setShowBuildModal] = useState(false)
@@ -118,9 +128,9 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   const messagesRef = useRef(messages)
   messagesRef.current = messages
 
-  // The composer/indicator gates scope to the chat that OWNS the in-flight turn (matching the
-  // per-chat delete gate below): after a mid-stream navigate, a sibling chat's Send/attach must
-  // not be locked — and its transcript must not show dots — for a stream that isn't its own (F7).
+  // The composer/indicator gates scope to the chat that OWNS the in-flight turn: after a mid-stream
+  // navigate, a sibling chat's Send/attach must not be locked — and its transcript must not show
+  // dots — for a stream that isn't its own (F7).
   const streamingHere = generating && streamingChatId === activeChatId
 
   // Running context-length estimate → 'ok' | 'warn' | 'full'. Drives the
@@ -394,7 +404,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     const userMsg: ChatUIMessage = { id: `local_${Date.now()}`, role: 'user', parts, seq: baseSeq, createdAt: new Date().toISOString() }
     setMessages((prev) => [...prev, userMsg])
     setGenerating(true)
-    setStreamingChatId(currentChatId) // gate THIS chat's delete for the turn's lifetime
+    setStreamingChatId(currentChatId) // scope the composer/send lock to the chat that owns this turn
 
     // U7: the conversation row must EXIST before the first turn — the stateless relay 404s
     // an unknown id (the legacy appears-on-first-append upsert is gone; the server persists

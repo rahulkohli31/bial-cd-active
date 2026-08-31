@@ -34,15 +34,26 @@
  * ═══ THE SHAPE, AND WHY IT IS CELLS RATHER THAN A CONTEXT VALUE ═══
  *
  * A plain context whose value is an object re-renders EVERY consumer whenever ANY field changes.
- * Here that would mean the pane host re-rendering on every character typed into the composer, and
- * the save state's publish re-rendering the pane. Each payload is therefore its own cell with its
- * own listener set, read through `useSyncExternalStore` — so a save-state publish reaches only the
- * shell's unload effect, and a keystroke reaches nothing at all.
+ * Each payload is therefore its own cell with its own listener set, read through
+ * `useSyncExternalStore`.
+ *
+ * BE PRECISE ABOUT WHAT THAT BUYS, because the tempting sentence is not true. A save-state publish
+ * reaches only the shell's unload effect. A keystroke touches neither the address nor the save
+ * state nor the visibility — but it DOES republish the pane view, because that view is rebuilt by
+ * identity every render (its toolbar nodes and its handlers are fresh closures), so the pane host
+ * re-renders once per character exactly as `LivePreview` did when the page rendered it directly.
+ * What the split protects is the thing that matters: the address is the VALUE-compared cell and
+ * the frame's identity input, so no amount of typing can move what is framed. Do not "fix" the
+ * re-render with a shallow comparator — the handlers are unstable, so it would buy nothing without
+ * memoising them too, and that is a behaviour change this refactor is not making.
  *
  * The context carries the CHANNEL HANDLE, which is created once and never replaced. That handle is
  * stable for the life of the shell, so the context itself never re-renders anybody.
  */
-import { createContext, useContext, useLayoutEffect, useSyncExternalStore, type ReactNode } from 'react'
+import { createContext, useContext, useLayoutEffect, useSyncExternalStore, type ComponentProps, type ReactNode } from 'react'
+// TYPE-ONLY, so this stays a leaf at runtime: the import is erased and the channel keeps no
+// dependency on the component it describes.
+import type LivePreview from '../LivePreview'
 import type { PreviewAddress } from '../../utils/previewAddress'
 import type { CompileState } from '../../utils/compileState'
 import type { PreviewLifeState, ReclaimBlocked } from '../../utils/buildSessionApi'
@@ -127,6 +138,23 @@ export interface PaneView {
    */
   onRevealed?: () => void
 }
+
+/**
+ * THE SUBSET CLAIM `AppPaneHost`'S SPREAD RESTS ON, pinned by the compiler rather than by a comment.
+ *
+ * The host spreads a `PaneView` straight into `<LivePreview/>`. JSX spread attributes are EXEMPT from
+ * excess-property checking — only fresh object literals get it — so a field added here that the pane
+ * has no prop for would compile clean and go nowhere at runtime, silently. That is the one failure a
+ * reader would reasonably assume the types already prevent.
+ *
+ * `never` means every field is a real prop. Add a field the pane does not accept and this alias stops
+ * being `never`, which the assertion below turns into a compile error at the declaration site — where
+ * the mistake is, rather than at the spread that would have swallowed it.
+ */
+export type UnacceptedPaneProps = Exclude<keyof PaneView, keyof ComponentProps<typeof LivePreview>>
+
+const _paneViewIsASubsetOfLivePreviewProps: UnacceptedPaneProps extends never ? true : never = true
+void _paneViewIsASubsetOfLivePreviewProps
 
 /**
  * The reclaim dialog's open state. The CLASSIFICATION stays where it is — this is only the slot.
@@ -286,9 +314,15 @@ export function useRailSlot(): RailSlot {
 //                         screen; clearing here would destroy the running app on the one
 //                         transition the requirement most obviously covers. Bounded by the
 //                         project instead (see `useWorkspaceAddress`).
-//   project    KEPT     — every surface declares its own on mount, so there is no window where
-//                         nobody has; clearing would blank it for a frame and, with it, the
-//                         address it validates.
+//   project    KEPT     — the cell must not go blank between an unmounting surface and the one
+//                         replacing it, because the next publisher's address is judged against
+//                         it. Note what KEPT does NOT buy: after a move to a surface that
+//                         declares nothing, the cell still names the departed project, so
+//                         `belongsElsewhere` cannot fire. Every surface the shell mounts
+//                         declares one for exactly that reason, and whichever surface Plan F
+//                         teaches to SHOW the pane must keep doing so — declaring the project
+//                         before publishing an address is what stops it framing the previous
+//                         project's app with nothing able to detect it.
 //   pane       CLEARED  — chrome and props belonging to a surface that is gone. The frame needs
 //                         only the address to keep running, so dropping these costs nothing and
 //                         keeping them would render a departed conversation's toolbar.

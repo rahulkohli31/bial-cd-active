@@ -152,10 +152,10 @@ export function resolvePreviewAddress(inputs: PreviewAddressInputs): PreviewAddr
   // stale "the container is alive" read.
   const status =
     (narratingChatIsOpenChat ? turnStatus : null) ??
-    (fromRelaunch
-      ? 'ready'
-      : ((hasLiveSession ? sessionStatus : null) ??
-        (fromProject ? 'ready' : (transcriptHasBuildOutcome ? 'ended' : null))))
+    (fromRelaunch ? 'ready' : null) ??
+    (hasLiveSession ? sessionStatus : null) ??
+    (fromProject ? 'ready' : null) ??
+    (transcriptHasBuildOutcome ? 'ended' : null)
 
   return { url, status }
 }

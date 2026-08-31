@@ -33,6 +33,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { ArrowLeft, Pencil, Check, X, MoreVertical } from 'lucide-react'
 import { Badge } from '../components/ui/badge'
+import { useWorkspaceProject } from '../components/workspace/workspaceChannel'
 import ProjectBuilder from '../components/projects/ProjectBuilder'
 import ProjectDescriptionEditor from '../components/projects/ProjectDescriptionEditor'
 import DeployControl from '../components/DeployControl'
@@ -69,6 +70,12 @@ function narrowChat(row: unknown): ChatSummary {
 
 export default function ProjectPage() {
   const { projectId } = useParams()
+  // WHICH PROJECT THE WORKSPACE IS SHOWING. Declared above the early returns below, because the
+  // loading and load-error branches are still this project's screen. A held preview address outlives
+  // the conversation that published it, and this is the only thing that can retire a stale one — the
+  // surface that says nothing leaves the previous project's app framed, invisibly, with nothing able
+  // to notice. Costs one call and no request.
+  useWorkspaceProject(projectId ?? null)
   const navigate = useNavigate()
 
   const [project, setProject] = useState<Project | null>(null)
