@@ -192,6 +192,41 @@ describe('AppPaneHost — the frame outlives a move between the two addresses (A
   })
 })
 
+describe('AppPaneHost — which column grows, and which one is sized', () => {
+  // THE REGRESSION THIS EXISTS TO CATCH, and jsdom cannot measure a pixel of it. The two columns
+  // are the conversation and the app. Before the extraction the builder surface owned both, so its
+  // 288px chat panel sat beside a `flex-1` preview. Split across the shell's grid with BOTH columns
+  // at `flex-1`, the workspace halves: the panel keeps its 288px inside a column twice its width
+  // and the app loses half the screen it had. Nothing in the unit suite would have said a word.
+  const outlet = () => screen.getByTestId('workspace-outlet')
+
+  it('with the pane visible, the conversation column is sized by its content and the pane takes the rest', () => {
+    render(<Workspace chatSurface={<ChatSurface />} />)
+
+    expect(outlet().className).not.toMatch(/flex-1/)
+    expect(paneWrapper()?.className).toMatch(/flex-1/)
+  })
+
+  it('with nothing asking for the pane, the conversation column IS the whole surface', () => {
+    // Every planning conversation, and the project screen before Plan F.
+    render(<Workspace chatSurface={<ChatSurface visible={false} />} />)
+
+    expect(outlet().className).toMatch(/flex-1/)
+    expect(paneWrapper()?.className).toMatch(/w-0/)
+  })
+
+  it('and the split follows the pane back and forth across a navigation', () => {
+    render(<Workspace chatSurface={<ChatSurface />} />)
+    expect(outlet().className).not.toMatch(/flex-1/)
+
+    fireEvent.click(screen.getByText('to project'))
+    expect(outlet().className).toMatch(/flex-1/)
+
+    fireEvent.click(screen.getByText('to chat'))
+    expect(outlet().className).not.toMatch(/flex-1/)
+  })
+})
+
 describe('AppPaneHost — a hidden pane is genuinely inert, at shell level', () => {
   // ASSERTED HERE AND NOT IN `ProjectPage.test.tsx`, ON PURPOSE. That suite renders the project
   // page with no shell and stubs `LivePreview` to null, so its `queryByTestId('live-preview')`

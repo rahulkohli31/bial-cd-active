@@ -51,6 +51,7 @@ import {
   WorkspaceChannelProvider,
   createWorkspaceChannel,
   useRailSlot,
+  useWorkspacePaneVisible,
   useWorkspaceReclaim,
   useWorkspaceSaveState,
 } from './workspaceChannel'
@@ -126,6 +127,18 @@ function ReclaimSlot() {
 function ShellFrame() {
   useUnsavedWorkWarning()
   const rail = useRailSlot()
+  // WHICH COLUMN GROWS, and it is not a cosmetic choice. The two columns are the conversation and
+  // the app, and the conversation is the SIZED one whenever the app is on screen: the builder
+  // surface's chat panel sets its own 288px and the pane takes everything left over, which is
+  // exactly the split the product has today. Leaving the outlet column at `flex-1` alongside a
+  // `flex-1` pane splits the workspace in half and strands the panel in a column twice its width.
+  //
+  // When nothing wants the pane — the project screen before Plan F, and every planning
+  // conversation — the outlet column grows instead, because then it IS the whole surface.
+  //
+  // Plan F's rail supplies its own two settled widths the same way, so this stays one rule rather
+  // than becoming a per-mode table here.
+  const paneVisible = useWorkspacePaneVisible()
 
   return (
     <div className="h-screen flex flex-col font-manrope bg-bial-bg overflow-hidden">
@@ -141,7 +154,10 @@ function ShellFrame() {
       >
         {/* The outlet column: the project surface or the chat surface. A flex child that may not
             overflow the frame — each surface declares its own scroller inside it. */}
-        <div className="flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden">
+        <div
+          data-testid="workspace-outlet"
+          className={`min-w-0 min-h-0 flex flex-col overflow-hidden ${paneVisible ? '' : 'flex-1'}`}
+        >
           <Outlet />
         </div>
         {/* The pane column — a SIBLING of the Outlet, which is what stops any route change from
