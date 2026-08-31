@@ -20,6 +20,7 @@ import { markAppVisible } from '../utils/observe'
 import { describeSaveFailure, describeModeSwitchFailure, isConversationGone } from '../utils/chatErrors'
 import { readDraft, writeDraft, clearDraft } from '../utils/composerDraft'
 import { resolvePreviewAddress } from '../utils/previewAddress'
+import { HIDDEN_BUT_MOUNTED } from '../components/workspace/hiddenSubtree'
 import {
   useAppPaneVisible,
   usePublishAddress,
@@ -2281,19 +2282,18 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     <>
       <div className="flex flex-1 min-h-0 overflow-hidden">
         {/* Chat panel — stays mounted when collapsed (CSS width:0), so the composer draft and
-            scroll position survive a hide/show cycle rather than resetting on remount.
-            `invisible` (not just `w-0 overflow-hidden`) is load-bearing: zero width and
-            overflow:hidden clip the panel visually but do NOT remove its descendants from the
-            tab order, so `aria-hidden` alone left the composer/Send/attach controls keyboard-
-            reachable while collapsed — a WCAG 4.1.2 violation. `visibility:hidden` drops the
-            whole subtree from both the tab order and the accessibility tree while staying
-            mounted, so the draft/scroll preservation below is unaffected. */}
+            scroll position survive a hide/show cycle rather than resetting on remount. The
+            hidden-but-mounted treatment itself comes from `HIDDEN_BUT_MOUNTED`, which carries the
+            WCAG reasoning: zero width and overflow:hidden clip the panel visually but do NOT
+            remove its descendants from the tab order, so `aria-hidden` alone left the
+            composer/Send/attach controls keyboard-reachable while collapsed. This surface is that
+            constant's first caller; Plan F's rail modes are its second. */}
         <div
           id="chat-panel"
           data-testid="chat-panel"
           aria-hidden={chatCollapsed}
           className={`flex flex-col bg-white border-r border-bial-border flex-shrink-0 overflow-hidden transition-[width] duration-200 ${
-            chatCollapsed ? 'w-0 border-r-0 invisible' : 'w-72 xl:w-80'
+            chatCollapsed ? `w-0 border-r-0 ${HIDDEN_BUT_MOUNTED}` : 'w-72 xl:w-80'
           }`}
         >
           {/* Chat header: back-navigation + project name ONLY (F7/F10). The redundant in-rail

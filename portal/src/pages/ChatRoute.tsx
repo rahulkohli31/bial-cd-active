@@ -32,8 +32,7 @@
  */
 import { useEffect, useRef, useState } from 'react'
 import { Navigate, useLocation, useParams, useSearchParams } from 'react-router-dom'
-import ChatPage from './ChatPage'
-import BuilderPage from './BuilderPage'
+import ConversationSlot from '../components/workspace/ConversationSlot'
 import { getConversation } from '../utils/conversationApi'
 import { getProject } from '../utils/projectApi'
 import { markChatOpened } from '../utils/observe'
@@ -197,28 +196,32 @@ export default function ChatRoute() {
   // a chat the app id of a DIFFERENT project: this component stays mounted across chat
   // navigations, so a stale `project` would otherwise outlive the chat it was read for.
   const resolved = project !== null && project.id === resolution.projectId ? project : null
-  const shared = {
-    chatId: resolution.chatId,
-    projectId: resolution.projectId,
-    projectName: resolved?.name ?? null,
-    // Finding #1: the builder's Relaunch affordance derives from PROJECT-level state, so a
-    // fresh conversation in a project with a saved build can still restore its preview.
-    //
-    // N7: what travels is whether a Relaunch would actually FIND something — not `appId`.
-    // The app row is minted by provision, before anything is built, so keying the claim on
-    // its existence advertised a saved build for every project whose first build failed.
-    // `null` while the project is still resolving is the same "cannot say" the server sends,
-    // and it withholds the claim rather than guessing.
-    //
-    // R18: the server now answers this from the recovery copy OR the saved bundle (the pair a
-    // restore actually consults), so the builder who never pressed Save is offered their work
-    // back. This is the COLD-LOAD value; once the preview poll lands, BuilderPage prefers its
-    // `restorable`, which is the same predicate asked more recently.
-    projectHasSavedBuild: resolved?.hasRelaunchableSnapshot ?? null,
-  }
-  return resolution.kind === 'builder' ? (
-    <BuilderPage {...shared} />
-  ) : (
-    <ChatPage {...shared} />
+  // THE KIND BRANCH MOVED, IT DID NOT GO AWAY. This route still resolves the conversation and now
+  // hands the resolution — kind included — to the one slot that mounts a body for it, so the
+  // largest kind comparison in the product has exactly one home instead of being the reason two
+  // page components exist. Plan D deletes it from the slot when the unified surface lands.
+  return (
+    <ConversationSlot
+      conversation={{
+        chatId: resolution.chatId,
+        kind: resolution.kind,
+        projectId: resolution.projectId,
+        projectName: resolved?.name ?? null,
+        // Finding #1: the builder's Relaunch affordance derives from PROJECT-level state, so a
+        // fresh conversation in a project with a saved build can still restore its preview.
+        //
+        // N7: what travels is whether a Relaunch would actually FIND something — not `appId`.
+        // The app row is minted by provision, before anything is built, so keying the claim on
+        // its existence advertised a saved build for every project whose first build failed.
+        // `null` while the project is still resolving is the same "cannot say" the server sends,
+        // and it withholds the claim rather than guessing.
+        //
+        // R18: the server now answers this from the recovery copy OR the saved bundle (the pair a
+        // restore actually consults), so the builder who never pressed Save is offered their work
+        // back. This is the COLD-LOAD value; once the preview poll lands, BuilderPage prefers its
+        // `restorable`, which is the same predicate asked more recently.
+        projectHasSavedBuild: resolved?.hasRelaunchableSnapshot ?? null,
+      }}
+    />
   )
 }

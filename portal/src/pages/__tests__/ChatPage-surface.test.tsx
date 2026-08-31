@@ -1,26 +1,26 @@
 /**
- * CHARACTERIZATION — the planning surface as it behaves today (Plan A, U1).
+ * The planning surface: its composer draft, and its context guardrail (Plan A — U1, then U5).
  *
- * Two things are recorded here and they are recorded for opposite reasons.
+ * Two things live here and they arrived for opposite reasons.
  *
- * THE DRAFT, WRITTEN DOWN AS THE DEFECT IT IS. R72 asks for one conversation surface whose draft
- * survives the same way in each kind. It does not today: the builder surface keeps its text in
- * `composerDraft`'s `sessionStorage` store (`BuilderPage.tsx:785`/`:1512`/`:2478`), while the
- * planning surface holds it only in assistant-ui's in-memory external-store composer and CLEARS it
- * on every chat change *including the first mount after a reload* (`ChatPage.tsx:226`). So a
- * planning draft dies on a reload and on a round trip to a sibling chat.
+ * THE DRAFT WAS WRITTEN DOWN IN U1 AS THE DEFECT IT WAS, AND U5 FLIPPED IT. R72 asks for one
+ * conversation surface whose draft survives the same way in each kind, and it did not: the builder
+ * surface kept its text in `composerDraft`'s `sessionStorage` store, while this surface held it
+ * only in assistant-ui's in-memory composer and cleared it on every chat change INCLUDING the
+ * first mount after a reload — so a planning draft died on a reload and on a round trip to a
+ * sibling chat. Both scenarios were written first as the losses they were, precisely so the fix
+ * would land in review as a diff on an expectation rather than as a silently rewritten one. They
+ * read as gains now, and the diff that made them so is one line in the hydration effect plus the
+ * three sites that keep the store in step with the composer.
  *
- * These two scenarios are written AS THEY ARE, deliberately, so that U5's change to them shows up
- * in review as a diff on an expectation rather than as a silently rewritten one. U5 is the only
- * unit permitted to flip them, and it says so.
- *
- * THE CONTEXT GUARDRAIL, WRITTEN DOWN AS THE THING U6 MUST NOT TAKE WITH IT. At `ctxLevel ===
- * 'full'` the send is a hard stop (`ChatPage.tsx:488`) whose ONLY escape is the two "start a new
- * chat" controls — and those call `handleNewChat`, which is also the sidebar's New Chat button.
- * U6 deletes the sidebar. Deleting the handler with it would leave a planning conversation
- * permanently unsendable, with copy still telling the reader to start a new chat and no control to
- * do it. That is the dead-UI removal trace inverted: the control gone and the sentence left. These
- * scenarios must stay green through U6 unchanged.
+ * THE CONTEXT GUARDRAIL IS HERE AS THE THING U6 MUST NOT TAKE WITH THE SIDEBAR. At
+ * `ctxLevel === 'full'` the send is a hard stop whose ONLY escape is the two "start a new chat"
+ * controls — and those call `handleNewChat`, which is also the sidebar's New Chat button. Deleting
+ * the handler along with the sidebar would leave a planning conversation permanently unsendable,
+ * with copy still telling the reader to start a new chat and no control to do it: the dead-UI
+ * removal trace inverted, the control gone and the sentence left. These scenarios stay green
+ * through U6 unchanged, and their queries are scoped to the banner so that they cannot have been
+ * passing on the sidebar's button all along.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup, within } from '@testing-library/react'
@@ -110,12 +110,20 @@ beforeEach(() => {
 })
 afterEach(() => cleanup())
 
-describe('ChatPage — the composer draft, as it behaves TODAY (U5 changes both of these)', () => {
-  it('a typed draft is LOST on a reload', async () => {
+describe('ChatPage — the composer draft, now the same store the builder surface uses (U5)', () => {
+  // THE ONE DELIBERATE BEHAVIOUR CHANGE IN AN OTHERWISE BEHAVIOUR-PRESERVING PLAN, and the two
+  // expectations below are where it shows. Both were written in U1 as the losses they were, so the
+  // change reads as a diff on an expectation rather than as a silently rewritten one.
+  //
+  // The mechanism was one line: the hydration effect cleared the composer on every chat change
+  // INCLUDING the first mount after a reload, so a cold open blanked a composer that had nothing
+  // in it yet and a planning draft could never survive anything. It reads this chat's own stored
+  // draft now — `sessionStorage`, keyed per conversation, cleared only on a successful send, which
+  // is the contract the builder surface has had all along.
+  it('a typed draft SURVIVES a reload', async () => {
     // The reload is modelled the only way a jsdom test can model one: unmount everything and mount
-    // the same URL again with nothing carried over but storage. That is exactly what a reload is
-    // for this page — assistant-ui's composer store is in-memory, so it starts empty either way,
-    // and `ChatPage.tsx:226` then clears it again on the first hydration.
+    // the same URL again with nothing carried over but storage — which is exactly what a reload is
+    // for this page, since assistant-ui's composer store is in-memory either way.
     const first = renderChat('/chat/chat-1')
     await screen.findByText(/Plan your next app/i)
     fireEvent.change(composer(), { target: { value: 'a visitor pass tracker' } })
@@ -125,12 +133,10 @@ describe('ChatPage — the composer draft, as it behaves TODAY (U5 changes both 
     renderChat('/chat/chat-1')
     await screen.findByText(/Plan your next app/i)
 
-    // TODAY: gone. U5 makes this survive by reading `composerDraft` for the routed chat instead of
-    // clearing unconditionally, and flips this expectation.
-    expect(composer().value).toBe('')
+    await waitFor(() => expect(composer().value).toBe('a visitor pass tracker'))
   })
 
-  it('a typed draft is LOST on a round trip to a sibling conversation', async () => {
+  it('each conversation shows its OWN draft across a round trip, and neither sees the other\'s', async () => {
     h.listProjectConversations.mockResolvedValue([
       { id: 'chat-1', kind: 'planning', title: 'First', updatedAt: new Date().toISOString() },
       { id: 'chat-2', kind: 'planning', title: 'Second', updatedAt: new Date(Date.now() - 1000).toISOString() },
@@ -144,14 +150,55 @@ describe('ChatPage — the composer draft, as it behaves TODAY (U5 changes both 
 
     fireEvent.click(screen.getByText('Second'))
     await waitFor(() => expect(h.getConversation).toHaveBeenCalledWith('chat-2'))
-    expect(composer().value).toBe('') // correct in both directions: chat-1's text must not leak here
+    // The half that was already correct, and the half a shared store is most likely to break:
+    // chat-1's text must not leak into chat-2.
+    expect(composer().value).toBe('')
+    fireEvent.change(composer(), { target: { value: 'something else entirely' } })
 
     fireEvent.click(screen.getByText('First'))
     await waitFor(() => expect(h.getConversation).toHaveBeenCalledWith('chat-1'))
 
-    // TODAY: chat-1's own text is gone too, because the clear is unconditional. U5 makes each
-    // conversation show its own draft, which is the half of this the builder surface already has.
-    expect(composer().value).toBe('')
+    await waitFor(() => expect(composer().value).toBe('a visitor pass tracker'))
+  })
+
+  it('a send clears the draft; a send that fails to upload keeps it', async () => {
+    // The store moves with the composer in both directions. A failed send is exactly when the text
+    // is worth most, and an uncleared draft after a SUCCESSFUL one would re-populate the composer
+    // with the message just sent — easy to send twice by accident.
+    h.sendMessage.mockResolvedValue('ok')
+    renderChat('/chat/chat-1')
+    await screen.findByText(/Plan your next app/i)
+
+    fireEvent.change(composer(), { target: { value: 'a visitor pass tracker' } })
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalled())
+    expect(sessionStorage.getItem('draft:chat-1')).toBeNull()
+
+    // …and a failure puts it back, so a reload after one does not lose the message.
+    h.createConversation.mockClear()
+    fireEvent.change(composer(), { target: { value: 'and a chart' } })
+    expect(sessionStorage.getItem('draft:chat-1')).toBe('and a chart')
+  })
+
+  it('storage that throws costs the draft and nothing else', async () => {
+    // The documented-optional case, not a swallowed error: `sessionStorage` genuinely throws
+    // rather than degrading (Safari private mode on quota, any embedding that blocks storage), and
+    // losing a draft is not worth taking the conversation down with it.
+    const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new Error('QuotaExceededError')
+    })
+    try {
+      renderChat('/chat/chat-1')
+      await screen.findByText(/Plan your next app/i)
+
+      fireEvent.change(composer(), { target: { value: 'a visitor pass tracker' } })
+
+      // In memory, on screen, and the surface is still alive around it.
+      expect(composer().value).toBe('a visitor pass tracker')
+      expect(screen.getByRole('button', { name: /send message/i })).toBeTruthy()
+    } finally {
+      setItem.mockRestore()
+    }
   })
 })
 

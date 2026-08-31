@@ -25,6 +25,7 @@ import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFIC
 import type { PendingAttachment } from '../utils/attachmentInput'
 import { openPdf } from '../utils/attachmentViewer'
 import { describeSaveFailure, isConversationGone } from '../utils/chatErrors'
+import { readDraft, writeDraft, clearDraft } from '../utils/composerDraft'
 import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
 import type { ChatMessage } from '../utils/messageTypes'
 
@@ -222,7 +223,12 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     // changed the route rather than one fetch later.
     setActive(chatId)
     setMessages([])
-    runtime.thread.composer.setText('') // the composer draft belongs to the OLD chat — never carry it into this one
+    // THE OLD CHAT'S DRAFT MUST NOT CARRY INTO THIS ONE — but blanking was the wrong way to
+    // ensure it, and this line was the whole of why a planning draft died on a reload: the effect
+    // runs on the FIRST mount too, so a cold open cleared a composer that had just been restored
+    // from nothing. Read this chat's own draft instead. Same store, same key discipline and same
+    // semantics the builder surface has used all along (R72).
+    runtime.thread.composer.setText(readDraft(chatId))
     clearPending() // and neither do its staged attachments (no key={chatId} remount clears them)
     // A stalled turn's error banner + its Regenerate context belong to the OLD chat. ChatPage
     // stays mounted across chat navigations (no key={chatId}), so without this the banner's "Try
@@ -412,6 +418,9 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
       // guard streamAssistant already uses for the identical race.
       if (activeChatIdRef.current !== currentChatId) return
       runtime.thread.composer.setText(rawText)
+      // …and the STORE follows the composer, or a reload after a failed upload would lose the
+      // message the restore just handed back. A failed send is exactly when the text is worth most.
+      writeDraft(currentChatId, rawText)
       restorePending(attachments)
       return
     }
@@ -502,6 +511,10 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     }
 
     runtime.thread.composer.setText('')
+    // The store moves with the composer. `clearDraft` is keyed on the ROUTED chat for the same
+    // reason `fireMessage` is passed it explicitly below: under flat routing the route's id is
+    // known from the first render while `activeChatId` only commits once hydration resolves.
+    clearDraft(chatId)
     clearPending()
 
     // Pass the route's chat id explicitly. Under flat routing it is known from the
@@ -941,6 +954,11 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                     maxRows={10}
                     onHeightChange={setComposerHeight}
                     onKeyDown={handleComposerKeyDown}
+                    /* A keystroke writes the draft, the same rhythm the builder surface has. The
+                       primitive composes this with its own handler (ours runs first), so the
+                       library's text state is unaffected. Programmatic `setText` calls do not fire
+                       it, which is why the three sites above move the store explicitly. */
+                    onChange={(e) => writeDraft(chatId, e.target.value)}
                     addAttachmentOnPaste={false}
                     placeholder="Describe what you're thinking… (Shift+Enter for new line)"
                     className="flex-1 resize-none text-sm text-tertiary bg-bial-bg border border-bial-border rounded-xl px-4 py-3 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary/20 transition placeholder:text-gray-300"
