@@ -457,6 +457,11 @@ export interface PreviewState {
   /** `slot_taken` only, and null when the server could not attribute the live container to
    *  any project of this user's — naming the wrong project is worse than naming none. */
   occupyingProjectName: string | null
+  /** The id behind that name, and the REMEDY's only input: "another project holds your
+   *  workspace" is a dead end without something to navigate to. Goes missing WITH the name and
+   *  for the same reason — the server withholds the whole attribution rather than guessing, so
+   *  a surface that has one and not the other is reading a body this parser did not produce. */
+  occupyingProjectId: string | null
   /** TRI-STATE, exactly like `SaveState.dirty`: `true` = the server could restore this app
    *  from the recovery copy or the saved bundle, `false` = confirmed it could not, `null` =
    *  NO CLAIM, so the UI promises nothing and keeps whatever it already knew. Two ways to
@@ -503,6 +508,7 @@ export async function fetchPreviewState(
       alive: false,
       previewUrl: null,
       occupyingProjectName: null,
+      occupyingProjectId: null,
       restorable: null,
     }
   }
@@ -513,6 +519,11 @@ export async function fetchPreviewState(
     previewUrl: typeof body.previewUrl === 'string' ? body.previewUrl : null,
     occupyingProjectName:
       typeof body.occupyingProjectName === 'string' ? body.occupyingProjectName : null,
+    // Same discipline as the name beside it: anything that is not literally a string is
+    // `null`, never coerced. A number, an object or an empty-ish value would otherwise become
+    // a route the go-to action navigates into and 404s on.
+    occupyingProjectId:
+      typeof body.occupyingProjectId === 'string' ? body.occupyingProjectId : null,
     // Anything that is not literally a boolean stays UNKNOWN — the same rule `dirty` follows,
     // and for the same reason: coercing here is how a missing field becomes a false promise.
     restorable: typeof body.restorable === 'boolean' ? body.restorable : null,
