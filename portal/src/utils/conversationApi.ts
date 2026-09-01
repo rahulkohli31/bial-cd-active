@@ -91,7 +91,43 @@ function normalizeHeader(doc: unknown): ConversationHeader | null {
  * rendering one. */
 type RawProjectionItem = { type: string; seq: number } & Record<string, unknown>
 
-export function messagesFromProjection(projection: RawProjectionItem[] | undefined): ChatMessage[] {
+/**
+ * Projection types that are KNOWN and deliberately render nothing.
+ *
+ * The distinction this set draws is the whole point of the fallback arm below. `turn_terminal` is
+ * a durable record of HOW a turn ended, carrying no prose and drawing no element — its silence is
+ * a decision. An item type nobody has ever heard of is not a decision; it is a client that has
+ * fallen behind its server, and the two must not look the same from here.
+ */
+const KNOWN_UNRENDERED = new Set(['turn_terminal'])
+
+/**
+ * What happens when the projection carries a type this client does not know.
+ *
+ * DELIBERATELY NOT A THROW, and deliberately not a rendered message either. A throw would take a
+ * whole transcript down because the server shipped one new item kind ahead of the browser, which
+ * is a routine deployment order. A rendered message would put platform-internal text in a
+ * citizen's chat, which is exactly what R36 forbids. So the item is surfaced to DEVELOPERS, loudly,
+ * and the transcript renders everything it does understand.
+ */
+export function reportUnknownProjectionItem(item: RawProjectionItem): void {
+  console.error(
+    `[conversationApi] Unknown projection item type "${item.type}" at seq ${item.seq} — dropped. ` +
+      `A new server projection arm needs a matching arm here, or this content is invisible to ` +
+      `every reader of a reloaded transcript.`,
+    item,
+  )
+}
+
+/**
+ * @param onUnknown Injected so a test can assert the surfaced item rather than scrape the console.
+ *   A parameter with a default rather than module state: every existing call site is unchanged and
+ *   two tests running in parallel cannot see each other's handler.
+ */
+export function messagesFromProjection(
+  projection: RawProjectionItem[] | undefined,
+  onUnknown: (item: RawProjectionItem) => void = reportUnknownProjectionItem,
+): ChatMessage[] {
   const messages: ChatMessage[] = []
   // THE KEY CARRIES THE ITEM'S POSITION, not just its seq (N3). One `messages` row can project
   // SEVERAL items — an assistant turn with two text parts, a row that yields both a step and a
@@ -187,6 +223,16 @@ export function messagesFromProjection(projection: RawProjectionItem[] | undefin
         parts: [{ type: 'build_in_progress', sessionId: item.sessionId as string }],
         seq: item.seq,
       })
+    } else if (!KNOWN_UNRENDERED.has(item.type)) {
+      // THE LOUD FALLBACK ARM (L4). Until this existed the chain simply ended, so an item type
+      // this client did not recognise vanished with no error, no warning and no trace — on the
+      // one path a reloaded transcript is rebuilt from. That is the four-edit change no compiler
+      // enforces, on the path this plan makes load-bearing for BOTH kinds of chat.
+      //
+      // A known-and-deliberately-silent type (`turn_terminal`) takes neither branch and stays
+      // silent, because "we decided this draws nothing" and "we have never heard of this" are
+      // different facts and only the second is a bug.
+      onUnknown(item)
     }
   }
   return messages
