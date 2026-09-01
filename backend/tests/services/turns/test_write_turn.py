@@ -75,6 +75,7 @@ from src.services.turns.copy import (
     COULD_NOT_CONFIRM_TEXT,
     DID_NOT_COME_TOGETHER_TEXT,
     KEPT_A_COPY,
+    SPENT_ENOUGH_TEXT,
     STILL_SHOWING_EARLIER,
     STILL_SHOWING_NOTHING,
     STILL_SHOWING_TEMPLATE,
@@ -2429,3 +2430,66 @@ async def test_an_unclassified_command_says_nothing_about_its_argv(_fresh_engine
         assert token not in frame.item.label
         assert token not in restated
     await engine._drain_long_operations(state)
+
+
+# --- U13 / R91: the spend bound, end to end -------------------------------------------------
+
+
+async def test_a_build_that_reaches_the_spend_bound_ends_saying_the_app_works(
+    _fresh_engine,
+    db_session,
+    session_factory,
+    fake_redis: aioredis.Redis,
+    fake_storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ AE47 / R91 — the bound fires inside the loop, before a request, and ends the turn.
+
+    THE SEAM IS THE POINT. It is checked at the same place the daily quota is: inside the node
+    loop, before the model request fires, where the run's accumulated spend is already known and
+    nothing can route around it. A check anywhere else — at the top of the turn, or in the
+    `finally` — either fires before there is anything to measure or fires after the money is
+    spent.
+
+    The bound is compressed to ZERO rather than spent for real: what is under test is "the loop
+    stops when the number is reached, before it asks for anything more, and says so" — not the
+    specific number, which is a named constant precisely so a test need not burn it. Zero also
+    makes the placement claim unambiguous, because a check anywhere after the request would let
+    one through.
+
+    Mutation check: move the check below `node.stream(...)` and this goes red on the request
+    count — the model gets one more turn after the bound was already reached."""
+    monkeypatch.setattr(engine_module, "RUN_TOKEN_BUDGET", 0)
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "rb1@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+    model, counts = _scripted([[_WROTE_A_FILE, _DECLARED_DONE]])
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+        expects_mutation=True,
+    )
+
+    # THE ENDING IS A NAMED ONE, not a crash — it travels the same route every other bounded
+    # ending on this path travels: `error_message` plus a `TurnErrorFrame`, so the client draws
+    # a banner rather than a generic failure.
+    assert state.status == "failed"
+    assert state.error_message is not None
+    assert SPENT_ENOUGH_TEXT.split("{")[0].strip() in state.error_message
+    assert "working" in state.error_message  # the app survives the bound, and it says so
+    # WHICH BOUND FIRED IS IN THE RECORD, and only in the record: the citizen reads one ending
+    # whichever of the three ceilings ended the turn, because the next move is the same either
+    # way and no word for an internal ceiling belongs in front of them.
+    assert state.end_reason == "run_budget_reached"
+    assert "budget" not in state.error_message.lower()
+    # And it did not spend a request it had no budget for: the bound is checked BEFORE the
+    # model is asked, so the very first request never fires.
+    assert counts["requests"] == 0

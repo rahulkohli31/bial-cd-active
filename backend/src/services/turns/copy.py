@@ -315,3 +315,25 @@ So the claim is keyed on something the platform DOES hold: whether the workspace
 Marks and no touch, marks and touch, no marks and no touch are all answerable. No marks and
 work landed is not, and this is what it says instead. The same tri-state discipline the
 workspace note keeps, where "could not tell" is never collapsed into a verdict."""
+
+
+SPENT_ENOUGH_TEXT: Final = (
+    "This one has taken as much as I want to spend on it in a single go, {kept}. "
+    "Your app is working — have a look, and send me the next bit when you are ready."
+)
+"""R91 — how a turn ends when it reaches the platform's spend bound.
+
+IT DOES NOT NAME A BOUND, AND THAT IS DELIBERATE. Three internal ceilings can end a run —
+requests, wall clock, spend — and which one fired is not something a citizen can act on
+differently: the next move is the same message either way. Naming one would also run straight
+into this module's own register rule, since "token budget", "request limit" and "wall clock"
+are all words for the platform's problem rather than theirs. Which bound fired is in the record
+and the logs, where the person who can act on it will look.
+
+"AS MUCH AS I WANT TO SPEND" rather than "you have run out". The citizen has not done anything
+wrong and has not hit a limit of their own — the daily budget is a different sentence, and
+confusing the two would tell them to wait until midnight when they can carry on right now.
+
+IT SAYS THE APP IS WORKING, because that is what the piece-at-a-time ordering buys and it is
+the fact that makes this ending survivable. `{kept}` is filled by the same securing function
+the daily-budget ending uses, so the reassurance is conditional on a copy actually landing."""

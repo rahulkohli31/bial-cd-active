@@ -33,6 +33,30 @@ MODEL_TURN_CEILING = 50
 within-run tool-call loop can't run away (a breach raises `UsageLimitExceeded` → escalation).
 Distinct from the daily token quota (per-user, DB) and the self-heal budget (KD-7)."""
 
+RUN_TOKEN_BUDGET = 750_000
+"""Hard SPEND ceiling on a single build turn, the third of three bounds on one loop (R91).
+
+WHY A THIRD ONE. `MODEL_TURN_CEILING` bounds requests and `RUN_WALL_CLOCK_DEADLINE_S` bounds
+elapsed time, and a build can stay inside both while spending a fortune: fifty requests carrying
+a large context are cheap in count and in seconds and expensive in tokens. The citizen can see
+the meter and the agent cannot, so the platform is the only party that can hold this line —
+which is exactly why it is a number here and not a sentence in a prompt.
+
+MEASURED ON `RunUsage.total_tokens`, WHICH EXCLUDES CACHE READS, and that exclusion is the
+point rather than an accident. This loop re-sends the same instructions and tool definitions
+verbatim on every step behind a cache breakpoint; counting those reads would make the bound a
+function of how many steps a build took rather than of how much work it did, and would punish
+the caching that makes long builds affordable.
+
+SIZED AGAINST A REAL TRACE, not chosen for roundness: the 2026-08-18 demo build spent ~938k
+tokens, of which about 65% was rework after an in-place container reset. 750k leaves room for a
+substantial legitimate build and stops the runaway shape that trace showed. Like the wall clock
+above, it is a safety net rather than a tuned SLA — TUNE it against real build telemetry.
+
+IT ENDS THE TURN WHERE THE APP WORKS, which is what makes it usable at all. The piece-at-a-time
+ordering (`FIRST_SLICE_RULE`) is what buys that: stopping happens at a piece boundary rather
+than mid-file, and the ending names what was agreed and not built."""
+
 RUN_WALL_CLOCK_DEADLINE_S = 1800.0
 """Hard WALL-CLOCK ceiling on a single `run_build`, independent of the count-based ceilings
 (`MODEL_TURN_CEILING`, `SELF_HEAL_MAX_RETRIES`). Those cap the number of model requests and repair

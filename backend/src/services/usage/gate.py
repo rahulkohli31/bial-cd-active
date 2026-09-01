@@ -288,8 +288,10 @@ class AtLimitEnding:
     work_is_secured: bool
 
 
-async def at_limit_ending(workspace: SecurableWorkspace | None) -> AtLimitEnding:
-    """Make the citizen's work durable, THEN tell them their budget is gone (R31, AE18).
+async def at_limit_ending(
+    workspace: SecurableWorkspace | None, *, sentence: str | None = None
+) -> AtLimitEnding:
+    """Make the citizen's work durable, THEN tell them why the turn is ending (R31, AE18, R91).
 
     THE ORDER IS THE POINT. What this replaces told the user "your changes are still in the
     workspace — click Save to keep them", which secured nothing and asserted something nobody
@@ -315,6 +317,17 @@ async def at_limit_ending(workspace: SecurableWorkspace | None) -> AtLimitEnding
     the cap too, and it has nothing to secure. That is the one case where the reassurance is
     withheld without anything having gone wrong, which is why the wording of
     `COULD_NOT_KEEP_A_COPY` asks the reader to save rather than announcing a fault.
+
+    ★ TWO ENDINGS, ONE SECURING PATH, AND THAT IS WHY `sentence` IS A PARAMETER (U13/R91). The
+    per-run spend bound has to end a turn exactly the way the daily budget does — copy taken
+    here, on the way out of the model loop, confirmed before the turn's `finally` pardons the
+    container — and it says something different when it gets there. Writing a second function
+    to do that would put a second snapshot→teardown ordering on the one path in this codebase
+    where getting the ordering wrong loses a citizen's tree.
+
+    So the caller passes its own `copy.py` constant and everything above stays exactly as it
+    is. `sentence` must carry a `{kept}` field and nothing else; omitting it keeps the daily
+    budget's own wording, which also keeps that path's bytes unchanged by this refactor.
     """
     # FUNCTION-SCOPED FOR THE PACKAGE CYCLE, exactly as `orchestrator/selfheal.py` documents its
     # own. `src.services.build_sessions.__init__` reaches `manager` → `appdata` →
@@ -327,9 +340,11 @@ async def at_limit_ending(workspace: SecurableWorkspace | None) -> AtLimitEnding
     from src.services.build_sessions.snapshot import RecoveryOutcome, write_recovery_copy
     from src.services.turns.copy import AT_LIMIT_TEXT, COULD_NOT_KEEP_A_COPY, KEPT_A_COPY
 
+    template = AT_LIMIT_TEXT if sentence is None else sentence
+
     def _say(*, secured: bool) -> AtLimitEnding:
         return AtLimitEnding(
-            message=AT_LIMIT_TEXT.format(
+            message=template.format(
                 kept=KEPT_A_COPY if secured else COULD_NOT_KEEP_A_COPY,
                 # A PLAIN ADDRESS, not a `mailto:` URI. This sentence is read as text in the
                 # banner above the composer, and a URI scheme printed mid-sentence is the exact

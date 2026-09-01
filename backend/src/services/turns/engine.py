@@ -137,6 +137,7 @@ from src.services.orchestrator.constants import (
     MODEL_TURN_CEILING,
     READINESS_MAX_POLLS,
     READINESS_POLL_S,
+    RUN_TOKEN_BUDGET,
     RUN_WALL_CLOCK_DEADLINE_S,
     SELF_HEAL_MAX_RETRIES,
     TEMPERATURE,
@@ -166,6 +167,7 @@ from src.services.turns.copy import (
     PLAN_NOT_KEPT_TEXT,
     RECOVERED_TEXT,
     REMAINDER_TEXT,
+    SPENT_ENOUGH_TEXT,
     STILL_SHOWING_EARLIER,
     STILL_SHOWING_NOTHING,
     STILL_SHOWING_TEMPLATE,
@@ -561,6 +563,11 @@ class _TurnState:
     #: attach seam from `BuildSession.attached`, and read only by R103's numerator — a turn that
     #: started nothing must not be able to report a start that reached a serving page.
     started_a_container: bool = False
+    #: Tokens this turn has spent across every `agent.iter` run it has made (U13/R91). A build
+    #: turn makes several — the first attempt plus each repair round — and the bound is on the
+    #: TURN, because that is the thing that ends and says what remains. `run.usage` covers
+    #: only the run in flight, so finished runs are folded here as they close.
+    tokens_spent: int = 0
     #: What the citizen last agreed to build first (U10/U12). Seeded from the conversation's own
     #: rows at turn start and replaced by any proposal made during the turn — latest wins, the
     #: same rule the offer follows. Empty means nothing was ever proposed, which is the ordinary
@@ -1840,6 +1847,38 @@ class TurnEngine:
                             "quota_exceeded",
                             (await at_limit_ending(state.sandbox)).message,
                         ) from exc
+                    # THE PLATFORM'S OWN BOUND, at the same seam and for the same reason
+                    # (U13/R91). Inside the loop, before the request fires, where the run's
+                    # accumulated spend is already known and nothing can skip it. The citizen
+                    # can see the meter and the agent cannot, so this is the only party that
+                    # can hold the line — and it is a number rather than an instruction
+                    # precisely because an instruction is not a guardrail.
+                    #
+                    # ACROSS THE WHOLE TURN, not one `agent.iter`. A build turn makes several
+                    # runs — the first attempt and each repair round — and a per-run bound
+                    # would reset on every repair, which is the shape that ran away in the
+                    # first place. `state.tokens_spent` carries the closed runs; `run.usage`
+                    # carries the one in flight.
+                    #
+                    # THE SAME SECURING FUNCTION AS THE QUOTA ARM ABOVE, with its own sentence.
+                    # Copy first, then say: this is the one path in the codebase where getting
+                    # that ordering wrong loses a citizen's tree, so there is one function that
+                    # does it and two sentences it can carry.
+                    spent = state.tokens_spent + run.usage.total_tokens
+                    if spent >= RUN_TOKEN_BUDGET:
+                        _log.info(
+                            "run_token_budget_reached",
+                            conversation_id=str(state.conversation_id),
+                            turn_id=str(state.turn_id),
+                            spent=spent,
+                            budget=RUN_TOKEN_BUDGET,
+                        )
+                        raise _WriteEndedError(
+                            "run_budget_reached",
+                            (
+                                await at_limit_ending(state.sandbox, sentence=SPENT_ENOUGH_TEXT)
+                            ).message,
+                        )
                     async with node.stream(run.ctx) as stream:
                         async for event in stream:
                             self._on_event(state, event)
@@ -1928,6 +1967,11 @@ class TurnEngine:
                     persisted_from=persisted_from,
                     session_factory=session_factory,
                 )
+            # FOLD THIS RUN'S SPEND ON THE WAY OUT (U13). Inside the `async with`, so it runs
+            # on the cut-short arm and the completed one alike — a repair round that stopped
+            # early still spent what it spent, and a bound that forgot it would reset on every
+            # repair, which is the runaway shape it exists to stop.
+            state.tokens_spent += run.usage.total_tokens
         return messages
 
     async def _record_write_step(
