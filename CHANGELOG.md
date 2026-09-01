@@ -4,252 +4,195 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.8.0] - 2026-09-01
+> **Pre-releases.** The sandbox-first workspace ships to `main` as one release, `1.7.0`. Until then
+> each wave that lands on `feat/sandbox-first-workspace` is cut as a beta below, and `VERSION`
+> carries the suffix — `1.7.0-beta.N`, then `-rc.N` once only fixes remain. At the merge a dated
+> `1.7.0` section is added above them and tagged `v1.7.0`; the betas stay as the record of how it
+> got there. A version number marks a build, not a merge.
+
+## [1.7.0-beta.3] - 2026-09-01
+
+One chat surface, one publish chip, one agent voice. (#168, #170, #169)
 
 ### Added
 
-- The agent can now say something **while it is working**, instead of only at the end. A build
-  that runs for two minutes used to show a row of finished steps and no words; it can now send
-  a short line as each piece starts or lands — *"Adding the status picker next to your search
-  box now."* The line is bounded by the platform rather than by a request in its instructions,
-  so it stays a line and cannot become an essay.
-- When a single message asks for many separate things, the agent proposes what to build first.
-  The message you read is written by the platform from what the agent found: everything you
-  asked for listed back, the two to four pieces it would start with, why those, and one
-  question. Saying the whole thing back matters — a request for nine things answered with three
+- The agent can now say something **while it is working**, instead of only at the end. A build that
+  runs for two minutes used to show a row of finished steps and no words; it can now send a short
+  line as each piece starts or lands — *"Adding the status picker next to your search box now."*
+  The line is bounded by the platform rather than by a request in its instructions, so it stays a
+  line and cannot become an essay.
+- When a single message asks for many separate things, the agent proposes what to build first:
+  everything you asked for listed back, the two to four pieces it would start with, why those, and
+  one question. Saying the whole thing back matters — a request for nine things answered with three
   reads as a refusal unless you can see all nine were heard.
-- A build now ends by saying **what was agreed and not built**, taken from the list you agreed
-  to rather than from the agent's recollection. Where the platform cannot tell which pieces
-  landed, it says that instead of guessing — it will not tell you finished work is outstanding.
-- A single build is now bounded by what it **spends**, as well as by how many steps it takes and
-  how long it runs. When it reaches that point it stops where the app works, keeps a copy of
-  your work first, and tells you what is left.
+- A build now ends by saying **what was agreed and not built**, taken from the list you agreed to
+  rather than from the agent's recollection. Where the platform cannot tell which pieces landed, it
+  says so instead of guessing.
+- A single build is now bounded by what it **spends**, as well as by how many steps it takes and how
+  long it runs. When it reaches that point it stops where the app works, keeps a copy of your work
+  first, and tells you what is left.
+- **"Take it back."** A version waiting with an administrator can be withdrawn from the chip with
+  one confirmation, so you are not stuck behind a decision that is not yours to make. The chip also
+  shows *when* a version was approved, not only which one.
 
 ### Changed
 
-- **A plan now arrives in five named parts** — what this gives you, what you will see, what the
-  app will remember, what stays exactly as it is, and what was assumed. The fourth is left out
-  entirely for a first build, because there is nothing yet to leave alone. Nothing in a plan
-  names a file, a folder, a framework or a command.
-- The buttons under a plan are now **Build this plan** and **Keep planning**. "Keep refining"
-  was confusing, and the agent, the button and the instructions it reads now use the same two
-  words — an agent telling you to press something the screen does not draw is a broken
-  instruction at the moment you are being asked to decide.
-- **One rule now governs the agent's words in both kinds of chat.** Anything written in the same
-  breath as an action is the agent talking to itself on the way there, and it no longer reaches
-  you in a planning chat either — which is where the 2,397-word reply of file paths came from.
-  The one thing that used to differ, how long a message should be, is now the only thing that
-  does: a plan is as long as it needs to be, and everything else is a couple of lines.
-- The consequence, stated plainly: **a planning answer no longer appears word by word.** It
-  arrives whole when the agent finishes writing it, at the same moment it would have finished
-  arriving before. Build chats have always worked this way.
-- A turn can no longer end with nothing to read. Where the agent said nothing at all, the
-  platform says so itself rather than leaving a screen of finished steps and silence.
-
-### Fixed
-
-- Whether a command is allowed no longer depends on which kind of chat it was typed into. It
-  was already a property of the ability rather than the chat, and that is now proved rather
-  than assumed.
-- Several comments describing how the platform decides things were wrong, and disagreed with
-  each other. The census they were trying to state is now a test that fails when it stops being
-  true, which a comment could never do.
-
-## [1.7.2] - 2026-09-01
-
-### Changed
-
-- **The chat is one screen now.** Planning a change and building it used to be two different
-  pages that looked and behaved differently — different scrolling, a different composer, a
-  different idea of what a message is. There is one surface, and which kind of chat you are in
-  changes the placeholder and nothing else.
-- **What the app is doing is written where it happened.** The build used to narrate itself in a
-  card pinned to the bottom of the screen, which erased and rewrote itself as it went and left
-  nothing behind. The steps now sit in the conversation, in order, grouped by the run they
-  belong to, and they are still there next week. A run that hit a problem says so and opens
-  itself; a run that went cleanly stays collapsed to a single line.
+- **The chat is one screen now.** Planning a change and building it used to be two different pages
+  that looked and behaved differently — different scrolling, a different composer, a different idea
+  of what a message is. There is one surface, and which kind of chat you are in changes the
+  placeholder and nothing else.
+- **What the app is doing is written where it happened.** The build used to narrate itself in a card
+  pinned to the bottom of the screen, which erased and rewrote itself as it went and left nothing
+  behind. The steps now sit in the conversation, in order, grouped by the run they belong to, and
+  they are still there next week. A run that hit a problem says so and opens itself; a clean one
+  stays collapsed to a single line.
 - **Stop moved to the composer**, where the rest of the controls are, and it no longer goes dead
   under your cursor when you press it.
-- Attachments open over the conversation instead of in a new browser tab, so you keep your place
-  and the reply keeps arriving behind them.
+- Attachments open over the conversation instead of in a new browser tab, so you keep your place and
+  the reply keeps arriving behind them.
 - The plan offer is a strip on the composer rather than a card in the transcript, and there is
   exactly one Build control on the screen.
+- **Publishing is one chip beside your project's name.** The Publish card, the Review & approval
+  card and the small button in the builder's toolbar are gone; there is one chip, it says where your
+  app stands, and pressing it opens one sentence and — where there is something to do — exactly one
+  button. Where there is nothing to do there is no button, rather than one that fails when pressed.
+- **The chip stops guessing.** Every label is read from a single answer the server works out, instead
+  of each screen recombining the same four or five fields and sometimes reaching a different
+  conclusion. That guesswork had produced the same kind of mistake four times in this one feature,
+  most recently promising "this can publish automatically" beside a Publish button moments before
+  the app was sent to an administrator instead.
+- **Being live and having newer unsaved work are now visibly different**, without opening anything:
+  "Live", "Live · newer work saved", and — on the rare occasion the platform cannot check — a plain
+  statement to that effect rather than a claim that nothing of yours is waiting.
+- **"Taken offline" and "Switched off" are two different things again**, because they have two
+  different remedies: a taken-offline app can be published straight back to the same address, and a
+  switched-off one cannot be published at all until an administrator says so.
+- The word "deploy", and the pipeline's own vocabulary — "Packaging your app", "Setting up the
+  server" — are gone from everything you read. While a publish runs, the chip says "Starting up".
+- **A plan now arrives in five named parts** — what this gives you, what you will see, what the app
+  will remember, what stays exactly as it is, and what was assumed. The fourth is left out entirely
+  for a first build, because there is nothing yet to leave alone. Nothing in a plan names a file, a
+  folder, a framework or a command.
+- The buttons under a plan are now **Build this plan** and **Keep planning**, and the agent uses the
+  same two words. An agent telling you to press something the screen does not draw is a broken
+  instruction at the moment you are being asked to decide.
+- **One rule now governs the agent's words in both kinds of chat.** Anything written in the same
+  breath as an action is the agent talking to itself on the way there, and it no longer reaches you
+  in a planning chat either — which is where the 2,397-word reply of file paths came from. The
+  consequence, stated plainly: **a planning answer no longer appears word by word.** It arrives
+  whole when the agent finishes writing it, at the same moment it would have finished arriving
+  before. Build chats have always worked this way.
 
 ### Fixed
 
 - **A refused message is no longer lost.** If the server turned a message down — the daily limit
   reached, a build already running, the service unavailable — the composer had already emptied
-  itself by the time the refusal arrived, and the text and any attached files were gone with no
-  way to get them back. The box now empties only once the server has actually accepted the
-  message.
-- **A file attached in one chat no longer follows you into the next one**, where it would have
-  been sent to a conversation you never attached it to.
-- Pressing Enter twice quickly no longer clears the box for the press it ignored.
-- A message turned down while you were looking at another chat no longer leaves that chat unable
-  to send anything for the rest of the session.
+  itself by the time the refusal arrived, and the text and any attached files were gone with no way
+  to get them back. The box now empties only once the server has accepted the message. Two relatives
+  of the same bug went with it: pressing Enter twice quickly no longer clears the box for the press
+  it ignored, and a message refused while you were looking at another chat no longer leaves that
+  chat unable to send anything for the rest of the session.
 - When sending is refused, the reason is the one that applies — the daily limit, a build in
   progress, the attachment limit — instead of one generic sentence for all of them.
+- **A file attached in one chat no longer follows you into the next one**, where it would have been
+  sent to a conversation you never attached it to.
 - **Attached spreadsheets and text files no longer print their whole contents into the
-  conversation**, and attached images and PDFs show up at all. Both were introduced by the
-  rebuild and are fixed in it.
-- Screen readers are told what a run of work amounted to when it finishes, not only that it
-  started — and are no longer read a summary of every past build when an old chat is opened.
-- The assistant now names the plan buttons the way the screen does.
+  conversation**, and attached images and PDFs show up at all.
+- A turn can no longer end with nothing to read. Where the agent said nothing at all, the platform
+  says so itself rather than leaving a screen of finished steps and silence.
+- Screen readers are told what a run of work amounted to when it finishes, not only that it started
+  — and are no longer read a summary of every past build when an old chat is opened.
 
-## [1.7.1] - 2026-09-01
+## [1.7.0-beta.2] - 2026-09-01
 
-### Changed
-
-- **Publishing is one chip beside your project's name.** The Publish card, the Review &
-  approval card and the small button in the builder's toolbar are gone; there is one chip,
-  it says where your app stands, and pressing it opens one sentence and — where there is
-  something to do — exactly one button. Where there is nothing to do there is no button,
-  rather than one that fails when pressed.
-- **The chip stops guessing.** Every label it shows is read from a single answer the server
-  works out, instead of each screen recombining the same four or five fields and sometimes
-  reaching a different conclusion. That guesswork had produced the same kind of mistake four
-  times in this one feature, most recently promising "this can publish automatically" beside
-  a Publish button moments before the app was sent to an administrator instead.
-- **Being live and having newer unsaved work are now visibly different**, without opening
-  anything. A published app with nothing newer reads "Live"; one you have saved since reads
-  "Live · newer work saved"; and on the rare occasion the platform cannot check, it says so
-  plainly rather than telling you nothing of yours is waiting.
-- **"Taken offline" and "Switched off" are two different things again**, because they have
-  two different remedies — a taken-offline app can be published straight back to the same
-  address, and a switched-off one cannot be published at all until an administrator says so.
-- **Approved apps say they are approved and stop there.** The old wording promised whether
-  pressing Publish would publish or send for review; that promise was not the interface's to
-  make, because the decision is taken inside the request against a version that can change on
-  the way. The button now says what it will attempt and the answer says what happened.
-- The word "deploy", and the pipeline's own vocabulary — "Packaging your app", "Setting up
-  the server" — are gone from everything you read. While a publish runs, the chip says
-  "Starting up".
+The workspace owns the running app, and a chat is a plan chat or a build chat. (#166, #167)
 
 ### Added
 
-- **"Take it back."** A version waiting with an administrator can be withdrawn from the chip,
-  with one confirmation. This existed on the server and in the old review card; carrying it
-  across is what keeps you from being stuck behind a decision that is not yours to make.
-- The chip now shows **when** a version was approved, not only which one.
-
-## [1.7.0] - 2026-09-01
-
-### Added
-
-- Pressing **Build this plan** now opens a new build chat that starts from the plan itself —
-  the plan arrives as the first message, word for word, exactly as if it had been pasted in.
-  The plan chat is left untouched, so a plan can be read again next week and built a second
-  time, differently, without anything having to be undone.
-- A plan chat can now answer questions about the app as it actually is. It used to answer from
-  a saved copy, which could be days old; it reads the same running app a build chat does. Where
-  there is nothing running to read, the message is refused with a sentence saying so rather than
-  answered confidently from stale code.
+- Pressing **Build this plan** now opens a new build chat that starts from the plan itself — the
+  plan arrives as the first message, word for word, exactly as if it had been pasted in. The plan
+  chat is left untouched, so a plan can be read again next week and built a second time,
+  differently, without anything having to be undone.
+- A plan chat can now answer questions about the app as it actually is. It used to answer from a
+  saved copy, which could be days old; it reads the same running app a build chat does. Where there
+  is nothing running to read, the message is refused with a sentence saying so rather than answered
+  confidently from stale code.
+- The warning about unsaved work now follows you across the whole workspace, not only while the
+  build chat happens to be the thing on screen.
 
 ### Changed
 
-- A chat is a **plan chat** or a **build chat**, chosen when it is created and never after.
-  There is no mode pill, no switch part-way through, and no way to be in a conversation whose
-  next message does something other than what the conversation is for. Two overlapping ideas
-  with six labels between them became one idea with two.
-- The offer to build is now tied to the plan the agent actually wrote, because the plan travels
-  inside the offer itself. Nothing reads the agent's prose to guess whether a plan happened.
-- Taking the workspace no longer depends on what kind of chat asked for it. A planning question
-  that needs the app running takes it on the same terms a build does, and is refused on the same
-  terms when someone else holds it.
+- A chat is a **plan chat** or a **build chat**, chosen when it is created and never after. There is
+  no mode pill, no switch part-way through, and no way to be in a conversation whose next message
+  does something other than what the conversation is for. Two overlapping ideas with six labels
+  between them became one idea with two.
+- The running app is now part of the workspace itself rather than something each screen draws for
+  itself. It used to exist only because the build chat was the page you happened to be on, which is
+  why walking away from that page took the app down with it.
+- Conversations are opened and deleted from the project page. The list that used to sit inside a
+  chat — beside the chat you were already reading — is gone, so there is one place that answers
+  "what is in this project" instead of two that could disagree.
+- Taking the workspace no longer depends on what kind of chat asked for it. A planning question that
+  needs the app running takes it on the same terms a build does, and is refused on the same terms
+  when someone else holds it.
 - Whether an app is published is now decided in one place on the server and read everywhere else,
   instead of each screen working it out from parts and occasionally disagreeing.
 
 ### Fixed
 
-- The Build button can no longer appear underneath something that was never a plan. It used to be
-  offered whenever the agent's writing merely looked plan-shaped, which put a build one click away
-  from a conversation nobody had agreed anything in.
+- **Walking away from a build chat no longer disturbs the running app.** Going to the project page
+  and back reloaded it; leaving mid-build reloaded it, because the pane read the departure as "the
+  turn just finished"; and leaving right after a build succeeded shut it down altogether — at the
+  moment a citizen is most likely to walk away.
+- **The Build button can no longer appear underneath something that was never a plan.** The offer is
+  tied to the plan the agent actually wrote, because the plan travels inside the offer itself;
+  nothing reads the agent's prose to guess whether a plan happened.
 - Starting a build from a plan can no longer leave behind an empty chat with no message in it. The
-  conversation and its first message are now written together, so a failure part-way through leaves
+  conversation and its first message are written together, so a failure part-way through leaves
   nothing rather than a shell you cannot use or explain.
 - A plan is never quietly cut short. An overlong plan is refused with a reason instead of being
   trimmed to fit and offered as though it were complete.
-- The warning that a plan had gone stale, and the override that let you build anyway, are both gone.
-  They asked the citizen to adjudicate something the platform could not actually tell them.
+- A first message that fails to save no longer takes the typed text with it. The notice asking you
+  to try again appeared over an empty box, offering a retry of something that no longer existed on
+  screen or in storage.
+- Screens inside the workspace are no longer clipped. Each fills the space it is given instead of
+  asserting a full window height of its own, and the spinner shown while a conversation loads is no
+  longer pushed below centre and cut off by the navigation bar.
 
 ### Removed
 
 - The mid-conversation mode switch and the endpoint behind it. A chat's kind is fixed at creation,
   so there is nothing to switch.
-- A failure state that could be stored but never shown. It has been deleted rather than shipped as
-  something a citizen could reach and find nothing behind.
+- The warning that a plan had gone stale, and the override that let you build anyway. They asked the
+  citizen to adjudicate something the platform could not actually tell them.
 
-## [1.6.21] - 2026-08-31
+## [1.7.0-beta.1] - 2026-08-31
 
-### Added
-
-- The warning about unsaved work now follows you across the whole workspace. Closing the tab
-  with changes that were never saved into the app asks you to confirm wherever you are in a
-  project, not only while the build chat happens to be the thing on screen.
-
-### Changed
-
-- The running app is now part of the workspace itself rather than something each screen draws
-  for itself. It used to exist only because the build chat was the page you happened to be on,
-  which is why walking away from that page took the app down with it.
-- Conversations are opened and deleted from the project page. The list that used to sit inside
-  a chat — beside the chat you were already reading — is gone, so there is one place that
-  answers "what is in this project" instead of two that could disagree.
-- The workspace has one height model. Every screen inside it now fills the space it is given
-  rather than asserting a full window height of its own and being clipped.
-
-### Fixed
-
-- Going from a build chat to its project page and back no longer reloads the running app.
-  Leaving was already safe; returning was not, and the app restarted underneath the citizen
-  every single time they came back to the conversation that built it.
-- Leaving a build chat while the build is still running no longer reloads the app. The pane
-  read the departure as "the turn just finished" and re-requested the page, about an event
-  that had not happened.
-- Leaving a build chat immediately after a build succeeds no longer shuts down the app. A
-  finished build's app stays up and serving, and walking away from the conversation was
-  destroying it at the moment a citizen is most likely to walk away.
-- A first message that fails to save no longer takes the typed text with it. The notice asking
-  the citizen to try again appeared over an empty box, offering a retry of something that no
-  longer existed on screen or in storage, so reloading could not recover it either.
-- The spinner shown while a conversation loads is no longer pushed below centre and clipped by
-  the navigation bar.
-
-## [1.6.20] - 2026-08-31
+Conversations say which kind they are, and the platform starts measuring. (#165)
 
 ### Added
 
-- Every conversation on a project page now says which kind it is, in words. The list drew
-  two different icons and never named either, so telling a Plan chat from a Build chat
-  meant knowing what a wrench stands for. Rows now read "Build", "Plan" or "Chat", and a
-  screen reader hears the whole phrase rather than a bare noun.
+- Every conversation on a project page now says which kind it is, in words. The list drew two
+  different icons and never named either, so telling a Plan chat from a Build chat meant knowing
+  what a wrench stands for. Rows now read "Build", "Plan" or "Chat", and a screen reader hears the
+  whole phrase rather than a bare noun.
 - The platform started measuring four things about the citizen's journey that nobody could
-  previously observe: how long a cold start actually takes, how many starts reach a running
-  app, how long it takes to first see your app after opening a project, and how often a
-  project is opened without any chat being opened. Until now every claim about any of these
-  was unfalsifiable. An administrator reads them through the counters endpoint that already
-  existed; no new screen was added, and no number reaches a citizen's screen.
-- A single narrow endpoint for the two of those measurements only a browser can see. It
-  accepts three named observations and nothing else, refuses a value outside the range an
-  honest one can occupy rather than quietly trimming it to fit, and stores no record of who
-  sent it.
-
-### Changed
-
-- The chat list no longer decides what a row is by testing for one value. There are three
-  kinds of conversation and the old test knew about one, so an assistant chat was labelled
-  as a plan. Every kind now comes from one table, and a kind nobody has invented yet gets an
-  honest word instead of the wrong one.
+  previously observe: how long a cold start actually takes, how many starts reach a running app, how
+  long it takes to first see your app after opening a project, and how often a project is opened
+  without any chat being opened. Until now every claim about any of these was unfalsifiable. An
+  administrator reads them through the counters endpoint that already existed; the two only a
+  browser can see arrive through a narrow endpoint that stores no record of who sent them. No number
+  reaches a citizen's screen.
 
 ### Fixed
 
-- A conversation whose kind collided with a built-in JavaScript property name would crash
-  its row instead of rendering. Reachable from ordinary API data, not just from mischief.
-- The preview pane reported that a citizen was looking at their app at moments when a cover
-  was over it saying the app had stopped running.
-- A measurement failing can no longer slow down or break the thing it is measuring: the
-  counter writes moved out from under the lock that a citizen's next build waits on, and a
-  measurement that throws is contained instead of taking the builder's screen down with it.
+- A conversation row could be labelled the wrong kind, or crash instead of rendering at all. The old
+  test knew about one of the three kinds, so an assistant chat was labelled a plan; separately, a
+  kind whose name collided with a built-in JavaScript property took the whole row down. Both were
+  reachable from ordinary API data.
+- A measurement failing can no longer slow down or break the thing it is measuring. The counter
+  writes moved out from under the lock that a citizen's next build waits on, and a measurement that
+  throws is contained instead of taking the builder's screen down with it.
 
 ## [1.6.19] - 2026-08-29
 
