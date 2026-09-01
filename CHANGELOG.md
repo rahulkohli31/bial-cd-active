@@ -10,6 +10,47 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 > `1.7.0` section is added above them and tagged `v1.7.0`; the betas stay as the record of how it
 > got there. A version number marks a build, not a merge.
 
+## [1.7.0-beta.4] - 2026-09-01
+
+Finishing the removal, and putting back the guardrail it dropped.
+
+### Added
+
+- **A long chat now warns you before it stops working, and tells you why when it does.** As a
+  conversation grows you get one line saying it is getting long and suggesting a new chat; past the
+  limit your administrator set, the next message is refused with a sentence that says what happened,
+  what to do, and — the part that actually matters — that your app and everything in it stays exactly
+  as it is. Before this, a chat that got too long simply failed, with no warning and no reason.
+- The limit is enforced on the **server**, at both places a chat can start a turn: an ordinary
+  message and pressing "Build this plan". Enforcing it in the browser is what let it disappear
+  silently in the first place.
+
+### Changed
+
+- **The per-conversation limits in the admin console do what their labels say.** "Per-conversation
+  warn" and "Per-conversation max" saved cleanly and changed nothing — for anyone, since the release
+  that deleted the old two-page chat. Both are now real, their help text describes what actually
+  happens, and the note about when a change takes effect distinguishes the two: the max applies to
+  the user's next message, the warning after their next reload.
+- While the app is being refined, the overlay says **"Still working…"** rather than "Still
+  iterating…".
+
+### Removed
+
+- **The legacy chat endpoint is gone.** There were two ways to run a chat turn; the portal stopped
+  using the older one, and it has now been removed rather than left mounted. A second, unused path
+  through the same work is a way around every limit the first one enforces — including the one this
+  release restores.
+- Six unused pieces of interface scaffolding and four dependencies that came with them, plus a chat
+  helper that has had no callers since June.
+
+### Fixed
+
+- Around sixty comments across the codebase that described the portal as it was two releases ago —
+  including four inside the new chat screen that referred to it by the name of the page it replaced,
+  and one that would have led the next reader to delete a working feature. Guards in both the
+  frontend and backend test suites now fail if a future removal leaves the same trail.
+
 ## [1.7.0-beta.3] - 2026-09-01
 
 One chat surface, one publish chip, one agent voice. (#168, #170, #169)
