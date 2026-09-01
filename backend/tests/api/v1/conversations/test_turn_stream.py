@@ -175,7 +175,9 @@ async def test_mid_turn_subscribe_gets_snapshot_then_tail(
 
     state = _fresh_engine.peek(conv.id)
     assert state is not None
-    while not state.text_parts:  # the first delta is out — we are genuinely mid-turn
+    while not (
+        state.text_parts or state.pending_text
+    ):  # the first delta is out — we are genuinely mid-turn
         await asyncio.sleep(0.01)
 
     # httpx's ASGITransport buffers a streaming response until the app completes, so the
@@ -193,8 +195,14 @@ async def test_mid_turn_subscribe_gets_snapshot_then_tail(
     frames = _frames_of(events.text)
     assert frames[0].type == "snapshot"
     assert frames[0].turn_status == "running"  # built BEFORE the release: genuinely mid-turn
-    assert frames[0].text_so_far == "first "
-    # Snapshot + tail converge to the uninterrupted client's final text.
+    # THE SNAPSHOT'S TEXT IS EMPTY MID-RESPONSE, and that is U4's stated cost rather than a
+    # defect. Prose is held until its response ends and proves it called no tool, so a client
+    # that reconnects mid-answer sees the steps and no partial text. The snapshot is still
+    # doing its job — it reports the turn is RUNNING, which is what stops the client showing
+    # a finished-looking transcript — and the answer arrives whole the moment it is released.
+    assert frames[0].text_so_far == ""
+    # Snapshot + tail still converge on the whole answer, which is the property that actually
+    # matters to a reconnecting reader: nothing is lost and nothing is doubled.
     deltas = "".join(f.text for f in frames if f.type == "text_delta")
     assert frames[0].text_so_far + deltas == "first second"
     assert frames[-1].type == "turn_ended" and frames[-1].status == "completed"
@@ -308,7 +316,7 @@ async def test_stop_endpoint_cancels_and_record_stays_truthful(
 
     state = _fresh_engine.peek(conv.id)
     assert state is not None
-    while not state.text_parts:
+    while not (state.text_parts or state.pending_text):
         await asyncio.sleep(0.01)
 
     stop = await client.post(f"/v1/conversations/{conv.id}/turns/{turn_id}/stop", headers=headers)
@@ -398,6 +406,11 @@ async def test_plan_kind_model_sees_no_write_tools(
         "search_files",
         "run_command",
         "present_plan_options",
+        # The shared conversation toolset — carried by BOTH kinds, because it is about the
+        # person waiting rather than about what this run can do. It is in an exact-set
+        # assertion on purpose: a tool meant for both arms that reached only one is a drift
+        # this test should catch, and a subset check would not.
+        "tell_the_user",
     }
 
 
@@ -742,7 +755,7 @@ async def test_reconnect_with_cursor_resumes_tail_only_without_duplicating_text(
 
     state = _fresh_engine.peek(conv.id)
     assert state is not None
-    while not state.text_parts:
+    while not (state.text_parts or state.pending_text):
         await asyncio.sleep(0.01)
     cursor = state.seq  # everything up to here is already in hand
 
@@ -759,10 +772,15 @@ async def test_reconnect_with_cursor_resumes_tail_only_without_duplicating_text(
     frames = _frames_of(events.text)
     assert frames, "the resume delivered nothing"
     assert frames[0].type != "snapshot"  # tail-only: continuity was provable
-    # The already-delivered prefix is NOT re-sent.
+    # NOTHING AT OR BEFORE THE CURSOR IS RE-SENT — the property this test is actually about,
+    # asserted on the sequence numbers rather than on the words. It used to be asserted by
+    # showing that "alpha" was absent, which only worked while the two deltas reached the wire
+    # separately: prose is held now (U4), so the whole answer arrives as one block AFTER the
+    # cursor. That block is legitimately in the tail, and "alpha not in replayed" would now be
+    # asserting that the resume lost half the answer.
+    assert all(frame.seq > cursor for frame in frames)
     replayed = "".join(f.text for f in frames if f.type == "text_delta")
-    assert "alpha" not in replayed
-    assert replayed == "omega"
+    assert replayed == "alpha omega"
     assert frames[-1].type == "turn_ended"
 
     # SETTLE THE TASK, not just the stream. `turn_ended` is delivered from inside the run, and
@@ -792,7 +810,7 @@ async def test_active_turn_in_conversation_read_while_running(
     turn_id = (await _post_turn(client, headers, conv)).json()["turnId"]
     state = _fresh_engine.peek(conv.id)
     assert state is not None
-    while not state.text_parts:
+    while not (state.text_parts or state.pending_text):
         await asyncio.sleep(0.01)
 
     detail = (await client.get(f"/v1/conversations/{conv.id}", headers=headers)).json()

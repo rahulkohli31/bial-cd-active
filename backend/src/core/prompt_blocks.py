@@ -50,6 +50,24 @@ served at, and must be left exactly as it is:
                             configuration in your own files instead.
 Add routes, components, libraries, and dependencies as your app needs them."""
 
+BUILD_THIS_PLAN_LABEL = "Build this plan"
+KEEP_PLANNING_LABEL = "Keep planning"
+"""The two buttons under a plan, and the ONE spelling of each (R-15, client-approved).
+
+THREE SURFACES MUST CARRY THE IDENTICAL STRINGS: the prompt segment that tells the model what
+the user will see, the offer tool's own description (which the model reads on every request),
+and the buttons the interface actually draws. An agent that tells a citizen to press a button
+the interface does not draw is a broken instruction at the one moment the product asks them to
+decide something.
+
+THEY LIVE IN THIS LEAF because two of those three are on the server and must not disagree —
+the prompt segment and the tool description are composed from different packages. The stored
+values behind the buttons (`build` / `refine`) are a separate, unchanged vocabulary: they are
+what the platform records, and renaming a label must never migrate a record.
+
+"Keep refining" was the previous second label; the client found it confusing, and it is not a
+synonym worth keeping alive in a comment."""
+
 APPLY_SCHEMA_CHANGE_TOOL = "apply_schema_change"
 """The ONE sanctioned channel for a schema change, and the ONE spelling of it (U23 / R29 / F4).
 
@@ -302,7 +320,8 @@ generates the migration and runs it in one call, and tells you truthfully which 
 either did.
 - `list_files` — List every file in the app (relative paths; heavy dirs like node_modules \
 excluded).
-- `search_files` — Search the app's files for a regex `pattern` (grep-like; case-sensitive)."""
+- `search_files` — Search the app's files for a regex `pattern` (grep-like; case-sensitive).
+- `tell_the_user` — Say one thing to the person waiting, in the middle of your work."""
 """GENERATED, NOT WRITTEN (U20 / R26) — a checked-in snapshot of
 `services/agent/toolsets.render_tool_surface(ChatKind.BUILD)`, which renders one line per
 tool from the tool definitions pydantic-ai hands the model at registration.

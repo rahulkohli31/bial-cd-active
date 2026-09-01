@@ -2269,15 +2269,67 @@ def test_write_prose_with_no_tool_call_after_it_is_still_the_citizens_answer(
     assert "arrival times" in "".join(state.text_parts)
 
 
-def test_ask_mode_prose_is_never_held(_fresh_engine) -> None:
-    """The hold is WRITE's alone: in Ask/Plan the prose IS the deliverable, and holding it would
-    be a dead screen for the length of the answer."""
+def test_a_plan_chat_holds_its_prose_exactly_as_a_build_chat_does(_fresh_engine) -> None:
+    """★ THE INVERSION (U4 / R74 / N2), and the reason it is safe to invert.
+
+    This test used to assert the opposite: that holding was Build's alone, because in a
+    planning chat the prose IS the deliverable and holding it would be a dead screen. Both
+    halves of that were true when it was written, and the first half is what changed — the
+    plan travels in the offer tool's argument now, and a mid-work word travels through
+    `tell_the_user`, so what the hold catches on this side is the same thing it always caught
+    on the other: the model narrating its way to a tool call.
+
+    What it costs is real and is not hidden: the answer no longer streams token by token in a
+    planning chat. It arrives whole, when its response ends, at the same moment it always did.
+
+    Mutation check: restore the `state.kind is not ChatKind.BUILD` early return in
+    `_stream_text` and this goes red while nothing else does."""
     engine = _fresh_engine
     state = _bare_state(ChatKind.PLAN)
 
     engine._on_event(state, _narrated("The visitor list lives in app/visitors/page.tsx."))
 
-    assert "app/visitors/page.tsx" in _text_on_the_wire(state)
+    # HELD, not lost: it is on the pending buffer and not on the wire.
+    assert _text_on_the_wire(state) == ""
+    assert "app/visitors/page.tsx" in "".join(state.pending_text)
+
+
+def test_a_plan_chats_narration_beside_a_tool_call_never_reaches_the_live_feed(
+    _fresh_engine,
+) -> None:
+    """★ AE43, live half — the same response means the same thing in both kinds.
+
+    The twin of `test_write_narration_beside_a_tool_call_never_reaches_the_live_feed`, one
+    chat kind over, and the pair is the whole of what N2 asks for here: a response that writes
+    prose and calls a tool is the model narrating its way to the call, and nothing about which
+    chat it is in changes that."""
+    engine = _fresh_engine
+    state = _bare_state(ChatKind.PLAN)
+
+    engine._on_event(state, _narrated("Let me look at how the visitor list works today. "))
+    engine._on_event(state, _called("read_file", '{"path": "app/page.tsx"}', "p1"))
+    engine._flush_pending_text(state)
+
+    assert _step_labels(state, phase="started"), "no step frame — the seam under test never ran"
+    assert _text_on_the_wire(state) == ""
+    assert "".join(state.text_parts) == ""
+
+
+def test_a_plan_chats_answer_with_no_tool_call_after_it_still_reaches_the_citizen(
+    _fresh_engine,
+) -> None:
+    """The other half on the planning side: a response that calls NO tool is the answer, and
+    the flush is what releases it. Without a flush on this path a planning turn goes silent —
+    which is why U4 adds one at the chat run's completion, `chat_agent.run` having no node
+    boundary to hook."""
+    engine = _fresh_engine
+    state = _bare_state(ChatKind.PLAN)
+
+    engine._on_event(state, _narrated("Your visitor list already records arrival times."))
+    engine._flush_pending_text(state)
+
+    assert "arrival times" in _text_on_the_wire(state)
+    assert "arrival times" in "".join(state.text_parts)
 
 
 async def test_a_long_operation_gets_a_status_line_refreshed_until_it_completes(

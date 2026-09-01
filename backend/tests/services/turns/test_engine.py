@@ -161,13 +161,18 @@ async def test_text_turn_streams_deltas_then_terminal(
     # exactly like Build), so the ack is followed by the workspace lifecycle pair
     # (preparing/ready), a compile-state read and a preview-url announce, all BEFORE the
     # model's own text — the same boilerplate a Build turn always carried.
+    #
+    # ONE `text_delta`, NOT TWO, AND THAT IS U4 (R74). Prose is HELD in every kind now, until
+    # the response ends and proves it called no tool — so the model's two deltas arrive as one
+    # flushed block instead of streaming through. The answer is unchanged and lands at the
+    # same moment; what it costs is the token-by-token reveal, which is stated in the plan and
+    # is the price of the same response meaning the same thing in both kinds.
     assert [f.type for f in frames] == [
         "step",
         "workspace",
         "workspace",
         "compile",
         "preview",
-        "text_delta",
         "text_delta",
         "turn_ended",
     ]
@@ -180,7 +185,6 @@ async def test_text_turn_streams_deltas_then_terminal(
         "workspace",
         "compile",
         "preview",
-        "text_delta",
         "text_delta",
         "turn_ended",
     ]
@@ -447,7 +451,9 @@ async def test_stop_cancels_and_leaves_truthful_record(
     )
     state = engine.peek(conv.id)
     assert state is not None
-    while not state.text_parts:  # the first delta proves the run is streaming
+    while not (
+        state.text_parts or state.pending_text
+    ):  # the first delta proves the run is streaming
         await asyncio.sleep(0.01)
 
     assert await engine.stop_turn(conv.id, turn_id) is True
@@ -490,7 +496,7 @@ async def test_a_second_stop_cannot_eat_the_terminal_frame(
     )
     state = engine.peek(conv.id)
     assert state is not None
-    while not state.text_parts:
+    while not (state.text_parts or state.pending_text):
         await asyncio.sleep(0.01)
 
     # Two stops in the SAME tick — the second lands while the first is still unwinding.
@@ -613,7 +619,9 @@ async def test_stopped_turn_still_bills_completed_model_requests(
     )
     state = engine.peek(conv.id)
     assert state is not None
-    while not state.text_parts:  # request 1 is done; request 2 is streaming
+    while not (
+        state.text_parts or state.pending_text
+    ):  # request 1 is done; request 2 is streaming
         await asyncio.sleep(0.01)
 
     assert await engine.stop_turn(conv.id, turn_id) is True
@@ -724,7 +732,7 @@ async def test_active_turn_info_only_while_running(
     )
     state = engine.peek(conv.id)
     assert state is not None
-    while not state.text_parts:
+    while not (state.text_parts or state.pending_text):
         await asyncio.sleep(0.01)
     info = engine.active_turn_info(conv.id)
     assert info is not None and info.turn_id == turn_id and info.last_seq >= 1
@@ -795,7 +803,7 @@ async def test_stop_user_turn_and_wait_settles_before_it_returns(
     )
     state = engine.peek(conv.id)
     assert state is not None
-    while not state.text_parts:  # the run is genuinely streaming
+    while not (state.text_parts or state.pending_text):  # the run is genuinely streaming
         await asyncio.sleep(0.01)
 
     stopped = await engine.stop_user_turn_and_wait(user.id, timeout_s=10)
@@ -836,7 +844,7 @@ async def test_stop_user_turn_and_wait_leaves_another_users_turn_alone(
     )
     state = engine.peek(conv.id)
     assert state is not None
-    while not state.text_parts:
+    while not (state.text_parts or state.pending_text):
         await asyncio.sleep(0.01)
 
     stranger = await UserFactory.create(db_session, email="stopother@rvaiglobal.com")
@@ -867,7 +875,7 @@ async def test_stop_user_turn_and_wait_is_safe_to_repeat(
     )
     state = engine.peek(conv.id)
     assert state is not None
-    while not state.text_parts:
+    while not (state.text_parts or state.pending_text):
         await asyncio.sleep(0.01)
 
     assert await engine.stop_user_turn_and_wait(user.id, timeout_s=10) is True
@@ -1041,7 +1049,7 @@ async def test_a_stopped_turn_leaves_exactly_one_terminal_even_when_stopped_twic
     )
     state = engine.peek(conv.id)
     assert state is not None
-    while not state.text_parts:
+    while not (state.text_parts or state.pending_text):
         await asyncio.sleep(0)
 
     assert await engine.stop_turn(conv.id, turn_id) is True
@@ -1078,7 +1086,7 @@ async def test_a_turn_that_never_reaches_a_terminal_writes_no_row(
     )
     state = engine.peek(conv.id)
     assert state is not None
-    while not state.text_parts:  # LIVENESS: the run really is mid-flight
+    while not (state.text_parts or state.pending_text):  # LIVENESS: the run really is mid-flight
         await asyncio.sleep(0)
 
     assert await _terminal_rows(db_session, conv.id) == []

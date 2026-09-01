@@ -115,12 +115,14 @@ from src.services.build_sessions.manager import (
 from src.services.build_sessions.outcome import STOPPED_BY_USER
 from src.services.messages.projection import (
     PLAN_OPTIONS_TOOL,
+    TELL_THE_USER_TOOL,
     TURN_TERMINAL_KIND,
     DisplayItem,
     PlanOptionsItem,
     StepItem,
     classify_tool_call,
     long_operation_line,
+    update_from_args,
 )
 from src.services.messages.store import append_batch
 from src.services.orchestrator.client_errors import discard_client_errors
@@ -155,6 +157,7 @@ from src.services.turns.copy import (
     COULD_NOT_CONFIRM_TEXT,
     DID_NOT_COME_TOGETHER_TEXT,
     NOT_RECOVERED_TEXT,
+    NOTHING_TO_SHOW_YET_TEXT,
     PLAN_NOT_KEPT_TEXT,
     RECOVERED_TEXT,
     STILL_SHOWING_EARLIER,
@@ -955,6 +958,22 @@ class TurnEngine:
                     persistable = _persistable_messages(result.new_messages())
                     deferred = _deferred_call(result.output)
 
+                    # THE FLUSH THIS RUN DID NOT HAVE (U4). Prose is held in every kind now,
+                    # and the Build node loop releases it at each node boundary — but
+                    # `chat_agent.run` has no node boundary to hook, so once anything is held
+                    # on this path nothing would ever release it and the turn would go silent.
+                    #
+                    # RUN COMPLETION IS THE RIGHT MOMENT, not a manufactured per-response one.
+                    # A response that wrote prose AND called a tool has already had that prose
+                    # discarded at the call event; a response that calls no tool ENDS the run.
+                    # So what is held here is exactly the trailing answer, and this releases it
+                    # at the same instant a per-response boundary would.
+                    #
+                    # BEFORE THE REFUSAL ARM BELOW, deliberately: that arm pushes a
+                    # platform-authored line, and flushing after it would print the citizen's
+                    # own answer underneath "that plan didn't arrive".
+                    self._flush_pending_text(state)
+
                     # AN OFFER IS EITHER HONOURABLE OR IT IS NOT WRITTEN AT ALL (R28a / R44).
                     # An empty plan, one past the stored-message ceiling, or a pre-migration
                     # call with no argument leaves nothing to press — so the call comes off
@@ -974,6 +993,29 @@ class TurnEngine:
                         persistable = [
                             *persistable,
                             ModelResponse(parts=[TextPart(content=PLAN_NOT_KEPT_TEXT)]),
+                        ]
+
+                    # R77 — WHERE THE AGENT SAID NOTHING, THE PLATFORM STILL SPEAKS. Widening
+                    # the drop made a wordless turn possible on this path for the first time:
+                    # a turn whose every response called a tool now renders activity and not
+                    # one word. R75 sanctions an agent CHOOSING not to speak, but after the
+                    # drop those two states are indistinguishable at the terminal — nothing
+                    # here can tell "it had nothing to add" from "everything it wrote was
+                    # dropped" — so R77 wins outright and every turn ends readable.
+                    #
+                    # `text_parts` IS THE WHOLE TEST, and it is a platform record rather than a
+                    # reading of the agent's prose: it holds what actually reached the citizen,
+                    # including a flushed answer, a spoken line and the plan. Empty means they
+                    # have nothing to read, whatever the reason.
+                    #
+                    # It travels the same persist seam as every other reply on this path, so a
+                    # reload shows what the live feed showed — the failure mode this replaces
+                    # is a line on screen that a refresh removes.
+                    if not state.text_parts:
+                        self._push_text(state, NOTHING_TO_SHOW_YET_TEXT)
+                        persistable = [
+                            *persistable,
+                            ModelResponse(parts=[TextPart(content=NOTHING_TO_SHOW_YET_TEXT)]),
                         ]
 
                     batches: list[tuple[list[ModelMessage], dict[str, Any] | None]] = [
@@ -2429,6 +2471,16 @@ class TurnEngine:
             self._push_text(state, TEXT_BLOCK_SEPARATOR)
         self._push_text(state, plan)
 
+    def _push_spoken(self, state: _TurnState, update: str) -> None:
+        """A voice-channel line onto the live stream, through the ungated text sink.
+
+        Separated from `_push_text` by the block separator for the same reason `_push_plan`
+        is: an earlier response in this turn may already have flushed prose, and `text_parts`
+        joins with nothing between entries."""
+        if state.text_parts:
+            self._push_text(state, TEXT_BLOCK_SEPARATOR)
+        self._push_text(state, update)
+
     def _emit_plan_options(self, state: _TurnState, tool_call_id: str) -> None:
         item = PlanOptionsItem(
             seq=0,  # live card; the reload projection assigns the row seq
@@ -2505,6 +2557,23 @@ class TurnEngine:
                     # the status on the same tool_call_id rather than stacking beside it.
                     self._emit_plan_options(state, event.part.tool_call_id)
                 state.steps.pop(event.part.tool_call_id, None)
+                return
+            if event.part.tool_name == TELL_THE_USER_TOOL:
+                # THE WORDS, AND NOT A STEP. Rendered here at the CALL event rather than at
+                # the result, and that placement is the whole guarantee: tool bodies run
+                # concurrently and their results arrive in completion order, while a reloaded
+                # transcript renders in part order — so a response that spoke and also read a
+                # file would put the two in one order live and the other order on reload.
+                # Call events arrive in part order, which is the order the projection uses.
+                #
+                # `update_from_args` is the same function the projection calls, so an update
+                # the tool body will refuse pushes nothing here either, without this site
+                # knowing what the bound is. Nothing is put in `state.steps`: there is no
+                # 'finished' frame to wait for, and a step row saying the agent decided to
+                # speak is the row this channel exists to avoid.
+                spoken = update_from_args(event.part.args)
+                if spoken:
+                    self._push_spoken(state, spoken)
                 return
             item = self._step_item(state, event.part.tool_name, event.part.args_as_json_str())
             # REPLACED, not accumulated beside: the first real step retires the ack from the
@@ -2633,19 +2702,26 @@ class TurnEngine:
     def _stream_text(self, state: _TurnState, text: str, *, new_block: bool) -> None:
         """Prose arriving mid-response, before we know whether a tool call follows it.
 
-        A Plan chat commits immediately — there the prose IS the deliverable and a held
-        stream would be a dead screen. A Build chat holds it: see `_TurnState.pending_text`.
+        HELD IN EVERY KIND (U4/R74/N2), and this is the site that used to ask which one. The
+        rule was never about the kind of chat: prose written in the same response as a tool
+        call is the model narrating its way to the call, and that is as true when the tool is
+        `read_file` in a planning chat as when it is `write_file` in a build. Asking the kind
+        said something else — that the same response means one thing here and another there —
+        and it is what let 2,397 words of paths and commands through on one side while the
+        other side was clean.
+
+        WHAT IT COSTS, STATED RATHER THAN DISCOVERED. Holding is inherently non-streaming, so
+        a planning answer now arrives as one block when its response completes rather than
+        token by token, and `text_so_far` is empty while it is held — a mid-turn reconnect
+        sees steps and no partial answer. Build has always behaved this way. What keeps the
+        screen from being empty in between is the voice channel (`TELL_THE_USER_TOOL`), which
+        is why the two ship together; and the moment the answer itself arrives is unchanged.
 
         `new_block` marks a fresh `TextPart` rather than a delta continuing the current one.
         Blocks were previously concatenated with nothing between them, which ran the last
         sentence of one into the first word of the next ("…the workspace.Now let me…") on
         the live feed only — reload always kept them as separate items.
         """
-        if state.kind is not ChatKind.BUILD:
-            if new_block and state.text_parts:
-                self._push_text(state, TEXT_BLOCK_SEPARATOR)
-            self._push_text(state, text)
-            return
         if new_block and state.pending_text:
             state.pending_text.append(TEXT_BLOCK_SEPARATOR)
         state.pending_text.append(text)

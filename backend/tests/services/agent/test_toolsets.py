@@ -42,6 +42,11 @@ from tests.services.orchestrator.fake_sandbox import FakeSandbox
 from tests.services.orchestrator.model_harness import text_turn, tool_turn
 
 _READ_TOOLS = {"read_file", "list_files", "search_files", "run_command"}
+_SHARED_TOOLS = {"tell_the_user"}
+"""`conversation_toolset` — the tools BOTH kinds carry, because they are about the person
+waiting rather than about what the run can do. Named once here so the exact-set assertions
+below stay exact: a shared tool has to appear in both, and a test that quietly dropped one
+side would pass while the two arms drifted."""
 _WRITE_ONLY_TOOLS = {"write_file", "edit_file", "insert_lines", "declare_done"}
 _SANDBOX_ONLY_TOOLS = _WRITE_ONLY_TOOLS | {"fetch_output_slice", "apply_schema_change"}
 """U22 / U23: `fetch_output_slice` and `apply_schema_change` are registered on `sandbox_toolset`,
@@ -93,7 +98,7 @@ async def test_a_plan_chat_gets_the_read_surface_plus_only_the_offer_tool(
         model=_tool_listing_model(seen, [text_turn("hello")]),
         toolsets=toolsets_for_kind(ChatKind.PLAN, workspace_from_read_deps).toolsets,
     )
-    assert seen["tool_names"] == _READ_TOOLS | {"present_plan_options"}
+    assert seen["tool_names"] == _READ_TOOLS | _SHARED_TOOLS | {"present_plan_options"}
     # Named individually as well as by set equality: a future tool added to the read-only
     # registry would move the set and could be waved through, but these six names are the
     # ones whose absence IS the guarantee.
@@ -255,7 +260,7 @@ async def test_a_build_chat_is_the_sandbox_set_plus_exactly_two_structured_reads
         model=_tool_listing_model(seen, [text_turn("done")]),
         toolsets=_write_toolsets(workspace),
     )
-    assert seen["tool_names"] == _READ_TOOLS | _SANDBOX_ONLY_TOOLS
+    assert seen["tool_names"] == _READ_TOOLS | _SANDBOX_ONLY_TOOLS | _SHARED_TOOLS
 
 
 async def test_writes_run_command_is_the_sandbox_one_not_the_read_only_guest_list(
@@ -348,7 +353,7 @@ async def test_the_kinds_differ_by_which_toolsets_they_are_handed_and_by_nothing
     plan = await registered_tool_definitions(ChatKind.PLAN)
     build = await registered_tool_definitions(ChatKind.BUILD)
 
-    assert set(plan) & set(build) == _READ_TOOLS
+    assert set(plan) & set(build) == _READ_TOOLS | _SHARED_TOOLS
     # Absence is the guardrail, so assert absence — not that a downstream check refuses them.
     assert not (_SANDBOX_ONLY_TOOLS & set(plan))
     assert _SANDBOX_ONLY_TOOLS <= set(build)

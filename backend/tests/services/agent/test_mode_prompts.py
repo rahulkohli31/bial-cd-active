@@ -15,14 +15,22 @@ this file owns the properties that must hold whatever the wording becomes.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import uuid
 
 import pytest
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.tools import ToolDefinition
 
-from src.core.prompt_blocks import NARRATION_VOICE, PORTAL_SURFACES, WRITE_IDENTITY
+from src.core.prompt_blocks import (
+    BUILD_THIS_PLAN_LABEL,
+    KEEP_PLANNING_LABEL,
+    NARRATION_VOICE,
+    PORTAL_SURFACES,
+    WRITE_IDENTITY,
+)
 from src.db.models.conversation import ChatKind
 from src.services.agent.agent import ChatDeps, chat_agent
 from src.services.agent.mode_prompts import (
@@ -30,6 +38,8 @@ from src.services.agent.mode_prompts import (
     PromptContext,
     compose_kind_prompt,
 )
+from src.services.agent.toolsets import registered_tool_definitions
+from src.services.messages.projection import TELL_THE_USER_TOOL
 from src.services.orchestrator.prompt import (
     BUILD_SYSTEM_PROMPT,
     BUILD_WORKING_RULES_HEAD,
@@ -369,10 +379,60 @@ def test_plan_segment_is_citizen_facing_not_a_developer_spec() -> None:
     # the composed prompt, where the model actually reads it.
     assert "plain, everyday words" in compose_kind_prompt(ChatKind.PLAN, _CONTEXT).lower()
     assert "will do" in lowered  # "what the app or this change will DO for them"
-    assert "see and be able to do" in lowered
+    assert "what you will see" in lowered
     assert "present_plan_options" in _PLAN_SEGMENT
     # the read-first grounding instruction stays — only the OUTPUT register changed
     assert "read the relevant files first" in lowered
+
+
+def test_the_plan_segment_names_the_five_sections_in_order() -> None:
+    """★ AE39 / R21 — the shape the origin asked a plan to have, asserted as prompt copy.
+
+    THIS IS AN ASSERTION ABOUT WHAT WE TELL THE MODEL, and that distinction is the point of
+    saying it out loud: whether a plan actually comes back with five sections is the model's
+    behaviour, observed rather than tested (R92). What can be pinned is that the instruction
+    is there, complete, and in the order a person reads in — a section quietly dropped in a
+    later edit is exactly the regression a prompt has no other way to catch.
+
+    "What stays exactly as it is" is CONDITIONAL and the segment must say so: on a first build
+    there is nothing yet to leave alone, and a section solemnly reporting that reads as
+    padding to the one person it is written for."""
+    lowered = _PLAN_SEGMENT.lower()
+    sections = [
+        "what this gives you",
+        "what you will see",
+        "what the app will remember",
+        "what stays exactly as it is",
+        "what i assumed",
+    ]
+    positions = [lowered.find(section) for section in sections]
+    assert all(at >= 0 for at in positions), dict(zip(sections, positions, strict=True))
+    assert positions == sorted(positions), "the five sections are out of order"
+    # The conditional half, and the reason it is a separate assertion: a segment that named
+    # the section but not its condition would pass the list above and still ask for a "what
+    # stays the same" paragraph on an empty project.
+    assert "leave this part out" in lowered
+
+    # The plan says nothing technical, and says so about each category rather than in general.
+    for banned in ("a file", "a folder", "a framework", "a library", "a command"):
+        assert banned in lowered, f"the no-jargon sentence stopped naming {banned!r}"
+
+
+def test_the_plan_segment_says_the_plan_travels_in_the_offer_argument() -> None:
+    """★ THE SENTENCE THAT MAKES THE WIDENED DROP SAFE (U9, and why it lands with U3/U4).
+
+    Prose written in the same response as a tool call does not reach the user in either kind
+    now. The old segment told the model to write the plan out and THEN call the offer — which,
+    under that rule, means the plan is written beside a tool call and disappears. The plan has
+    to travel in the argument, and the segment has to say so.
+
+    Mutation check: revert this paragraph to "write the plan, then call the tool" and no other
+    test in the repo goes red — the failure is a citizen pressing a button under nothing."""
+    lowered = _PLAN_SEGMENT.lower()
+    assert "as the `plan` argument of" in lowered
+    assert "not as a message beside the call" in lowered
+    # And the alternative it points at, so the model is not merely told what does not work.
+    assert TELL_THE_USER_TOOL in _PLAN_SEGMENT
 
 
 # THE PLAN REMINDERS' OWN F9 CHECK USED TO SIT HERE, and it is not orphaned: the reminders it
@@ -451,3 +511,47 @@ def test_no_segment_promises_an_emptiness_signal_that_never_arrives(kind: ChatKi
     lowered = compose_kind_prompt(kind, _CONTEXT).lower()
     assert "your tools will tell you truthfully" not in lowered
     assert "if there is no app yet" not in lowered
+
+
+def test_no_prompt_surface_names_a_button_the_interface_does_not_draw() -> None:
+    """★ R-15 / L8 — the five-link chain, checked at the link that used to break silently.
+
+    An agent that tells a citizen to press "Keep refining" when the interface draws "Keep
+    planning" is a broken instruction at the one moment the product asks them to decide
+    something, and nothing about it fails: the prompt composes, the tool registers, the turn
+    runs, and only the person reading it is stuck.
+
+    THE TOOL DESCRIPTIONS ARE CHECKED TOO, and that is the half a composed-prompt assertion
+    misses. `present_plan_options`' docstring is prompt copy — pydantic-ai sends it on the tool
+    schema of every request — but it never appears in any composed prompt string, so a guard
+    over prompts alone reads clean while the model is being told the old labels. That is not
+    hypothetical: this is exactly the site that survived the previous relabelling."""
+    retired = ("Keep refining", "keep refining", "Build it")
+    surfaces: dict[str, str] = {
+        f"composed {kind.value} prompt": compose_kind_prompt(kind, _CONTEXT) for kind in ChatKind
+    }
+    surfaces["BUILD_SYSTEM_PROMPT"] = BUILD_SYSTEM_PROMPT
+    for kind in ChatKind:
+        for name, definition in (await_definitions(kind)).items():
+            surfaces[f"{kind.value} tool `{name}`"] = definition.description or ""
+
+    for where, text in surfaces.items():
+        for label in retired:
+            assert label not in text, f"{where} still names the retired button {label!r}"
+
+    offer = (await_definitions(ChatKind.PLAN))["present_plan_options"].description or ""
+    assert BUILD_THIS_PLAN_LABEL in offer
+    assert KEEP_PLANNING_LABEL in offer
+    plan_prompt = compose_kind_prompt(ChatKind.PLAN, _CONTEXT)
+    assert BUILD_THIS_PLAN_LABEL in plan_prompt
+    assert KEEP_PLANNING_LABEL in plan_prompt
+
+
+def await_definitions(kind: ChatKind) -> dict[str, ToolDefinition]:
+    """`registered_tool_definitions` without the await, for a sync test.
+
+    The registry's renderer is async only because pydantic-ai's `get_tools` is; it performs no
+    I/O and calls no model (its accessors raise if anything tries). Running it on its own loop
+    here keeps the guard above a plain sync test beside the other prompt-copy guards, which is
+    where a reader looks for it."""
+    return asyncio.run(registered_tool_definitions(kind))

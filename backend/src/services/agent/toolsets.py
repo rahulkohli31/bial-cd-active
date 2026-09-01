@@ -15,6 +15,11 @@ The kind → tool matrix:
 | Plan  | yes (live workspace)   | allowlisted, read | —           | yes                  |
 | Build | yes (live workspace)   | full (+SQL guard) | yes         | —                    |
 
+BOTH arms additionally carry `CONVERSATION_TOOLSET` — the tools that are about the person
+waiting rather than about what the run can do (`agent/conversation_tools.py`). It is the one
+place this file registers the SAME object on both arms, and that is the point: a tool whose
+presence does not depend on the kind must not be listed twice, or the two lists drift.
+
 Two arms, because there are two kinds. The third row this table used to carry ("Ask") had no
 arm in the code by the time anyone read it, and the two that remained were named for modes
 that no longer exist — which is the failure this docstring is meant to prevent, committed by
@@ -76,6 +81,7 @@ from pydantic_ai.toolsets.function import FunctionToolset
 from pydantic_ai.usage import RunUsage
 
 from src.db.models.conversation import ChatKind
+from src.services.agent.conversation_tools import CONVERSATION_TOOLSET
 from src.services.agent.read_tools import ReadOnlyWorkspace, read_only_toolset
 from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.tools import sandbox_toolset
@@ -117,11 +123,18 @@ class ToolSurface[DepsT]:
 
 
 async def present_plan_options(ctx: RunContext[Any], plan: str) -> str:
-    """Show the user your plan with the Build it / Keep refining buttons beneath it. Pass the
-    whole plan as `plan` — that text is what the user reads and what a build works from, so it
-    has to stand on its own. Call this when the plan is ready; it ends your turn, and the
-    user's choice arrives as the result when they decide. Call it again, with the revised
-    plan, after they ask for changes."""
+    """Show the user your plan with the Build this plan and Keep planning buttons beneath it.
+    Pass the whole plan as `plan` — that text is what the user reads and what a build works
+    from, so it has to stand on its own. Call this when the plan is ready; it ends your turn,
+    and the user's choice arrives as the result when they decide. Call it again, with the
+    revised plan, after they ask for changes."""
+    # THE LABELS ABOVE ARE LITERALS AND A TEST HOLDS THEM TO `prompt_blocks`. They cannot be
+    # interpolated: an f-string in this position is an expression, not a docstring, so
+    # `__doc__` would be None — and a registered tool with no description is what the model
+    # would then be handed. `test_no_prompt_surface_names_a_button_the_interface_does_not_draw`
+    # is where the single source is actually enforced, and it checks tool DESCRIPTIONS as well
+    # as composed prompts: this docstring reaches the model on the tool schema and appears in
+    # no prompt string, which is exactly how it survived the last relabelling untouched.
     # THE PLAN RIDES THE ARGUMENT, and the docstring above is what the model actually reads,
     # so it is the contract rather than a description of one. Free text beside a tool call no
     # longer reaches the user, so a plan announced in the same breath as the offer would
@@ -184,6 +197,7 @@ def toolsets_for_kind[DepsT](
             return ToolSurface(
                 toolsets=[
                     read_only_toolset(workspace_of),
+                    cast(AbstractToolset[DepsT], CONVERSATION_TOOLSET),
                     cast(AbstractToolset[DepsT], _PLAN_OPTIONS_TOOLSET),
                 ],
                 may_write=False,
@@ -201,6 +215,7 @@ def toolsets_for_kind[DepsT](
                 toolsets=[
                     sandbox_toolset(sandbox_of),
                     read_only_toolset(workspace_of).filtered(_structured_reads_only),
+                    cast(AbstractToolset[DepsT], CONVERSATION_TOOLSET),
                 ],
                 may_write=True,
             )

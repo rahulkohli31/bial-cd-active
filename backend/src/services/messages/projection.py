@@ -30,7 +30,6 @@ from typing import Any, Final, Literal
 from pydantic import Field
 
 from src.core.prompt_blocks import APPLY_SCHEMA_CHANGE_TOOL
-from src.db.models.conversation import ChatKind
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.schemas import CamelModel
 from src.services.messages.store import ATTACHMENT_REF_KIND, SCHEMA_VERSION
@@ -38,6 +37,24 @@ from src.services.messages.store import ATTACHMENT_REF_KIND, SCHEMA_VERSION
 # The Plan-mode options tool (U8 stub, U11 mechanics). The projection derives the card's
 # resolution state from this tool's stored call/return pair.
 PLAN_OPTIONS_TOOL: Final = "present_plan_options"
+
+TELL_THE_USER_TOOL: Final = "tell_the_user"
+"""The mid-work voice channel's wire name (U3 / R75). Named HERE, beside the parser both
+emitters call, for the same reason `PLAN_OPTIONS_TOOL` is: the live emitter and this one must
+agree on the spelling or a spoken line renders on one side and not the other."""
+
+UPDATE_MAX_CHARS: Final = 280
+"""The whole of what bounds the voice channel, and it is a NUMBER rather than a sentence.
+
+R76 asks for a bounded channel, and the plan's rule is that an instruction is never counted as
+a guardrail — a prompt asking for brevity is a request the model stops honouring at exactly
+the moment it matters, which is a build going wrong. Two plain sentences about an app run to
+roughly two hundred characters; this leaves room without leaving room for a paragraph.
+
+ONE CEILING, ON CHARACTERS, AND NO PER-TURN CALL LIMIT. Nothing has been observed spamming
+this channel, a run's model requests are already bounded, and a second bound would buy
+per-turn counter state, a second retry path and its own refusal copy against a failure nobody
+has seen. Add it if traffic shows it."""
 
 TURN_TERMINAL_KIND: Final = "turn_terminal"
 """`meta.kind` of the durable turn-terminal row. Named here, beside the arm that reads it, and
@@ -597,6 +614,35 @@ def _plan_argument(args: Any) -> str | None:
     return plan.strip() or None
 
 
+def update_from_args(args: Any) -> str | None:
+    """The words a `tell_the_user` call carries, or None when it carries none that may be shown.
+
+    ★ THE SINGLE PLACE THE VOICE CHANNEL'S RULE LIVES. Both emitters call this — the live one
+    at `FunctionToolCallEvent`, this one at the call's stored part — so a refused update
+    reaches neither, and neither of them re-checks a ceiling the other might read differently.
+    The tool body raises the teaching `ModelRetry` so the model learns what happened; this
+    decides what a human sees, and the two read the same constant.
+
+    Tolerant of both stored shapes, like `_plan_argument`: pydantic-ai persists a tool call's
+    `args` as a JSON string or as an object depending on the provider. A malformed argument is
+    the same answer as a missing one — there is nothing to show — and a projection that raised
+    would take a whole transcript down over one row."""
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except ValueError:
+            return None
+    if not isinstance(args, dict):
+        return None
+    update = args.get("update")
+    if not isinstance(update, str):
+        return None
+    text = update.strip()
+    if not text or len(text) > UPDATE_MAX_CHARS:
+        return None
+    return text
+
+
 def _project_response_parts(
     row: Message,
     message: dict[str, Any],
@@ -615,25 +661,34 @@ def _project_response_parts(
     # class. `NARRATION_VOICE` asks the model for this; a build that fails is exactly when it
     # stops complying, so the guarantee cannot live in the prompt alone.
     #
-    # STRUCTURAL, NOT A WORD LIST, and deliberately not keyed on `meta.kind`. A Write turn
-    # that mutates nothing never calls `declare_done` and is persisted as an ordinary
+    # STRUCTURAL, NOT A WORD LIST, and deliberately not keyed on `meta.kind`. A turn that
+    # mutates nothing never calls `declare_done` and is persisted as an ordinary
     # `write_step` — the citizen asked a question and this prose IS the answer (the
     # zero-mutation ending at `engine._TurnState.expects_mutation`). "Has a tool call beside
     # it" keeps that answer and drops only narration; `kind == "write_completion"` would
     # silently eat it. Mirrored live in `engine._stream_text` — change both or reload and
     # the live feed disagree.
     #
-    # AND IT IS GATED ON WHEN THE ROW WAS WRITTEN, which is the half revision 0035 forced.
-    # 0035 rewrites every historical row's stamp to `build`, so without this guard the drop
-    # would become RETROACTIVE: a migrated Plan or Ask turn that read files and then wrote
-    # prose — the ordinary shape, not an edge case — would silently stop rendering its prose
-    # on reload. `schema_version` is a fact about when a row was written, never a per-row
-    # exemption keyed on the migrated stamp, so it costs the "behaviour lives in the toolset"
-    # claim nothing. Rows written before 0035 keep rendering exactly as they always did.
-    narrating_between_tools = (
-        row.schema_version >= SCHEMA_VERSION
-        and row.kind is ChatKind.BUILD
-        and any(p.get("part_kind") == "tool-call" for p in parts)
+    # IT NO LONGER ASKS WHICH KIND OF CHAT THIS IS (U4/R74/N2). The rule was always about the
+    # structural fact — this response also called a tool, so its prose was the model narrating
+    # its way there — and that fact is exactly as true in a planning chat. Keying it on the
+    # kind said the opposite: that the same response means one thing in one chat and something
+    # else in another. What replaced the guarantee the kind was standing in for is the voice
+    # channel (`TELL_THE_USER_TOOL`): prose beside a tool call is dropped in both kinds, and
+    # in both kinds there is one deliberate way to say something anyway.
+    #
+    # IT IS STILL GATED ON WHEN THE ROW WAS WRITTEN, which is the half revision 0035 forced.
+    # 0035 rewrites every historical row's stamp, so a row written before it cannot be read as
+    # evidence of anything: those transcripts render exactly as they always did. Note what
+    # this guard does NOT cover — a row written between 0035 and this change carries the new
+    # version and now takes the widened rule, so a planning response that wrote prose beside a
+    # tool call loses that prose on reload. That window exists only on unreleased branches
+    # (0035 has never been on `main`), and closing it would mean spending the payload
+    # SCHEMA_VERSION on a rendering rule: the version means "can this server parse this row",
+    # a rollback to the previous server must keep working, and nothing about the payload
+    # changed here.
+    narrating_between_tools = row.schema_version >= SCHEMA_VERSION and any(
+        p.get("part_kind") == "tool-call" for p in parts
     )
     for part in parts:
         part_kind = part.get("part_kind")
@@ -678,6 +733,26 @@ def _project_response_parts(
                         state=_plan_options_state(stored),
                     )
                 )
+                continue
+            if tool_name == TELL_THE_USER_TOOL:
+                # THE WORDS, AT THE POSITION THE CALL OCCUPIES — the `present_plan_options`
+                # shape, and the reason live order and reload order are the same order. The
+                # live stream pushes this same string from this same call at
+                # `FunctionToolCallEvent`, so a reloaded transcript reads as the citizen
+                # watched it arrive.
+                #
+                # AND IT IS NOT A STEP. Handled above `_step_label`, exactly as the offer is,
+                # so the transcript shows what was said and never a row announcing that the
+                # agent decided to say it — and never `Used tell_the_user`, which is what the
+                # label fallback would have printed into a citizen's feed.
+                #
+                # A refused call renders nothing here because `update_from_args` returns None
+                # for the same argument the tool body refused. No second copy of the rule, and
+                # no consulting the stored RESULT: a turn cut short before the tool return
+                # landed still said the words, and the citizen saw them.
+                spoken = update_from_args(part.get("args"))
+                if spoken:
+                    items.append(AssistantTextItem(seq=row.seq, text=spoken))
                 continue
             args = _args_dict(part.get("args"))
             label, hidden = _step_label(tool_name, args)
