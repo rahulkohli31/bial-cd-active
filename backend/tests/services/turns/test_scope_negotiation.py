@@ -38,6 +38,7 @@ from pydantic_ai.usage import RunUsage
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.conversation import ChatKind
+from src.db.models.harness_counter import HarnessCount, HarnessCounter
 from src.db.models.message import Message, MessageEntryKind
 from src.services.agent.conversation_tools import propose_first_slice, tell_the_user
 from src.services.messages.projection import (
@@ -403,3 +404,108 @@ async def test_the_proposal_reads_the_same_live_and_after_reload_in_either_kind(
     assert PROPOSAL_EVERYTHING_LEAD in reloaded[0]
     # And it is not a step — the transcript shows the proposal, never `Used propose_first_slice`.
     assert "propose_first_slice" not in reloaded[0]
+
+
+# --- U14 / R92: counted at the tool boundary, never read out of a transcript -----------------
+#
+# These two counters are what answer the question the scripted-transcript tests above
+# deliberately do not: whether the bounded-first-slice behaviour actually HAPPENS. Both are
+# facts about tool calls, which is the only kind of fact this plan lets anything act on.
+
+
+async def _counted(db: AsyncSession, name: HarnessCounter) -> list[int]:
+    rows = await db.execute(sa.select(HarnessCount).where(HarnessCount.name == name))
+    return [row.value for row in rows.scalars().all()]
+
+
+async def test_an_accepted_proposal_is_counted_once_and_a_refused_one_not_at_all(
+    db_session: AsyncSession, empty_harness_counts: None
+) -> None:
+    """★ The denominator is proposals the citizen was actually shown.
+
+    A refused proposal — over the bound, or naming a piece nobody found — reached no screen and
+    agreed nothing, so counting it would make the number "times the model tried" and quietly
+    inflate the very behaviour it exists to measure.
+
+    Mutation check: move the count above the bound checks and this goes red at two."""
+    await propose_first_slice(_ctx(), _NINE, _THREE, _WHY, _QUESTION)
+    with pytest.raises(ModelRetry):
+        await propose_first_slice(_ctx(), _NINE, _NINE[:5], _WHY, _QUESTION)
+
+    assert await _counted(db_session, HarnessCounter.FIRST_SLICE_PROPOSED) == [1]
+
+
+async def test_the_first_mark_against_the_agreement_counts_and_later_ones_do_not(
+    db_session: AsyncSession, empty_harness_counts: None
+) -> None:
+    """★ "Proceeded on the slice as proposed", observed at the boundary.
+
+    Counted on the FIRST matching mark, not on every one: a build that finishes three pieces
+    proceeded on the slice once, and counting per piece would make the ratio a function of how
+    many pieces a slice held."""
+    proposal = ModelResponse(
+        parts=[ToolCallPart("propose_first_slice", _args(_NINE, _THREE), "p1")]
+    )
+    history: list[ModelMessage] = [proposal]
+    await tell_the_user(_ctx(history), "That one is in.", "A visitor list")
+
+    history.append(
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "tell_the_user",
+                    json.dumps({"update": "That one is in.", "finished": "A visitor list"}),
+                    "m1",
+                )
+            ]
+        )
+    )
+    await tell_the_user(_ctx(history), "And that one.", "A sign-out button")
+
+    assert await _counted(db_session, HarnessCounter.FIRST_SLICE_ACCEPTED) == [1]
+
+
+async def test_a_re_proposed_slice_re_opens_the_question(
+    db_session: AsyncSession, empty_harness_counts: None
+) -> None:
+    """★ THE GAP BETWEEN THE TWO NUMBERS IS THE INTERESTING CASE.
+
+    Re-proposing mid-conversation is what "the citizen swapped something in" looks like from
+    the tool boundary. The earlier mark was against the OLD slice and is not evidence about the
+    new one, so the next first-mark counts again — and a second proposal that is never built
+    against shows up as a second `proposed` with no second `accepted`, which is precisely the
+    shape worth looking at in traffic."""
+    later = ["A weekly report", "A badge to print"]
+    history: list[ModelMessage] = [
+        ModelResponse(parts=[ToolCallPart("propose_first_slice", _args(_NINE, _THREE), "p1")]),
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "tell_the_user",
+                    json.dumps({"update": "In.", "finished": "A visitor list"}),
+                    "m1",
+                )
+            ]
+        ),
+        ModelResponse(parts=[ToolCallPart("propose_first_slice", _args(_NINE, later), "p2")]),
+    ]
+    await tell_the_user(_ctx(history), "In.", "A weekly report")
+
+    assert await _counted(db_session, HarnessCounter.FIRST_SLICE_ACCEPTED) == [1]
+
+
+async def test_a_broken_counter_never_refuses_the_tool_it_is_counting(
+    db_session: AsyncSession, empty_harness_counts: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tool must not fail because the metrics table is unreachable. `count` owns that
+    contract; this asserts the consequence at the new call site, which is a path a citizen is
+    waiting on."""
+    from src.services.build_sessions import counters as counters_module
+
+    def _explode(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("the counter table is gone")
+
+    monkeypatch.setattr(counters_module, "async_session_factory", _explode)
+
+    assert await propose_first_slice(_ctx(), _NINE, _THREE, _WHY, _QUESTION)
+    assert await _counted(db_session, HarnessCounter.FIRST_SLICE_PROPOSED) == []

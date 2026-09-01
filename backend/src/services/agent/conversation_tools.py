@@ -24,15 +24,18 @@ place, and neither emitter re-deriving a ceiling the other might read differentl
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Final
 
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.toolsets.function import FunctionToolset
 
+from src.db.models.harness_counter import HarnessCounter
 from src.services.messages.projection import (
     MAX_FIRST_SLICE,
     UPDATE_MAX_CHARS,
     agreed_slice,
+    finished_from_args,
 )
 from src.services.messages.projection import (
     PROPOSE_SLICE_TOOL as PROPOSE_SLICE_TOOL,
@@ -113,7 +116,45 @@ async def tell_the_user(ctx: RunContext[Any], update: str, finished: str | None 
                 f"({', '.join(agreed)}). Mark one of those, spelled the same way, or leave "
                 "`finished` out."
             )
+        if not _already_marked_against(ctx.messages, agreed):
+            # R92's SECOND HALF, counted where the fact is rather than read out of a
+            # transcript. The first mark that matches the agreed list is the observable form
+            # of "they proceeded on the slice as proposed" — a fact about a tool call, which
+            # is the only kind of fact this plan lets anything act on.
+            await _count(HarnessCounter.FIRST_SLICE_ACCEPTED)
     return _SHOWN
+
+
+def _already_marked_against(messages: Sequence[Any], agreed: Sequence[str]) -> bool:
+    """Has any earlier call in this run already marked a piece of the CURRENT agreement?
+
+    Scoped to the current agreement on purpose: a mark against a slice that has since been
+    re-proposed is not evidence about the new one, so re-proposing genuinely re-opens the
+    question of whether the build proceeded on what was agreed — which is exactly what the two
+    counters are there to show."""
+    for message in messages:
+        for part in getattr(message, "parts", []):
+            if getattr(part, "tool_name", None) != TELL_THE_USER_TOOL:
+                continue
+            marked = finished_from_args(getattr(part, "args", None))
+            if marked is not None and marked in agreed:
+                return True
+    return False
+
+
+async def _count(name: HarnessCounter) -> None:
+    """Fire-and-forget, and the import is function-scoped for the package cycle.
+
+    `src.services.build_sessions.__init__` reaches `manager` → `appdata` → `services.projects`
+    → `describe`, which imports the agent package this module lives in. At module level that
+    fails at interpreter start, in whichever router happens to import first, with a traceback
+    pointing nowhere near the cause — the same trap `usage/gate.py` documents.
+
+    `count` owns its own session and swallows everything, so a counter can never fail the tool
+    it is counting."""
+    from src.services.build_sessions.counters import count
+
+    await count(name)
 
 
 def _bad_slice(found: list[str], first: list[str]) -> str | None:
@@ -168,6 +209,9 @@ async def propose_first_slice(
         raise ModelRetry(
             "Ask exactly one question — the one thing you most need decided before you start."
         )
+    # COUNTED AFTER THE BOUNDS, so a refused proposal counts nothing: it reached no citizen and
+    # agreed nothing, and counting it would make the denominator "times the model tried".
+    await _count(HarnessCounter.FIRST_SLICE_PROPOSED)
     return _PROPOSED
 
 

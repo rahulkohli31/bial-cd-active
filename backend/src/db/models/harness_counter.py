@@ -122,6 +122,24 @@ class HarnessCounter(enum.StrEnum):
     #: which starts containers on two arms with different budgets, so a mean over both would
     #: describe neither.
     APP_COLD_START_MS = "app_cold_start_ms"
+    #: ── Did the bounded-first-slice behaviour actually happen? (U14 / R92) ──────────────────
+    #: Read together these two answer that without anyone opening a transcript, which is the
+    #: point: the scripted-transcript tests can only pin what the PLATFORM does with a given
+    #: proposal, and whether the model proposes against a nine-screen message is a fact about
+    #: traffic.
+    #:
+    #: One per proposal the tool ACCEPTED — a refused one (over the bound, or naming a piece
+    #: nobody found) counts nothing, because it reached no citizen and agreed nothing.
+    FIRST_SLICE_PROPOSED = "first_slice_proposed"
+    #: One per agreement the build then PROCEEDED ON, counted at the first finish-mark that
+    #: matches the agreed list — the observable form of "they took the slice as proposed".
+    #:
+    #: THE RATIO IS THE INTERESTING NUMBER, and the gap between the two is the interesting
+    #: case: proposals that were never built against are where the negotiation is landing
+    #: badly, whether because the citizen re-scoped or because the agent never followed its
+    #: own proposal. A second proposal in the same conversation is what "swapped something in"
+    #: looks like from here, and it shows up as a second `proposed` with no second `accepted`.
+    FIRST_SLICE_ACCEPTED = "first_slice_accepted"
     #: ── The browser-observed half of the same four questions (R104, R105) ───────────────────
     #: Written only through `POST /v1/observations`, whose server-side allowlist is these three
     #: names and nothing else — a browser cannot invent a counter.
