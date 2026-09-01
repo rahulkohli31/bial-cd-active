@@ -48,7 +48,10 @@ import type { ReclaimBlocked } from '../../../utils/buildSessionApi'
 // and a feedback modal into every scenario here. That the real navbar routes its links through the
 // hook is `Navbar.test.jsx`'s to prove; this proves there is something for it to route through.
 vi.mock('../../layout/Navbar', () => ({
-  default: () => {
+  // NAMED, because `default: () => …` is an anonymous arrow and the hooks lint rule reads a
+  // component's identity off its name — a hook inside one it cannot recognise is an error, and it
+  // is right to be: React itself keys a component's hook state on the same thing.
+  default: function StubNavbar() {
     const exit = useWorkspaceExit()
     return (
       <div data-testid="navbar">
@@ -482,6 +485,7 @@ describe('WorkspaceShell — the in-place unsaved-work guard (U8)', () => {
         : { name: 'not-running', headline: 'Your app is saved.', detail: null, action: null },
       projectId: 'p1',
       onStarted: () => {},
+      onStartPending: () => {},
       onStartOutcome: () => {},
       onRefresh: () => {},
       onReclaimRefusal: () => {},

@@ -277,6 +277,15 @@ export interface WorkspaceReport {
   /** Record how a start attempt ended; `null` clears it (a start that reached the app). */
   onStartOutcome: (outcome: StartOutcome | null) => void
   /**
+   * A PRESS HAS BEGUN, OR FINISHED — and the pane needs to know before the server does.
+   *
+   * The server's `starting` state is the honest answer and it arrives on the NEXT read, which is up
+   * to a full poll cadence away. Without this the pane went on saying "Your app is saved." for that
+   * whole window after somebody pressed the button: true, but not an acknowledgement, and the only
+   * feedback was a spinner inside the control itself.
+   */
+  onStartPending: (pending: boolean) => void
+  /**
    * THE URL A SUCCESSFUL START JUST PRODUCED — and the publisher decides what to do with it.
    *
    * Without this, pressing the start control inside a Build chat did nothing visible: that surface

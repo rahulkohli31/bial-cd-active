@@ -13,7 +13,7 @@
  * would pass in the very state that loses work, and its greenness would be mistaken for evidence.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
 import StartAppControl from '../StartAppControl'
 import { LAUNCH_LABEL, type WorkspaceAction } from '../workspaceState'
@@ -36,6 +36,7 @@ function reportSpy(over: Partial<WorkspaceReport> = {}): WorkspaceReport {
     state: { name: 'not-running', headline: 'Your app is saved.', detail: null, action: START },
     projectId: 'p1',
     onStarted: vi.fn(),
+    onStartPending: vi.fn(),
     onStartOutcome: vi.fn(),
     onRefresh: vi.fn(),
     onReclaimRefusal: vi.fn(),
@@ -305,5 +306,47 @@ describe('★ the URL a successful start produced reaches the surface that frame
 
     await waitFor(() => expect(report.onStartOutcome).toHaveBeenCalledWith(null))
     expect(report.onStarted).not.toHaveBeenCalled()
+  })
+})
+
+describe('★ the report reaches the surface even after this control is gone', () => {
+  it('records a successful start whose button unmounted mid-flight', async () => {
+    // THE BUG THIS IS WRITTEN AGAINST, and it was introduced by the fix one layer up. The moment a
+    // press reaches the map the state becomes `starting`, which offers no action — so the button
+    // that fired the request is unmounted before the request comes back. A `mounted` guard in
+    // front of the report then swallowed the control's own success: no URL for the pane to frame,
+    // no outcome to clear the wait, and the screen sat on "Getting your app ready." forever while
+    // a perfectly good container served underneath it.
+    //
+    // `mounted` protects THIS component's state. The report writes into the SURFACE, which outlives
+    // it and needs the answer either way.
+    let finish: (v: unknown) => void = () => {}
+    api.relaunchPreview.mockImplementation(() => new Promise((resolve) => { finish = resolve }))
+    const report = reportSpy()
+    const { unmount } = renderControl(START, report)
+    fireEvent.click(button())
+
+    // The control goes away while the request is still in the air.
+    unmount()
+    await act(async () => {
+      finish({ appId: 'a1', previewUrl: 'https://app.example/', status: 'ready', restoredFromFailedBuild: false, ready: true })
+    })
+
+    expect(report.onStarted).toHaveBeenCalledWith('https://app.example/')
+    expect(report.onStartOutcome).toHaveBeenCalledWith(null)
+    // …and the wait is cleared, or the pane holds `starting` for the life of the tab.
+    expect(report.onStartPending).toHaveBeenLastCalledWith(false)
+  })
+
+  it('records a REFUSAL the same way', async () => {
+    api.relaunchPreview.mockRejectedValue(new ApiError('the sandbox is unavailable', 503))
+    const report = reportSpy()
+    const { unmount } = renderControl(START, report)
+    fireEvent.click(button())
+    unmount()
+
+    await waitFor(() =>
+      expect(report.onStartOutcome).toHaveBeenCalledWith({ kind: 'failed', reason: 'the sandbox is unavailable' }),
+    )
   })
 })

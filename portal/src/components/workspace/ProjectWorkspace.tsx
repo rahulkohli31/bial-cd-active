@@ -154,6 +154,7 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
       state: workspace.state,
       projectId: project.id,
       onStarted: setStartedPreviewUrl,
+      onStartPending: workspace.reportStartPending,
       onStartOutcome: (outcome: StartOutcome | null) => {
         workspace.reportStartOutcome(outcome)
         // A start that reached the app clears the outcome AND asks again immediately, so the pane

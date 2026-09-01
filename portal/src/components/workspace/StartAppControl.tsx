@@ -69,9 +69,23 @@ export default function StartAppControl({ action, report }: StartAppControlProps
     if (!projectId || inFlight.current) return
     inFlight.current = true
     setPending(true)
+    // THE PANE HEARS THE PRESS IMMEDIATELY, not on the next poll tick. The server's own `starting`
+    // is the authority and it arrives later; this is what stops the sentence above this button
+    // saying nothing happened for up to forty-five seconds.
+    report.onStartPending(true)
     try {
       const res = await relaunchPreview({ projectId })
-      if (!mounted.current) return
+      // NO MOUNTED GUARD BEFORE THE REPORT, and the distinction is the bug it was written as.
+      //
+      // `mounted` protects THIS component's own state. The report's handlers write into the
+      // SURFACE — the workspace read, the address, the outcome slot — all of which outlive this
+      // button and all of which need the answer. And this control unmounts routinely mid-flight:
+      // the moment the press reaches the map, the state becomes `starting`, which offers no
+      // action, so the button that fired the request is gone before the request comes back.
+      //
+      // Guarding here meant a start that SUCCEEDED reported nothing: no URL for the pane to frame,
+      // no outcome to clear the wait. The screen sat on "Getting your app ready." forever while a
+      // perfectly good container served underneath it.
       // THE URL FIRST, and before the outcome. It is what the surface frames, and reporting it
       // second would leave one commit in which the state says "running" and the pane has no
       // address to show for it. Handed over even when `ready` is false: the container is up and
@@ -83,7 +97,8 @@ export default function StartAppControl({ action, report }: StartAppControlProps
       // off this boolean. Safe here only because both sides of the read are non-destructive.
       report.onStartOutcome(res.ready ? null : { kind: 'not-painted' })
     } catch (err) {
-      if (!mounted.current) return
+      // Same reasoning as the success path above: a refusal has to reach the surface whether or
+      // not the button that provoked it is still on screen.
       // DISCRIMINATED ON THE CODE BEFORE ANYTHING ELSE. A bare 409 is not self-describing: it
       // fires for a same-project reattach and for a cross-project block, and the two have
       // different remedies.
@@ -104,6 +119,7 @@ export default function StartAppControl({ action, report }: StartAppControlProps
       report.onStartOutcome(outcomeFor(err))
     } finally {
       inFlight.current = false
+      report.onStartPending(false)
       if (mounted.current) setPending(false)
     }
   }, [report])

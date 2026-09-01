@@ -37,9 +37,10 @@ const reading = (over: Partial<PreviewState> = {}): PreviewState => ({
 })
 
 const reportFor = (preview: PreviewState): WorkspaceReport => ({
-  state: resolveWorkspaceState({ preview, projectHasSavedBuild: null, startOutcome: null }),
+  state: resolveWorkspaceState({ preview, projectHasSavedBuild: null, startOutcome: null, startInFlight: false }),
   projectId: 'p1',
   onStarted: vi.fn(),
+  onStartPending: vi.fn(),
   onStartOutcome: vi.fn(),
   onRefresh: vi.fn(),
   onReclaimRefusal: vi.fn(),

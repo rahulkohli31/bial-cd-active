@@ -63,6 +63,8 @@ export interface WorkspaceReading {
   save: SaveState | null
   /** Record how the most recent start attempt ended. `null` clears it (a start that worked). */
   reportStartOutcome: (outcome: StartOutcome | null) => void
+  /** A press has begun, or finished. Drives the map's in-flight arm. */
+  reportStartPending: (pending: boolean) => void
   /** Ask again NOW. A deliberate gesture: a start that just finished, or a retry press. */
   refresh: () => void
 }
@@ -81,6 +83,9 @@ export function useWorkspaceState({
   const [preview, setPreview] = useState<PreviewState | null>(null)
   const [save, setSave] = useState<SaveState | null>(null)
   const [startOutcome, setStartOutcome] = useState<StartOutcome | null>(null)
+  // A press is in flight. See `WorkspaceInputs.startInFlight` for why the map needs to know: the
+  // server's own `starting` arrives on the next read, and this covers the gap until it does.
+  const [startInFlight, setStartInFlight] = useState(false)
   // NOT DERIVED FROM ANYTHING, and it cannot be. A retry press is a synchronous fact whose only
   // observable state change can be collapsed into one commit by React's batching, so an
   // invalidation spelled as "something changed" is one a fast enough server erases. A counter
@@ -90,6 +95,12 @@ export function useWorkspaceState({
   const refresh = useCallback(() => setEpoch((n) => n + 1), [])
   const reportStartOutcome = useCallback((outcome: StartOutcome | null) => {
     setStartOutcome(outcome)
+  }, [])
+  const reportStartPending = useCallback((pending: boolean) => {
+    setStartInFlight(pending)
+    // A press supersedes whatever the LAST attempt ended as. Leaving a stale "did not answer in
+    // time" standing under a fresh start is the pane arguing with the button somebody is holding.
+    if (pending) setStartOutcome(null)
   }, [])
 
   // Read inside the async body without re-arming the effect. A start outcome must not restart the
@@ -178,10 +189,11 @@ export function useWorkspaceState({
   }, [projectId, epoch])
 
   return {
-    state: resolveWorkspaceState({ preview, projectHasSavedBuild, startOutcome }),
+    state: resolveWorkspaceState({ preview, projectHasSavedBuild, startOutcome, startInFlight }),
     preview,
     save,
     reportStartOutcome,
+    reportStartPending,
     refresh,
   }
 }

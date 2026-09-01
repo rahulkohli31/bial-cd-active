@@ -161,6 +161,16 @@ export interface WorkspaceInputs {
   readonly projectHasSavedBuild: boolean | null
   /** How the most recent start attempt ended, or `null` if none has been made or it succeeded. */
   readonly startOutcome: StartOutcome | null
+  /**
+   * A START IS IN FLIGHT RIGHT NOW, from this surface's own press.
+   *
+   * Without it the pane went on saying "Your app is saved." for up to a full poll cadence after
+   * somebody pressed the button — true, but not an acknowledgement, and the only feedback was a
+   * spinner inside the control. The server's own `starting` state is the honest answer and it
+   * arrives on the next read; this is what covers the gap until it does, through the SAME arm, so
+   * the sentence still has one author.
+   */
+  readonly startInFlight: boolean
 }
 
 // ─── the map ──────────────────────────────────────────────────────────────────────────────────
@@ -188,7 +198,14 @@ export interface WorkspaceInputs {
  * confident "gone". The `assertNever` at the bottom is what keeps that true when the union grows.
  */
 export function resolveWorkspaceState(inputs: WorkspaceInputs): WorkspaceState {
-  const { preview, projectHasSavedBuild, startOutcome } = inputs
+  const { preview, projectHasSavedBuild, startOutcome, startInFlight } = inputs
+
+  // A LIVE CONTAINER OUTRANKS AN IN-FLIGHT PRESS, and nothing else does. If the read already says
+  // the app is serving, the start succeeded — saying "getting your app ready" over a running app
+  // would be the pane contradicting the frame beside it. Everything below `alive` yields, because
+  // a press is newer than any of them: a stale `asleep`, an unknown, or a previous attempt's
+  // ending are all facts from before the button was pressed.
+  if (startInFlight && preview?.state !== 'alive') return gettingReady()
 
   if (preview === null) return couldNotRead()
 
@@ -201,16 +218,7 @@ export function resolveWorkspaceState(inputs: WorkspaceInputs): WorkspaceState {
         action: null,
       }
     case 'starting':
-      // R4a, TAKEN LITERALLY. This sentence says what is happening and names no number, because
-      // nobody has measured one. The canvas's "about thirty seconds" and the register's "about
-      // half a minute" are both deliberately dropped; a duration arrives from a measured constant
-      // or not at all.
-      return {
-        name: 'starting',
-        headline: 'Getting your app ready.',
-        detail: null,
-        action: null,
-      }
+      return gettingReady()
     case 'slot_taken':
       return heldElsewhere(preview)
     case 'unknown':
@@ -336,6 +344,24 @@ function atRest(preview: PreviewState, projectHasSavedBuild: boolean | null): Wo
  * container, promises nothing about the work, and offers the only verb that is safe against a
  * signal we could not interpret.
  */
+/**
+ * R4a, TAKEN LITERALLY. This sentence says what is happening and names no number, because nobody
+ * has measured one. The canvas's "about thirty seconds" and the register's "about half a minute"
+ * are both deliberately dropped; a duration arrives from a measured constant or not at all.
+ *
+ * ONE FUNCTION FOR TWO ARRIVALS. The server's `starting` and this surface's own in-flight press are
+ * the same state — a start is happening — and giving them one sentence is what keeps them from
+ * drifting into two slightly different waits.
+ */
+function gettingReady(): WorkspaceState {
+  return {
+    name: 'starting',
+    headline: 'Getting your app ready.',
+    detail: null,
+    action: null,
+  }
+}
+
 function couldNotRead(): WorkspaceState {
   return {
     name: 'could-not-read',

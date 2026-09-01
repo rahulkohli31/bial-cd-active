@@ -64,6 +64,12 @@ const NOTHING_IS_SERVING: ReadonlySet<WorkspaceStateName> = new Set<WorkspaceSta
   'never-built',
   'held-by-another-project',
   'held-unattributed',
+  // `starting` IS one of these, and the wire says so in as many words: it means "a start is in
+  // flight … not `alive` (NO CONTAINER YET)". A held address survives its publisher, so without
+  // this a press over a stale URL re-framed a container that is not there — the pane showing an
+  // app while the platform is still bringing one up. The wait is the honest thing to show, and it
+  // is what the map's `starting` arm says.
+  'starting',
 ])
 
 export interface AppPaneProps {
@@ -169,7 +175,16 @@ function NoFrame({ report }: { report: ReturnType<typeof useWorkspaceReport> }) 
 
   const { state } = report
   return (
-    <div data-testid="app-pane-empty" className="flex flex-1 items-center justify-center p-8">
+    <div
+      data-testid="app-pane-empty"
+      // THE INTERNAL STATE NAME, EXPOSED FOR TESTS AND NEVER RENDERED. `not-running` is the one to
+      // watch: it is a state name here and on the wire, and the exact phrase R-16 forbids on
+      // screen. It is an attribute rather than text for that reason — and it gives a suite a handle
+      // on WHICH state the pane reached without pinning the copy, which the client has changed
+      // twice and may change again.
+      data-workspace-state={state.name}
+      className="flex flex-1 items-center justify-center p-8"
+    >
       <div className="max-w-sm text-center">
         <p className="text-base font-bold text-tertiary">{state.headline}</p>
         {state.detail && <p className="mt-2 text-sm text-neutral leading-relaxed">{state.detail}</p>}

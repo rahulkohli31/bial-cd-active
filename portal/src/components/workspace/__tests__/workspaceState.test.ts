@@ -40,6 +40,7 @@ function resolve(over: Partial<WorkspaceInputs> = {}) {
     preview: reading(),
     projectHasSavedBuild: null,
     startOutcome: null,
+    startInFlight: false,
     ...over,
   })
 }
@@ -269,7 +270,7 @@ describe('the properties that hold across every input', () => {
     for (const preview of states) {
       for (const startOutcome of outcomes) {
         for (const projectHasSavedBuild of [true, false, null]) {
-          const state = resolveWorkspaceState({ preview, projectHasSavedBuild, startOutcome })
+          const state = resolveWorkspaceState({ preview, projectHasSavedBuild, startOutcome, startInFlight: false })
           const text = `${state.headline} ${state.detail ?? ''} ${state.action?.label ?? ''}`
           expect(`${state.name}: ${text}`).not.toMatch(destructive)
           // Every arm says something, and offers at most one thing to press.

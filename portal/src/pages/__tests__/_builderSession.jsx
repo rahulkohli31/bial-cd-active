@@ -226,6 +226,100 @@ export async function send(text = 'a visitor app') {
   fireEvent.keyDown(composer(), { key: 'Enter' })
 }
 
+// ─── Plan F, U3/U4: THE ONE START CONTROL, and the vehicle for pressing it from a fresh chat ──
+//
+// `RelaunchAffordance` — four "Relaunch preview" / "Bring it back" buttons scattered through
+// `LivePreview`'s placeholder arms — is gone (Plan F, U4). R3's one control is
+// `StartAppControl.tsx`, rendered by `AppPane`'s `NoFrame` from the one computed workspace state,
+// and it speaks one vocabulary regardless of which arm handed it the action: `action.kind ===
+// 'start'` labels it "Launch Application", `'retry'` labels it "Try again", and BOTH presses call
+// the exact identical `start()` — the label is cosmetic, never behavioural (`StartAppControl.tsx`).
+// A suite that needs to press the one true control, whichever label the map is currently showing,
+// uses this rather than hard-coding one string — hard-coding one is exactly what broke every one
+// of these suites when the map's default answer (`could-not-read`, before any poll has landed)
+// turned out to say "Try again", not "Launch Application".
+export const findStartAppControl = () =>
+  screen.findByRole('button', { name: /^(Launch Application|Try again)$/ })
+
+/**
+ * The empty-pane placeholder (`NoFrame`, `AppPane.tsx`) — what the pane shows in place of the real
+ * iframe host whenever the workspace map's own veto says nothing is serving, or nothing has been
+ * resolved yet. It carries the map's INTERNAL state name as `data-workspace-state` — never
+ * rendered as copy, so a suite that asserts against it survives a copy rewrite nobody has to come
+ * back and tell every test about. Prefer this over matching the sentence itself.
+ */
+export const appPaneEmpty = () => document.querySelector('[data-testid="app-pane-empty"]')
+export const workspaceStateName = () => appPaneEmpty()?.getAttribute('data-workspace-state') ?? null
+
+/**
+ * Stamp `sessionProjectRef` — the ONE thing `StartAppControl`'s own click path needs and never
+ * itself provides — WITHOUT the reattach handing the resolver an address of its own.
+ *
+ * ═══ WHY THIS IS THE VEHICLE, NOT A CLICK ═══
+ *
+ * `StartAppControl`'s successful press hands its URL to `report.onStarted` ->
+ * `setStartedPreviewUrl` in `ConversationSurface.tsx`, which feeds `previewAddress.ts`'s
+ * `relaunchedUrl` arm — but that arm (like the session arm below it) is gated by
+ * `sessionBelongsToOpenProject`, wired to `sessionProjectMatches` = `sessionProjectRef.current ===
+ * projectId`. NOTHING in `StartAppControl`'s own click path ever stamps that ref: only a session
+ * REATTACH (`attachToLiveSession`, for a `build_in_progress` anchor) or the now-dead
+ * `handleRelaunch` do (`ConversationSurface.tsx`). A fresh chat that has never reattached to
+ * anything therefore has `sessionProjectMatches === false` forever, and pressing the one true
+ * start control silently changes nothing on screen — confirmed empirically while diagnosing this
+ * suite, and reported as a real product bug rather than papered over here.
+ *
+ * ═══ WHY PENDING, NOT RESOLVED ═══
+ *
+ * `attachToLiveSession` stamps the ref SYNCHRONOUSLY, before its `getStatus` round trip even
+ * starts (`ConversationSurface.tsx`, ordered before `session.reattach(sessionId)`) — so the stamp
+ * lands whether or not that round trip ever settles. A round trip that DOES settle hands the
+ * session hook a real `status`, and a `status` alone — with no URL at all — is enough to keep
+ * `AppPane` showing `AppPaneHost`'s own now-buttonless terminal card instead of `NoFrame` (the
+ * OTHER finding this investigation turned up: see `BuilderPage-session.test.jsx`'s "come back
+ * later" suite). Leaving the round trip pending sidesteps that trap entirely: the ref is stamped,
+ * nothing else about "the session" is ever true, and `NoFrame`/`StartAppControl` is reachable the
+ * moment the map has anything to say.
+ *
+ * ═══ THE ONE COST, AND HOW TO PAY IT ═══
+ *
+ * With the reattach pending forever the composer gate never opens (`gateCheck` only resolves
+ * inside the reattach's own `.then`/`.catch`). A caller that needs to send afterward calls the
+ * returned `settle()` once the relaunch has framed what it needed — the stamp survives a
+ * SUCCESSFUL settle (only a 404, or any other rejection, reverts it), so the gate opens for an
+ * ordinary send while the ref stays exactly where the click left it.
+ */
+export function primeStandbyReattach(h, { chatId = 'chat-A', projectId = 'p1', sessionId = 'standby-1' } = {}) {
+  let resolveStatus
+  // KEYED BY ID, not a blanket `mockResolvedValue` — a caller that later moves the SAME page
+  // instance to a sibling chat (flat routing keeps it mounted) triggers that chat's own adopt
+  // effect, and a blanket answer would hand IT this same anchor too: a second `getStatus` call
+  // overwrites `resolveStatus` above to point at the NEW pending promise, so `settle()` would stop
+  // reaching the original one and the sibling's OWN composer gate would hang open forever. Every
+  // other chat id gets no anchor at all, which is the ordinary "nothing was mid-build here" case.
+  h.getBuild.mockImplementation(async (id) =>
+    id === chatId
+      ? {
+          id,
+          kind: 'builder',
+          messages: [
+            { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'a visitor app' }] },
+            { id: 'srv_1_g', role: 'assistant', seq: 1, parts: [{ type: 'build_in_progress', sessionId }] },
+          ],
+        }
+      : null,
+  )
+  h.getStatus.mockImplementation(() => new Promise((resolve) => { resolveStatus = resolve }))
+  return {
+    /** Settle the reattach on an already-dead session (no URL, no status the resolver can use) —
+     *  opens the composer gate without disturbing whatever `StartAppControl` already framed. */
+    settle: () =>
+      resolveStatus?.({
+        sessionId, projectId, appId: 'a1', status: 'ended', previewUrl: null,
+        lastSeq: null, createdAt: 'c', updatedAt: 'u',
+      }),
+  }
+}
+
 /**
  * The full PRESS path: send a turn, wait for the plan-options card, click Build it.
  *

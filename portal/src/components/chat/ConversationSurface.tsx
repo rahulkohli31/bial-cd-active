@@ -2005,6 +2005,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // block below for why this arm needs a second producer at all. Declared here rather than beside
   // the poll's epoch because the address resolution reads it, and that runs further up.
   const [startedPreviewUrl, setStartedPreviewUrl] = useState<string | null>(null)
+  const [startPending, setStartPending] = useState(false)
   const address = resolvePreviewAddress({
     turnPreviewUrl: turnPreview.url,
     turnStatus: turnBuildStatus,
@@ -2013,21 +2014,20 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     // this surface's own relaunch path; `startedPreviewUrl` from the workspace's start control,
     // which calls the same endpoint directly. Neither can be dropped: the first still fires from
     // the build-session hook, and the second is the only producer the pane's own control has.
+    // TWO PRODUCERS FOR ONE ARM, and the newer one wins. `session.relaunchedPreviewUrl` comes from
+    // this surface's own relaunch path; `startedPreviewUrl` from the workspace's start control,
+    // which calls the same endpoint directly. Neither can be dropped: the first still fires from
+    // the build-session hook, and the second is the only producer the pane's own control has.
+    //
+    // THE RELAUNCHED ARM, NOT THE PROJECT ONE. They are gated identically, so the choice is about
+    // RANKING: a restore the citizen just asked for outranks the session's own URL, which describes
+    // the build before it. Demoting it to the project arm — ranked last — puts a stale session URL
+    // in front of the app they pressed a button to bring up.
     relaunchedUrl: startedPreviewUrl ?? session.relaunchedPreviewUrl,
+    projectPreviewUrl: null,
     sessionUrl: session.previewUrl,
     sessionStatus: session.status,
     sessionId: session.sessionId,
-    // NOT `previewState?.previewUrl`, and the reason is a cycle rather than an oversight: this
-    // surface's preview-state poll only runs while an address is ALREADY framed (see its effect
-    // below), so feeding its answer back in could never bootstrap one and would only widen the
-    // window in which a dropped address keeps framing.
-    //
-    // THE ARM IS NOW POPULATED — by its intended caller, not by this one. It exists for the
-    // surface that has a project and no chat, and `components/workspace/ProjectWorkspace.tsx` is
-    // it: its own read has no framed-URL precondition, precisely because the no-frame case is what
-    // the project screen's pane exists to describe. Nothing changes here; the note is updated
-    // because a closed gap must stop reading as an open one.
-    projectPreviewUrl: null,
     sessionBelongsToOpenProject: sessionProjectMatches,
     transcriptHasBuildOutcome: newestOutcome !== null,
   })
@@ -2158,8 +2158,24 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   const restoreInFlight = sessionProjectMatches && session.relaunching
   const [previewProbeEpoch, setPreviewProbeEpoch] = useState(0)
   useEffect(() => {
-    // Only worth asking while a frame is actually on screen claiming to be live.
-    if (!projectId || !framedPreviewUrl) {
+    // IT ASKS WITH NO FRAME NOW, and that is a deliberate widening (Plan F, U4).
+    //
+    // This used to read "only worth asking while a frame is actually on screen claiming to be
+    // live", which was true while the poll's only job was catching a framed app being reclaimed
+    // underneath it. Its answer now decides something else as well: whether the pane offers the
+    // one control that starts the app.
+    //
+    // THE FAILURE THAT FORCED IT. Reload a chat whose build has ended. The address resolves a
+    // STATUS and no URL — the transcript proves a build ran — so the pane drew "The preview is no
+    // longer running" and the poll returned right here without asking anything. The workspace state
+    // stayed unknown for the life of the tab, so the pane could never learn the workspace was
+    // asleep and never offered the way back: R3's one control, satisfied by zero, on the most
+    // ordinary return journey in the product.
+    //
+    // The cost is bounded and was already accepted: `fetchPreviewState` is cheap by contract (one
+    // cache read, no container call), and the terminal rule below still stops the timer on a
+    // settled answer.
+    if (!projectId) {
       setPreviewState(null)
       return undefined
     }
@@ -2451,6 +2467,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
             preview: previewState,
             projectHasSavedBuild,
             startOutcome: null,
+            startInFlight: startPending,
           }),
           projectId,
           // R-18/U4 — WHERE A START'S URL LANDS ON THIS SURFACE, and without it the start control
@@ -2460,7 +2477,21 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
           // retired — so a fresh start had no arm left to populate and the app came up in a
           // container nothing framed. The relaunched arm is exactly right for it: a restore has no
           // build lifecycle, which is why that arm resolves its own status to `ready`.
-          onStarted: setStartedPreviewUrl,
+          onStarted: (previewUrl) => {
+            // STAMP THE PROJECT, then record the URL — and the order does not matter, but the
+            // stamp does. Every project-scoped arm of the address resolver is gated by a stamp a
+            // SESSION leaves, and a chat with no session has none; without this a start fired here
+            // resolved to no address at all and the app came up in a container the pane refused to
+            // point at. Setting it is not a widening of the predicate, which must stay independent
+            // of the chat one — it is this surface honestly claiming the project's workspace,
+            // exactly as a reattach does when it adopts a live build.
+            sessionProjectRef.current = projectId
+            setStartedPreviewUrl(previewUrl)
+          },
+          // This surface has no map state of its own to move — it hands the pure map a `preview`
+          // and nothing else — so an in-flight press is local state here, exactly as it is in the
+          // hook the project surface uses.
+          onStartPending: setStartPending,
           onStartOutcome: () => setPreviewProbeEpoch((n) => n + 1),
           onRefresh: () => setPreviewProbeEpoch((n) => n + 1),
           // The SAME single-slot capture the composer and the relaunch button use — first refusal
