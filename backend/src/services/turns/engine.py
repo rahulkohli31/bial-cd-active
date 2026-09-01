@@ -115,13 +115,17 @@ from src.services.build_sessions.manager import (
 from src.services.build_sessions.outcome import STOPPED_BY_USER
 from src.services.messages.projection import (
     PLAN_OPTIONS_TOOL,
+    PROPOSE_SLICE_TOOL,
     TELL_THE_USER_TOOL,
     TURN_TERMINAL_KIND,
     DisplayItem,
     PlanOptionsItem,
     StepItem,
+    agreed_slice,
     classify_tool_call,
+    finished_from_args,
     long_operation_line,
+    proposal_from_args,
     update_from_args,
 )
 from src.services.messages.store import append_batch
@@ -153,6 +157,7 @@ from src.services.redis import get_redis
 from src.services.sandbox import SandboxClient, SandboxError
 from src.services.sandbox.base import CompileState
 from src.services.turns.copy import (
+    CANNOT_TELL_WHAT_REMAINS_TEXT,
     COULD_NOT_CHECK_TEXT,
     COULD_NOT_CONFIRM_TEXT,
     DID_NOT_COME_TOGETHER_TEXT,
@@ -160,6 +165,7 @@ from src.services.turns.copy import (
     NOTHING_TO_SHOW_YET_TEXT,
     PLAN_NOT_KEPT_TEXT,
     RECOVERED_TEXT,
+    REMAINDER_TEXT,
     STILL_SHOWING_EARLIER,
     STILL_SHOWING_NOTHING,
     STILL_SHOWING_TEMPLATE,
@@ -555,6 +561,15 @@ class _TurnState:
     #: attach seam from `BuildSession.attached`, and read only by R103's numerator — a turn that
     #: started nothing must not be able to report a start that reached a serving page.
     started_a_container: bool = False
+    #: What the citizen last agreed to build first (U10/U12). Seeded from the conversation's own
+    #: rows at turn start and replaced by any proposal made during the turn — latest wins, the
+    #: same rule the offer follows. Empty means nothing was ever proposed, which is the ordinary
+    #: case and produces no closing remainder at all.
+    agreed_pieces: list[str] = field(default_factory=list)
+    #: Which of those the agent marked finished as they landed. A SET, so a piece marked twice
+    #: counts once — the citizen reads a list of what is left, and a double mark must not be
+    #: able to make a piece disappear from it twice or appear as still outstanding.
+    finished_pieces: set[str] = field(default_factory=set)
 
     def text_so_far(self) -> str:
         return "".join(self.text_parts)
@@ -880,6 +895,13 @@ class TurnEngine:
             if workspace is not None:
                 note = await self._workspace_note(state)
                 history = [*history, ModelRequest(parts=[UserPromptPart(content=note)])]
+            # WHAT WAS AGREED, READ OUT OF THE CONVERSATION ITSELF (U12/R90). No column, no
+            # table, no project field: the agreement is the arguments of the last honourable
+            # proposal call in these rows, which is the same bounded route the plan travels. A
+            # Plan chat that proposed and a Build chat that then builds are two conversations,
+            # so this is empty in the second — and an empty agreement produces no closing
+            # remainder at all, which is the honest answer rather than a missing one.
+            state.agreed_pieces = agreed_slice(history)
             if state.kind is ChatKind.BUILD:
                 # A READER OF THE KIND, AND IT ASKS WHICH HARNESS RUNS THE TURN — the node loop
                 # with its per-step billing fold versus a single `chat_agent.run`. That is the
@@ -1992,6 +2014,11 @@ class TurnEngine:
         already keeps: a reply that was not stored has not been given. Silently swallowing it
         would end a build with a completion on screen that vanishes on the next reload."""
         text = sandbox.done_summary.strip() or _BUILD_FINISHED_FALLBACK
+        remainder = self._what_is_still_outstanding(
+            state, workspace_touched=sandbox.workspace_touched
+        )
+        if remainder is not None:
+            text = f"{text}{TEXT_BLOCK_SEPARATOR}{remainder}"
         # An earlier iteration of this same turn can have flushed prose of its own (a response
         # that called no tool — see `_flush_pending_text`), and `text_parts` is joined with
         # nothing between entries. Without this the closing message runs into that prose's last
@@ -2013,6 +2040,55 @@ class TurnEngine:
                 await db.commit()
         except Exception as exc:
             raise _PersistFailedError from exc
+
+    def _what_is_still_outstanding(
+        self, state: _TurnState, *, workspace_touched: bool
+    ) -> str | None:
+        """R89 — what was agreed and not built, from the platform's own record, or None.
+
+        THREE ANSWERS, AND THE THIRD IS WHY THIS IS NOT SIMPLY `agreed − marked`. The agreed
+        half is genuinely platform-held: it is the arguments of the proposal the citizen read.
+        The finished half is AGENT-SUPPLIED, and that is exactly where this design could have
+        shipped a lie — an agent that built all four pieces and marked none is
+        indistinguishable, from the marks alone, from one that built nothing. "These four
+        remain", in the platform's own voice, is a false fact the citizen has no reason to
+        doubt, and strictly worse than the agent's own recollection, which is what this unit
+        exists to replace.
+
+        So the claim is keyed on something the platform DOES hold — `workspace_touched`, the
+        turn's only evidence that anything was actually built:
+
+        * marks landed  → name `agreed − marked`. The ordinary path.
+        * no marks, nothing touched → name the whole agreed list. True, and platform-derived.
+        * no marks, work landed → say we could not tell, and name nothing as outstanding.
+
+        The same tri-state discipline the workspace note keeps, where "could not tell" is never
+        collapsed into a verdict.
+
+        NO AGREEMENT MEANS NO SENTENCE. Most turns never propose a slice, and a closing account
+        that appends an empty section to every build would be noise on all of them.
+
+        TAKES THE FACT, NOT THE SESSION. `workspace_touched` is the only thing this reads off
+        the run, and a parameter that says so IS the whole dependency — a `SandboxSession` here
+        would suggest the rule could grow to consult the container, which is the one thing it
+        must not do.
+
+        TAKES THE FACT, NOT THE SESSION. `workspace_touched` is the only thing this reads off
+        the run, and a parameter that says so is the whole dependency — a `SandboxSession`
+        here would suggest the rule could grow to consult the container, which is exactly what
+        it must not do."""
+        if not state.agreed_pieces:
+            return None
+        if not state.finished_pieces:
+            if workspace_touched:
+                return CANNOT_TELL_WHAT_REMAINS_TEXT
+            return REMAINDER_TEXT.format(pieces=", ".join(state.agreed_pieces))
+        outstanding = [
+            piece for piece in state.agreed_pieces if piece not in state.finished_pieces
+        ]
+        if not outstanding:
+            return None
+        return REMAINDER_TEXT.format(pieces=", ".join(outstanding))
 
     async def _persist_write_reprompt(
         self,
@@ -2574,6 +2650,25 @@ class TurnEngine:
                 spoken = update_from_args(event.part.args)
                 if spoken:
                     self._push_spoken(state, spoken)
+                # THE MARK, RECORDED FROM THE SAME CALL that carried the words (U12). The tool
+                # body has already refused a mark naming a piece nobody agreed to, so what
+                # reaches here is either on the agreed list or the call was retried and never
+                # got this far.
+                marked = finished_from_args(event.part.args)
+                if marked is not None:
+                    state.finished_pieces.add(marked)
+                return
+            if event.part.tool_name == PROPOSE_SLICE_TOOL:
+                # THE PROPOSAL, rendered exactly like a spoken line — and the arguments are also
+                # the AGREEMENT. Recording it here rather than re-reading the rows later keeps
+                # one rule ("the latest honourable proposal wins") and one parser between the
+                # live path and every reader: `agreed_slice` seeded this list from history at
+                # turn start, and this replaces it the moment a new proposal is made.
+                proposal = proposal_from_args(event.part.args)
+                if proposal:
+                    self._push_spoken(state, proposal)
+                    state.agreed_pieces = agreed_slice([ModelResponse(parts=[event.part])])
+                    state.finished_pieces.clear()
                 return
             item = self._step_item(state, event.part.tool_name, event.part.args_as_json_str())
             # REPLACED, not accumulated beside: the first real step retires the ack from the

@@ -42,7 +42,7 @@ from tests.services.orchestrator.fake_sandbox import FakeSandbox
 from tests.services.orchestrator.model_harness import text_turn, tool_turn
 
 _READ_TOOLS = {"read_file", "list_files", "search_files", "run_command"}
-_SHARED_TOOLS = {"tell_the_user"}
+_SHARED_TOOLS = {"tell_the_user", "propose_first_slice"}
 """`conversation_toolset` — the tools BOTH kinds carry, because they are about the person
 waiting rather than about what the run can do. Named once here so the exact-set assertions
 below stay exact: a shared tool has to appear in both, and a test that quietly dropped one

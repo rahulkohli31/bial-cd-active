@@ -41,6 +41,7 @@ from src.core.prompt_blocks import (
     BUILD_WORKING_RULES_HEAD,
     BUILD_WORKING_RULES_TAIL,
     DATA_INTEGRITY_RULES,
+    FIRST_SLICE_RULE,
     KEEP_PLANNING_LABEL,
     NARRATION_VOICE,
     PLAN_MESSAGE_LENGTH,
@@ -75,7 +76,10 @@ def _base(context: PromptContext) -> str:
     # R5: the walkthrough caught the model inventing portal features. The relay had this
     # clause and the mode system did not, so R5 would have regressed the moment the relay
     # retired — it belongs in BASE, where every mode carries it.
-    return f"{identity}\n\n{PORTAL_SURFACES}\n\n{DATA_INTEGRITY_RULES}\n\n{NARRATION_VOICE}"
+    return (
+        f"{identity}\n\n{PORTAL_SURFACES}\n\n{DATA_INTEGRITY_RULES}\n\n"
+        f"{NARRATION_VOICE}\n\n{FIRST_SLICE_RULE}"
+    )
 
 
 _PLAN_SEGMENT = f"""\

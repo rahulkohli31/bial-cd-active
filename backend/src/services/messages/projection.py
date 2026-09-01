@@ -43,6 +43,22 @@ TELL_THE_USER_TOOL: Final = "tell_the_user"
 emitters call, for the same reason `PLAN_OPTIONS_TOOL` is: the live emitter and this one must
 agree on the spelling or a spoken line renders on one side and not the other."""
 
+PROPOSE_SLICE_TOOL: Final = "propose_first_slice"
+"""The scope-negotiation tool's wire name (U10 / R83–R88). Named here for the same reason the
+other two are: the live emitter and this one must agree on the spelling, and the stored call is
+the record both of them read."""
+
+MAX_FIRST_SLICE: Final = 4
+"""R83's binding half — never more than four pieces in a first round.
+
+THE FLOOR IS DELIBERATELY NOT ENFORCED, and that is a decision rather than an omission. R83
+says "roughly two to four, FEWER when the pieces are large", and R84 gives the case outright:
+twenty pages describing one screen is one piece. A hard floor of two would refuse an honest
+single-piece slice inside the tool body and leave the model no recovery except to split a piece
+that should not be split, or to name one it does not intend to build — which then shows up as a
+padded remainder in the closing account. So the code bound is 1..4 and the two-piece preference
+is prompt copy, which is the right home for a soft preference and is not a guardrail claim."""
+
 UPDATE_MAX_CHARS: Final = 280
 """The whole of what bounds the voice channel, and it is a NUMBER rather than a sentence.
 
@@ -643,6 +659,158 @@ def update_from_args(args: Any) -> str | None:
     return text
 
 
+def _slice_argument(args: Any) -> dict[str, Any] | None:
+    """A proposal call's arguments, or None when the call carries nothing renderable.
+
+    ★ THE ONE PLACE THE PROPOSAL'S SHAPE IS DECIDED, read by three callers that must agree: the
+    live emitter, this projection, and the engine computing what is still outstanding. The tool
+    body enforces the same bounds so the model is taught when it trips them — but nothing
+    downstream re-derives them, and a call the body would refuse renders nowhere and counts as
+    no agreement.
+
+    Tolerant of both stored shapes, like `_plan_argument`: a tool call's `args` is a JSON string
+    or an object depending on the provider, and a malformed one is the same answer as a missing
+    one."""
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except ValueError:
+            return None
+    if not isinstance(args, dict):
+        return None
+    found = _clean_pieces(args.get("found"))
+    first = _clean_pieces(args.get("first"))
+    why = args.get("why")
+    question = args.get("question")
+    if not found or not first or not isinstance(why, str) or not isinstance(question, str):
+        return None
+    if len(first) > MAX_FIRST_SLICE or not set(first) <= set(found):
+        return None
+    if not why.strip() or not question.strip():
+        return None
+    return {"found": found, "first": first, "why": why.strip(), "question": question.strip()}
+
+
+def _clean_pieces(raw: Any) -> list[str]:
+    """A list-of-strings argument, emptied of anything that is not a usable piece name.
+
+    DE-DUPLICATED, ORDER PRESERVED. A piece named twice is one piece — the citizen reads a list,
+    and a repeated line reads as two things to do. Order is the agent's, because it is the order
+    the citizen agreed to and the order the remainder will name them back in."""
+    if not isinstance(raw, list):
+        return []
+    seen: dict[str, None] = {}
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            seen.setdefault(item.strip(), None)
+    return list(seen)
+
+
+def render_proposal(proposal: dict[str, Any]) -> str:
+    """R85's message, built by the PLATFORM from the call's arguments.
+
+    THE SHAPE IS THE RENDERER'S, NOT THE MODEL'S PROSE — which is the whole reason the proposal
+    is a tool rather than an instruction. "Lists everything back, names the first slice, says
+    what happens to the rest, asks one question" is true here by construction; asked for in a
+    prompt it would be true most of the time.
+
+    THE "REST" SENTENCE IS CONDITIONAL. A slice that covers everything found has no remainder,
+    and promising to come back to nothing is the platform inventing an outstanding item.
+
+    EXACTLY ONE QUESTION, because the argument is singular. A model that wrote three questions
+    into one string is not prevented by this — but nothing in the platform's frame adds a
+    second, and the prompt asks for one."""
+    # IMPORTED HERE, NOT AT MODULE SCOPE, and the cycle is real rather than theoretical:
+    # `services/turns/__init__` re-exports the engine, which imports this module, so a
+    # top-level `from src.services.turns.copy import ...` fails at import time with a partially
+    # initialised projection. The sentences belong in `copy.py` regardless — that module's
+    # jargon guard iterates over it, and a frame written anywhere else would be outside the one
+    # check that exists for citizen-facing wording.
+    from src.services.turns.copy import (
+        PROPOSAL_EVERYTHING_LEAD,
+        PROPOSAL_FIRST_LEAD,
+        PROPOSAL_REST_TEXT,
+    )
+
+    lines = [PROPOSAL_EVERYTHING_LEAD, ""]
+    lines += [f"- {piece}" for piece in proposal["found"]]
+    lines += ["", PROPOSAL_FIRST_LEAD, ""]
+    lines += [f"- {piece}" for piece in proposal["first"]]
+    lines += ["", proposal["why"]]
+    if len(proposal["first"]) < len(proposal["found"]):
+        lines += ["", PROPOSAL_REST_TEXT]
+    lines += ["", proposal["question"]]
+    return "\n".join(lines)
+
+
+def proposal_from_args(args: Any) -> str | None:
+    """The rendered proposal for a stored call, or None when the call carries none."""
+    proposal = _slice_argument(args)
+    return None if proposal is None else render_proposal(proposal)
+
+
+def finished_from_args(args: Any) -> str | None:
+    """The piece a `tell_the_user` call marked finished, or None when it marked none.
+
+    Separate from `update_from_args` because the two answer different questions and either can
+    be present without the other: an update with no mark is the ordinary case, and a mark whose
+    update was over the ceiling still happened — the piece IS finished, and losing that because
+    the sentence was too long would corrupt the closing account over a copy problem."""
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except ValueError:
+            return None
+    if not isinstance(args, dict):
+        return None
+    finished = args.get("finished")
+    if not isinstance(finished, str):
+        return None
+    return finished.strip() or None
+
+
+def agreed_slice(messages: Sequence[Any]) -> list[str]:
+    """What the citizen last agreed to build first, read out of the conversation's own record.
+
+    ★ LATEST WINS, and there is no stored linkage anywhere: the agreed list is the arguments of
+    the most recent honourable `propose_first_slice` call in these messages. That is the same
+    route the plan itself travels — the conversation's own rows — so re-proposing mid-build
+    replaces the agreement without a column, a table or anything that can go stale when a later
+    build quietly delivers a deferred piece.
+
+    ORDER-DEPENDENT ON PURPOSE, and callers must pass messages oldest-first. Both do: the run's
+    `message_history` and `load_rows`'s `ORDER BY seq` are the only two sources.
+
+    Takes serialized payload dicts OR pydantic-ai message objects, because the two callers hold
+    different shapes of the same fact — the engine has live `ModelResponse`s, a reader over
+    stored rows has payload dicts."""
+    agreed: list[str] = []
+    for message in messages:
+        for part in _parts_of(message):
+            if _part_field(part, "part_kind") != "tool-call":
+                continue
+            if _part_field(part, "tool_name") != PROPOSE_SLICE_TOOL:
+                continue
+            proposal = _slice_argument(_part_field(part, "args"))
+            if proposal is not None:
+                agreed = proposal["first"]
+    return agreed
+
+
+def _parts_of(message: Any) -> list[Any]:
+    if isinstance(message, dict):
+        return [p for p in message.get("parts", []) if isinstance(p, dict)]
+    return list(getattr(message, "parts", []))
+
+
+def _part_field(part: Any, name: str) -> Any:
+    if isinstance(part, dict):
+        return part.get(name)
+    if name == "part_kind":
+        return getattr(part, "part_kind", None)
+    return getattr(part, name, None)
+
+
 def _project_response_parts(
     row: Message,
     message: dict[str, Any],
@@ -733,6 +901,17 @@ def _project_response_parts(
                         state=_plan_options_state(stored),
                     )
                 )
+                continue
+            if tool_name == PROPOSE_SLICE_TOOL:
+                # THE PROPOSAL, RENDERED FROM ITS ARGUMENTS at the position the call occupies —
+                # the same shape as the voice channel and the offer, and for the same reason:
+                # one stored field, two emitters, no agreement to keep in step.
+                #
+                # NOT A STEP. Above `_step_label` like the other two, so the transcript shows
+                # the proposal and never `Used propose_first_slice`.
+                proposed = proposal_from_args(part.get("args"))
+                if proposed:
+                    items.append(AssistantTextItem(seq=row.seq, text=proposed))
                 continue
             if tool_name == TELL_THE_USER_TOOL:
                 # THE WORDS, AT THE POSITION THE CALL OCCUPIES — the `present_plan_options`

@@ -50,6 +50,44 @@ served at, and must be left exactly as it is:
                             configuration in your own files instead.
 Add routes, components, libraries, and dependencies as your app needs them."""
 
+FIRST_SLICE_RULE = """\
+WHEN A LOT ARRIVES AT ONCE — if a single message asks for many separate things, do not start \
+by building all of them. Call `propose_first_slice` with every piece you picked up, the two to \
+four you would build now, one sentence saying why those, and one question. Prefer two or three \
+pieces; take fewer when the pieces are large — twenty pages describing one screen is ONE \
+piece, and proposing it alone is right. Choose the pieces that give them something they can \
+actually use soonest, not the ones that are quickest for you.
+
+This is for NEW work arriving in bulk, and for nothing else. A question, a fix, a change to \
+something already built, or the next round of something already agreed is simply done. \
+Negotiating a small request wastes the user's turn and reads as reluctance, which is a failure \
+rather than caution.
+
+If they say they want all of it, say once what actually happens — everything at once takes \
+longer to get right and is harder to check — and then build in the order you proposed, \
+finishing each piece to something usable before starting the next.
+
+As each agreed piece lands, say so through `tell_the_user` and pass that piece's name as \
+`finished`. That is how the closing account knows what is left; without it the platform can \
+only say it could not tell."""
+"""R83–R88 — when to negotiate scope, and when negotiating is itself the failure.
+
+THE TRIGGER IS THE AGENT'S JUDGEMENT, DELIBERATELY. "Is this new work arriving in bulk, or a
+question, a fix, or the next round?" is a categorisation, and categorisation is what a model is
+for. The platform does not read the user's message to detect an oversized request — doing so
+would be the anti-pattern this plan names everywhere else, and it would be wrong on the cases
+that matter most.
+
+WHAT IS ENFORCED IS THE CEILING, and it is enforced in the tool body rather than here: never
+more than four pieces, and every proposed piece named in the found list. The two-piece
+PREFERENCE is prompt copy because it is soft by requirement — R83 says "fewer when the pieces
+are large" — and a soft preference in a guardrail would refuse honest single-piece slices.
+
+THE ENDING DIFFERS BY KIND WITH NO BRANCH ANYWHERE. A planning chat has the offer tool and no
+write tools, so the only ending available to it is an offer bound to the agreed slice. A build
+chat has the write tools and no offer tool, so the natural continuation is to build the slice
+in the same turn. Nothing in code chooses between those; the toolset already did."""
+
 BUILD_THIS_PLAN_LABEL = "Build this plan"
 KEEP_PLANNING_LABEL = "Keep planning"
 """The two buttons under a plan, and the ONE spelling of each (R-15, client-approved).
@@ -321,7 +359,9 @@ either did.
 - `list_files` — List every file in the app (relative paths; heavy dirs like node_modules \
 excluded).
 - `search_files` — Search the app's files for a regex `pattern` (grep-like; case-sensitive).
-- `tell_the_user` — Say one thing to the person waiting, in the middle of your work."""
+- `tell_the_user` — Say one thing to the person waiting, in the middle of your work.
+- `propose_first_slice` — When a request arrives with a lot of separate things in it, \
+propose what to build first."""
 """GENERATED, NOT WRITTEN (U20 / R26) — a checked-in snapshot of
 `services/agent/toolsets.render_tool_surface(ChatKind.BUILD)`, which renders one line per
 tool from the tool definitions pydantic-ai hands the model at registration.

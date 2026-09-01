@@ -411,6 +411,7 @@ async def test_plan_kind_model_sees_no_write_tools(
         # assertion on purpose: a tool meant for both arms that reached only one is a drift
         # this test should catch, and a subset check would not.
         "tell_the_user",
+        "propose_first_slice",
     }
 
 
