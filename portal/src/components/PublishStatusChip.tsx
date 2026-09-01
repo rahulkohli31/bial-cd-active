@@ -50,7 +50,7 @@ import { ChevronDown, ExternalLink } from 'lucide-react'
 
 import { Popover, PopoverContent, PopoverTrigger } from './ui/popover'
 import DataClassificationModal from './DataClassificationModal'
-import { useDeployment } from '../hooks/useDeployment'
+import { usePublishState } from '../hooks/usePublishState'
 import { assertNever } from '../utils/assertNever'
 import type {
   ApprovalState,
@@ -158,7 +158,7 @@ function presentationFor(state: PublishState): Presentation {
         version: 'submitted_with_note',
       }
     case 'approved_ready_to_publish':
-      // NO ARTBOARD. Adapted from the retired `SubmitControl`'s approved arm with its
+      // NO ARTBOARD. Adapted from the retired review card's approved arm with its
       // lineage promise removed: it says an administrator approved this version and that
       // pressing Publish is the next step, and it does NOT say whether that will publish
       // or route. That is the R38 discipline, and it is not pedantry — the decision is
@@ -187,10 +187,10 @@ function presentationFor(state: PublishState): Presentation {
     case 'starting_up':
       // Canvas, with two DEPARTURES. Its opening "Approved." goes: an app published
       // unattended under ladder rule 7 was never approved by anyone, and this state is
-      // reached both ways. And its "Starting it up now" is reworded, because that exact
-      // phrase is one of the pipeline's own retired phase labels — the vocabulary this
-      // plan deletes rather than restyles, and which a guard greps for. While a publish
-      // runs the chip says "Starting up" and stops there.
+      // reached both ways. And its own opening verb phrase is reworded, because it was
+      // word-for-word one of the pipeline's retired phase labels — the vocabulary this
+      // plan deletes rather than restyles, and which a guard greps the tree for. While a
+      // publish runs the chip says "Starting up" and stops there.
       return {
         label: 'Starting up',
         sentence: 'Your app is coming up now — usually a few minutes. Nothing to do.',
@@ -239,7 +239,7 @@ function presentationFor(state: PublishState): Presentation {
         version: 'live',
       }
     case 'taken_offline':
-      // NO ARTBOARD. Verbatim from the retired `DeployControl`, which had it right: a
+      // NO ARTBOARD. Verbatim from the retired Publish card, which had it right: a
       // taken-down app has a working remedy and a switched-off one does not, and
       // collapsing the two into one word would remove that remedy silently.
       return {
@@ -383,7 +383,7 @@ export default function PublishStatusChip({
     withdraw,
     withdrawing,
     withdrawError,
-  } = useDeployment(projectId)
+  } = usePublishState(projectId)
 
   const [open, setOpen] = useState(false)
   const [showModal, setShowModal] = useState(false)

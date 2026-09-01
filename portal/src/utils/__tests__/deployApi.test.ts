@@ -3,12 +3,14 @@
  * cover, because it mocks the module and hands the component a ready-made `DeploymentView`,
  * so `toDeploymentView` never runs there.
  *
- * `unpublishedAt` is the field that matters: it is the only thing separating a live app from
- * one an administrator took down (`isLive` reads nothing else), so a parser that drops it
- * renders a green "Live" badge over a dead address — the exact bug the review blocked on.
+ * `unpublishedAt` is a field that matters: it is the second axis separating a live app from
+ * one an administrator took down, so a parser that drops it renders a green "Live" badge
+ * over a dead address — the exact bug the review blocked on. It is no longer read by any
+ * predicate here (`isLive` is retired); the server folds it into `publishState`, and this
+ * suite pins both that the field survives the parse and that no helper derives from it.
  */
 import { describe, it, expect, vi } from 'vitest'
-import { getDeployment, isLive, isRoutedForReview, startDeploy } from '../deployApi'
+import { getDeployment, startDeploy } from '../deployApi'
 import { ApiError } from '../apiError'
 import type { DataClassificationAnswers } from '../deployApi'
 
@@ -56,21 +58,28 @@ describe('getDeployment parses the takedown axis', () => {
     expect(fetchImpl.mock.calls[0][0]).toBe('/api/projects/p1/deployment')
   })
 
-  it('a succeeded deploy carrying a takedown is NOT live', async () => {
-    // The consequence, pinned end to end: parse + predicate together are what stop the portal
-    // offering a clickable link to a container that no longer exists.
-    const fetchImpl = vi.fn(async () => ok({ ...BODY, unpublishedAt: '2026-08-12T10:00:00Z' }))
+  it('a takedown and a live deploy are told apart by the SERVER now, not by a predicate', async () => {
+    // What `isLive` used to answer, answered where it belongs. The consequence is the same
+    // one it was written for — the portal must not offer a clickable link to a container
+    // that no longer exists — but the decision is the server's, and the two responses
+    // differ in the field rather than in what the browser computes from them.
+    const takenDown = await getDeployment(
+      'p1',
+      deps(
+        vi.fn(async () =>
+          ok({ ...BODY, publishState: 'taken_offline', unpublishedAt: '2026-08-12T10:00:00Z' }),
+        ),
+      ),
+    )
+    const serving = await getDeployment(
+      'p1',
+      deps(vi.fn(async () => ok({ ...BODY, publishState: 'live_current', unpublishedAt: null }))),
+    )
 
-    expect(isLive(await getDeployment('p1', deps(fetchImpl)))).toBe(false)
-  })
-
-  it('a succeeded deploy with no takedown is live', async () => {
-    const fetchImpl = vi.fn(async () => ok({ ...BODY, unpublishedAt: null }))
-
-    const view = await getDeployment('p1', deps(fetchImpl))
-
-    expect(view.unpublishedAt).toBeNull()
-    expect(isLive(view)).toBe(true)
+    expect(takenDown.publishState).toBe('taken_offline')
+    expect(takenDown.unpublishedAt).toBe('2026-08-12T10:00:00Z')
+    expect(serving.publishState).toBe('live_current')
+    expect(serving.unpublishedAt).toBeNull()
   })
 
   it('a missing unpublishedAt key reads as null rather than undefined', async () => {
@@ -339,18 +348,41 @@ describe('startDeploy has two success shapes, discriminated by outcome', () => {
   })
 })
 
-describe('isRoutedForReview separates a queued version from a broken one', () => {
-  it('recognises the routed code', () => {
-    expect(isRoutedForReview('routed_for_review')).toBe(true)
+/**
+ * INERTNESS, not coverage. `isLive`, `isRoutedForReview` and `stepLabel` were retired
+ * together because they were three halves of one mistake — the browser re-deciding, from
+ * parts, something the server had already decided. What they answered is now one field.
+ *
+ * The guarantee they carried is not lost, it MOVED: a drift-routed pipeline row reading as
+ * "in review" rather than "didn't start" is the server's `failure_code` check, pinned in
+ * `backend/tests/api/v1/deploy/test_publish_state.py`; the informational rendering of it is
+ * pinned in `PublishStatusChip.test.tsx`. What is asserted here is only that no helper of
+ * that shape grows back in this module.
+ */
+describe('the module derives nothing, and must not start again', () => {
+  it('exports no predicate over a deployment field', async () => {
+    // Mutation receipt: re-export `isLive` (or any `isX`/`deriveX`/`computeX` over these
+    // fields) and this goes red by name. Asserted against the REAL module, not a mock.
+    const mod: Record<string, unknown> = await vi.importActual('../deployApi')
+
+    expect(Object.keys(mod).filter((k) => /^(is|derive|compute)[A-Z]/.test(k))).toEqual([])
   })
 
-  it('does not soften a real pipeline failure, or the retired refusal', () => {
-    // The predicate has to DISCRIMINATE. A lookup that answered true for everything would
-    // hide genuine build failures behind an informational banner, and would also quietly
-    // resurrect the retired dead end as a non-red state.
-    expect(isRoutedForReview('acr_build_failed')).toBe(false)
-    expect(isRoutedForReview('classification_below_threshold')).toBe(false)
-    expect(isRoutedForReview(null)).toBe(false)
-    expect(isRoutedForReview(undefined)).toBe(false)
+  it('translates no pipeline phase token into citizen words', async () => {
+    // `stepLabel` turned `claimed`/`packing`/`provisioning`/`starting` into "Getting
+    // ready"/"Packaging your app"/"Setting up the server"/"Starting it up". That whole
+    // vocabulary is DELETED rather than restyled — while a publish runs the chip says
+    // "Starting up" and stops there.
+    const mod: Record<string, unknown> = await vi.importActual('../deployApi')
+
+    expect(Object.keys(mod)).not.toContain('stepLabel')
+    for (const phase of [
+      'Getting ready',
+      'Packaging your app',
+      'Setting up the server',
+      'Starting it up',
+    ]) {
+      expect(JSON.stringify(Object.values(mod))).not.toContain(phase)
+    }
   })
 })

@@ -3,16 +3,16 @@
  *
  * TWO KINDS OF TEST LIVE HERE, and the second kind is the point. The first is this
  * component's own contract. The second is the PARITY CHECKLIST — the guarantees the three
- * retired controls (`DeployControl`, `SubmitControl`, `PublishButton`) pinned across 48
- * cases, walked and re-established here rather than deleted with their suites. A swap
- * drops guarantees in both directions (L5), and the old suites were the checklist someone
- * would otherwise have had to write from scratch.
+ * retired controls (the Publish card, the review card and the toolbar button; named
+ * descriptively because a retirement guard walks this tree for their symbols) pinned
+ * across 48 cases, walked and re-established here rather than deleted with their suites.
+ * A swap drops guarantees in both directions (L5), and the old suites were the checklist
+ * someone would otherwise have had to write from scratch.
  *
  * Two of those 48 are deliberately NOT carried, each with a verdict rather than a shrug:
- *   · "a 503 on the status read renders nothing at all" (`DeployControl.test.tsx:326`).
- *     A chip that renders nothing is indistinguishable from a broken page, and this is
- *     now the only publishing surface the citizen has. It becomes the ordinary
- *     read-failure chip with a re-read.
+ *   · "a 503 on the status read renders nothing at all". A chip that renders nothing is
+ *     indistinguishable from a broken page, and this is now the only publishing surface
+ *     the citizen has. It becomes the ordinary read-failure chip with a re-read.
  *   · the canvas's "YOUR LATEST" / saved-version rows. The server spends its one
  *     object-store metadata HEAD on the drift comparison and serves the answer, not the
  *     head, so no saved commit reaches this client to render.
@@ -26,15 +26,15 @@ import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vite
 import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react'
 
 import type { ApprovalState, DeploymentView, PublishState } from '../../utils/deployApi'
-import type { UseDeployment } from '../../hooks/useDeployment'
+import type { UsePublishState } from '../../hooks/usePublishState'
 
 const h = vi.hoisted(() => ({
-  useDeployment: vi.fn(),
+  usePublishState: vi.fn(),
   // The stub records what the chip handed the questionnaire, so a test can drive either
   // success back through the real `onConfirm` the chip supplied.
   modal: { current: null as null | { rejectionNote?: string | null; onConfirm: (a: never) => Promise<void> } },
 }))
-vi.mock('../../hooks/useDeployment', () => ({ useDeployment: h.useDeployment }))
+vi.mock('../../hooks/usePublishState', () => ({ usePublishState: h.usePublishState }))
 vi.mock('../DataClassificationModal', () => ({
   default: (props: { rejectionNote?: string | null; onConfirm: (a: never) => Promise<void> }) => {
     h.modal.current = props
@@ -90,17 +90,14 @@ const view = (publishState: PublishState, over: Partial<DeploymentView> = {}): D
   ...over,
 })
 
-const wire = (deployment: DeploymentView | null, over: Partial<UseDeployment> = {}): void => {
-  h.useDeployment.mockReturnValue({
+const wire = (deployment: DeploymentView | null, over: Partial<UsePublishState> = {}): void => {
+  h.usePublishState.mockReturnValue({
     deployment,
     approval: deployment?.approval ?? null,
-    running: false,
-    waitingForReview: false,
     loadError: null,
     refresh: vi.fn(),
     unsaved: null,
     saving: false,
-    routed: null,
     onConfirm: vi.fn(),
     saveAndPublish: vi.fn(),
     dismissUnsaved: vi.fn(),
@@ -108,7 +105,7 @@ const wire = (deployment: DeploymentView | null, over: Partial<UseDeployment> = 
     withdrawing: false,
     withdrawError: null,
     ...over,
-  } satisfies UseDeployment)
+  } satisfies UsePublishState)
 }
 
 const mount = (): void => {
@@ -732,16 +729,18 @@ describe('guarantees carried over from the controls this chip replaces', () => {
     expect(screen.getByTestId('publish-chip').textContent).toContain('Taken offline')
   })
 
-  it('never renders the retired pipeline vocabulary while a publish runs', async () => {
+  it('says only that it is starting up, whatever phase the pipeline reports', async () => {
+    // The retired phase vocabulary itself is guarded across the whole tree by
+    // `jsx-deploy-retirement.test.ts`, which is strictly stronger than checking rendered
+    // text here — and which is why the phrases are not written out again in this file.
+    // What this pins is the other half: `step` is on the response and is IGNORED.
     wire(view('starting_up', { status: 'running', step: 'packing' }))
     mount()
     const pop = await openChip()
-    const text = (pop.textContent ?? '') + screen.getByTestId('publish-chip').textContent
 
-    for (const phase of ['Getting ready', 'Packaging your app', 'Setting up the server', 'Starting it up', 'Working']) {
-      expect(text).not.toContain(phase)
-    }
     expect(screen.getByTestId('publish-chip').textContent).toContain('Starting up')
+    expect(pop.textContent).not.toContain('packing')
+    expect(within(pop).queryAllByRole('button')).toHaveLength(0)
   })
 
   it('points at no review-status anchor — there is no second card to point at', async () => {

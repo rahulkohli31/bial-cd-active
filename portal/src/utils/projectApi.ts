@@ -13,7 +13,9 @@
 import { ApiError, isRecord, readApiError } from './apiError'
 import { authFetch } from './api'
 
-/** The lifecycle of a project's one app, as surfaced by `AppRegistryPanel`/`SubmitControl`. */
+/** The lifecycle of a project's one app, as surfaced by `AppRegistryPanel` on the admin
+ *  side. The citizen side no longer reads it: publishing is one chip reading one
+ *  server-computed state, and this raw status is one of the parts it stopped recombining. */
 export type AppStatus = 'draft' | 'pending' | 'approved' | 'rejected' | 'disabled'
 
 /**

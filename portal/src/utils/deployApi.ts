@@ -216,35 +216,21 @@ export interface DeploymentView {
   publishState: PublishState
 }
 
-/** Is this deployment actually serving traffic right now? The one predicate every "it's
- *  live" affordance should branch on — succeeded AND not taken down. */
-export function isLive(deployment: DeploymentView | null | undefined): boolean {
-  return deployment?.status === 'succeeded' && !deployment.unpublishedAt
-}
-
 /**
- * Deployment failure codes that are NOT failures — the pipeline stopped because the
- * platform ROUTED this version to an administrator instead (ASM20: modelled as the
- * existing failed terminal state with a distinct code rather than a fourth status,
- * because a partial unique index depends on the status set).
+ * NO PREDICATE OVER THESE FIELDS LIVES HERE ANY MORE, and none may come back. (The names
+ * are deliberately not written out: a retirement guard walks this tree for them.)
  *
- * A LOOKUP, deliberately, rather than an `=== SOME_CONSTANT` comparison: this is the
- * seam the drift-routed publish plugs into, and a set is extended by adding one line
- * with no branch to re-reason about. Every member here renders through
- * `isRoutedForReview` as the informational waiting state and suppresses the red badge.
+ * Four helpers went together, because they were four halves of one mistake. One answered
+ * "is it serving traffic right now" from the status and the takedown stamp. One answered
+ * "was that failed row actually a routing" from a set of codes, and the set was the other.
+ * One turned the pipeline's phase tokens into citizen words. Every one of them re-decided,
+ * on this side of the wire, something the server had already decided — and each was a
+ * place where two surfaces reading one response could still disagree.
  *
- * `classification_below_threshold` is DELIBERATELY ABSENT and must not come back: the
- * terminal refusal it named was retired in U9 — the declaration that used to dead-end
- * now routes into a real queue — and the gate no longer emits it at all.
+ * `publishState` is where all four answers come from now. If a consumer needs one of them
+ * and the field cannot say it, the fix belongs in the server that authors the field, not
+ * in a helper here.
  */
-const ROUTED_FAILURE_CODES: ReadonlySet<string> = new Set(['routed_for_review'])
-
-/** Did this deploy stop because the version was routed for review rather than because
- *  something broke? The one predicate both publish surfaces branch on to choose the
- *  informational presentation over the red failure badge. */
-export function isRoutedForReview(failureCode: string | null | undefined): boolean {
-  return typeof failureCode === 'string' && ROUTED_FAILURE_CODES.has(failureCode)
-}
 
 /** The 409 raised when the workspace is ahead of the last save; retry with `saveFirst`. */
 export const UNSAVED_CHANGES = 'unsaved_changes'
@@ -469,26 +455,4 @@ export async function getDeployment(
   )
   if (!res.ok) throw await readApiError(res, 'Failed to read the deployment')
   return toDeploymentView(await res.json())
-}
-
-/** Plain-language copy for the pipeline's phase labels. The server calls `step` display-only
- *  and never branches on it, so an unrecognised phase falls back to something honest rather
- *  than rendering a raw token or, worse, throwing. */
-export function stepLabel(step: string | null): string {
-  switch (step) {
-    case 'claimed':
-      return 'Getting ready'
-    case 'packing':
-      return 'Packaging your app'
-    case 'building':
-      return 'Building'
-    case 'provisioning':
-      return 'Setting up the server'
-    case 'starting':
-      return 'Starting it up'
-    case 'live':
-      return 'Live'
-    default:
-      return 'Working'
-  }
 }
