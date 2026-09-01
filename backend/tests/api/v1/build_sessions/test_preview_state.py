@@ -820,3 +820,133 @@ async def test_a_readiness_timeout_on_the_attach_arm_is_non_destructive_and_the_
     assert after_save_state == before_save_state  # dirty (and everything else) unchanged
     assert fake_storage.objects[snapshot_key(app_id)] == snapshot_before
     assert fake_storage.mtimes[snapshot_key(app_id)] == mtime_before  # the etag proxy
+
+
+async def test_an_attach_that_cannot_confirm_anything_refuses_rather_than_restoring(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    wire,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R5 / L3 / L7, proof TWO — the one the merged code did not have, on the exact arm the
+    citizen-facing start control enters.
+
+    THE DEFECT THIS PINS. `SandboxUnreachableError` is a SUBCLASS of `NoLiveSandboxError`, and
+    `relaunch_preview`'s attach fork caught the PARENT. So the one case meaning *"the registry
+    says a container is live, the attach could not confirm anything, and it may well be up
+    holding hours of unsaved work"* was swallowed by the handler written for *"certain
+    absence"* and fell straight into the RESTORE arm — which `_safe_teardown`s the live
+    container before pulling the last saved bundle. The raising site states the intended
+    contract in its own comment: *"Callers that only want 'no handle' catch the parent and are
+    unaffected; the reclaim guard catches this subclass and refuses rather than guess."* The
+    reclaim guard does. This path did not.
+
+    WHY THE RESPONSE SHAPE IS NOT THE ASSERTION. A test checking only the status code passes
+    today, while the container is destroyed — the restore arm returns a perfectly good 200 with
+    a working preview URL, having thrown away whatever was in the container it replaced. So
+    this asserts L3's confirmation triple: nothing was torn down, provisioned or restored; the
+    platform's belief about unsaved work did not move; and the saved bundle's bytes and write
+    time are unchanged.
+    """
+    user, project = await _user_project(db_session, "ps-unknown-attach@rvaiglobal.com")
+    app_id = await resolve_app_for_project(db_session, user.id, project.id)
+    await db_session.commit()
+    await fake_storage.put(snapshot_key(app_id), b"SAVED-BUNDLE")
+
+    # A cold relaunch first, so a real container is up and registered for this app — that is
+    # what makes the attach below the UNKNOWN case rather than the certain-absent one.
+    cold = await client.post(
+        "/v1/build-sessions/relaunch",
+        json={"projectId": str(project.id)},
+        headers=auth_headers(user),
+    )
+    assert cold.status_code == 200
+    wire.sbx.attach_handle = SandboxHandle(
+        fqdn="live.example",
+        token="tok",
+        app_name=app_name_for(app_id),
+        preview_url="https://live.example",
+        ready=True,
+    )
+
+    save_state_url = f"/v1/build-sessions/projects/{project.id}/save-state"
+    before_save_state = (await client.get(save_state_url, headers=auth_headers(user))).json()
+    provisioned_before = list(wire.sbx.provisioned)
+    restored_before = list(wire.sbx.restored)
+    torn_down_before = list(wire.sbx.torn_down)
+    snapshot_before = fake_storage.objects[snapshot_key(app_id)]
+    mtime_before = fake_storage.mtimes[snapshot_key(app_id)]
+
+    # THE UNKNOWN: the registry still names this app READY and the attach cannot confirm
+    # anything — a cold container, a supervisor timeout, or an ARM blip. `SandboxNotReadyError`
+    # is a `SandboxError` and NOT a `SandboxGoneError`, which is exactly the distinction
+    # `_attach_for_read` turns into `SandboxUnreachableError`.
+    async def the_attach_cannot_confirm_anything(user_id: str) -> SandboxHandle:
+        raise SandboxNotReadyError("the supervisor did not answer")
+
+    monkeypatch.setattr(wire.sbx, "attach_existing", the_attach_cannot_confirm_anything)
+
+    refused = await client.post(
+        "/v1/build-sessions/relaunch",
+        json={"projectId": str(project.id)},
+        headers=auth_headers(user),
+    )
+
+    # A REFUSAL THE CLIENT TURNS INTO "TRY AGAIN" — never a 200 over a container it replaced.
+    # The route's own message for this arm already says the saved version is intact and a retry
+    # is the way forward, which is the honest answer to a question nobody could answer.
+    assert refused.status_code == 503
+
+    # THE CONFIRMATION TRIPLE (L3). Each of the three has an innocent explanation on its own;
+    # together they are what tells a rollback apart from every one of them.
+    assert wire.sbx.torn_down == torn_down_before, "the live container was destroyed"
+    assert wire.sbx.provisioned == provisioned_before, "a replacement container was created"
+    assert wire.sbx.restored == restored_before, "the saved bundle was pulled over live work"
+    # THE PATCH COMES OFF BEFORE THE SECOND SAVE-STATE READ, and it has to. `save-state` attaches
+    # too, so leaving the always-raising double in place would measure the double rather than the
+    # container and report a difference that has nothing to do with the relaunch — the exact
+    # false positive that makes a confirmation triple worthless.
+    monkeypatch.undo()
+    after_save_state = (await client.get(save_state_url, headers=auth_headers(user))).json()
+    assert after_save_state == before_save_state
+    assert fake_storage.objects[snapshot_key(app_id)] == snapshot_before
+    assert fake_storage.mtimes[snapshot_key(app_id)] == mtime_before
+
+    # And the registry is left alone: an unreadable answer is not a death certificate.
+    reg = await fake_redis.hgetall(registry_key(user.id))
+    assert reg.get(REGISTRY_FIELD_STATE) != REGISTRY_STATE_ENDING
+
+
+async def test_a_confirmed_absent_container_still_restores(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    wire,
+) -> None:
+    """THE REGRESSION THE FIX ABOVE COULD CAUSE, and it is the one that matters commercially:
+    the narrowing must not turn an ordinary cold start into a refusal.
+
+    A project whose container is genuinely gone is the COMMON case behind the start control —
+    the citizen comes back the next morning and presses it. `attach_existing` raises
+    `SandboxGoneError` (certain absence), `_attach_for_read` maps it to the plain parent, and
+    the restore arm is exactly right there: there is nothing live to lose."""
+    user, project = await _user_project(db_session, "ps-cold-start-still-works@rvaiglobal.com")
+    app_id = await resolve_app_for_project(db_session, user.id, project.id)
+    await db_session.commit()
+    await fake_storage.put(snapshot_key(app_id), b"SAVED-BUNDLE")
+
+    # `attach_handle` left as `None`: the fake raises `SandboxGoneError`, its "certain" refusal.
+    assert wire.sbx.attach_handle is None
+
+    restored = await client.post(
+        "/v1/build-sessions/relaunch",
+        json={"projectId": str(project.id)},
+        headers=auth_headers(user),
+    )
+
+    assert restored.status_code == 200
+    assert restored.json()["previewUrl"]
+    assert wire.sbx.restored, "the cold path must still restore, or the app never comes back"

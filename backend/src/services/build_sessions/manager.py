@@ -1738,7 +1738,14 @@ class SessionManager:
         - no registry, or not READY                          → certain: nothing live to lose
         - the name matches no app this user owns             → a ghost; the reconcile clears it
         - the container is CONFIRMED gone (`SandboxGoneError`) → certain: nothing to lose
-        - the incumbent is CLEAN                             → nothing to lose; reclaim silently
+
+        THE CLEAN INCUMBENT NO LONGER FALLS THROUGH (R94, plan 006 U5). It used to read "nothing
+        to lose; reclaim silently", which was true about the WORK and wrong about the person: their
+        other project stopped with no warning because a screen elsewhere needed the one workspace.
+        Both clean exits now RAISE, with `dirty` reported clean so the dialog says a clean stop
+        rather than claiming unsaved changes that do not exist. The four exits above are untouched:
+        they mean "nothing is being taken", not "another project holds it", and widening them
+        would raise a dialog about nothing.
 
         And the two that REFUSE rather than fall through, because the honest answer is unknown
         (#83 review, findings 4 and 5):
@@ -1811,10 +1818,53 @@ class SessionManager:
             # The plain parent: the registry is certain nothing of this app's is live.
             return
         state = await self._save_state_of(sandbox_client, handle, occupying.app_id)
+        # R94 — THE ASKING IS NO LONGER CONDITIONAL, AND THIS IS THE WHOLE OF THE WIDENING.
+        #
+        # These two exits used to `return`, which reclaimed a clean incumbent SILENTLY. That was a
+        # defensible reading of "protect real work" — nothing was being lost — but it is not what a
+        # citizen experiences: their other project stops, with no warning and no record, because a
+        # screen somewhere else needed the one workspace. Sandbox-first makes that far more common,
+        # since a planning question now takes the slot too. So the platform asks every time.
+        #
+        # EXACTLY TWO OF THE GUARD'S NINE EXITS CHANGE, and reading this as "delete the silent
+        # path" produces five bugs at once. The four above are not "another project holds it" at
+        # all — they are "NOTHING IS BEING TAKEN": the live sandbox is already the one we want;
+        # there is no registry entry or it is not READY; the occupying name matches no app this
+        # user owns;
+        # `NoLiveSandboxError`. Widening any of those turns an ordinary start into a dialog about
+        # nothing. And the fifth is the sharp one: `_occupying_project(...) is None` is a GHOST
+        # registry entry with no project to name, and R95 requires the dialog to name the project —
+        # widening it renders a dialog with a blank where the name goes.
+        #
+        # WHAT THIS COSTS, ACCEPTED RATHER THAN OPTIMISED AWAY: typing one question into a
+        # brand-new project and then starting a second one now raises a dialog about the first —
+        # a pristine container nobody would miss. R94 is explicit that this difference goes. It is
+        # one click, on a dialog whose clean arm claims no unsaved work and offers no Save button.
         if state.dirty is False:
-            return
+            raise SandboxReclaimBlockedError(
+                project_id=occupying.project_id,
+                project_name=occupying.project_name,
+                app_id=occupying.app_id,
+                dirty=False,
+            )
         if await self._nothing_to_lose(sandbox_client, handle, state):
-            return
+            # `dirty=False`, NOT `state.dirty`, AND THIS IS THE SHARPEST LINE IN THE UNIT.
+            #
+            # Passing `state.dirty` through here would silently reintroduce a bug this guard
+            # already fixed. `dirty` answers the SAVE BUTTON's question — "is there anything Save
+            # would write?" — and for a never-built project the answer is deliberately YES
+            # (`_save_state_of` maps "no commit, nothing saved" to dirty so the button appears on
+            # exactly the projects that most need it). This arm is answering a different question
+            # and fires BECAUSE there is nothing to lose, so it has to say so. Otherwise a person
+            # is told their pristine, untouched golden template "has unsaved changes" — the precise
+            # wording whose live-observed consequence the comment below calls "a straight
+            # downgrade".
+            raise SandboxReclaimBlockedError(
+                project_id=occupying.project_id,
+                project_name=occupying.project_name,
+                app_id=occupying.app_id,
+                dirty=False,
+            )
         # NOTHING TO LOSE — the case that made this guard worse than the bug.
         #
         # `dirty` answers the SAVE BUTTON's question ("is there anything Save would write?"),
@@ -2352,6 +2402,30 @@ class SessionManager:
                     # request and is not ours to roll back (see `_LockScope.spared`).
                     attached = True
                     scope.spare()
+                except SandboxUnreachableError:
+                    # UNKNOWN, AND THEREFORE NOT RESTORABLE — caught AHEAD of its parent, which
+                    # is the whole of this handler and the reason it exists.
+                    #
+                    # `SandboxUnreachableError` is a SUBCLASS of `NoLiveSandboxError`, so before
+                    # this arm the one case meaning "the container is supposed to be there and
+                    # may well be, holding work" was swallowed by the handler written for
+                    # "certain absence" and fell straight into the restore arm below — which
+                    # tears the live container down before pulling the last saved bundle. That
+                    # is the recorded #83 data-loss path, and this is the arm the citizen-facing
+                    # start control enters.
+                    #
+                    # The raising site states the contract in its own words: "Callers that only
+                    # want 'no handle' catch the parent and are unaffected; the reclaim guard
+                    # catches this subclass and refuses rather than guess." The reclaim guard
+                    # does. This path did not, because it was written when relaunch was a rarely
+                    # pressed recovery button rather than the front door.
+                    #
+                    # Refuse, and let it propagate. The route maps it to the same 503 as every
+                    # other unreadable-signal answer, whose message is already "a retry is the
+                    # way forward" — which is exactly right here: the saved version is intact,
+                    # the container may be too, and nothing has been destroyed to find out.
+                    # L7 in one arm: every unreadable arrow leads to escalate, never destroy.
+                    raise
                 except NoLiveSandboxError:
                     # THE COLD CLOCK STARTS HERE — see `cold_started_at` above for why this
                     # instant and not function entry.

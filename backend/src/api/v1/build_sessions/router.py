@@ -67,6 +67,7 @@ from src.services.build_sessions import (
     NoLiveSandboxError,
     NoSnapshotToRelaunchError,
     SandboxReclaimBlockedError,
+    SandboxUnreachableError,
     SessionManager,
     SnapshotUnavailableError,
     app_name_for,
@@ -460,9 +461,16 @@ async def relaunch_preview(
             raise AppApiError(
                 status.HTTP_404_NOT_FOUND, "No saved build to relaunch. Build the app first."
             ) from exc
-        except (SnapshotUnavailableError, SandboxError) as exc:
+        except (SnapshotUnavailableError, SandboxUnreachableError, SandboxError) as exc:
             # Transient/unknown snapshot state, a restore that failed every attempt, or the dev
             # server not coming ready — the saved version is intact; a retry is the way forward.
+            #
+            # `SandboxUnreachableError` IS THIS ANSWER, and it is named here rather than left to
+            # fall through as a 500. The attach fork now refuses on it instead of restoring: the
+            # registry says a container is live, the attach could not confirm anything, and the
+            # honest reply is "we could not tell" — which is precisely what this arm already
+            # says. It is NOT a `SandboxError` (it is a `NoLiveSandboxError` subclass), so
+            # listing it is the only way it reaches this message rather than an unhandled 500.
             raise AppApiError(
                 status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG
             ) from exc
