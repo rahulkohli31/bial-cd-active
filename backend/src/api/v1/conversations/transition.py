@@ -238,9 +238,13 @@ async def build_it(
     # happens to fit under it. If the plan cap ever moves, this is already correct.
     try:
         await enforce_context_limit(db, user.id, history=[], prompt=plan)
-    except ContextWindowExceededError:
+    except ContextWindowExceededError as exc:
+        # Same shape as the send route's refusal — one boundary, one body.
         raise AppApiError(
-            status.HTTP_413_CONTENT_TOO_LARGE, CHAT_TOO_LONG_TEXT, code=CHAT_TOO_LONG_CODE
+            status.HTTP_413_CONTENT_TOO_LARGE,
+            CHAT_TOO_LONG_TEXT,
+            code=CHAT_TOO_LONG_CODE,
+            detail={"occupied": exc.occupied, "hardLimit": exc.hard_limit},
         ) from None
 
     if model is None:

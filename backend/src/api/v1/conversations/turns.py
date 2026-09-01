@@ -369,8 +369,17 @@ async def start_turn(
     # copies the daily cap's pre-start gate rather than the mid-run terminal.
     try:
         await enforce_context_limit(db, user.id, history=history, prompt=prompt)
-    except ContextWindowExceededError:
-        raise AppApiError(413, CHAT_TOO_LONG_TEXT, code=CHAT_TOO_LONG_CODE) from None
+    except ContextWindowExceededError as exc:
+        # The PROSE says neither number on purpose — a citizen does not think in tokens. The
+        # `detail` does, because a non-browser caller has no other way to learn how far over it
+        # is: the daily cap's 429 carries `limit`/`used`/`remaining` for exactly this reason, and
+        # a refusal that withholds what it already measured makes the second caller guess.
+        raise AppApiError(
+            413,
+            CHAT_TOO_LONG_TEXT,
+            code=CHAT_TOO_LONG_CODE,
+            detail={"occupied": exc.occupied, "hardLimit": exc.hard_limit},
+        ) from None
 
     # Free text while plan options are pending resolves them as an implicit "keep refining"
     # (U11). The model must see a RESOLVED call — the dangling-call repair never has to guess

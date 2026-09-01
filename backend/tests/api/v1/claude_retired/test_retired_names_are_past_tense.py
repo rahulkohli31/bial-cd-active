@@ -23,7 +23,28 @@ from __future__ import annotations
 
 from pathlib import Path
 
-SRC = Path(__file__).resolve().parents[4] / "src"
+_BACKEND = Path(__file__).resolve().parents[4]
+
+# BOTH TREES, AND MARKDOWN TOO — the first version of this guard scanned `src/` alone, and that
+# is precisely where it let the drift through: `tests/journeys/_COOKBOOK_HARNESS.md` went on
+# handing the next author a copy-pasteable `from src.api.v1.claude.router import ...`, and
+# `_CONTRACTS.md` went on listing the relay as a live, passing contract, both invisible to a
+# check that only read production Python. A harness doc that lies costs the reader the same
+# hour a lying docstring does.
+# `claude_retired/` is the ONE directory excluded, and it has to be: these files exist to name
+# the dead thing and prove it is dead, so every mention is the subject of a sentence rather than
+# a claim about live code. Excluding anything wider would reopen the hole this widening closed.
+_GUARD_HOME = _BACKEND / "tests/api/v1/claude_retired"
+
+SCANNED = tuple(
+    path
+    for path in (
+        *sorted((_BACKEND / "src").rglob("*.py")),
+        *sorted((_BACKEND / "tests").rglob("*.py")),
+        *sorted((_BACKEND / "tests").rglob("*.md")),
+    )
+    if _GUARD_HOME not in path.parents
+)
 
 # Unambiguous identifiers only. A generic word like "relay" appears in live contexts (the C3
 # progress relay, the BRAIN→SESSION-API relay) and scanning for it would produce pure noise.
@@ -65,16 +86,16 @@ def _window(lines: list[str], index: int) -> str:
     return " ".join(lines[max(0, index - 2) : index + 3]).lower()
 
 
-def test_no_source_file_mentions_a_retired_name_in_the_present_tense() -> None:
+def test_no_source_or_harness_file_mentions_a_retired_name_in_the_present_tense() -> None:
     offenders: list[str] = []
-    for file in sorted(SRC.rglob("*.py")):
+    for file in SCANNED:
         lines = file.read_text(encoding="utf-8").splitlines()
         for index, line in enumerate(lines):
             for name in RETIRED:
                 if name not in line:
                     continue
                 if not any(marker in _window(lines, index) for marker in HISTORICAL):
-                    rel = file.relative_to(SRC)
+                    rel = file.relative_to(_BACKEND)
                     offenders.append(f"{rel}:{index + 1}: {name} — {line.strip()[:90]}")
     assert offenders == []
 

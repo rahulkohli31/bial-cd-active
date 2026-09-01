@@ -451,19 +451,6 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
   // U24 — `null` unless today's budget is spent, in which case it carries the reset time.
   const atLimit = useMemo(() => atLimitSendState(turnEnvelopes), [turnEnvelopes])
 
-  // The per-conversation guardrail's SOFT half. The transcript lives here, so the estimate does
-  // too — the composer is handed a finished sentence rather than a second opinion about how long
-  // the conversation is. The HARD half is the server's and arrives as an ordinary `turnError`.
-  //
-  // THE DEP IS `messages`, NOT `messages.length`, AND NARROWING IT WOULD BREAK THE FEATURE.
-  // `text_delta` repaints through `.map`, so the array grows a new reference on every frame
-  // while its LENGTH holds still for the whole reply. Keying on length would therefore skip
-  // exactly the case this warning exists for: a single enormous answer that pushes the chat
-  // over on its own. The citizen would see nothing, send once more, and meet the server's 413
-  // instead of the sentence that was supposed to reach them first. The walk is bounded by part
-  // count (JS `.length` is O(1)), and `transcript` below already re-walks the same array on
-  // every frame, so the recompute is not what costs anything here.
-  const contextWarning = useMemo(() => contextState(messages).message, [messages])
   const turnNarrativeIsThisChat = turnNarrativeChatRef.current === buildId
   const turnBuildStatus = useMemo(
     () =>
@@ -584,6 +571,31 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
   const buildIdRef = useRef<string | null>(null) // the active CONVERSATION being viewed/persisted — never a session id
   const streamAbortRef = useRef<AbortController | null>(null) // aborts the SUBSCRIPTION only — the turn runs on server-side
   const loadedBuildRef = useRef<string | null>(null)
+
+  // The per-conversation guardrail's SOFT half. The transcript lives here, so the estimate does
+  // too — the composer is handed a finished sentence rather than a second opinion about how long
+  // the conversation is. The HARD half is the server's and arrives as an ordinary `turnError`.
+  //
+  // IT LIVES BELOW `loadedBuildRef` BECAUSE IT READS IT, and a `useMemo` body runs during the
+  // render that declares it — putting this up with the other derived state threw a TDZ error on
+  // first paint that neither `tsc` nor eslint saw, because the reference is inside a closure.
+  //
+  // GUARDED TO THIS CHAT, the way the narrative values below are. The surface does NOT remount
+  // on a chat switch and `messages` is cleared in an effect, so there is a render where
+  // `buildId` already names the incoming chat while `messages` still holds the outgoing one —
+  // long enough to flash the previous conversation's warning onto the new composer.
+  //
+  // THE DEP IS `messages`, NOT `messages.length`, AND NARROWING IT WOULD BREAK THE FEATURE.
+  // `text_delta` repaints through `.map`, so the array grows a new reference on every frame
+  // while its LENGTH holds still for the whole reply. Keying on length would therefore skip
+  // exactly the case this warning exists for: a single enormous answer that pushes the chat
+  // over on its own. The citizen would see nothing, send once more, and meet the server's 413
+  // instead of the sentence that was supposed to reach them first. The walk is bounded by part
+  // count (JS `.length` is O(1)), and `transcript` already re-walks the same array every frame.
+  const contextWarning = useMemo(
+    () => (loadedBuildRef.current === buildId ? contextState(messages).message : null),
+    [messages, buildId],
+  )
   // Merged step runs, held by identity for `mergeStepRun` far below — declared here because
   // the per-chat effect clears it alongside these.
   const mergedRunsRef = useRef(new Map<string, ChatMessage>())

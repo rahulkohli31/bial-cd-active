@@ -57,12 +57,22 @@ CHARS_PER_TOKEN: Final = 4
 and the server's refusal are two readings of one scale rather than two different scales."""
 
 NOMINAL_BINARY_TOKENS: Final = 1_600
-"""What one image or PDF is charged, regardless of its size.
+"""What one attached image or PDF is charged, regardless of its size.
 
-Vision content costs roughly a thousand tokens per image and does not scale with the file's
-byte length, so the honest simplification is a flat charge. Its byte length is the WRONG
-number by orders of magnitude: base64 of a 5 MB photo is ~6.7 M characters, which at four
-characters to the token would read as 1.7 M tokens and refuse the conversation outright."""
+For an IMAGE this is honest. Vision content costs roughly a thousand tokens per image and does
+not scale with the file's byte length, so a flat charge is the right shape — byte length is the
+WRONG number by orders of magnitude: base64 of a 5 MB photo is ~6.7 M characters, which at four
+characters to the token would read as 1.7 M tokens and refuse the conversation outright.
+
+★ FOR A MULTI-PAGE PDF IT IS A KNOWN UNDER-COUNT, AND THE LARGEST ONE HERE. A document is read
+page by page, so a 40-page PDF costs roughly forty times what this charges it, and
+`_shared.resolve_binaries` admits `application/pdf` beside `image/*`. A citizen who attaches
+documents can therefore carry a conversation past the hard limit while this measures it as
+comfortably inside — which is the opaque provider-side failure the guardrail exists to replace,
+not a conservative estimate. It is recorded rather than fixed because the honest fix needs a
+page count the platform does not store yet (persisted at upload, as the deck branch already
+does for its own reasons); charging by byte length instead would resurrect the 1.7 M-token
+absurdity above. Until then: prose conversations are guarded, document-heavy ones are not."""
 
 SYSTEM_PROMPT_RESERVE: Final = 8_000
 """Room held back for what this function cannot see.
@@ -157,10 +167,18 @@ async def enforce_context_limit(
 ) -> None:
     """Raise `ContextWindowExceededError` when this conversation is past its owner's hard limit.
 
-    THE ONE PREFLIGHT, called from every route that starts a conversation turn. The daily cap
-    next door is hand-copied at three call sites, and the cost of that is on record: a gate
-    wired to one of two send paths is not a gate, it is a detour sign. This is a single function
-    precisely so the second entry point (`build_from_plan`) cannot drift away from the first.
+    THE ONE PREFLIGHT, called from BOTH routes that start a conversation turn — `turns.start_turn`
+    and `transition.build_from_plan`. The daily cap next door is hand-copied at three call sites,
+    and the cost of that is on record: a gate wired to one of two send paths is not a gate, it is
+    a detour sign. This is a single function precisely so the second entry point cannot drift
+    away from the first.
+
+    IT IS NOT "EVERY ROUTE THAT REACHES A MODEL", and this docstring used to say so. `POST
+    /v1/build-sessions` starts a model-driven build without consulting this (its per-step spend
+    is capped inside `orchestrator/harness.py`, but its context is not bounded here). That route
+    sends a caller-supplied prompt rather than a conversation history, so it is not a turn on a
+    conversation — but a reader who took the wider claim at face value would go looking for a
+    gate that is not there.
 
     Called AFTER `load_history` and BEFORE `persist_user_turn`, the same slot
     `enforce_daily_limit` occupies — so a refused turn leaves no row to roll back and no claim

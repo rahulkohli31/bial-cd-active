@@ -1,6 +1,8 @@
 """Project-test fixtures: swap the object store for an in-memory fake (cascade-delete blob
-sweep), inject a chat model, and bind the chat relay's billing drain to the test session
-(so the U8/U11 description/code-seed tests that hit `/v1/claude` roll back cleanly)."""
+sweep), inject a chat model, and bind the billing drain to the test session, so the
+description/code-seed tests — which now reach the model through
+`POST /{project_id}/description:generate`, not the retired `/v1/claude` relay — roll back
+cleanly."""
 
 from __future__ import annotations
 

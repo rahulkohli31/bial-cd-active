@@ -231,3 +231,43 @@ describe('the save-state TRI-STATE is published uncollapsed', () => {
     expect(screen.queryByText(/no unsaved|nothing unsaved|all saved|up to date/i)).toBeNull()
   })
 })
+
+describe('the per-conversation guardrail reaches the composer', () => {
+  // ★ WHY THIS FILE AND NOT A UNIT TEST. `contextLimits.ts` is unit-tested and `Composer`'s
+  // rendering of the prop is unit-tested, and BOTH stayed green while the one line joining
+  // them was deleted — the whole 1,649-test suite did. That is the same shape as the incident
+  // this branch exists to repair: the client-side guardrail died with `ChatPage.tsx` and
+  // nothing went red, because what was covered was the parts and never the wiring.
+  //
+  // So this asserts the SEAM: a long conversation loaded into the surface puts the sentence on
+  // the composer. Delete the `contextWarning` prop pass in `ConversationSurface.tsx`, or the
+  // `useMemo` that feeds it, and this is what goes red.
+  const conversationOf = (chars) => ({
+    id: 'build-X',
+    kind: 'build',
+    messages: [{ id: 'm1', role: 'user', parts: [{ type: 'text', text: 'x'.repeat(chars) }] }],
+  })
+
+  it('a conversation past the soft threshold warns on the composer', async () => {
+    // Past the default 150k-token soft limit: (150_000 - 8_000 reserve) * 4 chars, plus slack.
+    h.getBuild.mockResolvedValue(conversationOf(600_000))
+    h.readTurnStream.mockImplementation(() => new Promise(() => {}))
+    renderBuilder({ deps: deps().deps })
+
+    const warning = await screen.findByTestId('composer-context-warning')
+    expect(warning.textContent).toMatch(/new chat/i)
+  })
+
+  it('and an ordinary conversation says nothing', async () => {
+    h.getBuild.mockResolvedValue(conversationOf(200))
+    h.readTurnStream.mockImplementation(() => new Promise(() => {}))
+    renderBuilder({ deps: deps().deps })
+
+    // PAIRED WITH A LIVENESS ASSERTION. `queryByTestId(...) === null` is also what a surface
+    // that threw would produce, and this repo has been bitten by exactly that: the absence only
+    // means something once the composer is proven to be on screen next to it.
+    await waitForGateOpen()
+    expect(screen.getByTestId('composer-input')).toBeTruthy()
+    expect(screen.queryByTestId('composer-context-warning')).toBeNull()
+  })
+})
