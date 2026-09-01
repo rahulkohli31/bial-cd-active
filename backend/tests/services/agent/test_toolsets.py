@@ -328,6 +328,37 @@ async def test_the_registry_is_exhaustive_over_the_enum() -> None:
     assert surfaces[ChatKind.PLAN] != surfaces[ChatKind.BUILD]
 
 
+async def test_the_kinds_differ_by_which_toolsets_they_are_handed_and_by_nothing_else() -> None:
+    """★ U1 / R69 / N2 — the whole difference between the two kinds, stated as one claim.
+
+    Every other unit in this plan rests on this: if the two surfaces overlap somewhere other
+    than the read surface, then something outside the registry has to know which kind it is
+    looking at, and "the kind decides only the toolset" stops being true.
+
+    THE INTERSECTION IS NOT EMPTY, AND THAT IS THE INTERESTING PART. `read_file` and
+    `run_command` are on BOTH lists, under one name each, doing different things — Plan reads
+    and runs through the read-only registry, Build through the sandbox. That is not a leak in
+    the rule, it is the rule working: the same ABILITY, routed by the toolset the kind
+    resolved, with no caller anywhere asking which kind it was. The two are told apart the
+    only way the model can tell them apart — by their description, which is why
+    `test_writes_run_command_is_the_sandbox_one_not_the_read_only_guest_list` exists.
+
+    Deliberately NOT a tool count. This plan adds a shared toolset to both arms (U3, U10) and
+    a count assertion would go red two units from now with nothing wrong."""
+    plan = await registered_tool_definitions(ChatKind.PLAN)
+    build = await registered_tool_definitions(ChatKind.BUILD)
+
+    assert set(plan) & set(build) == _READ_TOOLS
+    # Absence is the guardrail, so assert absence — not that a downstream check refuses them.
+    assert not (_SANDBOX_ONLY_TOOLS & set(plan))
+    assert _SANDBOX_ONLY_TOOLS <= set(build)
+    assert "present_plan_options" in plan
+    assert "present_plan_options" not in build
+
+    # Same name on both lists, different ability underneath, decided by the registry alone.
+    assert plan["run_command"].description != build["run_command"].description
+
+
 # --- U16 / R73: the chat-kind catalogue, beside the registry above ------------------------
 
 

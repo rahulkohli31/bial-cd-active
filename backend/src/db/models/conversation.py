@@ -41,14 +41,20 @@ class ChatKind(StrEnum):
     narration reached the screen, decided which copy of the app a turn read, and was stamped on
     every stored row.
 
-    THE KIND HAS EXACTLY TWO READERS AND BOTH ARE NAMED, because "one module reads it" would be
-    nearly-true rather than true. `services/agent/toolsets.py` reads it to decide what the model
-    CAN DO — the guardrail. A Plan chat cannot change the app because `write_file`, `edit_file`,
-    `insert_lines`, `apply_schema_change`, the sandbox-routed `run_command` and `declare_done`
-    are not in the list handed to that run, never because something downstream notices which
-    kind of chat it is. `services/turns/engine.py` reads it once more, to select a HARNESS
-    SHAPE: the node loop with its per-step billing fold versus a single `chat_agent.run`, and
-    with it the run's `output_type`. Everything else that holds a kind is stamping a row.
+    WHAT MAY READ IT IS NAMED BY ROLE, NOT BY COUNT. `services/agent/toolsets.py` reads it to
+    decide what the model CAN DO — the guardrail. A Plan chat cannot change the app because
+    `write_file`, `edit_file`, `insert_lines`, `apply_schema_change`, the sandbox-routed
+    `run_command` and `declare_done` are not in the list handed to that run, never because
+    something downstream notices which kind of chat it is. `services/agent/mode_prompts.py`
+    reads it to decide what the model is TOLD. `services/turns/engine.py` reads it to select a
+    HARNESS SHAPE: the node loop with its per-step billing fold versus a single
+    `chat_agent.run`. Those three questions are the whole permitted set; everything else that
+    holds a kind is stamping a row.
+
+    An earlier version of this paragraph counted the readers ("exactly two") and the engine's
+    own comment counted them differently ("three ... the closed set"). Both were wrong, and a
+    number in a docstring cannot go red when it stops being true. Read the roles here; trust a
+    test for the census.
     """
 
     PLAN = "plan"

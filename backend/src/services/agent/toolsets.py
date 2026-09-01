@@ -1,47 +1,61 @@
-"""The mode → toolset registry (U8 / R6 / D1): tool gating AT THE SERVER.
+"""The chat-kind → toolset registry (U8 / R6 / D1): tool gating AT THE SERVER.
 
-The registry keys on the server-owned `conversation.mode` — never anything the client
-sends. Structural gating, not prompt gating: the unified Ask/Plan agent is constructed
-with NO tools, and every run passes exactly its mode's toolsets via `agent.run(...,
-toolsets=...)` (pydantic-ai 2.5.0: per-run toolsets are ADDITIVE, so an empty agent plus
-a mode's list IS the mode's whole surface). A wrong-mode tool is absent from the model's
-tool list AND uncallable — a forged call gets the runtime's unknown-tool rejection.
+The registry keys on the server-owned `conversation.kind` — never anything the client
+sends. Structural gating, not prompt gating: the single `chat_agent` is constructed with NO
+tools, and every run passes exactly its kind's toolsets — Plan through `chat_agent.run(...,
+toolsets=...)`, Build through `chat_agent.iter(..., toolsets=...)` (pydantic-ai 2.5.0:
+per-run toolsets are ADDITIVE, so a tool-less agent plus a kind's list IS that kind's whole
+surface). A wrong-kind tool is absent from the model's tool list AND uncallable — a forged
+call gets the runtime's unknown-tool rejection.
 
-The mode → tool matrix (plan, confirmed):
+The kind → tool matrix:
 
-| Mode  | read/list/search tools | run_command       | write tools | present_plan_options |
+| Kind  | read/list/search tools | run_command       | write tools | present_plan_options |
 |-------|------------------------|-------------------|-------------|----------------------|
-| Ask   | yes (snapshot or live) | allowlisted, read | —           | —                    |
-| Plan  | yes                    | allowlisted, read | —           | yes                  |
-| Write | yes (live workspace)   | full (+SQL guard) | yes         | —                    |
+| Plan  | yes (live workspace)   | allowlisted, read | —           | yes                  |
+| Build | yes (live workspace)   | full (+SQL guard) | yes         | —                    |
 
-Write additionally gets `fetch_output_slice` (U22/R28) and `apply_schema_change` (U23/R29), and
-both reach Write the ONLY way they could: registered on `sandbox_toolset`, beside the
+Two arms, because there are two kinds. The third row this table used to carry ("Ask") had no
+arm in the code by the time anyone read it, and the two that remained were named for modes
+that no longer exist — which is the failure this docstring is meant to prevent, committed by
+the docstring itself.
+
+Build additionally gets `fetch_output_slice` (U22/R28) and `apply_schema_change` (U23/R29), and
+both reach Build the ONLY way they could: registered on `sandbox_toolset`, beside the
 `run_command` whose truncation notice hands out the slice handles and whose two-step migration
 sequence the composite replaces. Putting either on `read_only_toolset` would have been the silent
 failure this file's allowlist is designed to produce — `_WRITE_STRUCTURED_READS` names two tools
-and nothing else, so a tool added there would be filtered out of the one mode that runs commands,
-with no test going red. `test_toolsets.py` asserts their membership against `toolsets_for_mode`
-directly.
+and nothing else, so a tool added there would be filtered out of the one kind that runs commands,
+with no test going red. `test_toolsets.py` asserts their membership through
+`registered_tool_definitions(ChatKind.BUILD)` — see
+`test_fetch_output_slice_reaches_the_only_kind_that_runs_commands`.
 
-WRITE's surface is COMPOSED here, from two factories: the eight sandbox tools
+BUILD's surface is COMPOSED here, from two factories: the eight sandbox tools
 (`orchestrator/tools.sandbox_toolset`, resolved through the run's attached
 `SandboxSession`) plus exactly `list_files`/`search_files` off `read_only_toolset`. The
 read-only side is `.filtered()` down to those two names by an ALLOWLIST — its `read_file`
 and `run_command` are dropped, so no name is ever registered twice (duplicate tool names
-are a pydantic-ai `UserError`) and the version Write gets is the sandbox-routed one. The
-allowlist direction matters: a tool added to `read_only_toolset` later stays OUT of Write
+are a pydantic-ai `UserError`) and the version Build gets is the sandbox-routed one. The
+allowlist direction matters: a tool added to `read_only_toolset` later stays OUT of Build
 until it is named, so the wrong-direction failure is a missing tool, never a silently
-shadowed one (a read-only `run_command` winning would leave Write unable to run anything).
+shadowed one (a read-only `run_command` winning would leave Build unable to run anything).
 
 GENERIC over the deps type (U10): the registry itself is deps-agnostic — the caller
-supplies the accessor that resolves the run's workspace from ITS deps. `ReadDeps` (+
-`workspace_from_read_deps`) is the minimal agent-level shape the U8 tests exercise; the
-turn engine passes a `ChatDeps`-typed accessor for real traffic.
+supplies the accessors that resolve the run's workspace, and for Build the attached sandbox,
+from ITS deps. `ReadDeps` (+ `workspace_from_read_deps`) is the minimal agent-level shape the
+U8 tests exercise; the turn engine passes `ChatDeps`-typed accessors for real traffic.
 
-`present_plan_options` is registered here as the SEAM (name + tiny shape, no plan
-payload); its turn-engine mechanics — detect-and-force-on-retry, the user's click stored
-as the tool RESULT, the snapshot-SHA stamp — are U11's.
+`present_plan_options` is registered here and CARRIES THE PLAN IN ITS ARGUMENT — the seam is
+no longer a bare name. The turn-engine mechanics are `turns/plan_options.py`'s: the user's
+click, minutes or days later, is stored as this call's RESULT. What used to be described here
+— a detect-and-force-on-retry that re-ran the turn, and a snapshot-SHA stamp on the pending
+card — is retired; see the notes at both former sites.
+
+Two more things live in this module and are not the registry: the chat-kind CATALOGUE
+(U16/R73 — what the two kinds are, served on `GET /v1/auth/me`) and the prompt's TOOL SURFACE
+renderer (U20/R26 — what the Build prompt is allowed to say about its tools). Each has its own
+banner below; both are here because they only stay honest with the registry if changing one
+puts the other under your cursor.
 """
 
 from __future__ import annotations

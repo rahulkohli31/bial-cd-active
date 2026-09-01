@@ -874,19 +874,21 @@ class TurnEngine:
                 note = await self._workspace_note(state)
                 history = [*history, ModelRequest(parts=[UserPromptPart(content=note)])]
             if state.kind is ChatKind.BUILD:
-                # ONE OF THE THREE READERS OF THE KIND, and each asks a different question:
-                # `agent/toolsets.py` asks what the model CAN DO, `agent/mode_prompts.py` asks
-                # what it is TOLD, and this asks WHICH HARNESS RUNS it. Three, not two — the
-                # organising rule is that behaviour lives in the toolset rather than in
-                # scattered branches, and the honest statement of it is that these three sites
-                # are the closed set. Anyone auditing every place the kind changes behaviour,
-                # adding a third kind, or building the import guard that enforces this, has to
-                # find all three; a comment claiming two would send them looking for two.
+                # A READER OF THE KIND, AND IT ASKS WHICH HARNESS RUNS THE TURN — the node loop
+                # with its per-step billing fold versus a single `chat_agent.run`. That is the
+                # whole of what the kind decides here. Unifying the two loops would mean giving
+                # a Plan run the streaming node loop and the per-step billing it has no steps
+                # for, so the fork is a shape, not a behaviour.
                 #
-                # This one selects a HARNESS SHAPE — the node loop with
-                # its per-step billing fold versus a single `chat_agent.run`, and with it the
-                # `output_type` below. Unifying the two loops would mean giving a Plan run the
-                # streaming node loop and the per-step billing it has no steps for.
+                # The other questions belong to the run configurator and are answered there:
+                # `agent/toolsets.py` decides what the model CAN DO, `agent/mode_prompts.py`
+                # what it is TOLD. Nothing downstream of either may ask again — U1 deleted the
+                # `output_type` branch below for exactly that reason.
+                #
+                # NO COUNT IS CLAIMED HERE ON PURPOSE. This comment used to say "three sites
+                # are the closed set" while `ChatKind`'s own docstring said "exactly two", and
+                # both were wrong against the tree. A census belongs somewhere that goes red
+                # when it stops being true, not in a sentence that cannot.
                 #
                 # A Build turn bills PER MODEL STEP, inside the loop — `record_usage` is
                 # called once per step and that is the only fold. Claiming the turn as
@@ -913,11 +915,19 @@ class TurnEngine:
                         workspace=workspace,
                     )
                     toolsets = toolsets_for_kind(state.kind, _workspace_of).toolsets
-                    # A Plan chat may DEFER on present_plan_options — the run then ends with a
-                    # DeferredToolRequests output instead of text (the pending card state).
-                    output_type: Any = (
-                        [str, DeferredToolRequests] if state.kind is ChatKind.PLAN else str
-                    )
+                    # UNCONDITIONAL, BECAUSE THE TOOLSET HAS ALREADY DECIDED IT (U1/R69/N2). A
+                    # run can only end deferred if a tool that DEFERS was registered on it, and
+                    # `present_plan_options` — the one `CallDeferred` in the tree — is on the
+                    # Plan arm and nowhere else. Asking the kind a second time here re-decided
+                    # something the line above had just decided, and the two could only ever
+                    # agree; what it bought instead was a branch an auditor has to read.
+                    #
+                    # Widening costs nothing on a run that produced text: pydantic-ai strips
+                    # `DeferredToolRequests` out of the output types and keeps a single flag,
+                    # so the request is byte-identical and the flag is only ever read when a
+                    # deferred call is actually present. `: Any` stays — the heterogeneous list
+                    # is what the `run` overloads need to see to type-check.
+                    output_type: Any = [str, DeferredToolRequests]
                     result = await chat_agent.run(
                         prompt,
                         deps=deps,
