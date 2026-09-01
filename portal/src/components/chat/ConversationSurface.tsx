@@ -86,15 +86,16 @@ const welcomeMessage = (): ChatMessage => ({ id: 'welcome', ephemeral: true, rol
 // decision the user was actually making. If per-app follow-ups are wanted later they have to
 // come from the model, which is the only party that knows what was just built.
 
-// The brief-card era is over (U11/U13): the plan streams as text, `present_plan_options`
-// renders the card, and its resolution state derives from the STORED record — never from
-// fence-parsing the transcript.
+// The brief-card era is over (U11/U13): the plan streams as text, `present_plan_options` raises
+// the offer, and its resolution state derives from the STORED record — never from fence-parsing
+// the transcript. Plan D moved the offer from a card in the transcript to a strip on the composer.
 
-// The LIVE half of a build turn is now the BuildProgress bubble (U15) — headline, friendly
-// steps, elapsed time, Stop/Force-end, and the raw output behind its Details expander. The
-// TERMINALS stay deliberately absent from the live surface: a finished build appends a real
-// `build`-part message (003-U5) that says the same thing permanently — live narrative while
-// it runs; a record once it is done.
+// The LIVE half of a build turn is the TRANSCRIPT itself (Plan D U6): steps are parts, and the
+// activity group draws them where they happened. It used to be the pinned `BuildProgress` bubble,
+// which carried the headline, elapsed time, Stop and a Details expander; stop moved to the
+// composer (U3) and the raw-output expander did not come across at all. The TERMINALS stay
+// deliberately absent from the live surface: a finished build appends a real `build`-part message
+// (003-U5) that says the same thing permanently — live narrative while it runs, a record after.
 
 /**
  * The one-line summary persisted alongside a build part. It is the message's TEXT, so it is both
@@ -239,7 +240,7 @@ const UNDRAWN_PARTS: ReadonlySet<MessagePart['type']> = new Set<MessagePart['typ
  * itself would be advice to abandon something the platform is already fixing. The action belongs
  * to a terminal, and the terminal has its own prose.
  */
-export const DIAGNOSTIC_FALLBACK = 'We hit a problem finishing that change.'
+const DIAGNOSTIC_FALLBACK = 'We hit a problem finishing that change.'
 
 /**
  * The durable truth for a build that began and whose outcome never landed.
@@ -248,7 +249,7 @@ export const DIAGNOSTIC_FALLBACK = 'We hit a problem finishing that change.'
  * says nothing about what to do next: the platform does not know whether that build's work
  * survived, and a next action invented here would be a guess presented as advice.
  */
-export const BUILD_WAS_RUNNING = 'A build was running here when this chat was last open.'
+const BUILD_WAS_RUNNING = 'A build was running here when this chat was last open.'
 
 /** A fresh accumulator. One helper, so a new field cannot be added to the type and forgotten at
  *  one of the two call sites that open a stream. */
@@ -566,6 +567,9 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
   const buildIdRef = useRef<string | null>(null) // the active CONVERSATION being viewed/persisted — never a session id
   const streamAbortRef = useRef<AbortController | null>(null) // aborts the SUBSCRIPTION only — the turn runs on server-side
   const loadedBuildRef = useRef<string | null>(null)
+  // Merged step runs, held by identity for `mergeStepRun` far below — declared here because
+  // the per-chat effect clears it alongside these.
+  const mergedRunsRef = useRef(new Map<string, ChatMessage>())
   const initFiredRef = useRef<string | null>(null) // the chat id already seeded — fire-once per chat, not per mount
   // Lets `handleBuildIt` read the latest session without depending on the `session` object
   // itself — `useBuildSession` returns a fresh object every render, so listing it as a
@@ -727,6 +731,11 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
     // (G3), so a leaked draft cannot send into the wrong chat and this effect has one fewer thing
     // it can forget.
     setMessages([])
+    // The merged-run cache is keyed by the ids of the messages that went into it, so nothing in it
+    // can be looked up again once the transcript above is emptied. Without this it is the one thing
+    // on the surface that only ever grows: the component does not remount across chats, so every
+    // step run ever scrolled into view would be retained, whole, for the life of the tab.
+    mergedRunsRef.current.clear()
     // AND THE GUARD ABOVE IS INVALIDATED IN THE SAME BREATH. `loadedBuildRef` means "the chat
     // whose transcript is on screen", and one line ago that stopped being true — so it has to
     // stop saying so here rather than only when the fetch below succeeds. It did not, and the
@@ -1546,6 +1555,11 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
           : 'Just checking whether a build is running here — one moment.',
       )
     }
+    // U24 — the same arm the display gate carries. The composer already refuses on it, so this is
+    // defence in depth rather than the only guard; it is here because the sentence above promises
+    // that EVERY reason is re-checked at the one place a turn actually starts, and an arm that
+    // lives in only one of the two is how the two come to disagree.
+    if (atLimit) throw new Error(atLimit.title)
     // Synchronous, and a REF rather than state: the two keydowns of a fast double-Enter land in the
     // SAME tick, so `generating` — set after an await — is still false for the second one. The
     // draft is deliberately held until the server confirms the turn, so that second read sees the
@@ -1805,7 +1819,6 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
    * cache is keyed on the exact ids in the run, so a run that has not changed hands back the same
    * object and the cache holds.
    */
-  const mergedRunsRef = useRef(new Map<string, ChatMessage>())
   const mergeStepRun = useCallback((run: ChatMessage, next: ChatMessage): ChatMessage => {
     const parts = [...(run.parts ?? []), ...(next.parts ?? [])]
     // The run's own id names it; every merged part's id rides in the key so a changed run misses.
@@ -1863,7 +1876,7 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
         continue
       }
 
-      if (parts.length !== 0 && !parts.some((p) => p != null && !UNDRAWN_PARTS.has(p.type))) continue
+      if (parts.length !== 0 && parts.every((p) => p == null || UNDRAWN_PARTS.has(p.type))) continue
 
       // ── 3. A RUN OF STORED STEP ROWS IS ONE MESSAGE, so it is one group ──────────────────────
       //
@@ -2494,11 +2507,21 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
   }, [isRunning, hasPendingOffer])
 
   /**
-   * R66 — the agent started working. The other half (what a group amounted to when it sealed) is
-   * the activity group's own to announce; this covers the turn's start, which nothing else says
-   * out loud.
+   * R66's TWO ANNOUNCEMENTS. The turn's start is this surface's to say, because nothing else knows
+   * a turn began; what a group amounted to is reported UP from the group as it seals, because the
+   * group is the only place that count is already correct (see `GroupSealedContext`).
+   *
+   * This used to pass a hardcoded `null` under a comment saying the group announced the second
+   * half itself. It did not — the group had no live region and no announcer — so a screen-reader
+   * user was told the agent had started and never told what it did.
    */
-  const announcement = useActivityAnnouncement({ isRunning, sealedSummary: null })
+  const [sealedSummary, setSealedSummary] = useState<string | null>(null)
+  const announcement = useActivityAnnouncement({ isRunning, sealedSummary })
+
+  // Named once, because the region's presence test and its content have to be the same value —
+  // written out twice they are two expressions that can be edited apart, and the failure mode is
+  // an empty `role="alert"` box or a sentence with no box around it.
+  const urgentText = urgent ?? (sessionProjectMatches ? session.error : null)
 
   return (
     <div className="flex flex-1 min-h-0 overflow-hidden">
@@ -2527,6 +2550,7 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
             instead of pushing the composer off the bottom. */}
         <div className="flex-1 min-h-0">
           <ChatThread
+            onGroupSealed={setSealedSummary}
             messages={transcript}
             isRunning={isRunning}
             onNew={handleAppend}
@@ -2564,12 +2588,12 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
             polite regions are — a region injected together with its text is frequently not
             announced at all. */}
         <div aria-live="assertive" role="alert">
-          {urgent ?? (sessionProjectMatches ? session.error : null) ? (
+          {urgentText ? (
             <div
               data-testid="urgent-banner"
               className="mx-3 mb-1 rounded-lg border border-danger/20 bg-danger/5 px-2.5 py-1.5 text-[11px] text-danger"
             >
-              {urgent ?? (sessionProjectMatches ? session.error : null)}
+              {urgentText}
             </div>
           ) : null}
         </div>

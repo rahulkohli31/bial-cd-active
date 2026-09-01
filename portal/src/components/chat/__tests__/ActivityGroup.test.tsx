@@ -243,3 +243,63 @@ describe('groupLabel — the wording, unit-tested away from the DOM', () => {
     )
   })
 })
+
+/**
+ * R66's SECOND ANNOUNCEMENT.
+ *
+ * The surface used to pass a hardcoded `null` for this, under a comment saying the group announced
+ * it itself. The group had no live region and no announcer, so the effect could never fire outside
+ * `Announcer`'s own unit test — a screen-reader user heard that the agent had started and never
+ * heard what it did. These pin the WIRING; the hook's own rules stay in `Announcer.test.tsx`.
+ */
+describe('a group reports what it amounted to, once, as it seals', () => {
+  const withReporter = (
+    parts: MessagePart[],
+    onGroupSealed: (summary: string) => void,
+    opts: { isRunning?: boolean; interrupted?: boolean } = {},
+  ) => (
+    <ChatThread
+      messages={[{ id: 'a1', role: 'assistant', parts, seq: 1 }]}
+      isRunning={opts.isRunning ?? false}
+      onNew={vi.fn().mockResolvedValue(undefined)}
+      onCancel={vi.fn().mockResolvedValue(undefined)}
+      interruptedMessageIds={opts.interrupted ? new Set(['a1']) : undefined}
+      onGroupSealed={onGroupSealed}
+    />
+  )
+
+  it('reports the sealed label — the same sentence the trigger shows', () => {
+    const onGroupSealed = vi.fn()
+    render(
+      withReporter(
+        [stepPart(1, 'Reading your data'), stepPart(2, 'Writing the page', 'failed')],
+        onGroupSealed,
+      ),
+    )
+    expect(onGroupSealed).toHaveBeenCalledTimes(1)
+    expect(onGroupSealed).toHaveBeenCalledWith('2 steps · one problem')
+  })
+
+  it('says nothing while a step is still running', () => {
+    const onGroupSealed = vi.fn()
+    render(withReporter([stepPart(1, 'Reading your data', 'pending')], onGroupSealed, { isRunning: true }))
+    expect(onGroupSealed).not.toHaveBeenCalled()
+    // LIVENESS — the group IS on screen, so the silence is the running check rather than a group
+    // that failed to render at all.
+    expect(groups()).toHaveLength(1)
+  })
+
+  it('carries the stopped wording when the turn was interrupted', () => {
+    const onGroupSealed = vi.fn()
+    render(withReporter([stepPart(1, 'Reading your data')], onGroupSealed, { interrupted: true }))
+    expect(onGroupSealed).toHaveBeenCalledWith('1 step · stopped before it finished')
+  })
+
+  it('does not re-announce when the group is merely re-rendered', () => {
+    const onGroupSealed = vi.fn()
+    const tree = withReporter([stepPart(1, 'Reading your data')], onGroupSealed)
+    const { rerender } = render(tree)
+    rerender(tree)
+    expect(onGroupSealed).toHaveBeenCalledTimes(1)
+  })
+})

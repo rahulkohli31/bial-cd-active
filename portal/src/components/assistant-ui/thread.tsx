@@ -67,6 +67,7 @@ import {
 import { CheckIcon, CopyIcon } from 'lucide-react'
 import { createContext, useContext, type ComponentType, type FC, type PropsWithChildren } from 'react'
 
+import type { AttachmentDescriptor } from '../../utils/attachmentStore'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 
@@ -89,6 +90,12 @@ export type ThreadComponents = {
   ToolPart: ToolCallMessagePartComponent
   /** Rendered above the viewport's bottom — U8's return control, U16's offer strip. */
   ViewportFooter?: ComponentType | undefined
+  /**
+   * The chips under a user message's prose. Attachments are the portal's own pipeline, so they
+   * arrive as descriptors on `metadata.custom` rather than through the library's attachment model
+   * — this slot is where they are drawn.
+   */
+  UserAttachments?: ComponentType<{ attachments: AttachmentDescriptor[] }> | undefined
 }
 
 const ThreadComponentsContext = createContext<ThreadComponents | null>(null)
@@ -276,13 +283,24 @@ const AssistantActionBar: FC = () => (
  * guarantee pinned by the parity checklist, not a branch on state.
  */
 const UserMessage: FC = () => {
-  const { TextPart } = useThreadComponents()
+  const { TextPart, UserAttachments } = useThreadComponents()
+  // The portal's own descriptors, put here by `convertMessage` — the library's attachment model is
+  // deliberately not adopted, so this is where they live.
+  const attachments = useAuiState((s) => s.message.metadata?.custom?.['attachments']) as
+    | AttachmentDescriptor[]
+    | undefined
+
   return (
     <MessagePrimitive.Root
       data-testid="user-message"
       data-role="user"
       className="animate-in fade-in slide-in-from-bottom-1 flex flex-col items-end gap-y-2 px-2 duration-150"
     >
+      {/* ABOVE the prose, and OUTSIDE the bubble's `empty:hidden` — an attachment sent with no
+          message of its own is a real thing a citizen does, and it must still be visible. */}
+      {UserAttachments && attachments && attachments.length > 0 ? (
+        <UserAttachments attachments={attachments} />
+      ) : null}
       <div className="max-w-[85%] break-words rounded-xl bg-muted px-4 py-2 text-foreground empty:hidden">
         <MessagePrimitive.Parts components={{ Text: () => <UserText Component={TextPart} /> }} />
       </div>

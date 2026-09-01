@@ -15,15 +15,9 @@
  */
 import type { ToolCallMessagePartComponent } from '@assistant-ui/react'
 
-import type { ActivityArgs, ActivityState } from './runtime/convertMessage'
-import { ToolActivityLine, type ToolActivityState } from './ToolActivityLine'
-import { UNRECOGNISED_STEP } from './ActivityGroup'
-
-function rowState(state: ActivityState | undefined): ToolActivityState {
-  if (state === 'ok') return 'ok'
-  if (state === 'failed') return 'failed'
-  return 'started'
-}
+import type { ActivityArgs } from './runtime/convertMessage'
+import { ToolActivityLine } from './ToolActivityLine'
+import { UNRECOGNISED_STEP, rowState } from './ActivityGroup'
 
 const ActivityRow: ToolCallMessagePartComponent = (part) => {
   const args = (part.args ?? {}) as Partial<ActivityArgs>

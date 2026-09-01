@@ -21,8 +21,9 @@
  *     when true it appends an optimistic assistant message with an id we do not control. Keeping
  *     identity server-owned is therefore a SEQUENCING requirement on the send path — a server-owned
  *     assistant message must be last the instant `isRunning` flips true — not something this file
- *     can fix. `hasUpcomingMessage` exports the predicate so the send path and its test can both
- *     read the same rule.
+ *     can fix. `hasUpcomingMessage` restates the library's own predicate here, where the ordering
+ *     is reasoned about, and its test pins it — the send path SATISFIES the rule by construction
+ *     rather than by consulting it, so nothing outside that test calls it.
  *  4. THE CONVERTER CACHES ON OBJECT IDENTITY. The runtime holds a WeakMap keyed on the message
  *     object and short-circuits on a hit, so MUTATING A MESSAGE IN PLACE IS INVISIBLE — the UI
  *     simply never re-renders. Every streamed update must produce a NEW object for the changed
@@ -51,6 +52,7 @@
  * narrows `detail` away on both paths, so this is the second of two walls, not the only one.
  */
 import type { ChatMessage, MessagePart } from '../../../utils/messageTypes'
+import { attachmentsFromParts } from '../../../utils/attachmentStore'
 import type { ThreadMessageLike } from '@assistant-ui/react'
 
 /** What a step's state becomes on the tool-call part the group renders. */
@@ -94,7 +96,12 @@ function activityState(state: 'ok' | 'failed' | 'pending'): ActivityState {
  * symptom.
  */
 export function convertPart(part: MessagePart): LibraryPart | null {
-  if (part.type === 'text') return { type: 'text', text: part.text }
+  // AN ATTACHMENT-BEARING TEXT PART IS NOT PROSE. `buildUserParts` puts the whole decoded file in
+  // `text` for a csv/txt and hangs the descriptor off `attachment`; the descriptor draws a chip and
+  // the body goes to the model, but it is never something the citizen typed. `partsToText` has
+  // always filtered it with the same `!p.attachment` test — without the filter here a staged
+  // spreadsheet renders into the bubble row by row.
+  if (part.type === 'text') return part.attachment ? null : { type: 'text', text: part.text }
 
   if (part.type === 'step') {
     // `tool` and `hidden` are deliberately NOT destructured. `tool` is the raw command name and an
@@ -114,6 +121,9 @@ export function convertPart(part: MessagePart): LibraryPart | null {
     }
   }
 
+  // `file` parts (image/PDF) have no library part either — like the inline-text attachments above
+  // they are carried as descriptors on the message and drawn as chips, not as content.
+  //
   // `build` / `build_in_progress` / `plan_options` — see the docblock. No element, by omission.
   return null
 }
@@ -154,10 +164,21 @@ export function convertMessage(message: ChatMessage): ThreadMessageLike {
       return { ...part, toolCallId: `${id}-${index}` }
     })
 
+  // THE ATTACHMENTS RIDE BESIDE THE CONTENT, NOT IN IT. Both shapes that carry one convert to no
+  // library part — the inline-text kind because its `text` is the file itself, the `file` kind
+  // because it has no textual form at all — so without this the transcript simply forgets that a
+  // citizen attached anything. `metadata.custom` is the library's own escape hatch for a host's
+  // data, which keeps our attachment pipeline ours (no `AttachmentAdapter`) and the thread a
+  // renderer.
+  const attachments = attachmentsFromParts(message.parts)
+
   return {
     id: message.id,
     role: message.role,
     content,
+    // Omitted entirely when there is nothing to carry, so an ordinary message converts to exactly
+    // what it did before.
+    ...(attachments.length > 0 ? { metadata: { custom: { attachments } } } : {}),
   }
 }
 

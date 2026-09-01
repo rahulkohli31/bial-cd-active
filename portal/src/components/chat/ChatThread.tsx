@@ -28,7 +28,8 @@ import { Thread, type ThreadComponents, type ThreadGroupPart } from '../assistan
 import { useChatRuntime } from './runtime/useChatRuntime'
 import type { ChatMessage } from '../../utils/messageTypes'
 import MessageContent from './MessageContent'
-import ActivityGroup, { InterruptedMessagesContext } from './ActivityGroup'
+import AttachmentChips from '../AttachmentChips'
+import ActivityGroup, { InterruptedMessagesContext, GroupSealedContext } from './ActivityGroup'
 import ActivityRow from './ActivityRow'
 
 export interface ChatThreadProps {
@@ -45,6 +46,8 @@ export interface ChatThreadProps {
   interruptedMessageIds?: ReadonlySet<string>
   /** Rendered under the viewport — the composer, the offer strip, the return-to-latest control. */
   footer?: FC | undefined
+  /** Told what an activity group amounted to as it seals — R66's second announcement. */
+  onGroupSealed?: ((summary: string) => void) | undefined
 }
 
 /**
@@ -79,6 +82,8 @@ const ReasoningGroup: FC<{ group: ThreadGroupPart; children?: React.ReactNode }>
   </p>
 )
 
+const noAnnouncement = () => {}
+
 const ChatThread: FC<ChatThreadProps> = ({
   messages,
   isRunning,
@@ -86,12 +91,14 @@ const ChatThread: FC<ChatThreadProps> = ({
   onCancel,
   interruptedMessageIds,
   footer,
+  onGroupSealed,
 }) => {
   const runtime = useChatRuntime({ messages, isRunning, onNew, onCancel })
 
   const components = useMemo<ThreadComponents>(
     () => ({
       TextPart,
+      UserAttachments: AttachmentChips,
       ToolGroup: ActivityGroup,
       ToolPart: ActivityRow,
       ReasoningGroup,
@@ -105,10 +112,16 @@ const ChatThread: FC<ChatThreadProps> = ({
     [interruptedMessageIds],
   )
 
+  // A stable identity for the default, so a surface that passes nothing does not hand the groups a
+  // new callback on every render and re-run their announce effect.
+  const announceSealed = useMemo(() => onGroupSealed ?? noAnnouncement, [onGroupSealed])
+
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <InterruptedMessagesContext.Provider value={interrupted}>
-        <Thread components={components} />
+        <GroupSealedContext.Provider value={announceSealed}>
+          <Thread components={components} />
+        </GroupSealedContext.Provider>
       </InterruptedMessagesContext.Provider>
     </AssistantRuntimeProvider>
   )

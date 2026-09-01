@@ -39,6 +39,7 @@ import { ChevronDown, ChevronRight } from 'lucide-react'
 import {
   createContext,
   useContext,
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -70,6 +71,19 @@ export const UNRECOGNISED_STEP = 'Working on your app'
 export const InterruptedMessagesContext = createContext<ReadonlySet<string>>(new Set())
 
 /**
+ * R66's SECOND ANNOUNCEMENT — what a group amounted to, the moment it sealed.
+ *
+ * It is reported from here rather than derived at the surface because this is the only place the
+ * count is already right: a diagnostic joins the group as a failed row but never reaches the
+ * surface's `turnSteps`, so a surface-side count would say "3 steps" about a group rendering four.
+ * Two places computing the same sentence is how they come to disagree.
+ *
+ * The default is a no-op, so a group rendered outside a provider (every unit test of this file)
+ * behaves exactly as it did.
+ */
+export const GroupSealedContext = createContext<(summary: string) => void>(() => {})
+
+/**
  * Read a tool-call part's args, or `undefined` for anything that is not one.
  *
  * A hand-written guard rather than an inline `filter(p => p.type === 'tool-call')`: the content
@@ -84,8 +98,12 @@ function toolCallArgs(
   return (part.args ?? {}) as Partial<ActivityArgs>
 }
 
-/** The converter's state, mapped onto the shared row atom's vocabulary. */
-function rowState(state: ActivityState): ToolActivityState {
+/**
+ * The converter's state, mapped onto the shared row atom's vocabulary. Exported because the row
+ * draws the same mapping, and two copies of a state map drift the first time a state is added.
+ * An absent state is a step that has not reported yet, which is 'started' — same as 'running'.
+ */
+export function rowState(state: ActivityState | undefined): ToolActivityState {
   if (state === 'ok') return 'ok'
   if (state === 'failed') return 'failed'
   return 'started'
@@ -151,17 +169,34 @@ const ActivityGroup: FC<PropsWithChildren<{ group: ThreadGroupPart }>> = ({ grou
 
   // Expanding must not throw the reader somewhere else. The library's own lock is what the
   // registry's component uses and it is exported, so it comes across without the port.
+  //
+  // IT RETURNS AN ACTIVATOR AND DOES NOTHING UNTIL IT IS CALLED — mounting the hook is not arming
+  // it. Dropping the return value left the sentence above describing a lock that never engaged.
   const contentRef = useRef<HTMLDivElement>(null)
-  useScrollLock(contentRef, 200)
+  const lockScroll = useScrollLock(contentRef, 200)
 
   const label = groupLabel(facts, interrupted)
   const Chevron = open ? ChevronDown : ChevronRight
+
+  // ONCE, WHEN IT SEALS. `sealed` guards against re-announcing on every later render, and the
+  // running check is what makes `label` the summary rather than whichever step was in flight.
+  const announceSealed = useContext(GroupSealedContext)
+  const sealed = useRef(false)
+  useEffect(() => {
+    if (facts.running || facts.count === 0 || sealed.current) return
+    sealed.current = true
+    announceSealed(label)
+  }, [facts.running, facts.count, label, announceSealed])
 
   return (
     <div data-testid="activity-group" data-state={open ? 'open' : 'closed'} className="my-2">
       <button
         type="button"
-        onClick={() => setReaderOpen(!open)}
+        onClick={() => {
+          // BEFORE the state change, so the lock is in place for the height change it causes.
+          lockScroll()
+          setReaderOpen(!open)
+        }}
         aria-expanded={open}
         data-testid="activity-group-trigger"
         // NO border and NO background — see the docblock. This is a line of text with glyphs, not
@@ -180,7 +215,7 @@ const ActivityGroup: FC<PropsWithChildren<{ group: ThreadGroupPart }>> = ({ grou
                 className="flex h-[18px] w-[18px] items-center justify-center rounded-md bg-surface-muted ring-2 ring-white"
                 style={i === 0 ? undefined : { marginLeft: '-6px' }}
               >
-                <GlyphOnly state={rowState(args?.state ?? 'running')} />
+                <GlyphOnly state={rowState(args?.state)} />
               </span>
             )
           })}
