@@ -220,9 +220,10 @@ export interface ErrorEvent {
    * file and a framework construct by design. These two are what the feed renders instead —
    * a plain sentence about the app, and something the reader can actually do.
    *
-   * OPTIONAL, because the legacy C7 feed emits neither. `BuildProgress` supplies its own
-   * committed fallback pair when they are missing, so an error status is never rendered
-   * without an action clause — that is the invariant, not the presence of these fields.
+   * OPTIONAL, because the legacy C7 feed emits neither. A committed fallback pair is supplied
+   * where they are rendered (the surface's diagnostic row, via `DIAGNOSTIC_FALLBACK`) when they
+   * are missing, so an error status is never rendered without an action clause — that is the
+   * invariant, not the presence of these fields.
    */
   user_message?: string
   user_action?: string

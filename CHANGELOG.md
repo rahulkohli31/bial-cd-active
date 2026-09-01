@@ -4,6 +4,47 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.2] - 2026-09-01
+
+### Changed
+
+- **The chat is one screen now.** Planning a change and building it used to be two different
+  pages that looked and behaved differently — different scrolling, a different composer, a
+  different idea of what a message is. There is one surface, and which kind of chat you are in
+  changes the placeholder and nothing else.
+- **What the app is doing is written where it happened.** The build used to narrate itself in a
+  card pinned to the bottom of the screen, which erased and rewrote itself as it went and left
+  nothing behind. The steps now sit in the conversation, in order, grouped by the run they
+  belong to, and they are still there next week. A run that hit a problem says so and opens
+  itself; a run that went cleanly stays collapsed to a single line.
+- **Stop moved to the composer**, where the rest of the controls are, and it no longer goes dead
+  under your cursor when you press it.
+- Attachments open over the conversation instead of in a new browser tab, so you keep your place
+  and the reply keeps arriving behind them.
+- The plan offer is a strip on the composer rather than a card in the transcript, and there is
+  exactly one Build control on the screen.
+
+### Fixed
+
+- **A refused message is no longer lost.** If the server turned a message down — the daily limit
+  reached, a build already running, the service unavailable — the composer had already emptied
+  itself by the time the refusal arrived, and the text and any attached files were gone with no
+  way to get them back. The box now empties only once the server has actually accepted the
+  message.
+- **A file attached in one chat no longer follows you into the next one**, where it would have
+  been sent to a conversation you never attached it to.
+- Pressing Enter twice quickly no longer clears the box for the press it ignored.
+- A message turned down while you were looking at another chat no longer leaves that chat unable
+  to send anything for the rest of the session.
+- When sending is refused, the reason is the one that applies — the daily limit, a build in
+  progress, the attachment limit — instead of one generic sentence for all of them.
+- **Attached spreadsheets and text files no longer print their whole contents into the
+  conversation**, and attached images and PDFs show up at all. Both were introduced by the
+  rebuild and are fixed in it.
+- Screen readers are told what a run of work amounted to when it finishes, not only that it
+  started — and are no longer read a summary of every past build when an old chat is opened.
+- The assistant now names the plan buttons the way the screen does.
+
 ## [1.7.1] - 2026-09-01
 
 ### Changed

@@ -103,11 +103,11 @@ class ToolSurface[DepsT]:
 
 
 async def present_plan_options(ctx: RunContext[Any], plan: str) -> str:
-    """Show the user your plan with the Build it / Keep refining buttons beneath it. Pass the
-    whole plan as `plan` — that text is what the user reads and what a build works from, so it
-    has to stand on its own. Call this when the plan is ready; it ends your turn, and the
-    user's choice arrives as the result when they decide. Call it again, with the revised
-    plan, after they ask for changes."""
+    """Show the user your plan with the Build this plan / Keep planning buttons beneath it.
+    Pass the whole plan as `plan` — that text is what the user reads and what a build works
+    from, so it has to stand on its own. Call this when the plan is ready; it ends your turn,
+    and the user's choice arrives as the result when they decide. Call it again, with the
+    revised plan, after they ask for changes."""
     # THE PLAN RIDES THE ARGUMENT, and the docstring above is what the model actually reads,
     # so it is the contract rather than a description of one. Free text beside a tool call no
     # longer reaches the user, so a plan announced in the same breath as the offer would

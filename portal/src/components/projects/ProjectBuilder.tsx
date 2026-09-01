@@ -23,12 +23,12 @@
  */
 import { useState, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Sparkles, ShieldAlert, X, Paperclip, FileText, FileSpreadsheet, Presentation } from 'lucide-react'
+import { Sparkles, ShieldAlert, X, Paperclip, FileText, FileSpreadsheet } from 'lucide-react'
 import { validatePrompt } from '../../utils/promptGuardrails'
 import type { PromptViolation } from '../../utils/promptGuardrails'
 import { uuidv7 } from '../../utils/conversationApi'
 import { usePendingAttachments } from '../../hooks/usePendingAttachments'
-import { ACCEPT_ATTR, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../../utils/attachmentInput'
+import { ACCEPT_ATTR } from '../../utils/attachmentInput'
 
 export interface ProjectBuilderProps {
   /** The project this composer builds/plans into. Required: it is what removes
@@ -127,15 +127,7 @@ export default function ProjectBuilder({ projectId }: ProjectBuilderProps) {
             <div className="flex flex-wrap gap-1.5 pt-0.5">
               {pendingAttachments.map((a) => (
                 <span key={a.id} className="flex items-center gap-1 text-[10px] font-medium bg-primary/5 text-primary border border-primary/30 rounded-md px-2 py-1">
-                  {TEXT_MEDIA_TYPES.has(a.mediaType) ? (
-                    a.mediaType === 'text/csv' ? <FileSpreadsheet size={9} /> : <FileText size={9} />
-                  ) : OFFICE_MEDIA_TYPES.has(a.mediaType) ? (
-                    officeFormat(a.mediaType) === 'excel' ? <FileSpreadsheet size={9} /> : <FileText size={9} />
-                  ) : DECK_MEDIA_TYPES.has(a.mediaType) ? (
-                    <Presentation size={9} />
-                  ) : (
-                    <FileText size={9} />
-                  )}
+                  {a.mediaType === 'text/csv' ? <FileSpreadsheet size={9} /> : <FileText size={9} />}
                   <span className="max-w-[160px] truncate">{a.name}</span>
                   <button onClick={() => removePending(a.id)} className="ml-0.5 hover:text-danger transition">
                     <X size={9} />

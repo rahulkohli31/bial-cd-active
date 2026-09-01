@@ -43,10 +43,10 @@
  * (`wireMessageFromParts`); the server rehydrates bytes and replays history from its
  * own store.
  */
-import { TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES } from './attachmentInput'
+import { TEXT_MEDIA_TYPES } from './attachmentInput'
 import type { PendingAttachment } from './attachmentInput'
 import { uploadAttachment as defaultUpload, deleteAttachment as defaultDelete } from './attachmentApi'
-import type { MessagePart, FilePartOffice, TextPart } from './messageTypes'
+import type { MessagePart, TextPart } from './messageTypes'
 
 /** The chip descriptor `attachmentsFromParts` builds — traced from its one real
  * consumer, `AttachmentChips.jsx`'s own doc comment: `{ attachmentId, kind,
@@ -80,12 +80,6 @@ function sanitizeFenceName(name: string): string {
  * read as instructions. Mirrors server `neutralizeFence`. */
 function neutralizeFence(text: string): string {
   return String(text || '').replace(/<\/(attachment)/gi, '<\\/$1')
-}
-
-/** The model-facing fence for an office part's extracted text (Decision 3) —
- * MUST match the server's `officeFence` so client/server assembly agree. */
-function officeFence(part: FilePartOffice): string {
-  return `<attachment name="${sanitizeFenceName(part.name)}" type="${part.format}">\n${neutralizeFence(part.text)}\n</attachment>`
 }
 
 /**
@@ -175,11 +169,10 @@ export function wireMessageFromParts(parts: MessagePart[]): WireMessage {
           prose.push(p.text)
         }
       } else if (p?.type === 'file') {
-        if (p.kind === 'office') {
-          attachmentTexts.push(officeFence(p))
-        } else if (p.kind !== 'deck' && typeof p.attachmentId === 'string') {
-          attachmentIds.push(p.attachmentId)
-        }
+        // NO `kind` branch any more. The office fence and the `kind !== 'deck'` filter both went
+        // with the producers below: a filter that excludes a part nothing can mint is a guard
+        // against a state that cannot occur, and it reads as though the state still can.
+        if (typeof p.attachmentId === 'string') attachmentIds.push(p.attachmentId)
       }
     }
   }
@@ -213,49 +206,21 @@ export async function buildUserParts(
         text: decodeBase64Text(a.base64),
         attachment: { attachmentId: a.id, name: a.name, mediaType: a.mediaType, size: a.size },
       })
-    } else if (OFFICE_MEDIA_TYPES.has(a.mediaType)) {
-      // The server stores the original AND returns the extracted Markdown (`text`);
-      // the office part carries that text (→ model, sticky) plus the stored ref
-      // (→ chip / re-download). The original bytes are never sent to the model.
-      const ref = await upload({ attachmentId: a.id, name: a.name, mediaType: a.mediaType, size: a.size, base64: a.base64 })
-      // UNCHECKED (matches pre-migration behavior): AttachmentRef's format/text/
-      // truncated are typed loosely (shared across image/office/deck refs) since
-      // that's what the server ACTUALLY guarantees for an office upload — trusted,
-      // not re-validated here.
-      parts.push({
-        type: 'file',
-        kind: 'office',
-        format: ref.format as 'word' | 'excel',
-        attachmentId: ref.attachmentId,
-        key: ref.key,
-        name: ref.name,
-        mediaType: ref.mediaType,
-        size: ref.size,
-        text: ref.text as string,
-        truncated: ref.truncated as boolean,
-        truncationNote: ref.truncationNote,
-      })
-    } else if (DECK_MEDIA_TYPES.has(a.mediaType)) {
-      // The server converts the deck to a PDF, uploads it to the Files API, and
-      // returns the original-bytes ref PLUS the internal pdfFileId/pageCount. The
-      // deck part carries pdfFileId (→ model, sticky vision block) and the .pptx
-      // ref (→ chip / re-download). No base64 ever reaches the deck send path.
-      const ref = await upload({ attachmentId: a.id, name: a.name, mediaType: a.mediaType, size: a.size, base64: a.base64 })
-      // UNCHECKED (matches pre-migration behavior) — see the office branch above.
-      parts.push({
-        type: 'file',
-        kind: 'deck',
-        attachmentId: ref.attachmentId,
-        key: ref.key,
-        name: ref.name,
-        mediaType: ref.mediaType,
-        size: ref.size,
-        pdfFileId: ref.pdfFileId as string,
-        pageCount: ref.pageCount as number,
-      })
+    // THE PRODUCERS ARE GONE, not merely the filter. `attachmentStore` went on MINTING deck
+    // parts under a stale comment claiming the server converted them, while the wire builder
+    // dropped them again a hundred lines away — a producer minting parts nothing consumes, which
+    // is exactly the residual a removal is supposed to close. Both it and the office producer go
+    // with the media types that fed them.
+    //
+    // TWO THINGS FALL OUT, and both are gains rather than side effects: the office branch used to
+    // run BEFORE the magic-byte check, so that check is now the sole gate for every uploaded file;
+    // and extraction ran before storage, so a rejected file never orphaned a blob — an ordering
+    // that survives because there is no extraction left to order.
     } else {
       const ref = await upload({ attachmentId: a.id, name: a.name, mediaType: a.mediaType, size: a.size, base64: a.base64 })
-      // UNCHECKED (matches pre-migration behavior) — see the office branch above.
+      // UNCHECKED, matching pre-migration behaviour: `AttachmentRef`'s fields are what the server
+      // actually guarantees for an upload — trusted here, not re-validated. (This note used to
+      // say "see the office branch above"; there is no office branch any more.)
       parts.push({
         type: 'file',
         attachmentId: ref.attachmentId,

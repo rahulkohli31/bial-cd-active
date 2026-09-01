@@ -201,7 +201,10 @@ describe('GlobalLimitsPanel', () => {
     // The prior "ops" pick is no longer visible under this search — `selected` is
     // pruned on a query change (finding 3's other half) so the confirmed count can
     // never silently refer to rows the admin can't currently see or review.
-    expect(screen.getByText('0 selected')).toBeTruthy()
+    // `waitFor`, not a bare read. `findByText('Eng')` resolves when the new page renders; the
+    // prune of `selected` is a separate state update that can land a tick later under load. A
+    // bare assertion here passes locally and fails in CI, which is a flake rather than a finding.
+    await waitFor(() => expect(screen.getByText('0 selected')).toBeTruthy())
   })
 
   it('a failed background page shows a retry banner and disables Select-all/Apply — never renders nothing', async () => {

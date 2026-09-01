@@ -18,7 +18,7 @@
  *          pinned from the other side: nothing canned may appear to seed the composer at all.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, act, cleanup, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 
 const h = vi.hoisted(() => ({
@@ -57,7 +57,7 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
   resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
 
-import BuilderPage from '../BuilderPage'
+import ConversationSurface from '../../components/chat/ConversationSurface'
 import { ApiError } from '../../utils/apiError'
 import {
   FakeEventSource, makeClient, primeClient, primeTurn, statusResp, turnStreaming, planReply,
@@ -73,7 +73,7 @@ const deps = () => {
 function renderAt(chatId, sessionDeps, projectId = 'p1') {
   return render(
     <MemoryRouter initialEntries={['/x']}>
-      <BuilderPage chatId={chatId} projectId={projectId} projectName="VIP Movement" buildSessionDeps={sessionDeps} />
+      <ConversationSurface chatId={chatId} projectId={projectId} projectName="VIP Movement" buildSessionDeps={sessionDeps} />
     </MemoryRouter>,
   )
 }
@@ -229,7 +229,7 @@ describe('the closed gate always states its reason', () => {
     await waitForGateOpen()
     type('a visitor app')
     fireEvent.keyDown(composer(), { key: 'Enter' })
-    fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
     await waitFor(() => expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/building your app/i))
   })
 })
@@ -323,7 +323,7 @@ describe('an in-flight turn belongs to ONE chat (G2)', () => {
     h.readTurnStream.mockImplementation(turnStreaming(planReply('B plan', 'opt-B')))
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <BuilderPage chatId="chat-B" projectId="p1" projectName="VIP Movement" buildSessionDeps={d} />
+        <ConversationSurface chatId="chat-B" projectId="p1" projectName="VIP Movement" buildSessionDeps={d} />
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
@@ -360,7 +360,7 @@ describe('a typed draft survives (G3)', () => {
       h.getBuild.mockResolvedValue({ id: chatId, kind: 'build', messages: [] })
       rerender(
         <MemoryRouter initialEntries={['/x']}>
-          <BuilderPage chatId={chatId} projectId="p1" projectName="VIP Movement" buildSessionDeps={d} />
+          <ConversationSurface chatId={chatId} projectId="p1" projectName="VIP Movement" buildSessionDeps={d} />
         </MemoryRouter>,
       )
       await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith(chatId))
@@ -426,7 +426,7 @@ describe('a finished build offers no canned follow-ups (2026-07-30)', () => {
     await waitForGateOpen()
     type('a visitor app')
     fireEvent.keyDown(composer(), { key: 'Enter' })
-    fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
 
     // The new chat's own adopt reattaches to the turn the read projection carries.
@@ -436,7 +436,7 @@ describe('a finished build offers no canned follow-ups (2026-07-30)', () => {
     })
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <BuilderPage chatId={NEW_BUILD_CHAT} projectId="p1" projectName="VIP Movement" buildSessionDeps={d.deps} />
+        <ConversationSurface chatId={NEW_BUILD_CHAT} projectId="p1" projectName="VIP Movement" buildSessionDeps={d.deps} />
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith(NEW_BUILD_CHAT))
@@ -532,7 +532,7 @@ describe('cross-chat build scoping and reload fidelity (CC1–CC4)', () => {
     const d = deps()
     const { rerender } = renderAt('chat-A', d.deps)
     await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('live-7'))
-    await waitFor(() => expect(screen.getByTestId('build-progress')).toBeTruthy())
+    await waitFor(() => expect(screen.getByTestId('stop-turn')).toBeTruthy())
 
     // Chat B carries a STALE anchor naming a different session.
     h.getBuild.mockResolvedValue({
@@ -546,7 +546,7 @@ describe('cross-chat build scoping and reload fidelity (CC1–CC4)', () => {
     h.getStatus.mockClear()
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <BuilderPage chatId="chat-B" projectId="p1" projectName="VIP Movement" buildSessionDeps={d.deps} />
+        <ConversationSurface chatId="chat-B" projectId="p1" projectName="VIP Movement" buildSessionDeps={d.deps} />
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
@@ -589,14 +589,20 @@ describe('cross-chat build scoping and reload fidelity (CC1–CC4)', () => {
     renderAt('build-X', d)
 
     await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('live-7'))
-    // The two contiguous stored steps group into ONE collapsed dropdown (not two always-visible
-    // rows) — the reload path renders through the same StepHistoryCollapsible BuildProgress uses.
-    await waitFor(() => expect(document.querySelectorAll('[data-kind="step-group"]')).toHaveLength(1))
-    fireEvent.click(document.querySelector('[data-kind="step-group"] button[aria-expanded]'))
-    expect(document.querySelectorAll('[data-kind="step-group"] [data-kind="step"]')).toHaveLength(2)
-    // …and the past-tense anchor STILL stays hidden: the build is live, the bubble speaks for it.
+    // ONE GROUP, NOT TWO — and this is the live/reload parity assertion (AE43), not a styling
+    // preference. The projection stores one MESSAGE per step while the live path puts every step
+    // of a turn on a single streaming message, so without the surface merging a run of stored step
+    // rows a build watched live would show one group of nine and the same build after a reload
+    // would show nine groups of one.
+    await waitFor(() => expect(screen.getAllByTestId('activity-group')).toHaveLength(1))
+    fireEvent.click(screen.getByTestId('activity-group-trigger'))
+    const rows = within(await screen.findByTestId('activity-group-rows'))
+    expect(rows.getByText(/Updated the home page/i)).toBeTruthy()
+    expect(rows.getByText(/Added the form/i)).toBeTruthy()
+    // …and the past-tense anchor stays out of the transcript: `build_in_progress` maps to no
+    // rendered part at all now, so the sentence cannot appear whether a build is live or not.
     expect(document.querySelector('[data-kind="build-in-progress"]')).toBeNull()
-    expect(screen.getByTestId('build-progress')).toBeTruthy()
+    expect(screen.getByTestId('stop-turn')).toBeTruthy()
   })
 
   it('CC3: a sibling chat renders no live build bubble, and therefore no Stop button', async () => {
@@ -623,14 +629,14 @@ describe('cross-chat build scoping and reload fidelity (CC1–CC4)', () => {
     await waitForGateOpen()
     type('build me a thing')
     fireEvent.keyDown(composer(), { key: 'Enter' })
-    fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
 
     // Arrive at the chat the handoff actually runs in (a chatId prop swap on the SAME instance,
     // mirroring how every other sibling-chat guard in this file simulates navigation).
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <BuilderPage chatId={LIVE_BUILD_CHAT} projectId="p1" projectName="VIP Movement" buildSessionDeps={d.deps} />
+        <ConversationSurface chatId={LIVE_BUILD_CHAT} projectId="p1" projectName="VIP Movement" buildSessionDeps={d.deps} />
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith(LIVE_BUILD_CHAT))
@@ -638,20 +644,31 @@ describe('cross-chat build scoping and reload fidelity (CC1–CC4)', () => {
       expect(h.readTurnStream).toHaveBeenCalledWith(expect.objectContaining({ turnId: BUILD_TURN_ID })),
     )
     await turn.frame(T_PREVIEW())
-    await waitFor(() => expect(screen.getByTestId('build-progress')).toBeTruthy())
-    expect(screen.getByRole('button', { name: /^Stop$/i })).toBeTruthy() // the owning chat's own Stop is real
+    await waitFor(() => expect(screen.getByTestId('stop-turn')).toBeTruthy())
+    // The owning chat's own Stop is real. `getAllBy` because R55's relocated control now sits on
+    // the composer beside the build card's own — deliberately, and only until U17 deletes the
+    // card. What this guard is about is the SIBLING, and that assertion below is unchanged.
+    expect(screen.getAllByRole('button', { name: /^Stop$/i }).length).toBeGreaterThan(0)
+    expect(screen.getByTestId('stop-turn')).toBeTruthy()
 
     // A THIRD, unrelated chat inherits none of it.
     h.getBuild.mockResolvedValue({ id: 'chat-B', kind: 'build', messages: [] })
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <BuilderPage chatId="chat-B" projectId="p1" projectName="VIP Movement" buildSessionDeps={d.deps} />
+        <ConversationSurface chatId="chat-B" projectId="p1" projectName="VIP Movement" buildSessionDeps={d.deps} />
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
 
-    expect(screen.queryByTestId('build-progress')).toBeNull()
+    expect(screen.queryByTestId('stop-turn')).toBeNull()
     expect(screen.queryByRole('button', { name: /^Stop$/i })).toBeNull()
+    // The relocated control is scoped by the same per-chat predicate, so it must be absent here
+    // too — an unscoped one would hand a sibling a working Stop for a build it never started,
+    // which is the exact defect this guard was written for.
+    expect(screen.queryByTestId('stop-turn')).toBeNull()
+    // Liveness: the sibling chat did render, so the two absences above are absences and not a
+    // crashed tree.
+    expect(composer()).toBeTruthy()
   })
 
   it('CC4: a reattached turn resubscribes ONCE on a truncation, then gives up honestly', async () => {
@@ -714,7 +731,26 @@ describe('the send-failure catch splits on whether the turn was accepted (N8)', 
     await waitFor(() => expect(screen.getByText(/could not be sent/i)).toBeTruthy())
     // The server persisted NOTHING, so the optimistic user bubble rolls back too — the
     // transcript must agree with the database (N8).
-    expect(screen.queryByText('build me a thing')).toBeNull()
+    //
+    // SCOPED TO THE TRANSCRIPT, because the composer legitimately still holds the same words and
+    // an unscoped `queryByText` matches the textarea too. That is not a detail of the assertion:
+    // the two halves are the whole contract, and a test that could not tell them apart is how the
+    // defect below survived.
+    //
+    // `waitFor`, NOT a bare assertion. The banner and the rollback are two state updates and the
+    // banner is the one this test waits on; under a loaded runner the rollback's commit can land
+    // a tick later. A bare read here passed alone and failed in the full suite, which is the
+    // definition of a flake rather than a finding.
+    await waitFor(() =>
+      expect(within(screen.getByTestId('thread-messages')).queryByText('build me a thing')).toBeNull(),
+    )
+
+    // AND THE CITIZEN STILL HAS THEIR MESSAGE. This is the assertion the suite was missing, and
+    // without it a P0 shipped: `onSent` used to fire before `startTurn` was attempted, so the
+    // composer's send promise had already resolved by the time the refusal arrived. It emptied
+    // itself, the later `onAbort` rejected a settled promise and did nothing, and the text and any
+    // staged files were gone — on the 429-over-the-daily-cap path above all others.
+    expect(composer().value).toBe('build me a thing')
   })
 
   it('a subscribe failure AFTER the 202 keeps the user bubble and says reload, not resend', async () => {
@@ -732,5 +768,127 @@ describe('the send-failure catch splits on whether the turn was accepted (N8)', 
     // appears to invite a duplicate resend of a turn the server is already running.
     expect(screen.getByText('build me a thing')).toBeTruthy()
     expect(screen.queryByText(/could not be sent/i)).toBeNull()
+  })
+})
+
+/**
+ * THE SEND PROMISE IS THE CONTRACT, and these are the paths that broke it.
+ *
+ * `Composer.doSend` empties the box when `onSubmit` RESOLVES and keeps everything when it REJECTS.
+ * That is the whole of R58/R59 — there is no optimistic clear and no restore path. So every way out
+ * of the send has to settle the promise, and settle it the right way. Three did not:
+ *
+ *   - `onSent` fired before `startTurn` was attempted, so a refusal arrived at an already-resolved
+ *     promise. The composer had emptied; the later `onAbort` did nothing. On a CONTINUING thread it
+ *     fired on no network call whatsoever, which is every message after the first;
+ *   - the double-Enter guard RETURNED, and a return is a resolve — so the second press emptied the
+ *     composer while the first send was still in flight;
+ *   - a bail-out taken after the reader had moved on settled nothing at all, so `handleSubmit`'s
+ *     `finally` never ran, `sendingRef` kept naming that chat, and every later press there matched
+ *     the stale guard and returned as though it had sent.
+ */
+describe('a refused send leaves the citizen holding their message', () => {
+  /** A conversation that already has a turn in it — so the next send is NOT the first. */
+  const continuing = () => ({
+    id: 'build-X',
+    kind: 'build',
+    messages: [
+      { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'a visitor app' }] },
+      { id: 'm1', role: 'assistant', seq: 1, parts: [{ type: 'text', text: 'Here you go.' }] },
+    ],
+  })
+
+  it('keeps the text when startTurn refuses the SECOND message in a thread', async () => {
+    // THE PATH THE P0 ACTUALLY TOOK. The first message goes through `createBuild`, which at least
+    // had a network call behind its premature release; every message after it released the
+    // composer on nothing at all.
+    h.getBuild.mockResolvedValue(continuing())
+    h.startTurn.mockRejectedValue(new Error('429 over the daily cap'))
+    renderAt('build-X', deps().deps)
+    await waitForGateOpen()
+
+    type('and add a search box')
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+
+    await waitFor(() => expect(screen.getByText(/could not be sent/i)).toBeTruthy())
+    expect(composer().value).toBe('and add a search box')
+    // The optimistic bubble still rolls back — the server persisted nothing.
+    await waitFor(() =>
+      expect(within(screen.getByTestId('thread-messages')).queryByText('and add a search box')).toBeNull(),
+    )
+  })
+
+  it('empties the composer once the server has ACCEPTED, not before', async () => {
+    // The other half: the fix must not hold the text hostage to the whole reply. A 202 means the
+    // message is persisted and the turn runs detached, so that is the moment the box may clear —
+    // well before any of the reply has streamed.
+    h.getBuild.mockResolvedValue(continuing())
+    h.readTurnStream.mockImplementation(() => new Promise(() => {})) // accepted, and still streaming
+    renderAt('build-X', deps().deps)
+    await waitForGateOpen()
+
+    type('and add a search box')
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+
+    await waitFor(() => expect(composer().value).toBe(''))
+    expect(h.startTurn).toHaveBeenCalled()
+  })
+
+  it('a double-Enter in one tick does not empty the composer for the press it swallowed', async () => {
+    // The second keydown lands in the SAME tick, so it hits the dedup guard. That guard used to
+    // return — and a return resolves — so it cleared the box while the first send was still in
+    // flight. If that first send then failed, the message it was holding was already gone.
+    h.getBuild.mockResolvedValue(continuing())
+    let releaseStart
+    h.startTurn.mockImplementation(() => new Promise((resolve) => { releaseStart = resolve }))
+    renderAt('build-X', deps().deps)
+    await waitForGateOpen()
+
+    type('do not lose this')
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+
+    // `waitFor` because the send awaits the attachment build before it reaches the wire — both
+    // keydowns land first, which is the whole point of the guard being synchronous.
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalledTimes(1))
+    // The swallowed press said nothing and cleared nothing.
+    expect(composer().value).toBe('do not lose this')
+    expect(screen.queryByText(/did not send/i)).toBeNull()
+
+    releaseStart()
+    await waitFor(() => expect(composer().value).toBe(''))
+  })
+
+  it('a refusal after the reader has moved on still frees that chat’s Send', async () => {
+    // The wedge. Nothing settled the promise on this path, so `handleSubmit`'s `finally` never ran
+    // and `sendingRef` went on naming this chat forever — every later press there matched the
+    // stale double-Enter guard and returned as though it had sent, silently, for the session.
+    h.getBuild.mockResolvedValue(continuing())
+    h.startTurn.mockRejectedValueOnce(new Error('refused at the door'))
+    const { deps: d } = deps()
+    const { rerender } = renderAt('build-X', d)
+    await waitForGateOpen()
+
+    type('first attempt')
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+    // Away and back while the refusal is in flight.
+    rerender(
+      <MemoryRouter initialEntries={['/x']}>
+        <ConversationSurface chatId="build-Y" projectId="p1" projectName="VIP Movement" buildSessionDeps={d} />
+      </MemoryRouter>,
+    )
+    rerender(
+      <MemoryRouter initialEntries={['/x']}>
+        <ConversationSurface chatId="build-X" projectId="p1" projectName="VIP Movement" buildSessionDeps={d} />
+      </MemoryRouter>,
+    )
+    await waitForGateOpen()
+
+    h.startTurn.mockResolvedValue(undefined)
+    type('second attempt')
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+
+    // It actually sent. Before the fix this press matched the stale guard and vanished.
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalledTimes(2))
   })
 })

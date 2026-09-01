@@ -70,9 +70,10 @@ async function pickSelect(triggerTestId: string, optionText: string) {
 afterEach(cleanup)
 beforeEach(() => {
   h.listMarketplace.mockReset()
-  // jsdom doesn't implement these; Radix's <Select> calls them on open/scroll (suite-wide
-  // convention, see UsersLimitsPanel/BuilderPage test files — vitest.config.js has no
-  // setupFiles, so the shim lives per-file).
+  // jsdom doesn't implement these; Radix's <Select> calls them on open/scroll. `src/test-setup.ts`
+  // now defines all four globally, so these four lines are redundant rather than load-bearing —
+  // kept only because sweeping the per-file stubs out is its own mechanical change, deliberately
+  // not folded into the commit that added `setupFiles`.
   Element.prototype.scrollIntoView = vi.fn()
   Element.prototype.hasPointerCapture = vi.fn().mockReturnValue(false)
   Element.prototype.releasePointerCapture = vi.fn()

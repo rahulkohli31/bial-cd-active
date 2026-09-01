@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest'
+import type { ReactElement } from 'react'
 import { render, cleanup, screen } from '@testing-library/react'
-import TurnBanner from '../TurnBanner'
+import TurnBanner, { withMailtoLinks } from '../TurnBanner'
 
 afterEach(cleanup)
 
@@ -92,5 +93,28 @@ describe('an address in a platform sentence', () => {
     expect(screen.getByTestId('turn-banner').textContent).toBe(plain)
     // LIVENESS: the linkifier really did run over this text and chose to add nothing.
     expect(screen.queryByRole('link')).toBeNull()
+  })
+})
+
+// The linkifier's own cases, moved here with the function (Plan D U17). They lived in
+// `BuildProgress.test.tsx`, which pinned a card this unit deleted; a relocated function keeps its
+// tests, or the move quietly costs the coverage. The two above assert the banner USES it — these
+// two assert what it does, which the surface-level pair cannot reach with a single address.
+describe('withMailtoLinks', () => {
+  it('linkifies every address in the sentence and never swallows a trailing full stop', () => {
+    // A `mailto:` that carries the sentence's final "." into the mailbox name bounces, and the
+    // citizen has no way to tell why.
+    const nodes = withMailtoLinks('Write to a@b.com or c@d.co.uk.')
+    const hrefs = nodes
+      .filter((n): n is ReactElement<{ href: string }> => typeof n !== 'string')
+      .map((n) => n.props.href)
+    expect(hrefs).toEqual(['mailto:a@b.com', 'mailto:c@d.co.uk'])
+    // The prose either side survives — a linkifier that returned ONLY the matches would pass
+    // every assertion above and lose the entire message.
+    expect(nodes.filter((n) => typeof n === 'string').join('')).toBe('Write to  or .')
+  })
+
+  it('leaves a sentence with no address exactly as it was', () => {
+    expect(withMailtoLinks('Nothing to link here.')).toEqual(['Nothing to link here.'])
   })
 })

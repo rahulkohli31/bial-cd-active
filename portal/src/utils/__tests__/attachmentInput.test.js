@@ -3,51 +3,25 @@ import {
   validateAttachmentFiles,
   validateConversationAttachmentCap,
   resolveMediaType,
-  officeFormat,
   textAttachmentBytes,
   fileToBase64,
   toAttachmentRef,
   ACCEPT_ATTR,
-  ALLOWED_MEDIA_TYPES,
-  LEGACY_DOC_REJECT_MSG,
-  LEGACY_PPT_REJECT_MSG,
-  PPTX_MEDIA_TYPE,
-  WORD_MEDIA_TYPE,
-  EXCEL_MEDIA_TYPE,
   MAX_FILE_SIZE,
   MAX_TEXT_FILE_SIZE,
   MAX_TEXT_BYTES_PER_CONVERSATION,
   MAX_FILES_PER_MESSAGE,
   MAX_ATTACHMENTS_PER_CONVERSATION,
 } from '../attachmentInput'
-// NOT mocked here, deliberately — see the shipped-default block at the bottom.
-import { DECK_ATTACHMENTS_ENABLED } from '../../config/features'
 
 // validateAttachmentFiles only reads name/type/size, so plain objects suffice
 // (and let us set an arbitrary size without allocating megabytes).
 const file = (name, type, size = 1024) => ({ name, type, size })
 
 describe('validateAttachmentFiles', () => {
-  it('accepts a .docx and .xlsx (even with an empty/generic MIME) via the resolved Office type', () => {
-    expect(validateAttachmentFiles([file('plan.docx', '')], 0)).toEqual({ ok: true })
-    expect(validateAttachmentFiles([file('data.xlsx', 'application/octet-stream')], 0)).toEqual({ ok: true })
-    expect(validateAttachmentFiles([file('report.docx', WORD_MEDIA_TYPE)], 0)).toEqual({ ok: true })
-  })
 
-  it('still rejects a legacy .doc with a clear "save as .docx" message', () => {
-    expect(validateAttachmentFiles([file('legacy.doc', 'application/msword')], 0)).toEqual({ error: LEGACY_DOC_REJECT_MSG })
-    expect(validateAttachmentFiles([file('old.doc', '')], 0)).toEqual({ error: LEGACY_DOC_REJECT_MSG })
-  })
 
-  it('accepts a real .docx even when the OS mislabels it as application/msword (extension wins)', () => {
-    expect(validateAttachmentFiles([file('plan.docx', 'application/msword')], 0)).toEqual({ ok: true })
-    expect(validateAttachmentFiles([file('data.xlsx', 'application/msword')], 0)).toEqual({ ok: true })
-  })
 
-  it('rejects a .docx/.xlsx over the 4 MB binary cap', () => {
-    expect(validateAttachmentFiles([file('big.docx', WORD_MEDIA_TYPE, MAX_FILE_SIZE + 1)], 0).error).toMatch(/4 MB/)
-    expect(validateAttachmentFiles([file('big.xlsx', '', MAX_FILE_SIZE + 1)], 0).error).toMatch(/4 MB/)
-  })
 
   it('rejects a genuinely unsupported type with a generic message', () => {
     const res = validateAttachmentFiles([file('clip.mp3', 'audio/mpeg')], 0)
@@ -131,10 +105,6 @@ describe('resolveMediaType', () => {
     expect(resolveMediaType(file('notes.txt', ''))).toBe('text/plain')
   })
 
-  it('canonicalizes .docx/.xlsx by extension when the browser MIME is blank/generic', () => {
-    expect(resolveMediaType(file('plan.docx', ''))).toBe(WORD_MEDIA_TYPE)
-    expect(resolveMediaType(file('Q1.XLSX', 'application/octet-stream'))).toBe(EXCEL_MEDIA_TYPE)
-  })
 
   it('falls through to file.type for non-text extensions', () => {
     expect(resolveMediaType(file('a.png', 'image/png'))).toBe('image/png')
@@ -142,47 +112,18 @@ describe('resolveMediaType', () => {
   })
 })
 
-describe('officeFormat', () => {
-  it('maps the Office media types to word/excel and nothing else', () => {
-    expect(officeFormat(WORD_MEDIA_TYPE)).toBe('word')
-    expect(officeFormat(EXCEL_MEDIA_TYPE)).toBe('excel')
-    expect(officeFormat('application/pdf')).toBeNull()
-    expect(officeFormat('text/csv')).toBeNull()
-  })
-})
+// `officeFormat` and the two deck suites are GONE, along with the media types they described
+// (R46). Their inertness is asserted in `attachmentInput-deck-disabled.test.js`, which stopped
+// mocking the flag when the flag stopped existing — a removal's tests become guards, not gaps.
 
 describe('ACCEPT_ATTR', () => {
-  it('carries the text + Office MIME types AND .csv/.txt/.docx/.xlsx extension tokens for the OS picker', () => {
+  it('offers the text types and their extension tokens, and nothing needing conversion', () => {
     expect(ACCEPT_ATTR).toContain('text/csv')
     expect(ACCEPT_ATTR).toContain('text/plain')
     expect(ACCEPT_ATTR).toContain('.csv')
     expect(ACCEPT_ATTR).toContain('.txt')
-    expect(ACCEPT_ATTR).toContain(WORD_MEDIA_TYPE)
-    expect(ACCEPT_ATTR).toContain(EXCEL_MEDIA_TYPE)
-    expect(ACCEPT_ATTR).toContain('.docx')
-    expect(ACCEPT_ATTR).toContain('.xlsx')
-  })
-})
-
-// These two hold in BOTH flag states, so they belong in the unmocked file. The
-// per-state behaviour lives in attachmentInput-deck.test.js (ON) and
-// attachmentInput-deck-disabled.test.js (OFF); the shipped default itself is
-// pinned at the bottom of this file, against the real flag.
-describe('deck (.pptx) — flag-independent behavior', () => {
-  it('resolveMediaType canonicalizes .pptx by extension even with empty/generic MIME', () => {
-    expect(resolveMediaType(file('q3.pptx', ''))).toBe(PPTX_MEDIA_TYPE)
-    expect(resolveMediaType(file('DECK.PPTX', 'application/octet-stream'))).toBe(PPTX_MEDIA_TYPE)
-    expect(resolveMediaType(file('zip.pptx', 'application/zip'))).toBe(PPTX_MEDIA_TYPE)
-  })
-
-  it('treats a real .pptx the OS mislabels as application/vnd.ms-powerpoint by extension (never as legacy .ppt)', () => {
-    // Extension wins over the ms-powerpoint mislabel, so it is NEVER the legacy
-    // .ppt rejection. True in both flag states, for two different reasons: with decks
-    // ON the branch's own `!/\.pptx$/` guard excludes it, and with decks OFF the branch
-    // does not run at all. Either way this file gets the generic message, never advice
-    // to convert a file it already is.
-    const res = validateAttachmentFiles([file('real.pptx', 'application/vnd.ms-powerpoint')], 0)
-    expect(res.error || '').not.toBe(LEGACY_PPT_REJECT_MSG)
+    expect(ACCEPT_ATTR).toContain('application/pdf')
+    expect(ACCEPT_ATTR).toContain('image/png')
   })
 })
 
@@ -221,37 +162,10 @@ describe('fileToBase64', () => {
   })
 })
 
-// THE SHIPPED DEFAULT, asserted against the real flag rather than a mocked one.
+// THE SHIPPED DEFAULT block is gone with the flag it pinned (R46).
 //
-// This block exists because #157 B2 turned the deck feature off and NOTHING went red.
-// Both deck spec files `vi.mock('../../config/features')`, so between them they cover
-// the two hypothetical worlds and neither says which one we ship — flipping
-// DECK_ATTACHMENTS_ENABLED back to `true` failed zero tests. A mocked module cannot
-// pin a shipped default; only an unmocked import can, which is why this file imports
-// it directly and why these assertions live here rather than beside their siblings.
-describe('the deck feature is OFF in the shipped build', () => {
-  it('ships with DECK_ATTACHMENTS_ENABLED false', () => {
-    // Half of "turn decks on" (#157 B2). The other half is a reachable GOTENBERG_URL
-    // server-side; flipping this alone re-offers a capability the server refuses.
-    expect(DECK_ATTACHMENTS_ENABLED).toBe(false)
-  })
-
-  it('offers .pptx nowhere in the real allowlist or the real OS picker', () => {
-    expect(ALLOWED_MEDIA_TYPES).not.toContain(PPTX_MEDIA_TYPE)
-    expect(ACCEPT_ATTR).not.toContain('.pptx')
-    expect(ACCEPT_ATTR).not.toContain(PPTX_MEDIA_TYPE)
-  })
-
-  it('THE DEAD END: a rejected .ppt is never told to save as .pptx', () => {
-    // The bug this pins: "save as .pptx and re-upload" is only followable while .pptx
-    // is in the allowlist above. With decks off, a user who followed it was rejected a
-    // SECOND time and told nothing new. The generic message is the honest one — it
-    // names what IS accepted, so there is a next step.
-    const res = validateAttachmentFiles([file('deck.ppt', 'application/vnd.ms-powerpoint')], 0)
-    expect(res.error).not.toBe(LEGACY_PPT_REJECT_MSG)
-    expect(res.error).not.toMatch(/save as \.pptx/i)
-    expect(res.error).toMatch(/isn't supported/)
-    // ...and the generic copy must not advertise the feature that is off.
-    expect(res.error).not.toMatch(/powerpoint/i)
-  })
-})
+// It existed because #157 B2 turned the deck feature off and nothing went red: both deck spec
+// files mocked `config/features`, so between them they covered two hypothetical worlds and
+// neither said which one we shipped. There is no flag to pin now — presentations, spreadsheets and
+// documents are refused outright — and the inertness guard that replaces this lives in
+// `attachmentInput-deck-disabled.test.js`, which stopped mocking when the flag stopped existing.

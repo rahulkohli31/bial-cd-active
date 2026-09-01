@@ -26,7 +26,7 @@
 import { act, fireEvent, screen, render, waitFor } from '@testing-library/react'
 import { expect } from 'vitest'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
-import BuilderPage from '../BuilderPage'
+import ConversationSurface from '../../components/chat/ConversationSurface'
 // THE REAL SHELL, not a stub, and both helpers below mount the page THROUGH it as a layout route.
 // After the extraction the surface is an outlet child rather than a root: it renders no page frame
 // and no navbar, and — from U4 — no pane of its own. A harness that kept mounting it bare would
@@ -240,13 +240,13 @@ export async function send(text = 'a visitor app') {
  */
 export async function sendAndConfirm(text = 'a visitor app') {
   await send(text)
-  const build = await screen.findByRole('button', { name: /^Build it$/ })
+  const build = await screen.findByRole('button', { name: /^Build this plan$/ })
   fireEvent.click(build)
   return build
 }
 
 /** Wait until a plan-options card's Build-it is on screen (without confirming it). */
-export const findPlanCard = () => screen.findByRole('button', { name: /^Build it$/ })
+export const findPlanCard = () => screen.findByRole('button', { name: /^Build this plan$/ })
 
 /**
  * Annotated because TypeScript suites use this harness too (`*.test.tsx`), and without it TS
@@ -266,7 +266,7 @@ export function renderBuilder({ deps, projectId = 'p1', hasSavedBuild = null, in
     <MemoryRouter initialEntries={initialEntries}>
       <Routes>
         <Route element={<WorkspaceShell />}>
-          <Route path="/chat/:chatId" element={<BuilderPage projectId={projectId} projectName="VIP Movement" projectHasSavedBuild={hasSavedBuild} buildSessionDeps={deps} />} />
+          <Route path="/chat/:chatId" element={<ConversationSurface projectId={projectId} projectName="VIP Movement" projectHasSavedBuild={hasSavedBuild} buildSessionDeps={deps} />} />
         </Route>
         <Route path="/projects" element={<div>projects index</div>} />
         <Route path="/projects/:pid" element={<div>project page</div>} />
@@ -335,7 +335,7 @@ export function renderBuilderAt({
           <Route
             path="/chat/:chatId"
             element={
-              <BuilderPage
+              <ConversationSurface
                 chatId={at.chatId}
                 projectId={at.projectId}
                 projectName={at.projectName}

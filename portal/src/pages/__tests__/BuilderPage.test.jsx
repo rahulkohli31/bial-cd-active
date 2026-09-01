@@ -55,7 +55,7 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
   resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
 
-import BuilderPage from '../BuilderPage'
+import ConversationSurface from '../../components/chat/ConversationSurface'
 
 /** The project page the breadcrumb links back to — echoes its :pid so the route is assertable. */
 function ProjectPageStub() {
@@ -71,7 +71,7 @@ function renderBuilder({ chatId = 'thread-1', projectId = 'p1', projectName = 'V
       <Routes>
         <Route
           path="/chat/:chatId"
-          element={<BuilderPage projectId={projectId} projectName={projectName} buildSessionDeps={deps} />}
+          element={<ConversationSurface projectId={projectId} projectName={projectName} buildSessionDeps={deps} />}
         />
         <Route path="/projects/:pid" element={<ProjectPageStub />} />
       </Routes>
@@ -89,11 +89,7 @@ async function sendFrom(c, text = 'a visitor app') {
 /** The whole user path to a build: send a turn, get the brief card, click Build it. */
 async function buildFrom(c, text = 'a visitor app') {
   sendFrom(c, text)
-  fireEvent.click(await within(c).findByRole('button', { name: /^Build it$/ }))
-}
-async function lastCard(c) {
-  const cards = await within(c).findAllByTestId('plan-options-card')
-  return cards[cards.length - 1]
+  fireEvent.click(await within(c).findByRole('button', { name: /^Build this plan$/ }))
 }
 // BroadcastChannel delivery is queued on a task: a new manager posts `poll`, the holder answers
 // `announce`, and only then does the newcomer's `blockedBy` see the claim. Drain a few ticks.
@@ -171,7 +167,7 @@ describe('U8 regression guard — builds/refreshBuilds survive the dropdown remo
     // cross-tab claim and shows the live narrative.
     const a = renderBuilder({ chatId: 'build-A' })
     await buildFrom(a.container)
-    await within(a.container).findByTestId('build-progress')
+    await within(a.container).findByTestId('stop-turn')
 
     // Tab B (same project) learns of the claim over the channel, then tries to build.
     const b = renderBuilder({ chatId: 'build-B' })
@@ -180,8 +176,11 @@ describe('U8 regression guard — builds/refreshBuilds survive the dropdown remo
     await buildFrom(b.container, 'add a table')
 
     // buildBlockedMessage READ `builds` to name the holder — proving builds/refreshBuilds were kept.
-    const card = await lastCard(b.container)
-    const alert = await within(card).findByRole('alert')
+    // RE-POINTED (Plan D U17): the refusal used to render inside the plan card, one per card id.
+    // There is one offer on the composer now, so the sentence goes to the surface's assertive
+    // slot instead — which is also where every other interrupting refusal lands, so a citizen has
+    // one place to look rather than one per control.
+    const alert = await within(b.container).findByTestId('urgent-banner')
     expect(alert.textContent).toMatch(/already building this project/i)
     expect(alert.textContent).toMatch(/First build/) // named the holder, not "another build chat"
     // B never started its own build — only A's transition fired.

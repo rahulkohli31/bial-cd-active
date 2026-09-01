@@ -1,12 +1,18 @@
 /**
- * Turn frames → the envelope shape `BuildProgress` already renders (U5).
+ * Turn frames → the C7 envelope shape, plus what the surface asks ABOUT a turn (U5, Plan D U17).
  *
- * A build is a Write turn now, so its narrative arrives as `step` / `diagnostic` / `quota`
- * turn frames instead of C7 progress envelopes. ADAPTING rather than rewriting is deliberate:
- * `BuildProgress` is the one place that knows how a build should read to a citizen — the
- * dedupe, the hidden-step policy, the elapsed-time reassurance, the Details expander — and a
- * second renderer fed by the new frames would be a second answer to all of that, free to
- * drift. One component, one story, two sources that agree by construction.
+ * A build is a Write turn now, so its narrative arrives as `step` / `diagnostic` / `quota` turn
+ * frames instead of C7 progress envelopes. ADAPTING rather than rewriting is deliberate: the two
+ * transports must never tell different stories about what a build looks like, and one mapping is
+ * how they agree by construction rather than by discipline.
+ *
+ * THE ENVELOPES NOW HAVE ONE READER, NOT TWO. `BuildProgress` — the pinned card that used to draw
+ * them — is gone, and the transcript draws activity from the message parts themselves (Plan D's
+ * `ActivityGroup`). What still needs the envelope shape is the legacy build-session feed and the
+ * two questions the surface asks of a turn: what phase it is in (`turnPhase`, for the app pane)
+ * and whether today's budget is spent (`atLimitSendState`, for the composer). Both moved here when
+ * their old home was deleted, and both belong here for the same reason: envelopes are this
+ * module's vocabulary, and neither the pane nor the composer should have to learn it.
  *
  * The mapping is small because the two vocabularies already describe the same thing. The one
  * place they genuinely differ is `diagnostic` → `error`: on the turn stream a diagnostic is
@@ -104,36 +110,48 @@ export function narrativeEnvelopes(narrative: TurnNarrative): FeedEnvelope[] {
 }
 
 /**
- * The phase a Write turn is in, in the status vocabulary `BuildProgress` reads.
+ * The phase this turn is in, in the status vocabulary the app pane reads.
  *
- * `null` — not a build turn at all, so the bubble stays out of the way. The ordering below is
- * the honest one: an unavailable workspace is terminal for this turn no matter what else
+ * `null` — nothing to say about the app, so the pane keeps whatever it already had. The ordering
+ * below is the honest one: an unavailable workspace is terminal for this turn no matter what else
  * arrived, and a live preview outranks "still provisioning" because the user can SEE it.
  *
- * `isBuild` has to be told to us, because the frames no longer say. This used to read the
- * workspace frame as the build's own signature — only Write attached a container, so only
- * Write emitted one. Ask and Plan read the same live container now (U5b) and emit the same
- * frame, so inferring from it announced "Building your app…" over a question about a heading,
- * and left an empty build bubble behind every answer.
+ * ══ `narrativeStatus`'s `isBuild` IS GONE, AND THE FRAMES ANSWER INSTEAD ══
+ *
+ * This used to be TOLD, by its caller, whether the turn was a build — because the surface knew the
+ * chat's kind and the frames did not. There is ONE surface now and it consults no kind anywhere
+ * (R72), so a parameter whose only honest source is "what sort of chat is this?" has no caller
+ * left. It also arrived as the literal `true` at the one site that passed it, which made the
+ * read-turn arm below unreachable in the shipped product.
+ *
+ * The frames already carry the distinction. A turn that WORKED ON THE APP emits steps, or a
+ * preview, or a diagnostic about one; a turn that only answered a question attaches the same live
+ * container (U5b) and emits nothing else. So the question is read off the narrative, and the two
+ * arms are the same two arms as before — reached by evidence rather than by declaration.
  */
-export function narrativeStatus(
+export function turnPhase(
   narrative: TurnNarrative,
   {
     running,
     terminal,
-    isBuild,
   }: {
     running: boolean
     terminal: 'completed' | 'failed' | 'stopped' | null
-    isBuild: boolean
   }
 ): BuildSessionStatus | null {
   if (narrative.workspace === null) return null
   if (narrative.workspace.state === 'unavailable') return 'failed'
-  if (!isBuild) {
+  // DID THIS TURN TOUCH THE APP? Generous on purpose — every one of these is a frame only a turn
+  // doing app work emits, and under-reading it would leave the pane uncovered over a real build,
+  // which is the louder wrong of the two. A question about a heading produces none of them.
+  const touchedTheApp =
+    Object.keys(narrative.steps).length > 0 ||
+    narrative.diagnostics.length > 0 ||
+    narrative.preview.url !== null ||
+    narrative.preview.state !== null
+  if (!touchedTheApp) {
     // A read turn has exactly one thing worth narrating: the 30-60s wait for its container,
-    // while it is still happening. Everything after it belongs to the answer, not to a
-    // build's progress bubble.
+    // while it is still happening. Everything after it belongs to the answer.
     return running && narrative.workspace.state === 'preparing' ? 'provisioning' : null
   }
   if (terminal === 'failed' || terminal === 'stopped') return 'failed'
@@ -141,4 +159,66 @@ export function narrativeStatus(
   if (!running) return null
   if (narrative.preview.state === 'ready') return 'ready'
   return narrative.workspace.state === 'preparing' ? 'provisioning' : 'building'
+}
+
+/** What the composer's SEND control does while the citizen is out of budget. */
+export interface AtLimitSendState {
+  /** Always true — the value exists so the call site reads as what it sets, not as a bare flag. */
+  disabled: true
+  /** The `title`, naming when sending starts working again. A control that will not act and does
+   *  not say why is the single most frustrating state a UI can be in: it looks broken, and the
+   *  reader has no way to tell whether waiting would help. */
+  title: string
+}
+
+/**
+ * The SEND control's state while today's budget is spent — `null` when it is not.
+ *
+ * RE-HOMED FROM `BuildProgress.tsx`, which U17 deleted. It came HERE rather than to the composer
+ * because it reads FEED ENVELOPES, which is this module's vocabulary and nothing a composer should
+ * have to know about: the surface asks the question and hands the composer a finished sentence.
+ *
+ * THE COMPOSER ITSELF STAYS ENABLED, and that is the whole reason this describes the send control
+ * rather than the composer. A citizen who is refused mid-thought has usually just typed something
+ * they want to keep; disabling the textarea takes their draft hostage until midnight, and (KTD-3)
+ * `disabled` on a focused element blurs it to `document.body`, dropping keyboard focus out of the
+ * page entirely. They can still select, copy and paste their draft somewhere safe — they simply
+ * cannot spend budget they do not have.
+ */
+export function atLimitSendState(envelopes: FeedEnvelope[]): AtLimitSendState | null {
+  // NEWEST WINS, by seq rather than by array order. A reconnect replays the stream and a resumed
+  // subscriber receives frames out of order; picking the last ARRIVED envelope would hand back a
+  // stale reset time from a replayed frame.
+  const quota = bySeq(envelopes).filter(
+    (env): env is QuotaExceededEvent => env.type === 'quota_exceeded',
+  )
+  const newest = quota.length > 0 ? quota[quota.length - 1] : null
+  if (!newest) return null
+  const when = formatResetTime(newest.resets_at)
+  return {
+    disabled: true,
+    title: when ? `You can send again after ${when}` : 'You can send again after midnight',
+  }
+}
+
+/**
+ * `resets_at` as a time a person can read, or `null` when it is not a usable instant.
+ *
+ * FALLS BACK RATHER THAN THROWING. The field is a wire value, and an unparseable one has already
+ * reached a renderer in the existing tests — `new Date('x').toLocaleTimeString()` renders the
+ * literal string "Invalid Date" into the citizen's banner, which is worse than saying nothing
+ * specific at all. The caller's fallback ("after midnight") is true regardless of the wire value,
+ * because the reset IS the next IST midnight.
+ */
+export function formatResetTime(isoUtc: string): string | null {
+  const at = new Date(isoUtc)
+  if (Number.isNaN(at.getTime())) return null
+  return at.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+}
+
+/** Dedup by `seq` (last-wins) and order by `seq` — C3 §4.2's replay property, kept. */
+function bySeq(envelopes: FeedEnvelope[]): FeedEnvelope[] {
+  const latest = new Map<number, FeedEnvelope>()
+  for (const env of envelopes) latest.set(env.seq, env)
+  return [...latest.values()].sort((a, b) => a.seq - b.seq)
 }

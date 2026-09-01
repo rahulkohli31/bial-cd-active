@@ -67,10 +67,12 @@ function renderShell(child: ReactNode) {
  * EVERY SURFACE THE SHELL FRAMES, by path. The shell's two routes (`App.tsx`) plus the components
  * they render inside its outlet column. A new in-shell surface belongs on this list.
  */
+// The two chat PAGES are gone (Plan D U17) and one surface replaces them, so the list follows the
+// tree rather than being left naming files that no longer exist — a guard whose inventory has
+// rotted reads the same as a guard that passes.
 const IN_SHELL_SURFACES = [
   'pages/ChatRoute.tsx',
-  'pages/ChatPage.tsx',
-  'pages/BuilderPage.tsx',
+  'components/chat/ConversationSurface.tsx',
   'pages/ProjectPage.tsx',
   'components/workspace/ConversationSlot.tsx',
   'components/workspace/AppPaneHost.tsx',

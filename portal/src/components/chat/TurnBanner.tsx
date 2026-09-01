@@ -32,7 +32,51 @@
  * relaunch, a failed save), and spending it here would make those stop cutting through. The
  * region is permanent and only its text changes, for the reason the render comment gives.
  */
-import { withMailtoLinks } from './BuildProgress'
+import type { ReactElement } from 'react'
+
+/** An email address, stopping before a trailing full stop — or the `mailto:` would carry the
+ *  sentence's punctuation into the mailbox name. */
+const AN_EMAIL_ADDRESS = /[^\s<>@]+@[^\s<>@.]+(?:\.[^\s<>@.]+)+/g
+
+/**
+ * The sentence with its support address turned into a real `mailto:` link.
+ *
+ * RE-HOMED FROM `BuildProgress.tsx` (Plan D U17 deleted it) TO ITS ONE REMAINING READER. It was
+ * exported from there because the at-limit row and this banner rendered the same server sentence;
+ * the row is gone with the card, so this slot is the only DOM the sentence reaches and there is
+ * nothing left to share it with.
+ *
+ * THE ADDRESS ARRIVES AS TEXT, and that is a division of labour rather than an oversight. The
+ * server owns the words, and a `mailto:` URI spelled out mid-sentence is precisely the register
+ * `services/turns/copy.py` exists to keep out. Making it clickable is a rendering concern, so it
+ * happens where there is a DOM to click.
+ *
+ * Returns an array of React nodes, never a string of markup: the sentence is server copy today,
+ * but a renderer that interprets its input as HTML is one configuration change away from being an
+ * injection sink, and there is nothing here that needs the risk.
+ */
+export function withMailtoLinks(text: string): (string | ReactElement)[] {
+  const out: (string | ReactElement)[] = []
+  let cursor = 0
+  // `matchAll` starts a fresh iteration each call — the regex is module-level and `g`-flagged, so
+  // reusing `exec` across calls would carry `lastIndex` between renders and drop links at random.
+  for (const match of text.matchAll(AN_EMAIL_ADDRESS)) {
+    const at = match.index
+    if (at > cursor) out.push(text.slice(cursor, at))
+    out.push(
+      <a
+        key={`${at}-${match[0]}`}
+        href={`mailto:${match[0]}`}
+        className="font-semibold underline underline-offset-2"
+      >
+        {match[0]}
+      </a>,
+    )
+    cursor = at + match[0].length
+  }
+  if (cursor < text.length) out.push(text.slice(cursor))
+  return out
+}
 
 interface TurnBannerProps {
   /** The sentence to show, or `null` for nothing. One value: newest wins by construction. */

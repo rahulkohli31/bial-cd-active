@@ -10,14 +10,13 @@
  * busy workspace, 503 unconfigured), so `buildFromPlan` THROWS and the card re-arms with the
  * server's own message. There is no `build_failed` outcome left to return.
  *
- * The REAL useBuildSession hook + LivePreview + BuildProgress run; only the C3 transport (client +
- * EventSource, still reachable through the legacy reattach path) and the U10 turn transport are
- * mocks.
+ * The REAL useBuildSession hook + LivePreview run; only the C3 transport (client + EventSource,
+ * still reachable through the legacy reattach path) and the U10 turn transport are mocks.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, cleanup, within } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
-import BuilderPage from '../BuilderPage'
+import ConversationSurface from '../../components/chat/ConversationSurface'
 import {
   FakeEventSource, PREVIEW_URL, makeClient, primeClient, renderBuilder, statusResp,
   PLAN_CARD_ID, planReply, primeTurn, turnStreaming, send, T_DELTA,
@@ -114,7 +113,7 @@ function primeHandoff(liveChatId = LIVE_CHAT_ID, turnId = BUILD_TURN_ID) {
  */
 async function sendPrompt(text = 'build me a tool') {
   await send(text)
-  fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
+  fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
   await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
 }
 
@@ -190,15 +189,23 @@ describe('BuilderPage — the build-turn flow (ORIG-§3-d/f)', () => {
     )
 
     await turn.frame(T_STEP('Scaffolding your app…'), T_STEP('Installing dependencies', { id: 'call-2', seq: 3 }))
-    // The rows are actually in the DOM (not just props) — no remount needed. Only the MOST
-    // RECENT step is visible live — it replaces the previous one in the same spot rather
-    // than both accumulating.
-    // SCOPED TO THE VISIBLE ROW (U17): the sr-only live region carries a second, deliberately
-    // PACED copy of the label, so both queries have to name which of the two they mean. The
-    // property under test — one row, replaced in place — is about the one a person looks at.
-    const liveRow = within(await screen.findByTestId('build-activity'))
-    expect(await liveRow.findByText(/Installing dependencies/i)).toBeTruthy()
-    expect(liveRow.queryByText(/Scaffolding your app/i)).toBeNull()
+    // FLIPPED, AND THE FLIP IS THE FEATURE (Plan D U6). This used to assert that only the MOST
+    // RECENT step was visible — the card showed one row and replaced it in place, so a build that
+    // did nine things showed one at a time and kept none. The activity group KEEPS them and
+    // collapses them to a count, which is what makes "what did it actually do?" answerable after
+    // the fact instead of only in the second it happened.
+    const group = await screen.findByTestId('activity-group')
+    // WHILE IT RUNS the trigger names what is happening NOW — the same one-line-at-a-time reading
+    // the old card gave. What changed is underneath: BOTH steps are held, one glyph each, and the
+    // reader can open the group and see them. The old card kept only the newest.
+    await waitFor(() => expect(group.textContent).toMatch(/Installing dependencies/i))
+    expect(within(group).getByTestId('activity-glyphs').children).toHaveLength(2)
+    // Collapsed by default, so the earlier label is not on screen yet…
+    expect(screen.queryByTestId('activity-group-rows')).toBeNull()
+    fireEvent.click(within(group).getByTestId('activity-group-trigger'))
+    // …and opening it shows both, which is the half the old card could not do.
+    const rows = within(await screen.findByTestId('activity-group-rows'))
+    expect(rows.getByText(/Scaffolding your app/i)).toBeTruthy()
 
     await turn.frame(T_PREVIEW())
     await waitFor(() => expect(document.querySelector('iframe')?.getAttribute('src')).toBe(PREVIEW_URL))
@@ -232,7 +239,10 @@ describe('BuilderPage — the build-turn flow (ORIG-§3-d/f)', () => {
     // ONE working indicator, ONE way to interrupt it: a build has no separate stop any more, so
     // this is the same `stopTurn` an ordinary reply uses, addressed by the live chat + turn id —
     // the chat the page is actually ON after the handoff, not the one Build-it was pressed in.
-    fireEvent.click(screen.getByRole('button', { name: /^stop$/i }))
+    // Addressed by test id: `stop-turn` is the RELOCATED control on the composer (R55, Plan D
+    // U3). The build card's own Stop is still mounted beside it for now and does the same thing;
+    // this is the one that survives the card's deletion.
+    fireEvent.click(screen.getByTestId('stop-turn'))
     await waitFor(() => expect(h.stopTurn).toHaveBeenCalledWith(LIVE_CHAT_ID, BUILD_TURN_ID))
     expect(h.stop).not.toHaveBeenCalled() // never the C3 session stop
 
@@ -278,32 +288,38 @@ describe('BuilderPage — the build-turn flow (ORIG-§3-d/f)', () => {
     await awaitBuildTurn()
 
     await turn.frame(T_STEP('Scaffolding your app…'), T_DIAGNOSTIC('Type error in app/page.tsx'))
-    // Retry framing in citizen language — never the terminal red block ("the turn is not
-    // failing — a repair run follows" is what the wire says).
-    expect(await screen.findByText(/trying another way/i)).toBeTruthy()
-    expect(document.querySelector('[data-kind="retry"]')).toBeTruthy()
-    expect(document.querySelector('[data-kind="error"]')).toBeNull()
-    // U16 — FLIPPED. This used to require the compiler's own title to render exactly once. The
-    // title is built FOR THE MODEL (it is the first meaningful line of a `tsc` diagnostic), so
-    // rendering it at all was the developer surface U16 removes. The retry row now carries the
-    // platform's sentence plus a next action; the title still rides on the frame, unrendered.
-    // This assertion is the END-TO-END half — server frame → parse → narrative → render — that
-    // BuildProgress's own unit tests cannot reach.
-    expect(document.querySelector('[data-kind="retry"] pre')).toBeNull()
-    expect(screen.queryAllByText(/Type error in app\/page\.tsx/i)).toHaveLength(0)
-    // Liveness, so the absence above is an absence and not a row that failed to render: this
-    // frame carries no citizen-facing pair (the fixture predates it), so the feed's committed
-    // fallback is what a citizen reads — both halves of it.
-    expect(screen.getByText(/We hit a problem finishing that change\./i)).toBeTruthy()
-    expect(
-      screen.getByText(/Try describing what you want again, or ask for something simpler\./i),
-    ).toBeTruthy()
 
-    // The repair succeeds and the turn completes: no residual failure presentation.
+    // RE-POINTED, AND THE NARRATIVE MOVED RATHER THAN GOING AWAY (Plan D U17). The deleted card
+    // drew a diagnostic as its own amber "trying another way" block that VANISHED at the terminal;
+    // it is a failed row inside the activity group now, so the group's own label carries it — and
+    // a citizen reading a build that has already finished can still see it hit something, which
+    // the vanishing block could never tell them.
+    const group = await screen.findByTestId('activity-group')
+    // ONE FAILED GLYPH, and the group is still RUNNING — which is the whole "not a failure" point.
+    // The count-and-problems label is what a SEALED group says; a running one names what is
+    // happening now, so the diagnostic shows here as a glyph rather than as a red block.
+    // SCOPED TO THE GLYPH STRIP, not the group: once the group is expanded each row carries its
+    // own sr-only "failed" too, so an unscoped count answers 2 for one problem.
+    const glyphs = () => within(within(screen.getByTestId('activity-group')).getByTestId('activity-glyphs'))
+    await waitFor(() => expect(glyphs().getAllByText(/^failed$/i).length).toBe(1))
+
+    // U16's rule, unchanged and now enforced one layer earlier: the compiler's own title is built
+    // FOR THE MODEL and never reaches the screen. It is not merely unrendered — `convertPart`
+    // never copies it into a part, so there is nothing in the DOM to leak.
+    expect(screen.queryAllByText(/Type error in app\/page\.tsx/i)).toHaveLength(0)
+    expect(group.querySelector('pre')).toBeNull()
+
+    // Liveness for those two absences: the citizen-facing half DID render, inside the group.
+    fireEvent.click(within(group).getByTestId('activity-group-trigger'))
+    const rows = within(await screen.findByTestId('activity-group-rows'))
+    expect(rows.getByText(/We hit a problem finishing that change\./i)).toBeTruthy()
+
+    // The repair succeeds and the turn completes. The problem STAYS on the record — that is the
+    // deliberate difference from the old card, which erased its own retry block at the terminal
+    // and left a finished build looking as though nothing had gone wrong.
     await turn.frame(T_BUILD_END())
     await turn.end()
-    await waitFor(() => expect(document.querySelector('[data-kind="retry"]')).toBeNull())
-    expect(document.querySelector('[data-kind="error"]')).toBeNull()
+    expect(glyphs().getAllByText(/^failed$/i).length).toBe(1)
   })
 
   it('U4 mirror: repair exhausted → turn_ended(failed) — the retry framing does NOT persist beside the terminal', async () => {
@@ -313,13 +329,20 @@ describe('BuilderPage — the build-turn flow (ORIG-§3-d/f)', () => {
     await awaitBuildTurn()
 
     await turn.frame(T_DIAGNOSTIC('Type error in app/page.tsx'))
-    expect(await screen.findByText(/trying another way/i)).toBeTruthy()
+    const group = await screen.findByTestId('activity-group')
+    const glyphs = () => within(within(screen.getByTestId('activity-group')).getByTestId('activity-glyphs'))
+    await waitFor(() => expect(glyphs().getAllByText(/^failed$/i).length).toBe(1))
+    void group
 
     await turn.frame(T_BUILD_END({ status: 'failed' }))
     await turn.end()
-    // Exactly one failure presentation is visible at the terminal (the outcome's), so the
-    // now-false "trying another way" must be gone.
+    // FLIPPED, AND THE FLIP IS THE POINT. The old card had TWO failure presentations at a failed
+    // terminal — its own amber retry block and the outcome — so one had to be withdrawn to stop
+    // them contradicting each other. There is one now: the group's count is the record of what
+    // happened, and it is still true after the turn failed. What must NOT appear beside it is a
+    // second, separate failure block.
     await waitFor(() => expect(screen.queryByText(/trying another way/i)).toBeNull())
+    expect(glyphs().getAllByText(/^failed$/i).length).toBe(1)
   })
 
   it('a quota breach ends gracefully and shows the daily-limit banner (C7 §8)', async () => {
@@ -332,7 +355,19 @@ describe('BuilderPage — the build-turn flow (ORIG-§3-d/f)', () => {
     // enough that the client formats the numbers itself rather than parsing a sentence.
     await turn.frame(T_QUOTA(), T_BUILD_END({ status: 'failed', reason: 'quota_exceeded' }))
     await turn.end()
-    await waitFor(() => expect(screen.getAllByText(/resets at midnight IST/i).length).toBeGreaterThan(0))
+    // RE-POINTED AT THE CONTROL THAT ACTUALLY WAITS (U24, Plan D U17). "Resets at midnight IST"
+    // was the deleted card's own row. The cap is a fact about SENDING, so it is stated where
+    // sending happens: the composer's gate note names the moment it works again, and Send carries
+    // the same sentence in its accessible name.
+    await waitFor(() =>
+      expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/you can send again after/i),
+    )
+    expect(
+      screen.getByRole('button', { name: /Send message — You can send again after/i }),
+    ).toBeTruthy()
+    // …and the composer is NOT disabled by it (R45/R64): a citizen refused mid-thought keeps the
+    // text they typed, and can select and copy it out.
+    expect(screen.getByTestId('composer-input').hasAttribute('disabled')).toBe(false)
     // getAllBy — see the announcement note above.
     expect(screen.getAllByText(/no longer running/i).length).toBeGreaterThan(0) // graceful terminal
   })
@@ -350,7 +385,7 @@ describe('BuilderPage — the transition\'s refusals are typed HTTP statuses now
     await sendPrompt()
 
     expect(await screen.findByText(/another build is already running/i)).toBeTruthy()
-    expect(screen.getByRole('button', { name: /^Build it$/ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /^Build this plan$/ })).toBeTruthy()
     expect(document.querySelector('iframe')).toBeNull() // nothing framed for this chat
     // No turn was subscribed to: the refusal happened before anything started.
     expect(h.readTurnStream).not.toHaveBeenCalledWith(expect.objectContaining({ turnId: BUILD_TURN_ID }))
@@ -412,7 +447,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     // round-trip (`buildStarting`), pinned separately in `BuilderPage-composer.test.jsx`.
     fireEvent.change(textarea, { target: { value: 'make it dark mode' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
-    expect(await screen.findByText(/send unlocks when the current reply finishes/i)).toBeTruthy()
+    expect(await screen.findByText(/send unlocks when it’s done/i)).toBeTruthy()
     expect(h.startTurn).not.toHaveBeenCalled()
     expect(h.stop).not.toHaveBeenCalled()
     expect(h.buildFromPlan).not.toHaveBeenCalled()
@@ -421,7 +456,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     // There is also no second Build-it to click while the build runs: the card that started it
     // is resolved. So the "build over a still-live session" hazard the stop-then-start dance
     // existed for (finding #19) is now unreachable from this chat, not merely handled.
-    expect(screen.queryByRole('button', { name: /^Build it$/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: /^Build this plan$/ })).toBeNull()
   })
 
   it('the composer RE-OPENS at the terminal, and the send is then a CHAT turn (the routing rule)', async () => {
@@ -469,8 +504,10 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     await sendPrompt('first build')
     await awaitBuildTurn()
     // LIVENESS FIRST: the page is genuinely on the live build, not merely missing the retired
-    // control because it rendered nothing.
-    expect(screen.getByTestId('build-progress')).toBeTruthy()
+    // control because it rendered nothing. RE-POINTED at the composer's stop (Plan D U17): the
+    // card that used to answer "is a build running here?" is deleted, and the stop control is the
+    // element whose presence now means exactly that.
+    expect(screen.getByTestId('stop-turn')).toBeTruthy()
     expect(screen.queryByRole('button', { name: /^Mode:/ })).toBeNull()
 
     // A row with a stray legacy `mode` — if a re-read were reintroduced, this is what it would see.
@@ -541,15 +578,17 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     // it (KTD-4) — `ModeSwitcher` and the axis it drove are BOTH gone (U1/U19), so there is no
     // pill left to freeze, mid-build reload or otherwise.
     expect(screen.queryByRole('button', { name: /^Mode:/ })).toBeNull()
-    // …and the transcript stops lying in the past tense: the live bubble supersedes the anchor.
+    // …and the transcript stops lying in the past tense: the past-tense anchor row is gone. It is
+    // no longer SUPERSEDED by a live bubble — `build_in_progress` maps to no rendered part at all
+    // now (see `convertMessage`), so the sentence cannot appear whether a build is live or not.
     expect(document.querySelector('[data-kind="build-in-progress"]')).toBeNull()
-    expect(screen.getByTestId('build-progress')).toBeTruthy()
+    expect(screen.getByTestId('stop-turn')).toBeTruthy()
 
     // Enforced, not merely rendered — the textarea is not disabled at all, so `handleSend` is the
     // only thing standing between Enter and a turn the server would refuse.
     fireEvent.change(textarea, { target: { value: 'while you are at it, add a chart' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
-    expect(await screen.findByText(/send unlocks when it finishes/i)).toBeTruthy()
+    expect((await screen.findByTestId('composer-gate-note')).textContent).toMatch(/building your app/i)
     expect(h.startTurn).not.toHaveBeenCalled()
     // …and the typed text SURVIVES the refusal, which is the point of keeping the box live.
     expect(textarea.value).toBe('while you are at it, add a chart')
@@ -566,7 +605,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     const turn = scriptedBuild()
     renderBuilder({ deps: deps().deps })
     await send('a visitor app')
-    fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
 
     const textarea = screen.getByPlaceholderText(/describe what you need/i)
     await waitFor(() => expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/send unlocks/i))
@@ -574,7 +613,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     h.startTurn.mockClear()
     fireEvent.change(textarea, { target: { value: 'and make it dark' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
-    expect(await screen.findByText(/send unlocks when it finishes/i)).toBeTruthy()
+    expect((await screen.findByTestId('composer-gate-note')).textContent).toMatch(/building your app/i)
     expect(h.startTurn).not.toHaveBeenCalled() // refused OUT LOUD, never silently dropped
 
     // The gate then hands over to the live build turn without ever re-opening in between.
@@ -607,19 +646,19 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     scriptedBuild()
     const { rerender } = render(
       <MemoryRouter initialEntries={['/x']}>
-        <Routes>{inWorkspace(<Route path="*" element=<BuilderPage chatId="chat-A" projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} /> />)}</Routes>
+        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId="chat-A" projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} /> />)}</Routes>
       </MemoryRouter>,
     )
     await screen.findByPlaceholderText(/describe what you need/i)
     await send('build A')
-    fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
     await waitFor(() =>
       expect(h.buildFromPlan).toHaveBeenCalledWith('chat-A', PLAN_CARD_ID, expect.any(String)),
     )
 
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <BuilderPage chatId={CHAT_A_LIVE} projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} />
+        <ConversationSurface chatId={CHAT_A_LIVE} projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} />
       </MemoryRouter>,
     )
     await awaitBuildTurn(BUILD_TURN_ID, CHAT_A_LIVE)
@@ -630,7 +669,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     h.readTurnStream.mockImplementation(turnStreaming(planReply('A sibling plan.', 'opt-S')))
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <Routes>{inWorkspace(<Route path="*" element=<BuilderPage chatId="chat-B" projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} /> />)}</Routes>
+        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId="chat-B" projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} /> />)}</Routes>
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
@@ -670,24 +709,24 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     const turn = scriptedBuild()
     const { rerender } = render(
       <MemoryRouter initialEntries={['/x']}>
-        <Routes>{inWorkspace(<Route path="*" element=<BuilderPage chatId="chat-A" projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} /> />)}</Routes>
+        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId="chat-A" projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} /> />)}</Routes>
       </MemoryRouter>,
     )
     // Build + frame a preview in project A.
     const ta = await screen.findByPlaceholderText(/describe what you need/i)
     fireEvent.change(ta, { target: { value: 'build A' } })
     fireEvent.keyDown(ta, { key: 'Enter' })
-    fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
     await waitFor(() =>
       expect(h.buildFromPlan).toHaveBeenCalledWith('chat-A', PLAN_CARD_ID, expect.any(String)),
     )
     // `inWorkspace`, like every other mount in this test: the app pane is a SIBLING of the
-    // router outlet now, so a bare `<BuilderPage>` has no host to frame the preview into and
+    // router outlet now, so a bare `<ConversationSurface>` has no host to frame the preview into and
     // the iframe assertion below would fail for a reason that has nothing to do with the
     // teardown this test is about.
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <Routes>{inWorkspace(<Route path="*" element=<BuilderPage chatId={CHAT_A_LIVE} projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} /> />)}</Routes>
+        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId={CHAT_A_LIVE} projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} /> />)}</Routes>
       </MemoryRouter>,
     )
     await awaitBuildTurn(BUILD_TURN_ID, CHAT_A_LIVE)
@@ -700,7 +739,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     h.readTurnStream.mockImplementation(turnStreaming(planReply('Build B, please.', 'opt-B')))
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <Routes>{inWorkspace(<Route path="*" element=<BuilderPage chatId="chat-B" projectId="pB" projectName="Project B" buildSessionDeps={sessionDeps} /> />)}</Routes>
+        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId="chat-B" projectId="pB" projectName="Project B" buildSessionDeps={sessionDeps} /> />)}</Routes>
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
@@ -711,12 +750,12 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     const tb = await screen.findByPlaceholderText(/describe what you need/i)
     fireEvent.change(tb, { target: { value: 'build B' } })
     fireEvent.keyDown(tb, { key: 'Enter' })
-    fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
     // The refusal is surfaced ON the card, where the click was — and the card re-arms as a retry,
     // so B can build once A is over instead of dead-ending on a plan.
     expect(await screen.findByText(/running in another project/i)).toBeTruthy()
     expect(h.stop).not.toHaveBeenCalled() // A's live build is untouched
-    const retry = screen.getByRole('button', { name: /^Build it$/ })
+    const retry = screen.getByRole('button', { name: /^Build this plan$/ })
     expect(retry.disabled).toBe(false)
   })
 })
@@ -811,7 +850,7 @@ describe('a failed mode switch says what actually failed (N12) — RETIRED, now 
     await awaitBuildTurn()
 
     // LIVENESS: genuinely on the live build, not merely missing a control on a blank page.
-    expect(screen.getByTestId('build-progress')).toBeTruthy()
+    expect(screen.getByTestId('stop-turn')).toBeTruthy()
     expect(screen.queryByRole('button', { name: /^Mode: /i })).toBeNull()
     fireEvent.keyDown(document, { code: 'KeyP', altKey: true })
     expect(screen.queryByRole('menuitemradio')).toBeNull()
@@ -859,25 +898,38 @@ describe('a read turn reads the live container without becoming a build (2026-07
     }
   }
 
-  it('narrates the container wait FIRST, and only THEN claims to be building (rewritten for U1)', async () => {
-    // Was: "…then never claims to be building" — a claim about a page state (`isBuild: false`)
-    // this page cannot produce any more. What survives is the ORDER: the wait is narrated
-    // honestly before anything else (never silent for 30-60s), and the SAME live bubble only
-    // moves to "Building your app…" once the container reports ready, never before.
+  it('says a reply is coming for the whole container wait, with no phase headline (rewritten for U6)', async () => {
+    // REWRITTEN A SECOND TIME, and the change is deliberate rather than incidental. The previous
+    // version asserted an ORDER between two phase headlines — "Setting up your sandbox" then
+    // "Building your app…" — drawn by the progress card. R35 removes that whole register: no
+    // headline, no elapsed timer, no "step 3 of 9", because the screen should read as an app
+    // being built rather than as an agent being watched.
+    //
+    // WHAT IT MUST STILL DO IS NOT GO SILENT, and that claim survives verbatim. The composer says
+    // a reply is on its way for the entire 30-60 second wait, and it keeps saying it after the
+    // container reports ready — which is the property the two-headline sequence was really about.
     h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
     const turn = scriptReadTurn()
     renderBuilder({ deps: deps().deps })
     await send('What is the heading text on the page right now? One line.')
 
-    const bubble = await screen.findByTestId('build-bubble')
-    expect(within(bubble).getByText(/Setting up your sandbox/i)).toBeTruthy()
-    expect(within(bubble).queryByText(/Building your app/i)).toBeNull() // not yet — still preparing
+    await waitFor(() =>
+      expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/send unlocks when it’s done/i),
+    )
+    // …and it is stoppable for all of it, which the wait's own headline never made it.
+    expect(screen.getByTestId('stop-turn')).toBeTruthy()
+    // NO PHASE NARRATION IN THE CHAT — scoped to the panel, because the APP PANE still narrates
+    // the workspace phase and should: that is a cover over the app being prepared, which is where
+    // a phase belongs. What R35 removes is the second, competing copy inside the conversation.
+    const chat = within(screen.getByTestId('chat-panel'))
+    expect(chat.queryByText(/Setting up your sandbox/i)).toBeNull()
+    expect(chat.queryByText(/Building your app…/i)).toBeNull()
 
-    // LIVENESS: the headline text itself moves — proof the page reacted to the frame rather than
-    // having frozen on the first one.
     await turn.frame(T_WORKSPACE('ready', 2))
-    await waitFor(() => expect(screen.getByTestId('build-progress').textContent).toMatch(/Building your app/i))
-    expect(screen.queryByText(/Setting up your sandbox/i)).toBeNull()
+    // The container coming up changes nothing a citizen reads in the conversation: the reply is
+    // still coming, and that is still the only thing the chat says about it.
+    expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/send unlocks when it’s done/i)
+    expect(chat.queryByText(/Setting up your sandbox/i)).toBeNull()
   })
 
   // Both terminals, because the reported symptom was the FAILED one: the `turn_ended` frame is
@@ -891,7 +943,7 @@ describe('a read turn reads the live container without becoming a build (2026-07
       const turn = scriptReadTurn()
       renderBuilder({ deps: deps().deps })
       await send('What is the heading text on the page right now? One line.')
-      await screen.findByTestId('build-bubble')
+      await screen.findByTestId('stop-turn')
 
       await turn.frame(
         T_WORKSPACE('ready', 2),
@@ -901,16 +953,19 @@ describe('a read turn reads the live container without becoming a build (2026-07
       await turn.end()
 
       expect(await screen.findByText(/Gate Cleaning Log — T1/)).toBeTruthy()
-      // The answer IS the whole reply. The bubble that used to sit under it held nothing but an
-      // avatar and three canned suggestions about an app nobody had described.
+      // The answer IS the whole reply. AN INERTNESS GUARD now (L8): the bubble that used to sit
+      // under it — an avatar wrapped around nothing — cannot appear for any turn state, because
+      // there is no such element. Paired with the liveness assertion above, so this cannot pass
+      // against a transcript that rendered nothing at all.
       expect(screen.queryByTestId('build-bubble')).toBeNull()
+      expect(screen.queryByTestId('activity-group')).toBeNull() // a read turn ran no tools
     })
   }
 })
 
 // The other half of the same emptiness rule, on the side it was written for: a WRITE turn whose
-// container never came up is terminal with no steps and no headline, so BuildProgress renders
-// nothing — and the wrapper used to render around that nothing.
+// container never came up is terminal with no steps and no headline, so the transcript has no
+// activity to draw — and the wrapper used to render around that nothing.
 describe('a build that dies before its first step shows no empty bubble (2026-07-30)', () => {
   it('renders the failure, not an empty assistant bubble', async () => {
     const turn = scriptedBuild({ opening: [T_WORKSPACE('unavailable', 1, 'The workspace service is not available right now.')] })
@@ -921,6 +976,8 @@ describe('a build that dies before its first step shows no empty bubble (2026-07
     await turn.end('failed')
 
     await waitFor(() => expect(screen.queryByTestId('build-bubble')).toBeNull())
+    // LIVENESS for that absence: the surface is alive and the composer is back.
+    expect(screen.getByTestId('composer-input')).toBeTruthy()
   })
 })
 
@@ -949,8 +1006,9 @@ describe('what the platform says about the workspace itself (U2)', () => {
     await send('Add a column for the gate number.')
     // Wait for the turn to be genuinely under way: `resetTurnNarrative` clears the banner at the
     // start of every turn, so a notice framed before that lands would be wiped by the setup
-    // rather than by anything this test is about.
-    await screen.findByTestId('build-bubble')
+    // rather than by anything this test is about. RE-POINTED at the composer's stop, which is the
+    // element whose presence means "a turn is running here" now.
+    await screen.findByTestId('stop-turn')
 
     await turn.frame(T_WORKSPACE('preparing', 2, null, 'Your workspace had been reset, so we are putting your app back.'))
 
@@ -974,7 +1032,7 @@ describe('what the platform says about the workspace itself (U2)', () => {
     const turn = scriptReadTurn()
     renderBuilder({ deps: deps().deps })
     await send('Add a column for the gate number.')
-    await screen.findByTestId('build-bubble')
+    await screen.findByTestId('stop-turn')
 
     expect(screen.queryByTestId('turn-banner')).toBeNull()
 
@@ -983,9 +1041,16 @@ describe('what the platform says about the workspace itself (U2)', () => {
 
     await turn.frame(T_WORKSPACE('ready', 3))
 
-    // LIVENESS: the headline moves from the preparing wait to the building claim.
-    await waitFor(() => expect(screen.getByTestId('build-progress').textContent).toMatch(/Building your app/i))
-    // …and the notice survives the ordinary `ready` tick untouched — neither posted anew nor wiped.
+    // LIVENESS, AND IT HAD TO CHANGE SHAPE. The old proof that the page reacted to the `ready`
+    // frame was a phase headline moving; there is none in the chat any more (R35), and a READ turn
+    // produces no pane cover either — `turnPhase` reads the frames, and a turn that has touched
+    // nothing has nothing to say about the app. So the liveness is that the surface is still
+    // running this turn at all, which a component that had thrown could not be.
+    expect(screen.getByTestId('stop-turn')).toBeTruthy()
+    // THE CLAIM ITSELF, and it is the sharp one: the `ready` frame carries the ordinary lifecycle
+    // MESSAGE ("Getting your workspace ready…"), and routing that to the banner would post phase
+    // narration above the composer on every turn anyone ever sends. Only a `notice` reaches it.
     expect(screen.getByTestId('turn-banner').textContent).toMatch(/could not check/i)
+    expect(screen.getByTestId('turn-banner').textContent).not.toMatch(/getting your workspace ready/i)
   })
 })

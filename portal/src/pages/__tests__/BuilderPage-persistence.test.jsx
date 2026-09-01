@@ -53,7 +53,7 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
   resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
 
-import BuilderPage from '../BuilderPage'
+import ConversationSurface from '../../components/chat/ConversationSurface'
 
 function renderBuilder(chatId = 'build-X') {
   const fake = new FakeEventSource(chatId)
@@ -61,7 +61,7 @@ function renderBuilder(chatId = 'build-X') {
   const view = render(
     <MemoryRouter initialEntries={[`/chat/${chatId}?projectId=p1&kind=build`]}>
       <Routes>
-        <Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="VIP Movement" buildSessionDeps={deps} />} />
+        <Route path="/chat/:chatId" element={<ConversationSurface projectId="p1" projectName="VIP Movement" buildSessionDeps={deps} />} />
         <Route path="/projects/:projectId" element={<div>project home</div>} />
         <Route path="/projects" element={<div>projects index</div>} />
       </Routes>
@@ -80,7 +80,7 @@ async function startBuild(text = 'make it blue') {
   const textarea = await screen.findByPlaceholderText(/describe what you need/i)
   fireEvent.change(textarea, { target: { value: text } })
   fireEvent.keyDown(textarea, { key: 'Enter' })
-  fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
+  fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
   await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
 }
 
@@ -147,7 +147,7 @@ describe('BuilderPage — the attachment user-turn is persisted before the build
     // The turn never reaches the server, so no plan comes back and there is nothing to
     // confirm — the file-less build is unreachable rather than merely un-triggered.
     expect(h.startTurn).not.toHaveBeenCalled()
-    expect(screen.queryByRole('button', { name: /^Build it$/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: /^Build this plan$/ })).toBeNull()
     expect(h.buildFromPlan).not.toHaveBeenCalled() // no build ignoring the file
   })
 })

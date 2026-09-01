@@ -59,7 +59,7 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
   resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
 
-import BuilderPage from '../BuilderPage'
+import ConversationSurface from '../../components/chat/ConversationSurface'
 
 const QUESTIONS = 'Which terminals should this cover, and who approves a visitor?'
 
@@ -71,7 +71,7 @@ function renderThread({ state, chatId = 'thread-1' } = {}) {
       <Routes>
         <Route
           path="/chat/:chatId"
-          element={<BuilderPage projectId="p1" projectName="VIP Movement" buildSessionDeps={deps} />}
+          element={<ConversationSurface projectId="p1" projectName="VIP Movement" buildSessionDeps={deps} />}
         />
       </Routes>
     </MemoryRouter>,
@@ -123,8 +123,8 @@ describe('the routing rule — a send is a chat turn, never a build', () => {
     // The plan text is a normal assistant bubble (no fence, no hidden markup)…
     expect(await screen.findByText(new RegExp(BRIEF.slice(0, 30)))).toBeTruthy()
     // …with the actionable card.
-    const build = await screen.findByRole('button', { name: /^Build it$/ })
-    expect(screen.getByRole('button', { name: /keep refining/i })).toBeTruthy()
+    const build = await screen.findByRole('button', { name: /^Build this plan$/ })
+    expect(screen.getByRole('button', { name: /keep planning/i })).toBeTruthy()
     expect(h.buildFromPlan).not.toHaveBeenCalled()
 
     fireEvent.click(build)
@@ -141,7 +141,7 @@ describe('the routing rule — a send is a chat turn, never a build', () => {
     await send('something vague')
 
     expect(await screen.findByText(new RegExp(QUESTIONS.slice(0, 25)))).toBeTruthy()
-    expect(screen.queryByRole('button', { name: /^Build it$/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: /^Build this plan$/ })).toBeNull()
     expect(h.buildFromPlan).not.toHaveBeenCalled()
   })
 })
@@ -160,13 +160,18 @@ describe('a restored thread re-renders every card from its STORED state', () => 
     })
     renderThread()
 
-    const cards = await screen.findAllByTestId('plan-options-card')
-    expect(cards).toHaveLength(2)
-    expect(within(cards[0]).queryByRole('button')).toBeNull() // expired — informational only
-    expect(within(cards[0]).getByText(/newer plan supersedes/i)).toBeTruthy()
-    expect(within(cards[1]).getByRole('button', { name: /^Build it$/ })).toBeTruthy()
+    // FLIPPED (Plan D U16/U17). Two stored offers used to render as two cards in the transcript,
+    // the older one drawn "expired" and informational. There is ONE control now and it lives on
+    // the composer, so the newest offer is the only one on screen — which is a stronger form of
+    // the same rule ("only the newest is actionable"): an expired card is a dead button a reader
+    // can still see and try, and this is none.
+    const cards = await screen.findAllByTestId('offer-strip')
+    expect(cards).toHaveLength(1)
+    expect(screen.queryByText(/newer plan supersedes/i)).toBeNull()
+    expect(within(cards[0]).getByRole('button', { name: /^Build this plan$/ })).toBeTruthy()
 
-    fireEvent.click(within(cards[1]).getByRole('button', { name: /^Build it$/ }))
+    // …and it is the NEWEST offer's tool call it answers, not the older one's.
+    fireEvent.click(within(cards[0]).getByRole('button', { name: /^Build this plan$/ }))
     await waitFor(() =>
       expect(h.buildFromPlan).toHaveBeenCalledWith('thread-1', 'opt-new', MINTED_BUILD_CHAT_ID),
     )
@@ -183,9 +188,19 @@ describe('a restored thread re-renders every card from its STORED state', () => 
     })
     renderThread()
 
-    expect(await screen.findByText(/you kept refining this plan/i)).toBeTruthy()
-    expect(screen.getByText(/build started from this plan/i)).toBeTruthy()
-    expect(screen.queryByRole('button', { name: /^Build it$/ })).toBeNull()
+    // FLIPPED (D2, Plan D U16). Settled cards used to render settled COPY and lose their buttons.
+    // A spent strip stays and stays PRESSABLE now — pressing it again is an ordinary request that
+    // creates another Build chat — so what marks it is `data-spent`, not the removal of the
+    // control. That is the deliberate change: "only one offer is live" is about which one blocks
+    // the composer, never about which one a citizen is allowed to press.
+    const strip = await screen.findByTestId('offer-strip')
+    expect(strip.getAttribute('data-spent')).toBe('true')
+    expect(within(strip).getByRole('button', { name: /^Build this plan$/ })).toBeTruthy()
+    // The retired settled copy is gone with the card that carried it.
+    expect(screen.queryByText(/you kept refining this plan/i)).toBeNull()
+    expect(screen.queryByText(/build started from this plan/i)).toBeNull()
+    // …and a spent offer does NOT block the composer: Send is free.
+    expect(screen.queryByTestId('composer-gate-note')).toBeNull()
   })
 
   it('an inertness guard: a stored build_failed record never re-arms with the failure named — the state and its re-arm copy are both gone', async () => {
@@ -194,30 +209,35 @@ describe('a restored thread re-renders every card from its STORED state', () => 
     // is already running") and let the citizen retry from the SAME card. Neither half of that
     // survives U12: `build_failed` and its `reason` field are gone from `PlanOptionsItem`
     // (turnStreamApi.ts), because Build-it now fails inside the one handoff call that would
-    // have produced this outcome — there is nothing left to persist, and PlanOptionsCard.tsx's
-    // own docblock says why: "a press that fails records nothing — the card was never spent,
-    // and there is nothing to un-spend. A failure is said once, in the error line below the
-    // buttons, by the caller that actually saw it."
+    // have produced this outcome — there is nothing left to persist. The deleted card's own
+    // docblock said why: "a press that fails records nothing — the card was never spent, and
+    // there is nothing to un-spend. A failure is said once, in the error line below the buttons,
+    // by the caller that actually saw it."
     //
-    // What's left to pin, from a row a pre-migration project might still carry: PlanOptionsCard
-    // does not recognise `build_failed` as one of its three states, so it falls through to its
-    // default branch with `actionable` false — the card still renders (this is the liveness half
-    // of the guard; a crash would leave nothing to query) but BOTH buttons stay permanently
-    // disabled, never the special re-arm this test used to require.
+    // What's left to pin, from a row a pre-migration project might still carry: `build_failed` is
+    // not one of the offer's recognised states, so the strip renders SPENT — it still draws (this
+    // is the liveness half of the guard; a crash would leave nothing to query) but it offers no
+    // re-arm, which is what this test used to require.
     h.getBuild.mockResolvedValue({
       id: 'thread-1',
       messages: [storedCard(1, 'opt-f', 'build_failed')],
     })
     renderThread()
 
-    const card = await screen.findByTestId('plan-options-card')
-    // Liveness: the card rendered its ordinary shell, not a blank tree.
-    expect(within(card).getByText(/ready to build this plan/i)).toBeTruthy()
+    const card = await screen.findByTestId('offer-strip')
+    // Liveness: the strip rendered its ordinary shell, not a blank tree.
+    expect(within(card).getByRole('button', { name: /^Build this plan$/ })).toBeTruthy()
     // The retired failure-named copy is gone…
     expect(screen.queryByText(/another build is already running/i)).toBeNull()
-    // …and the card is NOT armed — nothing on it can be clicked.
-    expect(within(card).getByRole('button', { name: /^Build it$/ }).disabled).toBe(true)
-    expect(within(card).getByRole('button', { name: /keep refining/i }).disabled).toBe(true)
+    // …and so is the shell copy the card used to carry around its buttons.
+    expect(screen.queryByText(/ready to build this plan/i)).toBeNull()
+    // NOTHING IS EVER `disabled` HERE (R45/R64), which is the assertion that had to change rather
+    // than the behaviour it guards. The old card rendered a real `disabled` for an unrecognised
+    // state; a real `disabled` on a focused control blurs it to `document.body`, and this surface
+    // does not ship one anywhere. An unrecognised stored state simply is not `pending`, so the
+    // strip renders SPENT — pressable, and not blocking the composer.
+    expect(card.getAttribute('data-spent')).toBe('true')
+    expect(card.querySelector('[disabled]')).toBeNull()
   })
 })
 
@@ -246,7 +266,7 @@ describe('a used card cannot re-fire', () => {
     )
     renderThread()
     await send('a visitor app')
-    fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
 
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledTimes(1))
     expect(h.buildFromPlan).toHaveBeenCalledWith('thread-1', PLAN_CARD_ID, MINTED_BUILD_CHAT_ID)
@@ -255,7 +275,7 @@ describe('a used card cannot re-fire', () => {
     expect(await screen.findByText('NEW BUILD CHAT TRANSCRIPT')).toBeTruthy()
     // …which is why a second press from the same card is not merely refused — the card and the
     // thread it was on are gone.
-    expect(screen.queryByRole('button', { name: /^Build it$/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: /^Build this plan$/ })).toBeNull()
   })
 })
 
@@ -281,21 +301,21 @@ describe('the reload half of the build narrative (U15)', () => {
     h.getStatus.mockRejectedValue(new ApiError('Build session not found.', 404))
     const { container } = renderThread()
 
-    // The stored step renders through the same collapsed StepHistoryCollapsible the live
-    // bubble uses post-build — the same story, told once opened.
-    const trigger = await waitFor(() => {
-      const btn = container.querySelector('[data-kind="step-group"] button[aria-expanded]')
-      if (!btn) throw new Error('trigger not yet rendered')
-      return btn
-    })
-    fireEvent.click(trigger)
+    // The stored step renders through the SAME activity group the live path uses (AE43) — one
+    // converter, one renderer, so a build read back looks like the build watched.
+    fireEvent.click(await screen.findByTestId('activity-group-trigger'))
     const step = await screen.findByText('Updated app/page.tsx')
-    expect(step.closest('[data-kind="step"]')?.getAttribute('data-state')).toBe('ok')
+    expect(step.closest('[data-state]')?.getAttribute('data-state')).toBe('ok')
     expect(h.getStatus).toHaveBeenCalledWith('gone-1') // it DID try to rejoin
     // Nothing live re-tells this build, so the durable truth line renders instead of a dead
     // spinner — and no toast, because a vanished session is expected, not an error.
+    //
+    // IT IS PROSE IN THE TRANSCRIPT NOW, not a `data-kind` row. `build_in_progress` maps to no
+    // rendered part, so the surface turns an unsuperseded anchor into the sentence itself — the
+    // alternative was the row vanishing entirely and a citizen finding a transcript that simply
+    // stops with no account of the build they started.
     await waitFor(() =>
-      expect(container.querySelector('[data-kind="build-in-progress"]')?.textContent).toMatch(
+      expect(container.textContent).toMatch(
         /a build was running here/i,
       ),
     )
@@ -315,22 +335,25 @@ describe('the reload half of the build narrative (U15)', () => {
         { id: 's5', role: 'assistant', seq: 5, parts: [{ type: 'step', step: { tool: 'write_file', label: 'Step five', state: 'ok' } }] },
       ],
     })
-    const { container } = renderThread()
+    renderThread()
 
-    const groups = await waitFor(() => {
-      const found = container.querySelectorAll('[data-kind="step-group"]')
-      if (found.length === 0) throw new Error('groups not yet rendered')
-      return found
-    })
-    // A real chat message interrupts the run — two SEPARATE groups, not one merged group.
+    // RE-POINTED AT THE ACTIVITY GROUP, and the claim is unchanged: a real chat message
+    // interrupts the run, so this is TWO groups rather than one merged one. It is the assertion
+    // that keeps the merge honest — a rule that swept every stored step row into one group would
+    // put "Step five" above prose that was written before it.
+    const groups = await screen.findAllByTestId('activity-group')
     expect(groups).toHaveLength(2)
 
-    fireEvent.click(groups[0].querySelector('button[aria-expanded]'))
-    expect(groups[0].querySelectorAll('[data-kind="step"]')).toHaveLength(3)
+    fireEvent.click(within(groups[0]).getByTestId('activity-group-trigger'))
+    const first = within(within(groups[0]).getByTestId('activity-group-rows'))
+    expect(first.getByText('Step one')).toBeTruthy()
+    expect(first.getByText('Step three')).toBeTruthy()
 
-    fireEvent.click(groups[1].querySelector('button[aria-expanded]'))
-    expect(groups[1].querySelectorAll('[data-kind="step"]')).toHaveLength(1)
-    expect(groups[1].textContent).toContain('Step five')
+    fireEvent.click(within(groups[1]).getByTestId('activity-group-trigger'))
+    const second = within(within(groups[1]).getByTestId('activity-group-rows'))
+    expect(second.getByText('Step five')).toBeTruthy()
+    // …and the interrupted run did NOT absorb it.
+    expect(second.queryByText('Step three')).toBeNull()
   })
 })
 
