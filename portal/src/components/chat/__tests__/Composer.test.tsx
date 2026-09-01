@@ -24,6 +24,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
 
 import Composer, { type ComposerProps } from '../Composer'
+import { OFFER_GATE_NOTE } from '../OfferStrip'
 import { readDraft, writeDraft } from '../../../utils/composerDraft'
 
 afterEach(() => {
@@ -304,5 +305,58 @@ describe('one composer, both kinds (R72)', () => {
     expect(box().value).toBe(first)
     expect(box().getAttribute('placeholder')).toBe('What are we planning?')
     expect(send().getAttribute('aria-disabled')).toBe('false')
+  })
+})
+
+/**
+ * WHICH REASON WINS WHEN MORE THAN ONE IS TRUE.
+ *
+ * `unavailableReason` is a four-arm cascade, and every other test in this file drives exactly one
+ * arm — so the ORDER, which is the only thing a cascade encodes, was never actually asserted.
+ * Reordering it would have broken nothing.
+ *
+ * The order is by immediacy, and the offer is deliberately LAST: the first three describe
+ * something happening right now — the citizen's own text is too long, a reply is arriving, their
+ * app is being built — while a pending offer describes a question still waiting. The offer also
+ * stays pending for the whole round trip its own Build press starts, so putting it first told a
+ * citizen to "choose one of the two above" while the build they had just chosen was starting.
+ */
+describe('the send-unavailable cascade, with more than one arm true', () => {
+  const OVER_CAP = 'x'.repeat(20000)
+  const offer = { toolCallId: 'tc-1', conversationId: 'chat-1', spent: false, onBuild: vi.fn(), onKeepPlanning: vi.fn() }
+  const gate = {
+    blocked: true,
+    reason: 'Building your app — keep typing if you like; send unlocks when it’s done.',
+  }
+
+  it('the citizen’s own text beats everything else', () => {
+    draw({ isRunning: true, gate, offer })
+    type(OVER_CAP)
+    expect(gateNote()?.textContent).toMatch(/too long|shorten|character/i)
+  })
+
+  it('a reply arriving beats a build gate and a waiting offer', () => {
+    draw({ isRunning: true, gate, offer })
+    type('short enough')
+    expect(gateNote()?.textContent).toMatch(/send unlocks when it’s done/i)
+  })
+
+  it('a build running beats a waiting offer', () => {
+    draw({ isRunning: false, gate, offer })
+    type('short enough')
+    expect(gateNote()?.textContent).toMatch(/Building your app/i)
+  })
+
+  it('the offer speaks only when nothing more immediate is true', () => {
+    draw({ isRunning: false, offer })
+    type('short enough')
+    expect(gateNote()?.textContent).toBe(OFFER_GATE_NOTE)
+  })
+
+  it('says exactly ONE of them, however many are true', () => {
+    const { container } = draw({ isRunning: true, gate, offer })
+    type(OVER_CAP)
+    expect(screen.getAllByTestId('composer-gate-note')).toHaveLength(1)
+    noRealDisabled(container)
   })
 })

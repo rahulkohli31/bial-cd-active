@@ -132,7 +132,7 @@ export interface PaneView {
    * R104's stop-clock. Plan E shipped the reveal mark in v1.6.20 and the mount it was passed at
    * is the one this plan replaces — the in-file comment there says "THIS MOUNT IS LOAD-BEARING …
    * Whoever re-hosts this pane carries the prop forward". It travels here rather than as a prop
-   * so it survives Plan D's deletion of the page that publishes it. Without it the number stops
+   * so it survived Plan D's deletion of the page that used to publish it. Without it the number stops
    * being produced and nothing announces that, which is the one failure a measurement cannot
    * detect.
    */
@@ -241,8 +241,7 @@ export function createWorkspaceChannel(): WorkspaceChannel {
  * `null` outside a shell, and that is not an error condition.
  *
  * Every publisher below no-ops when there is no channel, because the surfaces are mounted without
- * a shell in fifteen existing test suites and — until Plan D collapses them — could legitimately
- * be rendered anywhere. A surface that cannot reach a pane simply does not get one; it must never
+ * a shell in fifteen existing test suites and could legitimately be rendered anywhere. A surface that cannot reach a pane simply does not get one; it must never
  * throw, because the thing it would take down is the conversation.
  */
 const WorkspaceChannelContext = createContext<WorkspaceChannel | null>(null)
@@ -412,11 +411,10 @@ export function usePublishPaneView(view: PaneView): void {
 /**
  * THE ONE NAMED CALL by which a mounted surface declares it wants the pane VISIBLE.
  *
- * One call, greppable, and the call Plan D must preserve when it rewrites both surfaces' render
- * bodies. Saying it plainly, because the register of the claim matters: after this plan the pane
- * ELEMENT is rendered by the address, but what a citizen SEES is still decided by which surface
- * mounted — and until Plan F, the surface that declares visibility is still the one `ChatRoute`
- * picked by kind.
+ * One call, greppable, and the call Plan D carried across when it collapsed the two surfaces into
+ * one. Saying it plainly, because the register of the claim matters: the pane ELEMENT is rendered
+ * by the address, but what a citizen SEES is still decided by the mounted surface declaring it —
+ * there is now one surface doing that declaring rather than two.
  */
 export function useAppPaneVisible(visible: boolean): void {
   usePublish(useWorkspaceChannel()?.visible, visible, false)

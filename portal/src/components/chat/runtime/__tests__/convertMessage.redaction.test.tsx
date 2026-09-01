@@ -3,10 +3,17 @@
  *
  * ══ WHY THAT PLACEMENT IS THE REQUIREMENT ══
  *
- * The wire already carries `StepItem.detail.args` and `detail.result` on every step frame and
- * every reload item — redacted and clipped, but present — and a diagnostic frame carries a
- * developer half whose own schema docstring records that "safe to render verbatim" is the
- * sentence that once produced a stack trace under a file-path title in a citizen's chat.
+ * A diagnostic frame carries a developer half — the source, and the compiler's own title — whose
+ * schema docstring records that "safe to render verbatim" is the sentence that once produced a
+ * stack trace under a file-path title in a citizen's chat. That half is still on the wire, because
+ * the agent is the party that can act on it.
+ *
+ * `StepItem.detail.args` / `detail.result` are NOT on the wire: `StepDetail` was removed from the
+ * server outright (`services/messages/projection.py` now pins its emitted field set in a test) and
+ * `StepItem` here has no `detail` to copy. The converter's silence about those fields is therefore
+ * belt and braces rather than the only guard — which is worth stating plainly, because an earlier
+ * draft of this docblock claimed the opposite and would have had the next reader believe the wall
+ * was load-bearing where it is not, and merely tidy where it is.
  *
  * A promise at the component ("this row only renders the label") is only as good as the next
  * person editing that component. A converter that never copies the field means the expander (R33)

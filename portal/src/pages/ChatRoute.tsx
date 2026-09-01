@@ -202,10 +202,10 @@ export default function ChatRoute() {
   // a chat the app id of a DIFFERENT project: this component stays mounted across chat
   // navigations, so a stale `project` would otherwise outlive the chat it was read for.
   const resolved = project !== null && project.id === resolution.projectId ? project : null
-  // THE KIND BRANCH MOVED, IT DID NOT GO AWAY. This route still resolves the conversation and now
-  // hands the resolution — kind included — to the one slot that mounts a body for it, so the
-  // largest kind comparison in the product has exactly one home instead of being the reason two
-  // page components exist. Plan D deletes it from the slot when the unified surface lands.
+  // THE KIND BRANCH IS GONE. This route resolves the conversation and hands the resolution —
+  // kind included — to the slot, which mounts ONE surface for both kinds and never compares them.
+  // `kind` still travels because the surface's placeholder and the breadcrumb say which chat this
+  // is; nothing branches on it.
   return (
     <ConversationSlot
       conversation={{

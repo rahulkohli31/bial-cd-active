@@ -8,14 +8,15 @@
  *     each kind got its own root layout, its own height model and its own opinion about the app
  *     pane. Moving it here does not delete it — saying that plainly matters, because claiming the
  *     collapse would make R72's surface half sound delivered while a citizen still gets a
- *     different React page per kind. What it does is give the branch exactly ONE home, so Plan D
- *     has one line to delete when the unified surface lands.
+ *     different React page per kind. What it did was give the branch exactly ONE home, so Plan D
+ *     had one line to delete — and it has now deleted it. The slot mounts `ConversationSurface`
+ *     for both kinds and no longer reads `kind` at all.
  *  2. WHETHER THE MOUNTED CONVERSATION IS VISIBLE. The slot is where the hide treatment is
  *     APPLIED — `hiddenSubtree.ts` is where it is defined and where its WCAG reasoning lives,
  *     because the builder surface's chat-panel collapse is its other caller and a page importing
  *     the slot that mounts pages is a cycle.
  *  3. THE DRAFT for it — see below.
- *  4. Nothing else. Transport, transcript and attachments stay exactly where they are until Plan D.
+ *  4. Nothing else. Transport, transcript and attachments live on the surface itself.
  *
  * ═══ THE ROUTER STILL OWNS WHICH CONVERSATION IS MOUNTED ═══
  *

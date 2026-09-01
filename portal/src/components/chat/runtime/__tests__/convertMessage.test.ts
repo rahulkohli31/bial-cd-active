@@ -212,3 +212,63 @@ describe('hasUpcomingMessage — the one id the library mints', () => {
     expect(hasUpcomingMessage(true, [])).toBe(true)
   })
 })
+
+/**
+ * TWO STEPS IN ONE MESSAGE MUST NOT SHARE A `toolCallId`.
+ *
+ * The library groups and keys parts by that id, so a collision does not render twice — it renders
+ * ONCE and silently drops the other step. The id is `step-{seq}`, and a collision is reachable two
+ * ways: a stored row whose `seq` is missing (both become `step-undefined`), and a merged run of
+ * stored rows spanning two turns whose seq spaces restart at the same number.
+ *
+ * The de-dup branch that handles this shipped with the swap-over and nothing exercised it, which
+ * is how a guard against silent loss becomes silent loss of its own.
+ */
+describe('within-message tool-call ids are made unique', () => {
+  const stepMsg = (id: string, seqs: (number | undefined)[]): ChatMessage => ({
+    id,
+    role: 'assistant',
+    seq: 1,
+    parts: seqs.map((seq) => ({
+      type: 'step',
+      // `seq` is typed as required, so a stored row that arrived without one is cast in — which is
+      // exactly the shape this branch exists for.
+      step: { type: 'step', seq: seq as number, tool: 'bash', label: `Step ${seq}`, state: 'ok', hidden: false },
+    })),
+  })
+
+  const toolIds = (m: ChatMessage): (string | undefined)[] => {
+    const content = convertMessage(m).content
+    // `content` is `string | readonly Part[]` on the library's type; the array form is the only one
+    // this converter produces, and narrowing beats casting through the whole part union.
+    if (typeof content === 'string') return []
+    return content
+      .filter((p): p is Extract<typeof p, { type: 'tool-call' }> => p.type === 'tool-call')
+      .map((p) => p.toolCallId)
+  }
+
+  it('keeps both steps when two stored rows arrive with the SAME seq', () => {
+    const ids = toolIds(stepMsg('a1', [4, 4]))
+    expect(ids).toHaveLength(2)
+    expect(new Set(ids).size).toBe(2)
+  })
+
+  it('keeps both when neither row carries a seq at all', () => {
+    // Both would be `step-undefined` — the case where every part shares one key.
+    const ids = toolIds(stepMsg('a2', [undefined, undefined]))
+    expect(ids).toHaveLength(2)
+    expect(new Set(ids).size).toBe(2)
+  })
+
+  it('leaves distinct ids untouched, so the suffix is not applied indiscriminately', () => {
+    // The other half: a run with real seqs must keep the ids the live path produced, or a step
+    // would get a new identity on every reload and the group would see it as a new part.
+    expect(toolIds(stepMsg('a3', [1, 2, 3]))).toEqual(['step-1', 'step-2', 'step-3'])
+  })
+
+  it('nine steps with nine distinct seqs stay nine parts', () => {
+    const ids = toolIds(stepMsg('a4', [1, 2, 3, 4, 5, 6, 7, 8, 9]))
+    expect(ids).toHaveLength(9)
+    expect(new Set(ids).size).toBe(9)
+  })
+})
