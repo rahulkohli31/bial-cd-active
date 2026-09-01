@@ -329,6 +329,33 @@ describe('startTurn', () => {
     ).rejects.toMatchObject({ status: 409, message: 'A turn is already running.' })
     expect(new TurnStartError(409, 'x')).toBeInstanceOf(Error)
   })
+
+  it('carries the context refusal through with the SERVER\'s sentence, not a generic one', async () => {
+    // ★ The whole client half of the restored per-conversation guardrail is this line. The
+    // hard boundary is enforced on the server and the sentence a citizen reads is WRITTEN
+    // there — `ConversationSurface` puts `TurnStartError.message` straight into `TurnBanner`.
+    // So "refused with a reason" is true only if the reason survives this hop.
+    //
+    // The catch-all in `ConversationSurface` ("The message could not be sent. Try again.")
+    // fires for anything that is NOT a `TurnStartError`, and that generic line is exactly the
+    // dead end this guardrail exists to replace. A 413 that arrived without its message would
+    // reproduce today's opaque failure while looking fixed.
+    const sentence =
+      'This chat has got too long to carry on. Start a new chat to keep going — your app and everything you have built stays exactly as it is.'
+    const fetchFn = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ error: { message: sentence, code: 'context_hard_limit_exceeded' } }),
+          { status: 413 }
+        )
+    )
+
+    await expect(startTurn('c1', { text: 'hi' }, { fetchImpl: fetchFn })).rejects.toMatchObject({
+      status: 413,
+      message: sentence,
+      code: 'context_hard_limit_exceeded',
+    })
+  })
 })
 
 // F2 REGRESSION GUARD. The edge/nginx rewrite is `^/api → /v1`. If ANY of the six turn-transport

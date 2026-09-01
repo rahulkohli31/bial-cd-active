@@ -102,9 +102,10 @@ beforeEach(() => {
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
   h.buildUserParts.mockImplementation(async (text) => [{ type: 'text', text }])
-  // The scripted relay: every turn answers with a ready-to-build brief, so a single turn reaches
-  // the card these guards need. (Whether the model asks or briefs is its own judgment, pinned
-  // server-side — `backend/tests/api/v1/claude/test_interview_protocol.py`.)
+  // The scripted turn: every turn answers with a ready-to-build brief, so a single turn reaches
+  // the card these guards need. (Whether the model asks or briefs is its own judgment, and it is
+  // a property of the server-composed prompt — `backend/tests/services/agent/test_mode_prompts.py`.
+  // The relay suite this used to point at was retired with the relay.)
   primeTurn(h)
 })
 afterEach(() => cleanup())

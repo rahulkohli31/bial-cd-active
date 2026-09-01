@@ -64,8 +64,9 @@ ATTACHMENT_TOTAL_CAP = 50 * 1024 * 1024
 _BODY_LIMIT_BYTES = 6 * 1024 * 1024
 
 # The allowlist + magic-byte prefixes live in `src.services.media.magic` — the SINGLE source of
-# truth shared with the `/v1/claude` chat relay, so an inline block the upload path would reject
-# can never slip through the relay unvalidated. `ALLOWED_MEDIA` / `magic_matches` imported above.
+# truth shared with every other path that can put bytes in front of the model, so a block the
+# upload path would reject cannot slip in through one of them. `ALLOWED_MEDIA` / `magic_matches`
+# imported above.
 
 # Attachment limiter (Express: ~30/min, POST + DELETE only; GET is never limited).
 ATTACHMENT_RATE_LIMIT = 30

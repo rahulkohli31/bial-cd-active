@@ -1,9 +1,10 @@
-"""The C3 GET-SSE progress feed — byte-framing COPIED from `claude/router.py` (D6:
-copy into your own router, never shared-edit the chat relay), adapted for the C7
-envelope + `Last-Event-ID` resume (KTD-5).
+"""The C3 GET-SSE progress feed — byte-framing COPIED from the legacy chat relay (D6: copy
+into your own router, never shared-edit someone else's), adapted for the C7 envelope +
+`Last-Event-ID` resume (KTD-5). The relay has since been retired; the copy is why this
+router did not have to change when it went.
 
 Each frame is `id: {seq}\\n` + `data: {compact-envelope-json}\\n\\n`; the terminal
-`ended` envelope is followed by `data: [DONE]\\n\\n`. Unlike the chat relay we do NOT
+`ended` envelope is followed by `data: [DONE]\\n\\n`. Unlike that relay, this does NOT
 await a first queued item before committing to the StreamingResponse (verified minor):
 the producer (`run_build`) already ran at `start` and this GET is a pure CONSUMER, so a
 freshly-registered subscriber queue receives only future puts — awaiting it would hang a
@@ -21,7 +22,8 @@ from fastapi.responses import StreamingResponse
 from src.api.v1.build_sessions.schemas import EndedEvent, ProgressEnvelope
 from src.services.build_sessions import BuildSession
 
-# Copied verbatim from claude/router.py.
+# Copied verbatim from the retired relay's router (see the module docstring: copy, never
+# shared-edit).
 _SSE_HEADERS = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
 _DONE = b"data: [DONE]\n\n"
 # Bounded per-connection queue: a slow/dead subscriber is dropped by on_progress

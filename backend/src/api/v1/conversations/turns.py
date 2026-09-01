@@ -8,15 +8,16 @@ prove gap-free continuity, plain replay for one that can (`?turn=&cursor=`). Mul
 simultaneous subscribers each get the identical stream — fan-out is the engine's, the
 route only walks the ring.
 
-Wire discipline (copied from the build feed + relay, D6): commit the SSE response and
+Wire discipline (copied from the build feed and the since-retired relay, D6): commit the
+SSE response and
 emit the first frame BEFORE any model byte (the snapshot serves that role), `: ping`
 keepalives only between complete frames, errors travel in-band, and the terminal
 `turn_ended` frame is followed by `data: [DONE]` which closes the transport.
 
-The turn plumbing this route shares with the relay (binaries resolution, prompt assembly,
-history rehydration, the model/session-factory/storage dependencies) lives in `_shared.py`
-alongside this module — one source, no copies, and no reaching into another router's
-underscore-private names (ADR-0010).
+The turn plumbing this route shares with the plan→build handoff (binaries resolution, prompt
+assembly, history rehydration, the model/session-factory/storage dependencies) lives in
+`_shared.py` alongside this module — one source, no copies, and no reaching into another
+router's underscore-private names (ADR-0010).
 """
 
 from __future__ import annotations
@@ -77,6 +78,8 @@ from src.services.redis import build_coordination_or_503
 from src.services.sandbox import SandboxClient
 from src.services.turns.copy import (
     ALREADY_BUILDING_HERE_CODE,
+    CHAT_TOO_LONG_CODE,
+    CHAT_TOO_LONG_TEXT,
     WORKSPACE_UNAVAILABLE_CODE,
     WORKSPACE_UNAVAILABLE_TEXT,
 )
@@ -92,6 +95,10 @@ from src.services.turns.plan_options import (
 )
 from src.services.turns.plan_options import (
     resolve as resolve_plan_options,
+)
+from src.services.usage.context_window import (
+    ContextWindowExceededError,
+    enforce_context_limit,
 )
 from src.services.usage.gate import DailyTokenLimitExceededError, enforce_daily_limit
 
@@ -224,6 +231,7 @@ async def start_conversation_turn(
             ReclaimBlockedEnvelope,
             "The agent is already working here, or another project holds the workspace",
         ),
+        (413, ErrorEnvelope, "This conversation has grown past its per-conversation limit"),
         (429, DailyTokenLimitBody, "Daily token limit exceeded"),
         (503, ErrorEnvelope, "Claude client not configured"),
     ),
@@ -244,7 +252,7 @@ async def start_turn(
     # Daily-token gate BEFORE anything persists — a capped user's message is refused
     # whole, never half-recorded. The error carries its own byte-stable body (limit/used/
     # remaining, what the SPA's interceptor reads), so it is RETURNED, not flattened into
-    # the plain envelope — the same contract `claude/router.py` honours.
+    # the plain envelope. The context refusal below chooses the opposite and says why.
     try:
         await enforce_daily_limit(db, user.id)
     except DailyTokenLimitExceededError as exc:
@@ -331,19 +339,58 @@ async def start_turn(
     if project is None:  # FK guarantees this; fail loudly if it ever breaks
         raise AppApiError(404, "Conversation not found.")
 
-    # Free text while plan options are pending resolves them as an implicit "keep
-    # refining" (U11) — BEFORE history loads, so the model always sees a resolved call.
-    await resolve_pending_as_refine(db, user_id=user.id, conversation_id=conversation.id)
-
     rehydrate = history_rehydrator(db, storage, user.id)
-    try:
-        history = await load_history(
-            db, user_id=user.id, conversation_id=conversation.id, rehydrate=rehydrate
-        )
-    except AttachmentRehydrationError as exc:
-        raise AppApiError(400, str(exc)) from None
+
+    async def _history() -> list[ModelMessage]:
+        """Read twice on the rare path below, so the translation of a rehydration failure into
+        the citizen's 400 is written once rather than kept in step by hand."""
+        try:
+            return await load_history(
+                db, user_id=user.id, conversation_id=conversation.id, rehydrate=rehydrate
+            )
+        except AttachmentRehydrationError as exc:
+            raise AppApiError(400, str(exc)) from None
+
+    history = await _history()
     binaries = await resolve_binaries(db, storage, user.id, body.message.attachment_ids)
     prompt = prompt_content(body.message, binaries)
+
+    # The per-conversation guardrail — STILL ABOVE THE FIRST WRITE, which is what the ordering
+    # below it is arranged to keep true. Nothing has been persisted, so a refusal leaves no
+    # turn row, no usage row, no claim to release, and no spent plan-options card.
+    #
+    # IT CANNOT RELY ON A ROLLBACK, and that is why it is here rather than three lines lower.
+    # `resolve_pending_as_refine` reaches `append_batch`, which OWNS ITS COMMIT — so a refusal
+    # raised after it would leave the citizen's card resolved on disk with `get_db`'s rollback
+    # powerless to take it back: their message refused AND their offer silently consumed.
+    #
+    # It is a REFUSAL, not a run bound. The three ceilings inside the engine stop a run already
+    # under way; this one declines to start a turn whose prompt would not fit — which is why it
+    # copies the daily cap's pre-start gate rather than the mid-run terminal.
+    try:
+        await enforce_context_limit(db, user.id, history=history, prompt=prompt)
+    except ContextWindowExceededError as exc:
+        # The PROSE says neither number on purpose — a citizen does not think in tokens. The
+        # `detail` does, because a non-browser caller has no other way to learn how far over it
+        # is: the daily cap's 429 carries `limit`/`used`/`remaining` for exactly this reason, and
+        # a refusal that withholds what it already measured makes the second caller guess.
+        raise AppApiError(
+            413,
+            CHAT_TOO_LONG_TEXT,
+            code=CHAT_TOO_LONG_CODE,
+            detail={"occupied": exc.occupied, "hardLimit": exc.hard_limit},
+        ) from None
+
+    # Free text while plan options are pending resolves them as an implicit "keep refining"
+    # (U11). The model must see a RESOLVED call — the dangling-call repair never has to guess
+    # about a card the user typed past — so when this actually writes one, the history is read
+    # again. Only then: the common case is no pending card, and a second full load of a long
+    # conversation on every turn to serve the rare one would be a poor trade.
+    #
+    # It moved BELOW the guardrail above (it used to lead this block) because it is this
+    # route's first committing write, and every side-effect-free refusal has to land above it.
+    if await resolve_pending_as_refine(db, user_id=user.id, conversation_id=conversation.id):
+        history = await _history()
 
     display_name = user.display_name or user.email
     prompt_context = PromptContext(

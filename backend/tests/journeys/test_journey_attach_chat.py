@@ -1,31 +1,35 @@
-"""Journey: attachment upload → chat relay → the bytes actually reach the model.
+"""Journey: attachment upload → turn → the bytes actually reach the model.
 
 The SPA lets a user attach an image to a chat turn: the file is first uploaded to
 `POST /v1/attachments` (persisted owner-scoped in the object store), and then — because
-Azure-hosted Foundry has no Files API — the SAME bytes are base64-INLINED into the newest
-turn's Anthropic-shaped `content` and sent through the stateless `POST /v1/claude` relay
-(`src/services/agent/content.py` docstring: "the newest turn's binaries already
-base64-inlined"). This journey proves the whole chain end to end:
+Azure-hosted Foundry has no Files API — the server rehydrates that owned REFERENCE back to
+real bytes at send time and inlines them into the turn's prompt (`prompt_content`,
+`api/v1/conversations/_shared.py`). This journey proves the whole chain end to end:
 
-    upload(raw)  →  stored blob == raw  →  download == raw  →  inline into /v1/claude
+    upload(raw)  →  stored blob == raw  →  download == raw  →  send with the attachment id
                                                               →  model receives BinaryContent(raw)
 
-The load-bearing assertion is the last hop: `to_model_content` must map the inlined image
-block into a `pydantic_ai.BinaryContent` (image/png) carrying the EXACT uploaded bytes, and
-that content must arrive in the `UserPromptPart` the agent hands the model. If the attachment
-did not reach the model, the generated app could not be "influenced" by the image at all.
+The load-bearing assertion is the last hop: the stored reference must arrive at the model as
+a `pydantic_ai.BinaryContent` (image/png) carrying the EXACT uploaded bytes, inside the
+`UserPromptPart` the agent hands the model. If the attachment did not reach the model, the
+generated app could not be "influenced" by the image at all.
+
+The send step USED to be the retired `POST /v1/claude` relay; it is now
+`POST /v1/conversations/{id}/turns`. The chain is the same one — the rehydrator and
+`prompt_content` were always shared plumbing — so what moved is the door, not the property.
 
 `TestModel` does not expose the `list[ModelMessage]` it was handed, so — as in the sibling
 `test_journey_multiturn_generate` — the capturing turn uses pydantic-ai's message-recording
 sibling test model `FunctionModel`, whose `stream_function` receives the exact messages the
 agent passed the model. Both are injected the same way via `set_chat_model`.
 
-This is a CORRECT-behaviour (Express-parity) journey: the attachment→chat path is intact, so
-it MUST PASS on a correct product.
+This is a CORRECT-behaviour journey: the attachment→model path is intact, so it MUST PASS on
+a correct product.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import json
@@ -41,7 +45,10 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from src.config import settings
 from src.services.auth.csrf import issue_csrf_token
 from src.services.auth.session_jwt import mint_session_jwt
+from src.services.turns.engine import TurnEngine, set_turn_engine_for_tests
+from src.services.turns.guard import _mid_reply
 from tests.factories import UserFactory
+from tests.fakes import FakeSandboxClient
 
 _TTL = settings.auth.access_ttl_seconds
 
@@ -53,14 +60,41 @@ _B64_PNG = base64.b64encode(_RAW_PNG).decode()
 
 
 # --- chat fixtures ------------------------------------------------------------
-# `set_chat_model` + the billing override live in a conftest scoped to tests/api/v1/claude/.
-# A journey under tests/journeys/ has no access to them, so they are inlined here verbatim
-# (copied from tests/api/v1/claude/conftest.py).
+# `set_chat_model` + the billing override live in conftests scoped to tests/api/v1/.
+# A journey under tests/journeys/ has no access to them, so they are inlined here.
+
+
+@pytest.fixture(autouse=True)
+def _fresh_engine():  # noqa: ANN201
+    """A per-test turn engine, so this journey's detached turn is the only one to settle."""
+    _mid_reply.clear()
+    engine = TurnEngine()
+    set_turn_engine_for_tests(engine)
+    yield engine
+    set_turn_engine_for_tests(None)
+    _mid_reply.clear()
+
+
+@pytest.fixture(autouse=True)
+def _bind_a_workspace(app, fake_redis, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: ANN001
+    """A sandbox client on both seams — a turn refuses 503 `workspace_unavailable` without
+    one (R98). Inlined from `tests/api/v1/conversations/conftest.py`, which journeys cannot
+    reach; `fake_redis` rides along because binding a workspace is what makes the send
+    route's reclaim preflight reachable, and that preflight reads the coordination store."""
+    from src.api.v1.build_sessions.deps import sandbox_dependency, sandbox_or_none_dependency
+    from src.services.sandbox.config import SandboxConfig
+    from tests.api.v1.build_sessions.conftest import _sandbox_config
+
+    assert isinstance(_sandbox_config(), SandboxConfig)
+    monkeypatch.setattr(settings, "sandbox", _sandbox_config())
+    sbx = FakeSandboxClient()
+    app.dependency_overrides[sandbox_dependency] = lambda: sbx
+    app.dependency_overrides[sandbox_or_none_dependency] = lambda: sbx
 
 
 @pytest.fixture(autouse=True)
 def _override_billing(app, db_session) -> None:  # noqa: ANN001
-    from src.api.v1.claude.router import billing_session_factory
+    from src.api.v1.conversations._shared import billing_session_factory
 
     @contextlib.asynccontextmanager
     async def _session() -> AsyncIterator[Any]:
@@ -75,7 +109,7 @@ def set_chat_model(app):  # noqa: ANN001, ANN201
     """Inject a Pydantic AI model (a TestModel / FunctionModel) for the chat endpoint."""
 
     def _set(model: object) -> None:
-        from src.api.v1.claude.router import chat_model
+        from src.api.v1.conversations._shared import chat_model
 
         app.dependency_overrides[chat_model] = lambda: model
 
@@ -94,29 +128,49 @@ async def _auth(db_session: Any, **overrides: Any):
     return {"Cookie": f"session={jwt}; csrf={csrf}", "X-CSRF-Token": csrf}, user
 
 
-def _delta_texts(sse: str) -> list[str]:
-    """Pull the ordered ``delta.text`` payloads out of an SSE event-stream body."""
-    texts: list[str] = []
+def _answer_of(sse: str) -> str:
+    """The assistant's whole answer out of a turn-stream body: the snapshot's `textSoFar`
+    plus every `text_delta` after it. A settled turn replays as snapshot-only and a live one
+    tails deltas, so summing both is what makes the assertion independent of which happened."""
+    text = ""
     for line in sse.splitlines():
         if not line.startswith("data: "):
             continue
         payload = line.removeprefix("data: ")
         if payload == "[DONE]":
             continue
-        texts.append(json.loads(payload)["delta"]["text"])
-    return texts
+        frame = json.loads(payload)
+        if frame.get("type") == "snapshot":
+            text += frame["textSoFar"]
+        elif frame.get("type") == "text_delta":
+            text += frame["text"]
+    return text
+
+
+async def _settle(engine: Any, conversation_id: uuid.UUID) -> None:
+    """Await the DETACHED turn task, not just its stream: the run's `finally` still writes
+    the durable turn-terminal row after the last frame, on a session of its own."""
+    state = engine.peek(conversation_id)
+    assert state is not None and state.task is not None
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(state.task, timeout=10)
 
 
 # --- journey ------------------------------------------------------------------
 
 
 async def test_uploaded_image_reaches_the_model_as_binary_content(
-    client: Any, app: Any, db_session: Any, set_chat_model: Any, fake_storage: Any
+    client: Any,
+    app: Any,
+    db_session: Any,
+    set_chat_model: Any,
+    fake_storage: Any,
+    _fresh_engine: Any,
 ) -> None:
     headers, user = await _auth(db_session)
 
     # The accessor-level fake serves BOTH consumers of the store: the upload route
-    # (`storage_dependency` → `get_storage()`) and the U7 relay's send-time rehydrator
+    # (`storage_dependency` → `get_storage()`) and the turn route's send-time rehydrator
     # (`chat_storage` → `get_storage()`); keep the handle to assert the blob persisted.
     store = fake_storage
 
@@ -174,28 +228,31 @@ async def test_uploaded_image_reaches_the_model_as_binary_content(
     )
     assert created.status_code == 201, created.text
 
-    chat = await client.post(
-        "/v1/claude",
+    started = await client.post(
+        f"/v1/conversations/{conversation_id}/turns",
         headers=headers,
         json={
-            "conversationId": conversation_id,
             "message": {
                 "text": "Use this terminal floor-plan photo to build a gate-status board.",
+                "attachmentTexts": [],
                 "attachmentIds": [attachment_id],
             },
         },
     )
+    assert started.status_code == 202, started.text
+    await _settle(_fresh_engine, uuid.UUID(conversation_id))
+
+    chat = await client.get(f"/v1/conversations/{conversation_id}/events", headers=headers)
     assert chat.status_code == 200
     assert chat.headers["content-type"].startswith("text/event-stream")
     # The generation streamed back (the attachment demonstrably influenced the output text).
-    assert (
-        "".join(_delta_texts(chat.text))
-        == "Generated a gate-status board from the uploaded floor-plan image."
+    assert _answer_of(chat.text) == (
+        "Generated a gate-status board from the uploaded floor-plan image."
     )
     assert chat.text.endswith("data: [DONE]\n\n")
 
     # --- 4. LOAD-BEARING: the image arrived at the model as BinaryContent(raw) ----------
-    # `chat.text` fully drained the stream, so the drain (and thus the model call) finished.
+    # The turn settled above, so the model call finished.
     assert len(seen) == 1, "the agent must have been handed exactly one model request"
     history = seen[0]
 

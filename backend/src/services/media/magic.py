@@ -1,12 +1,17 @@
 """Shared media allowlist + magic-byte gate — the SINGLE source of truth for the binary media
 types an attachment may carry (Express `ALLOWED_MEDIA` / `validateAttachmentBytes`).
 
-Both untrusted entry points apply it so a block the upload path would reject can never slip
-through the chat relay unvalidated:
-  * `/v1/attachments` (+ office/deck branches) — the upload path.
-  * `/v1/claude` inline binaries (`services/agent/content.py`) — the stateless relay; the SPA
-    base64-inlines each turn's binaries, and a DIRECT API caller is bypassable, so the server
-    re-checks here too (Express validated at BOTH points for exactly this reason).
+EVERY path that can put bytes in front of the model applies it, so a block the upload path
+would reject cannot slip in through one of the others:
+  * `/v1/attachments` (+ the office branch) — the upload path, where bytes first arrive.
+  * `messages/store.py`'s rehydrator — a stored reference read back out of the object store on
+    every turn. Checked AGAIN rather than trusted: what was uploaded and what is served back
+    are two different reads, and only one of them was validated at the door.
+  * `build_sessions/attachments.py` — the same bytes reaching a build by conversation reference.
+
+The retired chat relay was a fourth, and re-checking there was the original reason this module
+exists as shared code rather than an inline check in the upload route. Three consumers is still
+more than one; the rule has not changed with the count.
 """
 
 from __future__ import annotations

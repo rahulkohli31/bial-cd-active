@@ -26,7 +26,7 @@ import sqlalchemy as sa
 from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.message import Message, MessageEntryKind
 from src.services.messages import store
-from tests.api.v1.conversations.test_turn_stream import _headers
+from tests.api.v1.conversations.conftest import _headers
 from tests.factories import ConversationFactory, UserFactory
 
 

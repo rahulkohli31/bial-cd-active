@@ -4,8 +4,8 @@
  *
  * The one structural change from Sandbox: there is no `ProjectPicker`. Sandbox had no
  * project, so it gated every handoff behind "pick a project first". Here the project is
- * a required prop, so `startChat` mints a chat and hands off directly — mirroring the exact
- * router-state shape `BuilderPage` / `ChatPage` already read
+ * a required prop, so `startChat` mints a chat and hands off directly — in the exact
+ * router-state shape the conversation surface reads
  * (`{ prompt, pendingAttachments }` for a build, `{ initialMessage }` for a plan).
  *
  * IT MINTS ONE KIND, AND NOTHING HERE CHOOSES. This composer used to carry an in-line
@@ -60,8 +60,8 @@ export default function ProjectBuilder({ projectId }: ProjectBuilderProps) {
     }
     // Mint through the SHARED `uuidv7`, never an inline `crypto.randomUUID()` — that mints a v4,
     // and the id becomes the conversation's PRIMARY KEY (ADR-0006 wants v7). This site and
-    // ChatPage's Launch-Builder each carried their own copy of the one-liner, which is precisely
-    // why both kept minting v4 long after the store's mint moved on.
+    // the retired planning page's Launch-Builder each carried their own copy of the one-liner,
+    // which is precisely why both kept minting v4 long after the store's mint moved on.
     //
     // `freshlyMinted` tells ChatRoute the row does not exist yet, so it can skip a GET that can
     // only 404. Router state — not a query param — because state dies on reload and never travels

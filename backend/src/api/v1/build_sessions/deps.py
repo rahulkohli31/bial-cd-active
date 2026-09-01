@@ -75,9 +75,9 @@ _orchestrator: BuildOrchestrator | None = None
 
 
 def _build_model(config: FoundryConfig) -> Model:
-    """The Foundry-backed Pydantic AI model — the exact chat-relay wiring
-    (`claude/router.py::chat_model`). A named seam so the C7 integration test can swap in
-    a scripted `FunctionModel` while still exercising the REAL dependency below."""
+    """The Foundry-backed Pydantic AI model — the same wiring the conversation routes use
+    (`conversations/_shared.py::chat_model`). A named seam so the C7 integration test can swap
+    in a scripted `FunctionModel` while still exercising the REAL dependency below."""
     return build_foundry_model(config)
 
 
@@ -100,7 +100,7 @@ async def _live_session_spec(session_id: uuid.UUID) -> BuildSpec:
     # R3 — the multimodal prompt: each attachment's content FIRST (fenced office/csv text, or
     # `BinaryContent` for image/PDF vision), then the instruction text. Attachments-before-text
     # is Anthropic's documented vision ordering and matches the portal's own `buildContent`
-    # ("text after files"), so the build path and the chat relay ground a model the same way —
+    # ("text after files"), so the build path and the send path ground a model the same way —
     # the instruction reads as a question ABOUT the material above it, which is exactly what a
     # "build me an app from this spreadsheet" prompt means. The attachments were materialized
     # at start (`build_sessions/attachments.py`), so this is pure assembly — no I/O, nothing

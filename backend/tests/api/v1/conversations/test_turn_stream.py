@@ -33,60 +33,19 @@ from src.api.v1.conversations.schemas import (
     WorkspaceFrame,
 )
 from src.api.v1.conversations.turns import KEEPALIVE_SECONDS
-from src.config import settings
 from src.db.models.conversation import ChatKind
-from src.services.auth.csrf import issue_csrf_token
-from src.services.auth.session_jwt import mint_session_jwt
 from src.services.turns import engine as engine_module
 from src.services.turns.engine import (
     _TURN_FAILED_MESSAGE,
-    TurnEngine,
     _TurnState,
-    set_turn_engine_for_tests,
 )
-from src.services.turns.guard import _mid_reply
+from tests.api.v1.conversations.conftest import _headers
 from tests.factories import ConversationFactory, UserFactory
 
-_TTL = settings.auth.access_ttl_seconds
-
-
-def _headers(user, *, with_csrf: bool = True) -> dict[str, str]:
-    jwt = mint_session_jwt(user.id, user.token_version, _TTL)
-    if not with_csrf:
-        return {"Cookie": f"session={jwt}"}
-    csrf = issue_csrf_token(user.id, user.token_version)
-    return {"Cookie": f"session={jwt}; csrf={csrf}", "X-CSRF-Token": csrf}
-
-
-@pytest.fixture(autouse=True)
-def _fresh_engine():
-    _mid_reply.clear()
-    engine = TurnEngine()
-    set_turn_engine_for_tests(engine)
-    yield engine
-    set_turn_engine_for_tests(None)
-    _mid_reply.clear()
-
-
-@pytest.fixture(autouse=True)
-def _override_billing(app, db_session) -> None:
-    from src.api.v1.claude.router import billing_session_factory
-
-    @contextlib.asynccontextmanager
-    async def _session():
-        yield db_session
-
-    app.dependency_overrides[billing_session_factory] = lambda: lambda: _session()
-
-
-@pytest.fixture
-def set_chat_model(app):
-    def _set(model) -> None:
-        from src.api.v1.claude.router import chat_model
-
-        app.dependency_overrides[chat_model] = lambda: model
-
-    return _set
+# The turn-driving fixtures live in `conftest.py` — four files needed the same four, and
+# two of them were the 3rd and 4th copy. Named here rather than autouse there, because the
+# other files in this directory drive no turns.
+pytestmark = pytest.mark.usefixtures("_fresh_engine", "_override_billing")
 
 
 async def _auth_with_conversation(db_session, *, kind=None):

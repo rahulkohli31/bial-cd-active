@@ -86,21 +86,21 @@ so this journey is the **green baseline** that proves the harness drives the rea
 **Updated 2026-07-17 for the canonical build thread + interview protocol (003-U1/U4).** The
 handoff no longer mints a builder chat, and arriving no longer builds anything.
 
-`ChatPage.handleBuildApp` flattens the planning transcript and calls the **stateless** Claude relay
-with `{messages:[{role:'user', content: transcript}], system: SUMMARIZE_SYSTEM_PROMPT}`, streams the
-builder prompt into the modal, then `handleLaunchBuilder` resolves the project's ONE canonical build
-thread (`POST /v1/conversations/builder-thread {projectId}`) and navigates to it flat at `/chat/{id}`
-with `state.prompt`. That prompt is sent to the relay like any other turn: the server-side interview
-protocol answers with a question or a brief card, and a build starts **only** when the user confirms
-a brief card (feeding Journey 1 at that point) — there is no first-prompt provision/generate effect.
-The backend-observable contract is the relay accepting a one-shot `messages+system` request and
-streaming assistant text.
+**This journey is RETIRED as described.** It documented the stateless Claude relay
+(`POST /v1/claude`), which `ChatPage.handleBuildApp` called to flatten a planning transcript into a
+builder prompt. Both are gone: the relay was deleted along with `ChatPage.jsx`, and the plan is now
+the offer tool call's OWN argument, so there is nothing to flatten or re-summarize — the handoff is
+`POST /v1/conversations/{id}/plan-options/{tool_call_id}/build`
+(`backend/src/api/v1/conversations/transition.py`).
+
+Rows 5.1-5.3 are kept, marked retired, per row 1.3's convention: a withdrawn contract is more
+useful pinned than deleted, because deleting it is how it quietly comes back.
 
 | # | Assertion the test must make | Status | Evidence |
 |---|------------------------------|--------|----------|
-| 5.1 | `POST /v1/claude {messages:[{role:'user',content}], system, conversationId}` → **200** streaming body; concatenated deltas are non-empty assistant text (the builder prompt). `conversationId` is REQUIRED (project-first); a valid UUID the SPA has not persisted yet — every chat's first turn — streams with no project context injected. | OK | SPA: `portal/src/pages/ChatPage.jsx:357-364`; back: `backend/src/api/v1/claude/router.py` `claude_chat`, `_project_context_system` |
-| 5.2 | `POST /v1/claude` with an unparseable/non-object body, empty/absent `messages`, a non-string `system`, a non-positive/non-integer `max_tokens`, a malformed transcript entry, or an absent/non-UUID `conversationId` → **400 `{error:{message}}`** (SPA error-banner envelope), emitted BEFORE any SSE byte. | OK | back: `claude/router.py` `claude_chat`, `_system_prompt`, `_max_output_tokens`, `_split_messages`, `_required_conversation_id` |
-| 5.3 | The relay persists nothing — a summarize call creates no conversation/message rows (SPA owns persistence via Journey 4). | OK | back: `claude/router.py:1-9` docstring ("server persists NO messages") |
+| 5.1 | The relay send was `POST /v1/claude`; it is **retired** and now answers **404/405** for every verb, absent from the OpenAPI schema, guarded forever. Its behaviour did not vanish: starting a turn is `POST /v1/conversations/{id}/turns` (**202**, text on `GET /v1/conversations/{id}/events`). | OK — retirement pinned; not a live contract. | guard: `claude_retired/test_relay_retired.py`; replacement: `conversations/turns.py` `start_turn` -> `services/turns/engine.py` |
+| 5.2 | The relay's hand-rolled request validation was **retired** with the route — a malformed body no longer reaches it at all, since 404/405 precedes any parsing. The turn engine validates its own body through the `TurnRequest` Pydantic model and answers **422**, not the old 400. | OK — retirement pinned. | guard: `claude_retired/test_relay_retired.py`; replacement: `conversations/schemas.py` `TurnRequest` |
+| 5.3 | "The relay persists nothing" was true of the deleted route and is now **inverted**: the surviving turn engine is the opposite — the SERVER owns persistence and writes the turn's rows itself. Nothing left in the product is a stateless model relay, which is the point (a second path through the same work is a way around every limit the first one enforces). | OK — retirement pinned. | guard: `claude_retired/test_relay_retired.py::test_there_is_exactly_one_send_path_and_one_stream_path` |
 
 ---
 

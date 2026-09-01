@@ -1,15 +1,17 @@
-"""The turn plumbing BOTH conversation surfaces run on (relay + turn engine).
+"""The turn plumbing the conversation routes run on.
 
-These helpers used to live as underscore-private names inside `api/v1/claude/router.py`, and
+These helpers used to live as underscore-private names inside the legacy relay's router, and
 `conversations/turns.py` reached across a package boundary to import them anyway — which is
 exactly the coupling ADR-0010 warns about: a "private" name with a second consumer is not
-private, it is undocumented shared API, and the next edit to the relay silently reshapes the
+private, it is undocumented shared API, and the next edit to the relay silently reshaped the
 turn route.
 
-The home is `conversations/` rather than `claude/` on purpose: the relay is the surface being
-RETIRED (U13), so the code that outlives it should not sit in the module that dies. The
-underscore in the FILE name marks it as internal to `api/v1` — it is plumbing, not a route
-module — while every NAME it exports is public, because it genuinely has two callers.
+The home is `conversations/` rather than beside the relay on purpose: the relay was the surface
+being retired, so the code that outlived it should not sit in the module that died. It has since
+died, and this file is what that move was for. The underscore in the FILE name marks it as
+internal to `api/v1` — it is plumbing, not a route module — while every NAME it exports is
+public, because it genuinely has more than one caller: the send route, the transition route, and
+the test fixtures that bind `chat_model` and `billing_session_factory`.
 """
 
 from __future__ import annotations
@@ -70,9 +72,10 @@ ATTACHMENT_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 # Citizen copy — this text reaches the user verbatim in a 409 body. It says what is happening and
 # when they get the chat back, and names nothing internal (no session, no mode, no lock).
 #
-# It lives HERE, beside the other two-caller plumbing, because BOTH conversation surfaces refuse
-# the same way: the U10 turn route and the legacy `POST /v1/claude` relay. A gate that exists on
-# only one of two live send paths is not a gate — it is a detour sign.
+# It lives HERE, beside the other shared plumbing, because more than one route refuses this way:
+# the send route and the plan→build handoff. A gate that exists on only one of two live entry
+# points is not a gate — it is a detour sign, which is the lesson the retired relay taught by
+# needing its own copy of this constant.
 BUILD_IN_FLIGHT_MSG = (
     "The assistant is building your app right now. Chat opens back up as soon as it finishes."
 )

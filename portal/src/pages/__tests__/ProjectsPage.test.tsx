@@ -5,8 +5,8 @@
  * delete dialog's chat-counter (`listProjectConversations`) are mocked at the
  * module boundary; `useKeysetList` runs for real (it is what we are exercising
  * through the page). A LocationProbe outside the Routes reports the current path so
- * navigation is observable without a real project-home page. This mirrors the
- * `vi.hoisted` + `MemoryRouter` shape of `ChatPage-sendpath.test.jsx`.
+ * navigation is observable without a real project-home page. It uses the `vi.hoisted` +
+ * `MemoryRouter` shape this directory's suites share.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'

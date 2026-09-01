@@ -2,8 +2,8 @@
  * Authenticated fetch for JSON API calls (admin console, future authed reads).
  *
  * Attaches the Bearer token when one exists (legacy Express callers) and, on a
- * pre-body 401, refreshes ONCE and retries — the same admission pattern as
- * fetchClaudeStream. In the cookie-session model refresh yields a success boolean
+ * pre-body 401, refreshes ONCE and retries — the same admission pattern the turn
+ * stream follows. In the cookie-session model refresh yields a success boolean
  * (not a token), so the retry carries no Authorization header and rides the
  * session cookie. Dependencies are injected so it's testable without a real
  * network or a React render.
@@ -96,8 +96,8 @@ export async function authFetch(
     if (refreshed) {
       res = await call()
       // The retry gets the same gate as the first attempt. A suspension that only surfaces on
-      // the second response would otherwise reach the caller as a bare 403 — `fetchClaudeStream`
-      // already re-checks, and the asymmetry was a latent hole rather than a deliberate choice.
+      // the second response would otherwise reach the caller as a bare 403 — the streaming path
+      // re-checks too, and the asymmetry was a latent hole rather than a deliberate choice.
       await bounceIfSuspended(res)
     }
   }

@@ -30,12 +30,28 @@
  *   the send discipline        → `BuilderPage-projectfirst`, `-composer`, `-persistence`
  *                                (persist-before-stream, the N8 both-bubble rollback, the gate)
  *   drag-and-drop + the draft  → `components/chat/__tests__/Composer.test.tsx`
- *   the length guardrail       → `utils/__tests__/composerCap.test.ts`
+ *   the per-MESSAGE length cap → `utils/__tests__/composerCap.test.ts`
  *   the plan offer             → `components/chat/__tests__/OfferStrip.test.tsx`
  *   the stream reader          → `utils/__tests__/turnStreamApi.test.ts`
  *   the build narrative        → `components/chat/__tests__/ActivityGroup.test.tsx`, and the
  *                                at-limit half moved WITH ITS FUNCTION to
  *                                `utils/__tests__/turnNarrative.test.ts`
+ *   the CONVERSATION guardrail → `utils/__tests__/contextLimits.test.ts` (the browser's warning)
+ *                                and, for the boundary that actually holds,
+ *                                `backend/tests/api/v1/conversations/test_context_gate.py`
+ *
+ * ══ ONE LINE OF THAT LIST WAS FALSE FOR A WHILE, AND IT IS WHY THIS IS BEING WRITTEN AGAIN ══
+ *
+ * It read "the length guardrail → composerCap.test.ts". `composerCap` caps ONE MESSAGE's
+ * characters; the guardrail bounded a whole CONVERSATION. Two unrelated things sharing the word
+ * "length", and the sentence turned a deletion into a redistribution on paper. What actually
+ * happened is that `ChatPage-surface`'s soft banner and hard block, and `contextLimits`'s
+ * `getContextLimits`, were deleted with their subject and NOTHING replaced them — an
+ * administrator went on setting a per-conversation limit that no code anywhere read.
+ *
+ * The last line above is the honest replacement, and the shape has changed on purpose: the hard
+ * stop is the SERVER's now. The old one lived entirely in the browser, which is exactly how
+ * deleting one page deleted a guarantee.
  *
  * The counts above are named in the PR so the suite arithmetic reconciles rather than being waved
  * through: 144 blocks removed here, plus 6 in U13's `attachmentInput-deck.test.js`, against the

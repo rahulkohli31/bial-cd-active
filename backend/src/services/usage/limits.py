@@ -1,10 +1,17 @@
-"""Effective per-user limits — the daily token cap (Plan A's live gate) + the SPA
-per-conversation context guardrails (soft/hard), resolved with Express's clamps.
+"""Effective per-user limits — the daily token cap and the per-conversation context
+guardrails (soft/hard), resolved with the clamps the portal has always applied.
 
 The SINGLE source of truth shared by the admin `/admin/users` endpoint AND `/auth/me`, so a
-superadmin's per-user override reaches the client (the daily badge + the "getting long" guardrail
-banner) instead of the client silently falling back to the global defaults. Daily reuses the
+superadmin's per-user override reaches the client (the daily badge + the "getting long"
+warning) instead of the client silently falling back to the global defaults. Daily reuses the
 gate's resolver so the badge and the 429 gate can never diverge.
+
+WHO ENFORCES WHICH. `hard` is the SERVER's: `usage/context_window.enforce_context_limit`
+refuses a turn at the route, before anything is persisted. `soft` is the browser's: it is
+advisory, it blocks nothing, and it exists to warn the citizen in time to start a new chat
+rather than to be told at the wall. This docstring used to call both of them "the values the
+client should enforce", which was true of neither — nothing enforced them at all, front or
+back, while an administrator was being shown a field promising a hard stop.
 """
 
 from __future__ import annotations
@@ -42,8 +49,11 @@ def effective_context(override: UserLimit | None) -> tuple[int, int]:
 
 
 async def effective_limits_for(db: AsyncSession, user_id: uuid.UUID) -> tuple[int, int, int]:
-    """(daily, context_soft, context_hard) for one user — the values the client should enforce.
-    Loads the user's override once; daily via the gate resolver so the badge and the gate agree."""
+    """(daily, context_soft, context_hard) for one user, as the client is told them: `daily`
+    drives the badge, `context_soft` the browser's warning, `context_hard` the number the
+    SERVER refuses at (sent so the browser can describe the boundary, never so it can police
+    it). Loads the user's override once; daily via the gate resolver so the badge and the gate
+    agree."""
     daily = await effective_daily_limit(db, user_id)
     override = await db.scalar(select(UserLimit).where(UserLimit.user_id == user_id))
     soft, hard = effective_context(override)

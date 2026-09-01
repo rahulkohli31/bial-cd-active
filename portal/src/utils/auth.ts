@@ -206,8 +206,8 @@ export function consumeSignoutReason(): string | null {
 
 // The full-page navigation, isolated behind one indirection so jsdom tests can
 // stub it (`window.location.assign` throws "Not implemented: navigation" in
-// jsdom). A hard navigation — not react-router — because the callers (authFetch,
-// fetchClaudeStream) have no router context and we WANT every in-flight page torn
+// jsdom). A hard navigation — not react-router — because the callers (`authFetch` and the
+// turn-stream reader) have no router context and we WANT every in-flight page torn
 // down, not a soft in-SPA transition that leaves stale trees mounted.
 function hardRedirect(url: string): void {
   window.location.assign(url)
@@ -226,8 +226,8 @@ let alreadyBouncing = false
  * hard-navigate to the login screen's (non-alarming) suspension banner.
  *
  * Idempotent / single-flight: concurrent 403s from several in-flight requests
- * produce exactly one navigation. Lives here (not in api.js) so `authFetch` and
- * `fetchClaudeStream` — which does NOT go through `authFetch` — share one path.
+ * produce exactly one navigation. Lives here rather than in `api.ts` so `authFetch` and the
+ * turn-stream reader — which does NOT go through `authFetch` — share one path.
  */
 export function handleSuspendedSession(): void {
   if (alreadyBouncing) return

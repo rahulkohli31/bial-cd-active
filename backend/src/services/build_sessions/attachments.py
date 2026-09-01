@@ -14,10 +14,10 @@ TODO(U5): once producers write native turns, re-verify the boundary semantics ag
 mid-build turn (the `startedSeq` capture in `SessionManager.start` is unchanged).
 
 **Why the build path may read messages from the DB at all.** Issue #28's "the server never reads
-messages from the DB" is a rule about the CHAT RELAY (`/v1/claude`), which is a stateless relay.
-It is NOT a rule about the build path — attachments travel by conversation REFERENCE (an optional
-`conversationId` on the start body) precisely so the bytes don't have to make a second trip
-through the browser.
+messages from the DB" was a rule about the retired stateless relay, whose whole contract was that
+the browser carried the transcript. It is NOT a rule about the build path — attachments travel by
+conversation REFERENCE (an optional `conversationId` on the start body) precisely so the bytes
+don't have to make a second trip through the browser.
 
 **Every failure RAISES** `BuildAttachmentError`, which the router turns into a 422 naming the
 file. A clear "we couldn't read your file" beats a build that pretends it read it (the

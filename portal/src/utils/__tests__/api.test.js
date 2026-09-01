@@ -2,8 +2,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { authFetch } from '../api'
 import { handleSuspendedSession } from '../auth'
 
-// The suspension teardown lives in auth.js so authFetch and fetchClaudeStream
-// share ONE implementation. Here we spy it to assert authFetch's wiring without
+// The suspension teardown lives in auth.ts so authFetch and the turn-stream reader — which
+// does not go through authFetch — share ONE implementation. Here we spy it to assert authFetch's wiring without
 // triggering a real jsdom navigation; its single-flight guarantee (concurrent
 // 403s → exactly one navigation) is unit-tested against the real function in
 // auth.test.js.

@@ -2,9 +2,10 @@
 non-interference with the outcome record's idempotency and status reads.
 
 The per-step BRAIN producer is tested with its own fixtures in
-`tests/services/orchestrator/test_transcript_steps.py`; the relay producer in
-`tests/api/v1/claude/test_transcript_persist.py`. This file covers the manager-level lifecycle
-rows, which need nothing but the store and factories.
+`tests/services/orchestrator/test_transcript_steps.py`. There was a third producer on the relay,
+covered by `tests/api/v1/claude/test_transcript_persist.py`; both were deleted when the relay was
+retired. This file covers the manager-level lifecycle rows, which need nothing but the store and
+factories.
 """
 
 from __future__ import annotations

@@ -390,23 +390,29 @@ app.dependency_overrides[
 
 ## 7. Injecting a `TestModel` for the chat endpoint (no network)
 
-`POST /v1/claude` streams SSE from a pydantic-ai model. In tests the Foundry model is
-replaced with a `pydantic_ai.models.test.TestModel`, and billing is bound to the
-rolled-back test session — both live in `tests/api/v1/claude/conftest.py`.
+`POST /v1/conversations/{id}/turns` starts a turn on the turn engine; the reply streams from a
+pydantic-ai model over `GET /v1/conversations/{id}/events`. In tests the Foundry model is
+replaced with a `pydantic_ai.models.test.TestModel` (or a `FunctionModel` when the test needs to
+see the prompt), and billing is bound to the rolled-back test session.
 
-**To reuse them in a journey test, place your journey module under
-`tests/api/v1/claude/` OR copy the two fixtures into a local `conftest.py`** (the
-`set_chat_model` + autouse `_override_billing` fixtures are scoped to that directory):
+> **The relay this section used to document is gone.** `POST /v1/claude` and
+> `tests/api/v1/claude/` were retired — the turn engine is the only send path
+> (guard: `tests/api/v1/claude_retired/test_relay_retired.py`). The two fixtures now live in
+> `tests/api/v1/conversations/conftest.py`, and the dependencies they override come from
+> `src/api/v1/conversations/_shared.py`, not the deleted `claude/router.py`.
+
+**To reuse them in a journey test, copy the two fixtures into a local `conftest.py`** (they are
+scoped to `tests/api/v1/conversations/`, and a journey module lives outside it):
 
 ```python
-# conftest.py next to your journey test — verbatim from tests/api/v1/claude/conftest.py
+# conftest.py next to your journey test
 import contextlib
 import pytest
 
 
 @pytest.fixture(autouse=True)
 def _override_billing(app, db_session) -> None:
-    from src.api.v1.claude.router import billing_session_factory
+    from src.api.v1.conversations._shared import billing_session_factory
 
     @contextlib.asynccontextmanager
     async def _session():
@@ -418,29 +424,28 @@ def _override_billing(app, db_session) -> None:
 @pytest.fixture
 def set_chat_model(app):
     def _set(model) -> None:
-        from src.api.v1.claude.router import chat_model
+        from src.api.v1.conversations._shared import chat_model
         app.dependency_overrides[chat_model] = lambda: model
     return _set
 ```
 
-Drive it (`test_chat_stream.py:56-64`):
+Driving a turn is TWO steps, unlike the relay's single call: the POST returns `202` and the text
+arrives on the event stream. See `tests/journeys/test_journey_multiturn_generate.py` for the
+worked version, including how to await the detached task before asserting on the DB.
 
 ```python
 from pydantic_ai.models.test import TestModel
 
-async def test_chat_turn(client, db_session, set_chat_model):
-    headers, _ = await _auth_user(db_session)
+async def test_chat_turn(client, db_session, app, set_chat_model):
+    user, conversation = await _auth_with_conversation(db_session)
     set_chat_model(TestModel(custom_output_text="hello world"))
-    # `conversationId` is REQUIRED (project-first). A fresh uuid4 is the legitimate
-    # first-turn case: it resolves to no stored row, so no project context is injected.
-    resp = await client.post("/v1/claude", headers=headers, json={
-        "messages": [{"role": "user", "content": "hello"}],
-        "conversationId": str(uuid.uuid4()),
-    })
-    assert resp.status_code == 200
-    assert resp.headers["content-type"].startswith("text/event-stream")
-    assert 'data: {"delta":{"text":"hello world"}}\n\n' in resp.text
-    assert resp.text.endswith("data: [DONE]\n\n")
+    resp = await client.post(
+        f"/v1/conversations/{conversation.id}/turns",
+        headers=_headers(user),
+        json={"message": {"text": "hello", "attachmentTexts": [], "attachmentIds": []}},
+    )
+    assert resp.status_code == 202          # the turn is ACCEPTED, not yet answered
+    await _settle(engine, conversation.id)  # await the detached task
 ```
 
 `resp.text` fully drains the stream — **billing lands before `[DONE]`**, so read the body
@@ -608,8 +613,10 @@ async def test_owner_builds_admin_approves(client, app, db_session):
   not just `client`.
 - **Two `storage_dependency` symbols** — `src.api.deps` (admin/governance) vs `attachments.router`.
   Override the one your route uses.
-- **`set_chat_model` / billing override are directory-scoped** to `tests/api/v1/claude/`.
-  Put a chat journey there, or copy the conftest fixtures locally.
+- **`set_chat_model` / billing override are directory-scoped** to
+  `tests/api/v1/conversations/`. A journey lives outside it, so copy the fixtures locally
+  (§7). The four files in that directory that drive turns opt in with a module-level
+  `pytestmark = pytest.mark.usefixtures("_fresh_engine", "_override_billing")`.
 - **Superadmin = email allowlist**, not a role. `admin@bial.com` / `superadmin@bial.com`
   (`.env.test`).
 - **One auth model: the session Cookie**, for owner and admin alike. The `X-App-Key` header

@@ -1,10 +1,15 @@
 /**
- * BuilderPage's half of the shared drag-drop wiring (usePendingAttachments, A2) — ChatPage's
- * composer got this coverage when drag-and-drop was added (ChatPage-dragdrop.test.jsx); this
- * page's own wiring (a410c7d) shipped with none, despite using the exact same hook and handlers
- * against a different child set (no pending-attachment preview row shares a wrapper with a
- * SessionBanners block + a mode switcher + a composer-gate note here, unlike ChatPage's simpler
- * banner set). Mirrors ChatPage-dragdrop.test.jsx's coverage rather than re-deriving it.
+ * Drag-and-drop wiring on the conversation surface (`usePendingAttachments`, A2).
+ *
+ * THIS WAS ONE HALF OF A PAIR. Two pages shared the hook and only the planning one had
+ * coverage, so this file was written to cover the other against a different child set — a
+ * pending-attachment preview row sharing a wrapper with a banners block, a switcher and a
+ * composer-gate note. There is ONE surface now and one child set; the sibling suite went with
+ * its page. The coverage is worth keeping, but it is no longer "the other half" of anything.
+ *
+ * (The file name still says `BuilderPage`. Every suite in this directory named that way now
+ * renders `ConversationSurface` — see its own docstring for why one file absorbed both pages.
+ * Renaming seventeen files is a change of its own and has not been made.)
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, fireEvent, createEvent, cleanup } from '@testing-library/react'

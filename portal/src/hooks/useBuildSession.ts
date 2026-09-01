@@ -39,7 +39,7 @@ import { subscribeBuildFeed } from '../utils/buildSessionEvents'
 import type { BuildFeedError, BuildFeedSubscription, EventSourceFactory } from '../utils/buildSessionEvents'
 import type { BuildSessionStatus, FeedEnvelope, ProgressEnvelope, RelaunchError } from '../utils/buildSessionTypes'
 
-/** How long a live `ready` preview may go quiet before the "still iterating" overlay clears (KTD-8b). */
+/** How long a live `ready` preview may go quiet before the "still working" overlay clears (KTD-8b). */
 const ITERATION_QUIET_MS = 4000
 
 /**

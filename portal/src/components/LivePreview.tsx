@@ -271,8 +271,8 @@ function BouncingWait({ children, className = '' }: { children: ReactNode; class
  *   - `onFrameMessage` — the client-error receiver seam, LIVE as of U13. The inbound `message`
  *                    listener validates BOTH `e.origin` against the preview origin AND `e.source`
  *                    against this pane's own iframe window (the C8 §3 security assertion), and
- *                    forwards only messages that pass both; `BuilderPage` relays them to the
- *                    harness, where a reported browser crash makes the health verdict not-green.
+ *                    forwards only messages that pass both; the conversation surface relays
+ *                    them to the harness, where a reported browser crash makes the health verdict not-green.
  *                    The source half is what survives every app sharing one hostname — origin
  *                    alone no longer tells this pane's app from any other app in the document.
  *                    Together they prove PROVENANCE, not content — the shape check lives on the
@@ -1101,7 +1101,7 @@ export default function LivePreview({
               // never loads, and `load` is the only thing that reveals it.
               className={`shrink-0 mx-auto h-full transition-[box-shadow,border-radius,opacity] duration-300 rounded-xl overflow-hidden shadow-lg bg-white relative ${revealed ? 'opacity-100' : 'opacity-0'}`}
             >
-              {/* A subtle "still iterating" overlay while the loop keeps refining a LIVE preview
+              {/* A subtle "still working" overlay while the loop keeps refining a LIVE preview
                   (status holds at `ready` and new step/log envelopes keep arriving). Non-blocking
                   (pointer-events-none) so the operator can still interact with the framed app. */}
               {iterating && (
@@ -1112,7 +1112,7 @@ export default function LivePreview({
                         <span key={i} className="w-1.5 h-1.5 bg-primary rounded-full animate-bounce" style={{ animationDelay: `${i * 0.15}s` }} />
                       ))}
                     </span>
-                    <span className="text-[11px] font-semibold text-neutral">Still iterating…</span>
+                    <span className="text-[11px] font-semibold text-neutral">Still working…</span>
                   </div>
                 </div>
               )}

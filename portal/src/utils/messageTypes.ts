@@ -1,8 +1,8 @@
 /**
- * The shared `parts[]` message-content model — the one thing every chat surface
- * (conversationApi.js reload, BuilderPage.jsx/ChatPage.jsx live streaming,
- * MessageContent.jsx render, attachmentStore.js transforms) agrees on the shape
- * of. This did NOT exist as a type anywhere before this file — it is derived
+ * The shared `parts[]` message-content model — the one thing every producer and
+ * consumer of a chat message (the `conversationApi` reload projection, the live
+ * turn stream, `MessageContent`'s render, `attachmentStore`'s transforms) agrees
+ * on the shape of. This did NOT exist as a type anywhere before this file — it is derived
  * from the real construction/consumption sites, not invented:
  *
  *   - `TextPart`/`FilePart` (all three `file` sub-shapes) come verbatim from the
@@ -18,14 +18,14 @@
  *     between producers (see below) — this file makes it visible rather than
  *     papering over it.
  *
- * PRE-EXISTING INCONSISTENCY, NOT FIXED HERE (types-only diff, worth raising
- * with Rahul separately): the persisted/reload `build` part
- * (`conversationApi.js`'s `messagesFromProjection`, the `banner` branch) and the
- * live `build` part (`BuilderPage.jsx`'s `showBuildOutcome`, `{ type:'build',
- * ...outcome }`) carry different field sets under the same `type:'build'`
- * discriminant. The consumer (`BuilderPage.jsx`'s `BuildOutcome` component)
- * never actually distinguishes them — it reads every field via plain optional
- * access regardless of producer, which is why this was never a runtime bug.
+ * PRE-EXISTING INCONSISTENCY, STILL NOT FIXED: the persisted/reload `build` part
+ * (`conversationApi`'s `messagesFromProjection`, the `banner` branch) and the live
+ * `build` part carry different field sets under the same `type:'build'`
+ * discriminant. Both producers named here originally lived on the deleted builder
+ * page; the divergence outlived it, which is why the two named types below are
+ * still worth keeping apart. No consumer has ever distinguished them — every field
+ * is read via plain optional access regardless of producer, which is why this was
+ * never a runtime bug.
  * `BuildPartPersisted` and `BuildPartLive` are kept as two distinct named
  * types, unioned, rather than collapsed into one everything-optional shape, so
  * the divergence stays legible to a future reader.
@@ -110,8 +110,7 @@ export interface BuildPartPersisted {
   previewUrl: string | null
 }
 
-/** The live `build` part (`BuilderPage.jsx`'s `showBuildOutcome`) — rendered the
- * moment a build turn ends, before any reload. Two call sites feed this: the C7
+/** The live `build` part — rendered the moment a build turn ends, before any reload. Two call sites feed this: the C7
  * session-based path (carries `sessionId`) and the current turn-stream "Build
  * it" path (carries `turnId`); both otherwise produce the same fields. */
 export interface BuildPartLive {
@@ -157,9 +156,9 @@ export type MessagePart =
   | StepPart
   | BuildInProgressPart
 
-/** The in-memory message shape every chat page renders (`{id, role, parts, seq}`
- * per `conversationApi.js`'s own doc comment). `seq`/`createdAt` are absent on
- * the ephemeral local welcome message (`BuilderPage.jsx`'s `welcomeMessage`). */
+/** The in-memory message shape the conversation surface renders
+ * (`{id, role, parts, seq}`, per `conversationApi`'s own doc comment).
+ * `seq`/`createdAt` are absent on the ephemeral local welcome message. */
 export interface ChatMessage {
   id: string
   role: 'user' | 'assistant'

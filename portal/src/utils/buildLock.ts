@@ -9,10 +9,10 @@
  *
  * Planning chats are never blocked. Only builds write code.
  *
- * WHY A FACTORY, NOT A MODULE SINGLETON. A module-level claim map would let two BuilderPage
- * instances in one document see each other's claims WITHOUT a channel round-trip, so a
- * two-page test would prove only the same-tab path and leave the cross-tab path — the one
- * this module exists for — entirely unexercised. With a factory, every manager owns its own
+ * WHY A FACTORY, NOT A MODULE SINGLETON. A module-level claim map would let two managers in
+ * one document see each other's claims WITHOUT a channel round-trip, so a two-instance test
+ * would prove only the same-tab path and leave the cross-tab path — the one this module exists
+ * for — entirely unexercised. With a factory, every manager owns its own
  * channel and the wire is the ONLY way claims travel: the same code path in one tab or six.
  * It also lets a test construct two managers over two real BroadcastChannels and drive the
  * message path directly.
@@ -140,9 +140,9 @@ export function createBuildLock({ channel = null, now = () => Date.now() }: Buil
   // that stopped beating. Runs only while we hold something (heartbeat starts on acquire).
   let heartbeat: ReturnType<typeof setInterval> | null = null
 
-  // Set by dispose(). A late async caller — BuilderPage re-acquires after an awaited
-  // start()/reattach() that may resolve post-unmount — must not restart the heartbeat on a
-  // dead manager: nothing could ever clear it again (a zombie interval for the SPA lifetime).
+  // Set by dispose(). A late async caller — the conversation surface re-acquires after an
+  // awaited start()/reattach() that may resolve post-unmount — must not restart the heartbeat
+  // on a dead manager: nothing could ever clear it again (a zombie interval for the SPA lifetime).
   let disposed = false
 
   const beat = (): void => {

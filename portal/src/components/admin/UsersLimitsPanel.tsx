@@ -19,9 +19,16 @@ import type { MergedUser } from './columns'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '../ui/table'
 import { Select, SelectValue, SelectTrigger, SelectContent, SelectItem } from '../ui/select'
 
-// The model's real context window — a per-conversation hard limit can be
-// lowered below this but never raised past it. Mirrors server/limits.js
-// (the server is the real boundary; this is a friendly client-side guard).
+// The model's real context window — a per-conversation hard limit can be lowered below this
+// but never raised past it. The clamp is the SERVER's (`services/usage/limits.effective_context`),
+// so typing a larger number here does not widen anything; this constant only keeps the hint
+// truthful about what will happen.
+//
+// THIS COMMENT USED TO SAY the opposite of what was true — "the server is the real boundary;
+// this is a friendly client-side guard" — while the server enforced nothing and the client had
+// stopped enforcing anything either. Both halves are now correct: the server refuses a turn
+// past the per-conversation max (`enforce_context_limit`, a 413 the citizen reads a sentence
+// from), and the browser's own warning at the soft threshold is the friendly guard.
 const MODEL_CONTEXT_WINDOW = 200_000
 // The wire page size (how many rows one fetchUsers call asks for — capped at the
 // server's MAX_PAGE_SIZE=100) is deliberately larger than the table's on-screen page
@@ -184,7 +191,7 @@ function EditModal({ user, defaults, onClose, onSaved, onToast }: EditModalProps
           <LimitField
             name="soft"
             label="Per-conversation warn"
-            hint="Show the “getting long” banner at this many tokens."
+            hint="Warn the user their chat is getting long at this many tokens. A warning only — it does not stop them sending."
             field={soft}
             setField={setSoft}
             defaultValue={defaults.contextSoftLimit}
@@ -192,19 +199,22 @@ function EditModal({ user, defaults, onClose, onSaved, onToast }: EditModalProps
           <LimitField
             name="hard"
             label="Per-conversation max"
-            hint={`Hard stop for a single chat. Max ${fmt(MODEL_CONTEXT_WINDOW)} (model window).`}
+            hint={`Hard stop for a single chat: past this the server refuses the next message and tells the user to start a new chat. Max ${fmt(MODEL_CONTEXT_WINDOW)} (model window).`}
             field={hard}
             setField={setHard}
             defaultValue={defaults.contextHardLimit}
           />
         </div>
 
-        {/* Propagation reality (docs/solutions: per-user-limits daily-vs-context): the daily
-            limit is a live server read; the context limits ride the cached profile. Never
-            imply a context change is instant. */}
+        {/* Propagation reality (docs/solutions: per-user-limits daily-vs-context). The two
+            per-conversation numbers now propagate DIFFERENTLY and the difference is the user's
+            to know about: the hard stop is read from the database on every send, so it bites
+            immediately; the warning threshold rides the profile the browser cached at sign-in,
+            so it follows on their next reload. Never imply either is instant when it is not. */}
         <p className="text-[11px] text-neutral mt-4 leading-relaxed">
-          The <strong className="text-tertiary">daily token limit</strong> takes effect on the user’s next request. The{' '}
-          <strong className="text-tertiary">per-conversation limits</strong> only take effect after the user reloads the app.
+          The <strong className="text-tertiary">daily token limit</strong> and the{' '}
+          <strong className="text-tertiary">per-conversation max</strong> take effect on the user’s next message. The{' '}
+          <strong className="text-tertiary">per-conversation warn</strong> only takes effect after the user reloads the app.
         </p>
 
         {err && (

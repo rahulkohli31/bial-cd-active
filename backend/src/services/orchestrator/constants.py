@@ -269,7 +269,7 @@ runs synchronously on the control-plane event loop — this is the belt to the r
 ([[sandbox-supervisor-child-env-scrub-allowlist]]: sandbox output is untrusted)."""
 
 MAX_OUTPUT_TOKENS = 64_000
-"""Per-model-step output clamp (mirrors the chat relay's `_MAX_OUTPUT_TOKENS`)."""
+"""Per-model-step output clamp."""
 
 TEMPERATURE = 0.0
 """Deterministic generation — a build task wants the same edit for the same diagnostic."""

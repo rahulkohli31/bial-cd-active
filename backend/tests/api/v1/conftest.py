@@ -1,9 +1,10 @@
 """Fixtures shared by every v1 API surface.
 
-`building` lives here rather than under `conversations/` because the ONE GATE it exercises has
-TWO consumers: the U10 turn route and the legacy `POST /v1/claude` relay. A fixture parked next
-to one of them is how the other surface ends up untested — and an ungated send path is a way
-around the gate, not a gap in coverage.
+`building` lives here rather than under `conversations/` because the gate it exercises is
+consulted from more than one surface. It was written when one of those was the legacy
+`POST /v1/claude` relay; that relay is retired, but the fixture is still shared by the
+conversations, projects and build-sessions suites, so it stays at the level they have in
+common. A fixture parked next to one consumer is how the others end up untested.
 """
 
 from __future__ import annotations

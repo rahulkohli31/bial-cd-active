@@ -9,9 +9,11 @@ a NULL as "no code yet". TODO(U5+): either re-establish a writer from the build 
 retire the readers with the column.
 
 What stays pinned here:
-  * submit never touches `current_code` (the open-sandbox artifact is the bundle copy);
-  * the relay's project-context system prompt is owner-scoped (ADR-0004) — the description,
-    the live cross-user surface on that seam, never leaks across users.
+  * submit never touches `current_code` (the open-sandbox artifact is the bundle copy).
+
+THE CROSS-USER PROMPT-GROUNDING TEST MOVED. It posted to the retired `POST /v1/claude` relay;
+the same ADR-0004 property is now asserted against the surviving send path in
+`tests/api/v1/conversations/test_project_grounding.py`.
 """
 
 from __future__ import annotations
@@ -107,50 +109,3 @@ async def test_submit_no_longer_touches_current_code(client, db_session, set_cha
     set_chat_model(TestModel(custom_output_text="never reached"))
     gen = await client.post(f"/v1/projects/{project.id}/description:generate", headers=headers)
     assert gen.status_code == 409
-
-
-async def test_cross_user_cannot_read_another_users_project_context(
-    client, db_session, set_chat_model
-) -> None:
-    """`_project_context_system`'s owner-scoped conversation lookup is what stops user B from
-    grounding a turn in user A's project (ADR-0004).
-
-    Asserted on the project DESCRIPTION, not on code: with the relay's code seed retired
-    (003-U2) there is nothing code-shaped left in a system prompt, so an old
-    `"OWNER_SECRET_CODE" not in instructions` assertion would now pass even if the `user_id`
-    predicate were dropped — i.e. it would be green and prove nothing. The description is the
-    live cross-user surface on this seam, so that is what this pins.
-    """
-    owner = await UserFactory.create(db_session)
-    owner_headers = _cookie(mint_session_jwt(owner.id, owner.token_version, _TTL))
-    project = await ProjectFactory.create(
-        db_session, owner.id, description="OWNER_SECRET_DESCRIPTION"
-    )
-    conv_a = await _builder_conv(db_session, owner.id, project.id)
-    await _provision(db_session, owner.id, project.id)
-
-    # The owner's OWN turn does get the description — otherwise the assertion below could pass
-    # simply because nothing ever injects a description (the vacuity trap this test just escaped).
-    model, captured = _capturing_stream_model()
-    set_chat_model(model)
-    assert (
-        await client.post(
-            "/v1/claude",
-            headers=owner_headers,
-            json={"conversationId": str(conv_a.id), "message": {"text": "continue the build"}},
-        )
-    ).status_code == 200
-    assert "OWNER_SECRET_DESCRIPTION" in captured["instructions"]
-
-    # User B references A's conversation id → owner-scoped lookup misses → U7's non-leaking
-    # 404 (the old stream-without-context arm retired with the browser payload).
-    b_headers, _ = await _auth(db_session)
-    model, captured = _capturing_stream_model()
-    set_chat_model(model)
-    resp = await client.post(
-        "/v1/claude",
-        headers=b_headers,
-        json={"conversationId": str(conv_a.id), "message": {"text": "continue the build"}},
-    )
-    assert resp.status_code == 404
-    assert "OWNER_SECRET_DESCRIPTION" not in captured.get("instructions", "")
