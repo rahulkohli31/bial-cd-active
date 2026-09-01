@@ -201,7 +201,7 @@ describe('toProgressEnvelope — parse at the boundary', () => {
 
   it('carries a step`s `hidden` flag through the parse (F3: else the live hidden-step filter is a no-op)', () => {
     // The backend serializes `hidden:true` for read-only/housekeeping steps; if the parser drops it,
-    // BuildProgress`s `!env.hidden` filter keeps every step and the LIVE feed shows what reload hides.
+    // the live `!env.hidden` filter keeps every step and the LIVE feed shows what reload hides.
     const hidden = toProgressEnvelope({ type: 'step', seq: 5, name: 'inspect', label: 'x', state: 'ok', hidden: true })
     expect(hidden).toMatchObject({ type: 'step', seq: 5, hidden: true })
     // A visible step parses to hidden:false (never undefined), so the boolean filter is well-defined.

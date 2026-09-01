@@ -62,9 +62,15 @@ vi.mock('../../utils/conversationApi.js', () => ({
   listProjectConversations: h.listProjectConversations,
   deleteConversation: h.deleteConversation,
 }))
-// SubmitControl owns its own data fetching (approvalApi) and has its own suite —
-// stubbed here so ProjectPage tests stay about the page.
-vi.mock('../../components/SubmitControl', () => ({ default: () => null }))
+// The publish chip owns its own read and its own suite; stubbed to a marker so these tests
+// stay about the page while still being able to assert WHERE it is mounted. The stub is
+// what makes the header-position cases below meaningful — a null stub would let the chip
+// vanish from either header branch without a single assertion noticing.
+vi.mock('../../components/PublishStatusChip', () => ({
+  default: ({ projectId }: { projectId: string }) => (
+    <span data-testid="publish-chip-stub" data-project={projectId} />
+  ),
+}))
 vi.mock('../../utils/chatHistory.js', () => ({ relativeTime: () => '1h ago' }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 // ProjectPage no longer mounts LivePreview (the passive View-app preview is hidden, U6).
@@ -227,6 +233,60 @@ describe('ProjectPage — the description rail (R3, U7 pop-up editor)', () => {
     expect(within(dialog).getByRole('button', { name: /^save$/i })).toBeTruthy()
     expect(within(dialog).getByRole('button', { name: /^generate$/i })).toBeTruthy()
     expect(within(dialog).getByRole('button', { name: /^cancel$/i })).toBeTruthy()
+  })
+})
+
+describe('ProjectPage — publishing is one chip beside the name (R37)', () => {
+  it('puts the chip beside the project name and nothing about publishing in the rail', async () => {
+    h.getProject.mockResolvedValue(makeProject({ appId: 'a1' }))
+    renderProjectPage()
+
+    await screen.findByRole('heading', { name: 'VIP Movement' })
+    expect(screen.getByTestId('publish-chip-stub').getAttribute('data-project')).toBe('p1')
+
+    // Scoped to the rail's own test id, so the absence is about the rail rather than
+    // about the whole page — the chip itself is a publish affordance and it is elsewhere.
+    const rail = screen.getByTestId('description-rail')
+    expect(within(rail).queryByTestId('publish-chip-stub')).toBeNull()
+    expect(within(rail).getByRole('button', { name: /edit/i })).toBeTruthy()
+    expect(rail.textContent).not.toMatch(/publish/i)
+    expect(rail.textContent).not.toMatch(/review/i)
+  })
+
+  it('shows the chip for a project with nothing built, rather than showing nothing', async () => {
+    // "Nothing built yet" is a state the chip NAMES. A citizen should learn it from the
+    // same place they learn everything else about their app, not from an absence — which
+    // is why the mount is not gated on `appId` the way the two retired cards were.
+    // Mutation receipt: put `project.appId &&` back in front of the chip and this goes red.
+    h.getProject.mockResolvedValue(makeProject({ appId: null }))
+    renderProjectPage()
+
+    await screen.findByRole('heading', { name: 'VIP Movement' })
+    expect(screen.getByTestId('publish-chip-stub')).toBeTruthy()
+  })
+
+  it('does not move the chip, or unmount it, when an inline rename starts', async () => {
+    // Both header branches are the same `flex items-center gap-2` row with the chip as the
+    // second child, so the rename swap does not shift it. `getByTestId` throws on a
+    // duplicate, which is what rules out the other failure — a second mount in the rename
+    // branch rather than a moved one.
+    h.getProject.mockResolvedValue(makeProject({ appId: 'a1' }))
+    renderProjectPage()
+
+    await screen.findByRole('heading', { name: 'VIP Movement' })
+    const before = screen.getByTestId('publish-chip-stub')
+    const nameBefore = before.previousElementSibling?.tagName
+
+    fireEvent.click(screen.getByRole('button', { name: /rename project/i }))
+
+    const after = screen.getByTestId('publish-chip-stub')
+    expect(after).toBeTruthy()
+    expect(screen.getByRole('textbox', { name: /project name/i })).toBeTruthy()
+    // Still the second child of the row, with the name element before it and the action
+    // buttons after it — in both branches.
+    expect(nameBefore).toBe('H1')
+    expect(after.previousElementSibling?.tagName).toBe('INPUT')
+    expect(after.nextElementSibling?.tagName).toBe('BUTTON')
   })
 })
 

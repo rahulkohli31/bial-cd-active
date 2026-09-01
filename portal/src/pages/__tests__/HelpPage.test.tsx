@@ -25,8 +25,18 @@
  */
 import { describe, it, expect } from 'vitest'
 import { FAQS } from '../HelpPage'
-import { ALLOWED_MEDIA_TYPES, EXCEL_MEDIA_TYPE, PPTX_MEDIA_TYPE } from '../../utils/attachmentInput'
-import { DECK_ATTACHMENTS_ENABLED } from '../../config/features'
+import { ALLOWED_MEDIA_TYPES } from '../../utils/attachmentInput'
+
+/**
+ * Literal media types, not imports.
+ *
+ * Plan D's narrowing deleted the `EXCEL_MEDIA_TYPE` / `PPTX_MEDIA_TYPE` exports along with the
+ * formats. Keeping them as literals is what preserves the REFUSED direction of the reconciliation:
+ * a format that is gone from the module must still be checked for absence from the copy, and an
+ * inventory built from the module's own exports can only check what it still offers.
+ */
+const EXCEL_MEDIA_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+const PPTX_MEDIA_TYPE = 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
 
 /** The answer to the FAQ whose question matches — fails loudly rather than returning
  *  `undefined` and letting a `.toMatch` on nothing decide the test. */
@@ -64,8 +74,7 @@ describe('the attachment answer agrees with the real allowlist', () => {
   it('promises only formats the composer actually accepts', () => {
     // Both directions. The one-way version of this test is what let ".pptx" survive in the
     // copy after the composer stopped taking it (#157 B2).
-    const offersPptx = ALLOWED_MEDIA_TYPES.includes(PPTX_MEDIA_TYPE)
-    expect(offersPptx).toBe(DECK_ATTACHMENTS_ENABLED)
+    const offersPptx = (ALLOWED_MEDIA_TYPES as readonly string[]).includes(PPTX_MEDIA_TYPE)
     if (offersPptx) {
       expect(answer).toMatch(/PowerPoint|\.pptx/i)
     } else {

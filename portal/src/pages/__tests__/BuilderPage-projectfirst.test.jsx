@@ -65,7 +65,7 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
   resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
 
-import BuilderPage from '../BuilderPage'
+import ConversationSurface from '../../components/chat/ConversationSurface'
 import { ApiError } from '../../utils/apiError'
 
 function makeDeps() {
@@ -77,7 +77,7 @@ function renderHandoff({ chatId = 'build-X', prompt = 'build me a gate tracker' 
   return render(
     <MemoryRouter initialEntries={[{ pathname: `/chat/${chatId}`, search: '?projectId=p1&kind=build', state: { prompt, theme: 'bial' } }]}>
       <Routes>
-        {inWorkspace(<Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="VIP Movement" buildSessionDeps={makeDeps()} />} />)}
+        {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface projectId="p1" projectName="VIP Movement" buildSessionDeps={makeDeps()} />} />)}
         <Route path="/projects/:projectId" element={<div>project home</div>} />
         <Route path="/projects" element={<div data-testid="projects-index">projects index</div>} />
       </Routes>
@@ -87,7 +87,7 @@ function renderHandoff({ chatId = 'build-X', prompt = 'build me a gate tracker' 
 
 /** Confirm the brief card the current turn produced — the page's only build trigger. */
 async function confirmBrief() {
-  fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
+  fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
 }
 
 beforeEach(() => {
@@ -210,7 +210,7 @@ describe('BuilderPage — a refine turn', () => {
     render(
       <MemoryRouter initialEntries={['/chat/build-X']}>
         <Routes>
-          {inWorkspace(<Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="VIP Movement" buildSessionDeps={makeDeps()} />} />)}
+          {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface projectId="p1" projectName="VIP Movement" buildSessionDeps={makeDeps()} />} />)}
         </Routes>
       </MemoryRouter>,
     )
@@ -284,7 +284,7 @@ describe('BuilderPage — the preview is handed R104\u2019s stop-clock (U4)', ()
 describe('BuilderPage — the composer is not shared across a chat navigation', () => {
   function BuilderHost() {
     const { chatId } = useParams()
-    return <BuilderPage chatId={chatId} projectId="p1" projectName="P" buildSessionDeps={makeDeps()} />
+    return <ConversationSurface chatId={chatId} projectId="p1" projectName="P" buildSessionDeps={makeDeps()} />
   }
   function GoToB() {
     const navigate = useNavigate()
@@ -347,7 +347,7 @@ describe('BuilderPage — the StrictMode load strand (U7)', () => {
       <StrictMode>
         <MemoryRouter initialEntries={['/chat/build-X']}>
           <Routes>
-            {inWorkspace(<Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="P" buildSessionDeps={makeDeps()} />} />)}
+            {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface projectId="p1" projectName="P" buildSessionDeps={makeDeps()} />} />)}
           </Routes>
         </MemoryRouter>
       </StrictMode>,
@@ -361,7 +361,7 @@ describe('BuilderPage — the StrictMode load strand (U7)', () => {
       <StrictMode>
         <MemoryRouter initialEntries={[{ pathname: '/chat/build-X', search: '?projectId=p1&kind=build', state: { prompt: 'build me a gate tracker', theme: 'bial' } }]}>
           <Routes>
-            {inWorkspace(<Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="VIP" buildSessionDeps={makeDeps()} />} />)}
+            {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface projectId="p1" projectName="VIP" buildSessionDeps={makeDeps()} />} />)}
           </Routes>
         </MemoryRouter>
       </StrictMode>,
@@ -383,7 +383,7 @@ describe('BuilderPage — a send blocked by an in-flight reply explains itself',
     render(
       <MemoryRouter initialEntries={['/chat/build-X']}>
         <Routes>
-          {inWorkspace(<Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="P" buildSessionDeps={makeDeps()} />} />)}
+          {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface projectId="p1" projectName="P" buildSessionDeps={makeDeps()} />} />)}
         </Routes>
       </MemoryRouter>,
     )
@@ -393,7 +393,7 @@ describe('BuilderPage — a send blocked by an in-flight reply explains itself',
 
     await send('second')
 
-    expect(await screen.findByText(/send unlocks when the current reply finishes/i)).toBeTruthy()
+    expect(await screen.findByText(/send unlocks when it’s done/i)).toBeTruthy()
     expect(h.startTurn).toHaveBeenCalledTimes(1) // the blocked send never re-entered
     // The second message is still in the box — the user composed it while waiting, which is
     // exactly what the mode-free contract invites them to do (KTD-1).
@@ -422,7 +422,7 @@ describe('BuilderPage — the hand-off does not replay on reload (N1)', () => {
           {inWorkspace(
             <Route
               path="/chat/:chatId"
-              element={<BuilderPage projectId="p1" projectName="VIP Movement" buildSessionDeps={makeDeps()} />}
+              element={<ConversationSurface projectId="p1" projectName="VIP Movement" buildSessionDeps={makeDeps()} />}
             />,
           )}
           <Route path="/projects" element={<div data-testid="projects-index">projects index</div>} />

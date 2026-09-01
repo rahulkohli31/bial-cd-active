@@ -169,6 +169,79 @@ describe('messagesFromProjection', () => {
   })
 })
 
+describe('messagesFromProjection — the loud fallback arm (Plan D U4, L4)', () => {
+  // Until this arm existed the if/else-if chain simply ENDED, so a projection item type this
+  // client did not recognise vanished with no error, no warning and no trace — on the one path a
+  // reloaded transcript is rebuilt from, for both kinds of chat. That is the four-edit change no
+  // compiler enforces, and this is the edit that makes the fourth one impossible to forget.
+
+  it('surfaces an unknown item type instead of swallowing it', () => {
+    const onUnknown = vi.fn()
+    const messages = messagesFromProjection(
+      [
+        { type: 'user_text', seq: 1, text: 'hello' },
+        { type: 'something_the_server_added_last_week', seq: 2, payload: { a: 1 } },
+      ],
+      onUnknown,
+    )
+
+    expect(onUnknown).toHaveBeenCalledTimes(1)
+    // The SHAPE is asserted, not just the count: whoever reads this report needs the type name
+    // and the seq to find the item, and a bare "something was dropped" is not actionable.
+    expect(onUnknown.mock.calls[0][0]).toMatchObject({
+      type: 'something_the_server_added_last_week',
+      seq: 2,
+    })
+    // Liveness, and the deliberate non-behaviour: the rest of the transcript still renders. A
+    // throw here would take a whole conversation down because the server shipped one new item
+    // kind ahead of the browser, which is a routine deployment order.
+    expect(messages).toHaveLength(1)
+    expect(messages[0].parts[0]).toEqual({ type: 'text', text: 'hello' })
+  })
+
+  it('stays silent for turn_terminal, which is KNOWN and deliberately draws nothing', () => {
+    // The distinction the arm exists to draw. "We decided this renders nothing" and "we have
+    // never heard of this" are different facts, and only the second is a bug — collapsing them
+    // would train everyone to ignore the report.
+    const onUnknown = vi.fn()
+    const messages = messagesFromProjection(
+      [{ type: 'turn_terminal', seq: 3, status: 'completed' }],
+      onUnknown,
+    )
+
+    expect(onUnknown).not.toHaveBeenCalled()
+    expect(messages).toEqual([])
+  })
+
+  it('never reports an item it rendered', () => {
+    const onUnknown = vi.fn()
+    messagesFromProjection(
+      [
+        { type: 'user_text', seq: 1, text: 'hi' },
+        { type: 'assistant_text', seq: 2, text: 'hello' },
+        { type: 'step', seq: 3, tool: 'bash', label: 'Read the file', state: 'ok', hidden: false },
+        { type: 'build_in_progress', seq: 4, sessionId: 's1' },
+      ],
+      onUnknown,
+    )
+
+    expect(onUnknown).not.toHaveBeenCalled()
+  })
+
+  it('defaults to a console report when no handler is injected', () => {
+    // The default matters: production has no handler, and the whole point is that the drop is
+    // visible to a developer rather than silent.
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      messagesFromProjection([{ type: 'brand_new_kind', seq: 9 }])
+      expect(spy).toHaveBeenCalledTimes(1)
+      expect(String(spy.mock.calls[0][0])).toMatch(/brand_new_kind/)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+})
+
 describe('createConversation / patchConversation / deleteConversation', () => {
   it('POSTs {id, projectId, kind} (+title/context when given) to the conversations route', async () => {
     // `mode` is gone from CreateConversationArgs and from ConversationHeader — proven from BOTH

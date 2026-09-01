@@ -75,8 +75,8 @@ vi.mock('../../utils/buildSessionApi', async (orig) => ({
 // `switchMode` is GONE — a chat's kind is fixed at creation, so there is no per-thread setting
 // left to switch. A mock factory that still listed it would be mocking an export the real module
 // no longer has; `resolvePlanOptions` is real but unused here (this suite never renders a
-// plan-options card), kept only because `PlanOptionsCard` — still imported by BuilderPage.tsx —
-// reaches for it, so a stray render must not hit the network.
+// plan offer), kept only because the surface reaches for it when an offer is answered, so a stray
+// render must not hit the network.
 vi.mock('../../utils/turnStreamApi', async (orig) => ({
   ...(await orig()),
   startTurn: (...a) => h.startTurn(...a),
@@ -86,7 +86,7 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
   resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
 
-import BuilderPage from '../BuilderPage'
+import ConversationSurface from '../../components/chat/ConversationSurface'
 
 function renderThread(chatId = 'thread-1') {
   const fake = new FakeEventSource(chatId)
@@ -94,7 +94,7 @@ function renderThread(chatId = 'thread-1') {
   return render(
     <MemoryRouter initialEntries={[`/chat/${chatId}`]}>
       <Routes>
-        {inWorkspace(<Route path="/chat/:chatId" element={<BuilderPage projectId="p1" buildSessionDeps={deps} />} />)}
+        {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface projectId="p1" buildSessionDeps={deps} />} />)}
       </Routes>
     </MemoryRouter>,
   )

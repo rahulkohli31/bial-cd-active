@@ -123,7 +123,7 @@ class ToolSurface[DepsT]:
 
 
 async def present_plan_options(ctx: RunContext[Any], plan: str) -> str:
-    """Show the user your plan with the Build this plan and Keep planning buttons beneath it.
+    """Show the user your plan with the Build this plan / Keep planning buttons beneath it.
     Pass the whole plan as `plan` — that text is what the user reads and what a build works
     from, so it has to stand on its own. Call this when the plan is ready; it ends your turn,
     and the user's choice arrives as the result when they decide. Call it again, with the

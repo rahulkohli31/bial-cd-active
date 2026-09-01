@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { FileText, FileSpreadsheet, ImageOff, Presentation } from 'lucide-react'
 import { fetchAttachmentObjectUrl } from '../utils/attachmentApi'
 import { openUrlInNewTab, downloadObjectUrl } from '../utils/attachmentViewer'
-import AttachmentLightbox from './AttachmentLightbox'
+import AttachmentPreview from './chat/AttachmentPreview'
 import type { AttachmentDescriptor } from '../utils/attachmentStore'
 
 /**
@@ -135,7 +135,18 @@ function AttachmentChip({ att }: { att: AttachmentDescriptor }) {
         onClick={() => src && setZoomed(true)}
         className="h-16 w-16 object-cover rounded-lg border border-white/20 bg-white/10 cursor-zoom-in hover:opacity-90 transition"
       />
-      {zoomed && <AttachmentLightbox name={att.name} src={src} onClose={() => setZoomed(false)} />}
+      {/* The hand-rolled full-screen overlay this used to open is gone (Plan D U17). The dialog
+          that replaces it brings a focus trap, `role="dialog"`, `aria-modal` and a scroll lock —
+          none of which the 55-line overlay had, and all of which a modal owes a keyboard user.
+          The ALREADY-FETCHED object URL is handed over rather than the attachment id: the
+          thumbnail above has the bytes, so re-addressing the same file through the API would be a
+          second read of something this component is already holding. */}
+      {zoomed && src && (
+        <AttachmentPreview
+          target={{ name: att.name, mediaType: att.mediaType, dataUrl: src }}
+          onClose={() => setZoomed(false)}
+        />
+      )}
     </>
   )
 }

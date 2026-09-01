@@ -128,6 +128,11 @@ export type DeployOutcome = StartedDeploy | RoutedForReview
 export interface ApprovalState {
   status: AppStatus
   approvedCommitSha: string | null
+  /** WHEN it was approved, beside which commit was. The chip's approved states name the
+   *  date first and mute the build code beside it, because a date is the thing a person
+   *  recognises. Null exactly when `approvedCommitSha` is — the two are written together
+   *  in one place server-side and are never apart. */
+  approvedAt: string | null
   /** WHICH lineage the current submission entered through. A `runbook` approval
    *  authorises the manual go-live runbook and never self-publishing (P5), so anything
    *  rendering "you may publish this" reads the lineage as well as the pin. */
@@ -138,6 +143,42 @@ export interface ApprovalState {
 }
 
 export type DeploymentStatus = 'running' | 'succeeded' | 'failed'
+
+/**
+ * THE publish state (R38) — one server-computed field, spelled exactly as
+ * `backend/src/api/v1/deploy/schemas.py`'s `PublishState` spells it. The server is its
+ * sole author; this union is the client's whole copy, and the chip switches on it and on
+ * nothing else.
+ *
+ * NOTHING HERE RECOMBINES ANYTHING. A client that mirrors a server decision from parts
+ * has produced the same class of bug four times in this one feature
+ * (`docs/solutions/ui-bugs/publish-dialog-scored-unmerged-answers-2026-08-21.md`), most
+ * recently promising "this can publish automatically" moments before the server routed
+ * the app to an administrator. `status` + `unpublishedAt` + `failureCode` + the approval
+ * lineage + the pin are all still on the wire for the version rows to render, but not one
+ * of them is read to decide what state the app is in.
+ *
+ * Three values look alike and are deliberately three, because the sentence under each is
+ * different: `live_current` (the heads agree — nothing of theirs is waiting),
+ * `live_newer_work` (they saved since it went live), and `live_drift_unknown` (the server
+ * could not make the comparison — a storage read that would not answer, or a bundle saved
+ * before the metadata stamp existed). The last one must never be spoken as the first: a
+ * false "nothing of yours is waiting" is the exact failure this feature keeps shipping.
+ */
+export type PublishState =
+  | 'nothing_built'
+  | 'draft'
+  | 'in_review'
+  | 'changes_requested'
+  | 'approved_ready_to_publish'
+  | 'approved_needs_review_again'
+  | 'starting_up'
+  | 'live_current'
+  | 'live_newer_work'
+  | 'live_drift_unknown'
+  | 'taken_offline'
+  | 'switched_off'
+  | 'did_not_start'
 
 /**
  * The latest deploy attempt, or an all-null envelope when there has never been one —
@@ -166,37 +207,30 @@ export interface DeploymentView {
    * meaning — this project has no app row yet — never "we couldn't read it".
    */
   approval: ApprovalState | null
-}
-
-/** Is this deployment actually serving traffic right now? The one predicate every "it's
- *  live" affordance should branch on — succeeded AND not taken down. */
-export function isLive(deployment: DeploymentView | null | undefined): boolean {
-  return deployment?.status === 'succeeded' && !deployment.unpublishedAt
+  /**
+   * THE field the publish surface branches on, and the only one it branches on (R38).
+   * TOTAL — never null, in every response shape including the empty envelope: there is no
+   * state in which the server declines to answer, and a drift it could not determine is
+   * its own value rather than an absent field.
+   */
+  publishState: PublishState
 }
 
 /**
- * Deployment failure codes that are NOT failures — the pipeline stopped because the
- * platform ROUTED this version to an administrator instead (ASM20: modelled as the
- * existing failed terminal state with a distinct code rather than a fourth status,
- * because a partial unique index depends on the status set).
+ * NO PREDICATE OVER THESE FIELDS LIVES HERE ANY MORE, and none may come back. (The names
+ * are deliberately not written out: a retirement guard walks this tree for them.)
  *
- * A LOOKUP, deliberately, rather than an `=== SOME_CONSTANT` comparison: this is the
- * seam the drift-routed publish plugs into, and a set is extended by adding one line
- * with no branch to re-reason about. Every member here renders through
- * `isRoutedForReview` as the informational waiting state and suppresses the red badge.
+ * Four helpers went together, because they were four halves of one mistake. One answered
+ * "is it serving traffic right now" from the status and the takedown stamp. One answered
+ * "was that failed row actually a routing" from a set of codes, and the set was the other.
+ * One turned the pipeline's phase tokens into citizen words. Every one of them re-decided,
+ * on this side of the wire, something the server had already decided — and each was a
+ * place where two surfaces reading one response could still disagree.
  *
- * `classification_below_threshold` is DELIBERATELY ABSENT and must not come back: the
- * terminal refusal it named was retired in U9 — the declaration that used to dead-end
- * now routes into a real queue — and the gate no longer emits it at all.
+ * `publishState` is where all four answers come from now. If a consumer needs one of them
+ * and the field cannot say it, the fix belongs in the server that authors the field, not
+ * in a helper here.
  */
-const ROUTED_FAILURE_CODES: ReadonlySet<string> = new Set(['routed_for_review'])
-
-/** Did this deploy stop because the version was routed for review rather than because
- *  something broke? The one predicate both publish surfaces branch on to choose the
- *  informational presentation over the red failure badge. */
-export function isRoutedForReview(failureCode: string | null | undefined): boolean {
-  return typeof failureCode === 'string' && ROUTED_FAILURE_CODES.has(failureCode)
-}
 
 /** The 409 raised when the workspace is ahead of the last save; retry with `saveFirst`. */
 export const UNSAVED_CHANGES = 'unsaved_changes'
@@ -247,11 +281,85 @@ function toApprovalState(value: unknown): ApprovalState | null {
   return {
     status: toAppStatus(value.status),
     approvedCommitSha: optionalString(value.approvedCommitSha),
+    approvedAt: optionalString(value.approvedAt),
     approvalRoute: toApprovalRoute(value.approvalRoute),
     rejectionNote: optionalString(value.rejectionNote),
     submittedSha: optionalString(value.submittedSha),
     submittedAt: optionalString(value.submittedAt),
   }
+}
+
+const PUBLISH_STATES: ReadonlySet<string> = new Set<PublishState>([
+  'nothing_built',
+  'draft',
+  'in_review',
+  'changes_requested',
+  'approved_ready_to_publish',
+  'approved_needs_review_again',
+  'starting_up',
+  'live_current',
+  'live_newer_work',
+  'live_drift_unknown',
+  'taken_offline',
+  'switched_off',
+  'did_not_start',
+])
+
+/**
+ * THE publish state, parsed once here so nothing downstream re-checks a raw record.
+ *
+ * IT THROWS, and the reversal recorded twenty lines up at `toApprovalRoute` does not
+ * apply. That reversal was for a SUPPLEMENTARY field: an unknown lineage could be
+ * answered `null` — the conservative reading — while the surface still rendered
+ * everything else. Here the field IS the surface. There is no conservative reading of
+ * "we do not know what state this app is in" that is not itself a claim, and the two
+ * candidates are both worse than throwing: guessing a state lies, and rendering nothing
+ * is indistinguishable from a broken page on the only publishing surface the citizen
+ * has. So it throws, and the chip owns what that looks like — one honest read-failure
+ * chip with a re-read and no action, never a blank space where the affordance was.
+ * A missing value throws for the same reason: a total field with a hole is a server
+ * contract break, not a state.
+ *
+ * ── THE MIRROR-GAP REGISTER (L12) ──────────────────────────────────────────────────
+ * L12 asks that a client mirroring a server decision either mirror the whole decision or
+ * not at all, and that where it provably cannot see an input, the gap is written down
+ * and proved one-directional. This client does not mirror the decision at all — it
+ * consumes it — so what follows is the list of what it could never have seen anyway, and
+ * why each gap can only ever cost a press, never a wrong promise.
+ *
+ * 1. THE TREE THE DECISION IS TAKEN AGAINST MAY BE SAVED INSIDE THE SAME REQUEST. This
+ *    is the load-bearing one. `saveFirst` writes a new snapshot before the ladder runs,
+ *    and ladder rule 3a defers to the pipeline, so the commit that gets judged need not
+ *    exist when this read is taken. No read taken before the press can predict the
+ *    outcome. ONE-DIRECTIONAL because the chip never promises an outcome: its button
+ *    states the ceiling of what the press will attempt, and the server's answer states
+ *    what happened. Publishing directly where the button said "Send update for review"
+ *    reads as the better outcome, not as a contradiction.
+ * 2. THE MERGED CLASSIFICATION SCORE. The server merges the STORED review with the
+ *    submitted answers and scores inside the request. The weights in this module are a
+ *    hand-kept duplicate that decides nothing (see the header) — the local total drives
+ *    the running tally and the explanation prompt and never withholds the button.
+ *    ONE-DIRECTIONAL: a refusal the server issues with its own explanation is the correct
+ *    outcome, never a UI failure to prevent.
+ * 3. THE SAVED SNAPSHOT'S HEAD. The server spends its one object-store metadata HEAD on
+ *    the drift comparison and serves the ANSWER, not the head. So the client cannot
+ *    compute drift and therefore cannot contradict the server about it — including that
+ *    it cannot quietly resolve `live_drift_unknown` to `live_current`.
+ * 4. THE COORDINATION LOCKS. `build_in_flight` (Redis) and `deploy_in_flight` (a
+ *    deployments-table predicate) are refusals taken against state this read never
+ *    queries. ONE-DIRECTIONAL: they arrive as a refusal after a press, with the server's
+ *    own sentence, never as a button this surface withheld on a guess.
+ * 5. OWNERSHIP. The gate is enforced with an ownership predicate in the query, not by
+ *    this surface offering or withholding anything. A chip that offered nothing would
+ *    still be refused if the request were forged, which is why nothing here is a security
+ *    control.
+ * ───────────────────────────────────────────────────────────────────────────────────
+ */
+function toPublishState(value: unknown): PublishState {
+  if (typeof value === 'string' && PUBLISH_STATES.has(value)) {
+    return value as PublishState
+  }
+  throw new ApiError('The server sent a publish state we could not read.', 500)
 }
 
 function toDeployOutcome(body: unknown): DeployOutcome {
@@ -293,6 +401,7 @@ function toDeploymentView(body: unknown): DeploymentView {
     finishedAt: optionalString(body.finishedAt),
     unpublishedAt: optionalString(body.unpublishedAt),
     approval: toApprovalState(body.approval),
+    publishState: toPublishState(body.publishState),
   }
 }
 
@@ -346,26 +455,4 @@ export async function getDeployment(
   )
   if (!res.ok) throw await readApiError(res, 'Failed to read the deployment')
   return toDeploymentView(await res.json())
-}
-
-/** Plain-language copy for the pipeline's phase labels. The server calls `step` display-only
- *  and never branches on it, so an unrecognised phase falls back to something honest rather
- *  than rendering a raw token or, worse, throwing. */
-export function stepLabel(step: string | null): string {
-  switch (step) {
-    case 'claimed':
-      return 'Getting ready'
-    case 'packing':
-      return 'Packaging your app'
-    case 'building':
-      return 'Building'
-    case 'provisioning':
-      return 'Setting up the server'
-    case 'starting':
-      return 'Starting it up'
-    case 'live':
-      return 'Live'
-    default:
-      return 'Working'
-  }
 }

@@ -85,3 +85,49 @@ body {
 .scrollbar-thin::-webkit-scrollbar { width: 4px; }
 .scrollbar-thin::-webkit-scrollbar-track { background: #f1f5f9; }
 .scrollbar-thin::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 2px; }
+
+/* ── The shimmer, hand-written, because `tw-shimmer` is Tailwind v4 only ──────────────
+   The assistant-ui `tool-group` source labels a running group with `ShimmerLabel`, which
+   comes from the npm package `tw-shimmer`. That package declares
+   `peerDependencies: { tailwindcss: ">=4.0.0-0" }` and ships `@property` + `@theme inline`
+   + `@utility` — none of which Tailwind 3.4.17 understands. Installing it would add a
+   dependency whose CSS this build passes through as dead text, so the label would simply
+   not animate and nothing would say so.
+
+   One keyframe replaces the whole package. It paints the text with a moving highlight
+   rather than pulsing opacity, so a long running label stays readable while it moves.
+
+   Reduced motion is honoured, and it is honoured by removing the gradient too, not just
+   the animation: a background-clipped transparent text colour with a FROZEN gradient
+   renders as a static two-tone smear. The same discipline is already written down in
+   `components/chat/ToolActivityLine.tsx`, which gates its spinner the same way. */
+@keyframes shimmer {
+  from { background-position: 150% 0; }
+  to   { background-position: -50% 0; }
+}
+
+.shimmer {
+  background-image: linear-gradient(
+    90deg,
+    hsl(var(--muted-foreground)) 0%,
+    hsl(var(--muted-foreground)) 40%,
+    hsl(var(--foreground)) 50%,
+    hsl(var(--muted-foreground)) 60%,
+    hsl(var(--muted-foreground)) 100%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: shimmer 2.4s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shimmer {
+    background-image: none;
+    -webkit-background-clip: border-box;
+    background-clip: border-box;
+    color: hsl(var(--muted-foreground));
+    animation: none;
+  }
+}

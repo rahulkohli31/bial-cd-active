@@ -7,7 +7,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
 import { usePendingAttachments } from '../usePendingAttachments'
-import type { PendingAttachment } from '../../utils/attachmentInput'
+import { MAX_FILES_PER_MESSAGE, type PendingAttachment } from '../../utils/attachmentInput'
 
 const h = vi.hoisted(() => ({
   fileToBase64: vi.fn(),
@@ -117,5 +117,54 @@ describe('usePendingAttachments — restorePending', () => {
     })
 
     expect(result.current.pendingAttachments.map((a) => a.id)).toEqual(['r1'])
+  })
+
+  // ── R57 — THE CAP BYPASS ──────────────────────────────────────────────────────────────────
+  //
+  // This merged with NO `MAX_FILES_PER_MESSAGE` clamp while `handleFiles` twenty lines above had
+  // one, so five staged plus five restored became ten and ten became fifteen — and because the
+  // per-conversation text budget is computed from what is staged, that doubled too. It was
+  // pinned by nothing, and the composer's own docblock claimed it was fixed when it was not.
+
+  it('clamps the RESTORED batch to the per-message cap, and says one was dropped', () => {
+    const { result } = renderHook(() => usePendingAttachments())
+    const batch = (prefix: string, n: number) =>
+      Array.from({ length: n }, (_, i) => attachment(`${prefix}${i}`, `${prefix}${i}.png`))
+
+    // Four already staged, three handed back by a failed send: only one fits.
+    act(() => result.current.restorePending(batch('a', MAX_FILES_PER_MESSAGE - 1)))
+    expect(result.current.pendingAttachments).toHaveLength(MAX_FILES_PER_MESSAGE - 1)
+
+    act(() => result.current.restorePending(batch('b', 3)))
+
+    expect(result.current.pendingAttachments).toHaveLength(MAX_FILES_PER_MESSAGE)
+    // ASSERT THE COUNT, not merely the absence of an error: a bypass that let all three through
+    // would also produce no error, and that is the bug.
+    expect(result.current.attachToast).toMatch(/2 files couldn’t be put back/i)
+  })
+
+  it('clamps the RESTORED items, never the ones the user just staged', () => {
+    // THE ASYMMETRY IS THE DESIGN. A citizen can SEE the files they just picked and cannot see
+    // the ones a failed send is handing back, so dropping the visible ones reads as the app
+    // eating their work while dropping the invisible ones is a limit being enforced.
+    const { result } = renderHook(() => usePendingAttachments())
+    const staged = Array.from({ length: MAX_FILES_PER_MESSAGE }, (_, i) =>
+      attachment(`mine${i}`, `mine${i}.png`),
+    )
+    act(() => result.current.restorePending(staged))
+
+    act(() => result.current.restorePending([attachment('back1', 'restored.png')]))
+
+    expect(result.current.pendingAttachments.map((a) => a.id)).toEqual(staged.map((a) => a.id))
+    expect(result.current.attachToast).toMatch(/one file couldn’t be put back/i)
+  })
+
+  it('says nothing when the whole batch fits', () => {
+    // The liveness half: the clamp must be silent on the ordinary path, or every successful
+    // restore would apologise for nothing.
+    const { result } = renderHook(() => usePendingAttachments())
+    act(() => result.current.restorePending([attachment('r1', 'restored.png')]))
+    expect(result.current.pendingAttachments).toHaveLength(1)
+    expect(result.current.attachToast).toBeNull()
   })
 })

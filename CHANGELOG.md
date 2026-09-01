@@ -55,6 +55,83 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   each other. The census they were trying to state is now a test that fails when it stops being
   true, which a comment could never do.
 
+## [1.7.2] - 2026-09-01
+
+### Changed
+
+- **The chat is one screen now.** Planning a change and building it used to be two different
+  pages that looked and behaved differently — different scrolling, a different composer, a
+  different idea of what a message is. There is one surface, and which kind of chat you are in
+  changes the placeholder and nothing else.
+- **What the app is doing is written where it happened.** The build used to narrate itself in a
+  card pinned to the bottom of the screen, which erased and rewrote itself as it went and left
+  nothing behind. The steps now sit in the conversation, in order, grouped by the run they
+  belong to, and they are still there next week. A run that hit a problem says so and opens
+  itself; a run that went cleanly stays collapsed to a single line.
+- **Stop moved to the composer**, where the rest of the controls are, and it no longer goes dead
+  under your cursor when you press it.
+- Attachments open over the conversation instead of in a new browser tab, so you keep your place
+  and the reply keeps arriving behind them.
+- The plan offer is a strip on the composer rather than a card in the transcript, and there is
+  exactly one Build control on the screen.
+
+### Fixed
+
+- **A refused message is no longer lost.** If the server turned a message down — the daily limit
+  reached, a build already running, the service unavailable — the composer had already emptied
+  itself by the time the refusal arrived, and the text and any attached files were gone with no
+  way to get them back. The box now empties only once the server has actually accepted the
+  message.
+- **A file attached in one chat no longer follows you into the next one**, where it would have
+  been sent to a conversation you never attached it to.
+- Pressing Enter twice quickly no longer clears the box for the press it ignored.
+- A message turned down while you were looking at another chat no longer leaves that chat unable
+  to send anything for the rest of the session.
+- When sending is refused, the reason is the one that applies — the daily limit, a build in
+  progress, the attachment limit — instead of one generic sentence for all of them.
+- **Attached spreadsheets and text files no longer print their whole contents into the
+  conversation**, and attached images and PDFs show up at all. Both were introduced by the
+  rebuild and are fixed in it.
+- Screen readers are told what a run of work amounted to when it finishes, not only that it
+  started — and are no longer read a summary of every past build when an old chat is opened.
+- The assistant now names the plan buttons the way the screen does.
+
+## [1.7.1] - 2026-09-01
+
+### Changed
+
+- **Publishing is one chip beside your project's name.** The Publish card, the Review &
+  approval card and the small button in the builder's toolbar are gone; there is one chip,
+  it says where your app stands, and pressing it opens one sentence and — where there is
+  something to do — exactly one button. Where there is nothing to do there is no button,
+  rather than one that fails when pressed.
+- **The chip stops guessing.** Every label it shows is read from a single answer the server
+  works out, instead of each screen recombining the same four or five fields and sometimes
+  reaching a different conclusion. That guesswork had produced the same kind of mistake four
+  times in this one feature, most recently promising "this can publish automatically" beside
+  a Publish button moments before the app was sent to an administrator instead.
+- **Being live and having newer unsaved work are now visibly different**, without opening
+  anything. A published app with nothing newer reads "Live"; one you have saved since reads
+  "Live · newer work saved"; and on the rare occasion the platform cannot check, it says so
+  plainly rather than telling you nothing of yours is waiting.
+- **"Taken offline" and "Switched off" are two different things again**, because they have
+  two different remedies — a taken-offline app can be published straight back to the same
+  address, and a switched-off one cannot be published at all until an administrator says so.
+- **Approved apps say they are approved and stop there.** The old wording promised whether
+  pressing Publish would publish or send for review; that promise was not the interface's to
+  make, because the decision is taken inside the request against a version that can change on
+  the way. The button now says what it will attempt and the answer says what happened.
+- The word "deploy", and the pipeline's own vocabulary — "Packaging your app", "Setting up
+  the server" — are gone from everything you read. While a publish runs, the chip says
+  "Starting up".
+
+### Added
+
+- **"Take it back."** A version waiting with an administrator can be withdrawn from the chip,
+  with one confirmation. This existed on the server and in the old review card; carrying it
+  across is what keeps you from being stuck behind a decision that is not yours to make.
+- The chip now shows **when** a version was approved, not only which one.
+
 ## [1.7.0] - 2026-09-01
 
 ### Added

@@ -95,6 +95,34 @@ export default {
         manrope: ['Manrope', 'sans-serif'],
         worksans: ['"Work Sans"', 'sans-serif'],
       },
+      // `--radius` has been declared in index.css since the shadcn token prep and was never
+      // wired to a Tailwind key, so every `rounded-lg` in a copied component silently fell
+      // back to Tailwind's STOCK radius. That is not a visible error — it is a component
+      // that looks almost right — which is the whole failure class the token guard exists
+      // for. These three names are the shadcn convention and are what copied sources use.
+      borderRadius: {
+        lg: 'var(--radius)',
+        md: 'calc(var(--radius) - 2px)',
+        sm: 'calc(var(--radius) - 4px)',
+      },
+      // Radix Collapsible drives the activity group's expand-in-place. It measures the
+      // panel and publishes `--radix-collapsible-content-height`; the animation is ours to
+      // declare. `tailwindcss-animate` does NOT ship these — it ships enter/exit utilities —
+      // so `animate-collapsible-down` resolves to nothing without this and the group snaps.
+      keyframes: {
+        'collapsible-down': {
+          from: { height: '0' },
+          to: { height: 'var(--radix-collapsible-content-height)' },
+        },
+        'collapsible-up': {
+          from: { height: 'var(--radix-collapsible-content-height)' },
+          to: { height: '0' },
+        },
+      },
+      animation: {
+        'collapsible-down': 'collapsible-down 0.2s ease-out',
+        'collapsible-up': 'collapsible-up 0.2s ease-out',
+      },
     },
   },
   plugins: [require('@tailwindcss/typography'), require('tailwindcss-animate')],

@@ -55,13 +55,9 @@ const h = vi.hoisted(() => ({
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
 }))
 
-// The relay serves BOTH pages here: BuilderPage's interview turns (which return the brief card) and
-// ChatPage's planning turns.
-vi.mock('../../hooks/useClaudeAPI', () => ({
-  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null, clearError: vi.fn(), abort: vi.fn() }),
-  getContextLimits: () => ({ soft: 1e9, hard: 1e9 }),
-  estimateConversationTokens: () => 0,
-}))
+// THE LEGACY RELAY MOCK IS GONE WITH THE HOOK (Plan D U17). Both kinds of chat run on the turn
+// stream now, so the mock below is the only transport this file needs — where it used to need two,
+// one per page.
 vi.mock('../../utils/turnStreamApi', async (orig) => ({
   ...(await orig()),
   startTurn: (...a) => h.startTurn(...a),
@@ -87,8 +83,7 @@ vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../components/LivePreview', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
 
-import BuilderPage from '../BuilderPage'
-import ChatPage from '../ChatPage'
+import ConversationSurface from '../../components/chat/ConversationSurface'
 
 /**
  * The browser's Back button, as a thing a test can press. Rendered as a sibling of the routed
@@ -107,7 +102,7 @@ function renderBuilder(chatId, projectId = 'p1') {
     <MemoryRouter initialEntries={[`/chat/${chatId}`]}>
       <BackButton />
       <Routes>
-        <Route path="/chat/:chatId" element={<BuilderPage projectId={projectId} projectName="VIP Movement" buildSessionDeps={deps} />} />
+        <Route path="/chat/:chatId" element={<ConversationSurface projectId={projectId} projectName="VIP Movement" buildSessionDeps={deps} />} />
       </Routes>
     </MemoryRouter>,
   )
@@ -124,7 +119,7 @@ async function sendFrom(container, text = 'make it blue') {
 
 /** Confirm the newest brief card — the page's only build trigger. Started cards read "Building…". */
 async function confirmBrief(container) {
-  const button = await within(container).findByRole('button', { name: /^Build it$/ })
+  const button = await within(container).findByRole('button', { name: /^Build this plan$/ })
   fireEvent.click(button)
   return button
 }
@@ -144,7 +139,7 @@ let turn
 
 /** The card the newest turn produced, i.e. the one a confirmation's error lands on. */
 async function lastCard(container) {
-  const cards = await within(container).findAllByTestId('plan-options-card')
+  const cards = await within(container).findAllByTestId('offer-strip')
   return cards[cards.length - 1]
 }
 
@@ -219,15 +214,15 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     // A's handoff carried the minted id, and its page followed it — the claim is for THAT chat,
     // not the one the button was pressed in.
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledWith('build-A', PLAN_CARD_ID, 'new-A'))
-    await within(a.container).findByTestId('build-progress') // A's build is live → claim held on 'new-A'
+    await within(a.container).findByTestId('stop-turn') // A's build is live → claim held on 'new-A'
 
     const b = renderBuilder('build-B')
     await within(b.container).findByPlaceholderText(/describe what you need/i)
     await flushChannel() // let B learn about A's claim over the channel
     await buildFrom(b.container, 'and add a table')
 
-    const card = await lastCard(b.container)
-    const warning = await within(card).findByRole('alert')
+    await lastCard(b.container) // wait for the offer to be on screen before reading the refusal
+    const warning = await within(b.container).findByTestId('urgent-banner')
     expect(/already building this project/i.test(warning.textContent)).toBe(true)
     expect(/First build/.test(warning.textContent)).toBe(true) // named the holder, not "some other tab"
     // B never started a build — only A's handoff fired.
@@ -238,7 +233,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     mintBuild('new-A', 'A build')
     const a = renderBuilder('build-A', 'p1')
     await buildFrom(a.container)
-    await within(a.container).findByTestId('build-progress')
+    await within(a.container).findByTestId('stop-turn')
 
     mintBuild('new-B', 'B build')
     const b = renderBuilder('build-B', 'p2')
@@ -253,7 +248,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     mintBuild('new-A', 'First build')
     const a = renderBuilder('build-A')
     await buildFrom(a.container, 'build it')
-    await within(a.container).findByTestId('build-progress')
+    await within(a.container).findByTestId('stop-turn')
     expect(h.buildFromPlan).toHaveBeenCalledTimes(1)
 
     // End A's first build — its claim on 'new-A' retracts once `endGenerating` runs at the
@@ -265,7 +260,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     // the honest proxy: it is the one DOM change this page actually makes when the turn ends.
     await turn.frame(T_BUILD_END())
     await turn.end()
-    await waitFor(() => expect(within(a.container).queryByTestId('build-progress')).toBeNull())
+    await waitFor(() => expect(within(a.container).queryByTestId('stop-turn')).toBeNull())
 
     // Refine from A's now-adopted chat — POST-build (U16: A's composer is shut while A's agent
     // works, so the refine can only be asked for once the build is over). The press hands off
@@ -281,15 +276,15 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     // BuilderPage.tsx — see its own docblock); `h.stop` pins that the retired stop-a-live-session
     // arm is never reached on this path, not that a candidate was found and skipped.
     expect(h.stop).not.toHaveBeenCalled()
-    await within(a.container).findByTestId('build-progress')
+    await within(a.container).findByTestId('stop-turn')
 
     const b = renderBuilder('build-B')
     await within(b.container).findByPlaceholderText(/describe what you need/i)
     await flushChannel() // let B learn about A's re-acquired claim
     await buildFrom(b.container, 'me too')
 
-    const card = await lastCard(b.container)
-    expect(/already building this project/i.test((await within(card).findByRole('alert')).textContent)).toBe(true)
+    await lastCard(b.container) // wait for the offer to be on screen before reading the refusal
+    expect(/already building this project/i.test((await within(b.container).findByTestId('urgent-banner')).textContent)).toBe(true)
     expect(h.buildFromPlan).toHaveBeenCalledTimes(2) // only A's two starts — B never started
   })
 
@@ -303,15 +298,15 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     h.buildFromPlan.mockResolvedValueOnce({ outcome: 'already_started', chatId: 'new-A', turnId: BUILD_TURN_ID })
     const a = renderBuilder('build-A')
     await buildFrom(a.container)
-    await within(a.container).findByTestId('build-progress') // joined → A's build is live
+    await within(a.container).findByTestId('stop-turn') // joined → A's build is live
 
     const b = renderBuilder('build-B')
     await within(b.container).findByPlaceholderText(/describe what you need/i)
     await flushChannel() // let B learn about A's claim
     await buildFrom(b.container, 'me too')
 
-    const card = await lastCard(b.container)
-    expect(/already building this project/i.test((await within(card).findByRole('alert')).textContent)).toBe(true)
+    await lastCard(b.container) // wait for the offer to be on screen before reading the refusal
+    expect(/already building this project/i.test((await within(b.container).findByTestId('urgent-banner')).textContent)).toBe(true)
     expect(h.buildFromPlan).toHaveBeenCalledTimes(1) // only A's transition — B never started
   })
 
@@ -319,14 +314,14 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     mintBuild('new-A', 'First build')
     const a = renderBuilder('build-A')
     await buildFrom(a.container)
-    await within(a.container).findByTestId('build-progress')
+    await within(a.container).findByTestId('stop-turn')
 
     const b = renderBuilder('build-B')
     await within(b.container).findByPlaceholderText(/describe what you need/i)
     await flushChannel()
     await buildFrom(b.container, 'wait for me')
-    const card = await lastCard(b.container)
-    expect(/already building this project/i.test((await within(card).findByRole('alert')).textContent)).toBe(true)
+    await lastCard(b.container) // wait for the offer to be on screen before reading the refusal
+    expect(/already building this project/i.test((await within(b.container).findByTestId('urgent-banner')).textContent)).toBe(true)
     expect(h.buildFromPlan).toHaveBeenCalledTimes(1)
 
     // A's build ends → its advisory claim retracts once `endGenerating` runs at the reattach's
@@ -336,13 +331,14 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     // turn actually ended.
     await turn.frame(T_BUILD_END())
     await turn.end()
-    await waitFor(() => expect(within(a.container).queryByTestId('build-progress')).toBeNull())
+    await waitFor(() => expect(within(a.container).queryByTestId('stop-turn')).toBeNull())
     await flushChannel() // let the retract reach B
 
-    // B's blocked card re-armed as a retry, so the brief it already holds is now buildable —
-    // which is itself another Build-it press, so it mints (and claims) a fresh chat too.
+    // B's offer was never spent by the refused press, so the plan it already holds is buildable
+    // again the moment the claim retracts — which is itself another press, so it mints (and
+    // claims) a fresh chat too.
     mintBuild('new-B', 'Second build')
-    fireEvent.click(within(card).getByRole('button', { name: /^Build it$/ }))
+    fireEvent.click(within(await lastCard(b.container)).getByRole('button', { name: /^Build this plan$/ }))
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledTimes(2))
     expect(h.buildFromPlan).toHaveBeenLastCalledWith('build-B', PLAN_CARD_ID, 'new-B')
   })
@@ -420,29 +416,31 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
   })
 })
 
-describe('ChatPage — a planning chat is never blocked by a build', () => {
-  it('sends freely while a build session is live in the same project', async () => {
+describe('a SIBLING conversation is never blocked by another chat\u2019s build', () => {
+  // RE-POINTED, NOT DELETED (Plan D U17). This used to mount `ChatPage` beside the builder,
+  // because a planning chat was a different component on a different transport and the claim was
+  // that the build lock did not reach it. One surface serves both kinds now, so the same claim is
+  // made the way it can be made: a SECOND conversation, mounted through the same surface, sends
+  // while the first one's build holds the project's advisory claim.
+  //
+  // The claim is still worth pinning, and arguably more so: with one component the risk that a
+  // project-scoped lock leaks into a sibling chat is higher, not lower, than when the two were
+  // separate files.
+  it('sends freely while a build is live in another chat of the same project', async () => {
     mintBuild('new-A', 'First build')
     const a = renderBuilder('build-A')
     await buildFrom(a.container)
-    await within(a.container).findByTestId('build-progress')
+    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
 
     h.listProjectConversations.mockResolvedValue([])
-    const plan = render(
-      <MemoryRouter initialEntries={['/chat/plan-1?projectId=p1&kind=plan']}>
-        <Routes>
-          <Route path="/chat/:chatId" element={<ChatPage projectId="p1" projectName="VIP Movement" />} />
-        </Routes>
-      </MemoryRouter>,
-    )
-    // Both pages relay through the same mock, so A's interview turn would satisfy a bare
-    // toHaveBeenCalled(). Only the planning turn may count.
-    h.sendMessage.mockClear()
-    h.sendMessage.mockResolvedValue('a plan')
-    const textarea = await waitFor(() => plan.container.querySelector('textarea[placeholder*="thinking"]'))
-    fireEvent.change(textarea, { target: { value: 'what should this do?' } })
-    fireEvent.keyDown(textarea, { key: 'Enter' })
+    h.startTurn.mockClear()
+    const sibling = renderBuilder('chat-B')
 
-    await waitFor(() => expect(h.sendMessage).toHaveBeenCalled()) // the planning turn never consulted the lock
+    const box = await within(sibling.container).findByTestId('composer-input')
+    fireEvent.change(box, { target: { value: 'what should this do?' } })
+    fireEvent.keyDown(box, { key: 'Enter' })
+
+    // The sibling's turn reached the server: the lock gates BUILD presses, never sends.
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalled())
   })
 })
