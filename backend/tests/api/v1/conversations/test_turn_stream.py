@@ -70,7 +70,7 @@ def _fresh_engine():
 
 @pytest.fixture(autouse=True)
 def _override_billing(app, db_session) -> None:
-    from src.api.v1.claude.router import billing_session_factory
+    from src.api.v1.conversations._shared import billing_session_factory
 
     @contextlib.asynccontextmanager
     async def _session():
@@ -82,7 +82,7 @@ def _override_billing(app, db_session) -> None:
 @pytest.fixture
 def set_chat_model(app):
     def _set(model) -> None:
-        from src.api.v1.claude.router import chat_model
+        from src.api.v1.conversations._shared import chat_model
 
         app.dependency_overrides[chat_model] = lambda: model
 

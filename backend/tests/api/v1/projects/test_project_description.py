@@ -15,9 +15,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from sqlalchemy import delete, select
 
-from src.api.v1.claude.prompts import ASSISTANT_IDENTITY_PROMPT, PORTAL_SELF_DESCRIPTION
 from src.config import settings
-from src.db.models.conversation import ChatKind
 from src.db.models.project import Project
 from src.db.models.token_usage import TokenUsage
 from src.db.models.user_limit import UserLimit
@@ -25,23 +23,9 @@ from src.services.auth.session_jwt import mint_session_jwt
 from src.services.usage.gate import record_usage
 from tests.factories import (
     AppRegistryFactory,
-    ConversationFactory,
     ProjectFactory,
     UserFactory,
 )
-
-
-def _capturing_stream_model():
-    """A streaming FunctionModel that records the system prompt (agent instructions) the
-    model actually received — the fake 'model client' the U8/U11 injection is asserted against."""
-    captured: dict[str, str] = {}
-
-    async def _stream(messages, info):
-        captured["instructions"] = info.instructions or ""
-        yield "streamed"
-
-    return FunctionModel(stream_function=_stream), captured
-
 
 _TTL = settings.auth.access_ttl_seconds
 _CODE = {"current": {"source": "export default () => <div>VIP movement</div>", "entry": "App"}}
@@ -271,7 +255,7 @@ async def test_generate_requires_auth_401(client) -> None:
 async def test_generate_not_configured_returns_503(client, db_session) -> None:
     # No model override → the shared `chat_model` dependency returns None (Foundry unset in
     # test) → 503, fired BEFORE any app/code lookup (a fresh project is still a 503, not the
-    # 409 "nothing to generate"). Mirrors claude test_not_configured_returns_503.
+    # 409 "nothing to generate").
     headers, user = await _auth(db_session)
     project = await ProjectFactory.create(db_session, user.id)
     resp = await client.post(f"/v1/projects/{project.id}/description:generate", headers=headers)
@@ -345,87 +329,10 @@ async def test_generate_losing_race_to_delete_is_404_and_rolls_back_billing(
 
 
 # --- U8: description injected as shared chat context (R16) ---------------------
-
-
-async def test_description_injected_into_chat_context(client, db_session, set_chat_model) -> None:
-    model, captured = _capturing_stream_model()
-    set_chat_model(model)
-    headers, user = await _auth(db_session)
-    project = await ProjectFactory.create(
-        db_session, user.id, name="VIP", description="Tracks VIP movements at BIAL."
-    )
-    conv = await ConversationFactory.create(
-        db_session, user.id, project_id=project.id, kind=ChatKind.PLAN
-    )
-
-    resp = await client.post(
-        "/v1/claude",
-        headers=headers,
-        json={"conversationId": str(conv.id), "message": {"text": "hi"}},
-    )
-    assert resp.status_code == 200
-    assert "Tracks VIP movements at BIAL." in captured["instructions"]
-
-
-async def test_null_description_adds_no_project_block(client, db_session, set_chat_model) -> None:
-    model, captured = _capturing_stream_model()
-    set_chat_model(model)
-    headers, user = await _auth(db_session)
-    project = await ProjectFactory.create(db_session, user.id)  # NULL description
-    conv = await ConversationFactory.create(
-        db_session, user.id, project_id=project.id, kind=ChatKind.PLAN
-    )
-
-    resp = await client.post(
-        "/v1/claude",
-        headers=headers,
-        json={"conversationId": str(conv.id), "message": {"text": "hi"}},
-    )
-    assert resp.status_code == 200
-    # No PROJECT additions for a null description — the composition is exactly the
-    # server-composed base (U7) + the unconditional portal self-description (#6).
-    #
-    # THE PER-KIND BASE-PROMPT SELECTION IS GONE with the three-valued kind enum this test
-    # used to pin against (`PLANNING_SYSTEM_PROMPT`) — every conversation, Plan included,
-    # gets `ASSISTANT_IDENTITY_PROMPT` now (toolset gating, not the relay prompt, is what a
-    # Plan kind actually restricts).
-    assert captured["instructions"] == ASSISTANT_IDENTITY_PROMPT + "\n\n" + PORTAL_SELF_DESCRIPTION
-
-
-async def test_unknown_conversation_id_is_a_404(client, db_session, set_chat_model) -> None:
-    # U7: conversations are created BEFORE the first turn, so an unknown id is a client bug —
-    # the old stream-anyway no-op arm is retired with the browser payload.
-    model, _captured = _capturing_stream_model()
-    set_chat_model(model)
-    headers, _ = await _auth(db_session)
-    resp = await client.post(
-        "/v1/claude",
-        headers=headers,
-        json={"conversationId": str(uuid.uuid4()), "message": {"text": "hi"}},
-    )
-    assert resp.status_code == 404
-    assert resp.json() == {"error": {"message": "Conversation not found."}}
-
-
-async def test_two_conversations_share_the_same_description(
-    client, db_session, set_chat_model
-) -> None:
-    headers, user = await _auth(db_session)
-    project = await ProjectFactory.create(
-        db_session, user.id, description="Shared grounding text."
-    )
-    seen: list[str] = []
-    for _ in range(2):
-        conv = await ConversationFactory.create(
-            db_session, user.id, project_id=project.id, kind=ChatKind.PLAN
-        )
-        model, captured = _capturing_stream_model()
-        set_chat_model(model)
-        resp = await client.post(
-            "/v1/claude",
-            headers=headers,
-            json={"conversationId": str(conv.id), "message": {"text": "hi"}},
-        )
-        assert resp.status_code == 200
-        seen.append(captured["instructions"])
-    assert all("Shared grounding text." in instructions for instructions in seen)
+#
+# MOVED, not dropped. These four tests posted to the retired `POST /v1/claude` relay and
+# asserted its `_compose_system` output. The property — a turn is grounded in its project's
+# description, and never in another user's — now lives at the surface that actually sends:
+# `tests/api/v1/conversations/test_project_grounding.py`. What stays in this file is the
+# `description:generate` ENDPOINT, which is a different thing from where a description is
+# later read.
