@@ -17,9 +17,6 @@ from src.services.messages.projection import (
     PlanOptionsItem as PlanOptionsItem,
 )
 from src.services.messages.projection import (
-    StepDetail as StepDetail,
-)
-from src.services.messages.projection import (
     StepItem as StepItem,
 )
 from src.services.messages.projection import (
@@ -62,9 +59,6 @@ from src.services.messages.store import (
     append_batch as append_batch,
 )
 from src.services.messages.store import (
-    append_mode_switch_marker as append_mode_switch_marker,
-)
-from src.services.messages.store import (
     attachment_rehydrator as attachment_rehydrator,
 )
 from src.services.messages.store import (
@@ -75,9 +69,6 @@ from src.services.messages.store import (
 )
 from src.services.messages.store import (
     load_rows as load_rows,
-)
-from src.services.messages.store import (
-    mode_switch_marker_text as mode_switch_marker_text,
 )
 from src.services.messages.store import (
     repair_dangling_tool_calls as repair_dangling_tool_calls,

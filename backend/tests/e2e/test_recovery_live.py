@@ -4,8 +4,8 @@ Real sandbox containers, real git, real Azurite, real Redis, real PostgreSQL. Se
 
 ON `may_write` (read once, then every call site below reads itself):
 
-`may_write` is not a free knob — it MIRRORS THE TURN'S TOOLSET. `toolsets_for_mode` hands the
-mutating `sandbox_toolset` to `ConversationMode.WRITE` and to nothing else, every
+`may_write` is not a free knob — it MIRRORS THE TURN'S TOOLSET. `toolsets_for_kind` hands the
+mutating `sandbox_toolset` to `ChatKind.BUILD` and to nothing else, every
 `workspace_touched = True` lives inside that toolset, and `workspace_touched` is the only thing
 the engine derives `finish_turn_sandbox(touched=...)` from. So in production `may_write=False`
 implies `touched=False`, always; a read-only turn paired with `touched=True` is a turn that

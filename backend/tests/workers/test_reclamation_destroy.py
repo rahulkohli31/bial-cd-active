@@ -59,7 +59,7 @@ def copy_attempts(monkeypatch: pytest.MonkeyPatch) -> list[CopyAttempt]:
 
 #: Every signal lapsed — the shape the classifier judged these containers in.
 UNCLAIMED = RegistryClaim(
-    lock_held=False, heartbeat_alive=False, stay_current=False, lease_held=False
+    lock_held=False, heartbeat_alive=False, stay_current=False, lease_held=False, starting=False
 )
 
 
@@ -221,7 +221,11 @@ async def test_a_builder_who_came_back_is_spared_even_though_the_tags_never_chan
     Mutation-check: drop the `_somebody_came_back` call from the destroy loop and this goes red
     while every other test in this file stays green."""
     resumed = RegistryClaim(
-        lock_held=True, heartbeat_alive=True, stay_current=False, lease_held=False
+        lock_held=True,
+        heartbeat_alive=True,
+        stay_current=False,
+        lease_held=False,
+        starting=False,
     )
     arm = _Arm(claims={"sbx-resumed": resumed})
 

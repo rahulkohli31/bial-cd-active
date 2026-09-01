@@ -843,13 +843,17 @@ async def preview_state(
 
     Deliberately NOT `save-state`, which the client could otherwise have polled: that runs two
     `git` execs inside the container per call, and its `dirty=null` conflates three unrelated
-    causes. This route's budget is frozen in C3 §8.3 — one registry hash read, at most two
+    causes. This route's budget is frozen in C3 §8.3 — one round trip to the coordination store
+    (two commands, pipelined: the registry hash and the U13 starting marker), at most two
     user-scoped rows, at most two object-store HEADs, and NO container call of any kind.
 
     Answers about THIS project only. A container serving a different app is `slot_taken` here,
     named where we can name it: the one-per-user registry means somebody else's container is
     exactly when yours is asleep, and the builder deserves to be told which of their own
-    projects is standing in the way rather than that their app disappeared."""
+    projects is standing in the way rather than that their app disappeared. As of U13, a start
+    already in flight for this project — this tab's own press, another tab's, or a chat
+    message that just started one — answers `starting` rather than the stale `asleep` a second
+    press used to invite."""
     await owned_project_or_404(db, user.id, project_id)
     state = await manager.project_preview_state(db, user, project_id)
     return PreviewStateResponse(

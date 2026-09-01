@@ -47,7 +47,7 @@ from src.api.v1.build_sessions.schemas import (
     BuildSessionStatus,
     ErrorSource,
 )
-from src.db.models.conversation import ConversationMode
+from src.db.models.conversation import ChatKind
 from src.db.models.message import MessageEntryKind
 from src.services.messages.store import append_batch
 from src.services.orchestrator.agent import build_agent
@@ -614,7 +614,7 @@ class BuildOrchestrator:
                     conversation_id=conversation_id,
                     messages=delta,
                     entry_kind=MessageEntryKind.STEP,
-                    mode=ConversationMode.WRITE,
+                    kind=ChatKind.BUILD,
                     meta={"kind": "build_step", "sessionId": str(session_id)},
                 )
         except Exception as exc:

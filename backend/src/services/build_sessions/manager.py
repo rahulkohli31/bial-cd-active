@@ -78,14 +78,17 @@ from src.services.build_sessions.liveness import flag_liveness_overpromise
 from src.services.build_sessions.locks import (
     DeadlineWriter,
     acquire_lock,
+    clear_starting_marker,
     delete_registry,
     grant_stay_of_execution,
     mark_registry_ending,
     read_registry,
+    read_registry_and_starting_marker,
     reap_lock,
     release_lock_as_holder,
     renew_lock,
     write_heartbeat,
+    write_starting_marker,
 )
 from src.services.build_sessions.outcome import (
     FORCE_ENDED,
@@ -556,11 +559,19 @@ class PreviewState:
     `alive` is DERIVED rather than stored, and that is the whole point of the reshape: as a
     field it was the only answer, and `False` meant "never built" and "another project took the
     slot" and "asleep" and "the registry read threw" indistinguishably. As a property it can
-    only ever mean `state is ALIVE`, so there is no longer anywhere for an error to hide."""
+    only ever mean `state is ALIVE`, so there is no longer anywhere for an error to hide.
+
+    U13 adds `PreviewLifeState.STARTING` to the enum this wraps and needs NO new field for it:
+    a start in flight names no preview URL and offers no restore, so the existing defaults
+    (`preview_url=None`, `restorable=None`) are already the right answer — `state` alone
+    carries the new fact."""
 
     state: PreviewLifeState
     preview_url: str | None = None
-    # SLOT_TAKEN only — whose work is in the container standing where this project's was.
+    # SLOT_TAKEN only — whose work is in the container standing where this project's was. As of
+    # U13 this is also populated directly from the starting marker's own payload (no registry
+    # round trip needed to name the occupier) when a start, rather than a live container, is
+    # what is holding the slot.
     occupying_project_id: uuid.UUID | None = None
     occupying_project_name: str | None = None
     # TRI-STATE (`restorable_presence`), and `None` is NO CLAIM rather than "no": either the
@@ -679,6 +690,23 @@ async def _occupying_project(
                 app_id=app_id, project_id=project_id, project_name=project_name
             )
     return None
+
+
+async def _project_name_owned_by(
+    db: AsyncSession, user_id: uuid.UUID, project_id: uuid.UUID
+) -> str | None:
+    """The name of a project this user owns, or `None` when it does not exist (or is not
+    theirs) — U13's direct counterpart to `_occupying_project` above.
+
+    `_occupying_project` exists ONLY because a registry hash cannot say which project a
+    container belongs to and must invert an app NAME back to one. The U13 starting marker
+    carries the project id outright, so the SLOT_TAKEN answer it feeds needs no inversion and
+    no ghost case — a marker that named a project the caller does not own could only mean the
+    marker itself is corrupt, which is exactly the `None` this returns."""
+    name: str | None = await db.scalar(
+        sa.select(Project.name).where(Project.id == project_id, Project.user_id == user_id)
+    )
+    return name
 
 
 async def _saved_head(app_id: uuid.UUID) -> str | None:
@@ -894,7 +922,7 @@ class BuildSession:
     handle: SandboxHandle
     # MAY THIS SESSION'S TURN MUTATE THE TREE? Structural, not observational: it comes from the
     # mode's toolset, which is decided before the run starts and cannot change during it.
-    # `toolsets_for_mode` gives Ask and Plan a `read_only_toolset` and ONLY Write the
+    # `toolsets_for_kind` gives a Plan chat a `read_only_toolset` and ONLY a Build chat the
     # `sandbox_toolset` that carries `write_file` / `edit_file` / `insert_lines`, so a
     # non-writing session can never touch the workspace no matter how long it runs.
     #
@@ -1061,7 +1089,17 @@ class SessionManager:
         Created, not merely assigned: a SPARED handle names a container that either was up
         before this request existed or has since been brought all the way up, so tearing it
         down is not a rollback, it is collateral damage (see `_LockScope.spared`). The lock is
-        still released either way — that one IS this request's to give back."""
+        still released either way — that one IS this request's to give back.
+
+        U13 — the FIRST thing this does, before the adopted check, is clear the starting
+        marker: a failed start is over, adopted or not, and the marker naming it must not
+        outlive the failure by its whole TTL. Guarded rather than bare (unlike the release
+        below): a Redis blip clearing the marker is not a reason to skip the teardown a failed
+        container still needs — the marker's own TTL is the backstop either way."""
+        try:
+            await clear_starting_marker(redis, user_id)
+        except Exception:
+            _log.exception("starting marker clear failed in compensation", user_id=str(user_id))
         if scope.adopted:
             return
         if scope.handle is not None and not scope.spared:
@@ -1078,12 +1116,22 @@ class SessionManager:
         redis: aioredis.Redis,
         user_id: uuid.UUID,
         sandbox_client: SandboxClient,
+        project_id: uuid.UUID,
         *,
         spare_app: str | None = None,
     ) -> AsyncIterator[_LockScope]:
         """Reconcile stale state → acquire the one-per-user Redis lock → run the body
-        compensated. The ONE skeleton behind `_start_locked` and `relaunch_preview` (their
-        pre-checks deliberately differ — see each call site).
+        compensated. The ONE skeleton behind `_start_locked`, `relaunch_preview` and
+        `ensure_sandbox` (their pre-checks deliberately differ — see each call site) — and,
+        as of U13, the single writer of the `starting` marker (R4c): every door into a
+        container goes through here, so a start in flight is reported identically to every
+        tab, every session and a page reloaded mid-start, never something a browser has to
+        remember across a request.
+
+        `project_id` NAMES the start for `project_preview_state` (C3 §8.3) and for U11's
+        reclamation spare predicate — it is the marker's whole payload. Required, not
+        optional: a marker that could not say which project it is starting would be able to
+        report `starting` but never `slot_taken`, which is the ghost this unit replaces.
 
         THE TWO WAYS THE LOCK CAN DENY, and why they leave here as different exceptions
         (U3). `acquire_lock` returning `None` now means one thing only — the lock is
@@ -1116,6 +1164,12 @@ class SessionManager:
           token; `_do_finalize` releases). The release sits inside the protected region: if it
           fails, compensation still tears the container down rather than leaving a live
           preview behind a lock nobody can release.
+        - U13 — the `starting` marker is written the instant the lock is acquired (nothing
+          before this may write it: an unacquired lock means this request is not the one
+          starting anything) and cleared on the SAME clean exit that releases or adopts the
+          lock, whichever the body did. A failed body clears it from the compensation arm
+          instead (see `_compensate_lock_and_container`), so every exit — success, adoption
+          or failure — leaves no marker behind before its TTL would have.
         """
         if not await _the_live_sandbox_is_already_the_one_we_want(redis, user_id, spare_app):
             await reconcile_user(
@@ -1135,7 +1189,36 @@ class SessionManager:
             raise BuildSessionConflictError(self._active_by_user.get(user_id))
         scope = _LockScope(token=token)
         try:
+            # U13 — from here until the scope exits, a poll of `project_preview_state` for
+            # `project_id` answers `starting` rather than whatever it would otherwise have said
+            # (a stale `asleep`, or a ghost `slot_taken`). Written AFTER the lock is held so a
+            # request that loses the race to acquire it never claims a start it did not win,
+            # and INSIDE the try because by this point a lock IS held: a Redis blip on this one
+            # `SET`, raised from above the try, would have unwound past the compensation arm and
+            # left that lock in place for its full 900s — every later start, relaunch and turn
+            # for this user answered "already building" with nothing building.
+            await write_starting_marker(redis, user_id, project_id)
             yield scope
+            # Clean exit — the body either released control back to us (RELEASE below) or
+            # adopted the lock (a session now owns the container). Either way the start this
+            # marker named is OVER: it succeeded or it handed off, and the container's own
+            # signals (the registry, then the lease) are what protect it from here.
+            #
+            # GUARDED, deliberately, unlike `release_lock_as_holder`/`write_heartbeat` below
+            # and elsewhere in this module: those sit BEFORE success is real, so their raise
+            # is what triggers compensation on a container that has not earned its keep yet.
+            # This sits AFTER it — the container is already up and, on this branch, may
+            # already be ADOPTED into a live `BuildSession` the caller is about to register.
+            # An unguarded raise here would unwind past that registration on a bare Redis
+            # blip clearing a best-effort marker, leaking a running, adopted container with
+            # no session tracking it. The marker's mandatory TTL is the backstop instead.
+            try:
+                await clear_starting_marker(redis, user_id)
+            except Exception:
+                _log.exception(
+                    "starting marker clear failed on clean exit; its TTL will expire it",
+                    user_id=str(user_id),
+                )
             if not scope.adopted:
                 await release_lock_as_holder(redis, user_id, token)
         except BaseException:
@@ -1272,7 +1355,7 @@ class SessionManager:
         too — `_pin_workspace` attaches for every mode — so gating on "a session exists" made
         the ordinary Save button answer "your app is still being built" while the user was
         waiting on a chat answer that could not touch a file. `may_write` comes from the
-        mode's toolset (`toolsets_for_mode` hands Ask and Plan a read-only set), so a
+        kind's tool surface (`toolsets_for_kind` returns it beside the toolsets), so a
         non-writing turn is structurally incapable of the mid-write bundle described above.
 
         The refusal is a backstop, not the mechanism: the client stops the build first (that is
@@ -1821,28 +1904,40 @@ class SessionManager:
     ) -> PreviewState:
         """What is serving THIS project — and if nothing is, WHY? (#83, reshaped by C3 §8.3.)
 
-        FOUR STATES, NOT ONE BOOLEAN. This used to answer `alive=False` identically for *never
+        FIVE STATES, NOT ONE BOOLEAN. This used to answer `alive=False` identically for *never
         built*, *another project took the slot*, *asleep*, and *the registry read threw*. Three
         of those are ordinary facts about a workspace; the fourth is an ERROR, and returning it
         wearing the same face as a fact is how the portal came to pull a live preview off the
-        screen because Redis hiccuped once.
+        screen because Redis hiccuped once. U13 adds a fifth: *a start is in flight right now*,
+        which used to be indistinguishable from `asleep` and invited a second press to provision
+        a second container (R3a/R4c).
 
         THE COST BUDGET IS PART OF THE CONTRACT (C3 §8.3), because the caller is a browser tab
-        on a 45-second timer: ONE registry hash read, at most two user-scoped DB rows, at most
-        two object-store HEADs — NONE AT ALL on the alive path, which is the overwhelming
-        majority of polls — and NO container `exec`, NO attach, NO ARM call, ever. Two
-        independent reasons, either sufficient. Reusing `_refuse_if_reclaim_would_destroy_work`
-        would drag in `_attach_for_read` and `_save_state_of` (a container round trip) and would
-        let a `RedisError` turn a poll into a 503; the "is there unsaved work" question stays on
-        the user-initiated 409 where a human is waiting for it. And an attach-based poll would
-        make every framed preview touch its container every 45 seconds, which R14 forbids
-        outright as a manufactured activity signal — a sandbox nobody is using would look busy
-        forever and never be reclaimed.
+        on a 45-second timer: ONE ROUND TRIP TO REDIS — two commands, pipelined (the registry
+        hash and the U13 starting marker) — at most two user-scoped DB rows, at most two
+        object-store HEADs — NONE AT ALL on the alive path, which is the overwhelming majority
+        of polls — and NO container `exec`, NO attach, NO ARM call, ever. **Amended by U13**:
+        the budget was "one registry hash read"; it is now "one round trip, two commands", never
+        two round trips — see `read_registry_and_starting_marker`. Two independent reasons
+        the container stays untouched, either sufficient. Reusing
+        `_refuse_if_reclaim_would_destroy_work` would drag in `_attach_for_read` and
+        `_save_state_of` (a container round trip) and would let a `RedisError` turn a poll into
+        a 503; the "is there unsaved work" question stays on the user-initiated 409 where a
+        human is waiting for it. And an attach-based poll would make every framed preview touch
+        its container every 45 seconds, which R14 forbids outright as a manufactured activity
+        signal — a sandbox nobody is using would look busy forever and never be reclaimed.
 
-        The registry read is ONE `hgetall` rather than the two this used to spend: the shared
-        comparison (`_registry_serves_and_is_ready`) is applied to a hash we already hold, so
-        the start path's predicate and this poll still cannot drift while the error arm — the
-        one thing the predicate deliberately swallows — is handled here instead of hidden.
+        PRECEDENCE, AND THE ORDER MATTERS (U13). An unreadable store still answers `unknown` —
+        checked first, so ambiguity never wears a confident face. A registry that serves this
+        project and is ready still answers `alive` even when a stale marker is also present — a
+        marker must never hide a running app. Then a marker naming THIS project answers
+        `starting`, ABOVE the never-built check below it, because a first build mints its app
+        row only once the start commits (`resolve_app_for_project` runs inside the lock) — so
+        `app_id is None` does not yet mean nothing is happening. Then a marker naming ANOTHER
+        project answers `slot_taken`, named directly from the marker rather than inverted from
+        an app name (no ghost: the marker already carries the project id `_occupying_project`
+        exists to reconstruct for the registry-only case below). Then the existing arms,
+        unchanged: never-built, asleep, and the registry-sourced `slot_taken`.
 
         AND THE RESTORE QUESTION IS ONLY ASKED WHEN ITS ANSWER CAN CHANGE THE SCREEN. This
         used to call `restorable_presence` before the registry read, i.e. on every poll of
@@ -1852,21 +1947,18 @@ class SessionManager:
         copy) is a surface that only exists when nothing is serving the project, so the alive
         arm returns `None` — NO CLAIM — and the client falls through to the answer the project
         route already gave it at load. That is what `null` has always meant here, and the
-        client's `??` was written for exactly this fall-through."""
+        client's `??` was written for exactly this fall-through. `starting` answers the same
+        way: a start in flight offers no restore affordance either."""
         app_id = await _existing_app_id(db, user.id, project_id)
-        if app_id is None:
-            # No app row, so no bundle key can exist either: `restorable=False` is a CONFIRMED
-            # absent here, not an unknown, and skipping the store call is an answer rather than
-            # an omission (the same reading `get_project` makes).
-            return PreviewState(state=PreviewLifeState.NEVER_BUILT, restorable=False)
         try:
-            reg = await read_registry(get_redis(), user.id)
+            reg, starting = await read_registry_and_starting_marker(get_redis(), user.id)
         except RedisNotConfiguredError:
             # A CERTAIN answer, not an ambiguous one (`services/redis/errors.py`): Redis is
             # genuinely optional outside production, and with no coordination store there is no
-            # sandbox subsystem at all — so nothing can be serving this project. Reporting that
-            # as UNKNOWN would put a permanent "we could not check" on every dev deployment,
-            # and letting it escape would 500 a poll, which is what it did before.
+            # sandbox subsystem at all — so nothing can be serving OR starting this project.
+            # `app_id` is a DB fact, independent of Redis, so it still settles NEVER_BUILT.
+            if app_id is None:
+                return PreviewState(state=PreviewLifeState.NEVER_BUILT, restorable=False)
             return PreviewState(
                 state=PreviewLifeState.ASLEEP, restorable=await restorable_presence(app_id)
             )
@@ -1876,14 +1968,20 @@ class SessionManager:
             # container. Note it is NOT a 503 either: the caller is a poll, and 503ing a
             # background timer would turn a blip into an error the user has to read.
             #
+            # UNKNOWN outranks even NEVER_BUILT here, deliberately: a Redis outage means a start
+            # already in flight (which mints its app row only on success) is exactly as
+            # unreadable as one that never happened, and reporting the DB's "no app row" as a
+            # confident NEVER_BUILT would be papering over the one thing this arm exists to
+            # admit it cannot see.
+            #
             # The store question is INDEPENDENT of the registry question and still answerable,
-            # so it is still asked: an unknown container state is precisely when the pane may
-            # have to offer a way back.
+            # so it is still asked when there is an app to ask it about.
             return PreviewState(
-                state=PreviewLifeState.UNKNOWN, restorable=await restorable_presence(app_id)
+                state=PreviewLifeState.UNKNOWN,
+                restorable=await restorable_presence(app_id) if app_id is not None else None,
             )
-        mine = app_name_for(app_id)
-        if reg is not None and _registry_serves_and_is_ready(reg, mine):
+        mine = app_name_for(app_id) if app_id is not None else None
+        if mine is not None and reg is not None and _registry_serves_and_is_ready(reg, mine):
             fqdn = reg.get(REGISTRY_FIELD_FQDN)
             # THE HOT PATH, AND IT SPENDS NOTHING ON THE STORE. `restorable` stays `None` —
             # "no claim" — because a running app renders no restore affordance for the answer
@@ -1897,9 +1995,30 @@ class SessionManager:
                 # getting it wrong shows a blank preview over a perfectly healthy container.
                 preview_url=settings.app_url(mine) if fqdn else None,
             )
-        # Everything below is a workspace that is NOT serving this project — which is the only
-        # place the restore offer is rendered, so this is the one place the answer earns its
-        # round trip.
+        if starting is not None:
+            # U13 — a start is in flight for THIS user, and it was not the one just ruled ALIVE
+            # above (a stale marker never wins against a serving registry). Naming it directly
+            # from the marker's own payload is the whole improvement over the registry-only
+            # SLOT_TAKEN arm below: no app-name inversion, no ghost, because the marker already
+            # says which project it is.
+            if starting == project_id:
+                return PreviewState(state=PreviewLifeState.STARTING)
+            occupying_name = await _project_name_owned_by(db, user.id, starting)
+            return PreviewState(
+                state=PreviewLifeState.SLOT_TAKEN,
+                occupying_project_id=starting,
+                occupying_project_name=occupying_name,
+                restorable=(await restorable_presence(app_id) if app_id is not None else False),
+            )
+        if app_id is None:
+            # No app row, so no bundle key can exist either: `restorable=False` is a CONFIRMED
+            # absent here, not an unknown, and skipping the store call is an answer rather than
+            # an omission (the same reading `get_project` makes). Reached only once a start for
+            # THIS project has been ruled out above — see the precedence note.
+            return PreviewState(state=PreviewLifeState.NEVER_BUILT, restorable=False)
+        # Everything below is a workspace that is NOT serving this project and has no start in
+        # flight — which is the only place the restore offer is rendered, so this is the one
+        # place the answer earns its round trip.
         restorable = await restorable_presence(app_id)
         if reg is None:
             return PreviewState(state=PreviewLifeState.ASLEEP, restorable=restorable)
@@ -2012,7 +2131,7 @@ class SessionManager:
         the live container for EVERY mode, so "a session is attached" is true throughout an
         ordinary Ask or Plan turn — and answering with that made a read-only question report
         "your app is still being built" and refuse the Save button while the user sat waiting
-        for a chat answer. `may_write` comes from the mode's toolset, so this is structural
+        for a chat answer. `may_write` comes from the kind's tool surface, so this is structural
         rather than a guess about what the agent might be doing.
 
         Deliberately NOT `workspace_touched` (the orchestrator's live "has it written yet?"
@@ -2165,7 +2284,7 @@ class SessionManager:
                 db, user, spare_app=spare_app, sandbox_client=sandbox_client
             )
             async with self._holding_user_lock(
-                redis, user_id, sandbox_client, spare_app=spare_app
+                redis, user_id, sandbox_client, project_id, spare_app=spare_app
             ) as scope:
                 app_id = await resolve_app_for_project(db, user_id, project_id)
                 # The snapshot gate runs BEFORE the commit and the storage provision: the 404
@@ -2481,7 +2600,7 @@ class SessionManager:
             db, user, spare_app=spare_app, sandbox_client=sandbox_client
         )
         async with self._holding_user_lock(
-            redis, user_id, sandbox_client, spare_app=spare_app
+            redis, user_id, sandbox_client, project_id, spare_app=spare_app
         ) as scope:
             app_id = await resolve_app_for_project(db, user_id, project_id)
             await db.commit()
@@ -2522,7 +2641,7 @@ class SessionManager:
             lock_token=scope.token,
             handle=handle,
             # A build is a Write run by definition — `_run_write` builds its agent with
-            # `toolsets_for_mode(ConversationMode.WRITE, ...)`, so the sandbox toolset is
+            # `toolsets_for_kind(ChatKind.BUILD, ...)`, so the sandbox toolset is
             # always present and the tree is always in play.
             may_write=True,
             attachments=attachments,
@@ -2641,7 +2760,7 @@ class SessionManager:
                 db, user, spare_app=spare_app, sandbox_client=sandbox_client
             )
             async with self._holding_user_lock(
-                redis, user_id, sandbox_client, spare_app=spare_app
+                redis, user_id, sandbox_client, project_id, spare_app=spare_app
             ) as scope:
                 app_id = await resolve_app_for_project(db, user_id, project_id)
                 await db.commit()
@@ -3190,7 +3309,9 @@ class SessionManager:
         except (Exception, TimeoutError):  # fmt: skip  # ruff py314 strips parens
             _log.exception("build outcome write failed", session_id=str(session.session_id))
 
-    async def _pardon_the_container(self, redis: aioredis.Redis, session: BuildSession) -> None:
+    async def _pardon_the_container(
+        self, redis: aioredis.Redis, session: BuildSession, *, touched: bool
+    ) -> None:
         """#13/R2 — the success-path alternative to teardown: the container outlives its
         build so the user can actually use what they just built.
 
@@ -3207,15 +3328,26 @@ class SessionManager:
         first would open a window where a concurrent sweep sees lock-gone (and, ≤90 s later,
         heartbeat-lapsed) with no lease yet, and executes the container we just pardoned.
 
+        `touched` (U12/R100) IS THE ONLY THING THAT CHANGES HERE, and it is a fact about WHAT
+        THIS RUN DID, never about which kind of chat sent it — `workspace_touched`
+        (`services/orchestrator/deps.py`), set only by the tools that actually write. A run
+        that wrote files earns the same long stay this always granted; one that wrote nothing
+        earns `DeadlineWriter.TURN_ENDED_UNCHANGED`'s shorter one, bounding the cost of a
+        chat-only session that pins the workspace on every turn (R93) without ever producing
+        anything worth a 30-minute reprieve. `grant_stay_of_execution`'s own monotonic
+        guarantee (`max(existing, computed)`) is what keeps this safe on a MIXED session: a
+        read-only turn arriving inside a write turn's still-standing stay leaves that longer
+        deadline, and its provenance, untouched — this call computes the short stay and the
+        primitive itself declines to record it as the reason.
+
         Best-effort per the end-sequence policy (a raise here would hang every SSE feed).
         Degraded modes are all safe: a failed stay grant means the sweep reaps at heartbeat
         lapse (~90 s — the pre-#13 lifetime, never an orphan, because the registry is still
         there to find); a failed lock release means the lock lingers to its TTL and the next
         start's `reap_lock` clears it."""
+        writer = DeadlineWriter.TURN_IN_FLIGHT if touched else DeadlineWriter.TURN_ENDED_UNCHANGED
         try:
-            await grant_stay_of_execution(
-                redis, session.user_id, writer=DeadlineWriter.TURN_IN_FLIGHT
-            )
+            await grant_stay_of_execution(redis, session.user_id, writer=writer)
         except Exception:
             _log.exception(
                 "stay grant failed in pardon; the sweep will reap at heartbeat lapse",
@@ -3296,7 +3428,13 @@ class SessionManager:
         #    always closes even on a kept-state teardown failure.
         try:
             if pardoned:
-                await self._pardon_the_container(redis, session)
+                # `touched=True` unconditionally: this is the BRAIN-driven build path, and
+                # `pardoned` already required a genuinely successful build (status ENDED, not
+                # force-ended) — a build that reached that verdict wrote the app it built.
+                # There is no read-only arm here to distinguish (unlike `finish_turn_sandbox`,
+                # an ordinary chat turn's end, where a Plan-kind or a Q&A message may touch
+                # nothing at all).
+                await self._pardon_the_container(redis, session, touched=True)
             else:
                 torn_down = True
                 if session.handle is not None:
@@ -3506,8 +3644,15 @@ class SessionManager:
         #      where a concurrent sweep sees lock-gone with no lease yet and executes the
         #      container we just spared. The registry entry stays: it is the sweep's only map
         #      to the container, and deleting it would orphan a live sandbox.
+        #
+        #      `touched` (U12/R100) THREADS STRAIGHT THROUGH from this method's own parameter —
+        #      the same fact steps 1b/1c above already key on. A turn that wrote nothing buys
+        #      the shorter stay; this is where a Plan-kind chat's ordinary Q&A turn (which can
+        #      never touch the tree — its toolset has no write tool) stops paying for a
+        #      30-minute reprieve it never earned, without this method ever asking what kind of
+        #      chat sent it.
         try:
-            await self._pardon_the_container(redis, session)
+            await self._pardon_the_container(redis, session, touched=touched)
         finally:
             # Guaranteed-run, exactly as in `_do_finalize`: the slot must free even if the
             # pardon raised, or this user can never send another Write message.

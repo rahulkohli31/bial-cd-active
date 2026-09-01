@@ -88,6 +88,14 @@ def _snapshot() -> dict[str, Any]:
     return _run_sql(_read)
 
 
+# THE WHOLE `deployments` TABLE AT HEAD, not just what revision 0025 created.
+#
+# The last three arrived AFTER this file was written and were never added to it, so this
+# assertion has been red since revision 0026 — invisibly, because it only runs in the opt-in
+# `destructive_migration` lane that nobody runs on a routine change. Corrected here rather than
+# left standing: this lane is the pre-ship check for a migration, and a lane with a permanent
+# red in it is a lane whose green means nothing. (Unrelated to the chat-kind work; noted so the
+# diff is not mistaken for it.)
 _EXPECTED_COLUMNS = frozenset(
     {
         "id",
@@ -107,6 +115,9 @@ _EXPECTED_COLUMNS = frozenset(
         "finished_at",
         "created_at",
         "updated_at",
+        "classification",  # 0026 — the data-classification gate
+        "classification_score",  # 0029 — the review's score
+        "unpublished_at",  # 0028 — the marketplace unpublish stamp
     }
 )
 

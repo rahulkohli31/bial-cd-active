@@ -57,7 +57,7 @@ from src.api.v1.conversations.schemas import (
 from src.api.v1.live_build import ReclaimBlockedEnvelope, reclaim_blocked_response
 from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry
-from src.db.models.conversation import Conversation, ConversationMode
+from src.db.models.conversation import Conversation
 from src.db.models.message import MessageEntryKind, MessageVisibility
 from src.db.models.project import Project
 from src.db.models.user import User
@@ -75,6 +75,11 @@ from src.services.messages.store import (
 )
 from src.services.redis import build_coordination_or_503
 from src.services.sandbox import SandboxClient
+from src.services.turns.copy import (
+    ALREADY_BUILDING_HERE_CODE,
+    WORKSPACE_UNAVAILABLE_CODE,
+    WORKSPACE_UNAVAILABLE_TEXT,
+)
 from src.services.turns.engine import (
     TurnNotRunningError,
     get_turn_engine,
@@ -174,7 +179,7 @@ async def start_conversation_turn(
             conversation_id=conversation.id,
             messages=[ModelRequest(parts=[UserPromptPart(content=prompt)])],
             entry_kind=MessageEntryKind.TURN,
-            mode=conversation.mode,
+            kind=conversation.kind,
             visibility=visibility,
             meta=meta,
         )
@@ -246,6 +251,16 @@ async def start_turn(
         return exc.as_response()
     if model is None:
         raise AppApiError(503, "Claude client not configured.")
+    # R98 — NO WORKSPACE SERVICE, SAID HERE RATHER THAN DEGRADED SILENTLY. Both kinds read the
+    # project's live app and only that, so a deployment with no sandbox service has nothing for
+    # either of them to read. The same shape as the refusal above it, with a machine-readable
+    # code so the browser can tell it from the workspace CONFLICTS that share its status family
+    # — different cause, different remedy, and a client reading only the status cannot tell.
+    #
+    # AT THE MOMENT OF SENDING, and before anything is claimed or written: the message is not
+    # consumed, no turn exists, and there is no half-started reply to explain afterwards.
+    if sandbox is None:
+        raise AppApiError(503, WORKSPACE_UNAVAILABLE_TEXT, code=WORKSPACE_UNAVAILABLE_CODE)
 
     # Every side-effect-free rejection lands BEFORE `resolve_pending_as_refine`, which is a
     # WRITE: a refused start must never burn the user's pending plan-options card. Both
@@ -261,30 +276,41 @@ async def start_turn(
         raise AppApiError(409, BUILD_IN_FLIGHT_MSG)
     if conversation_is_mid_reply(conversation.id):
         raise AppApiError(409, "A turn is already running for this conversation.")
-    # WRITE only, and BELOW the mid-reply guard on purpose: a Write send during a streaming
+    # UNCONDITIONAL, and BELOW the mid-reply guard on purpose: a send during a streaming
     # reply must still 409 as a busy conversation, or it races `transcript_head_seq`. This
-    # one asks a different question — is this user's single sandbox already committed to a
-    # DIFFERENT conversation? Cheap and synchronous; the expensive provision happens inside
-    # the detached turn, because blocking the POST on 30-60s recreates the dead end the
-    # composer contract exists to remove.
-    if conversation.mode is ConversationMode.WRITE:
-        active = manager.active_session_for(user.id)
-        if active is not None and active.conversation_id != conversation.id:
-            raise AppApiError(409, BUILD_IN_FLIGHT_MSG)
+    # one asks a different question — is this user's single workspace already committed to a
+    # DIFFERENT conversation of their own? Cheap and synchronous; the expensive provision
+    # happens inside the detached turn, because blocking the POST on 30-60s recreates the dead
+    # end the composer contract exists to remove.
+    #
+    # IT NO LONGER READS THE CHAT'S KIND, and that is R93: every turn takes the whole workspace
+    # for as long as it runs, whatever kind of chat it was sent in. A Plan turn pins the live
+    # container exactly as a Build turn does — that is what R18 made true — so a Plan send that
+    # slipped past this gate would take a workspace another of the user's chats was mid-build
+    # in, which is the one thing this check exists to prevent.
+    active = manager.active_session_for(user.id)
+    if active is not None and active.conversation_id != conversation.id:
+        raise AppApiError(409, BUILD_IN_FLIGHT_MSG, code=ALREADY_BUILDING_HERE_CODE)
 
-    # #83 — EVERY MODE, not just Write, and the guard above cannot answer this one.
+    # #83 — BOTH KINDS, not just Build, and the guard above cannot answer this one.
     #
     # Two reasons it sits outside that block. `active_session_for` only sees in-process
     # sessions, so a finished build's pardoned container — warm, holding no session, no lock
     # and no heartbeat — is invisible to it, and that is the state a user is most often in.
-    # And `_pin_workspace` attaches the project's LIVE container for Ask and Plan as well
-    # ("Resolve the turn-pinned read surface ONCE, for EVERY mode"), so a Plan turn in
-    # another project reclaims the incumbent's workspace exactly as a Write turn does.
+    # And `_pin_workspace` attaches the project's LIVE container for a Plan turn as well
+    # ("Resolve the turn-pinned read surface ONCE, for BOTH KINDS"), so a Plan turn in
+    # another project reclaims the incumbent's workspace exactly as a Build turn does.
     #
-    # Gating this on WRITE meant an Ask or Plan send still destroyed the other project's
+    # Gating this on the chat's kind meant a Plan send still destroyed the other project's
     # unsaved work, and did it inside the detached turn where the only thing the user saw was
     # "Your workspace could not be started right now" — no dialog, no named project, no way
     # to save. Asked here so the refusal is an HTTP 409 the client turns into a choice.
+    #
+    # THE SECOND OF R19'S TWO REFUSALS, and it carries `sandbox_reclaim_blocked` where the one
+    # above carries `already_building_here`. Same status, different cause, different remedy:
+    # one is "your own other chat is using it", the other is "somebody's unsaved work in
+    # another project is in the way". A client that could only read the status told the citizen
+    # the wrong thing about half the time.
     if sandbox is not None:
         # The seam wraps the preflight because the guard reads the registry through the
         # deliberately-unguarded `read_registry` (`locks.py`'s policy: an answer-bearing
@@ -461,15 +487,15 @@ async def turn_events(
 
 
 class ResolvePlanOptionsBody(CamelModel):
-    """The user's click. Only `refine` resolves HERE — `build` goes through U12's atomic
-    Build-it transition endpoint (record + flip mode + lock + start, one operation), so a
-    resolved-build can never exist without its build."""
+    """The user's click. Only `refine` resolves HERE — `build` goes through the Build-it
+    handoff endpoint, which creates the new Build chat and starts its turn BEFORE it answers
+    the offer, so a resolved-build can never exist without the build it names."""
 
     choice: Literal["refine"]
 
 
 class ResolvePlanOptionsResponse(CamelModel):
-    state: Literal["refine", "build", "build_failed"]
+    state: Literal["refine", "build"]
     already_resolved: bool
 
 

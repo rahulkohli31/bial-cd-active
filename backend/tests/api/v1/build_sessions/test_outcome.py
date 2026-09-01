@@ -22,7 +22,7 @@ import pytest
 from sqlalchemy import select
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus
-from src.db.models.conversation import Conversation, ConversationMode
+from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.services.build_sessions.outcome import (
     _summary,
@@ -358,7 +358,7 @@ def test_a_real_preview_url_survives_verbatim() -> None:
 # send 400s, with the mode pill as the only (invisible) way out.
 
 
-async def _mode(db_session, conversation_id) -> ConversationMode:
+async def _kind(db_session, conversation_id) -> ChatKind:
     conversation = await db_session.get(Conversation, conversation_id)
     assert conversation is not None
-    return conversation.mode
+    return conversation.kind

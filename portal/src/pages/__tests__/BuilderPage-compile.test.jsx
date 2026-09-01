@@ -9,13 +9,22 @@
  * LivePreview is stubbed to RECORD ITS PROPS rather than render. The pane's own behaviour on each
  * value is pinned in `components/__tests__/LivePreview.test.jsx`; what is unproven without this
  * file is the wiring between the two, which is exactly where a frame gets dropped silently.
+ *
+ * CHAT-KIND MIGRATION (sfw-002). `ConversationMode`/`ConversationKind` collapsed into one
+ * two-valued `ChatKind` fixed at creation, and this page now renders ONLY a `build` chat — every
+ * composer send holds the write toolset and runs directly against the sandbox (BuilderPage.tsx's
+ * own routing-rule docblock). There is no more "send → plan card → Build it" detour to drive a
+ * build through on this page: `handleBuildIt`'s whole mechanism now creates a SECOND, different
+ * chat and navigates there, so a card press can prove nothing about the compile signal this file
+ * exists to test. `runBuild` below drives the honest new path instead — an ordinary composer send
+ * IS a build turn, full stop — which is also simpler than the card dance it replaces.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup, act } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import {
-  FakeEventSource, makeClient, primeClient, primeTurn,
-  waitForGateOpen, scriptBuildTurn, BUILD_TURN_ID, T_STEP, T_PREVIEW, T_BUILD_END, T_DELTA, PREVIEW_URL,
+  FakeEventSource, makeClient, primeClient,
+  waitForGateOpen, T_STEP, T_WORKSPACE, T_PREVIEW, T_BUILD_END, T_DELTA, PREVIEW_URL,
   inWorkspace,
 } from './_builderSession.jsx'
 
@@ -24,7 +33,7 @@ const h = vi.hoisted(() => ({
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   sendMessage: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), stopTurn: vi.fn(),
-  switchMode: vi.fn(), resolvePlanOptions: vi.fn(),
+  resolvePlanOptions: vi.fn(),
   start: vi.fn(), relaunchPreview: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
   fetchPreviewState: vi.fn(), fetchCompileState: vi.fn(), fetchSaveState: vi.fn(),
   checkWorkspace: vi.fn(),
@@ -63,13 +72,17 @@ vi.mock('../../utils/buildSessionApi', async (orig) => ({
   fetchSaveState: (...a) => h.fetchSaveState(...a),
   checkWorkspace: (...a) => h.checkWorkspace(...a),
 }))
+// `switchMode` is GONE — a chat's kind is fixed at creation, so there is no per-thread setting
+// left to switch. A mock factory that still listed it would be mocking an export the real module
+// no longer has; `resolvePlanOptions` is real but unused here (this suite never renders a
+// plan-options card), kept only because `PlanOptionsCard` — still imported by BuilderPage.tsx —
+// reaches for it, so a stray render must not hit the network.
 vi.mock('../../utils/turnStreamApi', async (orig) => ({
   ...(await orig()),
   startTurn: (...a) => h.startTurn(...a),
   readTurnStream: (...a) => h.readTurnStream(...a),
   buildFromPlan: (...a) => h.buildFromPlan(...a),
   stopTurn: (...a) => h.stopTurn(...a),
-  switchMode: (...a) => h.switchMode(...a),
   resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
 
@@ -95,13 +108,54 @@ async function send(text = 'a visitor app') {
   fireEvent.keyDown(composer(), { key: 'Enter' })
 }
 
-async function runBuild(turn) {
-  await send()
-  fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
-  await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
-  await waitFor(() =>
-    expect(h.readTurnStream).toHaveBeenCalledWith(expect.objectContaining({ turnId: BUILD_TURN_ID })),
-  )
+/** The consolidating snapshot every subscribe gets FIRST, turn or no turn, gap-free replay or
+ *  none (`backend/src/api/v1/conversations/turns.py`'s own docstring: "emit the first frame
+ *  BEFORE any model byte — the snapshot serves that role"). It is what tells this page which
+ *  turn is live (`liveTurnIdRef.current`), which the compile-probe gate below reads to decide
+ *  whether the stream is already the authority — so a scripted turn that skips it is lying about
+ *  the one fact every real subscribe leads with. */
+const T_SNAPSHOT = (turnId = 't1', seq = 1) => ({
+  type: 'snapshot', seq, turnId, turnStatus: 'running', items: [], textSoFar: '', steps: [],
+})
+
+/**
+ * Script an ordinary send's own turn stream as an OPEN socket a test can push frames into by
+ * hand. Not `_builderSession.jsx`'s `scriptBuildTurn` — that helper still branches on whether
+ * `readTurnStream` was called WITH a `turnId`, which was how the old Build-it watch (subscribing
+ * to a turn already known to be a build) told itself apart from an ordinary send (subscribing
+ * with none, and getting back a streamed plan). That distinction is gone: `fireRelayTurn` never
+ * passes a `turnId` at all any more, or asks whether this chat's kind happens to be Write —
+ * every send on this BUILD-chat page opens the SAME plain subscription, and it is that turn
+ * which narrates the whole build. One shape, not two.
+ */
+function scriptTurn(opening = [T_SNAPSHOT(), T_WORKSPACE(undefined, 2)]) {
+  const live = { emit: null, close: null }
+  const impl = async ({ onFrame }) => {
+    live.emit = onFrame
+    for (const frame of opening) onFrame(frame)
+    return new Promise((resolve) => { live.close = resolve })
+  }
+  return {
+    impl,
+    /** Push more frames into the open turn (wrapped in act, so effects flush between). */
+    frame: async (...frames) => {
+      await act(async () => { for (const frame of frames) live.emit?.(frame) })
+    },
+    /** Close the socket. The TRANSPORT outcome only; the frames decide the semantic one. */
+    end: async (outcome = 'completed') => {
+      await act(async () => { live.close?.(outcome); await Promise.resolve() })
+    },
+  }
+}
+
+/**
+ * Send an ordinary message and wait for its turn to be genuinely open — no plan text, no card,
+ * no `Build it` press. A build IS the turn a plain composer send starts on this page now, so
+ * there is nothing left to confirm.
+ */
+async function runBuild(turn, text = 'a visitor app') {
+  await send(text)
+  await waitFor(() => expect(h.readTurnStream).toHaveBeenCalled())
   await turn.frame(T_STEP('Scaffolding your app…'))
 }
 
@@ -118,13 +172,13 @@ beforeEach(() => {
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
   h.buildUserParts.mockImplementation(async (text) => [{ type: 'text', text }])
+  h.startTurn.mockResolvedValue({ turnId: 't1' })
   h.fetchCompileState.mockResolvedValue('unknown')
   h.checkWorkspace.mockResolvedValue(false)
   h.fetchSaveState.mockResolvedValue({ appId: null, dirty: null, containerHead: null, savedHead: null, recoveryAt: null })
   h.fetchPreviewState.mockResolvedValue({
     state: 'unknown', alive: false, previewUrl: null, occupyingProjectName: null, restorable: null,
   })
-  primeTurn(h)
 })
 
 afterEach(cleanup)
@@ -140,7 +194,7 @@ describe('BuilderPage — the compile signal reaches the preview pane', () => {
       state: 'alive', alive: true, previewUrl: PREVIEW_URL,
       occupyingProjectName: null, restorable: true,
     })
-    const turn = scriptBuildTurn()
+    const turn = scriptTurn()
     h.readTurnStream.mockImplementation(turn.impl)
     renderThread()
     await runBuild(turn)
@@ -168,7 +222,7 @@ describe('BuilderPage — the compile signal reaches the preview pane', () => {
       state: 'alive', alive: true, previewUrl: PREVIEW_URL,
       occupyingProjectName: null, restorable: true,
     })
-    const turn = scriptBuildTurn()
+    const turn = scriptTurn()
     h.readTurnStream.mockImplementation(turn.impl)
     renderThread()
     await runBuild(turn)
@@ -192,7 +246,7 @@ describe('BuilderPage — the compile signal reaches the preview pane', () => {
   })
 
   it('starts with no claim at all, rather than claiming the app compiles', async () => {
-    const turn = scriptBuildTurn()
+    const turn = scriptTurn()
     h.readTurnStream.mockImplementation(turn.impl)
     renderThread()
     await runBuild(turn)
@@ -203,7 +257,7 @@ describe('BuilderPage — the compile signal reaches the preview pane', () => {
   })
 
   it('hands each live compile frame straight through', async () => {
-    const turn = scriptBuildTurn()
+    const turn = scriptTurn()
     h.readTurnStream.mockImplementation(turn.impl)
     renderThread()
     await runBuild(turn)
@@ -221,7 +275,7 @@ describe('BuilderPage — the compile signal reaches the preview pane', () => {
   it('passes `unknown` through as itself rather than dropping it', async () => {
     // The pane HOLDS its cover on `unknown`, so the value has to arrive to mean anything. A
     // dropped frame would look to the pane exactly like "nothing changed since the last clean".
-    const turn = scriptBuildTurn()
+    const turn = scriptTurn()
     h.readTurnStream.mockImplementation(turn.impl)
     renderThread()
     await runBuild(turn)
@@ -235,13 +289,13 @@ describe('BuilderPage — the compile signal reaches the preview pane', () => {
   it('recovers the state from a catch-up snapshot, so a reload mid-build lands covered', async () => {
     // Compile frames are emitted ON CHANGE, so a tab that reloads while the app is sitting broken
     // learns nothing until the next change. The snapshot is what closes that window.
-    const turn = scriptBuildTurn()
+    const turn = scriptTurn()
     h.readTurnStream.mockImplementation(turn.impl)
     renderThread()
     await runBuild(turn)
 
     await turn.frame({
-      type: 'snapshot', seq: 4, turnId: BUILD_TURN_ID, turnStatus: 'running',
+      type: 'snapshot', seq: 4, turnId: 't1', turnStatus: 'running',
       items: [], textSoFar: '', steps: [], compileState: 'failed',
     })
 
@@ -249,14 +303,14 @@ describe('BuilderPage — the compile signal reaches the preview pane', () => {
   })
 
   it('does not let a snapshot without a compile fact overwrite what the tail established', async () => {
-    const turn = scriptBuildTurn()
+    const turn = scriptTurn()
     h.readTurnStream.mockImplementation(turn.impl)
     renderThread()
     await runBuild(turn)
 
     await turn.frame(COMPILE('failed', 5))
     await turn.frame({
-      type: 'snapshot', seq: 6, turnId: BUILD_TURN_ID, turnStatus: 'running',
+      type: 'snapshot', seq: 6, turnId: 't1', turnStatus: 'running',
       items: [], textSoFar: '', steps: [],
     })
 
@@ -279,7 +333,7 @@ describe('BuilderPage — a workspace lost while the tab sat idle', () => {
       state: 'alive', alive: true, previewUrl: PREVIEW_URL,
       occupyingProjectName: null, restorable: true,
     })
-    const turn = scriptBuildTurn()
+    const turn = scriptTurn()
     h.readTurnStream.mockImplementation(turn.impl)
     renderThread()
     await runBuild(turn)

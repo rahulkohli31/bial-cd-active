@@ -79,7 +79,7 @@ afterEach(() => cleanup())
 
 describe('ChatPage — composer drag-and-drop (A2)', () => {
   it('accepts a valid dropped file — same preview row as the picker', async () => {
-    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    renderChat('/chat/chat-1?projectId=p1&kind=plan')
     const composer = await screen.findByTestId('composer')
 
     const file = new File(['x'.repeat(100)], 'photo.png', { type: 'image/png' })
@@ -89,7 +89,7 @@ describe('ChatPage — composer drag-and-drop (A2)', () => {
   })
 
   it('rejects an oversized dropped file with the same toast as the picker', async () => {
-    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    renderChat('/chat/chat-1?projectId=p1&kind=plan')
     const composer = await screen.findByTestId('composer')
 
     // MAX_FILE_SIZE is 4 MB for binary attachments (attachmentInput.ts) — one byte over.
@@ -101,7 +101,7 @@ describe('ChatPage — composer drag-and-drop (A2)', () => {
   })
 
   it('rejects a disallowed dropped file type with the same toast as the picker', async () => {
-    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    renderChat('/chat/chat-1?projectId=p1&kind=plan')
     const composer = await screen.findByTestId('composer')
 
     const file = new File(['x'], 'archive.zip', { type: 'application/zip' })
@@ -121,7 +121,7 @@ describe('ChatPage — composer drag-and-drop (A2)', () => {
  */
 describe('ChatPage — drop-target feedback', () => {
   it('marks the composer while a file drag is over it, and clears on leave', async () => {
-    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    renderChat('/chat/chat-1?projectId=p1&kind=plan')
     const composer = await screen.findByTestId('composer')
 
     expect(composer.getAttribute('data-dragging')).toBeNull()
@@ -132,7 +132,7 @@ describe('ChatPage — drop-target feedback', () => {
   })
 
   it('stays marked while the pointer crosses the composer\'s own children', async () => {
-    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    renderChat('/chat/chat-1?projectId=p1&kind=plan')
     const composer = await screen.findByTestId('composer')
     // A REAL descendant, not the form again — the whole point of the depth count is that
     // children re-fire these events at the form via bubbling, so a test that only dispatches
@@ -153,7 +153,7 @@ describe('ChatPage — drop-target feedback', () => {
   })
 
   it('ignores a drag that carries no files (e.g. dragging selected text)', async () => {
-    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    renderChat('/chat/chat-1?projectId=p1&kind=plan')
     const composer = await screen.findByTestId('composer')
 
     // Not just "nothing changed" — the enter is left entirely unclaimed (no preventDefault),
@@ -166,7 +166,7 @@ describe('ChatPage — drop-target feedback', () => {
   })
 
   it('a non-file dragLeave does not decrement a depth a file drag actually opened', async () => {
-    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    renderChat('/chat/chat-1?projectId=p1&kind=plan')
     const composer = await screen.findByTestId('composer')
 
     // A real file drag opens the highlight...
@@ -198,7 +198,7 @@ describe('ChatPage — drop-target feedback', () => {
     })
 
     try {
-      renderChat('/chat/chat-1?projectId=p1&kind=planning')
+      renderChat('/chat/chat-1?projectId=p1&kind=plan')
       const composer = await screen.findByTestId('composer')
 
       fireEvent.dragEnter(composer, FILE_DRAG)
@@ -214,7 +214,7 @@ describe('ChatPage — drop-target feedback', () => {
   })
 
   it('leaves a non-file drag to the browser entirely — never captures then silently drops it', async () => {
-    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    renderChat('/chat/chat-1?projectId=p1&kind=plan')
     const composer = await screen.findByTestId('composer')
 
     // preventDefault on dragover is what claims an element AS a drop target. Withholding it
@@ -236,7 +236,7 @@ describe('ChatPage — drop-target feedback', () => {
   })
 
   it('clears the mark immediately when a cancelled drag reports itself (Escape, drop elsewhere)', async () => {
-    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    renderChat('/chat/chat-1?projectId=p1&kind=plan')
     const composer = await screen.findByTestId('composer')
 
     fireEvent.dragEnter(composer, FILE_DRAG)
@@ -253,7 +253,7 @@ describe('ChatPage — drop-target feedback', () => {
   it('clears a stranded mark when the drag vanishes silently (Firefox window exit)', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
     try {
-      renderChat('/chat/chat-1?projectId=p1&kind=planning')
+      renderChat('/chat/chat-1?projectId=p1&kind=plan')
       const composer = await screen.findByTestId('composer')
 
       fireEvent.dragEnter(composer, FILE_DRAG)
@@ -285,7 +285,7 @@ describe('ChatPage — drop-target feedback', () => {
   })
 
   it('clears the mark on drop — no matching dragleave ever arrives', async () => {
-    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    renderChat('/chat/chat-1?projectId=p1&kind=plan')
     const composer = await screen.findByTestId('composer')
 
     fireEvent.dragEnter(composer, FILE_DRAG)
@@ -305,7 +305,7 @@ describe('ChatPage — drop-target feedback', () => {
   // to the browser's default handler unclaimed — which navigates the tab to the file, losing
   // the typed draft, every staged attachment, and any in-flight turn.
   it('claims a drop on the pending-attachment row too, not only the form beneath it', async () => {
-    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    renderChat('/chat/chat-1?projectId=p1&kind=plan')
     const composer = await screen.findByTestId('composer')
 
     dropFiles(composer, [new File(['x'.repeat(100)], 'photo.png', { type: 'image/png' })])

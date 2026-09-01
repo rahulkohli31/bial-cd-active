@@ -33,6 +33,9 @@ def release_conversation(conversation_id: uuid.UUID) -> None:
 
 
 def conversation_is_mid_reply(conversation_id: uuid.UUID) -> bool:
-    """Is a reply being generated right now? (The mode switch is only legal BETWEEN
-    turns — never mid-stream.)"""
+    """Is a reply being generated right now?
+
+    One reply at a time per conversation: a second send while the first is still streaming
+    would interleave two runs writing the same thread. (It once also gated the mode switch,
+    which was legal only between turns; that route is gone, this invariant is not.)"""
     return conversation_id in _mid_reply

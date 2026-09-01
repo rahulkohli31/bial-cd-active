@@ -10,7 +10,7 @@
  * stream); the plan streams as text and `present_plan_options` renders the card; a build starts
  * only through the atomic Build-it transition. So a suite that wants a build must (a) mock
  * `../../utils/turnStreamApi` onto its `h` bag (startTurn / readTurnStream / buildFromPlan /
- * switchMode / resolvePlanOptions / stopTurn), (b) prime it with `primeTurn(h)`, and (c) drive
+ * resolvePlanOptions / stopTurn), (b) prime it with `primeTurn(h)`, and (c) drive
  * `sendAndConfirm()`. `turnStreaming` scripts the frame feed; `planReply()` is the standard
  * text-plus-card turn.
  *
@@ -120,6 +120,9 @@ export const turnStreaming = (frames, outcome = 'completed') =>
 
 /** The turn a Build-it starts. `sessionId` is gone from the transition's answer entirely. */
 export const BUILD_TURN_ID = 'bt-1'
+/** The chat a handoff CREATES — a different conversation from the one Build it was pressed
+ *  in, which is the whole shape of the press now. */
+export const BUILD_CHAT_ID = 'bc-1'
 
 /** The sandbox lifecycle. `narrativeStatus` returns null until one of these lands, so a build
  *  test that omits it renders no bubble at all — the workspace frame IS the build's beginning. */
@@ -150,18 +153,23 @@ export const T_BUILD_END = (over = {}) => ({
 })
 
 /**
- * The two sockets a build now needs, scripted as one `readTurnStream` implementation.
+ * A `readTurnStream` implementation that can hold a socket OPEN, so a test can push frames into a
+ * running turn by hand and assert on it mid-flight. Close it with `end()`.
  *
- * An ordinary send subscribes with NO `turnId` and gets `plan` — the streamed brief plus its
- * options card. The Build-it watch subscribes WITH one (`watchBuildTurn` resubscribes at cursor 0),
- * and THAT socket is held OPEN: a running build is precisely an open socket, so a test that wants
- * to assert anything about one mid-flight has to hold it there and push frames in by hand. Close it
- * with `end()` when the build is meant to be over.
+ * TWO SUBSCRIBE SHAPES, AND WHICH ONE IS "THE BUILD" HAS CHANGED. A send subscribes with NO
+ * `turnId` — it is joining the turn its own POST just started, so the id is the server's to know
+ * — and a RE-ATTACH subscribes WITH one, because it is joining a turn it did not start. The
+ * Build-it press used to be a third shape: it started a build in THIS chat and watched it with an
+ * id. It is a handoff now, so that shape is gone, and on a build chat the plain send IS the build.
+ *
+ * By default the no-`turnId` branch replays `plan` and completes, which is what a suite driving a
+ * PLAN chat's reply wants. Pass `hold: true` when the send is the build being asserted on, and the
+ * same socket is held open instead — one helper, both shapes, rather than a local copy per suite.
  */
-export function scriptBuildTurn({ plan = planReply(), opening = [T_WORKSPACE()] } = {}) {
+export function scriptBuildTurn({ plan = planReply(), opening = [T_WORKSPACE()], hold = false } = {}) {
   const live = { emit: null, close: null }
   const impl = async ({ turnId, onFrame }) => {
-    if (!turnId) {
+    if (!turnId && !hold) {
       for (const frame of plan) onFrame(frame)
       return 'completed'
     }
@@ -186,9 +194,14 @@ export function scriptBuildTurn({ plan = planReply(), opening = [T_WORKSPACE()] 
 export function primeTurn(h, frames = planReply()) {
   h.startTurn.mockResolvedValue({ turnId: 't1' })
   h.readTurnStream.mockImplementation(turnStreaming(frames))
-  // U5: the transition starts a WRITE TURN. `turnId` is what the page subscribes to; `sessionId`,
-  // `reason` and the `build_failed` / `already_built` outcomes are all gone from the contract.
-  h.buildFromPlan.mockResolvedValue({ outcome: 'started', turnId: BUILD_TURN_ID, appId: 'a1' })
+  // THE HANDOFF'S ANSWER: `chatId` is the chat it CREATED and the one the press navigates to, so
+  // it is the field the caller actually acts on. `sessionId`, `appId`, `reason` and the
+  // `build_failed` / `already_built` / `stale_plan` outcomes are all gone from the contract.
+  h.buildFromPlan.mockResolvedValue({
+    outcome: 'started',
+    chatId: BUILD_CHAT_ID,
+    turnId: BUILD_TURN_ID,
+  })
   h.stopTurn?.mockResolvedValue('stopping')
 }
 
@@ -214,11 +227,16 @@ export async function send(text = 'a visitor app') {
 }
 
 /**
- * The full trigger path: send a turn, wait for the plan-options card, click Build it.
+ * The full PRESS path: send a turn, wait for the plan-options card, click Build it.
  *
- * This is what a build looks like from the user's side (U11/U12): the plan streams, the card
- * presents, the click runs the atomic transition. A test that only sends is asserting a chat
- * turn, not a build.
+ * WHAT THIS IS FOR HAS NARROWED. It used to be how a test reached a build at all — the plan
+ * streamed, the card presented, the click flipped this thread into Write and streamed the build
+ * here. The click is a HANDOFF now: it creates a second chat, starts the turn there and
+ * navigates, so nothing after it streams into the chat the button was in.
+ *
+ * So use this when the press ITSELF is the subject (that `buildFromPlan` is called, with the
+ * minted id, and where it lands). For a test that needs a build STREAMING on this page, send
+ * ordinarily — this page renders a build chat, and every send on one is a build turn.
  */
 export async function sendAndConfirm(text = 'a visitor app') {
   await send(text)
@@ -243,7 +261,7 @@ export const findPlanCard = () => screen.findByRole('button', { name: /^Build it
  *   initialEntries?: string[],
  * }} [opts]
  */
-export function renderBuilder({ deps, projectId = 'p1', hasSavedBuild = null, initialEntries = ['/chat/build-X?projectId=p1&kind=builder'] } = {}) {
+export function renderBuilder({ deps, projectId = 'p1', hasSavedBuild = null, initialEntries = ['/chat/build-X?projectId=p1&kind=build'] } = {}) {
   return render(
     <MemoryRouter initialEntries={initialEntries}>
       <Routes>

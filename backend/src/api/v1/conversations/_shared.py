@@ -44,7 +44,20 @@ from src.services.storage import ObjectStorage, StorageUnconfiguredError, get_st
 #
 # Message-shape bounds. Generous by intent: a citizen developer pasting a long spec is normal
 # traffic, and the real cost gate is the daily token limit, not a byte ceiling.
-
+#
+# THIS NUMBER SITS FAR ABOVE THE BROWSER'S OWN CAP ON PURPOSE, AND THEY ARE NOT TWO SPELLINGS
+# OF ONE RULE (R42a). The composer caps what a person can TYPE, which is a courtesy — it stops
+# someone pasting a novel and waiting to find out it was too much. This is the platform's own
+# SAFETY limit on what may be stored, and the server keeps its own precisely so it does not
+# inherit a number chosen for a text box: the handoff materialises a plan the browser never
+# typed, and a build's first message is written by the server, not by a keyboard.
+#
+# Both halves are refusals, never trims. A message cut at a ceiling is one the citizen believes
+# they sent whole, and the platform has no way to tell them otherwise afterwards.
+#
+# So: raising the browser cap toward this one is a decision, not a tidy-up, and lowering this
+# one to match the browser would silently break the server-materialised paths. If you are here
+# to collapse two numbers into one, that is the reason not to.
 MAX_MESSAGE_TEXT_CHARS = 64_000
 MAX_ATTACHMENT_TEXT_CHARS = 600_000
 MAX_ATTACHMENT_BLOCKS = 8

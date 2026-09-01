@@ -13,8 +13,8 @@ log to say so.
 
 ON `may_write` — the pairing rule these tests hold themselves to:
 
-`may_write` is not a free knob, it MIRRORS THE TURN'S TOOLSET. `toolsets_for_mode` hands the
-mutating `sandbox_toolset` to `ConversationMode.WRITE` alone, every `workspace_touched = True`
+`may_write` is not a free knob, it MIRRORS THE TURN'S TOOLSET. `toolsets_for_kind` hands the
+mutating `sandbox_toolset` to `ChatKind.BUILD` alone, every `workspace_touched = True`
 lives inside that toolset, and `workspace_touched` is the only thing the engine derives
 `finish_turn_sandbox(touched=...)` from. So `may_write=False` implies `touched=False` in
 production: a read-only turn that ends with `touched=True` is a turn that both cannot and did
@@ -981,7 +981,7 @@ async def test_stop_active_work_will_not_stop_a_different_project(
 # is true throughout an ordinary Ask or Plan turn. Reading that as "an agent is writing"
 # put a hammer icon and two Stop buttons in front of someone who had asked a question, and
 # made the Save button answer "your app is still being built" while they waited for a chat
-# reply. `may_write` comes from the mode's toolset instead — `toolsets_for_mode` hands Ask
+# reply. `may_write` comes from the mode's toolset instead — `toolsets_for_kind` hands Ask
 # and Plan a `read_only_toolset`, so a non-writing turn CANNOT touch the tree.
 
 

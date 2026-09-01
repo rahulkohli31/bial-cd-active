@@ -83,11 +83,16 @@ def _claim(
     heartbeat: bool = False,
     stay: bool = False,
     lease: bool = False,
+    starting: bool = False,
 ) -> RegistryClaim:
     """What the coordination store says about one registered container. Every signal defaults to
     LAPSED, because "registered" on its own is exactly the thing that must not spare anything."""
     return RegistryClaim(
-        lock_held=lock, heartbeat_alive=heartbeat, stay_current=stay, lease_held=lease
+        lock_held=lock,
+        heartbeat_alive=heartbeat,
+        stay_current=stay,
+        lease_held=lease,
+        starting=starting,
     )
 
 

@@ -25,7 +25,6 @@
  */
 import { describe, it, expect } from 'vitest'
 import { FAQS } from '../HelpPage'
-import { MODES } from '../../components/chat/ModeSwitcher'
 import { ALLOWED_MEDIA_TYPES, EXCEL_MEDIA_TYPE, PPTX_MEDIA_TYPE } from '../../utils/attachmentInput'
 import { DECK_ATTACHMENTS_ENABLED } from '../../config/features'
 
@@ -49,32 +48,15 @@ describe('the FAQ answers are non-empty prose', () => {
   })
 })
 
-describe('the "Start Chat" answer agrees with the real mode list', () => {
-  const answer = answerTo(/Start Chat/)
-
-  it('names every mode the composer actually offers', () => {
-    // Additive drift is the failure being pinned: a fourth mode would otherwise leave this
-    // answer confidently describing three.
-    for (const { label } of MODES) {
-      expect(answer, `the FAQ never mentions the ${label} mode`).toContain(label)
-    }
-    expect(MODES.length).toBe(3) // if this changes, the answer's "three modes" does too
-    expect(answer).toMatch(/three modes/i)
-  })
-
-  it('does not claim a build never starts — in Write it starts immediately', () => {
-    // THE BUG this pins. The first rewrite opened "It opens a chat — it does not start a
-    // build," which is true in Ask and Plan and false in Write, where ProjectBuilder's own
-    // helper copy promises "it gets built right away — no plan step."
-    expect(answer).not.toMatch(/does not start a build/i)
-    expect(answer).toMatch(/no plan step|straight away|right away|immediately/i)
-  })
-
-  it('still says Plan is the default, because it is', () => {
-    expect(MODES[1].value).toBe('plan') // ModeSwitcher's own sticky default
-    expect(answer).toMatch(/defaults to Plan/i)
-  })
-})
+// The "Start Chat" reconciliation block that used to live here is retired, not merely
+// unwritten: it checked the FAQ answer against `ModeSwitcher.MODES` (this file's own doctrine —
+// reconcile prose against the code it describes), and U19 deleted `ModeSwitcher` outright — U1
+// collapsed conversation kind + the ask/plan/write mode it switched into one two-valued ChatKind
+// (plan | build) chosen once at chat creation, so there is no live mode list left to reconcile
+// against. The "Start Chat" answer in `HelpPage.tsx` still describes the retired switch
+// ("three modes", "defaults to Plan") — `chatKind.ts`'s own comment already named this exact
+// copy update a deferral ("rides a later release"); U19 only widens how true that deferral is,
+// it does not resolve it. Left for whichever unit lands the create-time Plan/Build picker.
 
 describe('the attachment answer agrees with the real allowlist', () => {
   const answer = answerTo(/files can I attach/)

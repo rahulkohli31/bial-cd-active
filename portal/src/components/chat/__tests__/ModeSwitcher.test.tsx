@@ -1,179 +1,109 @@
 /**
- * ModeSwitcher (F5/U6) — the ONE shared in-composer Ask/Plan/Write switch.
+ * THE MODE SWITCH IS GONE — this file is its inertness guard (L8).
  *
- * What this pins:
- *  - the trigger reflects the current mode; opening shows all three with a one-line
- *    description each and a ✓ on the active mode;
- *  - a CHAT wiring routes onSelect through the server switch and reflects the
- *    server-CONFIRMED value — never optimistically, and never while disabled;
- *  - a PROJECT wiring updates local draft state with no server call;
- *  - ⌥P is a document-level shortcut that opens the menu AND swallows the keystroke
- *    (macOS Option+P would otherwise type `π`), and focus returns to the composer;
- *  - the shortcut is discoverable (labeled + tooltipped).
+ * WHAT USED TO BE HERE. `ModeSwitcher`: the one compact in-composer Ask / Plan / Write pill,
+ * mounted on both `BuilderPage` and `ProjectBuilder`, fully controlled and switching a
+ * conversation's `mode` via `turnStreamApi.switchMode` (chat mount) or local draft state
+ * (project mount). ⌥P opened it; `MODES` was the FAQ's own source of truth for what the three
+ * choices were called.
+ *
+ * WHY IT WENT. U1 collapsed the three-valued `ConversationKind` and the three-valued
+ * `ConversationMode` it switched into ONE two-valued `ChatKind` (plan | build), fixed at chat
+ * creation. There is no longer a mode to switch mid-conversation, so there is nothing left for
+ * a switch to do — the server route it called is retired (see the backend's own guard,
+ * `backend/tests/api/v1/conversations/test_mode_switch.py`), and `switchMode` itself is gone
+ * from `turnStreamApi.ts`. A control wired to a deleted endpoint is not a smaller feature; it is
+ * a dead one, so the repo's own convention
+ * (`docs/solutions/conventions/cleanly-removing-dead-ui-controls-2026-06-23.md`) applies: delete
+ * it, do not hide it behind a flag.
+ *
+ * WHY THIS FILE STAYS. Deleting the suite deletes the evidence. This walks the real source tree
+ * — not a render — because the thing being proven is an ABSENCE: nothing under `portal/src`
+ * still imports or mounts the component, and the component file itself does not exist. A render
+ * test cannot prove either half of that; only reading the tree can.
  */
-import { useRef, useState } from 'react'
-import { beforeAll, afterEach, describe, expect, it, vi } from 'vitest'
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
+import { describe, it, expect } from 'vitest'
+import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs'
+import path from 'node:path'
 
-import { ModeSwitcher } from '../ModeSwitcher'
-import * as turnStreamApi from '../../../utils/turnStreamApi'
-import { type ConversationMode } from '../../../utils/turnStreamApi'
+// vitest runs with cwd = the portal root (where vitest.config.ts lives), and import.meta.url is
+// a jsdom http URL here — so anchor on cwd, not the module URL (matches jsx-deploy-retirement).
+const SRC_ROOT = path.resolve(process.cwd(), 'src')
 
-// jsdom lacks these; Radix's menu calls them on open / focus roving.
-beforeAll(() => {
-  Element.prototype.scrollIntoView = vi.fn()
-  Element.prototype.hasPointerCapture = vi.fn(() => false)
-  Element.prototype.setPointerCapture = vi.fn()
-  Element.prototype.releasePointerCapture = vi.fn()
-})
+// WHAT COUNTS AS USING IT — and this is narrower than "the name appears", deliberately.
+//
+// The first version of this guard forbade the STRING anywhere under `src`, with an allowlist of
+// four files permitted to mention it in prose. That is the wrong shape for an L8 guard: the
+// convention it enforces asks every removal to leave a comment saying what used to be here and
+// why it went, so a name-anywhere rule makes following the convention a test failure and the fix
+// under time pressure is to delete the explanation. The allowlist could not keep up either — it
+// went red the moment three suites were rewritten to say, correctly, that the control they used
+// to exercise is gone.
+//
+// So the rule matches its own test name: an IMPORT of the module or a MOUNT of the component.
+// Both are what a re-add would actually look like, and neither can be written by accident in a
+// sentence about the past.
+const USES_IT = [
+  /from\s+['"][^'"]*ModeSwitcher['"]/, // import … from '…/ModeSwitcher'
+  /require\(\s*['"][^'"]*ModeSwitcher['"]/, // require('…/ModeSwitcher')
+  /import\(\s*['"][^'"]*ModeSwitcher['"]/, // a dynamic import of it
+  /<ModeSwitcher[\s/>]/, // <ModeSwitcher … /> — the mount
+  /vi\.mock\(\s*['"][^'"]*ModeSwitcher['"]/, // a mock standing in for it is still a dependency
+]
 
-afterEach(() => {
-  cleanup()
-  vi.restoreAllMocks()
-})
+// The guard itself writes those patterns down, so it would match every one of them.
+const ALLOWLIST = new Set([path.join('components', 'chat', '__tests__', 'ModeSwitcher.test.tsx')])
 
-interface HarnessProps {
-  initial?: ConversationMode
-  disabled?: boolean
-  wiring?: 'project' | 'chat'
-  withComposer?: boolean
+function walk(dir: string): string[] {
+  return readdirSync(dir).flatMap((entry) => {
+    const full = path.join(dir, entry)
+    return statSync(full).isDirectory() ? walk(full) : [full]
+  })
 }
 
-function Harness({ initial = 'plan', disabled = false, wiring = 'project', withComposer = false }: HarnessProps) {
-  const [mode, setMode] = useState<ConversationMode>(initial)
-  const composerRef = useRef<HTMLTextAreaElement>(null)
-  const onSelect = (next: ConversationMode) => {
-    if (wiring === 'chat') {
-      void turnStreamApi.switchMode('conv-1', next).then((confirmed) => setMode(confirmed))
-    } else {
-      setMode(next)
+describe('ModeSwitcher is retired (U19)', () => {
+  it('the component file is gone from disk', () => {
+    expect(existsSync(path.join(SRC_ROOT, 'components', 'chat', 'ModeSwitcher.tsx'))).toBe(false)
+  })
+
+  it('no source file imports or mounts it', () => {
+    const offenders: string[] = []
+    let scanned = 0
+    for (const file of walk(SRC_ROOT)) {
+      const rel = path.relative(SRC_ROOT, file)
+      if (ALLOWLIST.has(rel)) continue
+      scanned += 1
+      const text = readFileSync(file, 'utf8')
+      if (USES_IT.some((pattern) => pattern.test(text))) offenders.push(rel)
     }
-  }
-  return (
-    <div>
-      {withComposer && <textarea data-testid="composer" ref={composerRef} />}
-      <ModeSwitcher
-        value={mode}
-        onSelect={onSelect}
-        disabled={disabled}
-        composerRef={withComposer ? composerRef : undefined}
-      />
-      <div data-testid="mode">{mode}</div>
-    </div>
-  )
-}
-
-/** Open the menu the way a citizen would from the composer: the ⌥P shortcut. */
-function pressOptionP() {
-  return fireEvent.keyDown(document, { code: 'KeyP', altKey: true })
-}
-
-describe('ModeSwitcher', () => {
-  it('reflects the current mode in the trigger', () => {
-    render(<ModeSwitcher value="write" onSelect={vi.fn()} />)
-    expect(screen.getByRole('button', { name: /Mode: Write/i })).toBeTruthy()
+    // LIVENESS: the walk actually read the tree. An empty `offenders` proves nothing if `walk`
+    // returned nothing — a wrong `SRC_ROOT` (this file's cwd assumption is a real hazard) would
+    // otherwise make this guard pass forever while the component sat there mounted.
+    expect(scanned).toBeGreaterThan(100)
+    expect(offenders).toEqual([])
   })
 
-  it('opens to Ask/Plan/Write, each with a description and a ✓ on the active mode', () => {
-    render(<ModeSwitcher value="plan" onSelect={vi.fn()} />)
-    pressOptionP()
-
-    const items = screen.getAllByRole('menuitemradio')
-    expect(items).toHaveLength(3)
-
-    // Each mode carries a one-line plain-language description.
-    expect(screen.getByText(/Ask about your app/i)).toBeTruthy()
-    expect(screen.getByText(/Plan it together/i)).toBeTruthy()
-    expect(screen.getByText(/Build the changes/i)).toBeTruthy()
-
-    // The ✓ is on Plan (the active mode) and only there.
-    const plan = screen.getByRole('menuitemradio', { name: /Plan/i })
-    const ask = screen.getByRole('menuitemradio', { name: /Ask/i })
-    const write = screen.getByRole('menuitemradio', { name: /Write/i })
-    expect(plan.getAttribute('aria-checked')).toBe('true')
-    expect(ask.getAttribute('aria-checked')).toBe('false')
-    expect(write.getAttribute('aria-checked')).toBe('false')
-    expect(plan.querySelector('.lucide-check')).not.toBeNull()
-    expect(ask.querySelector('.lucide-check')).toBeNull()
-    expect(write.querySelector('.lucide-check')).toBeNull()
-  })
-
-  it('CHAT wiring: selecting fires the server switch and reflects the confirmed value', async () => {
-    const spy = vi.spyOn(turnStreamApi, 'switchMode').mockResolvedValue('write')
-    render(<Harness wiring="chat" initial="ask" />)
-
-    pressOptionP()
-    fireEvent.click(screen.getByRole('menuitemradio', { name: /Write/i }))
-
-    expect(spy).toHaveBeenCalledWith('conv-1', 'write')
-    await waitFor(() => expect(screen.getByTestId('mode').textContent).toBe('write'))
-    expect(screen.getByRole('button', { name: /Mode: Write/i })).toBeTruthy()
-  })
-
-  it('CHAT wiring: disabled fires no request and the menu never opens', () => {
-    const spy = vi.spyOn(turnStreamApi, 'switchMode').mockResolvedValue('plan')
-    render(<Harness wiring="chat" initial="plan" disabled />)
-
-    pressOptionP()
-    expect(screen.queryByRole('menuitemradio')).toBeNull() // shortcut is inert while disabled
-    const trigger = screen.getByRole('button', { name: /Mode: Plan/i }) as HTMLButtonElement
-    expect(trigger.disabled).toBe(true)
-    expect(spy).not.toHaveBeenCalled()
-  })
-
-  it('CHAT wiring: the trigger is CONTROLLED — it does not move until the server confirms', async () => {
-    let resolveSwitch: (mode: ConversationMode) => void = () => {}
-    vi.spyOn(turnStreamApi, 'switchMode').mockImplementation(
-      () => new Promise<ConversationMode>((resolve) => { resolveSwitch = resolve })
-    )
-    render(<Harness wiring="chat" initial="ask" />)
-
-    pressOptionP()
-    fireEvent.click(screen.getByRole('menuitemradio', { name: /Plan/i }))
-
-    // Requested, but NOT reflected yet — no optimistic move.
-    expect(screen.getByTestId('mode').textContent).toBe('ask')
-    expect(screen.getByRole('button', { name: /Mode: Ask/i })).toBeTruthy()
-
-    resolveSwitch('plan')
-    await waitFor(() => expect(screen.getByTestId('mode').textContent).toBe('plan'))
-  })
-
-  it('PROJECT wiring: selecting updates local draft with no server call', () => {
-    const spy = vi.spyOn(turnStreamApi, 'switchMode')
-    render(<Harness wiring="project" initial="plan" />)
-
-    pressOptionP()
-    fireEvent.click(screen.getByRole('menuitemradio', { name: /Write/i }))
-
-    expect(screen.getByTestId('mode').textContent).toBe('write')
-    expect(screen.getByRole('button', { name: /Mode: Write/i })).toBeTruthy()
-    expect(spy).not.toHaveBeenCalled()
-  })
-
-  it('⌥P opens the menu, types NO character, and returns focus to the composer after selection', async () => {
-    render(<Harness wiring="project" initial="plan" withComposer />)
-    const composer = screen.getByTestId('composer') as HTMLTextAreaElement
-    composer.focus()
-    expect(document.activeElement).toBe(composer)
-
-    // ⌥P from the focused composer: preventDefault swallows the `π`, and the menu opens.
-    const notCanceled = pressOptionP()
-    expect(notCanceled).toBe(false) // preventDefault was called (no π inserted)
-    expect(composer.value).toBe('')
-    expect(screen.getAllByRole('menuitemradio')).toHaveLength(3)
-
-    fireEvent.click(screen.getByRole('menuitemradio', { name: /Write/i }))
-    await waitFor(() => expect(document.activeElement).toBe(composer)) // keeps typing
-  })
-
-  it('surfaces the ⌥P shortcut for discoverability (label + tooltip)', () => {
-    render(<ModeSwitcher value="plan" onSelect={vi.fn()} />)
-    const trigger = screen.getByRole('button', { name: /Mode: Plan/i })
-    expect(trigger.getAttribute('title')).toContain('⌥P')
-    expect(trigger.getAttribute('aria-keyshortcuts')).toBe('Alt+P')
-
-    pressOptionP()
-    expect(screen.getByText('⌥P')).toBeTruthy() // the kbd hint in the menu
+  it('the guard would CATCH a re-add — each pattern matches the shape it is for', () => {
+    // The half that stops this from being a guard nobody has tested. An absence test whose
+    // matcher is subtly wrong reports the same clean result as a genuine absence.
+    const reAdds = [
+      "import { ModeSwitcher } from '../chat/ModeSwitcher'",
+      "const { ModeSwitcher } = require('./ModeSwitcher')",
+      "const M = await import('../../components/chat/ModeSwitcher')",
+      '<ModeSwitcher value={kind} onSelect={setKind} />',
+      "vi.mock('../../components/chat/ModeSwitcher', () => ({}))",
+    ]
+    for (const line of reAdds) {
+      expect(USES_IT.some((pattern) => pattern.test(line)), line).toBe(true)
+    }
+    // …and prose about the retired control is NOT a re-add, which is the whole point of the
+    // narrowing above.
+    const prose = [
+      '// The ModeSwitcher used to sit here; a chat kind is fixed at creation now.',
+      "  * mounted on both `BuilderPage` and `ProjectBuilder` — see ModeSwitcher's guard.",
+    ]
+    for (const line of prose) {
+      expect(USES_IT.some((pattern) => pattern.test(line)), line).toBe(false)
+    }
   })
 })

@@ -39,7 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import storage_dependency, storage_or_none_dependency
 from src.config import settings
 from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
-from src.db.models.conversation import ConversationKind
+from src.db.models.conversation import ChatKind
 from src.services.approvals.submit import submit_app_for_review
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.build_sessions.appdata import resolve_app_for_project
@@ -71,7 +71,7 @@ async def test_provisioned_app_is_addressable_at_its_returned_id(client, db_sess
     path) — since U6 there is no client-callable provision endpoint."""
     owner, headers = await _auth_user(db_session, email="owner@rvaiglobal.com")
     conv = await ConversationFactory.create(
-        db_session, owner.id, kind=ConversationKind.BUILDER, title="My builder app"
+        db_session, owner.id, kind=ChatKind.BUILD, title="My builder app"
     )
 
     app_id = str(await resolve_app_for_project(db_session, owner.id, conv.project_id))
@@ -107,7 +107,7 @@ async def test_build_submit_approve_pipeline(client, app, db_session) -> None:
     app.dependency_overrides[storage_or_none_dependency] = lambda: store
     owner, owner_headers = await _auth_user(db_session, email="owner@rvaiglobal.com")
     conv = await ConversationFactory.create(
-        db_session, owner.id, kind=ConversationKind.BUILDER, title="My builder app"
+        db_session, owner.id, kind=ChatKind.BUILD, title="My builder app"
     )
 
     # (a) mint the project's app the way a build session does — take the appId it resolves on.

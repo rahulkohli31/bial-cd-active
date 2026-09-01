@@ -279,7 +279,7 @@ either did.
 excluded).
 - `search_files` — Search the app's files for a regex `pattern` (grep-like; case-sensitive)."""
 """GENERATED, NOT WRITTEN (U20 / R26) — a checked-in snapshot of
-`services/agent/toolsets.render_tool_surface(ConversationMode.WRITE)`, which renders one line per
+`services/agent/toolsets.render_tool_surface(ChatKind.BUILD)`, which renders one line per
 tool from the tool definitions pydantic-ai hands the model at registration.
 
 It is pasted here rather than computed because THIS MODULE IS A LEAF (see the file docstring): a

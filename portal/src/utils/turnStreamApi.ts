@@ -19,20 +19,22 @@ import { readApiError } from './apiError'
 // Frame types (mirror backend `conversations/schemas.py`; camelCase on the wire)
 // ---------------------------------------------------------------------------------------
 
-export interface StepDetail {
-  args?: string | null
-  result?: string | null
-}
-
+/**
+ * A step, and DELIBERATELY WITHOUT A `detail`. `StepDetail` carried the tool's own arguments
+ * and result, and it is gone from the server (`services/messages/projection.py`, which now
+ * pins its emitted field set in a test) because nothing rendered it: it was a platform
+ * internal that crossed to the browser and sat there, one refactor away from an expander.
+ * Re-adding the field here would rebuild the client half of that seam and give the next
+ * contributor something to wire up — which is why this comment names it rather than leaving
+ * a silent omission. The egress rule it belongs to is C7 §3.0.
+ */
 export interface StepItem {
   type: 'step'
   seq: number
-  mode: string
   tool: string
   label: string
   state: 'ok' | 'failed' | 'pending'
   hidden: boolean
-  detail: StepDetail
 }
 
 /** Projection items ride the snapshot verbatim (U6 shapes); the hook re-exposes them. */
@@ -42,14 +44,16 @@ export interface ProjectionItem {
   [key: string]: unknown
 }
 
-/** The Build it / Keep refining card state (U11) — identical live and on reload. */
+/** The Build it / Keep refining card state — identical live and on reload.
+ *
+ * `build_failed` is GONE from the state set, not merely unused. Every case it carried is a
+ * typed HTTP status the Build-it call already raises on, so a card that renders it would be a
+ * second, staler account of a failure the caller has already been told about in full. */
 export interface PlanOptionsItem {
   type: 'plan_options'
   seq: number
-  mode: string
   toolCallId: string
-  state: 'pending' | 'refine' | 'build' | 'build_failed'
-  reason?: string | null
+  state: 'pending' | 'refine' | 'build'
 }
 
 export interface SnapshotFrame {
@@ -144,17 +148,20 @@ export interface PreviewFrame {
 /** An in-narrative build diagnostic. NOT a failure: a repair run follows, and rendering it as
  *  an error would tell the user their build died on its way to succeeding.
  *
- *  TWO AUDIENCES, ONE FRAME (U16). `title` and `cleanedStack` are the MODEL's half — `title` is
- *  the compiler's own first meaningful line, which is exactly why the repair run needs it and
- *  exactly why no citizen should read it. `userMessage` / `userAction` are the citizen's half,
- *  and they are the only two fields the feed renders. Both always arrive non-empty: the server
+ *  ONE AUDIENCE NOW. This frame used to carry the model's half beside the citizen's —
+ *  `title`, the compiler's own first meaningful line, and `cleanedStack`, the de-noised log —
+ *  described as safe to transmit but not a product surface. That distinction is not one a wire
+ *  format can hold, and the sentence "safe to render verbatim" that preceded it is what once
+ *  put a stack trace under a file-path title in a citizen's chat. The server stopped sending
+ *  both; this stopped parsing them, because a parser for a field nothing sends is a field one
+ *  refactor away from being rendered.
+ *
+ *  `userMessage` / `userAction` are what crosses, and both always arrive non-empty: the server
  *  derives them from the error class when its producer supplies none. */
 export interface DiagnosticFrame {
   type: 'diagnostic'
   seq: number
   source: 'tsc' | 'next_build' | 'server' | 'client'
-  title: string
-  cleanedStack: string
   userMessage: string
   userAction: string
 }
@@ -259,14 +266,6 @@ function asString(value: unknown): string {
   return typeof value === 'string' ? value : ''
 }
 
-function toStepDetail(value: unknown): StepDetail {
-  const doc = isRecord(value) ? value : {}
-  return {
-    args: typeof doc.args === 'string' ? doc.args : null,
-    result: typeof doc.result === 'string' ? doc.result : null,
-  }
-}
-
 /** Exported so conversationApi.ts's reload path can narrow a stored `step` item the
  * same way the live path does, instead of a raw `as unknown as StepItem` cast — see
  * PR #93 review finding 9. */
@@ -276,7 +275,6 @@ export function toStepItem(value: unknown): StepItem | null {
   return {
     type: 'step',
     seq: typeof value.seq === 'number' ? value.seq : 0,
-    mode: asString(value.mode),
     tool: asString(value.tool),
     label: asString(value.label),
     // Fail SAFE, not silent: an unrecognized state renders as still-running rather than
@@ -285,7 +283,6 @@ export function toStepItem(value: unknown): StepItem | null {
     // F3/U3: `hidden` is a RENDER hint that must survive the parse — dropping it makes the
     // consumer's `!step.hidden` filter a no-op on `undefined`.
     hidden: value.hidden === true,
-    detail: toStepDetail(value.detail),
   }
 }
 
@@ -302,11 +299,8 @@ export function toPlanOptionsItem(value: unknown): PlanOptionsItem | null {
   return {
     type: 'plan_options',
     seq: typeof value.seq === 'number' ? value.seq : 0,
-    mode: asString(value.mode),
     toolCallId,
-    state:
-      state === 'refine' || state === 'build' || state === 'build_failed' ? state : 'pending',
-    reason: typeof value.reason === 'string' ? value.reason : null,
+    state: state === 'refine' || state === 'build' ? state : 'pending',
   }
 }
 
@@ -441,8 +435,6 @@ function toTurnFrame(parsed: unknown): TurnFrame | null {
           source === 'tsc' || source === 'next_build' || source === 'server' || source === 'client'
             ? source
             : 'server',
-        title: asString(parsed.title),
-        cleanedStack: asString(parsed.cleanedStack),
         // Empty from an older server that predates the pair — NOT a parse failure. The feed
         // owns the fallback sentence + action for exactly this case, so an empty string here
         // degrades to product copy rather than to a blank error row.
@@ -499,8 +491,8 @@ export function parseSseText(buffer: string): ParsedChunk {
  * This module used to call raw `fetch` at six sites and hand-roll its own `credentials`
  * and CSRF header — a second, weaker copy of what `authFetch` already owns, and one that
  * had no 401 → refresh → retry at all. An expired session therefore killed the entire
- * chat transport: start, stop, mode-switch, Build-it, plan-resolve and the SSE reader all
- * died where every other call in the app quietly recovered (N11).
+ * chat transport: start, stop, Build-it, plan-resolve and the SSE reader all died where
+ * every other call in the app quietly recovered (N11).
  *
  * One shared expression, N readers — the rule from the daily-token-double-count learning.
  * `authFetch` owns the refresh retry, the per-attempt CSRF token, the suspension gate and
@@ -568,24 +560,36 @@ export class TurnStartError extends Error {
   }
 }
 
-export type ConversationMode = 'ask' | 'plan' | 'write'
-
 export interface BuildFromPlanOutcome {
-  /** `build_failed` is gone: every case it carried is now a typed HTTP status `authFetch`
-   *  already raises on — 429 for the daily cap, 409 for a busy workspace, 503 for an
-   *  unconfigured engine. `turnId` replaces `sessionId` because a build IS a turn now. */
-  outcome: 'started' | 'already_started' | 'stale_plan'
+  /** `stale_plan` is gone with the pin that produced it: the plan the build runs on IS the plan
+   *  the card offered, carried in the offer itself, so there is no second copy to drift from. */
+  outcome: 'started' | 'already_started'
+  /** The BUILD chat — a different conversation from the one the card was clicked in. Echoed
+   *  back rather than assumed, because `already_started` answers with the chat that already
+   *  exists, which is the same id on a double-press and the thing to navigate to either way. */
+  chatId: string
   turnId?: string | null
-  appId?: string | null
-  planHeadSha?: string | null
-  currentHeadSha?: string | null
 }
 
-/** Build-it (U5): flip + record + START A TURN, one endpoint. */
+/**
+ * Build-it: the HANDOFF. The plan chat is left exactly as it stands and a NEW build chat is
+ * created, seeded with the plan and started, in one call.
+ *
+ * THE ID IS MINTED BY THE CALLER, and that is what makes a double-press safe. Two presses send
+ * the same `chatId`, so the second finds the first's conversation already there and answers
+ * `already_started` naming it — where a server-minted id would have produced two build chats
+ * for one plan and left the citizen looking at the empty one.
+ *
+ * A TYPED failure, because the caller has to tell these apart and each has a different remedy:
+ * 409 `already_building_here` (this user's one workspace is committed to another chat — wait or
+ * go there), 503 `workspace_unavailable` (nothing to build in — not the citizen's fault and not
+ * their fix), 429 (the daily cap), 400 (the offer carried no usable plan). A bare `Error`
+ * collapses four remedies into one sentence, and the sentence is wrong for three of them.
+ */
 export async function buildFromPlan(
   conversationId: string,
   toolCallId: string,
-  options: { force?: boolean } = {},
+  chatId: string,
   deps: AuthFetchDeps = {}
 ): Promise<BuildFromPlanOutcome> {
   const resp = await authFetch(
@@ -593,46 +597,19 @@ export async function buildFromPlan(
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ force: options.force ?? false }),
+      body: JSON.stringify({ chatId }),
     },
     deps
   )
-  if (!resp.ok) {
-    const body = (await resp.json().catch(() => null)) as { error?: { message?: string } } | null
-    throw new Error(body?.error?.message ?? `build transition failed (${resp.status})`)
-  }
+  if (!resp.ok) throw await readApiError(resp, 'Could not start the build')
   return (await resp.json()) as BuildFromPlanOutcome
-}
-
-/** The atomic mode switch (U13) — returns the SERVER's confirmed mode. */
-export async function switchMode(
-  conversationId: string,
-  mode: ConversationMode,
-  deps: AuthFetchDeps = {}
-): Promise<ConversationMode> {
-  const resp = await authFetch(
-    `/api/conversations/${conversationId}/mode`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode }),
-    },
-    deps
-  )
-  // A TYPED failure, because the caller has to tell 409 (a turn is still running — the one
-  // case "finish the current step" is true of) from 401 (the session lapsed) from everything
-  // else. A bare `Error` forced BuilderPage to map all three onto one string, and the string
-  // it picked was false for two of them (N12).
-  if (!resp.ok) throw await readApiError(resp, 'Could not switch modes')
-  const parsed = (await resp.json()) as { mode: ConversationMode }
-  return parsed.mode
 }
 
 export async function resolvePlanOptions(
   conversationId: string,
   toolCallId: string,
   deps: AuthFetchDeps = {}
-): Promise<{ state: 'refine' | 'build' | 'build_failed'; alreadyResolved: boolean }> {
+): Promise<{ state: 'refine' | 'build'; alreadyResolved: boolean }> {
   const resp = await authFetch(
     `/api/conversations/${conversationId}/plan-options/${toolCallId}/resolve`,
     {
@@ -643,7 +620,7 @@ export async function resolvePlanOptions(
     deps
   )
   if (!resp.ok) throw new Error(`plan options resolve failed (${resp.status})`)
-  return (await resp.json()) as { state: 'refine' | 'build' | 'build_failed'; alreadyResolved: boolean }
+  return (await resp.json()) as { state: 'refine' | 'build'; alreadyResolved: boolean }
 }
 
 export async function stopTurn(
@@ -703,8 +680,8 @@ export async function readTurnStream(options: ReadStreamOptions): Promise<Stream
   // only begins once response HEADERS have arrived — so a server that accepted the socket
   // and then went quiet left this promise PENDING FOREVER. `BuilderPage`'s `endGenerating`
   // sits after the await, so `generatingChatId` never cleared and the composer animated
-  // "Setting up your sandbox… running Nm Ns", with a live Stop button and a disabled mode
-  // toggle, on a turn the server had already failed in under a second. The 60s stall window
+  // "Setting up your sandbox… running Nm Ns", with a live Stop button, on a turn the server
+  // had already failed in under a second. The 60s stall window
   // could not save it: it was never armed. Every outcome of a subscribe must be reachable
   // in bounded time, headers or no headers.
   //

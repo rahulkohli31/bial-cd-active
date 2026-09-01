@@ -28,7 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import storage_dependency, storage_or_none_dependency
 from src.config import settings
 from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
-from src.db.models.conversation import ConversationKind
+from src.db.models.conversation import ChatKind
 from src.services.approvals.submit import submit_app_for_review
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.build_sessions.appdata import resolve_app_for_project
@@ -66,10 +66,10 @@ async def test_one_user_fans_out_into_two_independent_apps(client, app, db_sessi
     project_a = await ProjectFactory.create(db_session, user.id, name="Tool A")
     project_b = await ProjectFactory.create(db_session, user.id, name="Tool B")
     conv_a = await ConversationFactory.create(
-        db_session, user.id, kind=ConversationKind.BUILDER, project_id=project_a.id
+        db_session, user.id, kind=ChatKind.BUILD, project_id=project_a.id
     )
     conv_b = await ConversationFactory.create(
-        db_session, user.id, kind=ConversationKind.BUILDER, project_id=project_b.id
+        db_session, user.id, kind=ChatKind.BUILD, project_id=project_b.id
     )
 
     # --- mint an app in each project --------------------------------------------

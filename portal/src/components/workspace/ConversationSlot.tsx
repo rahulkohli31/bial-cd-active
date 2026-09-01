@@ -80,7 +80,7 @@ export default function ConversationSlot({ conversation, hidden = false }: Props
       {/* THE ONE KIND COMPARISON in `pages/` and `components/workspace/`, and Plan D deletes it
           here when one surface serves both. Everything else about a conversation is decided by
           what is present or absent, never by a test on its kind. */}
-      {kind === 'builder' ? (
+      {kind === 'build' ? (
         <BuilderPage {...shared} projectHasSavedBuild={projectHasSavedBuild} />
       ) : (
         <ChatPage {...shared} />

@@ -18,8 +18,8 @@ therefore never data loss: falling past the ring's tail degrades to a fresh snap
 not a gap (the review's buffer-eviction finding, answered structurally).
 
 Mode gating happens HERE (the server's record, never the client request): the run gets
-exactly `toolsets_for_mode(conversation.mode)` over the turn-pinned workspace, and the
-U9-composed instructions for that mode. Ask/Plan turns bill like the relay (one drain,
+exactly `toolsets_for_kind(conversation.kind)` over the turn-pinned workspace, and the
+U9-composed instructions for that kind. Plan turns bill like the relay (one drain,
 disconnect-safe by construction — the task IS the drain); Write turns arrive with U12's
 warm sessions and bill per step through the harness.
 
@@ -36,7 +36,7 @@ import uuid
 from collections import deque
 from collections.abc import AsyncIterable, Awaitable, Callable
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Any, Final, Literal
 
@@ -60,12 +60,15 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import Model
 from pydantic_ai.models.anthropic import AnthropicModelSettings
-from pydantic_ai.settings import ToolOrOutput
 from pydantic_ai.tools import DeferredToolRequests
 from pydantic_ai.usage import RequestUsage, RunUsage, UsageLimits
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.api.v1.build_sessions.schemas import LIVENESS_LEASE_RENEW_CADENCE_SECONDS, ErrorSource
+
+# The ONE ceiling, imported rather than re-spelled: the offer refuses a plan the send route
+# would refuse as a message, and two literals is how those two numbers drift apart.
+from src.api.v1.conversations._shared import MAX_MESSAGE_TEXT_CHARS
 from src.api.v1.conversations.schemas import (
     CompileFrame,
     DiagnosticFrame,
@@ -81,20 +84,17 @@ from src.api.v1.conversations.schemas import (
     WorkspaceFrame,
 )
 from src.core.integrity_types import BaselineIdentity
-from src.core.redaction import redact_secrets
-from src.db.models.conversation import Conversation, ConversationMode
+from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.harness_counter import HarnessCounter
 from src.db.models.message import MessageEntryKind, MessageVisibility
 from src.db.models.user import User
 from src.services.agent.agent import ChatDeps, chat_agent
-from src.services.agent.mode_prompts import PromptContext, mode_reminder, workspace_note
+from src.services.agent.mode_prompts import PromptContext, workspace_note
 from src.services.agent.read_tools import (
-    EmptyProjectWorkspace,
-    ExtractedSnapshotWorkspace,
     LiveSandboxWorkspace,
     ReadOnlyWorkspace,
 )
-from src.services.agent.toolsets import plan_options_only_toolset, toolsets_for_mode
+from src.services.agent.toolsets import toolsets_for_kind
 from src.services.build_sessions.alarms import HMR_PROTOCOL_DRIFT_EVENT
 from src.services.build_sessions.counters import count
 from src.services.build_sessions.integrity import (
@@ -115,12 +115,12 @@ from src.services.build_sessions.manager import (
 from src.services.build_sessions.outcome import STOPPED_BY_USER
 from src.services.messages.projection import (
     PLAN_OPTIONS_TOOL,
+    TURN_TERMINAL_KIND,
     DisplayItem,
     PlanOptionsItem,
     StepItem,
     classify_tool_call,
     long_operation_line,
-    step_detail,
 )
 from src.services.messages.store import append_batch
 from src.services.orchestrator.client_errors import discard_client_errors
@@ -150,17 +150,18 @@ from src.services.orchestrator.selfheal import (
 from src.services.redis import get_redis
 from src.services.sandbox import SandboxClient, SandboxError
 from src.services.sandbox.base import CompileState
-from src.services.storage.snapshot_read import NoAppYet, extract_snapshot
 from src.services.turns.copy import (
     COULD_NOT_CHECK_TEXT,
     COULD_NOT_CONFIRM_TEXT,
     DID_NOT_COME_TOGETHER_TEXT,
     NOT_RECOVERED_TEXT,
+    PLAN_NOT_KEPT_TEXT,
     RECOVERED_TEXT,
     STILL_SHOWING_EARLIER,
     STILL_SHOWING_NOTHING,
     STILL_SHOWING_TEMPLATE,
     UNVERIFIED_TEXT,
+    WRITING_UP_THE_PLAN_LABEL,
 )
 from src.services.turns.guard import claim_conversation, release_conversation
 from src.services.turns.plan_options import META_PENDING
@@ -255,104 +256,12 @@ _BUILD_FINISHED_FALLBACK = (
 # typo in either one would silently stop every card from being found.
 PENDING_META_KIND = META_PENDING
 
-# The ephemeral retry nudge (U11): rides `message_history` on the forced re-issue only —
-# ModelResponse-only persistence keeps it out of the DB, same boundary as U14's reminders.
-_FORCE_OPTIONS_NUDGE = (
-    "<system-note>The plan above reads ready. Call present_plan_options now to show the "
-    "user the confirmation buttons. This note is between you and the platform — keep it out "
-    "of your reply.</system-note>"
-)
-
-# U14 (D3): the ephemeral mode-reminder cadence. Long conversations bury the per-run
-# instructions at the top of context, so the active mode's rules re-ride near the TAIL on
-# a deterministic cadence — a FULL restatement every 8th turn in the mode, the one-line
-# nudge every 4th between, silence otherwise. The persisted mode-switch marker rows (U4)
-# are the anchor: a switch resets the count and the new mode's first turn gets an
-# immediate full reminder (its history actively contradicts the fresh toolset). The
-# reminder rides `message_history` only — `new_messages()` structurally excludes injected
-# history, so no post-hoc filtering ever has to remember to strip it.
-REMINDER_FULL_EVERY = 8
-REMINDER_NUDGE_EVERY = 4
-
 # The one greppable name for "this turn's R10 liveness lease did not land" (U12). A constant
 # rather than two inline literals because the two failure shapes — the store would not answer,
 # and there was no registry hash to attach the lease to — are one operational question ("is
 # anything protecting live builds right now?"), and an alert cannot be written against a
 # string that exists in two spellings. The reason is a field, not part of the event name.
 LEASE_RENEW_FAILED_EVENT = "liveness_lease_renew_failed"
-
-# `mode_switch_marker_text` (store.py) always opens with this literal. Detecting it in
-# the rehydrated payload is deliberate: hiddenness lives on the ROW, so the text is the
-# one in-band signal — and a user typing the prefix themselves merely nudges the cadence.
-_MODE_MARKER_PREFIX = "[mode changed:"
-
-
-def _turns_since_mode_anchor(history: list[ModelMessage]) -> tuple[int, bool]:
-    """(user turns since the newest mode-switch marker, whether a marker was seen).
-    Counts real user prompts only — tool-return requests (plan-options resolutions) and
-    responses don't advance the cadence. The current turn's prompt is NOT in `history`
-    (it rides separately), so the count IS this turn's 0-based ordinal in the mode."""
-    count = 0
-    for message in reversed(history):
-        if not isinstance(message, ModelRequest):
-            continue
-        for part in message.parts:
-            if isinstance(part, UserPromptPart):
-                if isinstance(part.content, str) and part.content.startswith(_MODE_MARKER_PREFIX):
-                    return count, True
-                count += 1
-                break
-    return count, False
-
-
-def _plan_options_outstanding(history: list[ModelMessage]) -> bool:
-    """Is a confirmation card already with the user (N9b)?
-
-    True when the newest `present_plan_options` call has no USER PROMPT after it — which covers
-    both states the reminder must not talk over: the card is still pending, or the user has just
-    answered it (their click is a tool RETURN, not a prompt, so it does not clear this) and the
-    resolution turn is the one about to run.
-
-    Read from history rather than from the store because history is what the model sees and what
-    this function already has; the stored resolution against the `toolCallId` is the same fact,
-    one layer down. A user prompt after the call is the honest "we have moved on" signal.
-    """
-    seen_prompt = False
-    for message in reversed(history):
-        if isinstance(message, ModelRequest):
-            for part in message.parts:
-                if isinstance(part, UserPromptPart) and not (
-                    isinstance(part.content, str) and part.content.startswith(_MODE_MARKER_PREFIX)
-                ):
-                    seen_prompt = True
-        elif isinstance(message, ModelResponse):
-            # A DISTINCT name from the request loop above: reusing `part` narrows it to the
-            # request-part union and mypy rejects the response-part assignment.
-            for response_part in message.parts:
-                if (
-                    isinstance(response_part, ToolCallPart)
-                    and response_part.tool_name == PLAN_OPTIONS_TOOL
-                ):
-                    return not seen_prompt
-    return False
-
-
-def _reminder_text(mode: ConversationMode, history: list[ModelMessage]) -> str | None:
-    """The reminder riding THIS turn, or None between cadence points. Turn 0 of a fresh
-    conversation stays silent (the instructions are right there); turn 0 after a SWITCH
-    gets the full reminder."""
-    ordinal, after_switch = _turns_since_mode_anchor(history)
-    # The cadence decides WHETHER to speak; the card state decides what the Plan reminder may
-    # say. Keeping the two separate is why an outstanding card quiets the call-the-tool
-    # sentence without also silencing the mode anchor the cadence exists to re-assert.
-    outstanding = mode is ConversationMode.PLAN and _plan_options_outstanding(history)
-    if after_switch and ordinal == 0:
-        return mode_reminder(mode, full=True, plan_options_outstanding=outstanding)
-    if ordinal > 0 and ordinal % REMINDER_FULL_EVERY == 0:
-        return mode_reminder(mode, full=True, plan_options_outstanding=outstanding)
-    if ordinal > 0 and ordinal % REMINDER_NUDGE_EVERY == 0:
-        return mode_reminder(mode, full=False, plan_options_outstanding=outstanding)
-    return None
 
 
 def _deferred_call(output: object) -> ToolCallPart | None:
@@ -363,6 +272,74 @@ def _deferred_call(output: object) -> ToolCallPart | None:
         if call.tool_name == PLAN_OPTIONS_TOOL:
             return call
     return None
+
+
+def plan_argument_of(part: ToolCallPart) -> str | None:
+    """The `plan` argument an offer was called with, stripped — WITHOUT the length ceiling.
+
+    A PRE-MIGRATION CALL TOOK NO ARGUMENTS AT ALL and reads as absent here, which is correct —
+    there is no plan in it to find. Those cards were all resolved by revision 0035, so nothing
+    live depends on this answer; the handoff refuses them by name.
+
+    Deliberately tolerant of a malformed argument object rather than raising: this runs on the
+    turn's own path, and a model that emitted unparseable JSON has produced no plan, which is
+    the same answer as an empty one and not a reason to fail a turn that otherwise worked.
+
+    SPLIT OUT SO THE REFUSAL COPY CAN ASK THE QUESTION RATHER THAN INFER THE ANSWER.
+    `transition._refusal_for` has to tell "there is no plan here" from "the plan is too long",
+    and it used to do that by reverse-engineering which of `plan_from_call`'s branches returned
+    `None` — correct only while there are exactly two. A third rejection reason added below
+    would have silently reported itself as "too long" to the one person it is not true for."""
+    try:
+        args = part.args_as_dict()
+    except Exception:
+        return None
+    plan = args.get("plan")
+    if not isinstance(plan, str):
+        return None
+    return plan.strip() or None
+
+
+def plan_from_call(part: ToolCallPart) -> str | None:
+    """The plan an offer carries, or None when the call cannot be honoured (R28a / R44).
+
+    TWO REFUSALS, AND BOTH ARE STRUCTURAL RATHER THAN CHECKS SOMEBODY REMEMBERS. An empty
+    argument means the offer would carry nothing to build — the defect the retired prose
+    heuristic used to manufacture, a Build it button under a plan nobody wrote. An argument
+    past the stored-message ceiling is REFUSED, never trimmed: a plan cut mid-sentence is one
+    the citizen agrees to and the build never sees the end of."""
+    plan = plan_argument_of(part)
+    if plan is None or len(plan) > MAX_MESSAGE_TEXT_CHARS:
+        return None
+    return plan
+
+
+def _without_the_call(messages: list[ModelMessage], tool_call_id: str) -> list[ModelMessage]:
+    """The run's persistable slice with one tool call removed, and any response it emptied.
+
+    WHY REMOVE IT RATHER THAN STORE IT AND SKIP IT LATER. "No offer is recorded" has to be true
+    at EVERY reader, and there are two that answer independently: `plan_options._scan`, which
+    finds pending cards from the row meta, and the projection, which draws the card from the
+    stored tool call itself. Leaving an unhonourable call on the wire and teaching each reader
+    to ignore it is two rules to keep in step, and the projection's rule would have to
+    distinguish a migrated call (no argument, still rendered) from a new one (no argument,
+    never rendered). Not writing it is one rule, at one place, and it leaves the dangling-call
+    repair nothing to stitch."""
+    kept: list[ModelMessage] = []
+    for message in messages:
+        if not isinstance(message, ModelResponse):
+            kept.append(message)
+            continue
+        parts = [
+            part
+            for part in message.parts
+            if not (isinstance(part, ToolCallPart) and part.tool_call_id == tool_call_id)
+        ]
+        if len(parts) == len(message.parts):
+            kept.append(message)
+        elif parts:
+            kept.append(replace(message, parts=parts))
+    return kept
 
 
 def _persistable_messages(new_messages: list[ModelMessage]) -> list[ModelMessage]:
@@ -388,73 +365,25 @@ def _persistable_messages(new_messages: list[ModelMessage]) -> list[ModelMessage
     return kept
 
 
-# How far back from the end a `?` still means "this turn is asking". A model that closes
-# "…which shape should I plan around?\nEither way, I'll wait." is asking — the last-line-only
-# test read the sign-off and called the turn a plan.
-_CLARIFYING_TAIL_LINES = 3
-
-
-def _list_item_body(line: str) -> str | None:
-    """The text after a line's list marker (`- `, `* `, `• `, `1.`, `2)`), or None when the
-    line carries no marker at all."""
-    stripped = line.lstrip()
-    if stripped[:2] in {"- ", "* ", "• "}:
-        return stripped[2:].lstrip()
-    if stripped[:1].isdigit() and stripped[1:2] in {".", ")"}:
-        return stripped[2:].lstrip()
-    return None
-
-
-def _is_labelled_alternative(body: str) -> bool:
-    """True when a list item is a LABELLED CHOICE (`A.`, `B)`, `**C.**`) rather than a step.
-    Markdown emphasis is stripped first, because the model writes `- **A.** …`. Nobody
-    numbers a sequence of steps A/B/C — that shape means "pick one"."""
-    head = body.lstrip("*_ ")
-    if len(head) < 2 or head[1] not in {".", ")", ":"}:
-        return False
-    return head[0].isalpha() and head[0].isupper()
-
-
-def _looks_plan_shaped(text: str) -> bool:
-    """Conservative plan-shape heuristic for the retry guarantee: a Plan turn that ends
-    on a QUESTION is a legitimate clarifying turn (never retried); one that laid out
-    list-shaped steps without presenting the options gets the one forced retry.
-
-    This used to price a false fire at "one cheap forced call". A real trace (turn
-    019fc05f-d3df-729d-a688-d33a309bddfd) proved that wrong. The model asked which of three
-    options to take as settled, wrote them out as A/B/C, and closed on the statement "I'm
-    not going to start writing code until one of us has moved" — an explicit refusal to
-    finalize. This function saw no `?` on the LAST LINE and counted the three ANSWER CHOICES
-    as three plan steps, so it fired; the forced retry (rightly) produced no call; and
-    `_synthesize_options` fabricated a Build-it button under the question. A false fire can
-    put a build button beneath a plan nobody agreed to, so it is the expensive side now —
-    a miss is still just one extra user message.
-
-    Widened twice in response, and deliberately NOT by scanning the whole text for any `?`
-    (a legitimate plan may carry a rhetorical one):
-      * a `?` anywhere in the last `_CLARIFYING_TAIL_LINES` non-empty lines rather than only
-        the final one — a question with a sign-off after it is still a question;
-      * two or more list items that are labelled ALTERNATIVES — an explicit
-        choice-solicitation, which is a question whatever punctuation it ends on.
-    Both can only ever suppress a forced call, never add one, which keeps every step of the
-    widening on the cheap side of that asymmetry."""
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not lines:
-        return False
-    if any(line.endswith("?") for line in lines[-_CLARIFYING_TAIL_LINES:]):
-        return False
-    steps = 0
-    alternatives = 0
-    for line in lines:
-        body = _list_item_body(line)
-        if body is None:
-            continue
-        steps += 1
-        if _is_labelled_alternative(body):
-            alternatives += 1
-    if alternatives >= 2:
-        return False
-    return steps >= 2
+# NOTHING HERE READS THE AGENT'S PROSE TO DECIDE PRODUCT STATE, and this is where three things
+# that did used to live (R23).
+#
+# `_looks_plan_shaped` counted list items and looked for a trailing `?` to decide whether the
+# model had written a plan. When it said yes and no tool call had been made, a FORCED RETRY
+# re-issued the run with the options tool as the only thing it could reach; when that also
+# produced no call, `_synthesize_options` FABRICATED a card so the buttons appeared anyway.
+#
+# It fired wrongly, and the trace is on record (turn 019fc05f-d3df-729d-a688-d33a309bddfd): the
+# model laid out three options as A/B/C and closed with "I'm not going to start writing code
+# until one of us has moved" — an explicit refusal to finalize. The heuristic read the three
+# ANSWER CHOICES as three plan steps, saw no `?` on the final line, and put a Build-it button
+# under a plan nobody had agreed to. It was widened twice; the shape of the defect is that no
+# amount of widening fixes reading prose to infer intent.
+#
+# What replaces all three is one deliberate act by the agent: it calls the offer tool and passes
+# the plan as the argument. A turn that never calls the tool simply produced no plan, which is
+# the correct outcome rather than a defect to compensate for — and the buttons and the plan are
+# now the same act, so there is no longer a question of WHICH text the plan was.
 
 
 class TurnNotRunningError(Exception):
@@ -530,17 +459,17 @@ class _TurnState:
     turn_id: uuid.UUID
     conversation_id: uuid.UUID
     user_id: uuid.UUID
-    mode: ConversationMode
+    kind: ChatKind
     status: TurnStatus = "running"
     seq: int = 0
     ring: deque[TurnStreamFrame] = field(default_factory=lambda: deque(maxlen=RING_MAXLEN))
     text_parts: list[str] = field(default_factory=list)
-    # U15/R20 — WRITE-mode prose, held until we know what it is. Text streams BEFORE the tool
+    # U15/R20 — BUILD-chat prose, held until we know what it is. Text streams BEFORE the tool
     # call that would mark it as narration-between-tools, so the decision cannot be made at
     # delta time; one model response's prose accumulates here and is either dropped by
     # `_discard_pending_text` (a tool call followed → it was narration) or committed by
     # `_flush_pending_text` (the response ended with no tool call → it was the turn's answer).
-    # Never used in Ask/Plan, where the prose IS the deliverable and streams as it arrives.
+    # Never used in a Plan chat, where the prose IS the deliverable and streams as it arrives.
     pending_text: list[str] = field(default_factory=list)
     steps: dict[str, StepItem] = field(default_factory=dict)  # tool_call_id → newest item
     # U17's acknowledgement, held OUT of `steps` and beside it. The distinction the original
@@ -563,9 +492,6 @@ class _TurnState:
     # into the cleanup path (which lands inside the CancelledError arm and can eat the
     # terminal frame the subscriber is waiting for).
     stop_requested: bool = False
-    # The pinned extraction's head SHA (Plan turns stamp it onto their options card for
-    # U12's stale-plan check); None when no app exists yet.
-    head_sha: str | None = None
     # The user-facing reason a turn failed, set alongside the in-band `TurnErrorFrame`. The
     # frame lives only in the ring, so a subscriber whose cursor fell past it (or who arrives
     # after) would otherwise read `turn_status="failed"` with no reason attached.
@@ -764,7 +690,7 @@ class TurnEngine:
                 turn_id=uuid.uuid7(),
                 conversation_id=conversation.id,
                 user_id=user_id,
-                mode=conversation.mode,
+                kind=conversation.kind,
                 expects_mutation=expects_mutation,
             )
             self._by_conversation[conversation.id] = state
@@ -778,12 +704,10 @@ class TurnEngine:
             # snapshot nor `append_batch` ever sees it.
             ack = StepItem(
                 seq=0,  # transient: no row, so no row seq
-                mode=state.mode.value,
                 tool=ACK_TOOL,
                 label=ACK_TEXT,
                 state="pending",
                 hidden=False,
-                detail=step_detail(None, None),
             )
             state.acknowledgement = ack
             self._emit(
@@ -936,24 +860,35 @@ class TurnEngine:
                 manager=manager,
                 sandbox_client=sandbox_client,
             )
-            # U14: the ephemeral mode reminder rides as a fresh tail message on the run's
-            # history at cadence turns. Rebinding `history` here keeps the retry run below
-            # consistent (it extends the same list) while `new_messages()` — the only thing
-            # persisted — structurally never contains it.
-            reminder = _reminder_text(state.mode, history)
-            if reminder is not None:
-                history = [*history, ModelRequest(parts=[UserPromptPart(content=reminder)])]
-            # U8 / R14 — AND THE WORKSPACE NOTE, UNCONDITIONALLY, on every turn that pinned a
-            # sandbox. Same mechanism as the reminder above (an ephemeral tail on
-            # `message_history`, structurally excluded from the persisted rows) and deliberately
-            # NOT the same delivery: `_reminder_text` is cadence-gated and silent between anchors,
-            # so riding it would tell the model what its app is doing on roughly one turn in four
-            # while U8's entire claim is that answering from stale history is impossible.
+            # U8 / R14 — THE WORKSPACE NOTE, UNCONDITIONALLY, on every turn that pinned a
+            # sandbox: an ephemeral tail on `message_history`, structurally excluded from the
+            # persisted rows because `new_messages()` never contains injected history.
+            #
+            # It is the ONLY thing injected here now. The per-turn restatement that used to
+            # ride beside it — "you are in Plan mode", on a cadence — went with the modes it
+            # restated: a chat's kind is fixed at creation, and the toolset is what carries
+            # which chat this is. This note stayed because it is a different claim: it tells
+            # the model a FACT about the app that its history cannot know, and it holds on
+            # every turn rather than one in four.
             if workspace is not None:
                 note = await self._workspace_note(state)
                 history = [*history, ModelRequest(parts=[UserPromptPart(content=note)])]
-            if state.mode is ConversationMode.WRITE:
-                # A Write turn bills PER MODEL STEP, inside the loop — `record_usage` is
+            if state.kind is ChatKind.BUILD:
+                # ONE OF THE THREE READERS OF THE KIND, and each asks a different question:
+                # `agent/toolsets.py` asks what the model CAN DO, `agent/mode_prompts.py` asks
+                # what it is TOLD, and this asks WHICH HARNESS RUNS it. Three, not two — the
+                # organising rule is that behaviour lives in the toolset rather than in
+                # scattered branches, and the honest statement of it is that these three sites
+                # are the closed set. Anyone auditing every place the kind changes behaviour,
+                # adding a third kind, or building the import guard that enforces this, has to
+                # find all three; a comment claiming two would send them looking for two.
+                #
+                # This one selects a HARNESS SHAPE — the node loop with
+                # its per-step billing fold versus a single `chat_agent.run`, and with it the
+                # `output_type` below. Unifying the two loops would mean giving a Plan run the
+                # streaming node loop and the per-step billing it has no steps for.
+                #
+                # A Build turn bills PER MODEL STEP, inside the loop — `record_usage` is
                 # called once per step and that is the only fold. Claiming the turn as
                 # already billed here is what stops `_bill_once` from folding the same
                 # tokens a second time at the terminal and doubling every build's daily
@@ -973,15 +908,15 @@ class TurnEngine:
                     deps = ChatDeps(
                         db=db,
                         user_id=state.user_id,
-                        mode=state.mode,
+                        kind=state.kind,
                         prompt_context=prompt_context,
                         workspace=workspace,
                     )
-                    toolsets = toolsets_for_mode(state.mode, _workspace_of)
-                    # Plan mode may DEFER on present_plan_options — the run then ends with a
+                    toolsets = toolsets_for_kind(state.kind, _workspace_of).toolsets
+                    # A Plan chat may DEFER on present_plan_options — the run then ends with a
                     # DeferredToolRequests output instead of text (the pending card state).
                     output_type: Any = (
-                        [str, DeferredToolRequests] if state.mode == ConversationMode.PLAN else str
+                        [str, DeferredToolRequests] if state.kind is ChatKind.PLAN else str
                     )
                     result = await chat_agent.run(
                         prompt,
@@ -992,59 +927,50 @@ class TurnEngine:
                         output_type=output_type,
                         usage=turn_usage,
                         event_stream_handler=self._event_handler(state),
+                        # A CEILING, NOT A TUNING KNOB. This run passed no model settings at
+                        # all and inherited the provider default of 4096 output tokens. A plan
+                        # is written for a person to read and can run long — and truncation
+                        # here does not degrade, it wipes: the argument carrying the plan is
+                        # cut mid-string, the offer is refused, and the citizen pays for a turn
+                        # that produced nothing they can press. The same two settings the build
+                        # loop already passes, for the same reason.
+                        model_settings=AnthropicModelSettings(
+                            max_tokens=MAX_OUTPUT_TOKENS, temperature=TEMPERATURE
+                        ),
                     )
-                    batches: list[tuple[list[ModelMessage], dict[str, Any] | None]] = []
+                    persistable = _persistable_messages(result.new_messages())
                     deferred = _deferred_call(result.output)
-                    batches.append(
-                        (
-                            _persistable_messages(result.new_messages()),
-                            self._pending_meta(state, deferred),
-                        )
-                    )
 
-                    if (
-                        state.mode == ConversationMode.PLAN
-                        and deferred is None
-                        and _looks_plan_shaped(state.text_so_far())
-                    ):
-                        # The retry guarantee (U11): the model narrated a ready-looking plan
-                        # but never called the tool — ONE re-issue with the tool as forced as
-                        # the framework allows: the retry offers ONLY `present_plan_options`
-                        # (`ToolOrOutput` restriction + an options-only toolset — a stricter
-                        # `tool_choice` raises pydantic-ai's static guard, and
-                        # `DeferredToolRequests` cannot be the sole output type). The nudge
-                        # is ephemeral (only response + tool-return rows persist). A retry that
-                        # STILL produces no call falls through to the synthesized card rather than
-                        # failing the turn — the buttons ALWAYS appear.
-                        try:
-                            retry: Any = await chat_agent.run(
-                                _FORCE_OPTIONS_NUDGE,
-                                deps=deps,
-                                message_history=[*history, *result.new_messages()],
-                                model=model,
-                                toolsets=plan_options_only_toolset(),
-                                output_type=[str, DeferredToolRequests],
-                                model_settings={
-                                    "tool_choice": ToolOrOutput(function_tools=[PLAN_OPTIONS_TOOL])
-                                },
-                                usage=turn_usage,
-                                event_stream_handler=self._event_handler(state),
-                            )
-                        except Exception:
-                            _log.warning(
-                                "plan_options_forced_retry_failed",
-                                conversation_id=str(state.conversation_id),
-                                turn_id=str(state.turn_id),
-                                exc_info=True,
-                            )
-                        else:
-                            deferred = _deferred_call(retry.output)
-                            batches.append(
-                                (
-                                    _persistable_messages(retry.new_messages()),
-                                    self._pending_meta(state, deferred),
-                                )
-                            )
+                    # AN OFFER IS EITHER HONOURABLE OR IT IS NOT WRITTEN AT ALL (R28a / R44).
+                    # An empty plan, one past the stored-message ceiling, or a pre-migration
+                    # call with no argument leaves nothing to press — so the call comes off
+                    # what is persisted, no pending record is written, and the turn says so in
+                    # one platform-authored line. Nothing unbuildable is left on screen, and
+                    # the live feed already agreed: the event handler pushed no plan and
+                    # emitted no card for the same call.
+                    if deferred is not None and plan_from_call(deferred) is None:
+                        _log.info(
+                            "plan_options_offer_refused",
+                            conversation_id=str(state.conversation_id),
+                            turn_id=str(state.turn_id),
+                        )
+                        persistable = _without_the_call(persistable, deferred.tool_call_id)
+                        deferred = None
+                        self._push_plan(state, PLAN_NOT_KEPT_TEXT)
+                        persistable = [
+                            *persistable,
+                            ModelResponse(parts=[TextPart(content=PLAN_NOT_KEPT_TEXT)]),
+                        ]
+
+                    batches: list[tuple[list[ModelMessage], dict[str, Any] | None]] = [
+                        (persistable, self._pending_meta(deferred))
+                    ]
+
+                    # NO SECOND MODEL REQUEST IS ISSUED HERE, and none is issued anywhere as a
+                    # consequence of what the model wrote. The forced retry that used to sit at
+                    # this point re-ran the turn with the offer tool as the only thing the model
+                    # could reach, on the strength of a prose heuristic — see the note where
+                    # that heuristic used to be defined.
 
                     # WRITE-BEFORE-DONE (U5 policy): the reply must be durable before the
                     # turn may claim success. A failure of the persist seam is DISTINCT from
@@ -1061,17 +987,9 @@ class TurnEngine:
                                     conversation_id=state.conversation_id,
                                     messages=messages,
                                     entry_kind=MessageEntryKind.TURN,
-                                    mode=state.mode,
+                                    kind=state.kind,
                                     meta=meta,
                                 )
-                        if (
-                            state.mode == ConversationMode.PLAN
-                            and deferred is None
-                            and _looks_plan_shaped(state.text_so_far())
-                        ):
-                            # Retry cap reached with a plan on screen and no card — synthesize the
-                            # options as a system record so the user is never stranded planless.
-                            await self._synthesize_options(state, db)
                         await db.commit()
                     except Exception as exc:
                         raise _PersistFailedError from exc
@@ -1137,6 +1055,14 @@ class TurnEngine:
             )
             self._finish(state, "failed")
         finally:
+            # THE DURABLE TERMINAL, FIRST IN THE FINALLY. `_finish` emits the live
+            # `TurnEndedFrame` and cannot write it — it is synchronous by design, so that a
+            # terminal frame reaches every subscriber with no await in between for a second
+            # cancellation to slip through. So the row is written here, which is the same
+            # boundary: `finally` runs exactly once per turn, on every arm, after whichever
+            # `_finish` above set the status. Writing it from the arms instead would mean five
+            # call sites and a turn that could leave two rows.
+            await self._write_turn_terminal(state, session_factory)
             # The watcher dies FIRST, on every terminal arm and for EVERY mode. The Write
             # loop already stops its own on the way out, but Ask and Plan attach the same
             # live container — `_attach_sandbox` starts the watcher for whoever attaches —
@@ -1235,9 +1161,13 @@ class TurnEngine:
         the model can see it is a template. Withholding the tree was the more misleading
         option, and it is gone.
 
-        `head_sha` is stamped from the snapshot on the read paths only. It pins a Plan card
-        to a version so Build-it can notice the app moved underneath it; a live tree has no
-        fixed version to pin, which is the point of it being live."""
+        NOTHING PINS A VERSION HERE ANY MORE. A Plan turn used to stamp the snapshot's head
+        onto its options card so Build-it could warn that the app had moved underneath the
+        plan, and the writer sat inside a branch on the chat's kind — the last of those. What
+        the pin bought is paid for better and for more cases: the instruction to follow the
+        code's reality where it differs from what the plan assumed lives in the Build chat's
+        own prompt, which works for a plan built weeks later rather than only when two snapshot
+        heads happen to differ."""
         attach = partial(
             self._attach_sandbox,
             state,
@@ -1246,27 +1176,17 @@ class TurnEngine:
             manager=manager,
             sandbox_client=sandbox_client,
         )
-        if sandbox_client is None and state.mode is not ConversationMode.WRITE:
-            # THE SANDBOX SERVICE IS NOT CONFIGURED — a deployment fact, and the only reason
-            # left to read anything but the container. Not to be confused with "this project
-            # is new": a new project gets the container like everybody else (below). Read
-            # modes degrade to the last saved bundle rather than failing outright; Write falls
-            # through and fails loudly, because it cannot do its job without a container.
-            if app_id is None:
-                return EmptyProjectWorkspace(app_id=uuid.UUID(int=0))
-            extracted = await extract_snapshot(app_id)
-            if isinstance(extracted, NoAppYet):
-                return EmptyProjectWorkspace(app_id=app_id)
-            state.head_sha = extracted.head_sha
-            return ExtractedSnapshotWorkspace(root=extracted.root)
-        if state.mode is ConversationMode.PLAN and app_id is not None:
-            # Best-effort, and only for the version PIN — a Plan card records a snapshot head
-            # so Build-it can notice the app moved underneath it. It does not decide what Plan
-            # READS; that is the container, below. No snapshot yet simply means no pin, which
-            # costs a stale-plan warning and never the turn.
-            extracted = await extract_snapshot(app_id)
-            if not isinstance(extracted, NoAppYet):
-                state.head_sha = extracted.head_sha
+        # ONE ARM. There is no branch here at all any more — every turn, in both kinds,
+        # resolves the project's LIVE container and nothing else (R18).
+        #
+        # What used to sit above this was the last way a chat could answer from a saved copy:
+        # `sandbox_client is None and this is not a Build chat` fell through to extracting the
+        # newest snapshot bundle. That condition was never about the chat — `sandbox_client is
+        # None` is a deployment fact wearing a branch on the kind — and the behaviour it bought
+        # was a silent downgrade: the citizen asked about their app and got an answer about a
+        # copy of it, with nothing on screen to say which. The same fact is now asked one layer
+        # up, where a person can be told about it (R98, `api/v1/conversations/turns.py`), so a
+        # send that cannot reach a workspace is refused before it is spent.
         return LiveSandboxWorkspace(session=await attach())
 
     # -- the WRITE run -------------------------------------------------------------------
@@ -1340,13 +1260,15 @@ class TurnEngine:
                     user,
                     project_id,
                     sandbox_client=sandbox_client,
-                    # THE MODE, taken where it is decided. `toolsets_for_mode` gives Ask and
-                    # Plan a read-only toolset and only Write the `sandbox_toolset` that can
-                    # mutate files, so this is a structural fact about the run rather than a
-                    # prediction. Downstream guards cannot recover it — every mode pins the
-                    # container identically — and reading it as "always writing" made a read-
-                    # only question refuse the Save button and claim the app was being built.
-                    may_write=state.mode is ConversationMode.WRITE,
+                    # TAKEN FROM THE TOOL SURFACE ITSELF, not re-derived from the enum.
+                    # `toolsets_for_kind` gives a Plan run a read-only toolset and only a Build
+                    # run the `sandbox_toolset` that can mutate files, and it returns
+                    # `may_write` alongside them — so this is literally the same answer the
+                    # model's abilities give, rather than a second reading that convention
+                    # keeps in step. Downstream guards cannot recover it (both kinds pin the
+                    # container identically), and reading it as "always writing" once made a
+                    # read-only question refuse the Save button and claim the app was building.
+                    may_write=toolsets_for_kind(state.kind, _workspace_of, _sandbox_of).may_write,
                     # U2 — THE SENTENCE HAS TO ARRIVE BEFORE THE SLOW WORK, not after it. The
                     # recovery path adds tens of seconds of otherwise-silent latency, and the
                     # gate calls this the moment it knows, from inside the attach.
@@ -1712,16 +1634,13 @@ class TurnEngine:
                     # A later plan brings this class into a split-audience rendering with copy of
                     # its own. Until then, silence is the honest surface.
                     if error.source is not ErrorSource.CLIENT:
-                        source, title, stack = error.source, error.title, error.cleaned_stack
-                        self._emit(
-                            state,
-                            lambda seq: DiagnosticFrame(
-                                seq=seq,
-                                source=source,
-                                title=title,
-                                cleaned_stack=stack,
-                            ),
-                        )
+                        # `error.title` and `error.cleaned_stack` are deliberately NOT read
+                        # here. They are the model's half and they stay server-side, on the
+                        # `BuildError` the repair prompt below is built from; the frame carries
+                        # the class and the citizen's sentence, and nothing that came out of a
+                        # compiler.
+                        source = error.source
+                        self._emit(state, lambda seq: DiagnosticFrame(seq=seq, source=source))
                     turn_prompt = build_repair_prompt(error)
                 else:
                     # Green, but the model never said it was done — a nudge, not an error.
@@ -1756,7 +1675,7 @@ class TurnEngine:
         so a build that dies at step 40 has still paid for steps 1-39."""
         deps = ChatDeps(
             user_id=state.user_id,
-            mode=ConversationMode.WRITE,
+            kind=ChatKind.BUILD,
             prompt_context=prompt_context,
             workspace=workspace,
             sandbox=state.sandbox,
@@ -1767,7 +1686,7 @@ class TurnEngine:
             deps=deps,
             model=model,
             message_history=messages,
-            toolsets=toolsets_for_mode(ConversationMode.WRITE, _workspace_of, _sandbox_of),
+            toolsets=toolsets_for_kind(ChatKind.BUILD, _workspace_of, _sandbox_of).toolsets,
             output_type=str,
             usage_limits=UsageLimits(request_limit=MODEL_TURN_CEILING),
             # Without `max_tokens` pydantic-ai's Anthropic default of 4096 truncates a
@@ -1958,7 +1877,7 @@ class TurnEngine:
                     conversation_id=state.conversation_id,
                     messages=delta,
                     entry_kind=MessageEntryKind.STEP,
-                    mode=ConversationMode.WRITE,
+                    kind=ChatKind.BUILD,
                     meta={"kind": "write_step", "turnId": str(state.turn_id)},
                 )
                 await db.commit()
@@ -2007,7 +1926,7 @@ class TurnEngine:
                     conversation_id=state.conversation_id,
                     messages=[ModelResponse(parts=[TextPart(content=text)])],
                     entry_kind=MessageEntryKind.STEP,
-                    mode=ConversationMode.WRITE,
+                    kind=ChatKind.BUILD,
                     meta={"kind": "write_completion", "turnId": str(state.turn_id)},
                 )
                 await db.commit()
@@ -2032,7 +1951,7 @@ class TurnEngine:
                     conversation_id=state.conversation_id,
                     messages=[ModelRequest(parts=[UserPromptPart(content=turn_prompt)])],
                     entry_kind=MessageEntryKind.STEP,
-                    mode=ConversationMode.WRITE,
+                    kind=ChatKind.BUILD,
                     visibility=MessageVisibility.HIDDEN,
                     meta={"kind": "write_reprompt", "turnId": str(state.turn_id)},
                 )
@@ -2121,14 +2040,12 @@ class TurnEngine:
             label, step_state = "Not working yet — fixing it.", "failed"
         item = StepItem(
             seq=0,
-            mode=ConversationMode.WRITE.value,
             tool="verify",
             label=label,
             # `pending` IS the in-flight state in this vocabulary — the same one a real
             # tool call sits in between its call and its return.
             state=step_state,
             hidden=False,
-            detail=step_detail(None, None),
         )
         # The SAME tool_call_id for both phases, which is how the client replaces the
         # pending card in place instead of stacking two rows.
@@ -2387,50 +2304,69 @@ class TurnEngine:
         with suppress(Exception):
             await asyncio.shield(release_liveness_lease(get_redis(), state.user_id))
 
-    def _pending_meta(
-        self, state: _TurnState, deferred: ToolCallPart | None
-    ) -> dict[str, Any] | None:
-        """The row meta for a batch that carries the pending options call: the card's id
-        and the plan-time snapshot pin (row-level — never inside the native payload)."""
+    def _pending_meta(self, deferred: ToolCallPart | None) -> dict[str, Any] | None:
+        """The row meta for a batch that carries the pending options call: the card's id, and
+        nothing else.
+
+        TWO SHORT SCALARS, AND NOT THE PLAN. `meta` is JSONB that a redaction pass walks, and
+        putting up to 64,000 characters of plan here would be a third durable copy of a string
+        the tool call's own `args` already holds authoritatively. A copy that can silently
+        disagree with the call it describes is worse than no copy — every reader goes to the
+        args instead.
+
+        THE SNAPSHOT PIN IS GONE TOO (U6). It recorded the app's head at plan time so Build-it
+        could warn that the app had moved underneath the plan. Its only writer sat inside a
+        mode branch, and what it bought is paid for better: the instruction to follow the
+        code's reality where it differs from what the plan assumed now lives in the Build
+        chat's own prompt, where it works for a plan built weeks later rather than only when
+        two snapshot heads happen to differ."""
         if deferred is None:
             return None
-        return {
-            "kind": PENDING_META_KIND,
-            "toolCallId": deferred.tool_call_id,
-            "headSha": state.head_sha,
-        }
+        return {"kind": PENDING_META_KIND, "toolCallId": deferred.tool_call_id}
 
-    async def _synthesize_options(self, state: _TurnState, db: AsyncSession) -> None:
-        """The retry-cap fallback: no real tool call exists, so the card is a system
-        record (`plan_options_pending`, synthesized) — the user still gets their buttons,
-        the wire history stays clean, and the miss is logged for prompt tuning."""
-        tool_call_id = f"synthesized-{uuid.uuid4().hex[:12]}"
-        _log.warning(
-            "plan_options_synthesized_fallback",
-            conversation_id=str(state.conversation_id),
-            turn_id=str(state.turn_id),
+    # NOTHING SYNTHESIZES A CARD ANY MORE. `_synthesize_options` used to fabricate one — a
+    # hidden `plan_options_pending` system row with `synthesized: True` — when the heuristic
+    # said a plan had been written and neither the run nor the forced retry had called the
+    # tool, so that "the buttons ALWAYS appear". They appeared under plans nobody had agreed
+    # to. `plan_options._scan` still READS the synthesized shape, and must: rows written by
+    # the retired writer are in the database, and revision 0035 resolved their cards rather
+    # than deleting them.
+
+    def _emit_plan_status(self, state: _TurnState, tool_call_id: str) -> None:
+        """The "writing up the plan" line, held in `state.steps` so a client that subscribes
+        mid-argument sees it in the catch-up snapshot like any other in-flight step.
+
+        IT HAS NO DURABLE COUNTERPART, and that is deliberate rather than an omission: a status
+        that exists only while a turn is streaming has nothing to say on a reloaded transcript,
+        which shows the plan and the offer and never the moment before them. Same reasoning as
+        the turn's opening acknowledgement, which is also never persisted."""
+        item = StepItem(
+            seq=0,  # transient: no row, so no row seq
+            tool=PLAN_OPTIONS_TOOL,
+            label=WRITING_UP_THE_PLAN_LABEL,
+            state="pending",
+            hidden=False,
         )
-        await append_batch(
-            db,
-            user_id=state.user_id,
-            conversation_id=state.conversation_id,
-            messages=[],
-            entry_kind=MessageEntryKind.SYSTEM_EVENT,
-            mode=state.mode,
-            visibility=MessageVisibility.HIDDEN,
-            meta={
-                "kind": PENDING_META_KIND,
-                "toolCallId": tool_call_id,
-                "headSha": state.head_sha,
-                "synthesized": True,
-            },
+        state.acknowledgement = None
+        state.steps[tool_call_id] = item
+        self._emit(
+            state,
+            lambda seq: StepFrame(seq=seq, tool_call_id=tool_call_id, phase="started", item=item),
         )
-        self._emit_plan_options(state, tool_call_id)
+
+    def _push_plan(self, state: _TurnState, plan: str) -> None:
+        """The plan onto the live stream, through the ungated text sink.
+
+        Separated from `_push_text` only by the block separator: an earlier response in the
+        same turn may already have flushed prose, and `text_parts` joins with nothing between
+        entries, so without this the plan runs into that prose's last sentence."""
+        if state.text_parts:
+            self._push_text(state, TEXT_BLOCK_SEPARATOR)
+        self._push_text(state, plan)
 
     def _emit_plan_options(self, state: _TurnState, tool_call_id: str) -> None:
         item = PlanOptionsItem(
             seq=0,  # live card; the reload projection assigns the row seq
-            mode=state.mode.value,
             tool_call_id=tool_call_id,
             state="pending",
         )
@@ -2466,6 +2402,23 @@ class TurnEngine:
         if isinstance(event, PartStartEvent):
             if isinstance(event.part, TextPart) and event.part.content:
                 self._stream_text(state, event.part.content, new_block=True)
+            elif (
+                isinstance(event.part, ToolCallPart) and event.part.tool_name == PLAN_OPTIONS_TOOL
+            ):
+                # A STATUS THE MOMENT THE BLOCK OPENS, and only for this one tool.
+                #
+                # The name is available before any argument is: the provider's
+                # `content_block_start` for a tool use carries `name` with an empty `input`,
+                # which pydantic-ai surfaces here as a `ToolCallPart` whose `tool_name` is
+                # already set. That matters because the plan now rides the argument —
+                # thousands of tokens stream between this event and the call resolving, and
+                # with prose held beside a tool call the screen shows nothing new for the
+                # whole of it.
+                #
+                # NOT WIDENED TO EVERY TOOL, deliberately: the others resolve fast and already
+                # emit at `FunctionToolCallEvent`, so emitting at both events would double
+                # every step row in the transcript.
+                self._emit_plan_status(state, event.part.tool_call_id)
         elif isinstance(event, PartDeltaEvent):
             if isinstance(event.delta, TextPartDelta) and event.delta.content_delta:
                 self._stream_text(state, event.delta.content_delta, new_block=False)
@@ -2475,9 +2428,18 @@ class TurnEngine:
             # it can reach the wire, which is why the live feed and a later reload agree.
             self._discard_pending_text(state)
             if event.part.tool_name == PLAN_OPTIONS_TOOL:
-                # The options card, not a step: the call defers (the user's click is the
-                # result), so there is no 'finished' counterpart to wait for.
-                self._emit_plan_options(state, event.part.tool_call_id)
+                # The plan FIRST, then the card beneath it — the order the citizen reads, and
+                # the same order the reload projection produces from this one stored call.
+                # A call carrying no usable plan pushes nothing and offers nothing; the turn's
+                # own closing line says so, once, from the persist path below.
+                plan = plan_from_call(event.part)
+                if plan is not None:
+                    self._push_plan(state, plan)
+                    # The options card, not a step: the call defers (the user's click is the
+                    # result), so there is no 'finished' counterpart to wait for. It REPLACES
+                    # the status on the same tool_call_id rather than stacking beside it.
+                    self._emit_plan_options(state, event.part.tool_call_id)
+                state.steps.pop(event.part.tool_call_id, None)
                 return
             item = self._step_item(state, event.part.tool_name, event.part.args_as_json_str())
             # REPLACED, not accumulated beside: the first real step retires the ack from the
@@ -2606,15 +2568,15 @@ class TurnEngine:
     def _stream_text(self, state: _TurnState, text: str, *, new_block: bool) -> None:
         """Prose arriving mid-response, before we know whether a tool call follows it.
 
-        Ask/Plan commit immediately — there the prose IS the deliverable and a held stream
-        would be a dead screen. WRITE holds it: see `_TurnState.pending_text`.
+        A Plan chat commits immediately — there the prose IS the deliverable and a held
+        stream would be a dead screen. A Build chat holds it: see `_TurnState.pending_text`.
 
         `new_block` marks a fresh `TextPart` rather than a delta continuing the current one.
         Blocks were previously concatenated with nothing between them, which ran the last
         sentence of one into the first word of the next ("…the workspace.Now let me…") on
         the live feed only — reload always kept them as separate items.
         """
-        if state.mode is not ConversationMode.WRITE:
+        if state.kind is not ChatKind.BUILD:
             if new_block and state.text_parts:
                 self._push_text(state, TEXT_BLOCK_SEPARATOR)
             self._push_text(state, text)
@@ -2640,18 +2602,20 @@ class TurnEngine:
         self._push_text(state, held)
 
     def _step_item(self, state: _TurnState, tool_name: str, args_json: str) -> StepItem:
+        """A step, live. `args_json` is READ and never transmitted: it decides the friendly
+        label and whether the step is a hidden read, and then it is done.
+
+        THE ARGUMENTS USED TO RIDE THE FRAME, redacted here at the boundary because the
+        persistence seam redacted the rows and the two renderings had to agree. They agree
+        trivially now: neither carries them. Redaction at a boundary is only ever as good as
+        the redactor, and the thing that cannot leak is the thing that was never sent."""
         label, hidden = classify_tool_call(tool_name, args_json)
         return StepItem(
             seq=0,  # live steps have no row seq; the reload projection assigns real ones
-            mode=state.mode.value,
             tool=tool_name,
             label=label,
             state="pending",
             hidden=hidden,
-            # Redacted HERE, at the frame boundary — the persistence seam redacts the rows,
-            # so without this the LIVE stream showed a secret the reload had already masked.
-            # Same function both sides, so the two renderings can never disagree.
-            detail=step_detail(redact_secrets(args_json), None),
         )
 
     def _resolve_step(self, state: _TurnState, event: FunctionToolResultEvent) -> StepItem | None:
@@ -2660,15 +2624,11 @@ class TurnEngine:
             return None
         part = event.part
         failed = not isinstance(part, ToolReturnPart)  # a RetryPromptPart = refused/failed
-        content = (
-            redact_secrets(part.model_response_str()) if isinstance(part, ToolReturnPart) else None
-        )
-        resolved = pending.model_copy(
-            update={
-                "state": "failed" if failed else "ok",
-                "detail": step_detail(pending.detail.args, content),
-            }
-        )
+        # THE RESULT IS NOT READ, and that is the unit's point rather than an oversight: a
+        # tool's return is the single richest thing a turn holds — file contents, command
+        # output, whatever the sandbox said — and it used to be clipped, redacted and shipped
+        # on every step. Whether the call succeeded is the whole of what a step reports now.
+        resolved = pending.model_copy(update={"state": "failed" if failed else "ok"})
         state.steps[event.tool_call_id] = resolved
         if len(state.steps) > _STEPS_CAP:
             # Drop the oldest resolved step — snapshot material only; rows are authoritative.
@@ -2715,6 +2675,61 @@ class TurnEngine:
                 reason=state.end_reason,
             ),
         )
+
+    async def _write_turn_terminal(
+        self, state: _TurnState, session_factory: SessionFactory
+    ) -> None:
+        """One hidden `system_event` row saying how this turn ended.
+
+        BOTH KINDS, UNCONDITIONALLY, and nothing here reads `state.kind`: a Plan turn and a
+        Build turn resume the same way or one of them has the weaker path, and the weaker one
+        is always the one nobody notices until a citizen is looking at a frozen transcript.
+
+        NOTHING IS WRITTEN FOR A TURN THAT DID NOT REACH A TERMINAL — a process killed
+        mid-flight never gets here at all, which is the point: the absence of this row IS the
+        ended-unknown signal, and a row written on the way out of an unfinished turn would
+        destroy it.
+
+        BEST-EFFORT, AND SAID SO. This runs in the terminal path, after the reply is already
+        durable and after the subscriber has already been told the turn ended. A raise here
+        would take down the release and the watcher teardown below it — a leaked container and
+        a hung feed — to protect a row whose only job is to make a LATER reload truthful. So it
+        is logged and swallowed, exactly as `write_build_outcome` treats seq contention, and a
+        reload that finds no terminal falls back to the honest ended-unknown reading."""
+        if state.status not in ("completed", "failed", "stopped"):
+            return
+        try:
+            async with session_factory() as db:
+                await append_batch(
+                    db,
+                    user_id=state.user_id,
+                    conversation_id=state.conversation_id,
+                    # AN EMPTY PAYLOAD, and it is the whole of why this row is safe to write on
+                    # every turn. `load_history` flattens every row's payload — hidden ones
+                    # INCLUDED, because a hidden row can carry the tool return that answers a
+                    # deferred call, and dropping it would hand the model a dangling call. A row
+                    # with no messages contributes nothing to that flattening, so the model's
+                    # context is untouched. The fact lives entirely in `meta`, which only the
+                    # projection reads. A one-part `ModelResponse` here — even an empty string —
+                    # would put a blank assistant message into every subsequent prompt of the
+                    # conversation, for the rest of its life.
+                    messages=[],
+                    entry_kind=MessageEntryKind.SYSTEM_EVENT,
+                    kind=state.kind,
+                    visibility=MessageVisibility.HIDDEN,
+                    meta={
+                        "kind": TURN_TERMINAL_KIND,
+                        "turnId": str(state.turn_id),
+                        "status": state.status,
+                        "reason": state.end_reason,
+                    },
+                )
+        except Exception:
+            _log.exception(
+                "turn_terminal_row_failed",
+                conversation_id=str(state.conversation_id),
+                turn_id=str(state.turn_id),
+            )
 
     # -- subscription -------------------------------------------------------------------
 

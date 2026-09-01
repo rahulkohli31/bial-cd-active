@@ -2,9 +2,9 @@
 2026-07-22-002).
 
 Rebuilt in place by migration 0024 (destructive reset — the legacy SPA parts shape is gone).
-One row per persisted batch: a whole turn for Ask/Plan, a single agent step for Write (so a
-crash mid-build loses at most the in-flight step), a system/lifecycle entry, or a mode-switch
-marker. The JSONB `payload` is 100% native `ModelMessagesTypeAdapter` serialization — the ONLY
+One row per persisted batch: a whole turn in a Plan chat, a single agent step in a Build chat
+(so a crash mid-build loses at most the in-flight step), or a system/lifecycle entry. The JSONB
+`payload` is 100% native `ModelMessagesTypeAdapter` serialization — the ONLY
 transformations applied at the seam are attachment-binary externalization and secret redaction
 (`services/messages/store.py`); everything else round-trips byte-faithfully.
 
@@ -34,23 +34,27 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from src.db.base import Base
 from src.db.mixins import OwnedByUserMixin, TimestampMixin, UUIDv7PrimaryKeyMixin
-from src.db.models.conversation import ConversationMode, conversation_mode_enum
+from src.db.models.conversation import ChatKind, chat_kind_enum
 
 
 class MessageEntryKind(StrEnum):
     """What kind of batch this row holds. Native PG enum labels (ADR-0008).
 
-    * `turn` — a whole Ask/Plan turn (user prompt + the run's new messages).
-    * `step` — one Write-mode agent step (BRAIN persists per step for crash durability).
+    * `turn` — a whole Plan-chat turn (user prompt + the run's new messages).
+    * `step` — one Build-chat agent step (BRAIN persists per step for crash durability).
     * `system_event` — a lifecycle record (build outcome, provision/quota/stop events).
-    * `mode_switch` — a hidden direction-aware marker (`[mode changed: …]`) written by the
-      switch endpoint so the model sees WHERE in history the mode changed.
+
+    THE RETIRED `mode_switch` LABEL. There was a fourth: a hidden direction-aware marker
+    written by the mode-switch endpoint so the model could see where in history the mode
+    changed. There are no mode boundaries any more — a chat's kind is fixed at creation — so
+    revision 0035 deleted every such row and the member went with the endpoint. The PG label
+    is left in place and inert: nothing writes it, nothing reads it, and swapping the type to
+    remove one unreferenced label would rewrite the largest table for no behavioural gain.
     """
 
     TURN = "turn"
     STEP = "step"
     SYSTEM_EVENT = "system_event"
-    MODE_SWITCH = "mode_switch"
 
 
 class MessageVisibility(StrEnum):
@@ -62,7 +66,7 @@ class MessageVisibility(StrEnum):
 
 
 # Native PG enums, shared by the model columns and migration 0024 (`create_type=False` — the
-# migration owns CREATE/DROP TYPE). Mirrors `conversation_kind_enum`.
+# migration owns CREATE/DROP TYPE). Mirrors `chat_kind_enum`.
 message_entry_kind_enum = sa.Enum(
     MessageEntryKind,
     name="message_entry_kind",
@@ -105,9 +109,12 @@ class Message(UUIDv7PrimaryKeyMixin, TimestampMixin, OwnedByUserMixin, Base):
         nullable=False,
         server_default=sa.text("'visible'::message_visibility"),
     )
-    # Which mode the batch ran under (audit + projection labeling; the CURRENT mode lives on
-    # the conversation row — this is the historical stamp).
-    mode: Mapped[ConversationMode] = mapped_column(conversation_mode_enum, nullable=False)
+    # Which kind of chat the batch ran under — an AUDIT stamp, and deliberately kept even
+    # though nothing under `src/` reads it for a decision any more (R53 names the per-row stamp
+    # in as many words, and "what was this row written under" is cheap to keep and impossible
+    # to reconstruct later). Renamed from `mode` by revision 0035 rather than reused under the
+    # old name: leaving a column called `mode` behind is how a deleted vocabulary survives.
+    kind: Mapped[ChatKind] = mapped_column(chat_kind_enum, nullable=False)
     # The native batch: `ModelMessagesTypeAdapter.dump_python(mode="json")` output, with
     # `BinaryContent` externalized to attachment references and secrets redacted. A list of
     # ModelMessage dicts; may be empty for a pure lifecycle entry.

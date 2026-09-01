@@ -40,7 +40,7 @@ import { createElement } from 'react'
 import { screen, waitFor, cleanup, fireEvent } from '@testing-library/react'
 import {
   FakeEventSource, makeClient, primeClient, primeTurn, renderBuilderAt, withLiveBuildAnchor,
-  statusResp, send, sendAndConfirm, scriptBuildTurn, T_PREVIEW, T_BUILD_END, turnStreaming,
+  statusResp, send, scriptBuildTurn, T_PREVIEW, T_BUILD_END, turnStreaming,
   T_DELTA, T_END,
 } from './_builderSession.jsx'
 
@@ -309,11 +309,23 @@ describe('BuilderPage — the frame\'s identity is its ADDRESS, and nothing else
     // takes its HMR socket with it. The other half is the scenario below.
     const view = await relaunchFramedAt('chat-A', 'pA')
 
-    const turn = scriptBuildTurn()
+    // `hold` — the send IS the build here, so its socket has to stay open for the frames
+    // pushed in below rather than replaying a plan and completing.
+    const turn = scriptBuildTurn({ hold: true })
     h.readTurnStream.mockImplementation(turn.impl)
-    await sendAndConfirm('a visitor app')
+    // AN ORDINARY SEND, not the plan card. This page renders a BUILD chat and every send on one
+    // is a build turn, so a send is the shortest honest way to get a build streaming here — and
+    // the card is no longer even a route to one from this chat: pressing Build it hands off to a
+    // SECOND chat and navigates there, so the turn it starts would never stream into this frame.
+    await send('a visitor app')
+    // NO `turnId` IN THE SUBSCRIBE, and that is the send path's shape rather than an oversight:
+    // a send subscribes to whatever turn its own POST just started on this conversation, so the
+    // id is the server's to know. Only a RE-ATTACH names a turn, because it is joining one it
+    // did not start.
     await waitFor(() =>
-      expect(h.readTurnStream).toHaveBeenCalledWith(expect.objectContaining({ turnId: expect.any(String) })),
+      expect(h.readTurnStream).toHaveBeenCalledWith(
+        expect.objectContaining({ conversationId: 'chat-A' }),
+      ),
     )
     await turn.frame(T_PREVIEW(TURN_URL))
     await waitFor(() => expect(framedUrl()).toBe(TURN_URL))

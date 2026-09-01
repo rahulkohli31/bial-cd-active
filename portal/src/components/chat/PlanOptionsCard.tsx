@@ -4,10 +4,14 @@
  * the card can never disagree with the stored record.
  *
  * States: `pending` shows the two buttons (only the NEWEST card is actionable — older
- * pendings render expired); `refine` / `build` render the settled choice; `build_failed`
- * RE-ARMS the buttons with the failure named (the plan's never-resolved-with-no-build
- * rule). "Keep refining" resolves here; "Build it" is the caller's atomic transition
- * (U12 wires the endpoint through `onBuildIt`).
+ * pendings render expired); `refine` / `build` render the settled choice. There is no third
+ * settled state and no re-arm arm: a card used to be BURNED by a press that failed, and
+ * `build_failed` re-armed it with the failure named. Build-it starts a whole new chat now and
+ * answers this offer only once that chat's turn is running, so a press that fails records
+ * nothing — the card was never spent, and there is nothing to un-spend. A failure is said once,
+ * in the error line below the buttons, by the caller that actually saw it.
+ *
+ * "Keep refining" resolves here; "Build it" is the caller's handoff (through `onBuildIt`).
  */
 
 import { useState } from 'react'
@@ -26,12 +30,6 @@ export interface PlanOptionsCardProps {
   onRefined?: (toolCallId: string) => void
 }
 
-const FAILURE_COPY: Record<string, string> = {
-  lock_held: 'Another build is already running for your account.',
-  daily_cap: 'The daily usage limit was reached.',
-  provision_failed: 'The build environment could not be started.',
-}
-
 export function PlanOptionsCard({
   conversationId,
   item,
@@ -42,7 +40,7 @@ export function PlanOptionsCard({
   const [busy, setBusy] = useState<'build' | 'refine' | null>(null)
   const [error, setError] = useState<string | null>(null)
 
-  const actionable = !expired && (item.state === 'pending' || item.state === 'build_failed')
+  const actionable = !expired && item.state === 'pending'
 
   const handleRefine = async () => {
     setBusy('refine')
@@ -94,12 +92,6 @@ export function PlanOptionsCard({
 
   return (
     <div className="plan-options-card" data-state={item.state}>
-      {item.state === 'build_failed' && (
-        <p className="text-sm text-destructive" role="alert">
-          {FAILURE_COPY[item.reason ?? ''] ?? 'The build could not start.'} The plan is still
-          ready when you are.
-        </p>
-      )}
       <p className="text-sm">Ready to build this plan?</p>
       <div className="flex gap-2">
         <Button

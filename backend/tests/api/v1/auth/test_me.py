@@ -68,8 +68,9 @@ async def test_me_response_exposes_no_secret_fields(client, db_session) -> None:
     user = await UserFactory.create(db_session, upn="secret-upn@rvaiglobal.com")
     jwt = mint_session_jwt(user.id, user.token_version, _TTL)
     resp = await client.get("/v1/auth/me", headers=_cookie(jwt))
-    # `is_admin` (derived hint) + `limits` (effective) are exposed; upn/token_version stay hidden.
-    assert set(resp.json()) == {"id", "email", "display_name", "is_admin", "limits"}
+    # `is_admin` (derived hint) + `limits` (effective) + `chat_kinds` (the U16 catalogue) are
+    # exposed; upn/token_version stay hidden.
+    assert set(resp.json()) == {"id", "email", "display_name", "is_admin", "limits", "chat_kinds"}
 
 
 async def test_me_limits_default_when_no_override(client, db_session) -> None:
@@ -104,6 +105,25 @@ async def test_me_limits_reflect_per_user_override(client, db_session) -> None:
     assert limits["contextHardLimit"] == 180_000
 
 
+async def test_me_carries_exactly_two_chat_kinds_each_with_a_value_name_and_description(
+    client, db_session
+) -> None:
+    """U16/R73's happy path: the once-cached bootstrap the portal already fetches before first
+    paint carries the WHOLE chat-kind catalogue, so `chatKind.ts` never needs a second fetch —
+    and never needs a second, hand-written copy of the wording — to know what Plan and Build
+    chats are."""
+    user = await UserFactory.create(db_session)
+    jwt = mint_session_jwt(user.id, user.token_version, _TTL)
+    resp = await client.get("/v1/auth/me", headers=_cookie(jwt))
+    kinds = resp.json()["chat_kinds"]
+    assert len(kinds) == 2
+    assert {kind["value"] for kind in kinds} == {"plan", "build"}
+    for kind in kinds:
+        # Non-empty on every field: a blank name or description would render as a gap in the
+        # composer, not an error anyone would see in a log.
+        assert kind["value"] and kind["name"] and kind["description"]
+
+
 async def test_me_is_admin_false_for_citizen(client, db_session) -> None:
     # UserFactory's default email is not on the test SUPERADMIN_EMAILS allowlist.
     user = await UserFactory.create(db_session)
@@ -129,11 +149,13 @@ def test_auth_openapi_documents_carve_out_models_and_codes() -> None:
     me = paths["/v1/auth/me"]["get"]["responses"]
     assert {"200", "401"} <= set(me)
     # UserProfile stays SNAKE_CASE on the wire (NOT reparented onto CamelModel).
-    assert {"id", "email", "display_name", "is_admin", "limits"} <= set(
+    assert {"id", "email", "display_name", "is_admin", "limits", "chat_kinds"} <= set(
         components["UserProfile"]["properties"]
     )
     # ...but the nested ProfileLimits IS camelCase (reparented onto CamelModel).
     assert "dailyTokenLimit" in components["ProfileLimits"]["properties"]
+    # ...and the U16 catalogue entry is plain lowercase — no snake/camel seam to cross.
+    assert {"value", "name", "description"} <= set(components["ChatKindInfo"]["properties"])
     # refresh/logout: documented-only 200 model + the {"detail"} error codes.
     assert {"200", "401", "403"} <= set(paths["/v1/auth/refresh"]["post"]["responses"])
     assert {"200", "403"} <= set(paths["/v1/auth/logout"]["post"]["responses"])

@@ -12,7 +12,7 @@
  *  2. It 404s but the URL carries `?projectId=` → this is a brand-new chat whose row
  *     does not exist yet. There is no header-only create endpoint; the row appears on
  *     the first `appendMessage`. So a new chat opens at
- *     `/chat/{clientMintedId}?projectId={pid}&kind={planning|builder}` and the page
+ *     `/chat/{clientMintedId}?projectId={pid}&kind={plan|build}` and the page
  *     rewrites to the bare `/chat/{id}` once that first append lands. This is what
  *     lets a flat path survive a reload and a cold open.
  *  3. It 404s with no query → the chat is gone (or was never real). Back to /projects.
@@ -38,15 +38,15 @@ import { getProject } from '../utils/projectApi'
 import { markChatOpened } from '../utils/observe'
 import type { Project } from '../utils/projectApi'
 
-export type ChatKind = 'planning' | 'builder'
+export type ChatKind = 'plan' | 'build'
 
-/** `?kind=` is user-controllable, so anything but the builder opt-in is a planning chat. */
+/** `?kind=` is user-controllable, so anything but the build opt-in is a plan chat. */
 function kindFromQuery(raw: string | null): ChatKind {
-  return raw === 'builder' ? 'builder' : 'planning'
+  return raw === 'build' ? 'build' : 'plan'
 }
 
 function kindFromServer(raw: unknown): ChatKind {
-  return raw === 'builder' ? 'builder' : 'planning'
+  return raw === 'build' ? 'build' : 'plan'
 }
 
 /** `chatId` is carried so a render can tell whether a resolution still describes the routed chat. */
@@ -73,7 +73,7 @@ export default function ChatRoute() {
   //
   // WHY ROUTER STATE AND NOT THE QUERY. `?kind=` is user-controllable, and a saved chat's URL is
   // rewritten to the bare `/chat/{id}` only after its FIRST append — so a shared or bookmarked
-  // `/chat/{id}?kind=builder` for an already-saved chat is a perfectly ordinary URL, and skipping
+  // `/chat/{id}?kind=build` for an already-saved chat is a perfectly ordinary URL, and skipping
   // on "the URL has query params" would hand it its kind from that attacker- or accident-supplied
   // string instead of from the server. Router state cannot do that: it does not survive a reload
   // and it does not travel in a link, so the marker can only ever be present on the one navigation

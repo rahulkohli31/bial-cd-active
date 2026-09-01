@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.deps import run_build_dependency
 from src.api.v1.build_sessions.schemas import BuildResult, BuildSessionStatus, StepEvent
-from src.db.models.conversation import Conversation, ConversationKind, ConversationMode
+from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.message import Message, MessageEntryKind
 from tests.api.v1.build_sessions.conftest import auth_headers, drain
 from tests.factories import ConversationFactory, MessageFactory, ProjectFactory, UserFactory
@@ -45,7 +45,7 @@ async def _thread(db_session: AsyncSession):
     user = await UserFactory.create(db_session)
     project = await ProjectFactory.create(db_session, user.id)
     conv = await ConversationFactory.create(
-        db_session, user.id, project_id=project.id, kind=ConversationKind.BUILDER
+        db_session, user.id, project_id=project.id, kind=ChatKind.BUILD
     )
     # The turn that asked for the build — the outcome must land AFTER it.
     await MessageFactory.create(db_session, user.id, conv.id, seq=0)
@@ -236,56 +236,33 @@ async def test_a_build_with_no_thread_records_nothing_and_still_ends(
     assert session.status is BuildSessionStatus.ENDED
 
 
-# --- and the thread gets its mode back -----------------------------------------------------
+# --- kind is fixed at creation, a build never touches it ------------------------------------
 #
-# `Build it` flips the thread to Write; Write has no chat toolset and `start_turn` refuses its
-# turns outright. The composer re-opens the instant the build ends (one "the agent is working"
-# gate), so the end sequence has to hand the mode back — or the citizen gets a live composer whose
-# every send 400s. Driven through `manager.start` rather than the HTTP transition because the mode
-# is the TRANSITION's to flip; what this file proves is that the end sequence honours the entry
-# mode the session carries.
+# THIS SECTION USED TO PROVE A MODE-RESTORE HANDOFF: `Build it` flipped the thread's
+# three-valued `mode` to WRITE, Write was a chat dead end, and the end sequence had to hand
+# the mode back so the composer could reopen. That whole mechanism — `ConversationMode`, the
+# entry-mode round trip through `manager.start`, and the restore-on-finish step — is retired
+# (`manager.py`'s own `_do_finalize`/Write-end docstring: "Write is no longer a dead end the
+# thread has to be rescued from — that was the whole point of the convergence", predating even
+# this enum collapse). `Conversation.kind` is chosen once at creation and never changes (R14/R15;
+# no route mutates it), so there is nothing left to restore. `_live_write_thread` and
+# `_run_to_terminal`, the two helpers that drove the old round trip, are deleted rather than
+# type-patched: they called `manager.start(..., entry_mode=...)`, a parameter that no longer
+# exists, so "fixing" their types would have kept dead, non-callable code alive. What remains
+# is the inertness guard: an ordinary build must leave `kind` exactly as it found it.
 
 
-async def _live_write_thread(db_session, entry_mode: ConversationMode):
-    user = await UserFactory.create(db_session)
-    project = await ProjectFactory.create(db_session, user.id)
-    conv = await ConversationFactory.create(
-        db_session, user.id, project_id=project.id, kind=ConversationKind.BUILDER, mode=entry_mode
-    )
-    await MessageFactory.create(db_session, user.id, conv.id, seq=0)
-    conv.mode = ConversationMode.WRITE  # what the Build-it transition does
-    await db_session.flush()
-    return user, project, conv
-
-
-async def _run_to_terminal(wire, db_session, user, project, conv, entry_mode):
-    session = await wire.manager.start(
-        db_session,
-        user,
-        project.id,
-        "build it",
-        conversation_id=conv.id,
-        entry_mode=entry_mode,
-        run_build=ScriptedBrain(_verdict(BuildSessionStatus.ENDED, "completed")),
-        sandbox_client=wire.sbx,
-    )
-    assert session.task is not None
-    await session.task
-    return session
-
-
-async def test_an_api_only_build_leaves_the_mode_alone(
+async def test_an_api_only_build_never_touches_the_kind(
     client, db_session, wire, fake_redis, fake_storage
 ) -> None:
-    """`POST /build-sessions` never flips the mode, so it has nothing to restore. No entry mode
-    on the session must mean "don't touch it" — never a guessed default."""
+    """`POST /build-sessions` must never touch `kind` — it is immutable after creation, so a
+    build session has no mode to flip and nothing to restore."""
     user, project, conv = await _thread(db_session)
-    conv.mode = ConversationMode.WRITE
-    await db_session.flush()
+    starting_kind = conv.kind
 
     await _start(
         client, wire, user, project, conv, _verdict(BuildSessionStatus.ENDED, "completed")
     )
 
     reloaded = await db_session.get(Conversation, conv.id)
-    assert reloaded is not None and reloaded.mode is ConversationMode.WRITE
+    assert reloaded is not None and reloaded.kind is starting_kind

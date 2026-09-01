@@ -45,7 +45,7 @@ vi.mock('../../../pages/ChatPage', () => ({
 
 const conversation = (over: Partial<MountedConversation> = {}): MountedConversation => ({
   chatId: 'chat-1',
-  kind: 'planning',
+  kind: 'plan',
   projectId: 'p1',
   projectName: 'VIP Movement',
   projectHasSavedBuild: null,
@@ -65,18 +65,18 @@ afterEach(() => cleanup())
 
 describe('ConversationSlot — one home for the kind branch', () => {
   it('mounts the builder body for a builder resolution and the planning body for a planning one', () => {
-    renderSlot({ kind: 'builder' })
+    renderSlot({ kind: 'build' })
     expect(screen.getByTestId('builder-body')).toBeTruthy()
     expect(screen.queryByTestId('planning-body')).toBeNull()
 
     cleanup()
-    renderSlot({ kind: 'planning' })
+    renderSlot({ kind: 'plan' })
     expect(screen.getByTestId('planning-body')).toBeTruthy()
     expect(screen.queryByTestId('builder-body')).toBeNull()
   })
 
   it('hands the resolved conversation through to whichever body it mounted', () => {
-    renderSlot({ kind: 'builder', chatId: 'build-7' })
+    renderSlot({ kind: 'build', chatId: 'build-7' })
     expect(screen.getByTestId('builder-body').textContent).toContain('build-7')
   })
 
@@ -85,10 +85,10 @@ describe('ConversationSlot — one home for the kind branch', () => {
     // the collapse would make R72's surface half sound delivered while a citizen still gets a
     // different React page per kind. Plan D is what makes this test meaningless.
     function Switchable() {
-      const [kind, setKind] = useState<'planning' | 'builder'>('planning')
+      const [kind, setKind] = useState<'plan' | 'build'>('plan')
       return (
         <MemoryRouter>
-          <button type="button" onClick={() => setKind('builder')}>to builder</button>
+          <button type="button" onClick={() => setKind('build')}>to builder</button>
           <ConversationSlot conversation={conversation({ kind })} />
         </MemoryRouter>
       )

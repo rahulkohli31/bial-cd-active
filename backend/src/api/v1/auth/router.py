@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.v1.auth.schemas import (
+    ChatKindInfo,
     LogoutResponse,
     ProfileLimits,
     RefreshResponse,
@@ -39,6 +40,7 @@ from src.config import settings
 from src.db.models.refresh_token import RefreshToken
 from src.db.models.user import User
 from src.schemas import AUTH_401, DetailBody, error_responses
+from src.services.agent.toolsets import CHAT_KIND_CATALOGUE
 from src.services.auth.cookies import (
     REFRESH_COOKIE_PATH,
     cookie_secure,
@@ -245,6 +247,14 @@ async def me(user: CurrentUser, db: DbSession) -> UserProfile:
         limits=ProfileLimits(
             daily_token_limit=daily, context_soft_limit=soft, context_hard_limit=hard
         ),
+        # U16/R73: the whole chat-kind catalogue, straight off the registry that also decides
+        # what each kind can do — served here rather than a dedicated endpoint because this
+        # bootstrap is already fetched once, before first paint, and there is nothing about
+        # "what is a Plan chat" that changes per request.
+        chat_kinds=[
+            ChatKindInfo(value=entry.value, name=entry.name, description=entry.description)
+            for entry in CHAT_KIND_CATALOGUE
+        ],
     )
 
 

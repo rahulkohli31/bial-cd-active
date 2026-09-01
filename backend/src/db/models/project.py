@@ -3,7 +3,7 @@
 A project is the durable home a citizen developer builds a single tool inside: it
 links the user's three work surfaces — the codebase (its one `app_registry` row,
 R22/one-app-per-project), the chats, and the plan-kind chats (both the
-`conversations` table, distinguished by `ConversationKind`). Everything Phase-2
+`conversations` table, distinguished by `ChatKind`). Everything Phase-2
 attaches to (per-app DB isolation, deploy target, governance record) hangs off the
 project, so it is the keystone that lands before versioning.
 

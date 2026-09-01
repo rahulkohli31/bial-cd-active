@@ -33,8 +33,6 @@ export interface TurnNarrative {
    *  fields are optional. Listing them here makes omitting them a compile error. */
   diagnostics: {
     source: string
-    title: string
-    cleanedStack: string
     userMessage: string
     userAction: string
   }[]
@@ -71,14 +69,17 @@ export function narrativeEnvelopes(narrative: TurnNarrative): FeedEnvelope[] {
     const error: ErrorEvent = {
       type: 'error',
       seq: seq++,
-      // Fail to `server` rather than drop: an unrecognized source still has a real title and
-      // stack the user needs to see, and a swallowed diagnostic is a silent build failure.
+      // Fail to `server` rather than drop: an unrecognized source still carries a sentence
+      // the user needs to see, and a swallowed diagnostic is a silent build failure.
       source: (ERROR_SOURCES.has(diagnostic.source) ? diagnostic.source : 'server') as ErrorSource,
-      title: diagnostic.title,
-      cleaned_stack: diagnostic.cleanedStack,
-      // THE HALF THE USER ACTUALLY READS — carried across explicitly. `title`/`cleaned_stack`
-      // ride along for the model's sake and for the legacy feed's shape; the feed renders
-      // neither.
+      // EMPTY, and deliberately. The target `ErrorEvent` is the LEGACY C7 feed's shape, which
+      // still has these two fields because that transport still carries them; the turn stream
+      // does not send them any more, so there is nothing to map. They are written explicitly
+      // rather than omitted because the field list above is what makes a dropped field a
+      // compile error, and that property is worth more than two blank strings cost.
+      title: '',
+      cleaned_stack: '',
+      // THE HALF THE USER ACTUALLY READS.
       user_message: diagnostic.userMessage,
       user_action: diagnostic.userAction,
       // A diagnostic is a recovery in progress, never a terminal failure (the wire says so:

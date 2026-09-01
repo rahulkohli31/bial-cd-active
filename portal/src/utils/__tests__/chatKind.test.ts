@@ -1,50 +1,126 @@
 /**
- * `chatKindFor` — the lookup that decides what a chat row CALLS itself (U1/R16).
+ * `chatKindFor` — the lookup that decides what a chat row CALLS itself and SAYS about itself
+ * (U16/R73).
  *
- * The plan said this module needed no spec of its own, on the grounds that a test over one record
- * per kind could only restate the literal. That was right about the literals and wrong about the
- * LOOKUP: `kind` is unvalidated wire data (`narrowChat` in ProjectPage passes through whatever
- * string the API sent), and a plain object lookup answers for keys nobody put in it. So what is
- * tested here is only the part that is not a restatement — the fallback's reach.
+ * Before U16 the word and completion were literals baked into this file. Now they are not —
+ * `word` and `description` come from `getStoredUser()?.chat_kinds`, the U16 catalogue riding the
+ * once-cached `GET /auth/me` bootstrap. The strongest proof that the sourcing is real, rather
+ * than a hardcoded fallback with a bootstrap-shaped decoration on top, is to mock the bootstrap
+ * with wording that does NOT match the product copy and watch `chatKindFor` return exactly that
+ * — if a literal `'Build'`/`'Plan'` were still baked in anywhere, these tests would keep passing
+ * with the OLD words and go red the moment the mock's words diverged from them.
+ *
+ * `kind` is still unvalidated wire data (`narrowChat` in ProjectPage passes through whatever
+ * string the API sent), so the fallback's reach — prototype-pollution keys, values with no
+ * matching catalogue entry, a bootstrap that has not resolved yet — is tested here too.
  */
-import { describe, it, expect } from 'vitest'
-import { chatKindFor, CHAT_KINDS, UNKNOWN_CHAT_KIND } from '../chatKind'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+
+const h = vi.hoisted(() => ({ getStoredUser: vi.fn() }))
+vi.mock('../auth', () => ({ getStoredUser: h.getStoredUser }))
+
+import { chatKindFor, UNKNOWN_CHAT_KIND } from '../chatKind'
+
+// Deliberately NOT "Plan"/"Build" or the shipped descriptions — so a test that only checked
+// these values against themselves could not accidentally pass by restating the real copy.
+const MOCK_CATALOGUE = [
+  { value: 'plan', name: 'Ideate', description: 'Think it through first.' },
+  { value: 'build', name: 'Ship', description: 'Make it real.' },
+]
+
+function withCatalogue(chat_kinds: typeof MOCK_CATALOGUE | undefined) {
+  h.getStoredUser.mockReturnValue(chat_kinds ? { chat_kinds } : null)
+}
+
+beforeEach(() => {
+  h.getStoredUser.mockReset()
+})
 
 describe('chatKindFor', () => {
-  it('answers the two kinds that exist, in the citizen’s words and never the storage value', () => {
-    expect(chatKindFor('builder').word).toBe('Build')
-    expect(chatKindFor('planning').word).toBe('Plan')
-    // The wire value is a schema word; it must never reach a screen.
-    for (const kind of Object.values(CHAT_KINDS)) {
-      expect(kind!.word).not.toMatch(/builder|planning|assistant/i)
-    }
+  it('sources the word and the description from the bootstrap catalogue, not a literal here', () => {
+    withCatalogue(MOCK_CATALOGUE)
+    const plan = chatKindFor('plan')
+    expect(plan.word).toBe('Ideate')
+    expect(plan.description).toBe('Think it through first.')
+    const build = chatKindFor('build')
+    expect(build.word).toBe('Ship')
+    expect(build.description).toBe('Make it real.')
+    // The wire value is a schema word; it must never reach a screen as the WORD.
+    expect(plan.word).not.toBe('plan')
+    expect(build.word).not.toBe('build')
+  })
+
+  it('tracks a changed bootstrap rather than caching the first answer', () => {
+    // The same wire value, two different catalogues: if the module cached or hardcoded the
+    // wording on first use, the second call would still answer with the first mock's words.
+    withCatalogue(MOCK_CATALOGUE)
+    expect(chatKindFor('build').word).toBe('Ship')
+    withCatalogue([{ value: 'build', name: 'Launch', description: 'It is live now.' }])
+    expect(chatKindFor('build').word).toBe('Launch')
+  })
+
+  it('keeps the icon and the tint local, unaffected by whatever the bootstrap says', () => {
+    // R-8: icon/tint are NOT part of the catalogue's shape and must not move even though the
+    // words now do. Same kind, two catalogues, one look.
+    withCatalogue(MOCK_CATALOGUE)
+    const first = chatKindFor('plan')
+    withCatalogue([{ value: 'plan', name: 'Different Every Time', description: '…' }])
+    const second = chatKindFor('plan')
+    expect(second.Icon).toBe(first.Icon)
+    expect(second.tint).toBe(first.tint)
+    expect(second.iconTint).toBe(first.iconTint)
   })
 
   it('falls back for the third value the field can hold today, and for one it cannot yet', () => {
+    withCatalogue(MOCK_CATALOGUE)
     expect(chatKindFor('assistant')).toBe(UNKNOWN_CHAT_KIND)
     expect(chatKindFor('a_kind_invented_next_quarter')).toBe(UNKNOWN_CHAT_KIND)
     expect(chatKindFor('')).toBe(UNKNOWN_CHAT_KIND)
   })
 
+  it('falls back for a recognised wire value whose catalogue entry has not arrived', () => {
+    // Two separate misses this module must survive without throwing: no session at all (the
+    // bootstrap has not resolved), and a session whose catalogue is missing this value. Neither
+    // is hypothetical — the first is just "render before /auth/me's promise settles".
+    withCatalogue(undefined)
+    expect(chatKindFor('plan')).toBe(UNKNOWN_CHAT_KIND)
+    withCatalogue([{ value: 'build', name: 'Ship', description: 'Make it real.' }]) // no 'plan' entry
+    expect(chatKindFor('plan')).toBe(UNKNOWN_CHAT_KIND)
+  })
+
+  it('falls back rather than throwing when a profile arrives with no catalogue at all', () => {
+    // A THIRD MISS, and the one the type system says is impossible: a NON-NULL profile whose
+    // `chat_kinds` is absent. `UserProfile` is an unchecked cast over whatever `/auth/me`
+    // returned, so this is a wire shape, not a contradiction — a stale service worker, a
+    // server that predates the catalogue, a test double. The function's own contract says it
+    // never throws, and it is called once per row of the chat list: a throw here is not one
+    // bad badge, it is the whole project page failing to render.
+    h.getStoredUser.mockReturnValue({} as never)
+    expect(() => chatKindFor('plan')).not.toThrow()
+    expect(chatKindFor('plan')).toBe(UNKNOWN_CHAT_KIND)
+  })
+
   it('★ falls back for a kind that collides with an inherited Object property', () => {
-    // THE ONE THAT WAS A CRASH. A bare `CHAT_KINDS[kind]` finds `Object.prototype.constructor` —
-    // a truthy function — so `??` never fires, and the row then renders `undefined` as its word
-    // and hands `<kind.Icon />` an undefined component, which throws during render. `narrowChat`
-    // will pass any string the API sends straight into here.
+    // THE ONE THAT WAS A CRASH. A bare index into the local look-up table finds
+    // `Object.prototype.constructor` — a truthy function — so `??` never fires, and the row
+    // then renders `undefined` as its word and hands `<kind.Icon />` an undefined component,
+    // which throws during render. `narrowChat` will pass any string the API sends straight in.
     //
-    // Mutation check: drop the `Object.hasOwn` guard and this goes red.
+    // Mutation check: drop the `Object.hasOwn` guard in `chatKindFor` and this goes red.
+    withCatalogue(MOCK_CATALOGUE)
     for (const inherited of ['constructor', 'toString', 'valueOf', '__proto__', 'hasOwnProperty']) {
       expect(chatKindFor(inherited), `"${inherited}" escaped the fallback`).toBe(UNKNOWN_CHAT_KIND)
     }
   })
 
-  it('gives every record a word and a completion that composes into its phrase', () => {
+  it('gives every answer a word and a completion that composes into its phrase', () => {
     // The badge shows `word` and hides `completion`; the element's whole text is what a screen
     // reader says. A completion that does not continue its word reads as gibberish.
-    for (const kind of [...Object.values(CHAT_KINDS), UNKNOWN_CHAT_KIND]) {
-      expect(kind!.word.length).toBeGreaterThan(0)
-      expect(`${kind!.word}${kind!.completion}`.trim()).toBe(`${kind!.word}${kind!.completion}`.trim())
-      if (kind!.completion) expect(kind!.completion).toMatch(/^ /) // a space, not a jammed word
+    withCatalogue(MOCK_CATALOGUE)
+    for (const kind of [chatKindFor('plan'), chatKindFor('build'), UNKNOWN_CHAT_KIND]) {
+      expect(kind.word.length).toBeGreaterThan(0)
+      expect(`${kind.word}${kind.completion}`.trim()).toBe(`${kind.word}${kind.completion}`.trim())
+      if (kind.completion) expect(kind.completion).toMatch(/^ /) // a space, not a jammed word
     }
   })
 })

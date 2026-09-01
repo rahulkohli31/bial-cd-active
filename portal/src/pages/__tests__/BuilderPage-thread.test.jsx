@@ -6,8 +6,11 @@
  *  - a text-only reply (a clarifying question) renders with NO card;
  *  - a restored thread re-renders each card from its STORED state (pending → armed,
  *    refine/build → settled, older-than-newest → expired) — no local state to resync;
- *  - a used card cannot re-fire once its build started;
- *  - the in-composer mode switcher reflects the saved header mode.
+ *  - a used card cannot re-fire — Build it is now a HANDOFF, so "cannot re-fire" is proven
+ *    by the press ending in a navigation to a brand-new build chat, not by a settled local state;
+ *  - U19 deleted the in-composer mode switcher along with the `mode` it displayed (U1 collapsed
+ *    ConversationMode into the fixed-at-creation ChatKind) — this file's own guard for that is
+ *    below, under "the U13 header".
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup, within } from '@testing-library/react'
@@ -19,11 +22,18 @@ import {
 } from './_builderSession.jsx'
 import { ApiError } from '../../utils/apiError'
 
+// The id `handleBuildIt` mints for every Build-it press in this file (U12: the id is CLIENT
+// minted via `uuidv7`, then echoed back by the server as `BuildFromPlanOutcome.chatId` — the
+// mock below mirrors that echo). One fixed id is enough here because no single test in this
+// file presses Build it twice — a second, distinguishable mint only matters for the cross-tab
+// lock suite (BuilderPage-buildlock.test.jsx), which needs to tell several handoffs apart.
+const MINTED_BUILD_CHAT_ID = 'minted-build-chat-1'
+
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
-  deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
+  deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(), uuidv7: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
-  switchMode: vi.fn(), resolvePlanOptions: vi.fn(),
+  resolvePlanOptions: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
   relaunchPreview: vi.fn(),
 }))
@@ -32,7 +42,10 @@ vi.mock('../../utils/builderHistory', () => ({
   loadBuilds: h.loadBuilds, newBuild: h.newBuild, createBuild: h.createBuild,
   getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
-vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
+vi.mock('../../utils/conversationApi', () => ({
+  listProjectConversations: h.listProjectConversations,
+  uuidv7: (...a) => h.uuidv7(...a),
+}))
 vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../components/LivePreview', () => ({ default: () => null }))
@@ -43,7 +56,6 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
   startTurn: (...a) => h.startTurn(...a),
   readTurnStream: (...a) => h.readTurnStream(...a),
   buildFromPlan: (...a) => h.buildFromPlan(...a),
-  switchMode: (...a) => h.switchMode(...a),
   resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
 
@@ -74,12 +86,14 @@ async function send(text = 'a visitor app') {
   fireEvent.keyDown(composer(), { key: 'Enter' })
 }
 
-/** A stored plan-options projection message (what a reload hydrates). */
-const storedCard = (seq, toolCallId, state, reason = null) => ({
+/** A stored plan-options projection message (what a reload hydrates). `PlanOptionsItem` is
+ *  `{ type, seq, toolCallId, state }` only now (turnStreamApi.ts) — `mode` and `reason` are
+ *  both gone (the per-thread mode setting, and the failure-named re-arm respectively). */
+const storedCard = (seq, toolCallId, state) => ({
   id: `srv_${seq}_p`,
   role: 'assistant',
   seq,
-  parts: [{ type: 'plan_options', item: { type: 'plan_options', seq, mode: 'plan', toolCallId, state, reason } }],
+  parts: [{ type: 'plan_options', item: { type: 'plan_options', seq, toolCallId, state } }],
 })
 
 beforeEach(() => {
@@ -92,7 +106,12 @@ beforeEach(() => {
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
   h.buildUserParts.mockImplementation(async (text) => [{ type: 'text', text }])
+  h.uuidv7.mockReturnValue(MINTED_BUILD_CHAT_ID)
   primeTurn(h)
+  // U12: buildFromPlan hands off to a NEW chat and echoes the caller's minted id back as
+  // `chatId` — the shared harness's `primeTurn` still answers the pre-handoff shape (a bare
+  // `turnId`, no `chatId`), so every test in this file needs the real contract's shape.
+  h.buildFromPlan.mockResolvedValue({ outcome: 'started', chatId: MINTED_BUILD_CHAT_ID, turnId: 'bt-1' })
 })
 afterEach(() => cleanup())
 
@@ -109,7 +128,11 @@ describe('the routing rule — a send is a chat turn, never a build', () => {
     expect(h.buildFromPlan).not.toHaveBeenCalled()
 
     fireEvent.click(build)
-    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledWith('thread-1', PLAN_CARD_ID))
+    // Three positional args now (U12): the third is the CLIENT-MINTED id of the brand-new build
+    // chat this press hands off to.
+    await waitFor(() =>
+      expect(h.buildFromPlan).toHaveBeenCalledWith('thread-1', PLAN_CARD_ID, MINTED_BUILD_CHAT_ID),
+    )
   })
 
   it('a clarifying reply renders with NO card — a question is a legitimate planning turn', async () => {
@@ -144,7 +167,9 @@ describe('a restored thread re-renders every card from its STORED state', () => 
     expect(within(cards[1]).getByRole('button', { name: /^Build it$/ })).toBeTruthy()
 
     fireEvent.click(within(cards[1]).getByRole('button', { name: /^Build it$/ }))
-    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledWith('thread-1', 'opt-new'))
+    await waitFor(() =>
+      expect(h.buildFromPlan).toHaveBeenCalledWith('thread-1', 'opt-new', MINTED_BUILD_CHAT_ID),
+    )
   })
 
   it('settled cards render settled — refine and build states carry no buttons', async () => {
@@ -163,28 +188,73 @@ describe('a restored thread re-renders every card from its STORED state', () => 
     expect(screen.queryByRole('button', { name: /^Build it$/ })).toBeNull()
   })
 
-  it('a build_failed card re-arms with the failure named (never resolved-with-no-build)', async () => {
+  it('an inertness guard: a stored build_failed record never re-arms with the failure named — the state and its re-arm copy are both gone', async () => {
+    // AN INERTNESS GUARD, not a deleted test (L8). This used to prove a failed Build-it press
+    // left the card in a special `build_failed` state that showed the failure ("another build
+    // is already running") and let the citizen retry from the SAME card. Neither half of that
+    // survives U12: `build_failed` and its `reason` field are gone from `PlanOptionsItem`
+    // (turnStreamApi.ts), because Build-it now fails inside the one handoff call that would
+    // have produced this outcome — there is nothing left to persist, and PlanOptionsCard.tsx's
+    // own docblock says why: "a press that fails records nothing — the card was never spent,
+    // and there is nothing to un-spend. A failure is said once, in the error line below the
+    // buttons, by the caller that actually saw it."
+    //
+    // What's left to pin, from a row a pre-migration project might still carry: PlanOptionsCard
+    // does not recognise `build_failed` as one of its three states, so it falls through to its
+    // default branch with `actionable` false — the card still renders (this is the liveness half
+    // of the guard; a crash would leave nothing to query) but BOTH buttons stay permanently
+    // disabled, never the special re-arm this test used to require.
     h.getBuild.mockResolvedValue({
       id: 'thread-1',
-      mode: 'plan',
-      messages: [storedCard(1, 'opt-f', 'build_failed', 'lock_held')],
+      messages: [storedCard(1, 'opt-f', 'build_failed')],
     })
     renderThread()
 
-    expect(await screen.findByText(/another build is already running/i)).toBeTruthy()
-    expect(screen.getByRole('button', { name: /^Build it$/ })).toBeTruthy()
+    const card = await screen.findByTestId('plan-options-card')
+    // Liveness: the card rendered its ordinary shell, not a blank tree.
+    expect(within(card).getByText(/ready to build this plan/i)).toBeTruthy()
+    // The retired failure-named copy is gone…
+    expect(screen.queryByText(/another build is already running/i)).toBeNull()
+    // …and the card is NOT armed — nothing on it can be clicked.
+    expect(within(card).getByRole('button', { name: /^Build it$/ }).disabled).toBe(true)
+    expect(within(card).getByRole('button', { name: /keep refining/i }).disabled).toBe(true)
   })
 })
 
 describe('a used card cannot re-fire', () => {
-  it('after Build it succeeds the card settles — no second transition from the same card', async () => {
+  it('after Build it succeeds it hands off to a NEW build chat — no second transition from the same card', async () => {
+    // WHAT THIS USED TO PROVE: Build-it flipped THIS conversation into Write and streamed the
+    // build here, so "no second transition" meant the card settled to its stored `build` state
+    // and its buttons vanished while everything else about the chat stayed put.
+    //
+    // U12 changes what "no second transition" is EVIDENCE OF. There is no in-place settle to
+    // observe any more — the press ends by LEAVING this chat for a brand-new one seeded with the
+    // plan (handleBuildIt's own docblock: "the only place [the build's] narrative can honestly be
+    // watched is there"). So the card itself is gone from the screen not because it settled, but
+    // because the whole thread it lived on is. What's left to pin is the one-shot nature of the
+    // button: exactly one handoff call, carrying the id `handleBuildIt` minted, and the page
+    // actually following it.
+    h.getBuild.mockImplementation(async (id) =>
+      id === MINTED_BUILD_CHAT_ID
+        ? {
+            id,
+            messages: [
+              { id: 'm0', role: 'assistant', seq: 0, parts: [{ type: 'text', text: 'NEW BUILD CHAT TRANSCRIPT' }] },
+            ],
+          }
+        : null,
+    )
     renderThread()
     await send('a visitor app')
     fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
-    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledTimes(1))
 
-    // The card settled to its build state; the button is gone.
-    expect(await screen.findByText(/build started from this plan/i)).toBeTruthy()
+    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledTimes(1))
+    expect(h.buildFromPlan).toHaveBeenCalledWith('thread-1', PLAN_CARD_ID, MINTED_BUILD_CHAT_ID)
+    // The page followed the handoff to the new chat (liveness: real content rendered there,
+    // not a blank/crashed tree)…
+    expect(await screen.findByText('NEW BUILD CHAT TRANSCRIPT')).toBeTruthy()
+    // …which is why a second press from the same card is not merely refused — the card and the
+    // thread it was on are gone.
     expect(screen.queryByRole('button', { name: /^Build it$/ })).toBeNull()
   })
 })
@@ -265,12 +335,25 @@ describe('the reload half of the build narrative (U15)', () => {
 })
 
 describe('the U13 header', () => {
-  it('reflects the saved mode on the in-composer switcher', async () => {
+  it('an inertness guard: no mode control mounts, and a legacy `mode` field on the header is never read', async () => {
+    // AN INERTNESS GUARD, not a deleted test (L8). This used to prove the in-composer switcher
+    // (F5/U6) showed the server-saved `mode` as its trigger label ("Mode: Ask"). U1 collapsed the
+    // three-valued ConversationMode into a ChatKind fixed at creation, and U19 deleted
+    // `ModeSwitcher` with it (see ModeSwitcher.test.tsx for the tree-wide "nothing imports or
+    // mounts it" guard). There is no per-thread setting left to display or switch.
+    //
+    // What THIS page's own render can still pin: a header payload that happens to carry a
+    // leftover `mode` key (a pre-migration record, or a stale server response) is simply
+    // ignored — never read into any control — rather than the page tripping over an unexpected
+    // field.
     h.getBuild.mockResolvedValue({ id: 'thread-1', mode: 'ask', messages: [] })
     renderThread()
 
-    // F5/U6: the switch moved into the composer. Its trigger reflects the server-saved mode.
-    expect(await screen.findByRole('button', { name: /Mode: Ask/i })).toBeTruthy()
+    // Liveness: the composer actually mounted (a crash would leave nothing here to query).
+    await screen.findByPlaceholderText(/describe what you need/i)
+    // No mode control of any name mounted.
+    expect(screen.queryByRole('button', { name: /Mode:/i })).toBeNull()
+    expect(screen.queryByText(/Mode:/i)).toBeNull()
   })
 })
 
@@ -305,10 +388,13 @@ describe('R8 live clause — a reload MID-TURN re-attaches to the running reply'
   })
 
   it('does not re-subscribe when no turn is running', async () => {
-    h.getBuild.mockResolvedValue({ id: 'thread-1', mode: 'ask', activeTurn: null, messages: [] })
+    h.getBuild.mockResolvedValue({ id: 'thread-1', activeTurn: null, messages: [] })
     renderThread()
 
-    await screen.findByRole('button', { name: /Mode: Ask/i })
+    // Liveness: the composer mounted — this used to wait on the now-retired mode pill, which
+    // served the same "hydration settled" role; see the U13-header guard above for why it's gone.
+    await screen.findByPlaceholderText(/describe what you need/i)
+    await waitForGateOpen()
     expect(h.readTurnStream).not.toHaveBeenCalled()
   })
 })

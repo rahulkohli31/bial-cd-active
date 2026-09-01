@@ -49,7 +49,6 @@ from src.api.deps import CurrentUser, DbSession
 from src.api.v1.build_sessions.deps import SessionManagerDep
 from src.api.v1.claude.prompts import (
     ASSISTANT_IDENTITY_PROMPT,
-    PLANNING_SYSTEM_PROMPT,
     PORTAL_SELF_DESCRIPTION,
     SUMMARIZE_BRIEF_PROMPT,
 )
@@ -75,7 +74,7 @@ from src.api.v1.conversations._shared import (
     chat_storage as chat_storage,
 )
 from src.core.errors import AppApiError
-from src.db.models.conversation import Conversation, ConversationKind, ConversationMode
+from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.message import MessageEntryKind
 from src.db.models.project import Project
 from src.schemas import AUTH_401, CamelModel, DailyTokenLimitBody, ErrorEnvelope, error_responses
@@ -160,21 +159,26 @@ class TurnBody(CamelModel):
 
 @dataclass(frozen=True)
 class _TurnPersist:
-    """Where this turn's transcript lands: the resolved conversation and its mode. None for
-    ephemeral turns (they persist nothing, by contract)."""
+    """Where this turn's transcript lands: the resolved conversation and the kind its rows are
+    stamped with. None for ephemeral turns (they persist nothing, by contract)."""
 
     conversation_id: uuid.UUID
-    mode: ConversationMode
+    kind: ChatKind
 
 
-def _base_prompt(conversation: Conversation, ephemeral: str | None) -> str:
-    """The server-selected base system prompt (U7): ephemeral summarize wins outright; else
-    the conversation's kind decides. ASSISTANT kind shares the builder's identity line — it is
-    the generic portal-assistant voice."""
+def _base_prompt(_conversation: Conversation, ephemeral: str | None) -> str:
+    """The server-selected base system prompt (U7): ephemeral summarize wins outright, else the
+    generic portal-assistant voice.
+
+    THIS RELAY NO LONGER READS THE CHAT KIND, and that is the point. It was the only reader of
+    the retired three-valued kind enum — `planning` picked a planning prompt, anything else the
+    assistant one — and it gated nothing else: the relay carries no toolset at all. What a chat
+    kind means now lives entirely in the tool surface a run is handed
+    (`services/agent/toolsets.py`), and this route is on its way out (it is the second turn
+    engine R72 retires, once the portal stops calling it). The parameter stays so the signature
+    does not churn again when it goes."""
     if ephemeral == "summarize_brief":
         return SUMMARIZE_BRIEF_PROMPT
-    if conversation.kind == ConversationKind.PLANNING:
-        return PLANNING_SYSTEM_PROMPT
     return ASSISTANT_IDENTITY_PROMPT
 
 
@@ -268,7 +272,7 @@ async def _stream(
                                 conversation_id=persist.conversation_id,
                                 messages=responses,
                                 entry_kind=MessageEntryKind.TURN,
-                                mode=persist.mode,
+                                kind=persist.kind,
                             )
                 # Bill on the completed run — cache tokens fold into the daily cap (U6).
                 await record_usage(
@@ -444,7 +448,7 @@ async def claude_chat(
             # The previous attempt's user turn is already durable — replay history with no new
             # prompt (pydantic-ai adopts the trailing user request) and persist only the reply.
             prompt = None
-            persist = _TurnPersist(conversation_id=conversation.id, mode=conversation.mode)
+            persist = _TurnPersist(conversation_id=conversation.id, kind=conversation.kind)
         else:
             prompt = prompt_content(body.message, binaries)
             if body.ephemeral is None:
@@ -458,13 +462,13 @@ async def claude_chat(
                         conversation_id=conversation.id,
                         messages=[ModelRequest(parts=[UserPromptPart(content=prompt)])],
                         entry_kind=MessageEntryKind.TURN,
-                        mode=conversation.mode,
+                        kind=conversation.kind,
                     )
                 except SeqContentionError:
                     raise AppApiError(
                         409, "Another message is being recorded for this conversation. Try again."
                     ) from None
-                persist = _TurnPersist(conversation_id=conversation.id, mode=conversation.mode)
+                persist = _TurnPersist(conversation_id=conversation.id, kind=conversation.kind)
     except BaseException:
         # Anything that stops the turn between claim and drain-start releases the claim; once
         # `_stream` has spawned the drain, the drain's `finally` owns the release.

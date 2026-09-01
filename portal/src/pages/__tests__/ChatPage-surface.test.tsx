@@ -249,10 +249,10 @@ describe('ChatPage — the context guardrail and its only escape hatch (U6 must 
 
     fireEvent.click(escapeHatchBesides(/reached its maximum length/i))
 
-    // The third mint site, and the only producer of `kind=planning` conversations — the project
-    // screen's own composer mints `kind=builder`. Losing it would close the only door out of the
+    // The third mint site, and the only producer of `kind=plan` conversations — the project
+    // screen's own composer mints `kind=build`. Losing it would close the only door out of the
     // dead end above.
-    await waitFor(() => expect(here()).toBe('/chat/chat-fresh?projectId=p1&kind=planning'))
+    await waitFor(() => expect(here()).toBe('/chat/chat-fresh?projectId=p1&kind=plan'))
   })
 
   it('the softer warning also carries a live control', async () => {
@@ -263,6 +263,6 @@ describe('ChatPage — the context guardrail and its only escape hatch (U6 must 
 
     fireEvent.click(escapeHatchBesides(/getting long/i))
 
-    await waitFor(() => expect(here()).toBe('/chat/chat-fresh?projectId=p1&kind=planning'))
+    await waitFor(() => expect(here()).toBe('/chat/chat-fresh?projectId=p1&kind=plan'))
   })
 })

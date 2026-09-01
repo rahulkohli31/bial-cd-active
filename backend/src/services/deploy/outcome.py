@@ -25,7 +25,7 @@ import structlog
 from pydantic_ai.messages import ModelResponse, TextPart
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.db.models.conversation import Conversation, ConversationMode
+from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.services.messages.store import append_batch
 
@@ -79,7 +79,7 @@ async def write_deploy_outcome(
             conversation_id=conversation_id,
             messages=[ModelResponse(parts=[TextPart(content=message)])],
             entry_kind=MessageEntryKind.SYSTEM_EVENT,
-            mode=ConversationMode.WRITE,
+            kind=ChatKind.BUILD,
             visibility=MessageVisibility.VISIBLE,
             meta=meta,
         )

@@ -2,7 +2,7 @@
 catch-up-snapshot-then-tail, stop is the explicit cancel, and the frame union parses with
 the callable-discriminator discipline (malformed KNOWN tag raises; unknown tag captured).
 
-Also home to the HTTP-level no-overrides mode-gating proof U8 deferred here: an Ask-mode
+Also home to the HTTP-level no-overrides kind-gating proof U8 deferred here: a Plan-kind
 turn's model-visible tool list carries no write tools, through the REAL route + engine.
 """
 
@@ -34,6 +34,7 @@ from src.api.v1.conversations.schemas import (
 )
 from src.api.v1.conversations.turns import KEEPALIVE_SECONDS
 from src.config import settings
+from src.db.models.conversation import ChatKind
 from src.services.auth.csrf import issue_csrf_token
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.turns import engine as engine_module
@@ -83,12 +84,10 @@ def set_chat_model(app):
     return _set
 
 
-async def _auth_with_conversation(db_session, *, mode=None):
-    from src.db.models.conversation import ConversationMode
-
+async def _auth_with_conversation(db_session, *, kind=None):
     user = await UserFactory.create(db_session)
     conv = await ConversationFactory.create(
-        db_session, user.id, mode=mode if mode is not None else ConversationMode.ASK
+        db_session, user.id, kind=kind if kind is not None else ChatKind.PLAN
     )
     return user, conv
 
@@ -201,6 +200,14 @@ async def test_mid_turn_subscribe_gets_snapshot_then_tail(
     assert frames[-1].type == "turn_ended" and frames[-1].status == "completed"
     assert events.text.endswith("data: [DONE]\n\n")
 
+    # SETTLE THE TASK, not just the stream. `turn_ended` is delivered from inside the run, and
+    # the run's `finally` still has work after it — it drains the preview watcher and writes the
+    # durable turn-terminal row, which opens a session of its own. A test that returns on the
+    # last frame leaves that session unclosed and the connection is torn down by the garbage
+    # collector against an event loop pytest has already closed, which surfaces as an error at
+    # teardown rather than as a failure here.
+    await _settle(_fresh_engine, conv.id)
+
 
 async def test_the_acknowledgement_actually_reaches_a_subscriber(
     client, db_session, set_chat_model, _fresh_engine
@@ -254,6 +261,14 @@ async def test_the_acknowledgement_actually_reaches_a_subscriber(
         "the acknowledgement never reached the subscriber — it is emitted at seq 1, before any "
         "client can connect, so it has to ride the snapshot"
     )
+
+    # SETTLE THE TASK, not just the stream. `turn_ended` is delivered from inside the run, and
+    # the run's `finally` still has work after it — it drains the preview watcher and writes the
+    # durable turn-terminal row, which opens a session of its own. A test that returns on the
+    # last frame leaves that session unclosed and the connection is torn down by the garbage
+    # collector against an event loop pytest has already closed, which surfaces as an error at
+    # teardown rather than as a failure here.
+    await _settle(_fresh_engine, conv.id)
 
 
 async def test_second_post_while_running_is_409(
@@ -353,13 +368,20 @@ async def test_cross_user_conversation_is_404_everywhere(
     ).status_code == 404
 
 
-async def test_ask_mode_model_sees_no_write_tools(
+async def test_plan_kind_model_sees_no_write_tools(
     client, db_session, set_chat_model, _fresh_engine
 ) -> None:
     """The HTTP-level no-overrides gating proof (U8's deferred test): through the REAL
-    route, engine, and toolsets, an Ask turn's model-visible tool list is exactly the
-    read surface — no write_file / edit_file / insert_lines / declare_done, and no
-    present_plan_options either (that is Plan's)."""
+    route, engine, and toolsets, a Plan turn's model-visible tool list is exactly the read
+    surface plus the plan-confirmation tool — no write_file / edit_file / insert_lines /
+    declare_done.
+
+    THIS USED TO PIN A DISTINCT "ASK" SURFACE WITHOUT `present_plan_options` (Ask's old
+    three-valued-mode table had reads but no confirmation tool; only Plan carried it). Ask and
+    Plan collapsed into the one `ChatKind.PLAN` (see `db/models/conversation.py`), and
+    `toolsets_for_kind` hands every Plan-kind run the confirmation tool along with the read
+    surface — there is no longer a read-only-without-the-card surface to assert, so the
+    expected set below includes `present_plan_options`."""
     seen: dict[str, set[str]] = {}
 
     async def _capture(messages: list[ModelMessage], info: AgentInfo):
@@ -370,7 +392,13 @@ async def test_ask_mode_model_sees_no_write_tools(
     set_chat_model(FunctionModel(stream_function=_capture))
     assert (await _post_turn(client, _headers(user), conv)).status_code == 202
     await _settle(_fresh_engine, conv.id)
-    assert seen["tools"] == {"read_file", "list_files", "search_files", "run_command"}
+    assert seen["tools"] == {
+        "read_file",
+        "list_files",
+        "search_files",
+        "run_command",
+        "present_plan_options",
+    }
 
 
 async def test_write_mode_accepts_a_send_like_every_other_mode(
@@ -380,10 +408,10 @@ async def test_write_mode_accepts_a_send_like_every_other_mode(
     a real refusal for a real reason (Write had no toolset and no composable prompt) and is a
     lie now. A citizen who just built something can keep talking to it in the mode they are
     already in, which is the whole of N6."""
-    from src.db.models.conversation import ConversationMode
+    from src.db.models.conversation import ChatKind
 
     user = await UserFactory.create(db_session)
-    conv = await ConversationFactory.create(db_session, user.id, mode=ConversationMode.WRITE)
+    conv = await ConversationFactory.create(db_session, user.id, kind=ChatKind.BUILD)
     set_chat_model(_streaming_text("x"))
     resp = await _post_turn(client, _headers(user), conv)
     assert resp.status_code == 202
@@ -418,12 +446,23 @@ async def test_a_live_build_in_this_thread_refuses_the_turn(
     await _settle(_fresh_engine, conv.id)
 
 
-async def test_a_build_in_another_thread_never_gates_this_one(
+async def test_a_build_in_another_thread_now_refuses_this_one_by_name(
     client, db_session, set_chat_model, _fresh_engine, building
 ) -> None:
-    """Per-conversation, not per-user. The rule is "this chat's composer is shut while THIS
-    chat's agent works" — a planning conversation elsewhere is legitimate traffic, and gating
-    it would be the over-correction."""
+    """★ AE6 / R93 — AND THIS EXPECTATION IS THE OPPOSITE OF WHAT IT USED TO BE.
+
+    It used to read: "per-conversation, not per-user — a planning conversation elsewhere is
+    legitimate traffic, and gating it would be the over-correction." That was true while a
+    planning turn read a SAVED COPY of the app and touched no container. It reads the project's
+    live workspace now, like every other turn, so a send here while another of this user's chats
+    holds that workspace is not incidental traffic — it is a second claim on the one thing there
+    is only one of.
+
+    TWO QUESTIONS, STILL DISTINCT. "Is this chat's own agent mid-reply?" is per-conversation and
+    unchanged. "Is this user's one workspace already committed elsewhere?" is per-user, and it
+    is the one that changed. The refusal carries a machine code so a client can tell it from the
+    other 409 on this route, which has a different cause and a different remedy."""
+    from src.services.turns.copy import ALREADY_BUILDING_HERE_CODE
     from tests.factories import ConversationFactory
 
     user, conv = await _auth_with_conversation(db_session)
@@ -433,8 +472,171 @@ async def test_a_build_in_another_thread_never_gates_this_one(
     with building(other.id, user.id):
         resp = await _post_turn(client, _headers(user), conv)
 
-    assert resp.status_code == 202
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == ALREADY_BUILDING_HERE_CODE
+    assert _fresh_engine.peek(conv.id) is None  # refused BEFORE anything was claimed
+
+
+async def test_the_refused_send_is_not_stored_and_bills_nothing(
+    client, db_session, set_chat_model, _fresh_engine, building
+) -> None:
+    """★ AE51's server half. A refusal that costs the citizen their message is a worse bug than
+    the conflict it reports: they retype it, or they do not, and either way the platform took
+    something for nothing."""
+    import sqlalchemy as sa
+
+    from src.db.models.message import Message
+    from src.db.models.token_usage import TokenUsage
+    from tests.factories import ConversationFactory
+
+    user, conv = await _auth_with_conversation(db_session)
+    other = await ConversationFactory.create(db_session, user.id)
+    set_chat_model(_streaming_text("planning away"))
+
+    with building(other.id, user.id):
+        assert (await _post_turn(client, _headers(user), conv)).status_code == 409
+
+    rows = await db_session.scalar(
+        sa.select(sa.func.count()).select_from(Message).where(Message.conversation_id == conv.id)
+    )
+    assert (rows or 0) == 0
+    usage = await db_session.scalar(
+        sa.select(sa.func.count()).select_from(TokenUsage).where(TokenUsage.user_id == user.id)
+    )
+    assert (usage or 0) == 0
+
+
+async def test_two_plan_chats_can_both_be_open_and_only_sending_takes_the_slot(
+    client, db_session, set_chat_model, _fresh_engine
+) -> None:
+    """Open is free; SENDING is what claims. The gate is on the turn, not on the chat, so a
+    citizen can keep several planning conversations in front of them — which is the whole point
+    of them being cheap — and only discovers the one-workspace rule when two of them are
+    actually working at once."""
+    from tests.factories import ConversationFactory
+
+    user, first = await _auth_with_conversation(db_session)
+    second = await ConversationFactory.create(
+        db_session, user.id, project_id=first.project_id, kind=ChatKind.PLAN
+    )
+    set_chat_model(_streaming_text("answering"))
+
+    assert (await _post_turn(client, _headers(user), first)).status_code == 202
+    await _settle(_fresh_engine, first.id)
+    assert (await _post_turn(client, _headers(user), second)).status_code == 202
+    await _settle(_fresh_engine, second.id)
+
+
+# --- R98: no workspace service means the message is refused, not degraded ------------------
+
+
+@pytest.mark.parametrize("kind", [ChatKind.PLAN, ChatKind.BUILD])
+async def test_no_workspace_service_refuses_the_send_identically_in_both_kinds(
+    client, db_session, set_chat_model, _fresh_engine, no_workspace_service, kind
+) -> None:
+    """★ AE53. Both kinds, one answer, said at the moment of sending.
+
+    WHAT THIS REPLACED WAS SILENCE. A turn with no sandbox service configured used to answer
+    from the last SAVED copy of the app — a degradation the citizen was never told about,
+    wearing a branch on the chat's mode even though the condition it read was a deployment
+    fact. Both kinds read the live app and only the live app now, so where there is nothing to
+    read from, the honest thing is to refuse before the message is spent.
+
+    The code is asserted, not just the status: this 503 shares its family with nothing else on
+    this route, but the codes are how a browser tells the whole refusal family apart."""
+    import sqlalchemy as sa
+
+    from src.db.models.message import Message
+    from src.services.turns.copy import WORKSPACE_UNAVAILABLE_CODE
+
+    user, conv = await _auth_with_conversation(db_session, kind=kind)
+    set_chat_model(_streaming_text("never reached"))
+
+    resp = await _post_turn(client, _headers(user), conv, text="what does my app do?")
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"]["code"] == WORKSPACE_UNAVAILABLE_CODE
+    # ONE LINE, in the citizen's words — no container, no sandbox, no orchestrator.
+    message = resp.json()["error"]["message"]
+    assert "wasn't sent" in message
+    for jargon in ("sandbox", "container", "orchestrator", "workspace service"):
+        assert jargon not in message.lower()
+    # Nothing claimed, nothing written, no partial reply.
+    assert _fresh_engine.peek(conv.id) is None
+    rows = await db_session.scalar(
+        sa.select(sa.func.count()).select_from(Message).where(Message.conversation_id == conv.id)
+    )
+    assert (rows or 0) == 0
+
+
+def test_nothing_builds_a_saved_copy_workspace_for_a_turn() -> None:
+    """An inertness guard over the retired degrade arm.
+
+    `ExtractedSnapshotWorkspace` still EXISTS — the classification review and the deploy
+    pipeline both read a saved bundle, legitimately — so the guard is not "the class is gone".
+    It is that the turn engine no longer constructs one: the read surface a turn is given comes
+    from one arm, and there is no second path for a chat to answer from a copy."""
+    from src.services.turns import engine as engine_module
+
+    # Asserted on the module's NAMESPACE rather than on its source text: the engine cannot
+    # construct a snapshot workspace it never imported, and a name check survives a refactor
+    # that a text search would not.
+    for retired in (
+        "ExtractedSnapshotWorkspace",
+        "EmptyProjectWorkspace",
+        "extract_snapshot",
+        "NoAppYet",
+    ):
+        assert not hasattr(engine_module, retired), retired
+
+
+# --- R42a: the stored-message ceiling refuses rather than trims ----------------------------
+
+
+async def test_an_over_length_message_is_refused_at_the_boundary(
+    client, db_session, set_chat_model, _fresh_engine
+) -> None:
+    """★ AE18. Refused by the schema, before anything is claimed or stored — and REFUSED, not
+    trimmed. A message cut at a ceiling is one the citizen believes they sent whole, and the
+    platform has no way to tell them otherwise afterwards."""
+    import sqlalchemy as sa
+
+    from src.api.v1.conversations._shared import MAX_MESSAGE_TEXT_CHARS
+    from src.db.models.message import Message
+
+    user, conv = await _auth_with_conversation(db_session)
+    set_chat_model(_streaming_text("never reached"))
+
+    resp = await _post_turn(client, _headers(user), conv, text="x" * (MAX_MESSAGE_TEXT_CHARS + 1))
+
+    assert resp.status_code == 422, resp.text
+    rows = await db_session.scalar(
+        sa.select(sa.func.count()).select_from(Message).where(Message.conversation_id == conv.id)
+    )
+    assert (rows or 0) == 0
+
+
+async def test_a_message_one_character_under_the_ceiling_is_stored_whole(
+    client, db_session, set_chat_model, _fresh_engine
+) -> None:
+    """The other side of the same rule, and the half that catches a trim: a ceiling enforced by
+    truncation passes the refusal test above and fails this one."""
+    from src.api.v1.conversations._shared import MAX_MESSAGE_TEXT_CHARS
+    from src.services.messages.projection import UserTextItem, project_rows
+    from src.services.messages.store import load_rows
+
+    user, conv = await _auth_with_conversation(db_session)
+    set_chat_model(_streaming_text("answered"))
+    text = "y" * (MAX_MESSAGE_TEXT_CHARS - 1)
+
+    assert (await _post_turn(client, _headers(user), conv, text=text)).status_code == 202
     await _settle(_fresh_engine, conv.id)
+
+    items = project_rows(
+        list(await load_rows(db_session, user_id=user.id, conversation_id=conv.id))
+    )
+    typed = [item for item in items if isinstance(item, UserTextItem)]
+    assert [len(item.text) for item in typed] == [MAX_MESSAGE_TEXT_CHARS - 1]
 
 
 async def test_over_daily_limit_keeps_the_dedicated_429_body(
@@ -477,10 +679,10 @@ async def test_a_refused_start_leaves_the_pending_plan_card_unresolved(
     """`resolve_pending_as_refine` is a WRITE. Every rejection that can be decided without it
     must come FIRST — otherwise a 400/409 the user never asked for silently consumes their
     Build-it card and the button goes dead."""
-    from src.db.models.conversation import Conversation, ConversationMode
+    from src.db.models.conversation import ChatKind, Conversation
     from src.services.turns.guard import claim_conversation, release_conversation
 
-    user, conv = await _auth_with_conversation(db_session, mode=ConversationMode.PLAN)
+    user, conv = await _auth_with_conversation(db_session, kind=ChatKind.PLAN)
     set_chat_model(_plan_call_model())
     headers = _headers(user)
     assert (await _post_turn(client, headers, conv, text="plan it")).status_code == 202
@@ -505,10 +707,12 @@ async def test_a_refused_start_leaves_the_pending_plan_card_unresolved(
 
     # (c) the user's own sandbox is committed to ANOTHER thread → 409, card still untouched.
     # This replaces the old Write-mode 400: the refusal that remains is about the workspace
-    # being busy elsewhere, never about the mode itself.
+    # being busy elsewhere, never about the kind itself. `kind` is fixed at creation in real
+    # traffic (R14/R15, no route mutates it) — this direct row mutation is a TEST-ONLY shortcut
+    # to exercise the guard against a Build-kind row without driving a real transition.
     conversation = await db_session.get(Conversation, conv.id)
     assert conversation is not None
-    conversation.mode = ConversationMode.WRITE
+    conversation.kind = ChatKind.BUILD
     await db_session.flush()
     with building(uuid.uuid4(), user.id):  # live, but on ANOTHER thread
         refused = await _post_turn(client, headers, conv, text="hurry up")
@@ -560,6 +764,14 @@ async def test_reconnect_with_cursor_resumes_tail_only_without_duplicating_text(
     assert "alpha" not in replayed
     assert replayed == "omega"
     assert frames[-1].type == "turn_ended"
+
+    # SETTLE THE TASK, not just the stream. `turn_ended` is delivered from inside the run, and
+    # the run's `finally` still has work after it — it drains the preview watcher and writes the
+    # durable turn-terminal row, which opens a session of its own. A test that returns on the
+    # last frame leaves that session unclosed and the connection is torn down by the garbage
+    # collector against an event loop pytest has already closed, which surfaces as an error at
+    # teardown rather than as a failure here.
+    await _settle(_fresh_engine, conv.id)
 
 
 async def test_active_turn_in_conversation_read_while_running(
@@ -642,12 +854,7 @@ def test_build_frames_round_trip_without_degrading_to_unknown() -> None:
     frames: list[Any] = [
         WorkspaceFrame(seq=1, state="preparing", message="Warming up your workspace…"),
         PreviewFrame(seq=2, state="ready", preview_url="https://preview.example/app"),
-        DiagnosticFrame(
-            seq=3,
-            source=ErrorSource.TSC,
-            title="Type error in app/page.tsx",
-            cleaned_stack="app/page.tsx:12:5 — Property 'id' does not exist",
-        ),
+        DiagnosticFrame(seq=3, source=ErrorSource.TSC),
         QuotaFrame(seq=4, limit=1_000_000, used=1_000_042, resets_at="2026-07-30T00:00:00Z"),
     ]
     for frame in frames:
@@ -668,15 +875,14 @@ def test_build_frames_speak_camel_case_on_the_wire() -> None:
         "state": "ready",
         "previewUrl": "https://preview.example/app",
     }
-    diagnostic = DiagnosticFrame(
-        seq=3, source=ErrorSource.SERVER, title="Boom", cleaned_stack="at line 1"
-    )
+    diagnostic = DiagnosticFrame(seq=3, source=ErrorSource.SERVER)
     assert json.loads(diagnostic.model_dump_json(by_alias=True)) == {
         "type": "diagnostic",
         "seq": 3,
         "source": "server",
-        "title": "Boom",
-        "cleanedStack": "at line 1",
+        # NO `title`, NO `cleanedStack` — U14 took the model's half off this frame entirely.
+        # Asserted as an exact dict rather than by absence checks, which is what makes this the
+        # egress test: a field re-added anywhere in the shape fails here, whatever it is named.
         # U16 — the citizen-facing half, derived from the error class because the producer
         # supplied none. It is asserted HERE, on the exact wire dict, for the reason this test
         # exists at all: the portal narrows on the camelCase key, so a snake_case spelling of
@@ -751,13 +957,13 @@ def test_build_snapshot_carries_the_workspace_and_preview_facts(_fresh_engine) -
     """A `preview` frame that fired before the client connected is gone from the ring by the
     time a mid-Write reconnect asks. The catch-up snapshot is the only thing left that can
     answer, so it carries the trio and the reattach needs no second REST call."""
-    from src.db.models.conversation import ConversationMode
+    from src.db.models.conversation import ChatKind
 
     state = _TurnState(
         turn_id=uuid.uuid7(),
         conversation_id=uuid.uuid7(),
         user_id=uuid.uuid7(),
-        mode=ConversationMode.WRITE,
+        kind=ChatKind.BUILD,
     )
     # A chat turn never touches a workspace, so the trio starts as "nothing to say".
     blank = _fresh_engine.build_snapshot(state)
@@ -794,6 +1000,9 @@ async def test_csrf_required_on_turn_posts(client, db_session, set_chat_model) -
 # --- plan options over the API (U11) ------------------------------------------------------
 
 
+_OFFERED_PLAN = "Your visitor log will list today's visitors, newest first."
+
+
 def _plan_call_model():
     minted = {"n": 0}
 
@@ -806,7 +1015,10 @@ def _plan_call_model():
             {
                 0: DeltaToolCall(
                     name="present_plan_options",
-                    json_args="{}",
+                    # THE PLAN RIDES THE ARGUMENT. An offer with nothing in it is refused
+                    # and never recorded, so `"{}"` here would leave every assertion below
+                    # looking for a card that does not exist.
+                    json_args=json.dumps({"plan": _OFFERED_PLAN}),
                     tool_call_id="opt-api" if minted["n"] == 1 else f"opt-api-{minted['n']}",
                 )
             }
@@ -818,9 +1030,9 @@ def _plan_call_model():
 async def test_refine_click_resolves_over_the_api(
     client, db_session, set_chat_model, _fresh_engine
 ) -> None:
-    from src.db.models.conversation import ConversationMode
+    from src.db.models.conversation import ChatKind
 
-    user, conv = await _auth_with_conversation(db_session, mode=ConversationMode.PLAN)
+    user, conv = await _auth_with_conversation(db_session, kind=ChatKind.PLAN)
     set_chat_model(_plan_call_model())
     headers = _headers(user)
     assert (await _post_turn(client, headers, conv, text="plan it")).status_code == 202
@@ -848,10 +1060,10 @@ async def test_refine_click_resolves_over_the_api(
 async def test_free_text_while_pending_resolves_as_implicit_refine(
     client, db_session, set_chat_model, _fresh_engine
 ) -> None:
-    from src.db.models.conversation import ConversationMode
+    from src.db.models.conversation import ChatKind
     from src.services.turns.plan_options import find_pending
 
-    user, conv = await _auth_with_conversation(db_session, mode=ConversationMode.PLAN)
+    user, conv = await _auth_with_conversation(db_session, kind=ChatKind.PLAN)
     set_chat_model(_plan_call_model())
     headers = _headers(user)
     assert (await _post_turn(client, headers, conv, text="plan it")).status_code == 202
@@ -872,28 +1084,30 @@ async def test_free_text_while_pending_resolves_as_implicit_refine(
     assert "refine" in states and "pending" in states
 
 
-@pytest.mark.parametrize("mode_name", ["ask", "plan", "write"])
-async def test_a_turn_in_any_mode_refuses_to_reclaim_another_projects_unsaved_work(
-    client, db_session, set_chat_model, fake_redis, fake_storage, app, mode_name
+@pytest.mark.parametrize("kind", [ChatKind.PLAN, ChatKind.BUILD])
+async def test_a_turn_in_any_kind_refuses_to_reclaim_another_projects_unsaved_work(
+    client, db_session, set_chat_model, fake_redis, fake_storage, app, kind
 ) -> None:
-    """#83 — the refusal must not be gated on WRITE.
+    """#83 — the refusal must not be gated on Build.
 
-    `_pin_workspace` attaches the project's LIVE container for every mode ("Resolve the
-    turn-pinned read surface ONCE, for EVERY mode"), so an Ask or Plan turn takes the
-    one-per-user workspace exactly as a Write turn does. Gating the preflight on WRITE meant
-    those two still destroyed the incumbent's unsaved work — and did it inside the detached
-    turn, where the only thing the user saw was "Your workspace could not be started right
-    now": no dialog, no named project, and no way to save. Found in live testing.
+    `_pin_workspace` attaches the project's LIVE container for every kind ("Resolve the
+    turn-pinned read surface ONCE, for EVERY mode"), so a Plan turn takes the one-per-user
+    workspace exactly as a Build turn does. Gating the preflight on Build meant Plan still
+    destroyed the incumbent's unsaved work — and did it inside the detached turn, where the
+    only thing the user saw was "Your workspace could not be started right now": no dialog,
+    no named project, and no way to save. Found in live testing.
 
-    Parametrised over all three modes deliberately: this went wrong because someone (me) read
-    "the workspace" as "the Write workspace", and a single-mode test would let that back in."""
+    PARAMETRISED OVER BOTH KINDS, not the three modes ("ask", "plan", "write") this test used
+    to run against: Ask and Plan collapsed into the one `ChatKind.PLAN` (`db/models/
+    conversation.py`), so a third arm would just repeat the Plan case under a retired name.
+    Two arms still catch the original bug — this went wrong because someone (me) read "the
+    workspace" as "the Build workspace", and a single-kind test would let that back in."""
     from src.api.v1.build_sessions.deps import sandbox_or_none_dependency
-    from src.db.models.conversation import ConversationMode
     from src.services.build_sessions.manager import SandboxReclaimBlockedError, SessionManager
     from tests.fakes import FakeSandboxClient
 
     set_chat_model(_streaming_text("ok"))
-    user, conv = await _auth_with_conversation(db_session, mode=ConversationMode(mode_name))
+    user, conv = await _auth_with_conversation(db_session, kind=kind)
 
     # Another project of this user's holds the workspace, and it has unsaved work.
     async def _blocked(*a, **k):

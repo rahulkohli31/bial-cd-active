@@ -507,9 +507,11 @@ async def test_no_user_facing_frame_carries_any_part_of_the_report() -> None:
         source="window.onerror", title="Cannot read properties of undefined", stack=secret_ish
     )
 
-    frame = DiagnosticFrame(
-        seq=1, source=error.source, title=error.title, cleaned_stack=error.cleaned_stack
-    )
+    # THE FRAME CANNOT BE HANDED THE REPORT ANY MORE — `title` and `cleaned_stack` are not
+    # fields on it (U14). This construction used to pass both, which is precisely what made the
+    # absence assertions below worth writing; they are now guarding a shape that has nowhere to
+    # put the payload rather than a redactor that has to get it right.
+    frame = DiagnosticFrame(seq=1, source=error.source)
     rendered = frame.model_dump_json()
     egressed = error.model_dump_json()
 
@@ -521,12 +523,18 @@ async def test_no_user_facing_frame_carries_any_part_of_the_report() -> None:
         assert "untrusted-app-report" not in wire
     assert "agentOnlyDetail" not in egressed and "agent_only_detail" not in egressed
 
-    # LIVENESS: the report was genuinely processed — a frame built from this error is the client
-    # class, carries the platform's own sentence, and the model's copy DOES have the text.
+    # LIVENESS: the report was genuinely processed — a frame built from this error is the
+    # client class and carries the platform's own sentence, the ERROR still holds the platform's
+    # title with the report's own text kept out of it, and the model's copy DOES have the text.
     # Without these, every assertion above would also pass on a `BuildError` never built.
+    #
+    # The title and the empty stack are asserted on the ERROR rather than on the frame, because
+    # the frame no longer has either field (U14) — which is the stronger version of the same
+    # claim and the reason the assertions moved rather than went.
     assert frame.source == ErrorSource.CLIENT
-    assert frame.title == CLIENT_ERROR_TITLE
-    assert frame.cleaned_stack == ""
+    assert frame.user_message.strip() and frame.user_action.strip()
+    assert error.title == CLIENT_ERROR_TITLE
+    assert error.cleaned_stack == ""
     assert secret_ish in build_repair_prompt(error)
 
 

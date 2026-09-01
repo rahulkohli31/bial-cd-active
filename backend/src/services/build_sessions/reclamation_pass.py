@@ -117,13 +117,14 @@ async def _registry_claims() -> dict[str, RegistryClaim]:
 
 
 async def _claim_of(redis: aioredis.Redis, user: uuid.UUID) -> RegistryClaim:
-    """The four signals, read explicitly. One spelling, so the enumeration read and the delete-time
-    re-read below can never disagree about what "claimed" means."""
+    """The five signals, read explicitly. One spelling, so the enumeration read and the
+    delete-time re-read below can never disagree about what "claimed" means."""
     return RegistryClaim(
         lock_held=await locks.lock_is_held(redis, user),
         heartbeat_alive=await locks.heartbeat_is_alive(redis, user),
         stay_current=await locks.stay_of_execution_is_current(redis, user),
         lease_held=await locks.liveness_lease_is_held(redis, user),
+        starting=await locks.read_starting_marker(redis, user) is not None,
     )
 
 

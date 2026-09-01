@@ -23,12 +23,20 @@
  *
  * Also pinned here, on the same surface: the precedence between the poll's `restorable` and
  * the `projectHasSavedBuild` prop, which shipped in U17 with no test at all.
+ *
+ * CHAT-KIND MIGRATION (sfw-002). This page now renders ONLY a `build` chat, fixed at creation —
+ * every composer send already holds the write toolset (BuilderPage.tsx's routing-rule docblock),
+ * so there is no more plan-card confirm to drive a build through here. `handleBuildIt`'s card
+ * still exists, but pressing it now creates a SECOND, different chat and navigates there — its
+ * turn never touches this page, so it cannot be what `framedBuild` drives. An ordinary `send()`
+ * is the trigger instead: the plain `readTurnStream` call it makes IS the open socket every
+ * frame in this file is pushed into.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act, screen, waitFor, cleanup, fireEvent } from '@testing-library/react'
 import {
   FakeEventSource, PREVIEW_URL, makeClient, primeClient, renderBuilder,
-  primeTurn, sendAndConfirm, scriptBuildTurn, T_WORKSPACE, T_PREVIEW,
+  waitForGateOpen, composer, T_WORKSPACE, T_PREVIEW,
 } from './_builderSession.jsx'
 import type { PreviewLifeState, PreviewState } from '../../utils/buildSessionApi'
 
@@ -40,7 +48,7 @@ const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
-  switchMode: vi.fn(), resolvePlanOptions: vi.fn(),
+  resolvePlanOptions: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
   relaunchPreview: vi.fn(),
   fetchPreviewState: vi.fn(), fetchSaveState: vi.fn(),
@@ -57,12 +65,15 @@ vi.mock('../../utils/attachmentStore', async (orig) => ({
   ...(await orig<typeof import('../../utils/attachmentStore')>()),
   buildUserParts: h.buildUserParts,
 }))
+// `switchMode` is GONE — a chat's kind is fixed at creation, so there is no per-thread setting
+// left to switch. `resolvePlanOptions` is a real export, kept mocked only because
+// `PlanOptionsCard` (still imported by BuilderPage.tsx) reaches for it — never exercised here,
+// since this suite never renders that card.
 vi.mock('../../utils/turnStreamApi', async (orig) => ({
   ...(await orig<typeof import('../../utils/turnStreamApi')>()),
   startTurn: (...a: unknown[]) => h.startTurn(...a),
   readTurnStream: (...a: unknown[]) => h.readTurnStream(...a),
   buildFromPlan: (...a: unknown[]) => h.buildFromPlan(...a),
-  switchMode: (...a: unknown[]) => h.switchMode(...a),
   resolvePlanOptions: (...a: unknown[]) => h.resolvePlanOptions(...a),
 }))
 // The probe itself is the subject: it is counted, not stubbed away. `fetchSaveState` rides
@@ -76,6 +87,53 @@ vi.mock('../../utils/buildSessionApi', async (orig) => ({
 function deps() {
   const fake = new FakeEventSource('x')
   return { client: makeClient(h), eventSourceFactory: () => fake }
+}
+
+/**
+ * Script an ordinary send's own turn stream as an OPEN socket a test can push frames into by
+ * hand. Not `_builderSession.jsx`'s `scriptBuildTurn` — that helper still branches on whether
+ * `readTurnStream` was called WITH a `turnId`, which was how the old Build-it watch (subscribing
+ * to a turn already known to be a build) told itself apart from an ordinary send (subscribing
+ * with none, and getting back a streamed plan). That distinction is gone: `fireRelayTurn` never
+ * passes a `turnId`, and never asks the chat's kind either — every send on this BUILD-chat page
+ * opens the one plain subscription, and that IS the build.
+ *
+ * The opening snapshot mirrors what every real subscribe gets FIRST
+ * (`backend/src/api/v1/conversations/turns.py`'s own docstring: "emit the first frame BEFORE any
+ * model byte — the snapshot serves that role"), carrying the `turnId` this page reads into
+ * `liveTurnIdRef` — the fact several of this file's assertions (Stop, the compile-probe gate)
+ * depend on being true the moment a turn opens, not only once it ends.
+ */
+function scriptTurn(opening: unknown[] = [
+  { type: 'snapshot', seq: 1, turnId: 't1', turnStatus: 'running', items: [], textSoFar: '', steps: [] },
+  T_WORKSPACE(undefined, 2),
+]) {
+  const live: { emit: ((frame: unknown) => void) | null; close: ((outcome: string) => void) | null } = {
+    emit: null, close: null,
+  }
+  const impl = async ({ onFrame }: { onFrame: (frame: unknown) => void }) => {
+    live.emit = onFrame
+    for (const frame of opening) onFrame(frame)
+    return new Promise<string>((resolve) => { live.close = resolve })
+  }
+  return {
+    impl,
+    /** Push more frames into the open turn (wrapped in act, so effects flush between). */
+    frame: async (...frames: unknown[]) => {
+      await act(async () => { for (const frame of frames) live.emit?.(frame) })
+    },
+    /** Close the socket. The TRANSPORT outcome only; the frames decide the semantic one. */
+    end: async (outcome = 'completed') => {
+      await act(async () => { live.close?.(outcome); await Promise.resolve() })
+    },
+  }
+}
+
+/** Type into the composer and send — no plan, no card, no `Build it` press. */
+async function send(text = 'a visitor app') {
+  await waitForGateOpen()
+  fireEvent.change(composer(), { target: { value: text } })
+  fireEvent.keyDown(composer(), { key: 'Enter' })
 }
 
 /** A whole preview-state body, in the shape `fetchPreviewState` parses one into. */
@@ -106,13 +164,11 @@ const tick = (cadences = 1) =>
  * stopped when all it had done was look away.
  */
 async function framedBuild(hasSavedBuild: boolean | null = null) {
-  const turn = scriptBuildTurn()
+  const turn = scriptTurn()
   h.readTurnStream.mockImplementation(turn.impl)
   renderBuilder({ deps: deps(), hasSavedBuild })
-  await sendAndConfirm()
-  await waitFor(() =>
-    expect(h.readTurnStream).toHaveBeenCalledWith(expect.objectContaining({ turnId: expect.any(String) })),
-  )
+  await send()
+  await waitFor(() => expect(h.readTurnStream).toHaveBeenCalled())
   vi.useFakeTimers()
   await turn.frame(T_PREVIEW())
   await settle()
@@ -131,12 +187,12 @@ beforeEach(() => {
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([
-    { id: 'build-X', kind: 'builder', title: 'My build', updatedAt: new Date().toISOString() },
+    { id: 'build-X', kind: 'build', title: 'My build', updatedAt: new Date().toISOString() },
   ])
   h.buildUserParts.mockImplementation(async (text: string) => [{ type: 'text', text }])
+  h.startTurn.mockResolvedValue({ turnId: 't1' })
   h.fetchSaveState.mockResolvedValue({ appId: 'a1', dirty: false, savedHead: null, containerHead: null, recoveryAt: null })
   h.fetchPreviewState.mockResolvedValue(answer('alive'))
-  primeTurn(h)
 })
 afterEach(() => {
   vi.useRealTimers()

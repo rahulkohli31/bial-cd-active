@@ -19,14 +19,14 @@ const ok = (json) => ({ ok: true, status: 200, json: async () => json })
 
 describe('listConversations', () => {
   it('GETs ?kind= and normalizes _id → id', async () => {
-    const fetchImpl = vi.fn(async () => ok({ conversations: [{ _id: 'c1', kind: 'planning', title: 'T', updatedAt: '2026-06-20T00:00:00Z' }] }))
-    const list = await listConversations('planning', deps(fetchImpl))
-    expect(fetchImpl.mock.calls[0][0]).toBe('/api/conversations?kind=planning')
-    expect(list).toEqual([{ id: 'c1', kind: 'planning', title: 'T', createdAt: undefined, updatedAt: '2026-06-20T00:00:00Z' }])
+    const fetchImpl = vi.fn(async () => ok({ conversations: [{ _id: 'c1', kind: 'plan', title: 'T', updatedAt: '2026-06-20T00:00:00Z' }] }))
+    const list = await listConversations('plan', deps(fetchImpl))
+    expect(fetchImpl.mock.calls[0][0]).toBe('/api/conversations?kind=plan')
+    expect(list).toEqual([{ id: 'c1', kind: 'plan', title: 'T', createdAt: undefined, updatedAt: '2026-06-20T00:00:00Z' }])
   })
   it('throws the server message on failure', async () => {
     const fetchImpl = vi.fn(async () => ({ ok: false, status: 500, json: async () => ({ error: { message: 'boom' } }) }))
-    await expect(listConversations('planning', deps(fetchImpl))).rejects.toThrow('boom')
+    await expect(listConversations('plan', deps(fetchImpl))).rejects.toThrow('boom')
   })
 })
 
@@ -35,14 +35,14 @@ describe('listProjectConversations', () => {
     const fetchImpl = vi.fn(async () =>
       ok({
         conversations: [
-          { _id: 'c1', kind: 'planning', projectId: 'p1', title: 'Plan' },
-          { _id: 'c2', kind: 'builder', projectId: 'p1', title: 'Build' },
+          { _id: 'c1', kind: 'plan', projectId: 'p1', title: 'Plan' },
+          { _id: 'c2', kind: 'build', projectId: 'p1', title: 'Build' },
         ],
       }),
     )
     const list = await listProjectConversations('p1', deps(fetchImpl))
     expect(fetchImpl.mock.calls[0][0]).toBe('/api/conversations?projectId=p1')
-    expect(list.map((c) => c.kind)).toEqual(['planning', 'builder'])
+    expect(list.map((c) => c.kind)).toEqual(['plan', 'build'])
     expect(list.every((c) => c.projectId === 'p1')).toBe(true)
   })
   it('url-encodes the project id', async () => {
@@ -58,19 +58,22 @@ describe('listProjectConversations', () => {
 
 describe('getConversation', () => {
   it('hydrates header + PROJECTION into the in-memory message shape (U7)', async () => {
+    // `mode` is gone from the wire doc entirely — ConversationHeader lost the field, and the
+    // reload projection no longer carries a per-item mode either. `kind` is the whole of what
+    // a chat is now, fixed at creation. No assertion below reads `.mode`; that IS the proof.
     const fetchImpl = vi.fn(async () =>
       ok({
-        conversation: { _id: 'c1', kind: 'builder', mode: 'plan', title: 'App', context: { theme: 'bial' } },
+        conversation: { _id: 'c1', kind: 'build', title: 'App', context: { theme: 'bial' } },
         projection: [
-          { type: 'user_text', seq: 0, mode: 'plan', text: 'hi', attachmentIds: [] },
-          { type: 'assistant_text', seq: 1, mode: 'plan', text: 'hello!' },
+          { type: 'user_text', seq: 0, text: 'hi', attachmentIds: [] },
+          { type: 'assistant_text', seq: 1, text: 'hello!' },
         ],
         activeTurn: null,
       }),
     )
     const conv = await getConversation('c1', deps(fetchImpl))
     expect(conv.id).toBe('c1')
-    expect(conv.mode).toBe('plan')
+    expect(conv.kind).toBe('build')
     expect(conv.context).toEqual({ theme: 'bial' })
     expect(conv.activeTurn).toBeNull()
     expect(conv.messages).toEqual([
@@ -86,7 +89,7 @@ describe('getConversation', () => {
   // caller read `undefined`. ChatRoute's kind dispatch and the chat breadcrumb both
   // depend on this surviving hydration.
   it('surfaces conversation.projectId', async () => {
-    const fetchImpl = vi.fn(async () => ok({ conversation: { _id: 'c1', kind: 'builder', projectId: 'p1' }, projection: [] }))
+    const fetchImpl = vi.fn(async () => ok({ conversation: { _id: 'c1', kind: 'build', projectId: 'p1' }, projection: [] }))
     expect((await getConversation('c1', deps(fetchImpl))).projectId).toBe('p1')
   })
 })
@@ -108,10 +111,19 @@ describe('messagesFromProjection', () => {
       },
     ])
   })
-  it('maps a plan_options item to a card part carrying the STORED item (U13)', () => {
-    const item = { type: 'plan_options', seq: 3, mode: 'plan', toolCallId: 't', state: 'pending', reason: null }
-    expect(messagesFromProjection([item])).toEqual([
-      { id: 'srv_3_p_0', role: 'assistant', parts: [{ type: 'plan_options', item }], seq: 3 },
+  it('maps a plan_options item to a card part carrying the NARROWED item (U13) — mode/reason do not ride along', () => {
+    // The stored item is fed through toPlanOptionsItem, same as the live path (turnStreamApi.ts)
+    // — not forwarded verbatim. `mode` and `reason` are given here as an old stored row could
+    // still carry them, and neither reaches the rendered part: PlanOptionsItem dropped `reason`
+    // along with the `build_failed` state that used to need it.
+    const stored = { type: 'plan_options', seq: 3, mode: 'plan', toolCallId: 't', state: 'pending', reason: null }
+    expect(messagesFromProjection([stored])).toEqual([
+      {
+        id: 'srv_3_p_0',
+        role: 'assistant',
+        parts: [{ type: 'plan_options', item: { type: 'plan_options', seq: 3, toolCallId: 't', state: 'pending' } }],
+        seq: 3,
+      },
     ])
   })
   it('maps visible steps and the in-progress anchor; hidden (read) steps stay out (U15)', () => {
@@ -123,15 +135,15 @@ describe('messagesFromProjection', () => {
         { type: 'build_in_progress', seq: 3, sessionId: 's' },
       ]),
     ).toEqual([
-      // The step part is now toStepItem(visible), not the raw stored item — same
-      // narrowing function turnStreamApi.ts's live path uses (PR #93 review finding
-      // 9), so it also fills toStepItem's own defaults for fields `visible` never
-      // had (mode: '', detail: {args: null, result: null}) rather than forwarding
-      // the raw object's exact fields untouched.
+      // The step part is now toStepItem(visible), not the raw stored item — the same
+      // narrowing function turnStreamApi.ts's live path uses (PR #93 review finding 9).
+      // It used to default-fill two fields the stored row never had, `mode` and
+      // `detail: {args: null, result: null}`; StepItem carries neither any more, so a
+      // reloaded step is exactly the six fields below and nothing is synthesized.
       {
         id: 'srv_1_s_0',
         role: 'assistant',
-        parts: [{ type: 'step', step: { ...visible, mode: '', detail: { args: null, result: null } } }],
+        parts: [{ type: 'step', step: { ...visible } }],
         seq: 1,
       },
       // …index 2, not 1: the ordinal counts SOURCE position, so skipping the hidden step at
@@ -159,17 +171,22 @@ describe('messagesFromProjection', () => {
 
 describe('createConversation / patchConversation / deleteConversation', () => {
   it('POSTs {id, projectId, kind} (+title/context when given) to the conversations route', async () => {
-    const fetchImpl = vi.fn(async () => ({ ok: true, status: 201, json: async () => ({ conversation: { _id: 'c1', kind: 'planning', projectId: 'p1', mode: 'plan' } }) }))
-    const header = await createConversation('c1', { projectId: 'p1', kind: 'planning', title: 'T' }, deps(fetchImpl))
+    // `mode` is gone from CreateConversationArgs and from ConversationHeader — proven from BOTH
+    // ends here, not merely by asserting the new shape: a stray `mode` on the CALL never reaches
+    // the wire body (createConversation destructures only the named fields it still has), and a
+    // `mode` on the SERVER doc never survives normalizeHeader into the returned header.
+    const fetchImpl = vi.fn(async () => ({ ok: true, status: 201, json: async () => ({ conversation: { _id: 'c1', kind: 'plan', projectId: 'p1', mode: 'plan' } }) }))
+    const header = await createConversation('c1', { projectId: 'p1', kind: 'plan', title: 'T', mode: 'plan' }, deps(fetchImpl))
     const [url, opts] = fetchImpl.mock.calls[0]
     expect(url).toBe('/api/conversations')
     expect(opts.method).toBe('POST')
-    expect(JSON.parse(opts.body)).toEqual({ id: 'c1', projectId: 'p1', kind: 'planning', title: 'T' })
-    expect(header).toMatchObject({ id: 'c1', kind: 'planning', projectId: 'p1', mode: 'plan' })
+    expect(JSON.parse(opts.body)).toEqual({ id: 'c1', projectId: 'p1', kind: 'plan', title: 'T' })
+    expect(header).toMatchObject({ id: 'c1', kind: 'plan', projectId: 'p1' })
+    expect(header).not.toHaveProperty('mode')
   })
   it('createConversation rejects on failure (no silent drop)', async () => {
     const fetchImpl = vi.fn(async () => ({ ok: false, status: 409, json: async () => ({ error: { message: 'id already in use' } }) }))
-    await expect(createConversation('c1', { projectId: 'p1', kind: 'planning' }, deps(fetchImpl))).rejects.toThrow('id already in use')
+    await expect(createConversation('c1', { projectId: 'p1', kind: 'plan' }, deps(fetchImpl))).rejects.toThrow('id already in use')
   })
   it('patchConversation PATCHes the body; deleteConversation DELETEs (404 tolerated)', async () => {
     const patchFetch = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) }))
@@ -216,7 +233,7 @@ describe('uuidv7', () => {
 
 describe('createConversationStore', () => {
   it('newConversation mints a client UUIDv7 synchronously (no network)', () => {
-    const store = createConversationStore('planning')
+    const store = createConversationStore('plan')
     const a = store.newConversation()
     expect(a).toMatch(/^[0-9a-f-]{36}$/i)
     // The wiring, asserted where the decision is made: the store's mint IS `uuidv7`, so a

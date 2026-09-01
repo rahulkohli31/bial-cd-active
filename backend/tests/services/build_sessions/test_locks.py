@@ -15,10 +15,11 @@ from src.api.v1.build_sessions.schemas import (
     HEARTBEAT_TTL_SECONDS,
     LOCK_RENEW_CADENCE_SECONDS,
     LOCK_TTL_SECONDS,
+    STARTING_MARKER_TTL_SECONDS,
 )
 from src.services.build_sessions import locks
 from src.services.redis import REGISTRY_STATE_ENDING, heartbeat_key, registry_key
-from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, REGISTRY_FIELD_STATE
+from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, REGISTRY_FIELD_STATE, starting_key
 
 USER = uuid.uuid4()
 OTHER = uuid.uuid4()
@@ -190,3 +191,144 @@ async def test_registry_state_helpers(fake_redis: aioredis.Redis) -> None:
 
     await locks.delete_registry(fake_redis, USER)
     assert await locks.read_registry(fake_redis, USER) is None
+
+
+# --- U13: the start-in-flight marker ------------------------------------------------
+# `write_starting_marker` / `read_starting_marker` / `clear_starting_marker` are the
+# primitives `_holding_user_lock` (manager.py) builds the `starting` fact from; this section
+# pins them in isolation, the way `read_registry`/`mark_registry_ending` are pinned above.
+# The pipelined read `project_preview_state` actually calls is `test_preview_state.py`'s to
+# prove end to end — here it is pinned as a primitive: what it returns, and that it fails the
+# same way a bare `hgetall` would have.
+
+PROJECT = uuid.uuid4()
+
+
+async def test_a_written_marker_names_the_project_and_carries_a_mandatory_ttl(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """The whole payload is the project id, and the TTL is not a default — a marker with none
+    would be the registry hash's own mistake (ADR-0029) repeated in a new key."""
+    await locks.write_starting_marker(fake_redis, USER, PROJECT)
+
+    assert await locks.read_starting_marker(fake_redis, USER) == PROJECT
+    ttl = await fake_redis.ttl(starting_key(USER))
+    assert 0 < ttl <= STARTING_MARKER_TTL_SECONDS
+
+
+async def test_no_marker_reads_as_absent(fake_redis: aioredis.Redis) -> None:
+    assert await locks.read_starting_marker(fake_redis, USER) is None
+
+
+async def test_an_unreadable_marker_value_reads_as_absent_not_as_a_claim(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """Fails toward `None` on a value this process cannot parse — a hand-edited key or a
+    future writer using a different shape — rather than treating garbage as a start in
+    flight. The same fail-closed reading `liveness_lease_is_held` gives an unparseable
+    deadline, applied to a marker whose only job is to answer, never to spare on the strength
+    of a value nobody can account for."""
+    await fake_redis.set(starting_key(USER), "not-a-uuid", ex=STARTING_MARKER_TTL_SECONDS)
+
+    assert await locks.read_starting_marker(fake_redis, USER) is None
+
+
+async def test_clearing_is_idempotent(fake_redis: aioredis.Redis) -> None:
+    await locks.write_starting_marker(fake_redis, USER, PROJECT)
+
+    await locks.clear_starting_marker(fake_redis, USER)
+    assert await locks.read_starting_marker(fake_redis, USER) is None
+    await locks.clear_starting_marker(fake_redis, USER)  # a second clear is a clean no-op
+    assert await locks.read_starting_marker(fake_redis, USER) is None
+
+
+async def test_an_abandoned_marker_expires_on_its_own(fake_redis: aioredis.Redis) -> None:
+    """A marker is a BOUNDED claim, not a pardon: past its TTL it stops naming anything, with
+    no second actor required to clear it. fakeredis has no fast-forward clock, so the lapse is
+    simulated by deleting the key directly — indistinguishable, from a reader's side, from the
+    TTL having done it, which is the property this test is actually pinning."""
+    await locks.write_starting_marker(fake_redis, USER, PROJECT)
+    assert await locks.read_starting_marker(fake_redis, USER) == PROJECT
+
+    await fake_redis.delete(starting_key(USER))  # simulates the TTL lapsing
+
+    assert await locks.read_starting_marker(fake_redis, USER) is None
+
+
+async def test_the_pipelined_read_returns_both_the_registry_and_the_marker_in_one_round_trip(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """The exact pairing `project_preview_state` spends its one Redis round trip on (C3 §8.3):
+    two commands, not two round trips."""
+    await fake_redis.hset(registry_key(USER), mapping={REGISTRY_FIELD_APP_NAME: "sbx-x"})
+    await locks.write_starting_marker(fake_redis, USER, PROJECT)
+
+    reg, starting = await locks.read_registry_and_starting_marker(fake_redis, USER)
+
+    assert reg is not None and reg[REGISTRY_FIELD_APP_NAME] == "sbx-x"
+    assert starting == PROJECT
+
+
+async def test_the_pipelined_read_answers_both_absent_with_no_registry_or_marker(
+    fake_redis: aioredis.Redis,
+) -> None:
+    reg, starting = await locks.read_registry_and_starting_marker(fake_redis, USER)
+    assert reg is None
+    assert starting is None
+
+
+async def test_the_pipelined_read_still_migrates_a_legacy_registry_record(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """The legacy-prefix adoption `read_registry` performs on a plain read must not be lost by
+    routing through the pipeline instead: a pre-R22 user starting a build for the first time
+    since the cutover still finds their record."""
+    from src.services.redis.keys import legacy_registry_key
+
+    await fake_redis.hset(legacy_registry_key(USER), mapping={REGISTRY_FIELD_APP_NAME: "sbx-x"})
+
+    reg, starting = await locks.read_registry_and_starting_marker(fake_redis, USER)
+
+    assert reg is not None and reg[REGISTRY_FIELD_APP_NAME] == "sbx-x"
+    assert starting is None
+
+
+class _BoomPipeline:
+    """A pipeline stub whose `execute()` fails — the shape `pipe.execute()` actually takes on
+    a real outage, as opposed to the single-command `fake_redis.<method> = _boom` swap the
+    parametrized test above uses. Queuing methods return `self` so the fluent
+    `pipe.hgetall(...).get(...)` in `read_registry_and_starting_marker` still chains."""
+
+    def hgetall(self, *_args: object, **_kwargs: object) -> _BoomPipeline:
+        return self
+
+    def get(self, *_args: object, **_kwargs: object) -> _BoomPipeline:
+        return self
+
+    async def execute(self) -> object:
+        raise RedisError("redis is down")
+
+
+async def test_the_pipelined_read_surfaces_redis_errors_bare(
+    fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BARE, per the module's REDIS-ERROR POLICY: a `RedisError` from `pipe.execute()`
+    propagates exactly as a bare `hgetall` would have, so `project_preview_state`'s existing
+    `except RedisError` (answering `unknown`) keeps working unchanged."""
+    monkeypatch.setattr(fake_redis, "pipeline", lambda *a, **k: _BoomPipeline())
+    with pytest.raises(RedisError):
+        await locks.read_registry_and_starting_marker(fake_redis, USER)
+
+
+async def test_write_starting_marker_surfaces_redis_errors_bare(
+    fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The write must SURFACE rather than be swallowed into a silent non-start: it sits inside
+    `_holding_user_lock`'s try, so raising is what reaches the compensation arm that releases
+    the lock this request already holds. Swallowing it would leave a start nobody can see
+    behind a lock nobody can explain. The PLACEMENT half of that contract — that the call is
+    inside the try and not above it — is pinned by
+    `test_manager.py::test_a_failed_starting_marker_write_leaks_no_lock`."""
+    monkeypatch.setattr(fake_redis, "set", _boom)
+    with pytest.raises(RedisError):
+        await locks.write_starting_marker(fake_redis, USER, PROJECT)

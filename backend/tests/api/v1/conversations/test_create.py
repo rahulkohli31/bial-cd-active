@@ -4,11 +4,17 @@ The stateless relay 404s unknown conversations, so the SPA creates the row it mi
 streams. The contract under test: 201 on create, idempotent 200 on the same mint, one
 non-leaking 409 for any id that exists under different ownership/parentage, 404 for a
 project the caller does not own, CSRF enforced.
+
+AND IT IS THE ONLY PLACE A CHAT'S KIND IS EVER SET (R15). There is no route that changes it
+afterwards, so this boundary is where a wrong value has to be refused rather than coerced —
+including every value the retired three-valued enums used to accept.
 """
 
 from __future__ import annotations
 
 import uuid
+
+import pytest
 
 from src.config import settings
 from src.services.auth.csrf import issue_csrf_token
@@ -30,7 +36,7 @@ def _body(project, conversation_id: str | None = None, **extra) -> dict:
     return {
         "id": conversation_id or str(uuid.uuid4()),
         "projectId": str(project.id),
-        "kind": "planning",
+        "kind": "plan",
         **extra,
     }
 
@@ -49,27 +55,63 @@ async def test_create_returns_201_with_the_header(client, db_session) -> None:
     header = resp.json()["conversation"]
     assert header["_id"] == conversation_id
     assert header["projectId"] == str(project.id)
-    assert header["kind"] == "planning"
-    assert header["mode"]  # the server-owned sticky mode rides the header from birth
+    assert header["kind"] == "plan"
+    # There is no second field beside it. `mode` came off the header with the concept it named.
+    assert "mode" not in header
     assert header["title"] == "Gate tracker"
     assert header["context"] == {"theme": "dark"}
 
 
-async def test_create_honors_the_requested_mode_and_defaults_to_plan(client, db_session) -> None:
-    """U13: the root box mints Ask/Plan/Write chats — `mode` on create sticks; omitted
-    keeps the server default ('plan'), so older callers are untouched."""
+async def test_the_kind_the_caller_asked_for_is_the_kind_that_comes_back(
+    client, db_session
+) -> None:
+    """Both values, read back off the header. Neither is a default: the column has none, and a
+    chat whose kind the creator did not choose is a programming error rather than a chat that
+    quietly becomes one of them."""
     user = await UserFactory.create(db_session)
     project = await ProjectFactory.create(db_session, user.id)
 
-    asked = await client.post(
-        "/v1/conversations", headers=_headers(user), json=_body(project, mode="ask")
-    )
-    assert asked.status_code == 201, asked.text
-    assert asked.json()["conversation"]["mode"] == "ask"
+    for kind in ("plan", "build"):
+        resp = await client.post(
+            "/v1/conversations", headers=_headers(user), json=_body(project, kind=kind)
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["conversation"]["kind"] == kind
 
-    defaulted = await client.post("/v1/conversations", headers=_headers(user), json=_body(project))
-    assert defaulted.status_code == 201
-    assert defaulted.json()["conversation"]["mode"] == "plan"
+
+@pytest.mark.parametrize("retired", ["ask", "write", "planning", "assistant", "builder"])
+async def test_every_retired_value_is_refused_at_the_boundary(
+    client, db_session, retired: str
+) -> None:
+    """REFUSED, not coerced — and the difference matters more here than almost anywhere else.
+
+    The kind decides which tools a run is handed. A create that silently fell back to a default
+    would hand somebody a Build chat's write tools because they sent a word that used to be
+    valid. All five retired labels are named individually: two from the mode enum and three
+    from the kind enum, because an implementer narrowing one and forgetting the other leaves
+    exactly half of this open."""
+    user = await UserFactory.create(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+
+    resp = await client.post(
+        "/v1/conversations", headers=_headers(user), json=_body(project, kind=retired)
+    )
+    assert resp.status_code == 422, resp.text
+
+
+async def test_a_mode_field_on_the_create_body_is_not_honoured(client, db_session) -> None:
+    """The create request used to take a starting `mode` beside the kind. It is gone with the
+    concept — and a body that still sends one must not have it silently applied to anything."""
+    user = await UserFactory.create(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+
+    resp = await client.post(
+        "/v1/conversations", headers=_headers(user), json=_body(project, kind="plan", mode="write")
+    )
+    assert resp.status_code == 201, resp.text
+    header = resp.json()["conversation"]
+    assert header["kind"] == "plan"
+    assert "mode" not in header
 
 
 async def test_create_is_idempotent_per_owner(client, db_session) -> None:

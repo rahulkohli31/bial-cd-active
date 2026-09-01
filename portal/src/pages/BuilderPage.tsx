@@ -13,11 +13,11 @@ import TurnBanner from '../components/chat/TurnBanner'
 import { atLimitSendState } from '../components/chat/BuildProgress'
 import AttachmentLightbox from '../components/AttachmentLightbox'
 import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
-import { listProjectConversations } from '../utils/conversationApi'
+import { listProjectConversations, uuidv7 } from '../utils/conversationApi'
 import type { ConversationHeader } from '../utils/conversationApi'
 import { ApiError } from '../utils/apiError'
 import { markAppVisible } from '../utils/observe'
-import { describeSaveFailure, describeModeSwitchFailure, isConversationGone } from '../utils/chatErrors'
+import { describeSaveFailure, isConversationGone } from '../utils/chatErrors'
 import { readDraft, writeDraft, clearDraft } from '../utils/composerDraft'
 import { resolvePreviewAddress } from '../utils/previewAddress'
 import { HIDDEN_BUT_MOUNTED } from '../components/workspace/hiddenSubtree'
@@ -39,17 +39,16 @@ import { isActiveBuildStatus } from '../utils/buildSessionTypes'
 import type { BuildSessionStatus } from '../utils/buildSessionTypes'
 import { usePendingAttachments } from '../hooks/usePendingAttachments'
 import type { PendingAttachment } from '../utils/attachmentInput'
-import { startTurn, readTurnStream, buildFromPlan, switchMode, stopTurn, TurnStartError } from '../utils/turnStreamApi'
+import { startTurn, readTurnStream, buildFromPlan, stopTurn, TurnStartError } from '../utils/turnStreamApi'
 import { isKnownFrame } from '../utils/turnStreamApi'
 import type { CompileState } from '../utils/compileState'
 import { makeClientErrorRelay } from '../utils/clientErrorRelay'
-import type { TurnFrame, PlanOptionsItem, StepItem, ConversationMode, DiagnosticFrame, StreamOutcome, BuildFromPlanOutcome } from '../utils/turnStreamApi'
+import type { TurnFrame, PlanOptionsItem, StepItem, DiagnosticFrame, StreamOutcome } from '../utils/turnStreamApi'
 import { narrativeEnvelopes, narrativeStatus } from '../utils/turnNarrative'
 import type { TurnNarrative } from '../utils/turnNarrative'
 import { fetchSaveState, saveProject, releaseProject, stopActiveBuild, asReclaimBlocked, fetchPreviewState, fetchCompileState, checkWorkspace } from '../utils/buildSessionApi'
 import type { ReclaimBlocked, PreviewState, PreviewLifeState } from '../utils/buildSessionApi'
 import { PlanOptionsCard } from '../components/chat/PlanOptionsCard'
-import { ModeSwitcher } from '../components/chat/ModeSwitcher'
 import { wireMessageFromParts, buildUserParts, partsToText, attachmentsFromParts, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
 import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../utils/attachmentInput'
 import { openPdf } from '../utils/attachmentViewer'
@@ -286,18 +285,22 @@ const ChatMessageRow = memo(function ChatMessageRow({
  * an app is specified, built, and iterated for its whole life (003-U4).
  *
  * THE ROUTING RULE (load-bearing — read before changing any send path). EVERY composer send is a
- * TURN on this conversation (`startTurn` + the frame stream); what differs by MODE is the toolset
- * the server hands the model, not the pipeline. An Ask or Plan send runs a READ-ONLY turn. A
- * Write send runs an ordinary turn that holds the write toolset and works directly against the
- * live sandbox — there is no card-confirm gate in front of it. Plan's `present_plan_options`
- * card is ONE route into Write — its Build-it runs the atomic `buildFromPlan` transition, which
- * flips the thread's mode server-side — but not the only one: a thread already in Write builds
- * straight from the composer.
+ * TURN on this conversation (`startTurn` + the frame stream); what differs by KIND is the toolset
+ * the server hands the model, not the pipeline. This page renders a BUILD chat, whose every send
+ * holds the write toolset and works directly against the live sandbox — there is no card-confirm
+ * gate in front of it, and no per-send setting that could put one there. A chat's kind is fixed
+ * when it is created, so there is nothing on this page that can change what a send does.
+ *
+ * BUILD-IT IS A HANDOFF, NOT A FLIP. A plan chat's `present_plan_options` card starts a build by
+ * creating a SECOND, brand-new build chat seeded with the plan, and sending the citizen to it.
+ * The plan chat is left exactly as it stands — no flip, no marker, nothing recorded in either
+ * direction. `handleBuildIt` below is the interim caller for that press (Plan D's offer strip
+ * takes it over); the turn it starts is watched from the chat it actually runs in, on arrival,
+ * by the ordinary reattach path — not from here.
  *
  * "Existing refine semantics" now means: a live LEGACY build session in this project is stopped
- * (`session.stop()`) before `buildFromPlan` fires the fresh build. `session.start()` is no
- * longer called anywhere in this file — the session half only reattaches (reload-mid-build) or
- * stops.
+ * (`session.stop()`) before the handoff fires. `session.start()` is no longer called anywhere in
+ * this file — the session half only reattaches (reload-mid-build) or stops.
  *
  * THREE DISTINCT IDENTITIES (unchanged from the single-file era, KTD-8):
  *   conversationId — the thread      (`/chat/{id}`, PATCH /conversations/{id})
@@ -331,7 +334,11 @@ interface BuilderPageProps {
   buildSessionDeps?: UseBuildSessionDeps
 }
 
-type PlanOverrideValue = 'build' | 'refine' | `build_failed:${string}`
+/** A card's local overlay while the stored record catches up. `build_failed` is GONE from
+ *  the card's state set: a build that could not start says so as a typed HTTP failure, in the
+ *  error line under the card, and burning the card as well would tell the citizen the offer is
+ *  spent when it is still pressable. */
+type PlanOverrideValue = 'build' | 'refine'
 
 /** The turn-frame reducer's mutable accumulator, carried back out to the caller once the
  * stream settles (`streamAssistant`/`reattachToTurn`/`fireRelayTurn`'s shared shape). */
@@ -340,6 +347,10 @@ interface TurnSink {
   terminal: 'completed' | 'failed' | 'stopped' | null
   reason: string | null
   snapshotCommitted: boolean | null
+  /** WHICH turn this settled — needed after the stream ends, when `liveTurnIdRef` has already
+   *  been cleared by the terminal frame. The outcome card dedupes on it, so without it every
+   *  build on one page instance would dedupe on `undefined` and only the first would show. */
+  turnId: string | null
 }
 
 export default function BuilderPage({ chatId: chatIdProp, projectId = null, projectName = null, projectHasSavedBuild = null, buildSessionDeps }: BuilderPageProps = {}) {
@@ -396,11 +407,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // unscoped flag over that span gates every sibling chat in the tab: exactly the leak
   // `generatingChatId` and the per-chat `sendingRef` already exist to prevent.
   const [buildStartingChatId, setBuildStartingChatId] = useState<string | null>(null)
-  const [switchingMode, setSwitchingMode] = useState(false) // a server mode-switch is in flight
-  // The conversation's SERVER-OWNED mode (U13): seeded from the handoff for a brand-new
-  // chat, then from the saved header; the ModeToggle writes it through the atomic switch
-  // endpoint and this state reflects the server's confirmed answer.
-  const [chatMode, setChatMode] = useState<ConversationMode | null>(location.state?.mode ?? null)
+  // The build-chat id minted for each card, kept so a RETRY after a refusal re-sends the SAME
+  // id. Minting a fresh one per attempt would turn the server's idempotency arm off: a press
+  // that failed at the workspace claim and then succeeded would be indistinguishable, to the
+  // server, from two different builds of the same plan.
+  const mintedBuildChatRef = useRef<Record<string, string>>({})
   // The LIVE plan-options card (a `plan_options` frame mid-turn, before the row reaches a
   // reload's projection) + per-card local overrides so a Build-it outcome updates the card
   // instantly (the stored record catches up on the next hydration).
@@ -506,10 +517,13 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         ? narrativeStatus(turnNarrative, {
             running: generatingChatId === buildId,
             terminal: turnTerminal,
-            isBuild: chatMode === 'write',
+            // ALWAYS, on this page. This used to ask whether the conversation's current setting
+            // happened to be the writing one; the page it is asked on is now the answer, because
+            // this page renders a build chat and a build chat has no other kind of send.
+            isBuild: true,
           })
         : null,
-    [turnNarrative, turnNarrativeIsThisChat, generatingChatId, buildId, turnTerminal, chatMode],
+    [turnNarrative, turnNarrativeIsThisChat, generatingChatId, buildId, turnTerminal],
   )
 
   /** Stop the LIVE turn. Same endpoint an ordinary reply uses — a build has no separate
@@ -618,7 +632,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   messagesRef.current = messages
   const buildIdRef = useRef<string | null>(null) // the active CONVERSATION being viewed/persisted — never a session id
   const streamAbortRef = useRef<AbortController | null>(null) // aborts the SUBSCRIPTION only — the turn runs on server-side
-  const chatModeRef = useRef<ConversationMode | null>(null)
   const loadedBuildRef = useRef<string | null>(null)
   const initFiredRef = useRef<string | null>(null) // the chat id already seeded — fire-once per chat, not per mount
   // Lets `handleBuildIt` read the latest session without depending on the `session` object
@@ -629,26 +642,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   sessionRef.current = session
   const projectIdRef = useRef(projectId)
   projectIdRef.current = projectId
-  chatModeRef.current = chatMode
 
-  /**
-   * The chat mode switch: SERVER-CONFIRMED. The switcher never moves optimistically — we
-   * request the atomic switch and only reflect the mode the server hands back.
-   *
-   * A failure says what actually failed. It used to report every rejection as "Finish the
-   * current step before switching modes" — a sentence that is true of the server's 409 and
-   * false of a 401, a 500 and a dropped connection alike, and that named a step which in
-   * those cases did not exist (N12). `switchingMode` clears on every arm, so the control is
-   * never left inert.
-   */
-  const handleModeSelect = (nextMode: ConversationMode) => {
-    if (!buildId || nextMode === chatMode || switchingMode) return
-    setSwitchingMode(true)
-    switchMode(buildId, nextMode)
-      .then((confirmed) => setChatMode(confirmed))
-      .catch((err) => showAttachToast(describeModeSwitchFailure(err)))
-      .finally(() => setSwitchingMode(false))
-  }
   // The chat + project that ORIGINATED the live session (for attribution + the render gate). The
   // session is project-scoped, so its surfaces render only while viewing a chat of ITS project.
   const sessionChatRef = useRef<string | null>(null)
@@ -677,9 +671,9 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // project's one session, and one BuilderPage instance survives a project switch.
   const buildActiveHere = buildActive && sessionChatRef.current === buildId
   const generating = generatingChatId === buildId
-  // THE ONE GATE, AND ITS ONLY TERM IS TURN STATE (KTD-1). Mode appears nowhere in it: a mode is a
-  // tool-access level on this same conversation, not a thing that can shut the composer, and using
-  // it as a gate is what produced the Write dead end.
+  // THE ONE GATE, AND ITS ONLY TERM IS TURN STATE (KTD-1). What a chat IS appears nowhere in it: a
+  // kind is a tool-access level, not a thing that can shut the composer, and using it as a gate is
+  // what produced the Write dead end.
   //
   // WHAT THE GATE WITHHOLDS IS *SENDING*, NOT TYPING (KTD-2). The text box and the attach button
   // stay live at all times, so the user can compose their next message while they wait; they
@@ -796,6 +790,14 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // routing). The composer draft belongs to the OLD chat — a leaked draft would send into this
     // one — so restore THIS chat's saved draft rather than blanking unconditionally (G3).
     setMessages([])
+    // AND THE GUARD ABOVE IS INVALIDATED IN THE SAME BREATH. `loadedBuildRef` means "the chat
+    // whose transcript is on screen", and one line ago that stopped being true — so it has to
+    // stop saying so here rather than only when the fetch below succeeds. It did not, and the
+    // handoff made that reachable on the platform's commonest action: Build it push-navigates
+    // to the new chat, and Back before its `getBuild` resolves returned to a chat whose ref
+    // still named it. The guard then skipped the whole hydration and left the citizen looking
+    // at the empty transcript this line just made, recoverable only by reloading the page.
+    loadedBuildRef.current = null
     setInput(readDraft(buildId))
     clearPending()
     // Re-ask the live-build question for the chat we are arriving at. Carrying the previous chat's
@@ -812,11 +814,21 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
 
     getBuild(buildId)
       .then((saved) => {
-        if (!alive || buildIdRef.current !== buildId) return
+        if (!alive || buildIdRef.current !== buildId) {
+          // ARRIVAL ABANDONED, so nothing on this page will ever watch a turn here — and the
+          // advisory build claim is retracted by whatever watches (`endGenerating`). Leaving
+          // it announced would keep the 5s heartbeat re-asserting a claim with no watcher
+          // behind it, and every later Build press in this project — this tab or a sibling —
+          // would be told "another chat is already building" until the tab was reloaded. A
+          // release for a conversation holding no claim is a no-op, so this costs nothing on
+          // the ordinary path. The build itself is unaffected: it runs server-side, and the
+          // one-workspace-per-user refusal there is the authoritative gate this only mirrors.
+          releaseBuildClaim(buildId)
+          return
+        }
         loadedBuildRef.current = buildId
         // UNCHECKED (matches pre-migration behavior): the stored context's shape is asserted.
         if (saved?.context) contextRef.current = saved.context as { uploadedFiles: unknown[] }
-        if (saved?.mode) setChatMode(saved.mode)
         const restored = saved?.messages ?? []
         if (restored.length > 0) {
           // Seed the next seq from the highest PERSISTED seq, not the array length: a transcript
@@ -830,8 +842,8 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         // R8's OTHER live clause — the build half. A reload (or a second tab) landing on a
         // thread whose build is STILL RUNNING has no session in memory, so nothing would gate
         // the composer: the textarea would be enabled over a live build, every send would be
-        // refused by the server, the mode pill would offer a switch that 409s, and the
-        // transcript would say a build "was running" in the past tense about one that is
+        // refused by the server, and the transcript would say a build "was running" in the
+        // past tense about one that is
         // running right now. The projection carries the session id on the newest
         // `build_in_progress` part — that is all a reattach needs.
         reattachToLiveBuild(buildId, restored, () => alive)
@@ -851,9 +863,16 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         // other over one shared controller.
         if (!handedOff && saved?.activeTurn?.turnId) {
           void reattachToTurn(buildId, saved.activeTurn, () => alive)
+        } else if (!handedOff) {
+          // NOTHING IS RUNNING HERE, so nothing will settle and retract the claim. This is the
+          // handoff's own narrow window: the press announced a claim for a chat whose turn had
+          // already ended (or had not yet reached the read projection) by the time this page
+          // arrived and asked. Same reasoning as the abandoned-arrival release above.
+          releaseBuildClaim(buildId)
         }
       })
       .catch(() => {
+        releaseBuildClaim(buildId)
         if (alive) navigate('/projects', { replace: true })
       })
     return () => {
@@ -1000,13 +1019,34 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     [refreshSaveState],
   )
 
+  /**
+   * Retract this page's advisory build claim for one chat. A no-op when it holds none.
+   *
+   * Called from `endGenerating` (a turn settled) AND from the arrival effect (there is no turn
+   * to settle). Both are needed because the handoff SPLIT acquire from release: the press
+   * claims a chat it is about to navigate to, and the release belongs to whoever ends up
+   * watching that chat — which, on an abandoned or already-finished arrival, is nobody.
+   */
+  const releaseBuildClaim = useCallback((activeId: string) => {
+    buildLockRef.current?.release(activeId)
+  }, [])
+
   const endGenerating = useCallback(
     (activeId: string) => {
       setGeneratingChatId((prev) => (prev === activeId ? null : prev))
+      // THE ADVISORY CLAIM IS RETRACTED HERE, at the one point every turn path settles through
+      // (the send, the reattach, and the reload-mid-build). It used to be released in the
+      // build-watcher's `finally`, which worked only while the build ran in the chat that
+      // started it; a handoff's build runs in a chat this page ARRIVES at, so the claim has to
+      // be dropped by whatever ends up watching the turn rather than by whoever pressed the
+      // button. A release for a conversation holding no claim is a no-op, so this is safe on
+      // every ordinary reply too — and a claim nobody retracts blocks the user's next build
+      // until they close the tab, which is the failure worth being generous about.
+      releaseBuildClaim(activeId)
       notifyUsageChanged()
       settleSaveState()
     },
-    [settleSaveState],
+    [releaseBuildClaim, settleSaveState],
   )
 
   /** Arm (d)'s way out: re-run the same adopt round-trip that could not be completed. */
@@ -1054,7 +1094,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         // before this tab connected is gone from the server's ring, so the snapshot is the
         // only thing left that can answer — which is what saves a mid-build reload from a
         // second REST round-trip, and from an empty preview pane over a running app.
-        if (frame.turnId) liveTurnIdRef.current = frame.turnId
+        if (frame.turnId) {
+          liveTurnIdRef.current = frame.turnId
+          sink.turnId = frame.turnId
+        }
         if (frame.workspaceState) setTurnWorkspace({ state: frame.workspaceState, message: null })
         // Only when the server actually said something. A snapshot with no compile fact must
         // leave whatever the live tail already established alone.
@@ -1109,6 +1152,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         sink.terminal = frame.status
         sink.reason = frame.reason ?? null
         sink.snapshotCommitted = frame.snapshotCommitted ?? null
+        sink.turnId = frame.turnId ?? sink.turnId
         setTurnTerminal(frame.status)
         liveTurnIdRef.current = null
         if (frame.previewUrl) setTurnPreview({ url: frame.previewUrl, state: 'ready' })
@@ -1131,7 +1175,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     const assistantSeq = seqRef.current
     seqRef.current += 1
     const assistantId = `local_${Date.now()}_r`
-    const sink: TurnSink = { text: '', terminal: null, reason: null, snapshotCommitted: null }
+    const sink: TurnSink = { text: '', terminal: null, reason: null, snapshotCommitted: null, turnId: null }
     setGeneratingChatId(activeId)
     setTurnError(null)
     resetTurnNarrative()
@@ -1164,6 +1208,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       setMessages((prev) => prev.filter((m) => m.id !== assistantId))
       seqRef.current = assistantSeq
     }
+    announceTerminal(sink)
     refreshBuilds()
   }
 
@@ -1229,7 +1274,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
           projectId: projectId as string,
           title: deriveTitle(partsToText(parts)),
           context: contextRef.current,
-          mode: chatModeRef.current ?? 'plan',
+          // NO KIND HERE, and that is the store's job rather than an omission: `createBuild`
+          // is `builderHistory`'s bound store, which supplies the one kind it exists for. This
+          // used to also carry the conversation's per-send setting; a chat's kind is fixed when
+          // it is created, so there is nothing left for a send to say about it.
         })
         onSent?.()
       } catch (err) {
@@ -1257,7 +1305,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     const assistantSeq = seqRef.current
     seqRef.current += 1
     const assistantId = `local_${Date.now()}_a`
-    const sink: TurnSink = { text: '', terminal: null, reason: null, snapshotCommitted: null }
+    const sink: TurnSink = { text: '', terminal: null, reason: null, snapshotCommitted: null, turnId: null }
     setGeneratingChatId(activeId)
     setTurnError(null)
     resetTurnNarrative()
@@ -1335,6 +1383,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         setMessages((prev) => prev.filter((m) => m.id !== assistantId))
         seqRef.current = assistantSeq
       }
+      announceTerminal(sink)
       refreshBuilds()
     }
   }
@@ -1392,6 +1441,34 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   }, [refreshBuilds])
 
   /**
+   * THE OUTCOME CARD, drawn by whatever watched the turn.
+   *
+   * It used to be drawn by the build-watcher `Build it` started, which is gone: a build runs in
+   * a chat this page ARRIVES at now, so the only thing that can announce it is whatever ends up
+   * watching the turn there. BOTH watchers on this page call this — an ordinary send, and the
+   * reattach a reload or a handoff arrival takes — because on a build chat every turn IS a
+   * build. One helper rather than two copies, because the two watchers announcing the same
+   * turn differently is the failure this is guarding against.
+   *
+   * `showBuildOutcome` dedupes on the turn id and scans the transcript first, so a reload that
+   * already holds the server's own row renders nothing here.
+   */
+  const announceTerminal = useCallback(
+    (sink: TurnSink) => {
+      if (!sink.terminal) return
+      showBuildOutcome({
+        status: sink.terminal === 'completed' ? 'ended' : 'failed',
+        turnId: sink.turnId ?? undefined,
+        previewUrl: turnPreviewRef.current.url,
+        endedAt: new Date().toISOString(),
+        snapshotCommitted: sink.snapshotCommitted,
+        reason: sink.reason,
+      })
+    },
+    [showBuildOutcome],
+  )
+
+  /**
    * Watch the live session for its terminal and surface the outcome once.
    *
    * Reads the C7 `ended` envelope from the feed store for the authoritative detail
@@ -1422,22 +1499,12 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       snapshotCommitted: ended?.snapshot_committed ?? null,
       reason: ended?.reason ?? null,
     })
-    // The composer re-opens right here, so the mode pill above it has to be telling the truth.
-    // `Build it` optimistically set it to Write; the end sequence has just put the thread BACK
-    // into the mode it came from (`restore_conversation_mode`), and only the server knows which
-    // one that was. Re-read the header rather than guess — a wrong guess would show the citizen
-    // a mode their next send does not actually run in. Failure is a no-op: the pill stays as it
-    // was and a reload corrects it.
-    getBuild(activeId)
-      .then((saved) => {
-        if (saved?.mode && buildIdRef.current === activeId) setChatMode(saved.mode)
-      })
-      .catch(() => {
-        // NOT swallowed (`.claude/rules/fail-first.md`). The composer has just re-opened; if we
-        // could not learn the mode the server put the thread back into, the pill above it may be
-        // showing a mode the next send does not run in — say so rather than let it lie silently.
-        if (buildIdRef.current === activeId) showAttachToast('Reload to see the current chat mode.')
-      })
+    // A HEADER RE-READ USED TO LIVE HERE, and its disappearance is the point rather than an
+    // omission. The composer re-opens at this line, and the thing above it that had to be
+    // telling the truth was a pill naming a per-thread setting the server moved on the citizen's
+    // behalf at the end of a build. Nothing moves any more: what this chat is was decided when
+    // it was created, so there is no server-side answer to go and fetch, and no window in which
+    // the page could be showing a mode the next send does not run in.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session.status, session.sessionId, projectId])
 
@@ -1535,86 +1602,17 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   }
 
   /**
-   * Build it — the atomic U12 transition: ONE server call records the choice, flips the
-   * conversation to Write, acquires the build lock, and starts the build. Every failure
-   * is a typed outcome that re-arms the card; `started` hands back the session this page
-   * attaches its cockpit to. Stale plans warn first — the user decides (force).
-   */
-  /**
-   * Watch a build the server has already started, as the turn it now is.
+   * WATCHING A BUILD FROM THE CHAT IT WAS PRESSED IN USED TO LIVE HERE, and it is gone because
+   * the build no longer runs in this chat. `Build it` creates a SECOND conversation, seeded with
+   * the plan, and the turn belongs to that one: subscribing to it from here would stream one
+   * chat's frames into another chat's transcript and persist nothing, and the assistant bubble
+   * it seeded would be a permanent artefact of a reply that was never made here.
    *
-   * Structurally the same subscription an ordinary send makes — same frame handler, same
-   * resume-once on a dropped socket — because after U5 there is genuinely no difference: a
-   * build is a Write turn with more tools. What it does NOT do is `session.reattach`; there
-   * is no build session to attach to, and reaching for one would re-open the C7 feed this
-   * whole unit exists to retire.
+   * The subscription is not lost, it MOVED. `handleBuildIt` sends the citizen to the new chat,
+   * and this page's own hydration attaches to whatever turn is live on the chat it opens
+   * (`reattachToTurn`, via the `activeTurn` the read projection carries) — which is the same
+   * path a reload mid-build has always taken, and the only one that survives closing the tab.
    */
-  const watchBuildTurn = useCallback(async (activeId: string, turnId: string, toolCallId: string) => {
-    const assistantSeq = seqRef.current
-    seqRef.current += 1
-    const assistantId = `local_${Date.now()}_b`
-    const sink: TurnSink = { text: '', terminal: null, reason: null, snapshotCommitted: null }
-    setGeneratingChatId(activeId)
-    setTurnError(null)
-    resetTurnNarrative()
-    liveTurnIdRef.current = turnId
-    // THE CROSS-TAB CLAIM. It used to ride the build SESSION, and a build has no session any
-    // more — so without this a second chat in the same project gets no warning at all before
-    // it starts a rival build. The claim-holding effect below keys on `session.*`, which a
-    // Write turn never populates, so the acquire and the release both live here now.
-    // Advisory only: the server's 409 is the real barrier, this is the fast UX mirror.
-    sessionChatRef.current = activeId
-    sessionProjectRef.current = projectId
-    // watchBuildTurn only runs from handleBuildIt, which already guards `!projectId` before
-    // ever reaching here.
-    buildLockRef.current?.acquire(projectId as string, activeId)
-    setMessages((prev) => [
-      ...prev,
-      { id: assistantId, role: 'assistant', parts: [{ type: 'text', text: '' }], seq: assistantSeq, createdAt: new Date().toISOString() },
-    ])
-
-    streamAbortRef.current?.abort()
-    const controller = new AbortController()
-    streamAbortRef.current = controller
-    const onFrame = turnFrameHandler(activeId, assistantId, sink)
-    try {
-      // Cursor 0 deliberately: the build may have been running for seconds before this
-      // subscribe landed, and the consolidating snapshot is what recovers those frames.
-      let outcome = await readTurnStream({ conversationId: activeId, turnId, cursor: 0, signal: controller.signal, onFrame })
-      if (outcome === 'truncated' && !sink.terminal && !controller.signal.aborted) {
-        outcome = await readTurnStream({ conversationId: activeId, turnId, cursor: 0, signal: controller.signal, onFrame })
-      }
-      if (outcome === 'stalled') setTurnError('The build stalled. Reload to catch up.')
-      else if (outcome === 'truncated' && !sink.terminal) {
-        setTurnError('The connection dropped. Reload to catch up — the build is still running.')
-      }
-    } catch {
-      setPlanErrors((prev) => ({
-        ...prev,
-        [toolCallId]: 'The build started but this page could not join it — reload to watch it.',
-      }))
-    } finally {
-      endGenerating(activeId)
-      // Release on EVERY exit, including the one where this tab lost the stream: the build may
-      // still be running server-side, but this tab can no longer say anything true about it,
-      // and a claim nobody retracts blocks the user's next build until the tab is closed.
-      buildLockRef.current?.release(activeId)
-      notifyUsageChanged()
-    }
-
-    if (buildIdRef.current === activeId && sink.terminal) {
-      showBuildOutcome({
-        status: sink.terminal === 'completed' ? 'ended' : 'failed',
-        turnId,
-        previewUrl: turnPreviewRef.current.url,
-        endedAt: new Date().toISOString(),
-        snapshotCommitted: sink.snapshotCommitted,
-        reason: sink.reason,
-      })
-      refreshBuilds()
-    }
-  }, [projectId, resetTurnNarrative, turnFrameHandler, endGenerating, showBuildOutcome, refreshBuilds])
-
   const handleBuildIt = useCallback(async (toolCallId: string) => {
     if (sendingRef.current === buildIdRef.current) return
     if (!projectId) {
@@ -1657,28 +1655,29 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
           return
         }
       }
-      let outcome: BuildFromPlanOutcome = await buildFromPlan(activeBuildId, toolCallId)
-      if (outcome.outcome === 'stale_plan') {
-        const proceed = window.confirm(
-          'The app has changed since this plan was made. Build from this plan anyway?',
-        )
-        if (!proceed) return
-        outcome = await buildFromPlan(activeBuildId, toolCallId, { force: true })
-      }
-      if (outcome.outcome === 'started' || outcome.outcome === 'already_started') {
-        setPlanOverrides((prev) => ({ ...prev, [toolCallId]: 'build' }))
-        // Now CORRECT rather than optimistic: the server flipped the mode atomically with the
-        // record, and nothing hands it back at the terminal any more — Write is where this
-        // thread stays until the user moves it.
-        setChatMode('write')
-        if (outcome.turnId) {
-          // A build IS a turn. Subscribe to the turn stream exactly as an ordinary send does,
-          // rather than attaching a build session — there is no session to attach to, and the
-          // narrative (steps, workspace, preview, diagnostics) all arrives as turn frames.
-          await watchBuildTurn(activeBuildId, outcome.turnId, toolCallId)
-        }
-      }
+      // THE ID IS MINTED HERE, and that is what makes a double-press safe. Both presses carry
+      // the same id, so the second one finds the first's chat already there and is answered
+      // `already_started` naming it — where a server-minted id would leave the citizen looking
+      // at the second of two build chats made from one plan. Minted through the SHARED
+      // `uuidv7`, never an inline `crypto.randomUUID()`: this id becomes a conversation's
+      // PRIMARY KEY and ADR-0006 wants v7 (the same trap `ProjectBuilder`'s mint documents).
+      const mintedChatId = mintedBuildChatRef.current[toolCallId] ?? uuidv7()
+      mintedBuildChatRef.current[toolCallId] = mintedChatId
+      const outcome = await buildFromPlan(activeBuildId, toolCallId, mintedChatId)
+      setPlanOverrides((prev) => ({ ...prev, [toolCallId]: 'build' }))
+      // THE CROSS-TAB CLAIM, made for the chat that will actually hold the workspace — not for
+      // this one, which is about to stop being where anything happens. Advisory only: the
+      // server's unconditional one-slot preflight is the real barrier and answers 409
+      // `already_building_here`; this is the warning a sibling tab gets BEFORE that round-trip.
+      buildLockRef.current?.acquire(projectId, outcome.chatId)
+      // AND THEN LEAVE. The build runs in the chat the server just created, not in this one, so
+      // the only place its narrative can honestly be watched is there. The new chat's own
+      // hydration picks up the live turn on arrival.
+      navigate(`/chat/${outcome.chatId}`)
     } catch (err) {
+      // The server's message, verbatim, because each refusal has a different remedy and only
+      // the server knows which one this is: another chat holds the workspace, there is nowhere
+      // to build, the daily cap is spent, the offer carried no usable plan.
       setPlanErrors((prev) => ({
         ...prev,
         [toolCallId]: err instanceof Error ? err.message : 'The build could not be started. Try again.',
@@ -1687,19 +1686,14 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       if (sendingRef.current === activeBuildId) sendingRef.current = null
       setBuildStartingChatId((prev) => (prev === activeBuildId ? null : prev))
     }
-  }, [projectId, showAttachToast, buildBlockedMessage, watchBuildTurn])
+  }, [projectId, showAttachToast, buildBlockedMessage, navigate])
 
   /** A card's effective item: the stored record, overlaid with this page's just-made choice. */
   const applyPlanOverride = useCallback(
     (item: PlanOptionsItem): PlanOptionsItem => {
       const override = planOverrides[item.toolCallId]
       if (!override) return item
-      if (override === 'build') return { ...item, state: 'build' }
-      if (override === 'refine') return { ...item, state: 'refine' }
-      if (override.startsWith('build_failed:')) {
-        return { ...item, state: 'build_failed', reason: override.slice('build_failed:'.length) }
-      }
-      return item
+      return { ...item, state: override }
     },
     [planOverrides],
   )
@@ -2533,22 +2527,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
               </div>
             )}
 
-            {/* F5/U6: the compact in-composer mode switch. It STAYS disabled mid-turn, and for a
-                better reason than the one it used to carry: the server stamps the running turn's
-                rows with the conversation's mode and captures the build's entry_mode from it, so
-                switching mid-run would retroactively mislabel work already in flight — it answers
-                409, and this mirrors a real server rule (KTD-4). It is emphatically NOT a mode
-                gate on the composer; mode never gates the composer at all. */}
-            {chatMode && buildId && (
-              <div className="flex items-center">
-                <ModeSwitcher
-                  value={chatMode}
-                  onSelect={handleModeSelect}
-                  disabled={turnInFlight || switchingMode}
-                  composerRef={inputRef}
-                />
-              </div>
-            )}
             {/* WHY SEND IS UNAVAILABLE — always stated, with a distinct reason per cause. Plain
                 language, no product vocabulary: a citizen reading this has asked for an app and is
                 watching it get made. Note what the copy no longer says — the chat does not "open

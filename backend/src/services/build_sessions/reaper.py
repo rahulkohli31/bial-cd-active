@@ -74,6 +74,7 @@ from src.services.build_sessions.locks import (
     lock_is_held,
     mark_registry_ending,
     read_registry,
+    read_starting_marker,
     reap_lock,
     release_liveness_lease,
     stay_of_execution_is_current,
@@ -648,6 +649,17 @@ async def reconcile_user(
         # directions — a live build has lost that pair 90 seconds in, and a dead one leaves
         # it standing for a TTL. A held lease means an agent is making tool calls inside
         # that container right now.
+        return False
+    if not certified_dead and await read_starting_marker(redis, user_uuid) is not None:
+        # THE PRE-ADOPT WINDOW, and the only signal that can cover it. Between the registry hash
+        # landing and the container's heartbeat being seeded, the lock/heartbeat pair below is an
+        # AND that cannot be satisfied — so a sweep landing mid-cold-start would reap a container
+        # this user is seconds away from building in. The marker spans exactly that interval and
+        # carries a mandatory TTL, so it stops sparing on its own rather than needing anyone to
+        # remember to clear it.
+        #
+        # BELOW the lease, above the pair, for the same reason the lease sits where it does: a
+        # start that has already reached a live turn is answered by the stronger signal first.
         return False
     if (
         not certified_dead

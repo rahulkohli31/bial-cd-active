@@ -746,9 +746,11 @@ describe('U16: every error status is a sentence plus a next action', () => {
       steps: {},
       diagnostics: [
         {
+          // NO `title`, NO `cleanedStack` — the frame has no such fields to carry any more, so
+          // this fixture cannot supply them. That is a stronger version of what the rest of this
+          // file asserts: the compiler's own line and the de-noised stack used to ride here and
+          // be dropped at the draw site; now they never arrive.
           source: 'client',
-          title: 'TypeError: undefined is not a function',
-          cleanedStack: '',
           userMessage: 'The app opened but ran into a problem in the browser.',
           userAction: "Nothing to do right now — we're working on it.",
         },

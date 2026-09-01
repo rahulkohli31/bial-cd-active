@@ -3,7 +3,8 @@
 `present_plan_options` DEFERS (the run ends with the call unanswered); the choice arrives
 minutes later as a button click — or implicitly, when the user keeps typing instead
 (free text while options are pending resolves them as `refine`). The stored resolution is
-a plain `ToolReturnPart` row (`refine` / `build` / `build_failed:<reason>`), so the next
+a plain `ToolReturnPart` row (`refine` or `build` — a migrated row may still hold a
+`build_failed:<reason>` string from the retired recorder, which reads as resolved), so the next
 run's history carries call + return natively, and the U6 projection derives the card
 state from exactly what the model will see — one record, no drift.
 
@@ -24,15 +25,26 @@ import uuid
 from dataclasses import dataclass
 from typing import Literal
 
-from pydantic_ai.messages import ModelRequest, ToolReturnPart
+from pydantic_ai.messages import ModelRequest, ToolCallPart, ToolReturnPart
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.db.models.conversation import ConversationMode
+from src.db.models.conversation import ChatKind
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.services.messages.projection import PLAN_OPTIONS_TOOL
 from src.services.messages.store import append_batch, load_rows
 
-PlanChoice = Literal["refine", "build", "build_failed"]
+PlanChoice = Literal["refine", "build"]
+"""EVERY VALUE HERE IS REACHABLE FROM A USER ACTION, and there used to be a third that was not.
+
+`build_failed` existed so a failed Build-it press could RE-ARM the card the press had burned:
+the press resolved the offer first and started the build second, so a failure in between left a
+spent card with nothing behind it. `record_build_failure` wrote that state, and it had no
+production caller — its only reference outside this module was a test.
+
+The handoff removed the need for it by construction rather than by wiring one up. A failed
+handoff commits NOTHING: the offer's answer is the last write on that path, after the turn has
+already started, so there is no burned card to re-arm. Keeping a re-arm mechanism for a card
+that can no longer be burned would be a second answer to a question that now has one."""
 
 META_PENDING = "plan_options_pending"
 META_RESOLVED = "plan_options_resolved"
@@ -49,11 +61,15 @@ class NoPendingOptionsError(Exception):
 
 @dataclass(frozen=True)
 class PendingPlanOptions:
-    """The newest unresolved card: who to answer and the plan-time snapshot pin."""
+    """The newest unresolved card: who to answer, and where to find the call that made it.
+
+    `row_seq` is enough to find the row, and the row is where the PLAN is — inside the stored
+    call's own `args`. Nothing here carries the plan text, and nothing carries a snapshot pin
+    any more: the first would be a copy that can silently disagree with the call it describes,
+    and the second died with the stale-plan warning it fed."""
 
     tool_call_id: str
     row_seq: int
-    head_sha: str | None
     synthesized: bool
 
 
@@ -61,21 +77,17 @@ class PendingPlanOptions:
 class Resolution:
     tool_call_id: str
     choice: PlanChoice
-    reason: str | None
     already_resolved: bool
 
 
-def _resolution_content(choice: PlanChoice, reason: str | None) -> str:
-    if choice == "build_failed":
-        return f"build_failed:{reason or 'unknown'}"
-    return choice
-
-
 def _is_open_resolution(resolution: str | None) -> bool:
-    """A card is still ACTIONABLE when it has no resolution, OR its resolution is a
-    `build_failed` — the card re-arms (see `record_build_failure`), so the user may still retry
-    Build-it or Keep refining. Any other value (`refine` / `build`) is terminal."""
-    return resolution is None or resolution.startswith("build_failed")
+    """A card is actionable exactly while it has no resolution at all.
+
+    There is no re-arming arm any more: a resolution written is a resolution that stands. A
+    stray `build_failed:` string from before the retired recorder therefore reads as TERMINAL
+    rather than as live, which is the right way round — a migrated card must not offer a
+    button that nothing behind it can answer."""
+    return resolution is None
 
 
 def _scan(rows: list[Message]) -> tuple[list[PendingPlanOptions], dict[str, str]]:
@@ -91,7 +103,6 @@ def _scan(rows: list[Message]) -> tuple[list[PendingPlanOptions], dict[str, str]
                 PendingPlanOptions(
                     tool_call_id=meta["toolCallId"],
                     row_seq=row.seq,
-                    head_sha=meta.get("headSha"),
                     synthesized=bool(meta.get("synthesized", False)),
                 )
             )
@@ -135,7 +146,6 @@ async def resolve(
     conversation_id: uuid.UUID,
     tool_call_id: str,
     choice: PlanChoice,
-    reason: str | None = None,
 ) -> Resolution:
     """Record the user's choice as the tool result — idempotent on the call id: a second
     click (or second tab) answers with the ALREADY-stored resolution, never a rewrite."""
@@ -144,17 +154,13 @@ async def resolve(
     )
     calls, resolutions = _scan(rows)
     stored = resolutions.get(tool_call_id)
-    # A `build_failed` resolution is NON-terminal — the card re-armed, so a "Keep refining"
-    # (or a Build-it retry) after a failed build must still record. Only a terminal `refine` /
-    # `build` replays idempotently.
-    if stored is not None and not stored.startswith("build_failed"):
+    # EVERY resolution is terminal, so a second click replays the stored answer rather than
+    # writing a rival one. An unrecognised stored value — a `build_failed:` string from before
+    # the retired recorder — replays as `refine`, which is the only honest reading left: the
+    # build did not happen, and the card is spent.
+    if stored is not None:
         stored_choice: PlanChoice = "build" if stored == "build" else "refine"
-        return Resolution(
-            tool_call_id=tool_call_id,
-            choice=stored_choice,
-            reason=None,
-            already_resolved=True,
-        )
+        return Resolution(tool_call_id=tool_call_id, choice=stored_choice, already_resolved=True)
 
     by_id = {pending.tool_call_id: pending for pending in calls}
     target = by_id.get(tool_call_id)
@@ -166,21 +172,19 @@ async def resolve(
     if newest_open is None or newest_open.tool_call_id != tool_call_id:
         raise PlanOptionsExpiredError
 
-    content = _resolution_content(choice, reason)
-    if target.synthesized or stored is not None:
-        # No real call to answer (synthesized), OR the card already re-armed from a
-        # `build_failed` overlay — record the new choice as a system overlay so the ONE real
-        # `ToolReturnPart` per call id stays reserved for a successful build. The projection
-        # reads the newest overlay, superseding the earlier `build_failed`.
+    if target.synthesized:
+        # No real call to answer: the retired synthesizer's cards have no `ToolCallPart` on the
+        # wire, so their choice is recorded as a system overlay instead. Migrated rows only —
+        # nothing writes a synthesized card any more.
         await append_batch(
             db,
             user_id=user_id,
             conversation_id=conversation_id,
             messages=[],
             entry_kind=MessageEntryKind.SYSTEM_EVENT,
-            mode=ConversationMode.PLAN,
+            kind=ChatKind.PLAN,
             visibility=MessageVisibility.HIDDEN,
-            meta={"kind": META_RESOLVED, "toolCallId": tool_call_id, "choice": content},
+            meta={"kind": META_RESOLVED, "toolCallId": tool_call_id, "choice": choice},
         )
     else:
         await append_batch(
@@ -193,18 +197,16 @@ async def resolve(
                         ToolReturnPart(
                             tool_name=PLAN_OPTIONS_TOOL,
                             tool_call_id=tool_call_id,
-                            content=content,
+                            content=choice,
                         )
                     ]
                 )
             ],
             entry_kind=MessageEntryKind.TURN,
-            mode=ConversationMode.PLAN,
-            meta={"kind": META_RESOLUTION, "toolCallId": tool_call_id, "choice": content},
+            kind=ChatKind.PLAN,
+            meta={"kind": META_RESOLUTION, "toolCallId": tool_call_id, "choice": choice},
         )
-    return Resolution(
-        tool_call_id=tool_call_id, choice=choice, reason=reason, already_resolved=False
-    )
+    return Resolution(tool_call_id=tool_call_id, choice=choice, already_resolved=False)
 
 
 async def resolve_pending_as_refine(
@@ -247,54 +249,56 @@ def newest_card(rows: list[Message]) -> PendingPlanOptions | None:
     return calls[-1] if calls else None
 
 
-def approved_plan_text(rows: list[Message], pending: PendingPlanOptions) -> str:
-    """The plan the user approved: the assistant text of the presenting turn. For a real
-    card that is the text parts of ITS OWN response row; for a synthesized card (the model
-    narrated but never called) it is the newest assistant text at or before the card row."""
-    best = ""
+def stored_call(rows: list[Message], tool_call_id: str) -> ToolCallPart | None:
+    """The offer's own stored tool call, rebuilt from the row that persisted it.
+
+    THIS IS WHERE THE PLAN LIVES, and it is the only place it lives. The call's `args` carry
+    the plan the agent wrote, so the handoff, the projection and anything else that needs it
+    all read the same string from the same row — which is what makes "the plan a user reads and
+    the plan a build starts from are the same text" a property of the storage rather than an
+    agreement between two functions.
+
+    Returns None for a call that was never stored with arguments — every card presented before
+    the plan became the tool's argument — so the caller can refuse by name rather than build on
+    a stand-in."""
     for row in rows:
-        if row.seq > pending.row_seq:
-            break
-        texts: list[str] = []
         for message in row.payload if isinstance(row.payload, list) else []:
             if not isinstance(message, dict) or message.get("kind") != "response":
                 continue
             for part in message.get("parts", []):
-                if isinstance(part, dict) and part.get("part_kind") == "text":
-                    content = part.get("content")
-                    if isinstance(content, str) and content.strip():
-                        texts.append(content)
-        if texts:
-            best = "\n".join(texts)
-    return best
+                if (
+                    isinstance(part, dict)
+                    and part.get("part_kind") == "tool-call"
+                    and part.get("tool_name") == PLAN_OPTIONS_TOOL
+                    and part.get("tool_call_id") == tool_call_id
+                ):
+                    return ToolCallPart(
+                        tool_name=PLAN_OPTIONS_TOOL,
+                        args=part.get("args"),
+                        tool_call_id=tool_call_id,
+                    )
+    return None
 
 
-async def record_build_failure(
-    db: AsyncSession,
-    *,
-    user_id: uuid.UUID,
-    conversation_id: uuid.UUID,
-    tool_call_id: str,
-    reason: str,
-) -> None:
-    """A Build-it attempt failed (lock held / cap / provision). Recorded as a SYSTEM
-    overlay for real AND synthesized cards — never a ToolReturnPart, so a later retry's
-    success can still write the one true return (exactly one per call id on the wire).
-    The projection reads `build_failed:<reason>` and RE-ARMS the card."""
-    await append_batch(
-        db,
-        user_id=user_id,
-        conversation_id=conversation_id,
-        messages=[],
-        entry_kind=MessageEntryKind.SYSTEM_EVENT,
-        mode=ConversationMode.PLAN,
-        visibility=MessageVisibility.HIDDEN,
-        meta={
-            "kind": META_RESOLVED,
-            "toolCallId": tool_call_id,
-            "choice": f"build_failed:{reason}",
-        },
-    )
+# THERE IS NO `approved_plan_text`, and its absence is the point rather than a tidy-up.
+#
+# It walked backwards through the conversation's rows collecting assistant prose, and whatever
+# it found was treated as "the plan the user approved" — for a synthesized card, prose from a
+# DIFFERENT turn entirely. So a build could start from text nobody had offered, and there was
+# no way to tell, from the stored rows, which text a citizen had actually agreed to.
+#
+# The plan is the offer call's own `args` now. One string, written deliberately by the agent in
+# the same act that put the buttons on screen, and read from the same place by everything that
+# needs it — which is what makes "the plan a user reads and the plan a handoff posts are the
+# same string" a fact about the storage rather than a claim about two functions agreeing.
+
+
+# THERE IS NO `record_build_failure`, AND NOTHING NEEDS ONE. It wrote a `build_failed:<reason>`
+# overlay that re-armed a card a failed Build-it press had already burned — a compensating write
+# for an ordering the handoff no longer has. The handoff answers the offer LAST, after the turn
+# has started, so a failure leaves the card untouched and still pressable with nothing to undo.
+# It never had a production caller in the first place; its only reference outside this module was
+# a test, which is how an unreachable state survives a review.
 
 
 async def record_build_started(
@@ -322,7 +326,7 @@ async def record_build_started(
             conversation_id=conversation_id,
             messages=[],
             entry_kind=MessageEntryKind.SYSTEM_EVENT,
-            mode=ConversationMode.PLAN,
+            kind=ChatKind.PLAN,
             visibility=MessageVisibility.HIDDEN,
             meta={"kind": META_RESOLVED, "toolCallId": pending.tool_call_id, "choice": "build"},
         )
@@ -343,6 +347,6 @@ async def record_build_started(
             )
         ],
         entry_kind=MessageEntryKind.TURN,
-        mode=ConversationMode.PLAN,
+        kind=ChatKind.PLAN,
         meta={"kind": META_RESOLUTION, "toolCallId": pending.tool_call_id, "choice": "build"},
     )

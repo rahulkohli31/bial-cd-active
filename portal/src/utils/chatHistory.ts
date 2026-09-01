@@ -1,11 +1,13 @@
 import { createConversationStore, deriveTitle } from './conversationApi'
 
-// Planning-chat history, server-backed (kind 'planning'). The async store logic
+// Planning-chat history, server-backed (kind 'plan'). The async store logic
 // lives in the shared factory, which builderHistory.js mounts by kind alone.
 // U7: `appendMessage` is gone (the server persists turns itself); the send path
 // calls `createConversation` before the first turn instead. `newConversation`
 // stays synchronous (mints a UUID).
-const store = createConversationStore('planning')
+// U1 collapsed the old three-value ConversationKind + ask/plan/write ConversationMode into one
+// two-valued ChatKind (plan | build); the server 422s on the retired 'planning' string.
+const store = createConversationStore('plan')
 
 export const { loadHistory, newConversation, getConversation, deleteConversation, createConversation } = store
 

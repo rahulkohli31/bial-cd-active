@@ -138,9 +138,12 @@ const STOPPED_RUNNING_TEXT =
  *  workspace used to read "Preview unavailable", which describes a platform fault; it is a
  *  sleeping workspace whose work is on durable storage, and the next prompt brings it back. */
 /** The three states that mean "no container is serving this project" — `alive` and `unknown` are
- *  pointedly excluded. Named once so the copy tables and the render sites all narrow to the same
- *  union instead of each asserting it with a cast (`.claude/rules/fail-first-typescript.md`). */
-type GoneState = Exclude<PreviewLifeState, 'alive' | 'unknown'>
+ *  pointedly excluded, and so is U13's `starting`: a start already under way is the opposite of
+ *  gone, and the server's own action mapping (C3 §10.3) groups it with `alive` as "nothing to
+ *  offer, just a wait" — this pane must not invite a "send a prompt" remedy over a container that
+ *  is already on its way up. Named once so the copy tables and the render sites all narrow to the
+ *  same union instead of each asserting it with a cast (`.claude/rules/fail-first-typescript.md`). */
+type GoneState = Exclude<PreviewLifeState, 'alive' | 'unknown' | 'starting'>
 
 const GONE_TITLE: Record<GoneState, string> = {
   asleep: 'Your workspace is asleep',
@@ -794,13 +797,20 @@ export default function LivePreview({
                 : 'Preview unavailable'
               : showTerminal
                 ? 'The preview is no longer running'
-                : previewState === 'unknown'
-                  ? // The honest sentence for a check that did not happen. It deliberately does
-                    // NOT disturb the frame — nothing was learned, so nothing changes on screen.
-                    'We could not check on your preview just now — it may still be running'
-                  : revealed
-                    ? 'Your app preview is live'
-                    : ''
+                : previewState === 'starting'
+                  ? // U13: a start is CONFIRMED in flight (a build, a relaunch, or another tab's
+                    // turn), unlike `unknown` below which confirms nothing. Reuses the same
+                    // sentence the frame's own cold-start wait uses — one truthful "starting" word
+                    // for the citizen, not a second name for the same fact. Announcement-only, like
+                    // `unknown`: the fuller pane treatment for this state is Plan F's (R-4).
+                    FRAMING_TEXT
+                  : previewState === 'unknown'
+                    ? // The honest sentence for a check that did not happen. It deliberately does
+                      // NOT disturb the frame — nothing was learned, so nothing changes on screen.
+                      'We could not check on your preview just now — it may still be running'
+                    : revealed
+                      ? 'Your app preview is live'
+                      : ''
 
   return (
     <div className="flex flex-col h-full">

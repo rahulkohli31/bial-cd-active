@@ -35,7 +35,7 @@ const HANDOFF = { prompt: 'a visitor log app', mode: 'plan', pendingAttachments:
 
 describe('useDropTransientQuery', () => {
   it('THE BUG: the dropped entry carries no hand-off prompt', () => {
-    const drop = mountAt({ pathname: '/chat/c1', search: '?projectId=p1&kind=builder', state: HANDOFF })
+    const drop = mountAt({ pathname: '/chat/c1', search: '?projectId=p1&kind=build', state: HANDOFF })
     drop('c1')
 
     expect(navigate).toHaveBeenCalledTimes(1)
@@ -48,7 +48,7 @@ describe('useDropTransientQuery', () => {
   })
 
   it('still does its actual job — the transient query is stripped from the address', () => {
-    const drop = mountAt({ pathname: '/chat/c1', search: '?projectId=p1&kind=builder', state: HANDOFF })
+    const drop = mountAt({ pathname: '/chat/c1', search: '?projectId=p1&kind=build', state: HANDOFF })
     drop('c1')
 
     const [path] = navigate.mock.calls[0]
@@ -71,7 +71,7 @@ describe('useDropTransientQuery', () => {
   })
 
   it('drops once per chat id — the send path calls it on every turn', () => {
-    const drop = mountAt({ pathname: '/chat/c1', search: '?projectId=p1&kind=builder', state: HANDOFF })
+    const drop = mountAt({ pathname: '/chat/c1', search: '?projectId=p1&kind=build', state: HANDOFF })
     drop('c1')
     drop('c1')
     expect(navigate).toHaveBeenCalledTimes(1)

@@ -111,7 +111,9 @@ beforeEach(() => {
   h.loadHistory.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
   h.getConversation.mockResolvedValue(null)
-  h.createConversation.mockResolvedValue({ id: 'chat-1', kind: 'planning', mode: 'plan' })
+  // `mode` is gone from ConversationHeader (kind is the whole of what a chat is now) — the
+  // default mock carries only what the real header shape still has.
+  h.createConversation.mockResolvedValue({ id: 'chat-1', kind: 'plan' })
   h.deleteConversation.mockResolvedValue(true)
 })
 afterEach(() => cleanup())
@@ -120,7 +122,7 @@ describe('ChatPage — send-path guards (U10)', () => {
   it('aborts the send before streaming when the first-turn CREATE fails (U7)', async () => {
     h.newConversation.mockReturnValue('chat-1')
     h.createConversation.mockRejectedValue(new Error('network down'))
-    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    renderChat('/chat/chat-1?projectId=p1&kind=plan')
 
     const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
     fireEvent.change(textarea, { target: { value: 'hello' } })
@@ -144,11 +146,11 @@ describe('ChatPage — send-path guards (U10)', () => {
 
   it('a conversation switch mid-stream does not write the assistant turn onto the previous conversation', async () => {
     h.listProjectConversations.mockResolvedValue([
-      { id: 'chat-1', kind: 'planning', title: 'First', updatedAt: new Date().toISOString() },
-      { id: 'chat-2', kind: 'planning', title: 'Second', updatedAt: new Date(Date.now() - 1000).toISOString() },
+      { id: 'chat-1', kind: 'plan', title: 'First', updatedAt: new Date().toISOString() },
+      { id: 'chat-2', kind: 'plan', title: 'Second', updatedAt: new Date(Date.now() - 1000).toISOString() },
     ])
     h.getConversation.mockImplementation(async (id) => ({
-      id, kind: 'planning', title: id, messages: [], updatedAt: new Date().toISOString(),
+      id, kind: 'plan', title: id, messages: [], updatedAt: new Date().toISOString(),
     }))
     let resolveSend
     h.sendMessage.mockImplementation(() => new Promise((res) => { resolveSend = res }))
@@ -184,7 +186,7 @@ describe('ChatPage — Enter while a reply is streaming (assistant-ui migration)
   it('shows the same toast as clicking Send, not a silent no-op', async () => {
     let resolveSend
     h.sendMessage.mockImplementation(() => new Promise((res) => { resolveSend = res }))
-    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    renderChat('/chat/chat-1?projectId=p1&kind=plan')
 
     const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
     fireEvent.change(textarea, { target: { value: 'first message' } })
@@ -207,7 +209,7 @@ describe('ChatPage — Enter while a reply is streaming (assistant-ui migration)
   it('Shift+Enter still inserts a newline while streaming — only plain Enter is intercepted', async () => {
     let resolveSend
     h.sendMessage.mockImplementation(() => new Promise((res) => { resolveSend = res }))
-    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    renderChat('/chat/chat-1?projectId=p1&kind=plan')
 
     const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
     fireEvent.change(textarea, { target: { value: 'hi' } })
@@ -237,7 +239,7 @@ describe('ChatPage — assistant-ui\'s own send path stays unreachable', () => {
   // config), so this pins the effect a regression there would actually produce.
   it('a single Enter produces exactly one create + one send — assistant-ui\'s own submit path never ALSO fires', async () => {
     h.sendMessage.mockResolvedValue('ok')
-    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    renderChat('/chat/chat-1?projectId=p1&kind=plan')
 
     const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
     fireEvent.change(textarea, { target: { value: 'hello' } })
@@ -252,7 +254,7 @@ describe('ChatPage — assistant-ui\'s own send path stays unreachable', () => {
 describe('ChatPage — project-first send path', () => {
   it('creates the row with projectId, then names the conversation to /claude (U7)', async () => {
     h.sendMessage.mockResolvedValue('sure thing')
-    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    renderChat('/chat/chat-1?projectId=p1&kind=plan')
 
     const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
     fireEvent.change(textarea, { target: { value: 'hello' } })
@@ -270,7 +272,7 @@ describe('ChatPage — project-first send path', () => {
 
   it('creates the row BEFORE streaming — the relay 404s an unknown conversation (U7)', async () => {
     h.sendMessage.mockResolvedValue('ok')
-    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    renderChat('/chat/chat-1?projectId=p1&kind=plan')
     const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
     fireEvent.change(textarea, { target: { value: 'hello' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
@@ -281,7 +283,7 @@ describe('ChatPage — project-first send path', () => {
 
   it('leaves for /projects when the append 404s because the project was deleted', async () => {
     h.createConversation.mockRejectedValue(new ApiError('Project not found.', 404))
-    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    renderChat('/chat/chat-1?projectId=p1&kind=plan')
     const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
     fireEvent.change(textarea, { target: { value: 'hello' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
@@ -302,11 +304,11 @@ describe('ChatPage — the composer is not shared across a chat navigation', () 
     // ChatRoute reuses this ChatPage across /chat/A → /chat/B (no key={chatId} remount), so a
     // draft the hydrate effect fails to clear is chat B wearing chat A's clothes.
     h.listProjectConversations.mockResolvedValue([
-      { id: 'chat-1', kind: 'planning', title: 'First', updatedAt: new Date().toISOString() },
-      { id: 'chat-2', kind: 'planning', title: 'Second', updatedAt: new Date(Date.now() - 1000).toISOString() },
+      { id: 'chat-1', kind: 'plan', title: 'First', updatedAt: new Date().toISOString() },
+      { id: 'chat-2', kind: 'plan', title: 'Second', updatedAt: new Date(Date.now() - 1000).toISOString() },
     ])
     h.getConversation.mockImplementation(async (id) => ({
-      id, kind: 'planning', title: id, messages: [], updatedAt: new Date().toISOString(),
+      id, kind: 'plan', title: id, messages: [], updatedAt: new Date().toISOString(),
     }))
     renderChat('/chat/chat-1')
     expect(await screen.findByText(/Plan your next app/i)).toBeTruthy()
@@ -339,7 +341,7 @@ describe('ChatPage — the in-chat delete gate is GONE, and so is the situation 
   // actual argument, and it is asserted rather than asserted away.
   const twoChats = () => {
     h.getConversation.mockImplementation(async (id) => ({
-      id, kind: 'planning', title: id, messages: [], updatedAt: new Date().toISOString(),
+      id, kind: 'plan', title: id, messages: [], updatedAt: new Date().toISOString(),
     }))
   }
 
@@ -381,8 +383,8 @@ describe('ChatPage — the in-chat delete gate is GONE, and so is the situation 
 describe('ChatPage — the transient ?projectId= query is dropped once the row exists', () => {
   it('rewrites to the bare /chat/{id} once the first turn is under way', async () => {
     h.sendMessage.mockResolvedValue('ok')
-    renderChat('/chat/chat-1?projectId=p1&kind=planning')
-    expect(screen.getByTestId('location').textContent).toBe('/chat/chat-1?projectId=p1&kind=planning')
+    renderChat('/chat/chat-1?projectId=p1&kind=plan')
+    expect(screen.getByTestId('location').textContent).toBe('/chat/chat-1?projectId=p1&kind=plan')
 
     const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
     fireEvent.change(textarea, { target: { value: 'hello' } })
@@ -395,20 +397,20 @@ describe('ChatPage — the transient ?projectId= query is dropped once the row e
 
   it('does not rewrite when the create fails — the query still carries the only project link', async () => {
     h.createConversation.mockRejectedValue(new Error('network down'))
-    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    renderChat('/chat/chat-1?projectId=p1&kind=plan')
     const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
     fireEvent.change(textarea, { target: { value: 'hello' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
 
     await screen.findByText(/Could not save your message/i)
-    expect(screen.getByTestId('location').textContent).toBe('/chat/chat-1?projectId=p1&kind=planning')
+    expect(screen.getByTestId('location').textContent).toBe('/chat/chat-1?projectId=p1&kind=plan')
   })
 })
 
 describe('ChatPage — handoff fires once, never re-posts on reload (F1)', () => {
   const handoff = (chatId, initialMessage) => ({
     pathname: `/chat/${chatId}`,
-    search: '?projectId=p1&kind=planning',
+    search: '?projectId=p1&kind=plan',
     state: { initialMessage },
   })
 
@@ -430,7 +432,7 @@ describe('ChatPage — handoff fires once, never re-posts on reload (F1)', () =>
     // which is [] for a beat on every mount) is what stops the duplicate re-post + re-call.
     h.getConversation.mockResolvedValue({
       id: 'chat-1',
-      kind: 'planning',
+      kind: 'plan',
       title: 'x',
       messages: [
         { id: 'm0', role: 'user', parts: [{ type: 'text', text: 'plan my app' }], seq: 0 },
@@ -449,12 +451,12 @@ describe('ChatPage — handoff fires once, never re-posts on reload (F1)', () =>
   it('reopening a completed conversation shows it immediately with no re-fire', async () => {
     h.getConversation.mockResolvedValue({
       id: 'chat-1',
-      kind: 'planning',
+      kind: 'plan',
       title: 'x',
       messages: [{ id: 'm0', role: 'user', parts: [{ type: 'text', text: 'earlier' }], seq: 0 }],
       updatedAt: new Date().toISOString(),
     })
-    renderChat('/chat/chat-1?projectId=p1&kind=planning') // no handoff state
+    renderChat('/chat/chat-1?projectId=p1&kind=plan') // no handoff state
     await waitFor(() => expect(h.getConversation).toHaveBeenCalledWith('chat-1'))
     await act(async () => { await Promise.resolve() })
     expect(h.sendMessage).not.toHaveBeenCalled()
@@ -465,11 +467,11 @@ describe('ChatPage — handoff fires once, never re-posts on reload (F1)', () =>
 describe('ChatPage — a chat switch aborts the stream and leaks nothing cross-chat (F7)', () => {
   const twoChats = () => {
     h.listProjectConversations.mockResolvedValue([
-      { id: 'chat-1', kind: 'planning', title: 'First', updatedAt: new Date().toISOString() },
-      { id: 'chat-2', kind: 'planning', title: 'Second', updatedAt: new Date(Date.now() - 1000).toISOString() },
+      { id: 'chat-1', kind: 'plan', title: 'First', updatedAt: new Date().toISOString() },
+      { id: 'chat-2', kind: 'plan', title: 'Second', updatedAt: new Date(Date.now() - 1000).toISOString() },
     ])
     h.getConversation.mockImplementation(async (id) => ({
-      id, kind: 'planning', title: id, messages: [], updatedAt: new Date().toISOString(),
+      id, kind: 'plan', title: id, messages: [], updatedAt: new Date().toISOString(),
     }))
   }
   const attachButton = () => screen.getByTitle(/Attach images/i)
@@ -545,7 +547,7 @@ describe('ChatPage — a stalled stream keeps the partial reply (F1/U7)', () => 
     h.sendMessage
       .mockImplementationOnce(async (_m, onChunk) => { onChunk('a partial ans'); return null })
       .mockImplementationOnce(async (_m, onChunk) => { onChunk('the full reply'); return 'the full reply' })
-    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    renderChat('/chat/chat-1?projectId=p1&kind=plan')
 
     const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
     fireEvent.change(textarea, { target: { value: 'plan my app' } })
@@ -570,7 +572,7 @@ describe('ChatPage — a stalled stream keeps the partial reply (F1/U7)', () => 
     h.error = 'The response stalled. Check your connection and try again.'
     h.getConversation.mockResolvedValue(null)
     h.sendMessage.mockResolvedValue(null) // stalls before the first delta
-    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    renderChat('/chat/chat-1?projectId=p1&kind=plan')
 
     const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
     fireEvent.change(textarea, { target: { value: 'plan my app' } })
@@ -587,7 +589,7 @@ describe('ChatPage — Regenerate after a stall (F1)', () => {
     h.getConversation.mockResolvedValue(null)
     h.sendMessage.mockResolvedValueOnce(null) // the first turn stalls (a falsy result)
     h.sendMessage.mockResolvedValueOnce('the retried reply') // the regenerate succeeds
-    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    renderChat('/chat/chat-1?projectId=p1&kind=plan')
 
     const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
     fireEvent.change(textarea, { target: { value: 'plan my app' } })
@@ -610,12 +612,12 @@ describe('ChatPage — Regenerate after a stall (F1)', () => {
     // not leak onto chat-2 — clearing it on navigation stops a phantom bubble + a discarded bill.
     h.error = 'The response stalled. Check your connection and try again.'
     h.getConversation.mockImplementation(async (id) => ({
-      id, kind: 'planning', title: id, messages: [], updatedAt: new Date().toISOString(),
+      id, kind: 'plan', title: id, messages: [], updatedAt: new Date().toISOString(),
     }))
     h.sendMessage.mockResolvedValue(null) // chat-1's turn stalls
     h.listProjectConversations.mockResolvedValue([
-      { id: 'chat-1', kind: 'planning', title: 'First', updatedAt: new Date().toISOString() },
-      { id: 'chat-2', kind: 'planning', title: 'Second', updatedAt: new Date(Date.now() - 1000).toISOString() },
+      { id: 'chat-1', kind: 'plan', title: 'First', updatedAt: new Date().toISOString() },
+      { id: 'chat-2', kind: 'plan', title: 'Second', updatedAt: new Date(Date.now() - 1000).toISOString() },
     ])
     renderChat('/chat/chat-1')
 
@@ -642,7 +644,7 @@ describe('ChatPage — Regenerate after a stall (F1)', () => {
 describe('ChatPage — the initialMessage hand-off does not replay on reload (N1)', () => {
   const HANDOFF = {
     pathname: '/chat/c-new',
-    search: '?projectId=p1&kind=planning',
+    search: '?projectId=p1&kind=plan',
     state: { initialMessage: 'what can this platform do?' },
   }
 

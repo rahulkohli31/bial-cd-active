@@ -17,13 +17,14 @@ import { render, screen, fireEvent, within, act, cleanup } from '@testing-librar
 import { MemoryRouter, Routes, Route, useParams } from 'react-router-dom'
 import {
   FakeEventSource, makeClient, primeClient, primeTurn, waitForGateOpen, scriptBuildTurn,
+  BUILD_TURN_ID,
 } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
-  switchMode: vi.fn(), resolvePlanOptions: vi.fn(),
+  resolvePlanOptions: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(), relaunchPreview: vi.fn(),
 }))
 
@@ -31,17 +32,26 @@ vi.mock('../../utils/builderHistory', () => ({
   loadBuilds: h.loadBuilds, newBuild: h.newBuild, createBuild: h.createBuild,
   getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
-vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
+// SPREAD THE ORIGINAL — `uuidv7` is the shared mint `handleBuildIt` uses for the new build chat's
+// id (ADR-0006), and a factory that lists only `listProjectConversations` leaves every OTHER
+// export undefined. That used to be silent breakage; Vitest now warns loudly ("No 'uuidv7' export
+// is defined on the mock") the moment a real caller reaches for it — which `handleBuildIt` does on
+// every Build-it press, so the case had to be fixed here rather than merely noted.
+vi.mock('../../utils/conversationApi', async (importOriginal) => ({
+  ...(await importOriginal()),
+  listProjectConversations: h.listProjectConversations,
+}))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../components/LivePreview', () => ({ default: () => null }))
 vi.mock('../../components/AttachmentChips', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
+// `switchMode` is GONE from this list (U1/U19): the route it posted to no longer exists, and a
+// chat's kind can't change after creation, so there is nothing left for a mock to intercept.
 vi.mock('../../utils/turnStreamApi', async (orig) => ({
   ...(await orig()),
   startTurn: (...a) => h.startTurn(...a),
   readTurnStream: (...a) => h.readTurnStream(...a),
   buildFromPlan: (...a) => h.buildFromPlan(...a),
-  switchMode: (...a) => h.switchMode(...a),
   resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
 
@@ -94,7 +104,7 @@ beforeEach(() => {
   Element.prototype.scrollIntoView = vi.fn()
   primeClient(h)
   h.createBuild.mockResolvedValue({ ok: true })
-  h.getBuild.mockImplementation(async (id) => ({ id, kind: 'builder', messages: [] }))
+  h.getBuild.mockImplementation(async (id) => ({ id, kind: 'build', messages: [] }))
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
   h.buildUserParts.mockImplementation(async (text) => [{ type: 'text', text }])
@@ -140,17 +150,30 @@ describe('U8 — the chat header is back-navigation + project name only', () => 
 
 describe('U8 regression guard — builds/refreshBuilds survive the dropdown removal', () => {
   it('the Build-it blocked advisory still names the blocking chat by title', async () => {
-    // Another builder chat in the same project is mid-build; refreshBuilds learns its title.
+    // Build-it is a HANDOFF now (U5/U12): pressing it in `build-A` creates a SECOND, brand-new
+    // build chat and the claim + the live turn both belong to THAT chat, not to `build-A` — so
+    // the entry `refreshBuilds` has to find by id is the handed-off chat's, not the plan chat's.
+    const LIVE_BUILD_CHAT = 'build-A-live'
     h.listProjectConversations.mockResolvedValue([
-      { id: 'build-A', kind: 'builder', title: 'First build', updatedAt: new Date().toISOString() },
+      { id: LIVE_BUILD_CHAT, kind: 'build', title: 'First build', updatedAt: new Date().toISOString() },
     ])
+    h.buildFromPlan.mockResolvedValue({ outcome: 'started', chatId: LIVE_BUILD_CHAT, turnId: BUILD_TURN_ID })
+    // The handed-off chat's own hydration is what re-subscribes to the running turn (the
+    // `activeTurn` the read projection carries) — this page never watches a build it did not
+    // navigate into.
+    h.getBuild.mockImplementation(async (id) =>
+      id === LIVE_BUILD_CHAT
+        ? { id, kind: 'build', messages: [], activeTurn: { turnId: BUILD_TURN_ID, lastSeq: 0 } }
+        : { id, kind: 'build', messages: [] },
+    )
 
-    // Tab A starts a build → holds the advisory cross-tab claim.
+    // Tab A starts a build → Build-it navigates it to the new chat, which holds the advisory
+    // cross-tab claim and shows the live narrative.
     const a = renderBuilder({ chatId: 'build-A' })
     await buildFrom(a.container)
     await within(a.container).findByTestId('build-progress')
 
-    // Tab B (same project) learns of A's claim over the channel, then tries to build.
+    // Tab B (same project) learns of the claim over the channel, then tries to build.
     const b = renderBuilder({ chatId: 'build-B' })
     await within(b.container).findByPlaceholderText(/describe what you need/i)
     await flushChannel()

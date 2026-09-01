@@ -21,7 +21,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
 from src.db.models.app_registry import AppRegistry, mint_app_key
-from src.db.models.conversation import Conversation, ConversationKind
+from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.project import Project
 from tests.factories import (
     AppRegistryFactory,
@@ -61,9 +61,7 @@ async def test_conversation_project_id_not_null(db_session) -> None:
     user = await UserFactory.create(db_session)
     with pytest.raises(IntegrityError):
         async with db_session.begin_nested():
-            db_session.add(
-                Conversation(id=uuid.uuid4(), user_id=user.id, kind=ConversationKind.PLANNING)
-            )
+            db_session.add(Conversation(id=uuid.uuid4(), user_id=user.id, kind=ChatKind.PLAN))
             await db_session.flush()
 
 

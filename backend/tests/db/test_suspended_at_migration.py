@@ -47,12 +47,18 @@ async def test_suspended_at_set_and_clear_roundtrip(db_session) -> None:
 
 def test_chain_ends_at_a_single_linear_head() -> None:
     # The migration chain stays ONE linear head (no divergent branch). The head moved past
-    # 0033_harness_counters to 0034_project_description_fts (the marketplace's full-text
-    # search index over `projects.description`, #145). That revision has now been re-parented
+    # 0034_project_description_fts to 0035_chat_kind (the two three-valued enums collapsing
+    # into one two-valued `chat_kind`, on both tables). 0034 had already been re-parented
     # TWICE by this assertion: authored as an 0029 off 0028_deployment_unpublished_at, moved
     # to 0033 off 0032_rejection_standing on one rebase, and to 0034 off 0033_harness_counters
     # on the next — each time because main took the ordinal first. Which is exactly the silent
-    # divergence this line exists to catch, twice over. Pinning
+    # divergence this line exists to catch, twice over.
+    #
+    # SAY THIS OUT LOUD IN THE PULL REQUEST when it moves: CI runs the static gates and the
+    # single-head COUNT (`tests/test_alembic_single_head.py`) and deliberately does not run
+    # pytest, so this name-pinned assertion goes red locally while CI stays green. That is the
+    # change's own failure, not a pre-existing one — the exact write-off that blocked PR #120.
+    # Pinning
     # the exact head — rather than just the COUNT, which `test_alembic_single_head.py`
     # already guards — is what makes a rebase that silently re-parents a revision fail here
     # instead of at deploy. Updating this line is the deliberate acknowledgement that a new
@@ -60,4 +66,4 @@ def test_chain_ends_at_a_single_linear_head() -> None:
     # `down_revision` really is the head you expected to build on.
     config = Config(str(_BACKEND_ROOT / "alembic.ini"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0034_project_description_fts"]
+    assert heads == ["0035_chat_kind"]
