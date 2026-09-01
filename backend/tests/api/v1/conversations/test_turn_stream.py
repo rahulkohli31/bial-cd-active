@@ -12,9 +12,11 @@ import asyncio
 import contextlib
 import json
 import uuid
+from types import SimpleNamespace
 from typing import Any, get_args
 
 import pytest
+import sqlalchemy as sa
 from pydantic import Tag, ValidationError
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -33,14 +35,14 @@ from src.api.v1.conversations.schemas import (
     WorkspaceFrame,
 )
 from src.api.v1.conversations.turns import KEEPALIVE_SECONDS
-from src.db.models.conversation import ChatKind
+from src.db.models.conversation import ChatKind, Conversation
 from src.services.turns import engine as engine_module
 from src.services.turns.engine import (
     _TURN_FAILED_MESSAGE,
     _TurnState,
 )
 from tests.api.v1.conversations.conftest import _headers
-from tests.factories import ConversationFactory, UserFactory
+from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 
 # The turn-driving fixtures live in `conftest.py` — four files needed the same four, and
 # two of them were the 3rd and 4th copy. Named here rather than autouse there, because the
@@ -1174,3 +1176,244 @@ async def test_a_redis_outage_during_the_preflight_is_503_never_a_silent_reclaim
     assert resp.status_code == 503
     assert resp.status_code != 500  # the shape before the seam was added
     assert "try again" in resp.json()["error"]["message"].lower()
+
+
+# ==========================================================================================
+# R-18 (plan 006, U13) — THE WORKSPACE QUESTION COMES BEFORE ANYTHING DURABLE EXISTS
+# ==========================================================================================
+#
+# Closes issue #161's first half: observed on a BIAL desk with the client watching, a citizen
+# submitted a build in one project, watched it run for 1m 55s, and was then shown a modal asking
+# whether they wanted the workspace at all.
+#
+# The bug was an ORDERING. A first message committed its conversation row a round trip earlier, in
+# `POST /conversations`, whose only workspace awareness was a project-ownership check; nothing
+# asked about the workspace until this route ran. So a refused or declined first message left a
+# real, titled, empty conversation in the project's list, named after the text that was refused.
+#
+# Every scenario below asserts THE LIST, not the response. The response was always a correct 409 —
+# what was wrong was what it left behind, and a test that reads the status code cannot see it.
+
+
+async def _conversation_count(db_session, user_id) -> int:
+    """How many conversations this user actually owns, read fresh from the database.
+
+    A COUNT query rather than `expire_all()` plus an ORM read, deliberately: expiring the session
+    makes every attribute of every loaded object a lazy load, and the next `project.id` in the
+    caller then raises `MissingGreenlet` rather than answering. The query is already a round trip;
+    it needs no help being fresh."""
+    from sqlalchemy import func, select
+
+    from src.db.models.conversation import Conversation
+
+    total = await db_session.scalar(
+        select(func.count()).select_from(Conversation).where(Conversation.user_id == user_id)
+    )
+    return int(total or 0)
+
+
+async def _post_first_message(
+    client, headers, chat_id, project_id, *, kind="build", text="a visitor log"
+):
+    """A chat's FIRST message: the id is minted by the client, the row does not exist yet, and the
+    parentage rides the turn request rather than a separate create call."""
+    return await client.post(
+        f"/v1/conversations/{chat_id}/turns",
+        headers=headers,
+        json={
+            "message": {"text": text, "attachmentTexts": [], "attachmentIds": []},
+            "create": {"projectId": str(project_id), "kind": kind, "title": text},
+        },
+    )
+
+
+async def test_a_first_message_refused_by_the_workspace_leaves_no_conversation_behind(
+    client, db_session, set_chat_model, fake_redis, fake_storage, app
+) -> None:
+    """★ R-18, AND THIS IS THE SCENARIO THE BUG IS.
+
+    Assert THE LIST, not the response. A 409 was always what came back; the defect was the titled,
+    empty conversation it deposited into the project — named, in the observed incident, after the
+    very text the platform had just refused."""
+    from src.api.v1.build_sessions.deps import sandbox_or_none_dependency
+    from src.services.build_sessions.manager import SandboxReclaimBlockedError, SessionManager
+    from tests.fakes import FakeSandboxClient
+
+    set_chat_model(_streaming_text("ok"))
+    user = await UserFactory.create(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    await db_session.commit()
+    user_id, project_id, headers = user.id, project.id, _headers(user)
+    before = await _conversation_count(db_session, user_id)
+
+    async def _blocked(*a, **k):
+        raise SandboxReclaimBlockedError(
+            project_id=uuid.uuid4(), project_name="Car pool apps", app_id=uuid.uuid4(), dirty=True
+        )
+
+    monkey = SessionManager.reclaim_preflight
+    SessionManager.reclaim_preflight = _blocked  # type: ignore[method-assign]
+    app.dependency_overrides[sandbox_or_none_dependency] = lambda: FakeSandboxClient()
+    try:
+        resp = await _post_first_message(client, headers, uuid.uuid4(), project_id)
+    finally:
+        SessionManager.reclaim_preflight = monkey  # type: ignore[method-assign]
+        app.dependency_overrides.pop(sandbox_or_none_dependency, None)
+
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "sandbox_reclaim_blocked"
+    # THE ASSERTION THAT MATTERS. Not one row, not a soft-deleted one — the list is exactly as long
+    # as it was before the message was sent.
+    assert await _conversation_count(db_session, user_id) == before
+
+
+async def test_every_other_side_effect_free_refusal_leaves_zero_rows_too(
+    client, db_session, set_chat_model, fake_redis, fake_storage, app
+) -> None:
+    """A fix that only covered the reclaim refusal would leave THREE other ways to make the same
+    orphan. Each refusal below sits above the creation, and each is asserted against the list."""
+    from src.api.v1.build_sessions.deps import sandbox_or_none_dependency
+
+    set_chat_model(_streaming_text("ok"))
+    user = await UserFactory.create(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    await db_session.commit()
+    user_id, project_id, headers = user.id, project.id, _headers(user)
+    before = await _conversation_count(db_session, user_id)
+
+    # NO WORKSPACE SERVICE (R98). The one refusal that needs the sandbox seam UNBOUND, which is why
+    # it is written here rather than assumed by the suite's default fixture.
+    app.dependency_overrides[sandbox_or_none_dependency] = lambda: None
+    try:
+        refused = await _post_first_message(client, headers, uuid.uuid4(), project_id)
+    finally:
+        app.dependency_overrides.pop(sandbox_or_none_dependency, None)
+
+    assert refused.status_code == 503
+    assert await _conversation_count(db_session, user_id) == before
+
+
+async def test_a_project_someone_else_owns_is_refused_and_creates_nothing(
+    client, db_session, set_chat_model, fake_redis, fake_storage
+) -> None:
+    """OWNERSHIP IS CHECKED BEFORE ANYTHING IS READ OR WRITTEN (ADR-0004), and the 404 is the same
+    non-leaking answer an unknown project gets — existence under another owner is not
+    distinguishable from absence."""
+    set_chat_model(_streaming_text("ok"))
+    mine = await UserFactory.create(db_session)
+    theirs = await UserFactory.create(db_session)
+    their_project = await ProjectFactory.create(db_session, theirs.id)
+    await db_session.commit()
+    mine_id, theirs_id, project_id, headers = mine.id, theirs.id, their_project.id, _headers(mine)
+    before = await _conversation_count(db_session, mine_id)
+
+    resp = await _post_first_message(client, headers, uuid.uuid4(), project_id)
+
+    assert resp.status_code == 404
+    assert await _conversation_count(db_session, mine_id) == before
+    assert await _conversation_count(db_session, theirs_id) == 0
+
+
+async def test_a_first_message_with_the_workspace_free_creates_exactly_one_conversation(
+    client, db_session, set_chat_model, fake_redis, fake_storage, _fresh_engine
+) -> None:
+    """The happy path: one conversation, carrying the kind it was created with, and one turn."""
+    set_chat_model(_streaming_text("ok"))
+    user = await UserFactory.create(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    await db_session.commit()
+    user_id, project_id, headers = user.id, project.id, _headers(user)
+    chat_id = uuid.uuid4()
+
+    resp = await _post_first_message(client, headers, chat_id, project_id, kind="plan")
+
+    assert resp.status_code == 202, resp.text
+    await _settle(_fresh_engine, chat_id)
+
+    row = await db_session.scalar(sa.select(Conversation).where(Conversation.id == chat_id))
+    assert row is not None
+    assert row.kind is ChatKind.PLAN  # the kind it was created with, and nothing may change it
+    assert row.project_id == project_id
+    assert await _conversation_count(db_session, user_id) == 1
+
+
+async def test_the_row_and_the_first_message_become_durable_together(
+    client, db_session, set_chat_model, fake_redis, fake_storage, _fresh_engine
+) -> None:
+    """`flush`, NOT `commit`. The row is durable only when the turn's own commit lands, so a
+    failure between the two leaves NEITHER — the property that makes every refusal below the
+    creation safe as well as every one above it."""
+    from sqlalchemy import func, select
+
+    from src.db.models.message import Message
+
+    set_chat_model(_streaming_text("ok"))
+    user = await UserFactory.create(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    await db_session.commit()
+    chat_id = uuid.uuid4()
+
+    resp = await _post_first_message(client, _headers(user), chat_id, project.id)
+    assert resp.status_code == 202
+    await _settle(_fresh_engine, chat_id)
+
+    db_session.expire_all()
+    assert await db_session.get(Conversation, chat_id) is not None
+    messages = await db_session.scalar(
+        select(func.count()).select_from(Message).where(Message.conversation_id == chat_id)
+    )
+    assert int(messages or 0) >= 1, "the row exists but its first message does not"
+
+
+async def test_a_second_message_in_an_existing_conversation_is_unchanged(
+    client, db_session, set_chat_model, fake_redis, fake_storage, _fresh_engine
+) -> None:
+    """THIS IS THE FIRST-MESSAGE PATH ONLY. A chat that already exists takes no `create` block, and
+    a stale one is ignored rather than refused — a retry or a second tab must not 409."""
+    set_chat_model(_streaming_text("ok"))
+    user, conv = await _auth_with_conversation(db_session)
+    user_id, conv_id, headers = user.id, conv.id, _headers(user)
+    before = await _conversation_count(db_session, user_id)
+
+    plain = await _post_turn(client, headers, conv)
+    assert plain.status_code == 202
+    await _settle(_fresh_engine, conv_id)
+
+    assert await _conversation_count(db_session, user_id) == before
+
+
+async def test_a_create_block_on_a_conversation_that_already_exists_is_ignored(
+    client, db_session, set_chat_model, fake_redis, fake_storage, _fresh_engine
+) -> None:
+    """Idempotency the separate create route used to provide, kept: two tabs racing the same mint,
+    or a retry after a dropped response, must not 409 and must not make a second row."""
+    set_chat_model(_streaming_text("ok"))
+    user, conv = await _auth_with_conversation(db_session, kind=ChatKind.BUILD)
+    user_id, conv_id, project_id, headers = user.id, conv.id, conv.project_id, _headers(user)
+    before = await _conversation_count(db_session, user_id)
+
+    resp = await _post_first_message(client, headers, conv_id, project_id, kind="plan")
+
+    assert resp.status_code == 202
+    await _settle(_fresh_engine, conv_id)
+    row = await db_session.scalar(sa.select(Conversation).where(Conversation.id == conv_id))
+    assert row is not None
+    # THE EXISTING ROW WINS. A `create` block naming a different kind must not mutate one — a
+    # chat's kind is fixed at creation and there is no route that changes it.
+    assert row.kind is ChatKind.BUILD
+    assert await _conversation_count(db_session, user_id) == before
+
+
+async def test_an_unknown_conversation_with_no_parentage_is_still_a_404(
+    client, db_session, set_chat_model, fake_redis, fake_storage
+) -> None:
+    """Unchanged for every turn after the first. Without a `create` block there is nothing to build
+    a row from, so an unknown id is a client bug — and a cross-user id is indistinguishable from
+    it, which is one non-leaking answer."""
+    set_chat_model(_streaming_text("ok"))
+    user = await UserFactory.create(db_session)
+    await db_session.commit()
+
+    resp = await _post_turn(client, _headers(user), SimpleNamespace(id=uuid.uuid4()))
+
+    assert resp.status_code == 404

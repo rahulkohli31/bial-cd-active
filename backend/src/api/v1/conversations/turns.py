@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator
-from typing import Literal
+from typing import Any, Literal
 
 import sqlalchemy as sa
 import structlog
@@ -58,7 +58,7 @@ from src.api.v1.conversations.schemas import (
 from src.api.v1.live_build import ReclaimBlockedEnvelope, reclaim_blocked_response
 from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry
-from src.db.models.conversation import Conversation
+from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.message import MessageEntryKind, MessageVisibility
 from src.db.models.project import Project
 from src.db.models.user import User
@@ -74,6 +74,7 @@ from src.services.messages.store import (
     load_history,
     load_rows,
 )
+from src.services.projects import owned_project_or_404
 from src.services.redis import build_coordination_or_503
 from src.services.sandbox import SandboxClient
 from src.services.turns.copy import (
@@ -115,11 +116,39 @@ _DONE = b"data: [DONE]\n\n"
 KEEPALIVE_SECONDS = 15.0
 
 
+class NewConversation(CamelModel):
+    """The parentage of a conversation that DOES NOT EXIST YET (R-18).
+
+    Present only on a chat's FIRST message. The id rides the path exactly as it does for every
+    other turn, so this carries what a row cannot be built without and nothing else.
+
+    WHY IT LIVES ON THE TURN REQUEST AT ALL. The row used to be created by a separate
+    `POST /conversations` a round trip earlier, whose only workspace awareness was a
+    project-ownership check — so a message the workspace then refused left a real, titled,
+    empty conversation in the project's list, named after the text that was refused. Folding
+    the creation into this request lets every side-effect-free refusal already above it roll
+    the row back with it, because nothing is committed until the turn's own commit.
+    """
+
+    project_id: uuid.UUID
+    # REQUIRED, and this is still the only place a chat's kind is ever set. There is no route
+    # that changes it afterwards; a value outside the enum is refused at this boundary rather
+    # than coerced, because "which chat is this" decides what the model can do.
+    kind: ChatKind
+    title: str | None = None
+    context: Any = None
+
+
 class StartTurnBody(CamelModel):
-    """`POST /conversations/{id}/turns` — the new message only (R9); the conversation id
-    rides the path."""
+    """`POST /conversations/{id}/turns` — the new message (R9); the conversation id rides the
+    path.
+
+    `create` is present only on a chat's first message, and it is what makes R-18 true: check
+    the workspace, THEN create, THEN run. Absent for every subsequent turn, where the row
+    already exists and an unknown id is a client bug."""
 
     message: TurnMessage
+    create: NewConversation | None = None
 
 
 def _frame_bytes(frame: TurnStreamFrame) -> bytes:
@@ -130,6 +159,30 @@ def _frame_bytes(frame: TurnStreamFrame) -> bytes:
         + frame.model_dump_json(by_alias=True).encode()
         + b"\n\n"
     )
+
+
+async def _conversation_or_none(
+    db: AsyncSession, user_id: uuid.UUID, conversation_id: uuid.UUID
+) -> Conversation | None:
+    """The owner-scoped conversation row, or `None` when there is not one yet.
+
+    Deliberately NOT `resolve_conversation_or_404`: on a first message the absence is the ordinary
+    case, and raising there would make the 404 arrive before the parentage that can answer it has
+    been looked at."""
+    row: Conversation | None = await db.scalar(
+        sa.select(Conversation).where(
+            Conversation.id == conversation_id, Conversation.user_id == user_id
+        )
+    )
+    return row
+
+
+def _project_of(staged: NewConversation | None) -> uuid.UUID:
+    """The staged parentage's project. A narrowing helper: by the time this is called the caller
+    has established that one of the two arms exists, and this is what tells the type checker."""
+    if staged is None:  # unreachable — guarded by the caller
+        raise AppApiError(404, "Conversation not found.")
+    return staged.project_id
 
 
 async def _app_id_for_project(
@@ -247,7 +300,41 @@ async def start_turn(
     manager: SessionManagerDep,
     sandbox: OptionalSandbox,
 ) -> TurnStartResponse | JSONResponse:
-    conversation = await resolve_conversation_or_404(db, user.id, conversation_id)
+    # R-18 — CHECK, THEN CREATE, THEN RUN, and the order is the whole deliverable.
+    #
+    # A first message used to commit its conversation row a round trip EARLIER, in
+    # `POST /conversations`, whose only workspace awareness was a project-ownership check. Only
+    # afterwards did this route ask whether the workspace was free — so a refused or declined
+    # first message deposited a real, titled, empty conversation into the project's list, named
+    # after the text that was refused. Observed live: a citizen submitted a build, watched it run
+    # for nearly two minutes, and was then asked whether they wanted the workspace at all.
+    #
+    # Nothing durable — no row, no title, no list entry — may exist before the workspace answer is
+    # known. So the row is STAGED here and created below, after every side-effect-free refusal has
+    # passed, and it becomes durable only when the turn's own commit lands.
+    #
+    # THE PATTERN IS ALREADY IN THE TREE. `build_it` — the Build-this-plan transition — is the same
+    # shape and already gets it right: preflight first, then `db.add` + `db.flush()` and
+    # deliberately NOT a commit. This copies it rather than inventing a second ordering.
+    staged = body.create
+    existing = await _conversation_or_none(db, user.id, conversation_id)
+    if existing is None and staged is None:
+        # Unchanged for every turn after the first: conversations are created with their first
+        # message, so an unknown id with no parentage to build one from is a client bug — and a
+        # cross-user id is indistinguishable from it, which is one non-leaking 404 (ADR-0004).
+        raise AppApiError(404, "Conversation not found.")
+    if existing is not None:
+        # A `create` block on a conversation that already exists is a retry or a second tab. The
+        # existing row wins; the block is ignored rather than refused, which keeps the idempotency
+        # the separate create route used to provide.
+        staged = None
+    conversation = existing
+    project_id = existing.project_id if existing is not None else _project_of(staged)
+    # OWNERSHIP FIRST, and before anything else reads this project. A 404 here is the same
+    # non-leaking answer the resolver gives, so a project under another owner is indistinguishable
+    # from one that does not exist.
+    if existing is None:
+        await owned_project_or_404(db, user.id, project_id)
 
     # Daily-token gate BEFORE anything persists — a capped user's message is refused
     # whole, never half-recorded. The error carries its own byte-stable body (limit/used/
@@ -280,9 +367,9 @@ async def start_turn(
     # check below it: the two genuinely disagree (a build's first seconds run before the flip;
     # `POST /build-sessions` never touches the mode at all), and only liveness answers "is the
     # agent building THIS thread right now".
-    if manager.live_session_for_conversation(conversation.id) is not None:
+    if manager.live_session_for_conversation(conversation_id) is not None:
         raise AppApiError(409, BUILD_IN_FLIGHT_MSG)
-    if conversation_is_mid_reply(conversation.id):
+    if conversation_is_mid_reply(conversation_id):
         raise AppApiError(409, "A turn is already running for this conversation.")
     # UNCONDITIONAL, and BELOW the mid-reply guard on purpose: a send during a streaming
     # reply must still 409 as a busy conversation, or it races `transcript_head_seq`. This
@@ -297,7 +384,7 @@ async def start_turn(
     # slipped past this gate would take a workspace another of the user's chats was mid-build
     # in, which is the one thing this check exists to prevent.
     active = manager.active_session_for(user.id)
-    if active is not None and active.conversation_id != conversation.id:
+    if active is not None and active.conversation_id != conversation_id:
         raise AppApiError(409, BUILD_IN_FLIGHT_MSG, code=ALREADY_BUILDING_HERE_CODE)
 
     # #83 — BOTH KINDS, not just Build, and the guard above cannot answer this one.
@@ -329,14 +416,12 @@ async def start_turn(
         # no registry, no slot, and nothing a reclaim could destroy.
         with build_coordination_or_503():
             try:
-                await manager.reclaim_preflight(
-                    db, user, conversation.project_id, sandbox_client=sandbox
-                )
+                await manager.reclaim_preflight(db, user, project_id, sandbox_client=sandbox)
             except SandboxReclaimBlockedError as exc:
                 return reclaim_blocked_response(exc)
 
-    project = await db.get(Project, conversation.project_id)
-    if project is None:  # FK guarantees this; fail loudly if it ever breaks
+    project = await db.get(Project, project_id)
+    if project is None:  # ownership was checked above; fail loudly if it ever breaks
         raise AppApiError(404, "Conversation not found.")
 
     rehydrate = history_rehydrator(db, storage, user.id)
@@ -346,7 +431,7 @@ async def start_turn(
         the citizen's 400 is written once rather than kept in step by hand."""
         try:
             return await load_history(
-                db, user_id=user.id, conversation_id=conversation.id, rehydrate=rehydrate
+                db, user_id=user.id, conversation_id=conversation_id, rehydrate=rehydrate
             )
         except AttachmentRehydrationError as exc:
             raise AppApiError(400, str(exc)) from None
@@ -381,6 +466,35 @@ async def start_turn(
             detail={"occupied": exc.occupied, "hardLimit": exc.hard_limit},
         ) from None
 
+    # THE CREATION, AND IT LANDS HERE FOR A REASON THAT IS EASY TO GET WRONG BY ONE LINE.
+    #
+    # Every refusal above this point is side-effect-free — the daily cap, the missing workspace,
+    # "your own other chat is running", the reclaim refusal, the context guardrail — so a message
+    # refused by any of them leaves NOTHING behind. That is R-18: the project's conversation list
+    # is afterwards exactly as long as it was before.
+    #
+    # `flush`, NOT `commit`. The row becomes durable only when `start_conversation_turn` commits it
+    # together with the first message, so a failure between the two leaves neither — and every
+    # refusal below it still rolls the row back through `get_db`. Committing here would restore the
+    # exact orphan this reorder exists to remove, one line lower down.
+    #
+    # The refresh is not optional: server-default timestamps on a fresh row raise `MissingGreenlet`
+    # when projected without one.
+    if staged is not None:
+        conversation = Conversation(
+            id=conversation_id,
+            user_id=user.id,
+            project_id=project_id,
+            kind=staged.kind,
+            title=staged.title,
+            context=staged.context,
+        )
+        db.add(conversation)
+        await db.flush()
+        await db.refresh(conversation)
+    if conversation is None:  # unreachable: one of the two arms above always binds it
+        raise AppApiError(404, "Conversation not found.")
+
     # Free text while plan options are pending resolves them as an implicit "keep refining"
     # (U11). The model must see a RESOLVED call — the dangling-call repair never has to guess
     # about a card the user typed past — so when this actually writes one, the history is read
@@ -389,7 +503,7 @@ async def start_turn(
     #
     # It moved BELOW the guardrail above (it used to lead this block) because it is this
     # route's first committing write, and every side-effect-free refusal has to land above it.
-    if await resolve_pending_as_refine(db, user_id=user.id, conversation_id=conversation.id):
+    if await resolve_pending_as_refine(db, user_id=user.id, conversation_id=conversation_id):
         history = await _history()
 
     display_name = user.display_name or user.email
@@ -398,7 +512,7 @@ async def start_turn(
         project_name=project.name,
         project_description=project.description or None,
     )
-    app_id = await _app_id_for_project(db, user.id, conversation.project_id)
+    app_id = await _app_id_for_project(db, user.id, project_id)
 
     turn_id = await start_conversation_turn(
         db=db,
