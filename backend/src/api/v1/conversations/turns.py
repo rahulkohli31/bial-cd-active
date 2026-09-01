@@ -77,6 +77,8 @@ from src.services.redis import build_coordination_or_503
 from src.services.sandbox import SandboxClient
 from src.services.turns.copy import (
     ALREADY_BUILDING_HERE_CODE,
+    CHAT_TOO_LONG_CODE,
+    CHAT_TOO_LONG_TEXT,
     WORKSPACE_UNAVAILABLE_CODE,
     WORKSPACE_UNAVAILABLE_TEXT,
 )
@@ -92,6 +94,10 @@ from src.services.turns.plan_options import (
 )
 from src.services.turns.plan_options import (
     resolve as resolve_plan_options,
+)
+from src.services.usage.context_window import (
+    ContextWindowExceededError,
+    enforce_context_limit,
 )
 from src.services.usage.gate import DailyTokenLimitExceededError, enforce_daily_limit
 
@@ -224,6 +230,7 @@ async def start_conversation_turn(
             ReclaimBlockedEnvelope,
             "The agent is already working here, or another project holds the workspace",
         ),
+        (413, ErrorEnvelope, "This conversation has grown past its per-conversation limit"),
         (429, DailyTokenLimitBody, "Daily token limit exceeded"),
         (503, ErrorEnvelope, "Claude client not configured"),
     ),
@@ -344,6 +351,19 @@ async def start_turn(
         raise AppApiError(400, str(exc)) from None
     binaries = await resolve_binaries(db, storage, user.id, body.message.attachment_ids)
     prompt = prompt_content(body.message, binaries)
+
+    # The per-conversation guardrail, at the last moment it can still refuse cleanly: the
+    # history is loaded so the size is knowable, and NOTHING has been persisted, so a refusal
+    # leaves no turn row, no usage row and no claim to release. The same slot the daily cap
+    # occupies, for the same reason.
+    #
+    # It is a REFUSAL, not a run bound. The three ceilings inside the engine stop a run already
+    # under way; this one declines to start a turn whose prompt would not fit — which is why it
+    # copies the pre-start gate above rather than the mid-run terminal.
+    try:
+        await enforce_context_limit(db, user.id, history=history, prompt=prompt)
+    except ContextWindowExceededError:
+        raise AppApiError(413, CHAT_TOO_LONG_TEXT, code=CHAT_TOO_LONG_CODE) from None
 
     display_name = user.display_name or user.email
     prompt_context = PromptContext(

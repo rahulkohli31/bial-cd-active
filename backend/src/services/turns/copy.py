@@ -44,6 +44,35 @@ remedies and a client that reads only the status cannot tell them apart."""
 WORKSPACE_UNAVAILABLE_CODE: Final = "workspace_unavailable"
 """The code the R98 refusal carries. See `WORKSPACE_UNAVAILABLE_TEXT`."""
 
+CHAT_TOO_LONG_TEXT: Final = (
+    "This chat has got too long to carry on. Start a new chat to keep going — your app and "
+    "everything you have built stays exactly as it is."
+)
+"""What a citizen is told when a conversation has grown past the boundary set for them.
+
+WHAT IT REPLACED WAS NOTHING, and that is the defect it closes. The two-page portal warned as a
+chat got long and stopped it at the wall; the unified surface shipped with neither, so the first
+a citizen knew of the boundary was a failed turn with no reason and no next move — worse than
+what came before, not merely absent. Meanwhile an administrator has been setting a number on a
+field whose help text promises a hard stop, and nothing enforced it.
+
+IT NAMES NO NUMBER. "You have used 203,412 of your 200,000" is not something a person can act
+on, and both halves of it are words for the platform's accounting rather than for what is in
+front of them. The number belongs where an administrator sets it.
+
+THE SECOND SENTENCE IS THE LOAD-BEARING ONE. The only reason a citizen would hesitate to start
+a new chat is the fear that the work goes with the conversation. It does not — the app lives in
+the project — so saying so is what turns a refusal into an instruction they will actually
+follow. Without it the honest reading of the first sentence is "you have lost your app"."""
+
+CHAT_TOO_LONG_CODE: Final = "context_hard_limit_exceeded"
+"""The code the too-long refusal carries. See `CHAT_TOO_LONG_TEXT`.
+
+NOTHING IN THIS CODEBASE FORCES A READER TO HANDLE A NEW CODE — no `Literal` union, no native
+enum, no exhaustiveness anywhere on the refusal path; every code is an open string compared by
+hand. So adding one is free and silent, and the only thing that can notice a reader dropping it
+is a test. `test_context_gate.py` and the composer's own suite are that test."""
+
 ALREADY_BUILDING_HERE_CODE: Final = "already_building_here"
 """R19's first refusal: this user's one workspace is committed to another chat of their own.
 

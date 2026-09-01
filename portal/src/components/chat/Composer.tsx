@@ -121,6 +121,19 @@ export interface ComposerProps {
   stop?: Omit<StopTurnControlProps, 'onStopFailed'> | undefined
   /** R29 — the pending plan offer, rendered on the composer rather than in the transcript. */
   offer?: Omit<OfferStripProps, 'onFailed'> | undefined
+  /**
+   * The "this chat is getting long" line, or null/absent when it is not.
+   *
+   * A SENTENCE, NOT A NUMBER AND NOT A STATE. The surface owns the transcript and therefore
+   * owns the estimate (`utils/contextLimits.ts`); the composer's job is to show the line where
+   * a citizen will read it. Passing the computed sentence rather than the messages is what
+   * keeps this component free of a second opinion about how long a conversation is — the
+   * failure mode this whole guardrail is being rebuilt out of.
+   *
+   * IT IS NOT A GATE. Send stays available past the soft threshold; the hard boundary is the
+   * server's refusal, which arrives as an ordinary turn error.
+   */
+  contextWarning?: string | null | undefined
   /** Urgent sentences go to the assertive slot the surface owns. */
   onUrgent: (message: string) => void
 }
@@ -136,6 +149,7 @@ const Composer: FC<ComposerProps> = ({
   gate,
   stop,
   offer,
+  contextWarning,
   onUrgent,
 }) => {
   const [text, setText] = useState('')
@@ -390,6 +404,20 @@ const Composer: FC<ComposerProps> = ({
           <Send size={13} />
         </button>
       </div>
+
+      {/* The context guardrail's SOFT half: advisory, non-blocking, and deliberately not
+          `disabled` anything — see the top-of-file rule. Send still works past this line; what
+          stops a turn is the server, and it says so itself. `role="status"` so it is announced
+          once when it appears rather than interrupting. */}
+      {contextWarning && (
+        <p
+          role="status"
+          data-testid="composer-context-warning"
+          className="self-stretch text-xs leading-relaxed text-neutral"
+        >
+          {contextWarning}
+        </p>
+      )}
 
       {/* R43 — silent until it is useful, and then exact. See `composerCap.ts` for why the number
           is code points rather than String.length. */}

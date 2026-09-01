@@ -41,6 +41,7 @@ import { isKnownFrame } from '../../utils/turnStreamApi'
 import type { CompileState } from '../../utils/compileState'
 import { makeClientErrorRelay } from '../../utils/clientErrorRelay'
 import type { TurnFrame, PlanOptionsItem, StepItem, DiagnosticFrame, StreamOutcome } from '../../utils/turnStreamApi'
+import { contextState } from '../../utils/contextLimits'
 import { atLimitSendState, narrativeEnvelopes, turnPhase } from '../../utils/turnNarrative'
 import type { TurnNarrative } from '../../utils/turnNarrative'
 import { fetchSaveState, saveProject, releaseProject, stopActiveBuild, asReclaimBlocked, fetchPreviewState, fetchCompileState, checkWorkspace } from '../../utils/buildSessionApi'
@@ -448,6 +449,11 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
   const turnEnvelopes = useMemo(() => narrativeEnvelopes(turnNarrative), [turnNarrative])
   // U24 — `null` unless today's budget is spent, in which case it carries the reset time.
   const atLimit = useMemo(() => atLimitSendState(turnEnvelopes), [turnEnvelopes])
+
+  // The per-conversation guardrail's SOFT half. The transcript lives here, so the estimate does
+  // too — the composer is handed a finished sentence rather than a second opinion about how long
+  // the conversation is. The HARD half is the server's and arrives as an ordinary `turnError`.
+  const contextWarning = useMemo(() => contextState(messages).message, [messages])
   const turnNarrativeIsThisChat = turnNarrativeChatRef.current === buildId
   const turnBuildStatus = useMemo(
     () =>
@@ -2647,6 +2653,7 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
           onSubmit={handleSubmit}
           isRunning={isRunning}
           gate={gate}
+          contextWarning={contextWarning}
           // R55 — BOTH ways a build can be live here. `isRunning` is a turn this tab is streaming;
           // `buildActiveHere` is a LEGACY build session adopted on a reload, which sets no
           // streaming flag at all. Gating on the turn alone left a reloaded mid-build tab with a
