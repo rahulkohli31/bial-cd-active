@@ -548,6 +548,10 @@ class _TurnState:
     # FAILURE, not a quiet success. Nothing else about the two turns differs, so the caller
     # has to say which one this is — the engine cannot infer it from the prompt.
     expects_mutation: bool = False
+    #: Did THIS turn bring a container up, rather than joining one already serving? Set at the
+    #: attach seam from `BuildSession.attached`, and read only by R103's numerator — a turn that
+    #: started nothing must not be able to report a start that reached a serving page.
+    started_a_container: bool = False
 
     def text_so_far(self) -> str:
         return "".join(self.text_parts)
@@ -1315,6 +1319,31 @@ class TurnEngine:
             )
             raise _WriteEndedError("sandbox_unavailable", message) from exc
 
+        if not session.attached:
+            # R103's DENOMINATOR, FOR THE SEAM PLAN E CANNOT SEE. `relaunch_preview` counts the
+            # explicit start control; this counts the other way a container comes up — on the way
+            # to answering a question, which is how most of them come up. One name, two writers,
+            # and neither fires on the other's path: `relaunch_preview` is never called from a
+            # turn (the route is its only caller), and this line is inside the turn's own attach.
+            #
+            # `not session.attached` IS THE WHOLE CONDITION, and it is why `attached` had to be
+            # forwarded onto the session at all. This method runs on EVERY turn of EVERY kind,
+            # and on most of them the container is already up and serving — those turns started
+            # nothing. Counting them would make the denominator "turns" and hand R103 a ratio
+            # near 1 that means nothing. What is left is exactly the two arms that bring a
+            # container up: a fresh provision and a restore.
+            #
+            # ABOVE THE TWO INTEGRITY HOLDS BELOW ON PURPOSE. An UNRECOVERABLE or a RESTORED
+            # turn ends without running the agent — but a container did come up, and it will
+            # never reach the numerator. That gap is precisely what R103 exists to expose, so
+            # excluding these from the denominator would hide it.
+            #
+            # No duration row here, restating Plan E's reasoning rather than reversing it: a
+            # 15-second attach budget and a 120-second cold budget averaged together produce a
+            # number that describes neither. R102 asks how long a COLD start takes, and that is
+            # E's seam.
+            state.started_a_container = True
+            await count(HarnessCounter.APP_START_ATTEMPTED, app_id=session.app_id)
         if session.news is RecoveryNews.UNRECOVERABLE:
             # AE3. Nothing was put back, and the container is showing a template. The one thing
             # that must not happen is the agent building on it and the turn-end copy making that
@@ -2160,10 +2189,36 @@ class TurnEngine:
             await self._poll_compile_state(state, sandbox)
             if status.ready:
                 unanswered_polls = 0
-                if state.claim_preview_frame() or reconnecting:
+                first_serve = state.claim_preview_frame()
+                if first_serve or reconnecting:
                     # First serve, or recovered after a crash — either way the client needs
                     # the url to (re)mount its iframe on.
                     await self._emit_preview_ready(state, sandbox.handle.preview_url)
+                if first_serve and state.started_a_container:
+                    # R103's NUMERATOR, and this is the only place the turn learns the answer.
+                    # `ready` here means a request to the app root was actually SERVED — the
+                    # same definition `relaunch_preview` gates its own numerator on, so the two
+                    # writers are counting the same event.
+                    #
+                    # AFTER THE FRAME, NEVER BEFORE. This is an await on the one code path
+                    # between the app becoming servable and the citizen seeing it, so counting
+                    # first would delay their preview by a database round trip to record that
+                    # their preview arrived. Bookkeeping goes behind the thing it books.
+                    #
+                    # NOT `session.handle.ready`, which looks like this fact and is not one: on
+                    # both birth arms it is hard-coded False, and on the attach arm it is a
+                    # `/dev/status` snapshot taken BEFORE this turn's own `dev_start`. Reading
+                    # it at the attach seam would report a near-zero success rate and make R103
+                    # measure the container's birth rather than the app's.
+                    #
+                    # GATED ON THE CLAIM, NOT ON `_emit_preview_ready`. Two emitters call that
+                    # method — this watcher and the self-heal verify — and this watcher calls it
+                    # again on every crash RECOVERY (the `or reconnecting` above). The claim is
+                    # the synchronous once-per-turn one-shot, so counting on it is once by
+                    # construction. And gated on `started_a_container`, or every turn that
+                    # joined a container already serving would land in the numerator without a
+                    # matching denominator row.
+                    await count(HarnessCounter.APP_START_REACHED_RUNNING, app_id=sandbox.app_id)
                 reconnecting = False
             else:
                 # Counted on the PAIR (nothing answering AND no child alive), not on the framed/

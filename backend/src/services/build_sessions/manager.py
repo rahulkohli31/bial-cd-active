@@ -955,6 +955,13 @@ class BuildSession:
     # the time a session exists these are pure in-memory content; `_live_session_spec` appends
     # them to the prompt when BRAIN resolves its run context.
     attachments: list[str | BinaryContent] = field(default_factory=list)
+    #: WHICH ARM produced the container, forwarded from `_ResolvedSandbox` (U15/R103). `True`
+    #: means it was already up and serving and this turn merely joined it; `False` means this
+    #: turn BROUGHT ONE UP — a fresh provision or a restore. Without it, "did this turn start
+    #: anything?" is unanswerable at the turn seam: `restored=False` covers both a fresh
+    #: provision and a plain attach, and counting every attach as a start would make R103's
+    #: denominator "turns" rather than "starts" and its ratio read flatteringly close to 1.
+    attached: bool = False
     status: BuildSessionStatus = BuildSessionStatus.PROVISIONING
     last_seq: int = 0
     preview_url: str | None = None
@@ -2800,6 +2807,7 @@ class SessionManager:
             may_write=may_write,
             news=resolved.news,
             restored=resolved.restored,
+            attached=resolved.attached,
         )
         self._sessions[session.session_id] = session
         self._active_by_user[user_id] = session.session_id

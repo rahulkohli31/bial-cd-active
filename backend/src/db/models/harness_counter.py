@@ -88,21 +88,39 @@ class HarnessCounter(enum.StrEnum):
     #: decoration; the rule these follow is that a counter name ships in the same change as its
     #: writer or it does not ship.
     #:
-    #: One per press of the explicit start control, at entry, REFUSALS INCLUDED — the one-slot
-    #: conflict and the reclaim refusal are presses that could have started something and did
-    #: not, and excluding them would make the ratio below read flatteringly high. Carries no
-    #: `app_id`: at entry no app is resolved yet, and a complete denominator is worth more than
-    #: attribution on a row that only ever means "someone pressed" (R103's denominator).
+    #: R103's denominator. TWO WRITERS, ONE PER WAY A CONTAINER COMES UP, and they do not
+    #: overlap — `relaunch_preview` is reached only from the explicit start route, and the turn
+    #: engine's attach is reached only from a turn.
+    #:
+    #: From `relaunch_preview`: one per press of the explicit start control, at entry, REFUSALS
+    #: INCLUDED — the one-slot conflict and the reclaim refusal are presses that could have
+    #: started something and did not, and excluding them would make the ratio below read
+    #: flatteringly high. That row carries no `app_id`: at entry no app is resolved yet, and a
+    #: complete denominator is worth more than attribution on a row that only ever means
+    #: "someone pressed".
+    #:
+    #: From `TurnEngine._attach_sandbox` (U15): one per turn that BROUGHT A CONTAINER UP on the
+    #: way to answering — a fresh provision or a restore, never a turn that merely joined a
+    #: container already serving. Most turns do the latter, so counting them would make this
+    #: number "turns" instead of "starts". That row carries the `app_id`, because by then it is
+    #: resolved.
     APP_START_ATTEMPTED = "app_start_attempted"
-    #: One per start that reached a SERVING page. Never written for the attach arm's fail-open
-    #: `ready=False` outcome — that is a framable URL, not a running app, and counting it would
-    #: make R103 measure nothing. R103's numerator; the ratio of the two is R103.
+    #: One per start that reached a SERVING page — R103's numerator; the ratio of the two is
+    #: R103. Never written for the attach arm's fail-open `ready=False` outcome — that is a
+    #: framable URL, not a running app, and counting it would make R103 measure nothing.
+    #:
+    #: Same two writers, each gated so its numerator can only come from its own denominator:
+    #: `relaunch_preview` gates on `wait_ready` returning, and the turn engine gates on the
+    #: preview watcher's first served poll AND on this turn having started something.
     APP_START_REACHED_RUNNING = "app_start_reached_running"
     #: Milliseconds from the platform DECIDING to restore to the app answering — the restore arm
     #: only (R102). The attach arm writes no duration at all: a 15-second attach budget and a
     #: 120-second cold budget averaged together produce a number that describes neither.
     #: SCOPE, because a later reader will want to quote it: this is the explicit start CONTROL's
-    #: number. A first build provisions through a different path and is not in it.
+    #: number, and it is the ONE counter here with a single writer. A first build provisions
+    #: through a different path and is not in it, and neither is the turn engine's attach —
+    #: which starts containers on two arms with different budgets, so a mean over both would
+    #: describe neither.
     APP_COLD_START_MS = "app_cold_start_ms"
     #: ── The browser-observed half of the same four questions (R104, R105) ───────────────────
     #: Written only through `POST /v1/observations`, whose server-side allowlist is these three
