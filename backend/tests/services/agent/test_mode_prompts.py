@@ -8,9 +8,12 @@ per run and never reach a persisted row (`test_store_roundtrip.py` pins the stor
 
 TWO SEGMENTS NOW, NOT THREE. The Ask segment went with the third enum value it existed for;
 what it said about reading the app is what the Plan segment already says, and the one thing it
-said that Plan does not — what a brand-new project's files actually look like — is recorded as
-a hand-off below rather than quietly dropped. Plan C owns the two surviving segments' wording;
-this file owns the properties that must hold whatever the wording becomes.
+said that Plan does not — what a brand-new project's files actually look like — was recorded as
+a hand-off below rather than quietly dropped. Plan 003 (shipped) decided the two surviving
+segments' wording but left that hand-off's ACTION half undecided; plan 006's U14 is what closed
+it, in the Plan segment alone
+(`test_no_segment_promises_an_emptiness_signal_that_never_arrives` below). This file owns the
+properties that must hold whatever the wording becomes.
 """
 
 from __future__ import annotations
@@ -20,7 +23,13 @@ import inspect
 import uuid
 
 import pytest
-from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    UserPromptPart,
+)
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.tools import ToolDefinition
 
@@ -37,6 +46,7 @@ from src.services.agent.mode_prompts import (
     _PLAN_SEGMENT,
     PromptContext,
     compose_kind_prompt,
+    workspace_note,
 )
 from src.services.agent.toolsets import registered_tool_definitions
 from src.services.messages.projection import TELL_THE_USER_TOOL
@@ -201,10 +211,11 @@ def test_the_name_the_files_instruction_went_with_the_segment_that_carried_it() 
 
     That follows from the origin's decision about what the two kinds are for; it is not a defect
     this change introduced, and it is not a gap this change may paper over by inventing prompt
-    copy. So the guard is inertness only: the instruction is gone from every composition, and
-    Plan C — which owns the two segments' wording — decides whether any version of "when the
-    user is genuinely asking about the code, answer about the code" belongs in the Plan
-    segment."""
+    copy. So the guard is inertness only: the instruction is gone from every composition, and it
+    stays gone on purpose — plan 006's U14 closed the Plan segment's OTHER hand-off (the ACTION
+    half: what to do once the model reads a fresh project's files —
+    `test_no_segment_promises_an_emptiness_signal_that_never_arrives` below) and left this half,
+    naming files and quoting code, permanently retired rather than reviving it too."""
     for kind in ChatKind:
         assert "name the actual files and quote the actual code" not in compose_kind_prompt(
             kind, _CONTEXT
@@ -501,16 +512,82 @@ def test_no_segment_promises_an_emptiness_signal_that_never_arrives(kind: ChatKi
     WIDENED TO BOTH SURVIVING SEGMENTS rather than deleted with the segment that carried it.
     The promise was wrong about the platform, not about Ask, so it must not reappear in either.
 
-    HAND-OFF, STATED RATHER THAN DROPPED: the deleted segment also carried the LIVENESS half —
-    a sentence saying what a fresh project actually reads as ("the starter template … talk about
-    what could be built for them"), so the model was not merely denied a wrong expectation but
-    given the right one. `_PLAN_SEGMENT` does not say it today, and this change deliberately
-    does not author prompt copy. Plan C owns the two segments' wording and should decide whether
-    the Plan segment picks that sentence up; until it does, the liveness half is not asserted
-    here, because asserting it would fail for a reason this change did not cause."""
+    HAND-OFF, ONCE STATED RATHER THAN DROPPED, NOW CLOSED (plan 006's U14). The deleted Ask
+    segment's liveness sentence carried two things: a FACT ("the starter template … in place")
+    and an ACTION on it ("talk about what could be built for them"). By the time this test was
+    first written the FACT was already covered — not by anything this file decides, but by the
+    workspace note (`mode_prompts.workspace_note`, U8/R14), which tells a Plan turn the app is
+    still the starter template on every turn regardless of what any segment says. Only the
+    ACTION half was genuinely missing, and plan 003 (shipped) is the plan that left it missing
+    without deciding it either way. U14 is what decided it: `_PLAN_SEGMENT` now carries the
+    instruction, and only Plan's segment does — the assertion below was withheld pending that
+    decision and is no longer."""
     lowered = compose_kind_prompt(kind, _CONTEXT).lower()
     assert "your tools will tell you truthfully" not in lowered
     assert "if there is no app yet" not in lowered
+    # THE ASSERTION THAT WAS WITHHELD (U14): Plan's composition now carries the instruction the
+    # retired sentence's ACTION half taught, and Build's — which shares the workspace note's
+    # FACT but not the segment — does not. Parametrized over the whole enum like the rest of
+    # this test, so a third kind added without a decision here fails loudly instead of silently.
+    if kind is ChatKind.PLAN:
+        assert "talk about what could be built for them" in lowered
+    else:
+        assert "talk about what could be built for them" not in lowered
+
+
+async def test_a_plan_turn_carries_the_notes_fact_and_the_segments_instruction_together(
+    db_session,
+) -> None:
+    """★ THE INTEGRATION HALF OF U14's HAND-OFF CLOSE.
+
+    The two tests above prove the FACT (the workspace note, unit-tested by
+    `test_reminders.py`) and the ACTION (the Plan segment's new clause, unit-tested by
+    `test_no_segment_promises_an_emptiness_signal_that_never_arrives` above) each exist in
+    isolation. Neither would catch one regressing while the other stays green — the segment
+    could lose its clause, or a future turn could stop appending the note, and every OTHER
+    test in this file or `test_reminders.py` would still pass. This assembles a Plan turn the
+    way `turns/engine.py` actually does: the note appended to `message_history` as a
+    `UserPromptPart` (the note's channel), the segment delivered through `@agent.instructions`
+    (the segment's channel) — and proves both reach the one model call on the one turn.
+    """
+    captured_instructions = ""
+    captured_messages: list[ModelMessage] = []
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal captured_instructions, captured_messages
+        captured_instructions = info.instructions or ""
+        captured_messages = list(messages)
+        return ModelResponse(parts=[TextPart(content="ok")])
+
+    note = workspace_note(serving=True, still_the_template=True)
+    history: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=note)])]
+    deps = ChatDeps(
+        db=db_session,
+        user_id=uuid.uuid4(),
+        kind=ChatKind.PLAN,
+        prompt_context=_CONTEXT,
+    )
+
+    await chat_agent.run(
+        "what should we build?",
+        deps=deps,
+        model=FunctionModel(respond),
+        message_history=history,
+    )
+
+    # The segment's INSTRUCTION, on the instructions channel.
+    assert "talk about what could be built for them" in captured_instructions
+    # The note's FACT, on the message-history channel — the same wording `_WORKSPACE_STILL_
+    # TEMPLATE` composes, checked as literal text rather than the private constant so this
+    # test fails the way a reviewer reading the model's actual request would notice it.
+    sent_notes = [
+        part.content
+        for message in captured_messages
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, UserPromptPart)
+    ]
+    assert any("still byte-for-byte the starter template" in str(text) for text in sent_notes)
 
 
 def test_no_prompt_surface_names_a_button_the_interface_does_not_draw() -> None:
