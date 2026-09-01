@@ -389,6 +389,15 @@ _PRIVATE_NOTES = {
     "the continue nudge": "you ended your turn without calling `declare_done`",
     "declare_done's acknowledgement": "Acknowledged — that summary is now the closing message",
     "the voice channel's acknowledgement": "Shown to the user. Carry on with the work.",
+    # THE REFUSALS ARE PRIVATE NOTES TOO, and U8's Approach names them alongside the workspace
+    # note. They are written to steer the AGENT — "use `read_file`, `list_files`, and
+    # `search_files` instead" is advice about a toolset the citizen cannot see and has no way
+    # to act on. A refusal quoted into a reply reads as the platform telling the person who
+    # asked for a visitor list that their package manager is unavailable.
+    "the guest-list refusal": "is not on the guest list",
+    "the guest-list refusal's advice to the agent": "Use `read_file`, `list_files`",
+    "a denied-flag refusal": "is not available to a read-only `run_command`",
+    "the empty-argv refusal": "pass argv tokens",
 }
 
 

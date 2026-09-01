@@ -38,7 +38,12 @@ from src.db.models.conversation import ChatKind
 from src.services.auth.csrf import issue_csrf_token
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.turns import engine as engine_module
-from src.services.turns.engine import TurnEngine, _TurnState, set_turn_engine_for_tests
+from src.services.turns.engine import (
+    _TURN_FAILED_MESSAGE,
+    TurnEngine,
+    _TurnState,
+    set_turn_engine_for_tests,
+)
 from src.services.turns.guard import _mid_reply
 from tests.factories import ConversationFactory, UserFactory
 
@@ -354,6 +359,25 @@ async def test_model_failure_travels_in_band(
     assert state is not None
     types = [f.type for f in state.ring]
     assert "error" in types and types[-1] == "turn_ended"
+
+    # ★ R82 / U7 — ON THE TURN THAT WENT WRONG, WHAT THE CITIZEN READS IS OURS.
+    #
+    # This is the half of the plain-language contract that can be asserted rather than
+    # observed. The tempting test — "the composed prompt contains the audience block, therefore
+    # the agent speaks plainly" — proves an instruction was PRESENT, which is the one thing
+    # nobody doubted; it is what let a 2,397-word reply ship under a green suite. Here the
+    # model wrote nothing that survived, so the register of what reaches the screen is not a
+    # question about the model at all: it is a platform constant, by identity.
+    assert state.error_message == _TURN_FAILED_MESSAGE
+    error_frames = [f for f in state.ring if f.type == "error"]
+    assert [f.message for f in error_frames] == [_TURN_FAILED_MESSAGE]
+    # AND THE MODEL'S HALF-SENTENCE DOES NOT LEAK. `before ` was streamed and then the run
+    # died. Under the widened hold (U4/R74) prose is buffered until its response completes, and
+    # a response that never completes never flushes — so a citizen reading a failed turn gets
+    # one platform sentence rather than an abandoned fragment trailing off mid-thought.
+    assert "before" not in (state.error_message or "")
+    assert "before" not in state.text_so_far()
+    assert "upstream fell over" not in state.text_so_far()  # nor the raw exception text
 
 
 # --- ownership + gating -------------------------------------------------------------------
