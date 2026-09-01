@@ -4,6 +4,57 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] - 2026-09-01
+
+### Added
+
+- The agent can now say something **while it is working**, instead of only at the end. A build
+  that runs for two minutes used to show a row of finished steps and no words; it can now send
+  a short line as each piece starts or lands — *"Adding the status picker next to your search
+  box now."* The line is bounded by the platform rather than by a request in its instructions,
+  so it stays a line and cannot become an essay.
+- When a single message asks for many separate things, the agent proposes what to build first.
+  The message you read is written by the platform from what the agent found: everything you
+  asked for listed back, the two to four pieces it would start with, why those, and one
+  question. Saying the whole thing back matters — a request for nine things answered with three
+  reads as a refusal unless you can see all nine were heard.
+- A build now ends by saying **what was agreed and not built**, taken from the list you agreed
+  to rather than from the agent's recollection. Where the platform cannot tell which pieces
+  landed, it says that instead of guessing — it will not tell you finished work is outstanding.
+- A single build is now bounded by what it **spends**, as well as by how many steps it takes and
+  how long it runs. When it reaches that point it stops where the app works, keeps a copy of
+  your work first, and tells you what is left.
+
+### Changed
+
+- **A plan now arrives in five named parts** — what this gives you, what you will see, what the
+  app will remember, what stays exactly as it is, and what was assumed. The fourth is left out
+  entirely for a first build, because there is nothing yet to leave alone. Nothing in a plan
+  names a file, a folder, a framework or a command.
+- The buttons under a plan are now **Build this plan** and **Keep planning**. "Keep refining"
+  was confusing, and the agent, the button and the instructions it reads now use the same two
+  words — an agent telling you to press something the screen does not draw is a broken
+  instruction at the moment you are being asked to decide.
+- **One rule now governs the agent's words in both kinds of chat.** Anything written in the same
+  breath as an action is the agent talking to itself on the way there, and it no longer reaches
+  you in a planning chat either — which is where the 2,397-word reply of file paths came from.
+  The one thing that used to differ, how long a message should be, is now the only thing that
+  does: a plan is as long as it needs to be, and everything else is a couple of lines.
+- The consequence, stated plainly: **a planning answer no longer appears word by word.** It
+  arrives whole when the agent finishes writing it, at the same moment it would have finished
+  arriving before. Build chats have always worked this way.
+- A turn can no longer end with nothing to read. Where the agent said nothing at all, the
+  platform says so itself rather than leaving a screen of finished steps and silence.
+
+### Fixed
+
+- Whether a command is allowed no longer depends on which kind of chat it was typed into. It
+  was already a property of the ability rather than the chat, and that is now proved rather
+  than assumed.
+- Several comments describing how the platform decides things were wrong, and disagreed with
+  each other. The census they were trying to state is now a test that fails when it stops being
+  true, which a comment could never do.
+
 ## [1.7.0] - 2026-09-01
 
 ### Added
