@@ -4,6 +4,89 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-09-01
+
+### Added
+
+- Pressing **Build this plan** now opens a new build chat that starts from the plan itself —
+  the plan arrives as the first message, word for word, exactly as if it had been pasted in.
+  The plan chat is left untouched, so a plan can be read again next week and built a second
+  time, differently, without anything having to be undone.
+- A plan chat can now answer questions about the app as it actually is. It used to answer from
+  a saved copy, which could be days old; it reads the same running app a build chat does. Where
+  there is nothing running to read, the message is refused with a sentence saying so rather than
+  answered confidently from stale code.
+
+### Changed
+
+- A chat is a **plan chat** or a **build chat**, chosen when it is created and never after.
+  There is no mode pill, no switch part-way through, and no way to be in a conversation whose
+  next message does something other than what the conversation is for. Two overlapping ideas
+  with six labels between them became one idea with two.
+- The offer to build is now tied to the plan the agent actually wrote, because the plan travels
+  inside the offer itself. Nothing reads the agent's prose to guess whether a plan happened.
+- Taking the workspace no longer depends on what kind of chat asked for it. A planning question
+  that needs the app running takes it on the same terms a build does, and is refused on the same
+  terms when someone else holds it.
+- Whether an app is published is now decided in one place on the server and read everywhere else,
+  instead of each screen working it out from parts and occasionally disagreeing.
+
+### Fixed
+
+- The Build button can no longer appear underneath something that was never a plan. It used to be
+  offered whenever the agent's writing merely looked plan-shaped, which put a build one click away
+  from a conversation nobody had agreed anything in.
+- Starting a build from a plan can no longer leave behind an empty chat with no message in it. The
+  conversation and its first message are now written together, so a failure part-way through leaves
+  nothing rather than a shell you cannot use or explain.
+- A plan is never quietly cut short. An overlong plan is refused with a reason instead of being
+  trimmed to fit and offered as though it were complete.
+- The warning that a plan had gone stale, and the override that let you build anyway, are both gone.
+  They asked the citizen to adjudicate something the platform could not actually tell them.
+
+### Removed
+
+- The mid-conversation mode switch and the endpoint behind it. A chat's kind is fixed at creation,
+  so there is nothing to switch.
+- A failure state that could be stored but never shown. It has been deleted rather than shipped as
+  something a citizen could reach and find nothing behind.
+
+## [1.6.21] - 2026-08-31
+
+### Added
+
+- The warning about unsaved work now follows you across the whole workspace. Closing the tab
+  with changes that were never saved into the app asks you to confirm wherever you are in a
+  project, not only while the build chat happens to be the thing on screen.
+
+### Changed
+
+- The running app is now part of the workspace itself rather than something each screen draws
+  for itself. It used to exist only because the build chat was the page you happened to be on,
+  which is why walking away from that page took the app down with it.
+- Conversations are opened and deleted from the project page. The list that used to sit inside
+  a chat — beside the chat you were already reading — is gone, so there is one place that
+  answers "what is in this project" instead of two that could disagree.
+- The workspace has one height model. Every screen inside it now fills the space it is given
+  rather than asserting a full window height of its own and being clipped.
+
+### Fixed
+
+- Going from a build chat to its project page and back no longer reloads the running app.
+  Leaving was already safe; returning was not, and the app restarted underneath the citizen
+  every single time they came back to the conversation that built it.
+- Leaving a build chat while the build is still running no longer reloads the app. The pane
+  read the departure as "the turn just finished" and re-requested the page, about an event
+  that had not happened.
+- Leaving a build chat immediately after a build succeeds no longer shuts down the app. A
+  finished build's app stays up and serving, and walking away from the conversation was
+  destroying it at the moment a citizen is most likely to walk away.
+- A first message that fails to save no longer takes the typed text with it. The notice asking
+  the citizen to try again appeared over an empty box, offering a retry of something that no
+  longer existed on screen or in storage, so reloading could not recover it either.
+- The spinner shown while a conversation loads is no longer pushed below centre and clipped by
+  the navigation bar.
+
 ## [1.6.20] - 2026-08-31
 
 ### Added
@@ -22,9 +105,6 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   accepts three named observations and nothing else, refuses a value outside the range an
   honest one can occupy rather than quietly trimming it to fit, and stores no record of who
   sent it.
-- The warning about unsaved work now follows you across the whole workspace. Closing the tab
-  with changes that were never saved into the app asks you to confirm wherever you are in a
-  project, not only while the build chat happens to be the thing on screen.
 
 ### Changed
 
@@ -32,14 +112,6 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   kinds of conversation and the old test knew about one, so an assistant chat was labelled
   as a plan. Every kind now comes from one table, and a kind nobody has invented yet gets an
   honest word instead of the wrong one.
-- The running app is now part of the workspace itself rather than something each screen draws
-  for itself. It used to exist only because the build chat was the page you happened to be on,
-  which is why walking away from that page took the app down with it.
-- Conversations are opened and deleted from the project page. The list that used to sit inside
-  a chat — beside the chat you were already reading — is gone, so there is one place that
-  answers "what is in this project" instead of two that could disagree.
-- The workspace has one height model. Every screen inside it now fills the space it is given
-  rather than asserting a full window height of its own and being clipped.
 
 ### Fixed
 
@@ -50,20 +122,6 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A measurement failing can no longer slow down or break the thing it is measuring: the
   counter writes moved out from under the lock that a citizen's next build waits on, and a
   measurement that throws is contained instead of taking the builder's screen down with it.
-- Going from a build chat to its project page and back no longer reloads the running app.
-  Leaving was already safe; returning was not, and the app restarted underneath the citizen
-  every single time they came back to the conversation that built it.
-- Leaving a build chat while the build is still running no longer reloads the app. The pane
-  read the departure as "the turn just finished" and re-requested the page, about an event
-  that had not happened.
-- Leaving a build chat immediately after a build succeeds no longer shuts down the app. A
-  finished build's app stays up and serving, and walking away from the conversation was
-  destroying it at the moment a citizen is most likely to walk away.
-- A first message that fails to save no longer takes the typed text with it. The notice asking
-  the citizen to try again appeared over an empty box, offering a retry of something that no
-  longer existed on screen or in storage, so reloading could not recover it either.
-- The spinner shown while a conversation loads is no longer pushed below centre and clipped by
-  the navigation bar.
 
 ## [1.6.19] - 2026-08-29
 
@@ -507,7 +565,6 @@ most a handful of workspaces, and every candidate is re-checked immediately befo
 - Restore no longer manufactures containers with no identity.
 - Two flag defects: one that would have stopped sandbox reaping entirely on deploy, and one
   switch that did nothing.
-
 
 **The publish gate no longer works backwards.** Since 1.6.10, answering the data-classification
 questions honestly had the opposite effect to the one intended: an app that declared credentials
