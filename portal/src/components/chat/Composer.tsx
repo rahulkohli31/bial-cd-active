@@ -44,7 +44,11 @@
  *   discarded silently, and the citizen believed the model could see a file it could not. Because
  *   nothing clears until the server confirms, a read that lands late lands on the send it belongs
  *   to; if the send has already gone, the reader is TOLD rather than left with silence.
- * R57 — THE CAP BYPASS lives in `usePendingAttachments.restorePending` and is fixed there.
+ * R57 — THE CAP BYPASS lived in `usePendingAttachments.restorePending`, which merged a restored
+ *   batch with no per-message clamp. It is fixed there, and this composer additionally never
+ *   CALLS it: nothing is cleared optimistically, so there is nothing to restore. Both halves
+ *   matter — the clamp because the function is still exported and reachable, and the non-call
+ *   because a defect you cannot reach is better than one you have guarded.
  * R60 — CROSS-CHAT LEAKAGE is guarded by the send path stamping the conversation it is sending to
  *   and comparing on completion.
  */

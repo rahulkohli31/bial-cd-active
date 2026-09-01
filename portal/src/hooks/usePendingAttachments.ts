@@ -153,14 +153,44 @@ export function usePendingAttachments(): UsePendingAttachmentsResult {
     setPendingAttachments([])
   }, [])
 
-  const restorePending = useCallback((items: PendingAttachment[]) => {
-    // Merge rather than replace: the composer stays live while the send that's being
-    // restored-from was failing, so the user may already have staged something new — a
-    // plain replace would discard it.
-    const seen = new Set(pendingRef.current.map((a) => a.id))
-    pendingRef.current = [...pendingRef.current, ...items.filter((a) => !seen.has(a.id))]
-    setPendingAttachments(pendingRef.current)
-  }, [])
+  const restorePending = useCallback(
+    (items: PendingAttachment[]) => {
+      // Merge rather than replace: the composer stays live while the send that's being
+      // restored-from was failing, so the user may already have staged something new — a
+      // plain replace would discard it.
+      const seen = new Set(pendingRef.current.map((a) => a.id))
+      const fresh = items.filter((a) => !seen.has(a.id))
+
+      // R57 — THE CAP BYPASS, CLOSED. This merged with no `MAX_FILES_PER_MESSAGE` clamp while
+      // `handleFiles` twenty lines above has one, so five staged plus five restored became ten,
+      // and ten became fifteen — and the per-conversation text budget doubled with it, since
+      // that is computed from what is staged.
+      //
+      // THE CLAMP FALLS ON THE RESTORED BATCH, NEVER ON WHAT THE USER JUST PICKED, and the
+      // asymmetry is the whole design: they can SEE the files they just staged and cannot see the
+      // ones a failed send is handing back, so dropping the visible ones would look like the app
+      // eating their work while dropping the invisible ones is merely a limit being enforced.
+      //
+      // AND THEY ARE TOLD. A silent clamp is the same defect one layer down: the citizen believes
+      // a file came back, sends, and the model answers about a document it was never given.
+      const room = Math.max(0, MAX_FILES_PER_MESSAGE - pendingRef.current.length)
+      const restored = fresh.slice(0, room)
+      const dropped = fresh.length - restored.length
+
+      if (restored.length > 0) {
+        pendingRef.current = [...pendingRef.current, ...restored]
+        setPendingAttachments(pendingRef.current)
+      }
+      if (dropped > 0) {
+        showAttachToast(
+          dropped === 1
+            ? `One file couldn’t be put back — you can attach at most ${MAX_FILES_PER_MESSAGE} per message.`
+            : `${dropped} files couldn’t be put back — you can attach at most ${MAX_FILES_PER_MESSAGE} per message.`,
+        )
+      }
+    },
+    [showAttachToast],
+  )
 
   // ── Drop-target feedback ────────────────────────────────────────────────────────────
   // Without it the composer advertises "drop them anywhere in the composer" (the attach

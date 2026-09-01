@@ -13,8 +13,12 @@
  * that interacts with the existing `manualChunks`.
  *
  * THE ONE THING A PLAIN IFRAME DOES NOT GET is `authFetch`'s 401-refresh-and-retry. An expired
- * session shows the API's error inside the frame rather than silently refreshing, so the frame
- * carries a fallback sentence rather than an unexplained blank.
+ * session shows the API's own error document INSIDE the frame rather than silently refreshing.
+ * That is not a blank — the reader sees the server's response — and it is also not something this
+ * component can improve on: an `<iframe>` does not fire `error` for a 401 or a 404, it renders
+ * what came back. `onError` is therefore load-bearing for the IMAGE branch (an `<img>` does fire)
+ * and belt-and-braces on the frame; the fallback sentence's real reachable cases are an image that
+ * failed to load and a target with no address at all.
  *
  * ══ WHAT THE DIALOG BRINGS THAT THE OLD LIGHTBOX LACKED ══
  *
