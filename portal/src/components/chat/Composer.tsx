@@ -75,6 +75,28 @@ import OfferStrip, { OFFER_GATE_NOTE, type OfferStripProps } from './OfferStrip'
 import StopTurnControl, { type StopTurnControlProps } from './StopTurnControl'
 
 /** What one send carries. The composer assembles it; the surface performs it. */
+/**
+ * A refusal whose message was WRITTEN FOR THE CITIZEN and is therefore safe to show.
+ *
+ * The type is the permission. `onSubmit` can reject for reasons that are nobody's business on
+ * screen — a `TypeError` from a bug, an aborted send the surface has already explained in its own
+ * banner with the server's wording — and showing `err.message` for those would put developer text,
+ * or a second differently-worded copy of the banner, in front of someone asking for an app. Only
+ * this class means "say this out loud".
+ *
+ * `silent` covers the press the surface swallowed because an identical one is already in flight:
+ * the citizen did not knowingly make it, so there is nothing to report — but it must still reject,
+ * because resolving would empty the composer for a press that sent nothing.
+ */
+export class SendRefusal extends Error {
+  readonly silent: boolean
+  constructor(message: string, opts: { silent?: boolean } = {}) {
+    super(message)
+    this.name = 'SendRefusal'
+    this.silent = opts.silent ?? false
+  }
+}
+
 export interface ComposerSubmission {
   text: string
   attachments: PendingAttachment[]
@@ -134,9 +156,17 @@ const Composer: FC<ComposerProps> = ({
   // Hydrate the draft for whichever conversation is mounted, and re-hydrate on a switch. The store
   // is keyed per conversation, so this is what makes a draft follow its own chat rather than
   // leaking into a sibling.
+  //
+  // THE STAGED FILES GO WITH IT, and they are dropped rather than restored because — unlike the
+  // draft — they live only in memory as decoded bytes, so there is nothing to hydrate them back
+  // from. Leaving them was the worse of the two: this composer is NOT remounted per chat (flat
+  // routing keeps one instance), so a file picked in one chat stayed staged in the next, counted
+  // against that chat's attachment and text budgets, and would have been sent into a conversation
+  // the citizen never attached it to.
   useEffect(() => {
     setText(readDraft(conversationId))
-  }, [conversationId])
+    clearPending()
+  }, [conversationId, clearPending])
 
   const cap = useMemo(() => capState(text), [text])
   const hasContent = text.trim().length > 0 || pendingAttachments.length > 0
@@ -183,8 +213,20 @@ const Composer: FC<ComposerProps> = ({
       setText('')
       clearDraft(conversationId)
       clearPending()
-    } catch {
-      onUrgent('That message did not send. Everything you typed is still here — try again.')
+    } catch (err) {
+      // The swallowed press: nothing sent, nothing said, nothing cleared.
+      if (err instanceof SendRefusal && err.silent) return
+      // THE REFUSAL'S OWN WORDS, but only when they were written to be read. `onSubmit` throws a
+      // distinct sentence per reason — a build running here, the daily cap, the attachment cap, no
+      // project open — and collapsing all of them into one generic line told a citizen "that did
+      // not send" while withholding the only thing that would let them act on it. Anything else
+      // that rejects keeps the generic sentence: an aborted send is already in the surface's own
+      // banner in the server's words, and a bug's message is not for this audience.
+      onUrgent(
+        err instanceof SendRefusal
+          ? err.message
+          : 'That message did not send. Everything you typed is still here — try again.',
+      )
     }
   }, [
     unavailableReason,

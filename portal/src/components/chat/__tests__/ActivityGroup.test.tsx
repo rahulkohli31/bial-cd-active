@@ -268,13 +268,27 @@ describe('a group reports what it amounted to, once, as it seals', () => {
     />
   )
 
+  /**
+   * Drive the REAL transition: a step arrives pending, then the same step resolves. Rendering the
+   * finished state directly is what the group must stay silent for — that is a reload, not
+   * something the reader just watched happen.
+   */
+  const runThenSeal = (
+    running: MessagePart[],
+    sealedParts: MessagePart[],
+    onGroupSealed: (summary: string) => void,
+    opts: { interrupted?: boolean } = {},
+  ) => {
+    const { rerender } = render(withReporter(running, onGroupSealed, { isRunning: true }))
+    rerender(withReporter(sealedParts, onGroupSealed, { isRunning: false, ...opts }))
+  }
+
   it('reports the sealed label — the same sentence the trigger shows', () => {
     const onGroupSealed = vi.fn()
-    render(
-      withReporter(
-        [stepPart(1, 'Reading your data'), stepPart(2, 'Writing the page', 'failed')],
-        onGroupSealed,
-      ),
+    runThenSeal(
+      [stepPart(1, 'Reading your data', 'pending'), stepPart(2, 'Writing the page', 'pending')],
+      [stepPart(1, 'Reading your data'), stepPart(2, 'Writing the page', 'failed')],
+      onGroupSealed,
     )
     expect(onGroupSealed).toHaveBeenCalledTimes(1)
     expect(onGroupSealed).toHaveBeenCalledWith('2 steps · one problem')
@@ -289,17 +303,35 @@ describe('a group reports what it amounted to, once, as it seals', () => {
     expect(groups()).toHaveLength(1)
   })
 
+  it('says nothing for a group that was ALREADY finished when the chat opened', () => {
+    // THE ONE THAT MATTERS. R66 announces what just happened. A finished chat with past builds in
+    // it renders sealed groups on mount, and announcing those meant a reader who opened a
+    // conversation heard a summary of work nobody had just done — once per historical group, the
+    // last of them winning the live region.
+    const onGroupSealed = vi.fn()
+    render(withReporter([stepPart(1, 'Reading your data'), stepPart(2, 'Writing the page')], onGroupSealed))
+    expect(onGroupSealed).not.toHaveBeenCalled()
+    expect(groups()).toHaveLength(1)
+  })
+
   it('carries the stopped wording when the turn was interrupted', () => {
     const onGroupSealed = vi.fn()
-    render(withReporter([stepPart(1, 'Reading your data')], onGroupSealed, { interrupted: true }))
+    runThenSeal(
+      [stepPart(1, 'Reading your data', 'pending')],
+      [stepPart(1, 'Reading your data')],
+      onGroupSealed,
+      { interrupted: true },
+    )
     expect(onGroupSealed).toHaveBeenCalledWith('1 step · stopped before it finished')
   })
 
   it('does not re-announce when the group is merely re-rendered', () => {
     const onGroupSealed = vi.fn()
-    const tree = withReporter([stepPart(1, 'Reading your data')], onGroupSealed)
-    const { rerender } = render(tree)
-    rerender(tree)
+    const running = [stepPart(1, 'Reading your data', 'pending')]
+    const done = [stepPart(1, 'Reading your data')]
+    const { rerender } = render(withReporter(running, onGroupSealed, { isRunning: true }))
+    rerender(withReporter(done, onGroupSealed))
+    rerender(withReporter(done, onGroupSealed))
     expect(onGroupSealed).toHaveBeenCalledTimes(1)
   })
 })

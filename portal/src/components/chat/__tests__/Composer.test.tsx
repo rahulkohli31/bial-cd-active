@@ -268,6 +268,28 @@ describe('attachments', () => {
     expect(attach.hasAttribute('disabled')).toBe(false)
     expect(attach.getAttribute('aria-disabled')).toBeNull()
   })
+
+  it('a staged file does NOT follow the reader into the next chat', async () => {
+    // The draft is stored per conversation and re-hydrates on a switch; the staged files had no
+    // such handling and simply stayed. This composer is not remounted per chat — flat routing
+    // keeps one instance — so a file picked in one conversation was still staged in the next,
+    // counted against that chat's attachment and text budgets, and would have been sent into a
+    // conversation the citizen never attached it to.
+    //
+    // They are DROPPED rather than restored on the way back: unlike the draft they live only in
+    // memory as decoded bytes, so there is nothing to hydrate them from.
+    const { rerender, props } = draw()
+    const file = new File(['id,name\n1,Priya'], 'payroll.csv', { type: 'text/csv' })
+    fireEvent.change(screen.getByTestId('composer-file-input'), { target: { files: [file] } })
+
+    await waitFor(() => expect(screen.getByTestId('composer-chips').textContent).toContain('payroll.csv'))
+
+    rerender(<Composer {...props} conversationId="chat-2" />)
+    expect(screen.queryByTestId('composer-chips')).toBeNull()
+    // LIVENESS — the composer is still mounted and usable in the sibling, so the chip's absence is
+    // the switch clearing it rather than a component that failed to render.
+    expect(box()).toBeTruthy()
+  })
 })
 
 describe('one composer, both kinds (R72)', () => {

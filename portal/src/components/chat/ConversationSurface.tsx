@@ -4,7 +4,7 @@ import { PanelLeftOpen, PanelLeftClose } from 'lucide-react'
 import PublishStatusChip from '../PublishStatusChip'
 import Announcer, { useActivityAnnouncement } from './Announcer'
 import ChatThread from './ChatThread'
-import Composer, { type ComposerSubmission } from './Composer'
+import Composer, { SendRefusal, type ComposerSubmission } from './Composer'
 import type { BuildHandoff } from './OfferStrip'
 import ScrollToLatest from './ScrollToLatest'
 import SessionBanners from './SessionBanners'
@@ -1266,7 +1266,6 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
           // used to also carry the conversation's per-send setting; a chat's kind is fixed when
           // it is created, so there is nothing left for a send to say about it.
         })
-        onSent?.()
       } catch (err) {
         releaseUploadedAttachments(parts)
         setUrgent(describeSaveFailure(err, 'Could not start this thread. Check your connection.'))
@@ -1275,16 +1274,18 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
         if (stillHere()) {
           setMessages(priorMessages)
           seqRef.current = userSeq
-          onAbort?.()
         }
+        // OUTSIDE the guard. `onAbort` settles the composer's send promise, and a promise that
+        // never settles never runs `handleSubmit`'s `finally` — which is what clears `sendingRef`.
+        // Leaving it unsettled because the reader had moved on wedged that chat's Send silently
+        // for the rest of the session: every later press matched the stale double-Enter guard and
+        // returned as though it had sent.
+        onAbort?.()
         // The thread was deleted out from under us (elsewhere, or in another tab): leave, rather
         // than sit on a page whose every send will fail the same way.
         if (isConversationGone(err)) navigate('/projects', { replace: true })
         return
       }
-    } else {
-      // The turn is about to stream (and the server persists it) — safe to clear the draft.
-      onSent?.()
     }
     dropTransientQuery(activeId)
     refreshBuilds()
@@ -1313,6 +1314,16 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
         attachmentIds: wire.attachmentIds ?? [],
       })
       posted = true
+      // THE ONE PLACE THE COMPOSER MAY EMPTY, and it is here because this is the first instant the
+      // server is holding the message. A 202 means it is persisted and the reply runs detached, so
+      // the citizen's text has somewhere to live other than the box they typed it in.
+      //
+      // IT USED TO FIRE EARLIER — on row creation, or on nothing at all for a continuing thread —
+      // which is every message after the first. The promise can only settle once, so the composer
+      // had already emptied by the time `startTurn` refused; the `onAbort` below then rejected an
+      // already-resolved promise and did nothing, and the text and files were gone. That is the
+      // 429-over-the-daily-cap path, which is exactly when losing the message is least forgivable.
+      onSent?.()
       streamAbortRef.current?.abort()
       const controller = new AbortController()
       streamAbortRef.current = controller
@@ -1327,6 +1338,11 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
       if (outcome === 'stalled') setTurnError('The reply stalled. Reload to catch up.')
       else if (outcome === 'truncated' && !sink.terminal) setTurnError('The connection dropped. Reload to catch up.')
     } catch (err) {
+      // Whether the reclaim DIALOG has taken ownership of settling the composer's promise: its
+      // retry closure carries the same `onSent`/`onAbort`, so settling here as well would reject a
+      // promise the retry is still going to resolve, and a successful retry would then leave the
+      // citizen's text sitting in a composer that never emptied.
+      let reclaimOwnsRetry = false
       if (stillHere()) {
         if (posted) {
           // The turn was ACCEPTED — only the subscribe after it broke. The user's message is
@@ -1346,6 +1362,7 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
           const handled = captureReclaim(err, () =>
             fireRelayTurn(rawText, attachments, activeId, { isAlive, onAbort, onSent, prior }),
           )
+          reclaimOwnsRetry = handled
           if (!handled)
             setTurnError(err instanceof TurnStartError ? err.message : 'The message could not be sent. Try again.')
           // N8 — ROLL BACK BOTH BUBBLES, not just the assistant's. A `startTurn` that threw
@@ -1356,14 +1373,19 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
           // let the error banner be the only account of what happened.
           setMessages((prev) => prev.filter((m) => m.id !== assistantId && m.id !== userMsg.id))
           seqRef.current = userSeq
-          // AND TELL THE COMPOSER TO KEEP EVERYTHING. A refused turn persisted nothing, so the
-          // citizen's text and staged files must survive — this is the path a 429 over the daily
-          // cap takes, and it is exactly when losing the message would be least forgivable.
-          // Without this the send promise never settles: the text would stay (correctly) but by
-          // accident, on a promise nobody resolves.
-          onAbort?.()
         }
       }
+      // TELL THE COMPOSER TO KEEP EVERYTHING, on every path out of here. A refused turn persisted
+      // nothing, so the citizen's text and staged files must survive — the 429-over-the-daily-cap
+      // path, and exactly when losing the message would be least forgivable.
+      //
+      // OUTSIDE `stillHere()`, because settling is not a rendering decision. An unsettled promise
+      // never runs `handleSubmit`'s `finally`, so `sendingRef` keeps naming this chat and every
+      // later press there matches the double-Enter guard and returns as though it had sent.
+      //
+      // `posted` is the one case that must NOT abort: the server has the message, `onSent` already
+      // fired above, and this is only the subscription breaking afterwards.
+      if (!posted && !reclaimOwnsRetry) onAbort?.()
       endGenerating(activeId)
       return
     }
@@ -1543,13 +1565,13 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
     const text = rawText.trim()
     if (!text && attachments.length === 0) return
     if (buildActiveHere || buildStarting) {
-      throw new Error('Your app is being built — send unlocks when it finishes. Keep typing meanwhile.')
+      throw new SendRefusal('Your app is being built — send unlocks when it finishes. Keep typing meanwhile.')
     }
     if (generating) {
-      throw new Error('Send unlocks when the current reply finishes. Keep typing meanwhile.')
+      throw new SendRefusal('Send unlocks when the current reply finishes. Keep typing meanwhile.')
     }
     if (gateCheck !== 'resolved') {
-      throw new Error(
+      throw new SendRefusal(
         gateCheck === 'unreachable'
           ? 'Still can’t tell whether a build is running here. Try the Retry above.'
           : 'Just checking whether a build is running here — one moment.',
@@ -1559,22 +1581,27 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
     // defence in depth rather than the only guard; it is here because the sentence above promises
     // that EVERY reason is re-checked at the one place a turn actually starts, and an arm that
     // lives in only one of the two is how the two come to disagree.
-    if (atLimit) throw new Error(atLimit.title)
+    if (atLimit) throw new SendRefusal(atLimit.title)
     // Synchronous, and a REF rather than state: the two keydowns of a fast double-Enter land in the
     // SAME tick, so `generating` — set after an await — is still false for the second one. The
     // draft is deliberately held until the server confirms the turn, so that second read sees the
     // very same text and fires a second relay turn: a duplicate persisted message, a duplicate
     // model call, and two offers for one request.
     //
-    // SILENTLY, and it is the one refusal here that does not throw: this is one keystroke burst,
-    // not a second intention, and throwing would put an error sentence on screen for a press the
-    // citizen did not knowingly make — and empty nothing, since the first send is still running.
-    if (sendingRef.current === buildIdRef.current) return
+    // SILENTLY — the composer says nothing for it. This is one keystroke burst, not a second
+    // intention, and an error sentence for a press the citizen did not knowingly make is noise.
+    //
+    // IT THROWS RATHER THAN RETURNING, and the difference is the whole point: returning resolved
+    // the promise, and the composer empties itself on a resolve. So the second press cleared the
+    // text and files while the FIRST send was still in flight — and if that one then failed, the
+    // message it was still holding was already gone. `SUPERSEDED` is the one rejection the
+    // composer swallows without a word; the first press still owns the outcome and the clearing.
+    if (sendingRef.current === buildIdRef.current) throw new SendRefusal('', { silent: true })
     // Project-first: a thread REQUIRES a project (no lazy Default — never reintroduce).
-    if (!projectId) throw new Error('Open a project to start a build.')
+    if (!projectId) throw new SendRefusal('Open a project to start a build.')
     if (attachments.length > 0) {
       const cap = validateConversationAttachmentCap(countAttachments(messages), attachments.length)
-      if ('error' in cap) throw new Error(cap.error)
+      if ('error' in cap) throw new SendRefusal(cap.error)
     }
 
     // R60 — THE CHAT THE COMPOSER STAMPED AT PRESS TIME, not whichever one is open when this

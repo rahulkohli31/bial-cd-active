@@ -732,11 +732,25 @@ describe('the send-failure catch splits on whether the turn was accepted (N8)', 
     // The server persisted NOTHING, so the optimistic user bubble rolls back too — the
     // transcript must agree with the database (N8).
     //
+    // SCOPED TO THE TRANSCRIPT, because the composer legitimately still holds the same words and
+    // an unscoped `queryByText` matches the textarea too. That is not a detail of the assertion:
+    // the two halves are the whole contract, and a test that could not tell them apart is how the
+    // defect below survived.
+    //
     // `waitFor`, NOT a bare assertion. The banner and the rollback are two state updates and the
     // banner is the one this test waits on; under a loaded runner the rollback's commit can land
     // a tick later. A bare read here passed alone and failed in the full suite, which is the
     // definition of a flake rather than a finding.
-    await waitFor(() => expect(screen.queryByText('build me a thing')).toBeNull())
+    await waitFor(() =>
+      expect(within(screen.getByTestId('thread-messages')).queryByText('build me a thing')).toBeNull(),
+    )
+
+    // AND THE CITIZEN STILL HAS THEIR MESSAGE. This is the assertion the suite was missing, and
+    // without it a P0 shipped: `onSent` used to fire before `startTurn` was attempted, so the
+    // composer's send promise had already resolved by the time the refusal arrived. It emptied
+    // itself, the later `onAbort` rejected a settled promise and did nothing, and the text and any
+    // staged files were gone — on the 429-over-the-daily-cap path above all others.
+    expect(composer().value).toBe('build me a thing')
   })
 
   it('a subscribe failure AFTER the 202 keeps the user bubble and says reload, not resend', async () => {
@@ -754,5 +768,127 @@ describe('the send-failure catch splits on whether the turn was accepted (N8)', 
     // appears to invite a duplicate resend of a turn the server is already running.
     expect(screen.getByText('build me a thing')).toBeTruthy()
     expect(screen.queryByText(/could not be sent/i)).toBeNull()
+  })
+})
+
+/**
+ * THE SEND PROMISE IS THE CONTRACT, and these are the paths that broke it.
+ *
+ * `Composer.doSend` empties the box when `onSubmit` RESOLVES and keeps everything when it REJECTS.
+ * That is the whole of R58/R59 — there is no optimistic clear and no restore path. So every way out
+ * of the send has to settle the promise, and settle it the right way. Three did not:
+ *
+ *   - `onSent` fired before `startTurn` was attempted, so a refusal arrived at an already-resolved
+ *     promise. The composer had emptied; the later `onAbort` did nothing. On a CONTINUING thread it
+ *     fired on no network call whatsoever, which is every message after the first;
+ *   - the double-Enter guard RETURNED, and a return is a resolve — so the second press emptied the
+ *     composer while the first send was still in flight;
+ *   - a bail-out taken after the reader had moved on settled nothing at all, so `handleSubmit`'s
+ *     `finally` never ran, `sendingRef` kept naming that chat, and every later press there matched
+ *     the stale guard and returned as though it had sent.
+ */
+describe('a refused send leaves the citizen holding their message', () => {
+  /** A conversation that already has a turn in it — so the next send is NOT the first. */
+  const continuing = () => ({
+    id: 'build-X',
+    kind: 'build',
+    messages: [
+      { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'a visitor app' }] },
+      { id: 'm1', role: 'assistant', seq: 1, parts: [{ type: 'text', text: 'Here you go.' }] },
+    ],
+  })
+
+  it('keeps the text when startTurn refuses the SECOND message in a thread', async () => {
+    // THE PATH THE P0 ACTUALLY TOOK. The first message goes through `createBuild`, which at least
+    // had a network call behind its premature release; every message after it released the
+    // composer on nothing at all.
+    h.getBuild.mockResolvedValue(continuing())
+    h.startTurn.mockRejectedValue(new Error('429 over the daily cap'))
+    renderAt('build-X', deps().deps)
+    await waitForGateOpen()
+
+    type('and add a search box')
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+
+    await waitFor(() => expect(screen.getByText(/could not be sent/i)).toBeTruthy())
+    expect(composer().value).toBe('and add a search box')
+    // The optimistic bubble still rolls back — the server persisted nothing.
+    await waitFor(() =>
+      expect(within(screen.getByTestId('thread-messages')).queryByText('and add a search box')).toBeNull(),
+    )
+  })
+
+  it('empties the composer once the server has ACCEPTED, not before', async () => {
+    // The other half: the fix must not hold the text hostage to the whole reply. A 202 means the
+    // message is persisted and the turn runs detached, so that is the moment the box may clear —
+    // well before any of the reply has streamed.
+    h.getBuild.mockResolvedValue(continuing())
+    h.readTurnStream.mockImplementation(() => new Promise(() => {})) // accepted, and still streaming
+    renderAt('build-X', deps().deps)
+    await waitForGateOpen()
+
+    type('and add a search box')
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+
+    await waitFor(() => expect(composer().value).toBe(''))
+    expect(h.startTurn).toHaveBeenCalled()
+  })
+
+  it('a double-Enter in one tick does not empty the composer for the press it swallowed', async () => {
+    // The second keydown lands in the SAME tick, so it hits the dedup guard. That guard used to
+    // return — and a return resolves — so it cleared the box while the first send was still in
+    // flight. If that first send then failed, the message it was holding was already gone.
+    h.getBuild.mockResolvedValue(continuing())
+    let releaseStart
+    h.startTurn.mockImplementation(() => new Promise((resolve) => { releaseStart = resolve }))
+    renderAt('build-X', deps().deps)
+    await waitForGateOpen()
+
+    type('do not lose this')
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+
+    // `waitFor` because the send awaits the attachment build before it reaches the wire — both
+    // keydowns land first, which is the whole point of the guard being synchronous.
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalledTimes(1))
+    // The swallowed press said nothing and cleared nothing.
+    expect(composer().value).toBe('do not lose this')
+    expect(screen.queryByText(/did not send/i)).toBeNull()
+
+    releaseStart()
+    await waitFor(() => expect(composer().value).toBe(''))
+  })
+
+  it('a refusal after the reader has moved on still frees that chat’s Send', async () => {
+    // The wedge. Nothing settled the promise on this path, so `handleSubmit`'s `finally` never ran
+    // and `sendingRef` went on naming this chat forever — every later press there matched the
+    // stale double-Enter guard and returned as though it had sent, silently, for the session.
+    h.getBuild.mockResolvedValue(continuing())
+    h.startTurn.mockRejectedValueOnce(new Error('refused at the door'))
+    const { deps: d } = deps()
+    const { rerender } = renderAt('build-X', d)
+    await waitForGateOpen()
+
+    type('first attempt')
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+    // Away and back while the refusal is in flight.
+    rerender(
+      <MemoryRouter initialEntries={['/x']}>
+        <ConversationSurface chatId="build-Y" projectId="p1" projectName="VIP Movement" buildSessionDeps={d} />
+      </MemoryRouter>,
+    )
+    rerender(
+      <MemoryRouter initialEntries={['/x']}>
+        <ConversationSurface chatId="build-X" projectId="p1" projectName="VIP Movement" buildSessionDeps={d} />
+      </MemoryRouter>,
+    )
+    await waitForGateOpen()
+
+    h.startTurn.mockResolvedValue(undefined)
+    type('second attempt')
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+
+    // It actually sent. Before the fix this press matched the stale guard and vanished.
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalledTimes(2))
   })
 })

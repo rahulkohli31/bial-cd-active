@@ -178,12 +178,23 @@ const ActivityGroup: FC<PropsWithChildren<{ group: ThreadGroupPart }>> = ({ grou
   const label = groupLabel(facts, interrupted)
   const Chevron = open ? ChevronDown : ChevronRight
 
-  // ONCE, WHEN IT SEALS. `sealed` guards against re-announcing on every later render, and the
-  // running check is what makes `label` the summary rather than whichever step was in flight.
+  // ONCE, ON THE TRANSITION — not on mount.
+  //
+  // R66 announces what just happened, so the group has to have RUN here to have anything to
+  // report. Firing on "not running and has steps" instead announced every historical group in the
+  // transcript the moment a finished chat was opened: five past builds meant five summaries into
+  // the live region, none of them about anything the reader had just done.
+  //
+  // `watchedItRun` is what makes it a transition; `sealed` keeps it to one announcement after that.
   const announceSealed = useContext(GroupSealedContext)
+  const watchedItRun = useRef(false)
   const sealed = useRef(false)
   useEffect(() => {
-    if (facts.running || facts.count === 0 || sealed.current) return
+    if (facts.running) {
+      watchedItRun.current = true
+      return
+    }
+    if (!watchedItRun.current || facts.count === 0 || sealed.current) return
     sealed.current = true
     announceSealed(label)
   }, [facts.running, facts.count, label, announceSealed])
