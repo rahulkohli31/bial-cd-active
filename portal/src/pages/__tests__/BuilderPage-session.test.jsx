@@ -10,9 +10,8 @@
  * busy workspace, 503 unconfigured), so `buildFromPlan` THROWS and the card re-arms with the
  * server's own message. There is no `build_failed` outcome left to return.
  *
- * The REAL useBuildSession hook + LivePreview + BuildProgress run; only the C3 transport (client +
- * EventSource, still reachable through the legacy reattach path) and the U10 turn transport are
- * mocks.
+ * The REAL useBuildSession hook + LivePreview run; only the C3 transport (client + EventSource,
+ * still reachable through the legacy reattach path) and the U10 turn transport are mocks.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, cleanup, within } from '@testing-library/react'
@@ -965,8 +964,8 @@ describe('a read turn reads the live container without becoming a build (2026-07
 })
 
 // The other half of the same emptiness rule, on the side it was written for: a WRITE turn whose
-// container never came up is terminal with no steps and no headline, so BuildProgress renders
-// nothing — and the wrapper used to render around that nothing.
+// container never came up is terminal with no steps and no headline, so the transcript has no
+// activity to draw — and the wrapper used to render around that nothing.
 describe('a build that dies before its first step shows no empty bubble (2026-07-30)', () => {
   it('renders the failure, not an empty assistant bubble', async () => {
     const turn = scriptedBuild({ opening: [T_WORKSPACE('unavailable', 1, 'The workspace service is not available right now.')] })

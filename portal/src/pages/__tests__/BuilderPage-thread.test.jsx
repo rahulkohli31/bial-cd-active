@@ -209,16 +209,15 @@ describe('a restored thread re-renders every card from its STORED state', () => 
     // is already running") and let the citizen retry from the SAME card. Neither half of that
     // survives U12: `build_failed` and its `reason` field are gone from `PlanOptionsItem`
     // (turnStreamApi.ts), because Build-it now fails inside the one handoff call that would
-    // have produced this outcome — there is nothing left to persist, and PlanOptionsCard.tsx's
-    // own docblock says why: "a press that fails records nothing — the card was never spent,
-    // and there is nothing to un-spend. A failure is said once, in the error line below the
-    // buttons, by the caller that actually saw it."
+    // have produced this outcome — there is nothing left to persist. The deleted card's own
+    // docblock said why: "a press that fails records nothing — the card was never spent, and
+    // there is nothing to un-spend. A failure is said once, in the error line below the buttons,
+    // by the caller that actually saw it."
     //
-    // What's left to pin, from a row a pre-migration project might still carry: PlanOptionsCard
-    // does not recognise `build_failed` as one of its three states, so it falls through to its
-    // default branch with `actionable` false — the card still renders (this is the liveness half
-    // of the guard; a crash would leave nothing to query) but BOTH buttons stay permanently
-    // disabled, never the special re-arm this test used to require.
+    // What's left to pin, from a row a pre-migration project might still carry: `build_failed` is
+    // not one of the offer's recognised states, so the strip renders SPENT — it still draws (this
+    // is the liveness half of the guard; a crash would leave nothing to query) but it offers no
+    // re-arm, which is what this test used to require.
     h.getBuild.mockResolvedValue({
       id: 'thread-1',
       messages: [storedCard(1, 'opt-f', 'build_failed')],

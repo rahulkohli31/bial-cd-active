@@ -5,7 +5,7 @@ import Navbar from '../components/layout/Navbar'
 // The one support address this page states, rather than the two hardcoded copies it
 // carried (each under its own "TODO: confirm support address"). The CONFIGURED address
 // is `ApiSettings.SUPPORT_CONTACT_EMAIL`, but it is backend-only: it reaches a citizen
-// solely inside the server-rendered at-limit sentence that BuildProgress turns into a
+// solely inside the server-rendered at-limit sentence that `TurnBanner` turns into a
 // mailto. No endpoint returns it, and the portal reads no VITE_* vars, so this page
 // cannot read it without the config endpoint filed under #157 B3. Until then a single
 // constant is the honest shape: one place to fix when the address is confirmed, instead

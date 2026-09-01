@@ -1,11 +1,11 @@
 /**
  * STOP, MOVED TO WHERE THE COMPOSER IS (R55).
  *
- * Today stop lives inside `BuildProgress` — the pinned card this work exists to delete. This
- * component is the same ability in a component of its own, mounted on the composer's chrome, and
- * it ships BEFORE anything is removed so there is never a commit in which a build can be started
- * and not stopped. U10 gives it its permanent home on the new composer; U17 asserts a running
- * turn is still stoppable after `BuildProgress.tsx` is gone.
+ * Stop used to live inside `BuildProgress`, the pinned card this plan deleted. This component is
+ * the same ability in a component of its own, mounted on the composer's chrome, and it shipped
+ * BEFORE anything was removed so there was never a commit in which a build could be started and
+ * not stopped. U10 gave it its permanent home on the composer; U17 asserts a running turn is
+ * still stoppable now `BuildProgress.tsx` is gone.
  *
  * RELOCATED, NOT REDESIGNED. The better version of stop is its own work.
  *
@@ -16,14 +16,14 @@
  * build session has no turn id and is stopped through the session. Nothing here asks what kind of
  * chat this is, and after this plan nothing on the surface does.
  *
- * FORCE-END DELIBERATELY DOES NOT MOVE. `BuildProgress` records that a turn build has no
+ * FORCE-END DELIBERATELY DID NOT MOVE. `BuildProgress` recorded that a turn build has no
  * force-end equivalent, and a kill switch that confirms "this kills in-progress work" and then
- * does nothing is worse than no kill switch. It dies with the card.
+ * does nothing is worse than no kill switch. It died with the card.
  *
  * ── `aria-disabled`, NEVER `disabled` (R64) ──
  *
- * The shipped button in `BuildProgress` uses a real `disabled={stopping}`. That is the bug R64
- * forbids: `disabled` on the currently-focused element blurs it to `document.body`, so a keyboard
+ * The button in `BuildProgress` used a real `disabled={stopping}`. That is the bug R64 forbids:
+ * `disabled` on the currently-focused element blurs it to `document.body`, so a keyboard
  * user who has just pressed Stop loses their place at the exact moment they were promised
  * feedback. This codebase records the mechanism twice already (`BuilderPage`'s textarea and its
  * Send button) and it is not a style preference. Enforcement lives in the handler; the attribute

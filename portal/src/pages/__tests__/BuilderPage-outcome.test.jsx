@@ -63,8 +63,8 @@ vi.mock('../../components/AttachmentChips', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
 // `switchMode` is GONE — a chat's kind is fixed at creation, so there is no per-thread setting
 // left to switch. `resolvePlanOptions` is a real export, kept mocked only because
-// `PlanOptionsCard` (still imported by BuilderPage.tsx) reaches for it — never exercised here,
-// since this suite never renders that card.
+// the surface reaches for it when a plan offer is answered — never exercised here, since this
+// suite never renders an offer.
 vi.mock('../../utils/turnStreamApi', async (orig) => ({
   ...(await orig()),
   startTurn: (...a) => h.startTurn(...a),

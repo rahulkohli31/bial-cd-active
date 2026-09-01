@@ -2,7 +2,7 @@
  * The single owner of a build session's lifecycle: it starts / re-attaches / stops /
  * force-ends a C3 session, subscribes to its C7 SSE feed, derives the
  * `BuildSessionStatus`, and runs the frozen keep-alive timers. Every cockpit surface
- * (LivePreview, BuildProgress, SessionBanners) reads from here.
+ * (LivePreview, the conversation surface's banners) reads from here.
  *
  * KEY BEHAVIOURS (the plan's load-bearing decisions):
  *

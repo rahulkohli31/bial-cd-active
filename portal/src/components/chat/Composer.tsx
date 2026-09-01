@@ -289,8 +289,8 @@ const Composer: FC<ComposerProps> = ({
       )}
 
       {/* R55 — stop's permanent home. U3 built it and mounted it into the block this replaces; if
-          it were not re-mounted here it would be deleted with `BuildProgress` and the surface would
-          ship with a running build and no way to stop it. */}
+          it were not re-mounted here it would have been deleted with `BuildProgress`, and the
+          surface would ship with a running build and no way to stop it. */}
       {stop && (
         <div className="flex justify-end pb-1">
           <StopTurnControl {...stop} onStopFailed={onUrgent} />

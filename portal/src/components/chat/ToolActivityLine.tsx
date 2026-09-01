@@ -1,7 +1,8 @@
 /**
- * ToolActivityLine — the shared Mode-A atom for build/tool activity (F3/U3). ONE renderer used by
- * both the LIVE `BuildProgress` step rows and the RELOAD stored-step rows in `BuilderPage`, so the
- * two feeds can never visually diverge.
+ * ToolActivityLine — the shared Mode-A atom for build/tool activity (F3/U3). ONE renderer, reached
+ * through `ActivityRow` for a step and `ActivityGroup`'s glyph strip for the collapsed summary, so
+ * the live and reloaded halves of a build can never visually diverge. (It used to be named as
+ * `BuildProgress`' and `BuilderPage`'s shared atom; both were deleted with the two-page era.)
  *
  * A chrome-free flex row — no card, no border: `[state glyph 14px] friendly label`.
  * The friendly label is neutral-coloured in every state; a FAILED row conveys failure by the glyph
@@ -9,9 +10,9 @@
  * (WCAG 1.4.1). Height is constant across states so a line never reflows as it resolves. The
  * running spinner is gated behind `prefers-reduced-motion`.
  *
- * Palette: the portal's CUSTOM tokens the `BuildProgress` bubble already uses (`text-danger`,
- * `text-primary`, `text-tertiary`) — NOT shadcn's `text-destructive` / `text-muted-foreground`, so
- * the new lines don't diverge inside the same bubble.
+ * Palette: the portal's CUSTOM tokens (`text-danger`, `text-primary`, `text-tertiary`) — NOT
+ * shadcn's `text-destructive` / `text-muted-foreground`, so these rows do not diverge from the
+ * portal's own colours where they sit in the transcript.
  */
 import { CheckCircle2, Loader2, XCircle } from 'lucide-react'
 import { useEffect, useState } from 'react'

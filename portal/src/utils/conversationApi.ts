@@ -174,8 +174,8 @@ export function messagesFromProjection(
       })
     }
     else if (item.type === 'plan_options') {
-      // The Build it / Keep refining card (U11/U13): carried as its own part so the page
-      // renders PlanOptionsCard with the STORED resolution state — live and reload agree.
+      // The Build it / Keep refining card (U11/U13): carried as its own part so the surface
+      // renders the offer with the STORED resolution state — live and reload agree.
       // Narrowed via toPlanOptionsItem — the same function the live path uses
       // (turnStreamApi.ts) — rather than a raw `as unknown as PlanOptionsItem` cast, so
       // a malformed stored item is DROPPED here exactly as it is live, not handed to the
@@ -197,7 +197,7 @@ export function messagesFromProjection(
       // Hidden steps (reads) stay out of the transcript, same rule as the live feed —
       // checked on the RAW item.hidden, unchanged, since that's a structural filter
       // (reload drops hidden steps before they become a message at all; live forwards
-      // them and BuildProgress.tsx filters at render) this fix doesn't touch.
+      // them and the surface filters them out of the parts it paints) this fix doesn't touch.
       if (!item.hidden) {
         // Narrowed via toStepItem — the same function the live path uses — rather than a
         // raw cast. Only returns null if the value isn't a record at all, which can't
