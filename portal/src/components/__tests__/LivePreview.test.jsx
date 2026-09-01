@@ -500,7 +500,7 @@ describe('LivePreview — the U6 relaunch response matrix (#43)', () => {
       />,
     )
     // LIVENESS: the terminal placeholder still renders and still makes the saved-build claim.
-    expect(container.textContent).toMatch(/restore your saved app/i)
+    expect(container.textContent).toMatch(/your saved app is still there/i)
     // The kind-specific copy is gone, not merely un-alerted — pinned so a reader does not assume
     // it survives elsewhere on the pane.
     expect(container.textContent).not.toMatch(/try again later/i)
@@ -518,7 +518,7 @@ describe('LivePreview — the U6 relaunch response matrix (#43)', () => {
         relaunchError={{ kind: 'failed', message: 'Failed to relaunch the preview' }}
       />,
     )
-    expect(container.textContent).toMatch(/restore your saved app/i)
+    expect(container.textContent).toMatch(/your saved app is still there/i)
     expect(container.textContent).not.toMatch(/failed to relaunch/i)
     expect(screen.queryByRole('alert')).toBeNull()
     expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
@@ -980,7 +980,7 @@ describe('LivePreview — the preview only claims a build that exists (R5)', () 
       <LivePreview previewUrl={null} status="ended" onRelaunch={vi.fn()} hasSavedBuild={false} />,
     )
     expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
-    expect(container.textContent).not.toMatch(/restore your saved app/i)
+    expect(container.textContent).not.toMatch(/relaunch it|relaunch the preview/i)
     expect(container.textContent).toMatch(/nothing to relaunch yet/i)
   })
 
@@ -1000,7 +1000,7 @@ describe('LivePreview — the preview only claims a build that exists (R5)', () 
       act(() => vi.advanceTimersByTime(20001)) // past the reconnect cap → showUnavailable
       expect(container.textContent).toMatch(/preview unavailable/i)
       expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
-      expect(container.textContent).not.toMatch(/restore your saved app/i)
+      expect(container.textContent).not.toMatch(/relaunch it|relaunch the preview/i)
       expect(container.textContent).toMatch(/nothing to relaunch yet/i)
     } finally {
       vi.useRealTimers()
@@ -1016,7 +1016,7 @@ describe('LivePreview — the preview only claims a build that exists (R5)', () 
     const first = render(
       <LivePreview previewUrl={null} status="ended" onRelaunch={onRelaunchTerminal} hasSavedBuild />,
     )
-    expect(first.container.textContent).toMatch(/restore your saved app/i)
+    expect(first.container.textContent).toMatch(/your saved app is still there/i)
     expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
     expect(onRelaunchTerminal).not.toHaveBeenCalled()
     first.unmount()
@@ -1035,7 +1035,7 @@ describe('LivePreview — the preview only claims a build that exists (R5)', () 
         />,
       )
       act(() => vi.advanceTimersByTime(20001))
-      expect(container.textContent).toMatch(/restore your saved app/i)
+      expect(container.textContent).toMatch(/your saved app is still there/i)
       expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
       expect(onRelaunchUnavailable).not.toHaveBeenCalled()
     } finally {
@@ -1048,7 +1048,7 @@ describe('LivePreview — the preview only claims a build that exists (R5)', () 
       <LivePreview previewUrl={null} status="ended" onRelaunch={vi.fn()} hasSavedBuild={null} />,
     )
     expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
-    expect(document.body.textContent).not.toMatch(/restore your saved app/i) // no "there is one"
+    expect(document.body.textContent).not.toMatch(/relaunch it|relaunch the preview/i) // no "there is one"
     expect(document.body.textContent).not.toMatch(/no saved build/i) // and no "there is none"
     expect(document.body.textContent).toMatch(/start a new build/i)
     first.unmount()
@@ -1066,7 +1066,7 @@ describe('LivePreview — the preview only claims a build that exists (R5)', () 
       )
       act(() => vi.advanceTimersByTime(20001))
       expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
-      expect(document.body.textContent).not.toMatch(/restore your saved app/i)
+      expect(document.body.textContent).not.toMatch(/relaunch it|relaunch the preview/i)
       expect(document.body.textContent).not.toMatch(/no saved build/i)
     } finally {
       vi.useRealTimers()

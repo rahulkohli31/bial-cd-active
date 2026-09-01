@@ -369,7 +369,12 @@ export default function LivePreview({
   status = null,
   iterating = false,
   onFrameMessage,
-  onRelaunch,
+  // ACCEPTED AND DELIBERATELY UNREAD, like `lastBuildFailed` above. It gated the copy that named
+  // the retired start button; the button is `AppPane`'s now and the copy no longer directs anybody
+  // at it. The prop stays because `PaneView` still carries it and `UnacceptedPaneProps` pins that
+  // every field there is a real prop of this component — removing it here without removing it
+  // there would turn that guard red for the wrong reason.
+  onRelaunch: _onRelaunch,
   relaunching = false,
   relaunchError = null,
   // ACCEPTED AND DELIBERATELY UNREAD. It chose between two labels on the start button this unit
@@ -974,8 +979,8 @@ export default function LivePreview({
                       ? goneBody(goneState, occupyingProjectName, hasSavedBuild)
                       : hasSavedBuild === false
                         ? 'There’s nothing to relaunch yet — this project has no saved build. Build the app first.'
-                        : hasSavedBuild === true && onRelaunch
-                          ? 'The preview server stopped and didn’t come back. Relaunch it to restore your saved app.'
+                        : hasSavedBuild === true
+                          ? 'The preview server stopped and didn’t come back. Your saved app is still there.'
                           : 'The preview server stopped and didn’t come back. Start a new build to bring the live preview back.'}
                   </p>
                 )}
@@ -1010,8 +1015,8 @@ export default function LivePreview({
                   <p className="text-xs text-neutral/60 leading-relaxed mb-3">
                     {hasSavedBuild === false
                       ? 'There’s nothing to relaunch yet — this project has no saved build. Build the app first.'
-                      : hasSavedBuild === true && onRelaunch
-                        ? 'This build session has ended. Relaunch it to restore your saved app into a fresh preview.'
+                      : hasSavedBuild === true
+                        ? 'This build session has ended. Your saved app is still there.'
                         : 'This build session has ended. Start a new build to bring the live preview back.'}
                   </p>
                 )}
@@ -1154,10 +1159,13 @@ export default function LivePreview({
               <Loader2 size={26} className="text-warning animate-spin" style={{ animationDuration: '1.8s' }} />
             </div>
             <p className="text-sm font-semibold text-neutral mb-1">{SLOW_TEXT}</p>
-            {/* R5/N7, as everywhere else on this pane: the relaunch is offered — and PROMISED in
-                the copy — only when the server confirmed a saved build (null is "store
-                unreachable", which claims nothing), and a 404 after the click is said out loud
-                rather than vanishing the button in silence. */}
+            {/* THE COPY NO LONGER NAMES A CONTROL THIS CARD DOES NOT HAVE (Plan F, U4). These three
+                placeholders used to end with "relaunch it" / "relaunch the preview to start it
+                fresh" beside a button that sat right below them; the button moved to `AppPane`,
+                where R3's one start control lives, and an instruction pointing at nothing is worse
+                than no instruction. Each sentence keeps its FACT and drops the direction. The
+                `not_found` arm below stays exactly as it is — it announces a saved build that has
+                genuinely vanished, which is a statement rather than an instruction. */}
             {relaunchError?.kind === 'not_found' ? (
               <p role="alert" className="text-xs text-danger max-w-xs leading-relaxed mb-4">
                 That saved build is no longer available, so there is nothing to relaunch. The
@@ -1165,9 +1173,7 @@ export default function LivePreview({
               </p>
             ) : (
               <p className="text-xs text-neutral/60 max-w-xs leading-relaxed mb-4">
-                {hasSavedBuild === true && onRelaunch
-                  ? 'It will appear here the moment it loads. If you would rather not wait, relaunch the preview to start it fresh.'
-                  : 'It will appear here the moment it loads.'}
+                {'It will appear here the moment it loads.'}
               </p>
             )}
           </div>
