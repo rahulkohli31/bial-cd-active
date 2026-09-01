@@ -75,6 +75,7 @@ from src.services.turns.copy import (
     COULD_NOT_CONFIRM_TEXT,
     DID_NOT_COME_TOGETHER_TEXT,
     KEPT_A_COPY,
+    REMAINDER_TEXT,
     SPENT_ENOUGH_TEXT,
     STILL_SHOWING_EARLIER,
     STILL_SHOWING_NOTHING,
@@ -2493,3 +2494,61 @@ async def test_a_build_that_reaches_the_spend_bound_ends_saying_the_app_works(
     # And it did not spend a request it had no budget for: the bound is checked BEFORE the
     # model is asked, so the very first request never fires.
     assert counts["requests"] == 0
+
+
+async def test_the_spend_bound_names_what_was_agreed_and_not_built(
+    _fresh_engine,
+    db_session,
+    session_factory,
+    fake_redis: aioredis.Redis,
+    fake_storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★★ AE47 / R91's second clause — "and says what remains", end to end.
+
+    THE BOUND FIRING IS HALF THE REQUIREMENT. A run that stops where the app works, and then
+    leaves the citizen to work out which of the pieces they agreed to actually landed, has done
+    the mechanical half and skipped the half they can act on. This is the assertion that the
+    ending carries U12's remainder rather than merely existing.
+
+    THE NAMES COME FROM THE AGREED LIST. `agreed_slice` reads them off the proposal call the
+    citizen read — the platform's own record — so the sentence is derived, not recalled. The
+    seeding is stubbed here because WHERE the agreed list comes from is `test_scope_negotiation`'s
+    subject; what is under test is that this ending consults it at all.
+
+    NOTHING WAS MARKED AND NOTHING WAS TOUCHED, which is the tri-state's first arm: no container
+    took a write, so naming the whole agreed list is true rather than a guess. The arm that would
+    have shipped a lie — work landed, nothing marked — is pinned in `test_scope_negotiation`.
+
+    Mutation check: drop the remainder from `_bounded_run_ending` and this goes red on the
+    pieces while the sentence itself still passes."""
+    agreed = ["A visitor list", "A sign-out button"]
+    monkeypatch.setattr(engine_module, "RUN_TOKEN_BUDGET", 0)
+    monkeypatch.setattr(engine_module, "agreed_slice", lambda _history: list(agreed))
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "rb2@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+    model, _ = _scripted([[_WROTE_A_FILE, _DECLARED_DONE]])
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+        expects_mutation=True,
+    )
+
+    assert state.end_reason == "run_budget_reached"
+    assert state.error_message is not None
+    # BOTH HALVES, IN ONE MESSAGE: the app works, and here is what is left.
+    assert "working" in state.error_message
+    assert REMAINDER_TEXT.format(pieces=", ".join(agreed)) in state.error_message
+    # ORDER IS THE CITIZEN'S, not the set's: they agreed to these in this sequence.
+    assert state.error_message.index("A visitor list") < state.error_message.index(
+        "A sign-out button"
+    )

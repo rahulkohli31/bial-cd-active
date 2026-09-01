@@ -1532,11 +1532,15 @@ class TurnEngine:
         try:
             while True:
                 if time.monotonic() - loop_started > RUN_WALL_CLOCK_DEADLINE_S:
+                    # ONE ENDING FOR ALL THREE BOUNDS (U13/R91). What stood here named the
+                    # bound and then told the citizen to "click Save to keep them" — the exact
+                    # sentence `at_limit_ending`'s docstring records as the one that secured
+                    # nothing and asserted something nobody had checked. This arm is the one
+                    # MOST likely to be reached with a wedged container, so it is the one that
+                    # can least afford to promise a save it never performed.
                     raise _WriteEndedError(
                         "wall_clock_deadline_exceeded",
-                        "This is taking much longer than expected, so it has been stopped. "
-                        "Your changes are still in the workspace — click Save to keep them, "
-                        "then send a message to pick it back up.",
+                        await self._bounded_run_ending(state),
                     )
                 # The count ceilings bound requests and repairs; this bounds elapsed time,
                 # which neither of them does. Checked BETWEEN iterations, so a run already
@@ -1576,13 +1580,13 @@ class TurnEngine:
                     )
                 except UsageLimitExceeded as exc:
                     # The model burned its per-run request ceiling — usually a loop, not a
-                    # hard problem. Named, because "hit a problem" would send the user to
-                    # support when the right advice is to narrow the ask.
+                    # hard problem. It ends the same way the other two internal ceilings do
+                    # (U13/R91): the tree is secured first, one sentence that names no bound,
+                    # and the remainder from what was agreed. `end_reason` keeps which bound
+                    # fired distinguishable for the person who can act on it.
                     raise _WriteEndedError(
                         "request_limit",
-                        "The assistant took too many steps on this one without finishing. "
-                        "Your changes are still in the workspace — click Save to keep them, "
-                        "then try asking for a smaller change.",
+                        await self._bounded_run_ending(state),
                     ) from exc
                 iteration += 1
 
@@ -1875,9 +1879,7 @@ class TurnEngine:
                         )
                         raise _WriteEndedError(
                             "run_budget_reached",
-                            (
-                                await at_limit_ending(state.sandbox, sentence=SPENT_ENOUGH_TEXT)
-                            ).message,
+                            await self._bounded_run_ending(state),
                         )
                     async with node.stream(run.ctx) as stream:
                         async for event in stream:
@@ -2084,6 +2086,45 @@ class TurnEngine:
                 await db.commit()
         except Exception as exc:
             raise _PersistFailedError from exc
+
+    async def _bounded_run_ending(self, state: _TurnState) -> str:
+        """THREE BOUNDS, ONE ENDING (U13/R91) — durable first, then the sentence, then what
+        is left.
+
+        Request count, wall clock and spend can each end a run, and R91 asks one thing of all
+        three: end where the app works, and say what remains. Which internal ceiling fired is
+        not something a citizen can act on differently — the next move is the same message
+        either way — so it lives in `end_reason` and the logs, where the person who CAN act on
+        it looks, and never in the copy.
+
+        THE OTHER TWO ARMS USED TO SECURE NOTHING. They told the citizen "your changes are
+        still in the workspace — click Save to keep them", which is verbatim the sentence
+        `at_limit_ending`'s docstring records as securing nothing and asserting something
+        nobody had checked. Whether the work survived depended on the exit path's best-effort
+        autosave, which is deliberately swallowed — so on the day it failed, the citizen had
+        already been told it had not. Routing all three through the one securing function is
+        what makes the reassurance true rather than hopeful.
+
+        ONE SECURING FUNCTION, NOT THREE. A divergent snapshot-then-teardown ordering here
+        loses a citizen's tree, which is why `at_limit_ending` takes the sentence as a
+        parameter rather than each caller growing its own copy of the ordering.
+
+        THE DAILY QUOTA IS NOT ONE OF THESE. It is the citizen's own budget, it resets at
+        midnight, and it keeps its own sentence — telling someone to wait until midnight when
+        they could carry on right now is the confusion `SPENT_ENOUGH_TEXT` exists to avoid.
+        Its bytes are pinned by a regression test for exactly that reason.
+
+        NO SANDBOX MEANS NOTHING WAS BUILT. `workspace_touched` is False when the turn never
+        took a container, which is the truthful input to the tri-state below rather than a
+        default standing in for a missing fact."""
+        message = (await at_limit_ending(state.sandbox, sentence=SPENT_ENOUGH_TEXT)).message
+        remainder = self._what_is_still_outstanding(
+            state,
+            workspace_touched=state.sandbox is not None and state.sandbox.workspace_touched,
+        )
+        if remainder is None:
+            return message
+        return f"{message}{TEXT_BLOCK_SEPARATOR}{remainder}"
 
     def _what_is_still_outstanding(
         self, state: _TurnState, *, workspace_touched: bool
