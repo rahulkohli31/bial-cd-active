@@ -227,3 +227,70 @@ def test_which_bound_fired_stays_in_the_record_while_the_citizen_reads_one_sente
     for reason in _BOUNDED_REASONS:
         for word in reason.split("_"):
             assert word not in rendered, f"the shared ending leaks {reason!r} at {word!r}"
+
+
+# --- what the bound actually measures --------------------------------------------------------
+
+
+def test_the_bound_does_not_price_a_cache_read_like_fresh_input() -> None:
+    """★★ THE 2026-07-30 INCIDENT, PREVENTED ON THE SECOND CEILING TOO.
+
+    Under pydantic-ai `input_tokens` is the grand-total prompt size and the cache buckets are
+    ALREADY INSIDE it — a request with 10 fresh tokens and a 90k cache read reports
+    `input_tokens == 90_010`, so `total_tokens` is 90_015. This loop re-sends the same
+    instructions and tool definitions behind a cache breakpoint on every step, so a bound
+    reading that raw number charges the whole prefix again per step.
+
+    That is not hypothetical: `billable_spend`'s docstring records one calculator build booking
+    956k of a 1M daily cap on 68 tokens of real fresh input, which is why the DAILY meter is
+    cost-weighted. A per-run ceiling reading the raw total would have reintroduced exactly that
+    on a second ceiling — ending honest builds early and measuring how many steps a build took
+    rather than how much work it did, which `RUN_TOKEN_BUDGET`'s own docstring says it must not.
+
+    Mutation check: return `usage.total_tokens` from `_run_spend` and this goes red."""
+    from pydantic_ai.usage import RunUsage
+
+    from src.services.turns.engine import _run_spend
+
+    mostly_cached = RunUsage(
+        input_tokens=90_010,  # 90k of it read from cache, 10 genuinely fresh
+        output_tokens=5,
+        cache_read_tokens=90_000,
+        cache_write_tokens=0,
+    )
+    assert mostly_cached.total_tokens == 90_015  # what the naive reading would have charged
+    # Weighted: 10 fresh + 5 output + 90_000/10 = 9_015.
+    assert _run_spend(mostly_cached) == 9_015
+    # The claim that matters is the RATIO, not the constant: a turn that is almost entirely
+    # cache reads must not be charged as though it were almost entirely fresh input.
+    assert _run_spend(mostly_cached) < mostly_cached.total_tokens / 5
+
+
+def test_the_run_bound_and_the_daily_meter_weigh_a_token_identically() -> None:
+    """ONE POLICY, TWO READERS. The daily meter is a SQL column expression and the run bound is
+    an in-process scalar, so they cannot share an implementation — but they must not drift into
+    two numbers the citizen hears the same word for. Both spell the weighting from the same two
+    divisors, and this pins that they agree on real arithmetic rather than merely importing the
+    same constants.
+
+    Mutation check: change either divisor in `weighted_spend` alone and this goes red."""
+    from src.services.usage.gate import (
+        _CACHE_READ_DIVISOR,
+        _CACHE_WRITE_SURCHARGE_DIVISOR,
+        weighted_spend,
+    )
+
+    fresh, output, read, write = 1_000, 500, 40_000, 8_000
+    expected = (
+        fresh
+        + output
+        + read / _CACHE_READ_DIVISOR
+        + write
+        + write / _CACHE_WRITE_SURCHARGE_DIVISOR
+    )
+    assert weighted_spend(
+        input_tokens=fresh + read + write,  # the grand total, as pydantic-ai reports it
+        output_tokens=output,
+        cache_read_tokens=read,
+        cache_write_tokens=write,
+    ) == int(expected)

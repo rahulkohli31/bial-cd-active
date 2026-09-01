@@ -665,8 +665,8 @@ def _slice_argument(args: Any) -> dict[str, Any] | None:
     Both stored shapes go through `_args_dict`: a tool call's `args` is a JSON string or an
     object depending on the provider, and a malformed one is the same answer as a missing one."""
     parsed = _args_dict(args)
-    found = _clean_pieces(parsed.get("found"))
-    first = _clean_pieces(parsed.get("first"))
+    found = clean_pieces(parsed.get("found"))
+    first = clean_pieces(parsed.get("first"))
     why = parsed.get("why")
     question = parsed.get("question")
     if not found or not first or not isinstance(why, str) or not isinstance(question, str):
@@ -678,8 +678,14 @@ def _slice_argument(args: Any) -> dict[str, Any] | None:
     return {"found": found, "first": first, "why": why.strip(), "question": question.strip()}
 
 
-def _clean_pieces(raw: Any) -> list[str]:
+def clean_pieces(raw: Any) -> list[str]:
     """A list-of-strings argument, emptied of anything that is not a usable piece name.
+
+    PUBLIC BECAUSE THE TOOL BODY READS IT TOO. `propose_first_slice` enforces the ceiling on
+    the list this returns, not on the raw argument, so the body and the renderer agree on what
+    "four pieces" counts. They did not always: the body counted the raw list while the renderer
+    counted the cleaned one, so a call naming the same piece five times was refused by the body
+    and drawn by the renderer at the same moment.
 
     DE-DUPLICATED, ORDER PRESERVED. A piece named twice is one piece — the citizen reads a list,
     and a repeated line reads as two things to do. Order is the agent's, because it is the order
@@ -773,6 +779,44 @@ def agreed_slice(messages: Sequence[Any]) -> list[str]:
             if proposal is not None:
                 agreed = proposal["first"]
     return agreed
+
+
+def finished_slice(messages: Sequence[Any]) -> set[str]:
+    """Which pieces of the CURRENT agreement have already been marked finished, from the record.
+
+    THE OTHER HALF OF `agreed_slice`, AND IT HAS TO EXIST FOR THE SAME REASON. The agreement is
+    re-derived from history on every turn, so it survives one; the marks were per-turn memory,
+    so they did not. A citizen who builds one piece per turn — which is the ordering this whole
+    plan asks for — would have turn two tell them that turn one's finished piece is still to do.
+    The platform asserting that finished work is outstanding is the exact false fact U12 exists
+    to prevent; it was simply arriving through the other door.
+
+    A NEW PROPOSAL CLEARS THEM, mirroring the live rule exactly. Marks made against a slice that
+    has since been re-proposed are not evidence about the new one — the same reasoning
+    `_already_marked_against` gives, and the same thing the live emitter does when it clears the
+    set on an honourable proposal. Scoping by position rather than by name matters because a
+    piece can be named in both the old agreement and the new one.
+
+    SCOPED TO WHAT WAS AGREED. A mark naming something outside the current agreement is ignored
+    here, exactly as the live emitter ignores it — the model can invent a name, and a set that
+    accepted one would make the remainder's honest arm unreachable."""
+    agreed = agreed_slice(messages)
+    if not agreed:
+        return set()
+    marked: set[str] = set()
+    for message in messages:
+        for part in _parts_of(message):
+            tool_name = _part_field(part, "tool_name")
+            if tool_name == PROPOSE_SLICE_TOOL:
+                if _slice_argument(_part_field(part, "args")) is not None:
+                    marked.clear()
+                continue
+            if tool_name != TELL_THE_USER_TOOL:
+                continue
+            piece = finished_from_args(_part_field(part, "args"))
+            if piece is not None and piece in agreed:
+                marked.add(piece)
+    return marked
 
 
 def _parts_of(message: Any) -> list[Any]:

@@ -35,6 +35,7 @@ from src.services.messages.projection import (
     MAX_FIRST_SLICE,
     UPDATE_MAX_CHARS,
     agreed_slice,
+    clean_pieces,
     finished_from_args,
 )
 from src.services.messages.projection import (
@@ -203,8 +204,15 @@ async def propose_first_slice(
     # own arguments are the agreement, so there is nothing to resolve off the run and nothing
     # here should try. It is in the signature because pydantic-ai's `FunctionToolset` is typed
     # to accept a context-first callable — dropping it works at run time and fails `ty`.
-    pieces_found = [piece.strip() for piece in found if piece.strip()]
-    pieces_first = [piece.strip() for piece in first if piece.strip()]
+    # CLEANED THE WAY THE RENDERER CLEANS, which is the whole point of borrowing its function
+    # rather than restating the rule. This body's bounds decide what the model is told; the
+    # renderer's decide what the citizen sees, and they run at different moments — the call
+    # event draws the card before this body has executed. When the two cleaned differently they
+    # disagreed: `first=["A","A","A","A","A"]` is five entries and one piece, so the body
+    # refused it for naming five while the renderer drew a card for the one, leaving a citizen
+    # reading a proposal the model was being told to retry.
+    pieces_found = clean_pieces(found)
+    pieces_first = clean_pieces(first)
     refusal = _bad_slice(pieces_found, pieces_first)
     if refusal is not None:
         raise ModelRetry(refusal)

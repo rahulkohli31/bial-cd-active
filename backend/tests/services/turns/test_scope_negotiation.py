@@ -45,6 +45,7 @@ from src.services.messages.projection import (
     MAX_FIRST_SLICE,
     AssistantTextItem,
     agreed_slice,
+    finished_slice,
     project_rows,
     proposal_from_args,
 )
@@ -566,3 +567,183 @@ async def test_a_mark_naming_a_piece_nobody_agreed_to_cannot_defeat_the_could_no
         ),
     )
     assert state.finished_pieces == {_THREE[0]}
+
+
+@pytest.mark.parametrize(
+    "found,first",
+    [
+        (_NINE, ["A visitor list"] * 5),  # five entries, ONE piece — the case that diverged
+        (_NINE, [" A visitor list ", "A visitor list"]),  # whitespace makes a false second
+        (_NINE, _NINE[:MAX_FIRST_SLICE]),  # exactly at the ceiling
+        (_NINE, _NINE[: MAX_FIRST_SLICE + 1]),  # genuinely over it
+        ([" ", ""], ["A visitor list"]),  # nothing usable in `found`
+    ],
+    ids=["repeated", "whitespace-dupe", "at-ceiling", "over-ceiling", "empty-found"],
+)
+async def test_the_body_refuses_exactly_what_the_renderer_declines_to_draw(
+    found: list[str], first: list[str]
+) -> None:
+    """★★ ONE QUESTION, TWO ASKERS, AND THEY MUST NOT DISAGREE.
+
+    The tool body decides what the MODEL is told; `_slice_argument` decides what the CITIZEN
+    sees. They run at different moments — the live emitter draws the card at the call event,
+    before this body has executed — so a disagreement is not a tidiness problem: it puts a
+    proposal on screen that the model is simultaneously being told to retry, and pins
+    `agreed_pieces` to a slice nobody accepted.
+
+    THEY DID DISAGREE. The body counted the raw `first` list and the renderer counted the
+    de-duplicated one, so `["A visitor list"] * 5` was refused as five pieces and drawn as one.
+    Both now clean through `clean_pieces` before judging.
+
+    Asserted as an EQUIVALENCE over the shapes where the two could drift, rather than by
+    re-testing each bound — the bounds already have their own tests, and what was missing was
+    anything checking the two readers agree.
+
+    Mutation check (run): strip instead of clean in the body (`[p.strip() for p in first]`) and
+    `repeated` goes red. Only that one — `whitespace-dupe` survives it, because two entries are
+    still under the ceiling however they are counted, so both readers accept it either way. It
+    stays in the table as a shape that COULD diverge if the ceiling ever moved to one, not as a
+    case carrying the mutant; claiming otherwise would be the kind of unearned coverage this
+    file's other docstrings are careful about."""
+    body_refused: bool
+    try:
+        await propose_first_slice(_ctx(), found, first, _WHY, _QUESTION)
+        body_refused = False
+    except ModelRetry:
+        body_refused = True
+
+    drew_nothing = proposal_from_args(_args(found, first)) is None
+
+    assert body_refused == drew_nothing, (
+        f"body_refused={body_refused} but drew_nothing={drew_nothing} — a call the model is "
+        "told to retry must reach no screen, and one it is allowed must reach one"
+    )
+
+
+# --- the marks have to survive a turn, exactly as the agreement does -------------------------
+
+
+def _mark_call(piece: str, call_id: str) -> ModelResponse:
+    return ModelResponse(
+        parts=[
+            ToolCallPart(
+                tool_name="tell_the_user",
+                args=json.dumps({"update": "That one is in.", "finished": piece}),
+                tool_call_id=call_id,
+            )
+        ]
+    )
+
+
+def test_a_piece_finished_in_an_earlier_turn_is_not_named_as_still_to_do() -> None:
+    """★★ THE ASYMMETRY THAT MADE THE REMAINDER LIE ON THE SECOND TURN.
+
+    `agreed_slice` re-derives the agreement from history on every turn, so the agreement
+    survived a turn. The marks were per-turn memory and did not. A citizen building one piece
+    per turn — the ordering this whole plan asks for — would finish a piece in turn one and be
+    told at the end of turn two that it was still to do.
+
+    That is the platform asserting that finished work is undone, in its own voice, on evidence
+    it holds and misread. It is the same false fact the tri-state exists to prevent, and it was
+    reachable without any misbehaviour by the model at all: the agent marked correctly, and the
+    platform forgot.
+
+    WHAT THIS PINS, AND WHAT IT DOES NOT. It seeds the state the way the engine seeds one, so
+    it pins `finished_slice` and the remainder's use of it. It does NOT prove the engine calls
+    it: the seeding happens deep inside `_run_write`, and this test writes the field directly.
+    Removing the engine's call leaves this green — I ran that mutant to check rather than
+    assuming — so the call site is pinned structurally by
+    `test_the_engine_seeds_both_halves_of_the_record` below. Two tests, because one of them
+    would otherwise be claiming coverage it does not have."""
+    history: list[ModelMessage] = [
+        ModelResponse(parts=[ToolCallPart("propose_first_slice", _args(_NINE, _THREE), "p1")]),
+        _mark_call(_THREE[0], "m1"),
+    ]
+
+    assert agreed_slice(history) == list(_THREE)
+    assert finished_slice(history) == {_THREE[0]}
+
+    # A fresh turn, seeded the way the engine seeds one.
+    state = _state()
+    state.agreed_pieces = agreed_slice(history)
+    state.finished_pieces = finished_slice(history)
+
+    line = _remainder(state, touched=True)
+    assert line is not None
+    assert _THREE[0] not in line, "named a piece that was finished in an earlier turn"
+    assert line == REMAINDER_TEXT.format(pieces=", ".join(_THREE[1:]))
+
+
+def test_a_fresh_proposal_reopens_the_question_that_earlier_marks_had_closed() -> None:
+    """The live emitter clears the marks when a new proposal lands, so reading them back has to
+    do the same or the two paths would disagree about what is outstanding.
+
+    SCOPED BY POSITION, NOT BY NAME. A piece can appear in both the old agreement and the new
+    one, so "ignore marks naming pieces outside the current agreement" is not sufficient on its
+    own — a mark made before the re-proposal is not evidence about what came after it."""
+    history: list[ModelMessage] = [
+        ModelResponse(parts=[ToolCallPart("propose_first_slice", _args(_NINE, _THREE), "p1")]),
+        _mark_call(_THREE[0], "m1"),
+        # The same piece is agreed again in a later round — the earlier mark is not evidence.
+        ModelResponse(parts=[ToolCallPart("propose_first_slice", _args(_NINE, _THREE), "p2")]),
+    ]
+
+    assert agreed_slice(history) == list(_THREE)
+    assert finished_slice(history) == set()
+
+    state = _state()
+    state.agreed_pieces = agreed_slice(history)
+    state.finished_pieces = finished_slice(history)
+    # Nothing marked against the NEW agreement and work landed → the honest arm, not a claim.
+    assert _remainder(state, touched=True) == CANNOT_TELL_WHAT_REMAINS_TEXT
+
+
+def test_a_mark_naming_something_outside_the_agreement_is_ignored_on_the_way_back_in() -> None:
+    """The same guard the live path keeps, on the reload path. A set that accepted an invented
+    name would be non-empty, and a non-empty set is what makes the honest arm unreachable."""
+    history: list[ModelMessage] = [
+        ModelResponse(parts=[ToolCallPart("propose_first_slice", _args(_NINE, _THREE), "p1")]),
+        _mark_call("A thing nobody asked for", "m1"),
+    ]
+    assert finished_slice(history) == set()
+
+
+def test_the_engine_seeds_both_halves_of_the_record() -> None:
+    """★ THE CALL SITE, PINNED STRUCTURALLY — because the behavioural test above cannot.
+
+    The remainder is only honest if the turn starts from what the record says on BOTH halves.
+    Seeding just the agreement is what made the second turn of a piece-at-a-time build report
+    a finished piece as outstanding, and that defect is invisible to any test that sets
+    `finished_pieces` itself.
+
+    So this reads the source: wherever the engine seeds `agreed_pieces` from `agreed_slice`, it
+    must seed `finished_pieces` from `finished_slice` in the same place. Structural for the same
+    reason the three-bounds guard is — what matters is that the call exists, and a test that
+    could observe it would have to stand up most of a turn.
+
+    Mutation check (run): replace the seeding with `set()` and this goes red."""
+    import ast
+    import inspect
+    import pathlib as _pathlib
+
+    from src.services.turns import engine as engine_module
+
+    tree = ast.parse(_pathlib.Path(inspect.getfile(engine_module)).read_text())
+    seeded: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not (isinstance(target, ast.Attribute) and isinstance(node.value, ast.Call)):
+            continue
+        callee = node.value.func
+        if target.attr in {"agreed_pieces", "finished_pieces"} and isinstance(callee, ast.Name):
+            seeded[target.attr] = callee.id
+
+    assert seeded.get("agreed_pieces") == "agreed_slice", (
+        "the engine no longer seeds the agreement from the record"
+    )
+    assert seeded.get("finished_pieces") == "finished_slice", (
+        "the engine seeds the agreement from the record but not the marks — the second turn of "
+        "a piece-at-a-time build will name finished work as still outstanding"
+    )

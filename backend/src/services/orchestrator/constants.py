@@ -42,11 +42,19 @@ a large context are cheap in count and in seconds and expensive in tokens. The c
 the meter and the agent cannot, so the platform is the only party that can hold this line —
 which is exactly why it is a number here and not a sentence in a prompt.
 
-MEASURED ON `RunUsage.total_tokens`, WHICH EXCLUDES CACHE READS, and that exclusion is the
-point rather than an accident. This loop re-sends the same instructions and tool definitions
-verbatim on every step behind a cache breakpoint; counting those reads would make the bound a
-function of how many steps a build took rather than of how much work it did, and would punish
-the caching that makes long builds affordable.
+MEASURED COST-WEIGHTED, THROUGH `usage/gate.py`'s `weighted_spend` — the same weighting the
+citizen's daily meter uses, so the two ceilings measure the same thing. This loop re-sends the
+same instructions and tool definitions verbatim on every step behind a cache breakpoint, and
+counting those reads at face value would make the bound a function of how many steps a build
+took rather than of how much work it did, punishing the caching that makes long builds
+affordable.
+
+NOT `RunUsage.total_tokens`, AND AN EARLIER VERSION OF THIS BOUND GOT THAT WRONG. That property
+is `input_tokens + output_tokens`, and under pydantic-ai `input_tokens` is the grand-total
+prompt size with the cache buckets already inside it — 10 fresh tokens plus a 90k cache read
+arrive as `input_tokens == 90_010`. Reading it raw is the mistake `billable_spend` records as a
+2026-07-30 production incident, where one calculator build booked 956k of a 1M daily cap on 68
+tokens of real fresh input.
 
 SIZED AGAINST A REAL TRACE, not chosen for roundness: the 2026-08-18 demo build spent ~938k
 tokens, of which about 65% was rework after an in-place container reset. 750k leaves room for a

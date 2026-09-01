@@ -124,6 +124,7 @@ from src.services.messages.projection import (
     agreed_slice,
     classify_tool_call,
     finished_from_args,
+    finished_slice,
     long_operation_line,
     proposal_from_args,
     update_from_args,
@@ -182,6 +183,7 @@ from src.services.usage.gate import (
     enforce_daily_limit,
     next_ist_midnight_iso,
     record_usage,
+    weighted_spend,
 )
 
 _log = structlog.get_logger()
@@ -399,6 +401,30 @@ def _persistable_messages(new_messages: list[ModelMessage]) -> list[ModelMessage
 
 class TurnNotRunningError(Exception):
     """Stop named a turn that is not the conversation's in-flight turn."""
+
+
+def _run_spend(usage: RunUsage) -> int:
+    """What this run has spent, weighted the way the citizen's daily meter weights it.
+
+    NOT `usage.total_tokens`. That is `input_tokens + output_tokens`, and under pydantic-ai
+    `input_tokens` is the grand-total prompt size with the cache buckets ALREADY FOLDED IN —
+    verified against the Anthropic mapper, where 10 fresh input tokens plus a 90k cache read
+    arrive as `input_tokens == 90_010`. A bound reading that raw number prices a cached prefix
+    at full rate on every step, which is precisely the mistake `billable_spend` records as a
+    2026-07-30 production incident: one calculator build booked 956k of a 1M daily cap on 68
+    tokens of real fresh input. A per-run bound repeating it would end honest builds early, and
+    would measure how many steps a build took rather than how much work it did — the very thing
+    `RUN_TOKEN_BUDGET`'s own docstring says the bound must not do.
+
+    ONE POLICY, TWO READERS. The weighting lives in `usage/gate.py` beside the daily meter's
+    column expression, because a per-run ceiling and a per-day ceiling that weighted tokens
+    differently would be two numbers described to the citizen as the same word."""
+    return weighted_spend(
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        cache_read_tokens=usage.cache_read_tokens,
+        cache_write_tokens=usage.cache_write_tokens,
+    )
 
 
 def _sandbox_unavailable_message(exc: Exception) -> str:
@@ -915,6 +941,13 @@ class TurnEngine:
             # the voice channel is on both arms of the toolset. Moving this inside the Build
             # fork would silently drop legitimate marks in a Plan chat that proposed a slice.
             state.agreed_pieces = agreed_slice(history)
+            # AND THE MARKS WITH IT. Seeding only the agreement gave the two halves different
+            # memories: the agreement survived a turn and the completion did not, so the second
+            # turn of a piece-at-a-time build named the first turn's finished piece as still
+            # outstanding — the platform asserting that finished work is undone, which is the
+            # false fact this unit exists to prevent, arriving through the other door. Both
+            # halves now come from the same record.
+            state.finished_pieces = finished_slice(history)
             if state.kind is ChatKind.BUILD:
                 # A READER OF THE KIND, AND IT ASKS WHICH HARNESS RUNS THE TURN — the node loop
                 # with its per-step billing fold versus a single `chat_agent.run`. That is the
@@ -1874,7 +1907,7 @@ class TurnEngine:
                     # Copy first, then say: this is the one path in the codebase where getting
                     # that ordering wrong loses a citizen's tree, so there is one function that
                     # does it and two sentences it can carry.
-                    spent = state.tokens_spent + run.usage.total_tokens
+                    spent = state.tokens_spent + _run_spend(run.usage)
                     if spent >= RUN_TOKEN_BUDGET:
                         _log.info(
                             "run_token_budget_reached",
@@ -1979,7 +2012,7 @@ class TurnEngine:
             # on the cut-short arm and the completed one alike — a repair round that stopped
             # early still spent what it spent, and a bound that forgot it would reset on every
             # repair, which is the runaway shape it exists to stop.
-            state.tokens_spent += run.usage.total_tokens
+            state.tokens_spent += _run_spend(run.usage)
         return messages
 
     async def _record_write_step(

@@ -142,6 +142,40 @@ _CACHE_READ_DIVISOR = 10  # read ≈ fresh / 10
 _CACHE_WRITE_SURCHARGE_DIVISOR = 4  # write ≈ fresh + fresh / 4 (125%)
 
 
+def weighted_spend(
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int,
+    cache_write_tokens: int,
+) -> int:
+    """`billable_spend`'s weighting, applied to an in-memory usage object rather than a row.
+
+    THE SECOND READER OF ONE POLICY, NOT A SECOND POLICY. `billable_spend` below is a SQL
+    column expression and cannot be evaluated against a live `RunUsage`, which is what a
+    running turn holds. Both spell the same arithmetic from the same two divisors, and the
+    test suite pins them to agree on the same numbers — a per-run bound that weighted tokens
+    differently from the daily meter would mean two ceilings measuring two different things
+    while both are described to the citizen as spend.
+
+    WHY WEIGHTED AT ALL, AND THIS IS THE PART THAT COST US ONCE. Under pydantic-ai
+    `input_tokens` is the grand-total prompt size and `cache_read`/`cache_write` are sub-buckets
+    ALREADY INSIDE it, so a naive `input + output` counts a cached prefix at full price on every
+    step. Billing reads at face value is what let one simple-calculator build book 956k of a 1M
+    daily cap while its real fresh input was 68 tokens (2026-07-30 prod incident). A per-run
+    bound reading the raw total would repeat that: it would end long-but-legitimate builds early
+    and be a function of how many steps a build took rather than how much work it did.
+    """
+    fresh = max(input_tokens - cache_read_tokens - cache_write_tokens, 0)
+    return int(
+        fresh
+        + output_tokens
+        + cache_read_tokens / _CACHE_READ_DIVISOR
+        + cache_write_tokens
+        + cache_write_tokens / _CACHE_WRITE_SURCHARGE_DIVISOR
+    )
+
+
 def billable_spend() -> sa.ColumnElement[int]:
     """The daily billable token total as a column expression, COST-WEIGHTED per token class:
     `fresh_input + output + cache_read/10 + cache_write*1.25`.
