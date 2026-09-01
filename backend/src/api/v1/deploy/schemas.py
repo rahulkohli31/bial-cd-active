@@ -152,6 +152,14 @@ class ApprovalState(CamelModel):
     # NULL is a real state, not a gap: a never-approved app has no pin, and a
     # never-submitted draft has no lineage (see `ApprovalRoute`'s NULL semantics).
     approved_commit_sha: str | None = None
+    # WHEN the administrator approved, beside WHICH commit they approved. The pin alone
+    # cannot be rendered to a citizen — Plan G's chip names the date first and mutes the
+    # build code beside it, because a date is the thing a person recognises. Costs
+    # nothing: `approved_at` is a column on the registry row this response already
+    # selects in full, so surfacing it adds no query and no I/O. NULL means never
+    # approved, exactly as `approved_commit_sha` does — the two are written together in
+    # one place (`admin/router.py`'s `approve`) and are never apart.
+    approved_at: datetime | None = None
     approval_route: ApprovalRoute | None = None
     rejection_note: str | None = None
     submitted_sha: str | None = None
@@ -162,6 +170,7 @@ class ApprovalState(CamelModel):
         return cls(
             status=row.status,
             approved_commit_sha=row.approved_commit_sha,
+            approved_at=row.approved_at,
             approval_route=row.approval_route,
             rejection_note=row.rejection_note,
             submitted_sha=row.source_commit_sha,

@@ -36,6 +36,10 @@ const BODY = {
   failureDetail: null,
   startedAt: '2026-08-12T09:00:00Z',
   finishedAt: '2026-08-12T09:05:00Z',
+  // TOTAL — every response shape carries one, so a fixture without it is not a shape the
+  // server can produce. `live_current` because this fixture IS a succeeded deploy serving
+  // an address with nothing newer saved.
+  publishState: 'live_current',
 }
 
 describe('getDeployment parses the takedown axis', () => {
@@ -82,6 +86,7 @@ describe('getDeployment parses the APPROVAL state riding on the same response', 
   const APPROVAL = {
     status: 'pending',
     approvedCommitSha: null,
+    approvedAt: null,
     approvalRoute: 'self_publish',
     rejectionNote: 'Explain where the vendor key is stored.',
     submittedSha: 'a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0',
@@ -149,6 +154,115 @@ describe('getDeployment parses the APPROVAL state riding on the same response', 
     )
 
     expect(view.approval?.approvalRoute).toBeNull()
+  })
+
+  it('carries WHEN it was approved beside WHICH commit was', async () => {
+    // The approved states name the date first and mute the build code beside it. The pin
+    // alone cannot be rendered as a version row, so the stamp has to survive the parse.
+    // Mutation receipt: drop `approvedAt: optionalString(value.approvedAt)` from
+    // toApprovalState and this goes red.
+    const view = await getDeployment(
+      'p1',
+      deps(
+        vi.fn(async () =>
+          ok({
+            ...BODY,
+            approval: {
+              ...APPROVAL,
+              status: 'approved',
+              approvedCommitSha: 'f9e8d7c6b5a4f9e8d7c6b5a4f9e8d7c6b5a4f9e8',
+              approvedAt: '2026-08-20T09:14:00Z',
+            },
+          }),
+        ),
+      ),
+    )
+
+    expect(view.approval?.approvedAt).toBe('2026-08-20T09:14:00Z')
+    expect(view.approval?.approvedCommitSha).toBe('f9e8d7c6b5a4f9e8d7c6b5a4f9e8d7c6b5a4f9e8')
+  })
+})
+
+/**
+ * THE ONE FIELD THE PUBLISH SURFACE BRANCHES ON (R38). Every case here is about the
+ * boundary refusing to invent a state: the surface IS this field, so there is no
+ * conservative reading of an unrecognised value that is not itself a claim.
+ */
+describe('getDeployment parses the one publish state, and refuses to guess it', () => {
+  const parse = async (over: Record<string, unknown>) =>
+    getDeployment('p1', deps(vi.fn(async () => ok({ ...BODY, ...over }))))
+
+  it('parses the drifted-live value with the live version stamp it renders beside', async () => {
+    const view = await parse({
+      publishState: 'live_newer_work',
+      headSha: 'a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0',
+    })
+
+    expect(view.publishState).toBe('live_newer_work')
+    expect(view.headSha).toBe('a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0')
+    expect(view.finishedAt).toBe('2026-08-12T09:05:00Z')
+  })
+
+  it('parses the PLAIN live value, and it equals neither of the other two', async () => {
+    // The ordinary state of a published app with nothing newer saved — reachable because
+    // the server's read makes the comparison (R-1 amended). Asserting the inequalities is
+    // the point: a parser that collapsed any of these three into another would render one
+    // state's sentence over another's, and "nothing of yours is waiting" is the exact
+    // false reassurance this feature has shipped four times.
+    const view = await parse({ publishState: 'live_current' })
+
+    expect(view.publishState).toBe('live_current')
+    expect(view.publishState).not.toBe('live_newer_work')
+    expect(view.publishState).not.toBe('live_drift_unknown')
+  })
+
+  it('parses the could-not-determine value as its own thing, never as plain live', async () => {
+    const view = await parse({ publishState: 'live_drift_unknown' })
+
+    expect(view.publishState).toBe('live_drift_unknown')
+    expect(view.publishState).not.toBe('live_current')
+  })
+
+  it('parses a state with no live version and no approval stamp', async () => {
+    const view = await parse({
+      publishState: 'draft',
+      headSha: null,
+      finishedAt: null,
+      url: null,
+      approval: {
+        status: 'draft',
+        approvedCommitSha: null,
+        approvedAt: null,
+        approvalRoute: null,
+        rejectionNote: null,
+        submittedSha: null,
+        submittedAt: null,
+      },
+    })
+
+    expect(view.publishState).toBe('draft')
+    expect(view.headSha).toBeNull()
+    expect(view.approval?.approvedCommitSha).toBeNull()
+    expect(view.approval?.approvedAt).toBeNull()
+  })
+
+  it('throws on an unrecognised value, with a message a person can read', async () => {
+    // Mutation receipt: give `toPublishState` a fallback arm — any fallback — and this
+    // goes red. There is deliberately no default and no exported escape hatch.
+    const err = await parse({ publishState: 'live_probably' }).catch((e: unknown) => e)
+
+    expect(err).toBeInstanceOf(ApiError)
+    expect((err as ApiError).message).toMatch(/publish state we could not read/i)
+  })
+
+  it('throws when the value is missing entirely — a total field with a hole is a bug', async () => {
+    const { publishState: _dropped, ...withoutIt } = BODY
+    const err = await getDeployment('p1', deps(vi.fn(async () => ok(withoutIt)))).catch(
+      (e: unknown) => e,
+    )
+
+    expect(err).toBeInstanceOf(ApiError)
+    expect((err as ApiError).message).toMatch(/publish state we could not read/i)
   })
 })
 

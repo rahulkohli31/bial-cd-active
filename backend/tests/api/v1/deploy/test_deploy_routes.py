@@ -601,6 +601,11 @@ async def test_the_status_carries_the_apps_approval_state(wire, client, db_sessi
     assert resp.json()["approval"] == {
         "status": "pending",
         "approvedCommitSha": None,
+        # Beside the pin, and NULL for the same reason it is: this app is pending, so
+        # nobody has approved anything yet. The two are written together and are never
+        # apart. Asserted as an exact dict on purpose — a field added to the wire without
+        # a client that reads it should have to come through here.
+        "approvedAt": None,
         "approvalRoute": "self_publish",
         "rejectionNote": "Explain where the vendor key is stored.",
         "submittedSha": _HEAD_SHA,
@@ -641,8 +646,36 @@ async def test_a_never_submitted_app_still_reports_its_draft_lifecycle(
     assert approval["status"] == "draft"
     assert approval["submittedSha"] is None
     assert approval["approvedCommitSha"] is None
+    assert approval["approvedAt"] is None
     assert approval["approvalRoute"] is None
     assert resp.json()["publishState"] == "draft"
+
+
+async def test_the_approval_carries_when_it_was_approved_not_only_which_commit(
+    wire, client, db_session
+) -> None:
+    """The approved states name a DATE first and mute the build code beside it, because a
+    date is what a person recognises — so the stamp has to reach the wire, not just the pin.
+
+    It costs nothing: `approved_at` is a column on the registry row this route already
+    selects in full. It is written in exactly one place, beside `approved_commit_sha`
+    (`admin/router.py`'s `approve`), which is why the two are asserted together here.
+
+    Mutation receipt: drop `approved_at=row.approved_at` from `ApprovalState.of` and this
+    goes red on `approvedAt` being None while the pin beside it is not."""
+    user, app_row = await _owner_with_app(db_session, wire)
+    approved = datetime(2026, 8, 19, 10, 0, tzinfo=UTC)
+    app_row.status = AppStatus.APPROVED
+    app_row.approved_commit_sha = _HEAD_SHA
+    app_row.approved_at = approved
+    app_row.approval_route = ApprovalRoute.SELF_PUBLISH
+    await db_session.commit()
+
+    resp = await client.get(_STATUS.format(pid=app_row.project_id), headers=auth_headers(user))
+
+    approval = resp.json()["approval"]
+    assert approval["approvedCommitSha"] == _HEAD_SHA
+    assert approval["approvedAt"] == "2026-08-19T10:00:00Z"
 
 
 # --- the status read does not need the pipeline ------------------------------------
