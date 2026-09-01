@@ -2,15 +2,18 @@
  * The cross-surface reconciliation event — the mechanism that stops two mounts of the
  * publish surface disagreeing, and the one thing about it that had no test at all.
  *
- * ITS SUBJECT IS NOT RETIRED, WHICH IS WHY THIS SUITE MOVED RATHER THAN WENT. It was
- * written when three controls each ran their own `useDeployment`, two of them two inches
- * apart on one screen, where nothing is ever re-entered and a withdrawal in one left the
- * other saying "waiting for review". Those three are now one chip — but the chip is still
- * mounted TWICE, on the project page and in the builder's pane toolbar, and it will be
- * until Plan F merges the two screens. So the nudge now buys CROSS-ROUTE and CROSS-TAB
- * freshness instead of settling an argument between two cards: a publish started in one
- * tab must not leave another tab's chip stale. Same mechanism, same test, different reason
- * to keep it.
+ * WHAT IT PINS IS A CONTRACT, NOT A SHIPPED ARRANGEMENT — and saying so is the point of
+ * this note. It was written when three controls each ran their own `useDeployment`, two of
+ * them two inches apart on one screen, where nothing is ever re-entered and a withdrawal in
+ * one left the other saying "waiting for review". Those three are now one chip with two
+ * mount SITES, and the two sites are sibling routes under one Outlet: at most one is live,
+ * so in the shipped product the nudge has nobody to notify today.
+ *
+ * The suite is kept because the mechanism is, and for the same reason — it is what makes a
+ * second publish surface in one document safe, and re-learning that the hard way is the
+ * outcome deleting it buys. These tests render two hooks EXPLICITLY, which is the only way
+ * the contract can be exercised at all now; do not read that as a claim about how many the
+ * app mounts.
  *
  * These mount TWO hooks on the same project — the shape the event exists for — and assert
  * the reconciliation without leaning on focus or visibility, which have their own paths.

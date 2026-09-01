@@ -82,8 +82,8 @@ afterEach(cleanup)
 
 describe('the poll runs only while something is actually changing on its own', () => {
   // THE INCIDENT: an ungated timer hit the API every five seconds for as long as a page
-  // stayed open — 132 requests on one idle project page. The chip is mounted TWICE per
-  // session, so an ungated timer is now two of them.
+  // stayed open — 132 requests on one idle project page, from two controls that each ran
+  // their own. One chip is half of that and still all of the bug.
   const callsOverTime = async (publishState: PublishState): Promise<number> => {
     getDeployment.mockResolvedValue(view(publishState))
     vi.useFakeTimers()

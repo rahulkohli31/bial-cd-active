@@ -14,12 +14,25 @@
  * still a draft. Hanging the lifecycle off this read is also the only way a surface with
  * no app id can show anything at all, and the builder's mount is exactly that.
  *
- * MUTATIONS ANNOUNCE THEMSELVES to every other mount watching the same project. The
- * visibility/focus listeners fire only when a tab is re-entered, which is no use to two
- * surfaces on one screen — and after this plan there are no longer two on one screen, so
- * the nudge now buys CROSS-ROUTE and CROSS-TAB freshness instead: a publish started in one
- * tab must not leave another tab's chip stale. Still worth its lines, for a different
- * reason than it was written for.
+ * TWO REFRESH TRIGGERS BESIDES THE POLL, and they are worth telling apart.
+ *
+ * The visibility/focus listeners are what make the poll safe to stop: a publish can be
+ * started from another tab, so a settled state is re-read whenever somebody actually looks
+ * at this one. That is the cross-tab story, and it still works exactly as it did.
+ *
+ * The `bial:deployment-changed` nudge is NOT that. It is a `window` CustomEvent, so it never
+ * leaves the document that dispatched it — it exists to reconcile two mounts on ONE screen,
+ * which is what the retired publish card and review status card were: two inches apart,
+ * where nothing is ever re-entered and a withdrawal in one left the other saying "waiting
+ * for review". There is now one chip, and its two mount sites (the project page and the
+ * builder's pane toolbar) are SIBLING ROUTES under one Outlet — so at most one is live and
+ * the nudge currently has nobody to notify.
+ *
+ * IT IS KEPT ANYWAY, deliberately, and this is the whole reason: it is three lines and a
+ * listener, it costs nothing while it has no second mount, and the moment anything puts two
+ * publish surfaces in one document again it is the difference between them agreeing and
+ * them contradicting each other. Deleting it would be re-learning that lesson later. Its
+ * test renders two hooks explicitly and so still pins the contract.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {

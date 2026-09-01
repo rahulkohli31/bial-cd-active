@@ -33,8 +33,10 @@
  *   · Its popover is PORTALLED to the document body, so a header with clipped overflow or
  *     its own stacking context cannot hide it. This is load-bearing today: the builder
  *     mount sits under four nested `overflow-hidden` ancestors.
- *   · It owns its own read and its own refresh lifetime, so mounting it twice is CORRECT
- *     rather than merely tolerated.
+ *   · It owns its own read and its own refresh lifetime, so a SECOND mount would be correct
+ *     rather than merely tolerated. There are two mount SITES today — this project page and
+ *     the builder's pane toolbar — but they are sibling routes under one Outlet, so only
+ *     ever one of them is live.
  *   · Plan F's only obligation is to place it beside the project name and drop the mount
  *     that dies with the builder page. Nothing here changes when F collapses the screens.
  * ────────────────────────────────────────────────────────────────────────────────────
@@ -52,6 +54,7 @@ import { Popover, PopoverContent, PopoverTrigger } from './ui/popover'
 import DataClassificationModal from './DataClassificationModal'
 import { usePublishState } from '../hooks/usePublishState'
 import { assertNever } from '../utils/assertNever'
+import { shortSha } from '../utils/shortSha'
 import type {
   ApprovalState,
   DeployOutcome,
@@ -493,13 +496,11 @@ export default function PublishStatusChip({
    * It sits OUTSIDE the popover on purpose: an announcement is owed whether or not the
    * popover happens to be open.
    */
-  const announcement =
-    answer ??
-    (loadError !== null
-      ? 'Publish status: unavailable'
-      : presentation === null
-        ? ''
-        : `Publish status: ${presentation.label}`)
+  let announcement = answer ?? ''
+  if (answer === null && loadError !== null) announcement = 'Publish status: unavailable'
+  else if (answer === null && presentation !== null) {
+    announcement = `Publish status: ${presentation.label}`
+  }
 
   const liveRegion = (
     <span data-testid="publish-announce" role="status" aria-live="polite" className="sr-only">
@@ -521,30 +522,30 @@ export default function PublishStatusChip({
       <>
         {liveRegion}
         <Popover open={open} onOpenChange={onOpenChange}>
-        <PopoverTrigger asChild>
-          <button
-            type="button"
-            data-testid="publish-chip"
-            aria-label="Publish status: unavailable"
-            className="inline-flex items-center gap-1 rounded-md border border-bial-border bg-surface-muted px-2 py-0.5 text-xs font-semibold text-neutral transition hover:bg-white"
-          >
-            Status unavailable
-            <ChevronDown size={12} aria-hidden />
-          </button>
-        </PopoverTrigger>
-        <PopoverContent data-testid="publish-popover" aria-labelledby={headingId}>
-          <p id={headingId} className="text-xs leading-relaxed text-neutral">
-            {loadError}
-          </p>
-          <button
-            type="button"
-            data-testid="publish-recheck"
-            onClick={() => void refresh()}
-            className="mt-3 w-full rounded-lg bg-primary px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-primary-600"
-          >
-            Check again
-          </button>
-        </PopoverContent>
+          <PopoverTrigger asChild>
+            <button
+              type="button"
+              data-testid="publish-chip"
+              aria-label="Publish status: unavailable"
+              className="inline-flex items-center gap-1 rounded-md border border-bial-border bg-surface-muted px-2 py-0.5 text-xs font-semibold text-neutral transition hover:bg-white"
+            >
+              Status unavailable
+              <ChevronDown size={12} aria-hidden />
+            </button>
+          </PopoverTrigger>
+          <PopoverContent data-testid="publish-popover" aria-labelledby={headingId}>
+            <p id={headingId} className="text-xs leading-relaxed text-neutral">
+              {loadError}
+            </p>
+            <button
+              type="button"
+              data-testid="publish-recheck"
+              onClick={() => void refresh()}
+              className="mt-3 w-full rounded-lg bg-primary px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-primary-600"
+            >
+              Check again
+            </button>
+          </PopoverContent>
         </Popover>
       </>
     )
@@ -604,7 +605,7 @@ export default function PublishStatusChip({
                     data-testid="publish-version-sha"
                     className="ml-1.5 rounded bg-surface-muted px-1 py-0.5 text-[10px] font-normal text-neutral"
                   >
-                    {version.sha.slice(0, 7)}
+                    {shortSha(version.sha)}
                   </code>
                 )}
               </p>
