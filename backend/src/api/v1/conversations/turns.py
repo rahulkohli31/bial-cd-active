@@ -340,12 +340,18 @@ async def start_turn(
         raise AppApiError(404, "Conversation not found.")
 
     rehydrate = history_rehydrator(db, storage, user.id)
-    try:
-        history = await load_history(
-            db, user_id=user.id, conversation_id=conversation.id, rehydrate=rehydrate
-        )
-    except AttachmentRehydrationError as exc:
-        raise AppApiError(400, str(exc)) from None
+
+    async def _history() -> list[ModelMessage]:
+        """Read twice on the rare path below, so the translation of a rehydration failure into
+        the citizen's 400 is written once rather than kept in step by hand."""
+        try:
+            return await load_history(
+                db, user_id=user.id, conversation_id=conversation.id, rehydrate=rehydrate
+            )
+        except AttachmentRehydrationError as exc:
+            raise AppApiError(400, str(exc)) from None
+
+    history = await _history()
     binaries = await resolve_binaries(db, storage, user.id, body.message.attachment_ids)
     prompt = prompt_content(body.message, binaries)
 
@@ -375,12 +381,7 @@ async def start_turn(
     # It moved BELOW the guardrail above (it used to lead this block) because it is this
     # route's first committing write, and every side-effect-free refusal has to land above it.
     if await resolve_pending_as_refine(db, user_id=user.id, conversation_id=conversation.id):
-        try:
-            history = await load_history(
-                db, user_id=user.id, conversation_id=conversation.id, rehydrate=rehydrate
-            )
-        except AttachmentRehydrationError as exc:
-            raise AppApiError(400, str(exc)) from None
+        history = await _history()
 
     display_name = user.display_name or user.email
     prompt_context = PromptContext(

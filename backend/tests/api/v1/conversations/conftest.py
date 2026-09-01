@@ -7,8 +7,15 @@ The "a build is running in this thread" seam (`building`) moved up to `tests/api
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 
+from src.config import settings
+from src.services.auth.csrf import issue_csrf_token
+from src.services.auth.session_jwt import mint_session_jwt
+from src.services.turns.engine import TurnEngine, set_turn_engine_for_tests
+from src.services.turns.guard import _mid_reply
 from tests.fakes import FakeStorage
 
 
@@ -67,3 +74,65 @@ def no_workspace_service(app) -> None:
     from src.api.v1.build_sessions.deps import sandbox_or_none_dependency
 
     app.dependency_overrides[sandbox_or_none_dependency] = lambda: None
+
+
+# =============================================================================
+# The turn-driving seams, shared by the four files that drive turns
+# =============================================================================
+#
+# These were byte-identical copies in `test_turn_stream.py`, `test_build_transition.py`,
+# `test_project_grounding.py` and `test_context_gate.py` — the last two added the 3rd and 4th
+# copy, and `test_build_transition.py` had already resorted to importing `_headers` out of
+# ANOTHER TEST MODULE to avoid a fifth. They live here now.
+#
+# THEY ARE DELIBERATELY NOT `autouse`, unlike the storage and workspace fixtures above. Six other
+# files in this directory drive no turns at all, and a directory-wide autouse `_override_billing`
+# would rebind their billing factory for no reason. The four that need them opt in with a
+# module-level `pytestmark = pytest.mark.usefixtures("_fresh_engine", "_override_billing")` —
+# the same blast radius the per-module `autouse=True` had, said out loud at the module that wants
+# it rather than assumed for eight.
+
+_TTL = settings.auth.access_ttl_seconds
+
+
+def _headers(user, *, with_csrf: bool = True) -> dict[str, str]:
+    """A signed-in browser's cookies. `with_csrf=False` is the unsafe-method rejection case."""
+    jwt = mint_session_jwt(user.id, user.token_version, _TTL)
+    if not with_csrf:
+        return {"Cookie": f"session={jwt}"}
+    csrf = issue_csrf_token(user.id, user.token_version)
+    return {"Cookie": f"session={jwt}; csrf={csrf}", "X-CSRF-Token": csrf}
+
+
+@pytest.fixture
+def _fresh_engine():
+    """One turn engine per test, and a clean mid-reply guard either side of it — the engine is a
+    process global, so one leaked from a previous test would decide the next test's answer."""
+    _mid_reply.clear()
+    engine = TurnEngine()
+    set_turn_engine_for_tests(engine)
+    yield engine
+    set_turn_engine_for_tests(None)
+    _mid_reply.clear()
+
+
+@pytest.fixture
+def _override_billing(app, db_session) -> None:
+    """Bill against the test's own session, so a turn's usage row is visible to its assertions."""
+    from src.api.v1.conversations._shared import billing_session_factory
+
+    @contextlib.asynccontextmanager
+    async def _session():
+        yield db_session
+
+    app.dependency_overrides[billing_session_factory] = lambda: lambda: _session()
+
+
+@pytest.fixture
+def set_chat_model(app):
+    def _set(model) -> None:
+        from src.api.v1.conversations._shared import chat_model
+
+        app.dependency_overrides[chat_model] = lambda: model
+
+    return _set

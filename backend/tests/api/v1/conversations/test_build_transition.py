@@ -51,8 +51,6 @@ from src.services.messages.projection import (
 )
 from src.services.messages.store import load_history, load_rows
 from src.services.turns.copy import ALREADY_BUILDING_HERE_CODE
-from src.services.turns.engine import TurnEngine, set_turn_engine_for_tests
-from src.services.turns.guard import _mid_reply
 from src.services.turns.plan_options import (
     find_pending,
     resolution_of,
@@ -60,7 +58,7 @@ from src.services.turns.plan_options import (
 )
 from src.services.usage.gate import record_usage
 from tests.api.v1.build_sessions.conftest import _sandbox_config
-from tests.api.v1.conversations.test_turn_stream import _headers
+from tests.api.v1.conversations.conftest import _headers
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 from tests.fakes import FakeBrain, FakeSandboxClient
 
@@ -72,35 +70,10 @@ _PLAN = (
 )
 
 
-@pytest.fixture(autouse=True)
-def _fresh_engine():
-    _mid_reply.clear()
-    engine = TurnEngine()
-    set_turn_engine_for_tests(engine)
-    yield engine
-    set_turn_engine_for_tests(None)
-    _mid_reply.clear()
-
-
-@pytest.fixture(autouse=True)
-def _override_billing(app, db_session) -> None:
-    from src.api.v1.conversations._shared import billing_session_factory
-
-    @contextlib.asynccontextmanager
-    async def _session():
-        yield db_session
-
-    app.dependency_overrides[billing_session_factory] = lambda: lambda: _session()
-
-
-@pytest.fixture
-def set_chat_model(app):
-    def _set(model) -> None:
-        from src.api.v1.conversations._shared import chat_model
-
-        app.dependency_overrides[chat_model] = lambda: model
-
-    return _set
+# The turn-driving fixtures live in `conftest.py` — four files needed the same four, and
+# two of them were the 3rd and 4th copy. Named here rather than autouse there, because the
+# other files in this directory drive no turns.
+pytestmark = pytest.mark.usefixtures("_fresh_engine", "_override_billing")
 
 
 @pytest.fixture

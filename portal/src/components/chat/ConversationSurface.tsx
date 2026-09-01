@@ -454,6 +454,15 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
   // The per-conversation guardrail's SOFT half. The transcript lives here, so the estimate does
   // too — the composer is handed a finished sentence rather than a second opinion about how long
   // the conversation is. The HARD half is the server's and arrives as an ordinary `turnError`.
+  //
+  // THE DEP IS `messages`, NOT `messages.length`, AND NARROWING IT WOULD BREAK THE FEATURE.
+  // `text_delta` repaints through `.map`, so the array grows a new reference on every frame
+  // while its LENGTH holds still for the whole reply. Keying on length would therefore skip
+  // exactly the case this warning exists for: a single enormous answer that pushes the chat
+  // over on its own. The citizen would see nothing, send once more, and meet the server's 413
+  // instead of the sentence that was supposed to reach them first. The walk is bounded by part
+  // count (JS `.length` is O(1)), and `transcript` below already re-walks the same array on
+  // every frame, so the recompute is not what costs anything here.
   const contextWarning = useMemo(() => contextState(messages).message, [messages])
   const turnNarrativeIsThisChat = turnNarrativeChatRef.current === buildId
   const turnBuildStatus = useMemo(

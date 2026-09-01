@@ -212,10 +212,14 @@ async def resolve(
 async def resolve_pending_as_refine(
     db: AsyncSession, *, user_id: uuid.UUID, conversation_id: uuid.UUID
 ) -> Resolution | None:
-    """The implicit resolution (free text while options are pending → `refine`). Called
-    by the turn-start path BEFORE history loads, so the model always sees a resolved
-    call — the dangling-call repair never has to guess about a card the user simply
-    typed past. No pending → None, not an error."""
+    """The implicit resolution (free text while options are pending → `refine`), so the model
+    always sees a resolved call — the dangling-call repair never has to guess about a card the
+    user simply typed past. No pending → None, not an error.
+
+    The turn-start path calls this AFTER its first history load, not before: this is that
+    route's first committing write (`resolve` reaches `append_batch`, which owns its commit), so
+    every side-effect-free refusal — the context guardrail above all — has to be decided above
+    it. The caller re-reads the history when this returns a resolution."""
     pending = await find_pending(db, user_id=user_id, conversation_id=conversation_id)
     if pending is None:
         return None

@@ -34,45 +34,23 @@ from pydantic_ai.models.function import (
 from sqlalchemy import func, select
 
 from src.api.v1.conversations._shared import chat_model as chat_model_dep
-from src.config import settings
 from src.db.models.conversation import ChatKind
 from src.db.models.message import Message, MessageEntryKind
 from src.db.models.token_usage import TokenUsage
 from src.db.models.user_limit import UserLimit
 from src.main import create_app
-from src.services.auth.csrf import issue_csrf_token
-from src.services.auth.session_jwt import mint_session_jwt
 from src.services.messages.store import append_batch
 from src.services.turns.copy import CHAT_TOO_LONG_CODE, CHAT_TOO_LONG_TEXT
-from src.services.turns.engine import TurnEngine, set_turn_engine_for_tests
-from src.services.turns.guard import _mid_reply
 from src.services.turns.plan_options import find_pending
 from src.services.usage.context_window import SYSTEM_PROMPT_RESERVE
 from src.services.usage.limits import DEFAULT_CONTEXT_HARD
+from tests.api.v1.conversations.conftest import _headers
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 
-_TTL = settings.auth.access_ttl_seconds
-
-
-@pytest.fixture(autouse=True)
-def _fresh_engine():
-    _mid_reply.clear()
-    engine = TurnEngine()
-    set_turn_engine_for_tests(engine)
-    yield engine
-    set_turn_engine_for_tests(None)
-    _mid_reply.clear()
-
-
-@pytest.fixture(autouse=True)
-def _override_billing(app, db_session) -> None:
-    from src.api.v1.conversations._shared import billing_session_factory
-
-    @contextlib.asynccontextmanager
-    async def _session():
-        yield db_session
-
-    app.dependency_overrides[billing_session_factory] = lambda: lambda: _session()
+# The turn-driving fixtures live in `conftest.py` — four files needed the same four, and
+# two of them were the 3rd and 4th copy. Named here rather than autouse there, because the
+# other files in this directory drive no turns.
+pytestmark = pytest.mark.usefixtures("_fresh_engine", "_override_billing")
 
 
 @pytest.fixture(autouse=True)
@@ -85,12 +63,6 @@ def _a_model(app) -> None:
         yield "ok"
 
     app.dependency_overrides[chat_model] = lambda: FunctionModel(stream_function=_stream)
-
-
-def _headers(user) -> dict[str, str]:
-    jwt = mint_session_jwt(user.id, user.token_version, _TTL)
-    csrf = issue_csrf_token(user.id, user.token_version)
-    return {"Cookie": f"session={jwt}; csrf={csrf}", "X-CSRF-Token": csrf}
 
 
 async def _settle(engine: Any, conversation_id: uuid.UUID) -> None:
