@@ -9,6 +9,7 @@ import BuildProgress, { hasBuildNarrative, StepHistoryCollapsible } from '../com
 import type { StepHistoryItem } from '../components/chat/BuildProgress'
 import MessageContent from '../components/chat/MessageContent'
 import SessionBanners from '../components/chat/SessionBanners'
+import StopTurnControl from '../components/chat/StopTurnControl'
 import TurnBanner from '../components/chat/TurnBanner'
 import { atLimitSendState } from '../components/chat/BuildProgress'
 import AttachmentLightbox from '../components/AttachmentLightbox'
@@ -2561,6 +2562,36 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                 )}
               </p>
             )}
+            {/* STOP, RELOCATED TO THE COMPOSER (R55, Plan D U3). It ships here BEFORE anything is
+                deleted, so no commit in this plan leaves a build startable and not stoppable.
+                `BuildProgress`'s own Stop is deliberately left in place for now — two stop
+                controls for one turn is a transient state, and it is the safe direction of the
+                two. U10 gives this its permanent home on the new composer; U17 asserts a running
+                turn is still stoppable once the card is gone.
+
+                SCOPED TO THIS CHAT, the same way the bubble above is. The page does not remount
+                on a chat switch (CC3), so an unscoped condition renders a working Stop button in
+                a sibling chat for a build its reader never started. */}
+            {isActiveBuildStatus(buildStatus) &&
+              (narratingTurn || (showSession && sessionChatRef.current === buildId)) && (
+                <div className="flex justify-end">
+                  <StopTurnControl
+                    running
+                    // Read at PRESS time. `liveTurnIdRef` is a ref precisely because a value
+                    // captured at render stops the wrong turn — see its declaration.
+                    resolveTarget={() => {
+                      const conversationId = buildIdRef.current
+                      const turnId = liveTurnIdRef.current
+                      return conversationId && turnId ? { conversationId, turnId } : null
+                    }}
+                    onStopTurn={stopTurn}
+                    onStopSession={async () => {
+                      await session.stop()
+                    }}
+                    onStopFailed={setTurnError}
+                  />
+                </div>
+              )}
             <div className="flex gap-2 items-end rounded-2xl">
               <input
                 ref={fileInputRef}

@@ -232,7 +232,10 @@ describe('BuilderPage — the build-turn flow (ORIG-§3-d/f)', () => {
     // ONE working indicator, ONE way to interrupt it: a build has no separate stop any more, so
     // this is the same `stopTurn` an ordinary reply uses, addressed by the live chat + turn id —
     // the chat the page is actually ON after the handoff, not the one Build-it was pressed in.
-    fireEvent.click(screen.getByRole('button', { name: /^stop$/i }))
+    // Addressed by test id: `stop-turn` is the RELOCATED control on the composer (R55, Plan D
+    // U3). The build card's own Stop is still mounted beside it for now and does the same thing;
+    // this is the one that survives the card's deletion.
+    fireEvent.click(screen.getByTestId('stop-turn'))
     await waitFor(() => expect(h.stopTurn).toHaveBeenCalledWith(LIVE_CHAT_ID, BUILD_TURN_ID))
     expect(h.stop).not.toHaveBeenCalled() // never the C3 session stop
 

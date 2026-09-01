@@ -265,7 +265,11 @@ describe('showing the outcome', () => {
     renderThread()
     await runBuild(turn)
 
-    fireEvent.click(await screen.findByRole('button', { name: /^stop$/i }))
+    // `stop-turn` is the RELOCATED control on the composer (R55, Plan D U3), not the one inside
+    // the build card. Both are on screen for now and both stop the same turn the same way; this
+    // one is addressed by test id because it is the one that survives the card's deletion, so
+    // this assertion keeps meaning the same thing afterwards.
+    fireEvent.click(await screen.findByTestId('stop-turn'))
     await waitFor(() => expect(h.stopTurn).toHaveBeenCalledWith('thread-1', 't1'))
     expect(h.stop).not.toHaveBeenCalled() // never the C3 session stop
 

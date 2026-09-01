@@ -639,7 +639,11 @@ describe('cross-chat build scoping and reload fidelity (CC1–CC4)', () => {
     )
     await turn.frame(T_PREVIEW())
     await waitFor(() => expect(screen.getByTestId('build-progress')).toBeTruthy())
-    expect(screen.getByRole('button', { name: /^Stop$/i })).toBeTruthy() // the owning chat's own Stop is real
+    // The owning chat's own Stop is real. `getAllBy` because R55's relocated control now sits on
+    // the composer beside the build card's own — deliberately, and only until U17 deletes the
+    // card. What this guard is about is the SIBLING, and that assertion below is unchanged.
+    expect(screen.getAllByRole('button', { name: /^Stop$/i }).length).toBeGreaterThan(0)
+    expect(screen.getByTestId('stop-turn')).toBeTruthy()
 
     // A THIRD, unrelated chat inherits none of it.
     h.getBuild.mockResolvedValue({ id: 'chat-B', kind: 'build', messages: [] })
@@ -652,6 +656,13 @@ describe('cross-chat build scoping and reload fidelity (CC1–CC4)', () => {
 
     expect(screen.queryByTestId('build-progress')).toBeNull()
     expect(screen.queryByRole('button', { name: /^Stop$/i })).toBeNull()
+    // The relocated control is scoped by the same per-chat predicate, so it must be absent here
+    // too — an unscoped one would hand a sibling a working Stop for a build it never started,
+    // which is the exact defect this guard was written for.
+    expect(screen.queryByTestId('stop-turn')).toBeNull()
+    // Liveness: the sibling chat did render, so the two absences above are absences and not a
+    // crashed tree.
+    expect(composer()).toBeTruthy()
   })
 
   it('CC4: a reattached turn resubscribes ONCE on a truncation, then gives up honestly', async () => {
