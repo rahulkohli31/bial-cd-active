@@ -42,8 +42,7 @@
  * them has a reattach path at all; Plans B and D own that. Nor does this collapse the two page
  * components — moving a branch is not deleting it.
  */
-import BuilderPage from '../../pages/BuilderPage'
-import ChatPage from '../../pages/ChatPage'
+import ConversationSurface from '../chat/ConversationSurface'
 import type { ChatKind } from '../../pages/ChatRoute'
 import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
 
@@ -68,7 +67,10 @@ interface Props {
 }
 
 export default function ConversationSlot({ conversation, hidden = false }: Props) {
-  const { chatId, kind, projectId, projectName, projectHasSavedBuild } = conversation
+  // `kind` is deliberately NOT destructured. It is still resolved by the route and still carried
+  // on `MountedConversation`, but nothing here reads it — and pulling it into scope is the first
+  // step back toward branching on it.
+  const { chatId, projectId, projectName, projectHasSavedBuild } = conversation
   const shared = { chatId, projectId, projectName }
 
   return (
@@ -77,14 +79,15 @@ export default function ConversationSlot({ conversation, hidden = false }: Props
       aria-hidden={hidden}
       className={`flex-1 min-h-0 flex flex-col overflow-hidden ${hidden ? HIDDEN_BUT_MOUNTED : ''}`}
     >
-      {/* THE ONE KIND COMPARISON in `pages/` and `components/workspace/`, and Plan D deletes it
-          here when one surface serves both. Everything else about a conversation is decided by
-          what is present or absent, never by a test on its kind. */}
-      {kind === 'build' ? (
-        <BuilderPage {...shared} projectHasSavedBuild={projectHasSavedBuild} />
-      ) : (
-        <ChatPage {...shared} />
-      )}
+      {/* THE KIND COMPARISON THAT LIVED HERE IS GONE (Plan D U17). It picked one of two page
+          components; there is one surface now, and it renders identically for both kinds because
+          nothing in it — or below it — asks what kind a conversation is. `kind` is still resolved
+          by `ChatRoute` and still travels on `MountedConversation`, because the route genuinely
+          knows it and a later reader may need it; what has stopped is anything BRANCHING on it.
+          Everything about a conversation is decided by what is present or absent instead: a Plan
+          chat shows no build because no build parts arrive in it, never because a renderer
+          checked. */}
+      <ConversationSurface {...shared} projectHasSavedBuild={projectHasSavedBuild} />
     </div>
   )
 }

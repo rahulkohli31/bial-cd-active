@@ -126,9 +126,33 @@ export function convertPart(part: MessagePart): LibraryPart | null {
  * every one after it and the runtime treats the whole tail as new.
  */
 export function convertMessage(message: ChatMessage): ThreadMessageLike {
+  const seen = new Set<string>()
   const content = message.parts
     .map(convertPart)
     .filter((p): p is NonNullable<typeof p> => p !== null)
+    .map((part, index) => {
+      // UNIQUE TOOL-CALL IDS WITHIN A MESSAGE, enforced here rather than trusted.
+      //
+      // `toolCallId` is `step-{seq}`, and a collision is reachable two ways: a stored row whose
+      // `seq` is missing (both become `step-undefined`), and a merged run of stored rows that
+      // spans two turns whose seq spaces restart. The library groups and keys parts by this id, so
+      // a collision does not render twice — it renders ONCE and silently loses the other step,
+      // which is the same class of quiet loss `assertUniqueIds` refuses at the message level.
+      //
+      // Suffixed with the INDEX WITHIN THIS MESSAGE, which is stable for a given message object:
+      // the converter is memoised on message identity, so the same message always yields the same
+      // ids, and only a message that genuinely changed gets new ones.
+      if (part.type !== 'tool-call') return part
+      // `toolCallId` is optional on the library's type. `convertPart` always sets it, and an
+      // absent one is the same collision hazard as a repeated one — every part missing it would
+      // share the key `undefined` — so the two cases are handled together rather than separately.
+      const id = part.toolCallId ?? 'step'
+      if (part.toolCallId !== undefined && !seen.has(id)) {
+        seen.add(id)
+        return part
+      }
+      return { ...part, toolCallId: `${id}-${index}` }
+    })
 
   return {
     id: message.id,

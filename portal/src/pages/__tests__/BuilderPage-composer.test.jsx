@@ -18,7 +18,7 @@
  *          pinned from the other side: nothing canned may appear to seed the composer at all.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, act, cleanup, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 
 const h = vi.hoisted(() => ({
@@ -57,7 +57,7 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
   resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
 
-import BuilderPage from '../BuilderPage'
+import ConversationSurface from '../../components/chat/ConversationSurface'
 import { ApiError } from '../../utils/apiError'
 import {
   FakeEventSource, makeClient, primeClient, primeTurn, statusResp, turnStreaming, planReply,
@@ -73,7 +73,7 @@ const deps = () => {
 function renderAt(chatId, sessionDeps, projectId = 'p1') {
   return render(
     <MemoryRouter initialEntries={['/x']}>
-      <BuilderPage chatId={chatId} projectId={projectId} projectName="VIP Movement" buildSessionDeps={sessionDeps} />
+      <ConversationSurface chatId={chatId} projectId={projectId} projectName="VIP Movement" buildSessionDeps={sessionDeps} />
     </MemoryRouter>,
   )
 }
@@ -229,7 +229,7 @@ describe('the closed gate always states its reason', () => {
     await waitForGateOpen()
     type('a visitor app')
     fireEvent.keyDown(composer(), { key: 'Enter' })
-    fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
     await waitFor(() => expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/building your app/i))
   })
 })
@@ -323,7 +323,7 @@ describe('an in-flight turn belongs to ONE chat (G2)', () => {
     h.readTurnStream.mockImplementation(turnStreaming(planReply('B plan', 'opt-B')))
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <BuilderPage chatId="chat-B" projectId="p1" projectName="VIP Movement" buildSessionDeps={d} />
+        <ConversationSurface chatId="chat-B" projectId="p1" projectName="VIP Movement" buildSessionDeps={d} />
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
@@ -360,7 +360,7 @@ describe('a typed draft survives (G3)', () => {
       h.getBuild.mockResolvedValue({ id: chatId, kind: 'build', messages: [] })
       rerender(
         <MemoryRouter initialEntries={['/x']}>
-          <BuilderPage chatId={chatId} projectId="p1" projectName="VIP Movement" buildSessionDeps={d} />
+          <ConversationSurface chatId={chatId} projectId="p1" projectName="VIP Movement" buildSessionDeps={d} />
         </MemoryRouter>,
       )
       await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith(chatId))
@@ -426,7 +426,7 @@ describe('a finished build offers no canned follow-ups (2026-07-30)', () => {
     await waitForGateOpen()
     type('a visitor app')
     fireEvent.keyDown(composer(), { key: 'Enter' })
-    fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
 
     // The new chat's own adopt reattaches to the turn the read projection carries.
@@ -436,7 +436,7 @@ describe('a finished build offers no canned follow-ups (2026-07-30)', () => {
     })
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <BuilderPage chatId={NEW_BUILD_CHAT} projectId="p1" projectName="VIP Movement" buildSessionDeps={d.deps} />
+        <ConversationSurface chatId={NEW_BUILD_CHAT} projectId="p1" projectName="VIP Movement" buildSessionDeps={d.deps} />
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith(NEW_BUILD_CHAT))
@@ -532,7 +532,7 @@ describe('cross-chat build scoping and reload fidelity (CC1–CC4)', () => {
     const d = deps()
     const { rerender } = renderAt('chat-A', d.deps)
     await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('live-7'))
-    await waitFor(() => expect(screen.getByTestId('build-progress')).toBeTruthy())
+    await waitFor(() => expect(screen.getByTestId('stop-turn')).toBeTruthy())
 
     // Chat B carries a STALE anchor naming a different session.
     h.getBuild.mockResolvedValue({
@@ -546,7 +546,7 @@ describe('cross-chat build scoping and reload fidelity (CC1–CC4)', () => {
     h.getStatus.mockClear()
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <BuilderPage chatId="chat-B" projectId="p1" projectName="VIP Movement" buildSessionDeps={d.deps} />
+        <ConversationSurface chatId="chat-B" projectId="p1" projectName="VIP Movement" buildSessionDeps={d.deps} />
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
@@ -589,14 +589,20 @@ describe('cross-chat build scoping and reload fidelity (CC1–CC4)', () => {
     renderAt('build-X', d)
 
     await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('live-7'))
-    // The two contiguous stored steps group into ONE collapsed dropdown (not two always-visible
-    // rows) — the reload path renders through the same StepHistoryCollapsible BuildProgress uses.
-    await waitFor(() => expect(document.querySelectorAll('[data-kind="step-group"]')).toHaveLength(1))
-    fireEvent.click(document.querySelector('[data-kind="step-group"] button[aria-expanded]'))
-    expect(document.querySelectorAll('[data-kind="step-group"] [data-kind="step"]')).toHaveLength(2)
-    // …and the past-tense anchor STILL stays hidden: the build is live, the bubble speaks for it.
+    // ONE GROUP, NOT TWO — and this is the live/reload parity assertion (AE43), not a styling
+    // preference. The projection stores one MESSAGE per step while the live path puts every step
+    // of a turn on a single streaming message, so without the surface merging a run of stored step
+    // rows a build watched live would show one group of nine and the same build after a reload
+    // would show nine groups of one.
+    await waitFor(() => expect(screen.getAllByTestId('activity-group')).toHaveLength(1))
+    fireEvent.click(screen.getByTestId('activity-group-trigger'))
+    const rows = within(await screen.findByTestId('activity-group-rows'))
+    expect(rows.getByText(/Updated the home page/i)).toBeTruthy()
+    expect(rows.getByText(/Added the form/i)).toBeTruthy()
+    // …and the past-tense anchor stays out of the transcript: `build_in_progress` maps to no
+    // rendered part at all now, so the sentence cannot appear whether a build is live or not.
     expect(document.querySelector('[data-kind="build-in-progress"]')).toBeNull()
-    expect(screen.getByTestId('build-progress')).toBeTruthy()
+    expect(screen.getByTestId('stop-turn')).toBeTruthy()
   })
 
   it('CC3: a sibling chat renders no live build bubble, and therefore no Stop button', async () => {
@@ -623,14 +629,14 @@ describe('cross-chat build scoping and reload fidelity (CC1–CC4)', () => {
     await waitForGateOpen()
     type('build me a thing')
     fireEvent.keyDown(composer(), { key: 'Enter' })
-    fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
 
     // Arrive at the chat the handoff actually runs in (a chatId prop swap on the SAME instance,
     // mirroring how every other sibling-chat guard in this file simulates navigation).
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <BuilderPage chatId={LIVE_BUILD_CHAT} projectId="p1" projectName="VIP Movement" buildSessionDeps={d.deps} />
+        <ConversationSurface chatId={LIVE_BUILD_CHAT} projectId="p1" projectName="VIP Movement" buildSessionDeps={d.deps} />
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith(LIVE_BUILD_CHAT))
@@ -638,7 +644,7 @@ describe('cross-chat build scoping and reload fidelity (CC1–CC4)', () => {
       expect(h.readTurnStream).toHaveBeenCalledWith(expect.objectContaining({ turnId: BUILD_TURN_ID })),
     )
     await turn.frame(T_PREVIEW())
-    await waitFor(() => expect(screen.getByTestId('build-progress')).toBeTruthy())
+    await waitFor(() => expect(screen.getByTestId('stop-turn')).toBeTruthy())
     // The owning chat's own Stop is real. `getAllBy` because R55's relocated control now sits on
     // the composer beside the build card's own — deliberately, and only until U17 deletes the
     // card. What this guard is about is the SIBLING, and that assertion below is unchanged.
@@ -649,12 +655,12 @@ describe('cross-chat build scoping and reload fidelity (CC1–CC4)', () => {
     h.getBuild.mockResolvedValue({ id: 'chat-B', kind: 'build', messages: [] })
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <BuilderPage chatId="chat-B" projectId="p1" projectName="VIP Movement" buildSessionDeps={d.deps} />
+        <ConversationSurface chatId="chat-B" projectId="p1" projectName="VIP Movement" buildSessionDeps={d.deps} />
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
 
-    expect(screen.queryByTestId('build-progress')).toBeNull()
+    expect(screen.queryByTestId('stop-turn')).toBeNull()
     expect(screen.queryByRole('button', { name: /^Stop$/i })).toBeNull()
     // The relocated control is scoped by the same per-chat predicate, so it must be absent here
     // too — an unscoped one would hand a sibling a working Stop for a build it never started,
@@ -725,7 +731,12 @@ describe('the send-failure catch splits on whether the turn was accepted (N8)', 
     await waitFor(() => expect(screen.getByText(/could not be sent/i)).toBeTruthy())
     // The server persisted NOTHING, so the optimistic user bubble rolls back too — the
     // transcript must agree with the database (N8).
-    expect(screen.queryByText('build me a thing')).toBeNull()
+    //
+    // `waitFor`, NOT a bare assertion. The banner and the rollback are two state updates and the
+    // banner is the one this test waits on; under a loaded runner the rollback's commit can land
+    // a tick later. A bare read here passed alone and failed in the full suite, which is the
+    // definition of a flake rather than a finding.
+    await waitFor(() => expect(screen.queryByText('build me a thing')).toBeNull())
   })
 
   it('a subscribe failure AFTER the 202 keeps the user bubble and says reload, not resend', async () => {

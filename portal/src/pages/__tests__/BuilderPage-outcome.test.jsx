@@ -75,7 +75,7 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
   resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
 
-import BuilderPage from '../BuilderPage'
+import ConversationSurface from '../../components/chat/ConversationSurface'
 
 function renderThread(chatId = 'thread-1') {
   const fake = new FakeEventSource(chatId)
@@ -83,7 +83,7 @@ function renderThread(chatId = 'thread-1') {
   const view = render(
     <MemoryRouter initialEntries={[`/chat/${chatId}`]}>
       <Routes>
-        <Route path="/chat/:chatId" element={<BuilderPage projectId="p1" buildSessionDeps={deps} />} />
+        <Route path="/chat/:chatId" element={<ConversationSurface projectId="p1" buildSessionDeps={deps} />} />
       </Routes>
     </MemoryRouter>,
   )
@@ -147,8 +147,26 @@ async function runBuild(turn, text = 'a visitor app') {
   await turn.frame(T_STEP('Scaffolding your app…'))
 }
 
-/** The outcome cards on screen. */
-const outcomeCards = () => screen.queryAllByTestId('build-outcome')
+/**
+ * THE OUTCOME AS A CITIZEN READS IT NOW — prose in the transcript, not a card (Plan D U17).
+ *
+ * `BuildOutcome` is deleted. Its content did not go with it: the summary sentence it printed was
+ * always the message's own TEXT (`outcomeSummary` on the surface, `outcome.py::_summary` on the
+ * server — the two are written to match so a live render and a reloaded row read identically), and
+ * that text is now simply rendered as the assistant's reply.
+ *
+ * So the queries below match the SENTENCE rather than a test id. That is a strictly better thing
+ * to assert: the test id proved a box existed, and this proves the citizen was told.
+ */
+const OUTCOME_SENTENCE = /build finished\.|the build failed|the build stopped/i
+const outcomeCards = () =>
+  screen
+    .queryAllByTestId('assistant-message')
+    .filter((m) => OUTCOME_SENTENCE.test(m.textContent || ''))
+const findOutcome = async () => {
+  await waitFor(() => expect(outcomeCards().length).toBeGreaterThan(0))
+  return outcomeCards()[outcomeCards().length - 1]
+}
 
 /** Any `build` part the page tried to PERSIST — it must never write one; the server does. */
 const persistedOutcomes = () =>
@@ -181,11 +199,13 @@ describe('showing the outcome', () => {
     await turn.frame(T_BUILD_END({ turnId: 't1' }))
     await turn.end()
 
-    const card = await screen.findByTestId('build-outcome')
+    const card = await findOutcome()
     expect(card.textContent).toMatch(/build finished/i)
-    // The per-build preview URL died with its sandbox the moment the build ended, so the card —
-    // a permanent historical record — must never surface it as a working link (F4). The live
-    // "Relaunch preview" affordance lives in the preview pane, not on this card.
+    // The per-build preview URL died with its sandbox the moment the build ended, so the record —
+    // permanent, and read again on every future open — must never surface it as a working link
+    // (F4). The live "Relaunch preview" affordance lives in the preview pane. The card that used
+    // to render this link conditionally is gone, so the guarantee is now structural: no link is
+    // rendered because no renderer exists to render one.
     expect(card.querySelector(`a[href="${PREVIEW_URL}"]`)).toBeNull()
   })
 
@@ -197,7 +217,7 @@ describe('showing the outcome', () => {
 
     await turn.frame(T_PREVIEW(), T_BUILD_END({ turnId: 't1' }))
     await turn.end()
-    await screen.findByTestId('build-outcome')
+    await findOutcome()
 
     // Two writers would mean two records for one build (the server's row and this one), and the
     // server's is the one that survives a closed tab.
@@ -215,7 +235,7 @@ describe('showing the outcome', () => {
     await turn.frame(T_BUILD_END({ turnId: 't1', status: 'failed', reason: 'tsc failed after 3 attempts' }))
     await turn.end()
 
-    const card = await screen.findByTestId('build-outcome')
+    const card = await findOutcome()
     expect(card.textContent).toMatch(/build failed/i)
     // The reason is what the user can act on — surface it, don't bury it in the feed.
     expect(card.textContent).toMatch(/tsc failed after 3 attempts/i)
@@ -232,7 +252,12 @@ describe('showing the outcome', () => {
 
     // A build that did not save is not a success: the next build will not start from it, and the
     // user has to know that before building on top of it.
-    expect(await screen.findByText(/wasn’t saved/i)).toBeTruthy()
+    //
+    // RE-POINTED AT THE BANNER (Plan D U17). This sentence used to live inside the outcome card;
+    // it is in the one banner slot above the composer now — derived from the newest build part, so
+    // it still survives a reload exactly as the card's version did, and it is now where the
+    // citizen is standing when they are about to build again on top of it.
+    expect((await screen.findByTestId('turn-banner')).textContent).toMatch(/wasn’t saved/i)
   })
 
   it('a terminal that never reports the save does not claim the code was thrown away', async () => {
@@ -249,9 +274,9 @@ describe('showing the outcome', () => {
 
     await turn.frame(T_BUILD_END({ turnId: 't1' })) // completed, and silent about the snapshot
     await turn.end()
-    // LIVENESS FIRST: a card has to actually exist for the absence below to mean anything —
-    // `queryByText(...).toBeNull()` also passes on a component that silently rendered nothing.
-    await screen.findByTestId('build-outcome')
+    // LIVENESS FIRST: the outcome has to actually be on screen for the absence below to mean
+    // anything — `queryByText(...).toBeNull()` also passes on a surface that rendered nothing.
+    await findOutcome()
 
     expect(screen.queryByText(/wasn’t saved/i)).toBeNull()
   })
@@ -275,7 +300,7 @@ describe('showing the outcome', () => {
 
     await turn.frame(T_BUILD_END({ turnId: 't1', status: 'stopped', reason: 'stopped_by_user' }))
     await turn.end('completed')
-    expect(await screen.findByTestId('build-outcome')).toBeTruthy()
+    expect(await findOutcome()).toBeTruthy()
   })
 
   it('still warns when the terminal explicitly says the snapshot did not commit', async () => {
@@ -289,7 +314,7 @@ describe('showing the outcome', () => {
     await turn.frame(T_BUILD_END({ turnId: 't1', snapshotCommitted: false }))
     await turn.end()
 
-    expect(await screen.findByText(/wasn’t saved/i)).toBeTruthy()
+    expect((await screen.findByTestId('turn-banner')).textContent).toMatch(/wasn’t saved/i)
   })
 
   it('shows nothing while the build is still running', async () => {
@@ -300,7 +325,11 @@ describe('showing the outcome', () => {
 
     await turn.frame(T_PREVIEW())
 
-    await waitFor(() => expect(screen.getByText(/preview is live/i)).toBeTruthy())
+    // LIVENESS, RE-POINTED (Plan D U17). It used to read the pane's "preview is live" copy; the
+    // pane's cover is driven by `turnPhase` off the frames now, and this harness mounts no pane at
+    // all. What the absence below needs is proof the build is genuinely still running, and the
+    // composer's stop control is present for exactly and only that.
+    await waitFor(() => expect(screen.getByTestId('stop-turn')).toBeTruthy())
     expect(outcomeCards()).toHaveLength(0)
   })
 })
@@ -319,7 +348,7 @@ describe('dedupe on the build TURN', () => {
     await turn.frame(T_BUILD_END({ turnId: 't1' }), T_BUILD_END({ turnId: 't1' }))
     await turn.end()
 
-    await screen.findByTestId('build-outcome')
+    await findOutcome()
     await waitFor(() => expect(outcomeCards()).toHaveLength(1))
   })
 
@@ -353,8 +382,10 @@ describe('dedupe on the build TURN', () => {
     h.readTurnStream.mockImplementation(turn.impl)
     renderThread()
     // The stored row renders immediately from the seeded transcript, before the reattach's
-    // stream says anything at all.
-    await screen.findByTestId('build-outcome')
+    // stream says anything at all. It is the message's TEXT part that carries the sentence — the
+    // `build` part beside it maps to no rendered element, which is exactly why the fixture's two
+    // parts still produce one readable outcome.
+    await findOutcome()
 
     await waitFor(() => expect(h.readTurnStream).toHaveBeenCalled())
     await turn.frame(T_BUILD_END({ turnId: 't1' }))
@@ -370,7 +401,7 @@ describe('dedupe on the build TURN', () => {
     await runBuild(first)
     await first.frame(T_BUILD_END({ turnId: 't1' }))
     await first.end()
-    await screen.findByTestId('build-outcome')
+    await findOutcome()
 
     // An iteration is a NEW turn, and its outcome is its own record — the whole reason the record
     // is keyed by the build rather than by the thread.

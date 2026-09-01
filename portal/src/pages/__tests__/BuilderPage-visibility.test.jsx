@@ -125,25 +125,32 @@ describe('BuilderPage — build turn visible without a refresh', () => {
 
     // The assistant side is on screen at once (optimistic-visible-state), not after a re-hydration.
     // The `workspace` frame is what the bubble hangs off — the turn's sandbox is the build's start.
-    expect(await screen.findByTestId('build-progress')).toBeTruthy()
+    expect(await screen.findByTestId('stop-turn')).toBeTruthy()
     expect(h.getBuild).toHaveBeenCalledTimes(1) // the single mount-time adopt — no second hydration
 
     await turn.frame(T_STEP('Scaffolding your app…'))
-    // SCOPED TO THE VISIBLE ROW (U17). The label renders twice now — once in the feed row a
-    // person reads, once in the sr-only live region that paces what a screen reader hears — so
-    // an unscoped `findByText` is ambiguous rather than wrong.
-    const row = await screen.findByTestId('build-activity')
-    expect(await within(row).findByText(/Scaffolding your app/i)).toBeTruthy() // feed row in the DOM
+    // RE-POINTED AT THE ACTIVITY GROUP (Plan D U6/U17). The step used to draw a single feed row
+    // inside the progress card; it is a part on the streaming message now, and the group's trigger
+    // names the step happening NOW while it runs. Same claim, same frame, different element: the
+    // label reached the DOM without a re-hydration.
+    const group = await screen.findByTestId('activity-group')
+    await waitFor(() => expect(group.textContent).toMatch(/Scaffolding your app/i))
   })
 
-  it('flips the status line to "preview is live" once the preview frame arrives', async () => {
+  it('frames the preview as soon as its frame arrives', async () => {
+    // REWRITTEN WITH ITS SUBJECT (Plan D U17). "Preview is live" was the progress card's status
+    // LINE — chat-side narration of a pane state, in the register R35 removes. What the frame is
+    // actually for survives and is the stronger claim: the app pane frames the URL, without a
+    // reload and without waiting for the turn to end.
     const turn = scriptTurn()
     h.readTurnStream.mockImplementation(turn.impl)
     renderBuilder({ deps: deps().deps })
     await startBuild()
 
     await turn.frame(T_PREVIEW())
-    expect(await screen.findByText(/preview is live/i)).toBeTruthy()
+    await waitFor(() => expect(document.querySelector('iframe')?.getAttribute('src')).toBe(PREVIEW_URL))
+    // …and the chat says nothing about it, which is the half that changed.
+    expect(within(screen.getByTestId('chat-panel')).queryByText(/preview is live/i)).toBeNull()
   })
 
   it('does NOT blank the live preview while the agent keeps working after the preview frames (KTD-8b)', async () => {
@@ -156,11 +163,15 @@ describe('BuilderPage — build turn visible without a refresh', () => {
     await waitFor(() => expect(document.querySelector('iframe')?.getAttribute('src')).toBe(PREVIEW_URL))
 
     // A self-heal step AFTER the preview came up. The defect is the BLANKING: the frame must keep
-    // the same URL (same DOM node, no reload) while the loop runs on. The "still working" line
-    // rides the chat bubble now rather than a preview-pane overlay — one narrative, one place —
-    // so that is where the reassurance is asserted.
+    // the same URL (same DOM node, no reload) while the loop runs on.
+    //
+    // THE REASSURANCE MOVED AGAIN, and it is now the activity group naming the step in progress
+    // rather than a "still working on your app" line. That line was the progress card's, and the
+    // group says something strictly more useful in the same place: WHAT it is working on.
     await turn.frame(T_STEP('Fixing the type error', { id: 'call-2', seq: 4 }))
     expect(document.querySelector('iframe')?.getAttribute('src')).toBe(PREVIEW_URL) // NOT blanked
-    expect(await screen.findByText(/still working on your app/i)).toBeTruthy()
+    await waitFor(() =>
+      expect(screen.getByTestId('activity-group').textContent).toMatch(/Fixing the type error/i),
+    )
   })
 })

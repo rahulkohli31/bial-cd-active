@@ -1,8 +1,10 @@
 /**
  * ChatRoute — the flat `/chat/:chatId` kind dispatcher.
  *
- * Both pages are stubbed so this file tests exactly one thing: which page gets
- * rendered, with which project, and when the route bails to /projects instead.
+ * The SLOT is stubbed so this file tests exactly one thing: what the route resolves — which
+ * conversation, of which kind, in which project — and when it bails to /projects instead. It used
+ * to stub two pages and assert which one mounted; there is one surface now (Plan D U17), so the
+ * resolution IS the contract.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
@@ -26,26 +28,35 @@ vi.mock('../../utils/api', async (importOriginal) => ({
 vi.mock('../../utils/conversationApi.js', () => ({ getConversation: h.getConversation }))
 vi.mock('../../utils/projectApi', () => ({ getProject: h.getProject }))
 
-// Stub both pages: which one mounts, and what props it received, is the whole contract.
-vi.mock('../ChatPage', () => ({
-  // Named, not an anonymous arrow: this stub calls `useNavigate`, and a hook is only legal
-  // inside something lint can SEE is a component. As `default: () => …` the rule reads the
-  // function's name as "default" — lowercase, so "not a component" — and errors.
-  default: function ChatPageStub({ chatId, projectId, projectName }: { chatId?: string; projectId?: string | null; projectName?: string | null }) {
+/**
+ * ONE STUB, AND IT IS THE SLOT (Plan D U17).
+ *
+ * This file used to stub two PAGES, because the route chose between them and "which one mounts"
+ * was the contract. There is one surface now, so the route's contract is the VALUE it hands the
+ * slot — a resolved conversation, kind included — rather than a component it selects. Stubbing
+ * the slot is what lets that value be asserted directly; stubbing the surface underneath it would
+ * leave the kind invisible, since the slot deliberately does not pass it down.
+ *
+ * Named, not an anonymous arrow: this stub calls `useNavigate`, and a hook is only legal inside
+ * something lint can SEE is a component. As `default: () => …` the rule reads the function's name
+ * as "default" — lowercase, so "not a component" — and errors.
+ */
+vi.mock('../../components/workspace/ConversationSlot', () => ({
+  default: function ConversationSlotStub({
+    conversation,
+  }: {
+    conversation: { chatId: string; kind: string; projectId: string | null; projectName: string | null }
+  }) {
     const navigate = useNavigate()
+    const { chatId, kind, projectId, projectName } = conversation
     return (
-      <div data-testid="chat-page">
-        {`planning|${chatId}|${projectId}|${projectName}`}
+      <div data-testid="conversation-slot" data-kind={kind}>
+        {`${kind}|${chatId}|${projectId}|${projectName}`}
         <button onClick={() => navigate(`/chat/${chatId}`, { replace: true })}>drop query</button>
         <button onClick={() => navigate('/chat/c2')}>go to c2</button>
       </div>
     )
   },
-}))
-vi.mock('../BuilderPage', () => ({
-  default: ({ chatId, projectId, projectName }: { chatId?: string; projectId?: string | null; projectName?: string | null }) => (
-    <div data-testid="builder-page">{`builder|${chatId}|${projectId}|${projectName}`}</div>
-  ),
 }))
 
 import ChatRoute from '../ChatRoute'
@@ -89,22 +100,23 @@ afterEach(() => cleanup())
 /** The observation bodies this render posted — see `_observeBeacons` for the mock contract. */
 const beacons = () => beaconsFrom(h.authFetch)
 
-describe('ChatRoute — kind dispatch', () => {
-  it('renders ChatPage for a plan conversation', async () => {
+describe('ChatRoute — kind RESOLUTION (it no longer dispatches)', () => {
+  // THE NAME CHANGED BECAUSE THE JOB DID (Plan D U17). These two used to assert which PAGE
+  // mounted; there is one surface now, so what is left to be right about is the kind the route
+  // RESOLVES and hands on. That is the whole of the route's remaining contract, and it is still
+  // worth pinning — the value decides which toolset the server gives the model.
+  it('resolves a plan conversation as plan', async () => {
     h.getConversation.mockResolvedValue(conversation({ kind: 'plan' }))
     renderRoute('/chat/c1')
-    expect(await screen.findByTestId('chat-page')).toBeTruthy()
-    expect(screen.queryByTestId('builder-page')).toBeNull()
+    expect((await screen.findByTestId('conversation-slot')).getAttribute('data-kind')).toBe('plan')
   })
 
   // Was "renders BuilderPage for a builder conversation": `builder` was the OLD three-valued
-  // ConversationKind's word. It collapsed into the two-valued ChatKind's `build` (U1) — renamed
-  // here too, not just in the fixture, so this name doesn't go on describing a kind that no
-  // longer exists.
-  it('renders BuilderPage for a build conversation', async () => {
+  // ConversationKind's word. It collapsed into the two-valued ChatKind's `build` (U1).
+  it('resolves a build conversation as build', async () => {
     h.getConversation.mockResolvedValue(conversation({ kind: 'build' }))
     renderRoute('/chat/c1')
-    expect(await screen.findByTestId('builder-page')).toBeTruthy()
+    expect((await screen.findByTestId('conversation-slot')).getAttribute('data-kind')).toBe('build')
   })
 
   it('lets the SERVER win when its kind disagrees with ?kind=', async () => {
@@ -113,32 +125,32 @@ describe('ChatRoute — kind dispatch', () => {
     // (the retired word) matches neither branch of `kindFromQuery`'s `raw === 'build'` check, so
     // both the query and the server would have resolved to `plan` regardless of which one won.
     renderRoute('/chat/c1?kind=build')
-    // A stale or hand-edited query must never render a build page over a plan transcript.
-    expect(await screen.findByTestId('chat-page')).toBeTruthy()
-    expect(screen.queryByTestId('builder-page')).toBeNull()
+    // A stale or hand-edited query must never decide the toolset over a plan transcript.
+    expect((await screen.findByTestId('conversation-slot')).getAttribute('data-kind')).toBe('plan')
   })
 
   it('issues exactly ONE getConversation to resolve the kind', async () => {
     h.getConversation.mockResolvedValue(conversation())
     renderRoute('/chat/c1')
-    await screen.findByTestId('chat-page')
+    await screen.findByTestId('conversation-slot')
     expect(h.getConversation).toHaveBeenCalledTimes(1)
   })
 })
 
 describe('ChatRoute — a conversation whose row does not exist yet', () => {
-  it('renders the ?kind= page when the id 404s but a ?projectId= is present', async () => {
+  it('takes the kind from ?kind= when the id 404s but a ?projectId= is present', async () => {
     h.getConversation.mockResolvedValue(null)
     renderRoute('/chat/new-uuid?projectId=p1&kind=build')
     // The row appears on the first appendMessage; until then only the query knows the project.
-    expect(await screen.findByTestId('builder-page')).toBeTruthy()
-    expect(screen.getByTestId('builder-page').textContent).toContain('|new-uuid|p1|')
+    const slot = await screen.findByTestId('conversation-slot')
+    expect(slot.getAttribute('data-kind')).toBe('build')
+    expect(slot.textContent).toContain('|new-uuid|p1|')
   })
 
   it('defaults an unrecognised ?kind= to plan rather than trusting it', async () => {
     h.getConversation.mockResolvedValue(null)
     renderRoute('/chat/new-uuid?projectId=p1&kind=wat')
-    expect(await screen.findByTestId('chat-page')).toBeTruthy()
+    expect((await screen.findByTestId('conversation-slot')).getAttribute('data-kind')).toBe('plan')
   })
 
   it('redirects to /projects when the id 404s with NO query', async () => {
@@ -163,8 +175,8 @@ describe('ChatRoute — the GET that cannot succeed', () => {
   it('a freshly-minted open issues NO getConversation and renders from the query', async () => {
     renderRoute('/chat/fresh-id?projectId=p1&kind=build', { freshlyMinted: true })
 
-    expect(await screen.findByTestId('builder-page')).toBeTruthy()
-    expect(screen.getByTestId('builder-page').textContent).toContain('|fresh-id|p1|')
+    expect(await screen.findByTestId('conversation-slot')).toBeTruthy()
+    expect(screen.getByTestId('conversation-slot').textContent).toContain('|fresh-id|p1|')
     expect(h.getConversation).not.toHaveBeenCalled()
   })
 
@@ -178,9 +190,8 @@ describe('ChatRoute — the GET that cannot succeed', () => {
     h.getConversation.mockResolvedValue(conversation({ kind: 'plan' }))
     renderRoute('/chat/c1?projectId=p1&kind=build')
 
-    expect(await screen.findByTestId('chat-page')).toBeTruthy()
+    expect((await screen.findByTestId('conversation-slot')).getAttribute('data-kind')).toBe('plan')
     expect(h.getConversation).toHaveBeenCalledWith('c1')
-    expect(screen.queryByTestId('builder-page')).toBeNull()
   })
 
   it('falls back to the fetch when the marker arrives with no projectId to resolve from', async () => {
@@ -189,7 +200,7 @@ describe('ChatRoute — the GET that cannot succeed', () => {
     h.getConversation.mockResolvedValue(conversation({ kind: 'plan' }))
     renderRoute('/chat/c1', { freshlyMinted: true })
 
-    expect(await screen.findByTestId('chat-page')).toBeTruthy()
+    expect(await screen.findByTestId('conversation-slot')).toBeTruthy()
     expect(h.getConversation).toHaveBeenCalledTimes(1)
   })
 })
@@ -198,7 +209,7 @@ describe('ChatRoute — the project breadcrumb', () => {
   it('passes projectName down once getProject resolves', async () => {
     h.getConversation.mockResolvedValue(conversation())
     renderRoute('/chat/c1')
-    await waitFor(() => expect(screen.getByTestId('chat-page').textContent).toContain('VIP Movement'))
+    await waitFor(() => expect(screen.getByTestId('conversation-slot').textContent).toContain('VIP Movement'))
     expect(h.getProject).toHaveBeenCalledWith('p1')
   })
 
@@ -207,14 +218,14 @@ describe('ChatRoute — the project breadcrumb', () => {
     h.getConversation.mockResolvedValue(conversation())
     h.getProject.mockRejectedValue(new Error('gone'))
     renderRoute('/chat/c1')
-    await waitFor(() => expect(screen.getByTestId('chat-page').textContent).toContain('|null'))
+    await waitFor(() => expect(screen.getByTestId('conversation-slot').textContent).toContain('|null'))
     expect(screen.queryByTestId('projects-index')).toBeNull()
   })
 
   it('falls back to the query projectId when the conversation carries none', async () => {
     h.getConversation.mockResolvedValue(conversation({ projectId: undefined }))
     renderRoute('/chat/c1?projectId=p9')
-    await waitFor(() => expect(screen.getByTestId('chat-page').textContent).toContain('|p9|'))
+    await waitFor(() => expect(screen.getByTestId('conversation-slot').textContent).toContain('|p9|'))
   })
 })
 
@@ -222,7 +233,7 @@ describe('ChatRoute — load failure', () => {
   it('falls back to the query rather than stranding the user on a spinner', async () => {
     h.getConversation.mockRejectedValue(new Error('boom'))
     renderRoute('/chat/c1?projectId=p1&kind=build')
-    expect(await screen.findByTestId('builder-page')).toBeTruthy()
+    expect(await screen.findByTestId('conversation-slot')).toBeTruthy()
   })
 
   it('bails to /projects when the load fails and there is no query to fall back on', async () => {
@@ -246,12 +257,12 @@ describe('ChatRoute — the page is never torn down mid-turn', () => {
         </Routes>
       </MemoryRouter>,
     )
-    const page = await screen.findByTestId('chat-page')
+    const page = await screen.findByTestId('conversation-slot')
     expect(h.getConversation).toHaveBeenCalledTimes(1)
 
     // The page rewrites its own URL, exactly as ChatPage/BuilderPage do after the first append.
     fireEvent.click(screen.getByText('drop query'))
-    await waitFor(() => expect(screen.getByTestId('chat-page')).toBe(page)) // same node: no remount
+    await waitFor(() => expect(screen.getByTestId('conversation-slot')).toBe(page)) // same node: no remount
 
     expect(h.getConversation).toHaveBeenCalledTimes(1)
     expect(screen.queryByRole('status', { name: /loading chat/i })).toBeNull()
@@ -272,7 +283,7 @@ describe('ChatRoute — the page is never torn down mid-turn', () => {
         </Routes>
       </MemoryRouter>,
     )
-    const page = await screen.findByTestId('chat-page')
+    const page = await screen.findByTestId('conversation-slot')
     expect(page.textContent).toContain('|c1|')
 
     fireEvent.click(screen.getByText('go to c2'))
@@ -280,10 +291,10 @@ describe('ChatRoute — the page is never torn down mid-turn', () => {
 
     // c2 has not resolved. The page is still mounted, still showing c1.
     expect(screen.queryByRole('status', { name: /loading chat/i })).toBeNull()
-    expect(screen.getByTestId('chat-page').textContent).toContain('|c1|')
+    expect(screen.getByTestId('conversation-slot').textContent).toContain('|c1|')
 
     resolveSecond?.({ id: 'c2', kind: 'plan', projectId: 'p1', messages: [] })
-    await waitFor(() => expect(screen.getByTestId('chat-page').textContent).toContain('|c2|'))
+    await waitFor(() => expect(screen.getByTestId('conversation-slot').textContent).toContain('|c2|'))
   })
 })
 
@@ -297,7 +308,7 @@ describe('ChatRoute — the chat-open mark (U4; R105)', () => {
 
     renderRoute('/chat/c1')
 
-    await screen.findByTestId('chat-page')
+    await screen.findByTestId('conversation-slot')
     await waitFor(() => expect(beacons()).toEqual([{ name: 'project_opened_chat' }]))
   })
 
@@ -306,13 +317,13 @@ describe('ChatRoute — the chat-open mark (U4; R105)', () => {
     h.authFetch.mockClear()
     h.getConversation.mockResolvedValue(conversation({ id: 'c1', projectId: 'p-two' }))
     renderRoute('/chat/c1')
-    await screen.findByTestId('chat-page')
+    await screen.findByTestId('conversation-slot')
     await waitFor(() => expect(beacons()).toHaveLength(1))
 
     cleanup()
     h.getConversation.mockResolvedValue(conversation({ id: 'c2', projectId: 'p-two' }))
     renderRoute('/chat/c2')
-    await screen.findByTestId('chat-page')
+    await screen.findByTestId('conversation-slot')
 
     expect(beacons()).toEqual([{ name: 'project_opened_chat' }])
   })
@@ -326,7 +337,7 @@ describe('ChatRoute — the chat-open mark (U4; R105)', () => {
 
     renderRoute('/chat/c1')
 
-    await screen.findByTestId('chat-page')
+    await screen.findByTestId('conversation-slot')
     expect(beacons()).toEqual([])
   })
 
@@ -335,7 +346,7 @@ describe('ChatRoute — the chat-open mark (U4; R105)', () => {
 
     renderRoute('/chat/c1')
 
-    await screen.findByTestId('chat-page')
+    await screen.findByTestId('conversation-slot')
     expect(beacons()).toEqual([])
   })
 })

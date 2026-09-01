@@ -51,13 +51,13 @@ vi.mock('../../components/chat/MessageContent', () => ({
   },
 }))
 
-import BuilderPage from '../BuilderPage'
+import ConversationSurface from '../../components/chat/ConversationSurface'
 import { FakeEventSource, makeClient, primeClient, primeTurn } from './_builderSession.jsx'
 
 function renderAt(chatId, sessionDeps, projectId = 'p1') {
   return render(
     <MemoryRouter initialEntries={['/x']}>
-      <BuilderPage chatId={chatId} projectId={projectId} projectName="VIP Movement" buildSessionDeps={sessionDeps} />
+      <ConversationSurface chatId={chatId} projectId={projectId} projectName="VIP Movement" buildSessionDeps={sessionDeps} />
     </MemoryRouter>,
   )
 }
@@ -69,9 +69,17 @@ const deps = () => {
 
 const composer = () => screen.getByPlaceholderText(/describe what you need/i)
 
-/** How many times MessageContent was invoked for the row carrying this exact text. */
+/**
+ * How many times MessageContent was invoked for the row carrying this exact text.
+ *
+ * IT ACCEPTS BOTH SHAPES because the caller changed (Plan D U17). The deleted row component handed
+ * `MessageContent` a whole `parts` ARRAY; the thread's text-part slot hands it the already-
+ * assembled STRING of one part. Reading both is what lets this test keep asserting the same
+ * property across the rewrite instead of being deleted with the component it was named after.
+ */
 const rendersFor = (text) =>
   h.messageContentRender.mock.calls.filter(([props]) => {
+    if (typeof props.parts === 'string') return props.parts === text
     const parts = Array.isArray(props.parts) ? props.parts : []
     return parts.some((p) => p?.type === 'text' && p.text === text)
   }).length
@@ -89,7 +97,12 @@ beforeEach(() => {
 })
 afterEach(() => cleanup())
 
-describe('ChatMessageRow actually memoizes (review round 2, fix 1)', () => {
+// RENAMED WITH ITS SUBJECT (Plan D U17). `ChatMessageRow` — the hand-rolled, hand-memoised
+// transcript row — is deleted. The property it was written to defend is not: typing must not
+// re-render history. It is now defended by construction rather than by a `memo()` call, because
+// the composer's text is local state inside `Composer` and never reaches the transcript at all —
+// which is a stronger guarantee than a memo whose prop list one careless addition could defeat.
+describe('typing never re-renders history', () => {
   it('typing in the composer does not re-render an unrelated historical bubble', async () => {
     h.getBuild.mockResolvedValue({
       id: 'build-X',
@@ -108,8 +121,8 @@ describe('ChatMessageRow actually memoizes (review round 2, fix 1)', () => {
     await waitFor(() => expect(rendersFor('first reply, unrelated to anything typed next')).toBeGreaterThan(0))
     const before = rendersFor('first reply, unrelated to anything typed next')
 
-    // Composer text is local `useState` in BuilderPage — touches no message, session, or plan
-    // state. A memo that actually bails out must absorb this entirely before the historical row.
+    // Composer text is local `useState` INSIDE THE COMPOSER — it touches no message, session or
+    // offer state, and the surface above it does not re-render at all. Nothing has to bail out.
     fireEvent.change(composer(), { target: { value: 'typing should not disturb history' } })
 
     const after = rendersFor('first reply, unrelated to anything typed next')

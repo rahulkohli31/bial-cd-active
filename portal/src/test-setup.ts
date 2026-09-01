@@ -92,6 +92,12 @@ Element.prototype.hasPointerCapture ??= function hasPointerCapture() {
 }
 Element.prototype.setPointerCapture ??= function setPointerCapture() {}
 Element.prototype.releasePointerCapture ??= function releasePointerCapture() {}
+// The FIFTH, added when the thread's viewport arrived (U17): `useThreadViewportAutoScroll` calls
+// `scrollTo` from a `requestAnimationFrame` callback, so its absence surfaces as an UNCAUGHT
+// exception rather than a failing assertion — the test that provoked it has usually already
+// passed, and the message names a library file nobody edited. jsdom implements `scrollTo` on
+// `window` but not on `Element`, which is exactly the shape of gap this file exists to close.
+Element.prototype.scrollTo ??= function scrollTo() {}
 
 // ── Clipboard ────────────────────────────────────────────────────────────────────────────────
 // A SPY, not a stub, and reset between tests. N1's copy button is the only consumer and its

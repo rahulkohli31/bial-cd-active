@@ -143,10 +143,16 @@ const Composer: FC<ComposerProps> = ({
    * Plain language: a citizen reading this asked for an app and is watching it get made.
    */
   const unavailableReason = useMemo<string | null>(() => {
-    if (offerPending) return OFFER_GATE_NOTE
+    // THE ORDER IS BY IMMEDIACY, and the offer is LAST on purpose. All four block Send, but the
+    // first three describe something happening right now — the citizen's own text is too long, a
+    // reply is arriving, their app is being built — while a pending offer describes a question
+    // still waiting. The offer also stays pending for the whole of the round trip its own Build
+    // press starts, so putting it first told a citizen to "choose one of the two above" while the
+    // build they had just chosen was starting.
     if (cap.over) return cap.message
     if (isRunning) return 'Replying — keep typing if you like; send unlocks when it’s done.'
     if (gate?.blocked) return gate.reason
+    if (offerPending) return OFFER_GATE_NOTE
     return null
   }, [offerPending, cap.over, cap.message, isRunning, gate])
 
@@ -210,6 +216,12 @@ const Composer: FC<ComposerProps> = ({
   return (
     <div
       data-testid="composer"
+      // The drop-target state as an ATTRIBUTE, not only as a ring class. A colour change is not a
+      // thing a test can assert without pinning a Tailwind string, and it is not a thing a screen
+      // reader can perceive at all — so the state is exposed here and the ring is the visual half
+      // of the same fact. Carried over from the surface this composer replaces, where it was the
+      // one assertion the drag-and-drop suites actually discriminated on.
+      data-dragging={draggingFiles || undefined}
       {...dragHandlers}
       // The drop target is the WRAPPER, not the inner row: the chips and the gate note above the
       // row are visually "the composer" too, and a drop landing on them would otherwise fall

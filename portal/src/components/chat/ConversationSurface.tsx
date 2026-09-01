@@ -1,27 +1,23 @@
-import { useState, useEffect, useRef, useCallback, useMemo, memo } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo, type FC } from 'react'
 import { useNavigate, useLocation, useParams } from 'react-router-dom'
-import {
-  Send, Sparkles, User, Paperclip, FileText, FileSpreadsheet, X,
-  CheckCircle2, XCircle, ExternalLink, PanelLeftOpen, PanelLeftClose,
-} from 'lucide-react'
-import PublishStatusChip from '../components/PublishStatusChip'
-import BuildProgress, { hasBuildNarrative, StepHistoryCollapsible } from '../components/chat/BuildProgress'
-import type { StepHistoryItem } from '../components/chat/BuildProgress'
-import MessageContent from '../components/chat/MessageContent'
-import SessionBanners from '../components/chat/SessionBanners'
-import StopTurnControl from '../components/chat/StopTurnControl'
-import TurnBanner from '../components/chat/TurnBanner'
-import { atLimitSendState } from '../components/chat/BuildProgress'
-import AttachmentLightbox from '../components/AttachmentLightbox'
-import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
-import { listProjectConversations, uuidv7 } from '../utils/conversationApi'
-import type { ConversationHeader } from '../utils/conversationApi'
-import { ApiError } from '../utils/apiError'
-import { markAppVisible } from '../utils/observe'
-import { describeSaveFailure, isConversationGone } from '../utils/chatErrors'
-import { readDraft, writeDraft, clearDraft } from '../utils/composerDraft'
-import { resolvePreviewAddress } from '../utils/previewAddress'
-import { HIDDEN_BUT_MOUNTED } from '../components/workspace/hiddenSubtree'
+import { PanelLeftOpen, PanelLeftClose } from 'lucide-react'
+import PublishStatusChip from '../PublishStatusChip'
+import Announcer, { useActivityAnnouncement } from './Announcer'
+import ChatThread from './ChatThread'
+import Composer, { type ComposerSubmission } from './Composer'
+import type { BuildHandoff } from './OfferStrip'
+import ScrollToLatest from './ScrollToLatest'
+import SessionBanners from './SessionBanners'
+import TurnBanner from './TurnBanner'
+import ProjectBreadcrumb from '../projects/ProjectBreadcrumb'
+import { listProjectConversations } from '../../utils/conversationApi'
+import type { ConversationHeader } from '../../utils/conversationApi'
+import { ApiError } from '../../utils/apiError'
+import { markAppVisible } from '../../utils/observe'
+import { describeSaveFailure, isConversationGone } from '../../utils/chatErrors'
+
+import { resolvePreviewAddress } from '../../utils/previewAddress'
+import { HIDDEN_BUT_MOUNTED } from '../workspace/hiddenSubtree'
 import {
   useAppPaneVisible,
   usePublishAddress,
@@ -29,32 +25,32 @@ import {
   usePublishReclaim,
   usePublishSaveState,
   useWorkspaceProject,
-} from '../components/workspace/workspaceChannel'
-import { notifyUsageChanged } from '../utils/usage'
-import { createBuildLock, openBuildLockChannel } from '../utils/buildLock'
-import type { BuildLock } from '../utils/buildLock'
-import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
-import { useBuildSession } from '../hooks/useBuildSession'
-import type { UseBuildSessionDeps } from '../hooks/useBuildSession'
-import { isActiveBuildStatus } from '../utils/buildSessionTypes'
-import type { BuildSessionStatus } from '../utils/buildSessionTypes'
-import { usePendingAttachments } from '../hooks/usePendingAttachments'
-import type { PendingAttachment } from '../utils/attachmentInput'
-import { startTurn, readTurnStream, buildFromPlan, stopTurn, TurnStartError } from '../utils/turnStreamApi'
-import { isKnownFrame } from '../utils/turnStreamApi'
-import type { CompileState } from '../utils/compileState'
-import { makeClientErrorRelay } from '../utils/clientErrorRelay'
-import type { TurnFrame, PlanOptionsItem, StepItem, DiagnosticFrame, StreamOutcome } from '../utils/turnStreamApi'
-import { narrativeEnvelopes, narrativeStatus } from '../utils/turnNarrative'
-import type { TurnNarrative } from '../utils/turnNarrative'
-import { fetchSaveState, saveProject, releaseProject, stopActiveBuild, asReclaimBlocked, fetchPreviewState, fetchCompileState, checkWorkspace } from '../utils/buildSessionApi'
-import type { ReclaimBlocked, PreviewState, PreviewLifeState } from '../utils/buildSessionApi'
-import { PlanOptionsCard } from '../components/chat/PlanOptionsCard'
-import { wireMessageFromParts, buildUserParts, partsToText, attachmentsFromParts, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
-import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES } from '../utils/attachmentInput'
-import { openPdf } from '../utils/attachmentViewer'
-import { loadBuilds, createBuild, getBuild, deriveTitle } from '../utils/builderHistory'
-import type { ChatMessage, MessagePart, BuildPart, BuildPartLive } from '../utils/messageTypes'
+} from '../workspace/workspaceChannel'
+import { notifyUsageChanged } from '../../utils/usage'
+import { createBuildLock, openBuildLockChannel } from '../../utils/buildLock'
+import type { BuildLock } from '../../utils/buildLock'
+import { useDropTransientQuery } from '../../hooks/useDropTransientQuery'
+import { useBuildSession } from '../../hooks/useBuildSession'
+import type { UseBuildSessionDeps } from '../../hooks/useBuildSession'
+import { isActiveBuildStatus } from '../../utils/buildSessionTypes'
+
+
+import type { PendingAttachment } from '../../utils/attachmentInput'
+import { startTurn, readTurnStream, buildFromPlan, stopTurn, TurnStartError } from '../../utils/turnStreamApi'
+import { isKnownFrame } from '../../utils/turnStreamApi'
+import type { CompileState } from '../../utils/compileState'
+import { makeClientErrorRelay } from '../../utils/clientErrorRelay'
+import type { TurnFrame, PlanOptionsItem, StepItem, DiagnosticFrame, StreamOutcome } from '../../utils/turnStreamApi'
+import { atLimitSendState, narrativeEnvelopes, turnPhase } from '../../utils/turnNarrative'
+import type { TurnNarrative } from '../../utils/turnNarrative'
+import { fetchSaveState, saveProject, releaseProject, stopActiveBuild, asReclaimBlocked, fetchPreviewState, fetchCompileState, checkWorkspace } from '../../utils/buildSessionApi'
+import type { ReclaimBlocked, PreviewState, PreviewLifeState } from '../../utils/buildSessionApi'
+import { resolvePlanOptions } from '../../utils/turnStreamApi'
+import { wireMessageFromParts, buildUserParts, partsToText, countAttachments, releaseUploadedAttachments } from '../../utils/attachmentStore'
+import { validateConversationAttachmentCap } from '../../utils/attachmentInput'
+
+import { loadBuilds, createBuild, getBuild, deriveTitle } from '../../utils/builderHistory'
+import type { ChatMessage, MessagePart, BuildPartLive } from '../../utils/messageTypes'
 
 // The from-scratch greeting (ephemeral — never persisted, and never sent to the model: it is
 // chrome, not a turn, and replaying it as history would have the model answering its own hello).
@@ -113,191 +109,37 @@ function outcomeSummary({ status, reason }: Pick<BuildPartLive, 'status' | 'reas
   return 'Build finished.'
 }
 
-/** The persisted build outcome (003-U5) — a compact, permanent record of one build turn.
- * `live` is true ONLY while THIS build's exact preview is the currently-running one; the link is
- * gated on it so a per-session URL that died with its sandbox is never presented as clickable (#43,
- * F4). When it's dead, the "Relaunch preview" action lives in the live-preview pane, not on this
- * historical card (relaunch restores the LATEST snapshot, which a per-build card can't speak for). */
-function BuildOutcome({ part, live = false }: { part: BuildPart; live?: boolean }) {
-  const failed = part.status === 'failed'
-  return (
-    <div
-      data-testid="build-outcome"
-      className={`mt-2 rounded-xl border px-3 py-2.5 ${failed ? 'border-danger/30 bg-danger/5' : 'border-bial-border bg-white'}`}
-    >
-      <div className="flex items-center gap-1.5">
-        {failed ? <XCircle size={12} className="text-danger flex-shrink-0" /> : <CheckCircle2 size={12} className="text-green-600 flex-shrink-0" />}
-        <p className="text-[11px] font-bold text-tertiary">{failed ? 'Build failed' : 'Build finished'}</p>
-      </div>
-      {failed && part.reason && (
-        <p className="mt-1 text-[10px] leading-relaxed text-neutral break-words">{part.reason}</p>
-      )}
-      {part.previewUrl && live && (
-        // Shown ONLY while this build's exact preview is the running one — a per-session sandbox
-        // URL dies with its session, so once it's not live we drop the link entirely rather than
-        // let a user click into a dead frame (F4). Relaunch lives in the preview pane.
-        <a
-          href={part.previewUrl}
-          target="_blank"
-          rel="noreferrer"
-          className="mt-1.5 inline-flex items-center gap-1 text-[10px] font-semibold text-primary hover:underline break-all"
-        >
-          <ExternalLink size={9} className="flex-shrink-0" />
-          Open the live preview
-        </a>
-      )}
-      {/* `snapshotCommitted` only exists on BuildPartLive — BuildPartPersisted never carries it,
-          same as the pre-migration JS reading it as `undefined` on that shape. */}
-      {!failed && 'snapshotCommitted' in part && part.snapshotCommitted === false && (
-        // R7's whole point: a build that ran but did not save is NOT a success, and the user has
-        // to know before they build again on top of it.
-        <p className="mt-1 text-[10px] leading-relaxed text-warning-700">
-          This build’s code wasn’t saved, so the next build won’t start from it.
-        </p>
-      )}
-    </div>
-  )
-}
-
-/** A run of consecutive stored `step` messages, collapsed into one `StepHistoryCollapsible`
- *  render item (see `renderItems` below) instead of one always-visible row per message. */
-interface StepGroupItem {
-  type: 'step-group'
-  key: string
-  steps: StepHistoryItem[]
-}
-type RenderItem = ChatMessage | StepGroupItem
-function isStepGroupItem(item: RenderItem): item is StepGroupItem {
-  return 'type' in item && item.type === 'step-group'
-}
-
-interface ChatMessageRowProps {
-  msg: ChatMessage
-  isStreaming: boolean
-  buildId: string
-  showSession: boolean
-  sessionStatus: BuildSessionStatus | null
-  sessionPreviewUrl: string | null
-  newestPlanCallId: string | null
-  planErrors: Record<string, string | null>
-  applyPlanOverride: (item: PlanOptionsItem) => PlanOptionsItem
-  onBuildIt: (toolCallId: string) => void
-  onRefined: (toolCallId: string) => void
-  /** U4 — this message's claim about the app is no longer true: the workspace was found reverted
-   *  while the tab sat idle. Primitive, so the memo above still skips every other row. */
-  retracted: boolean
-}
-
 /**
- * One row of the transcript — a bubble, a build-outcome card, a plan card, or some mix. Memoized
- * (finding 10/11): `paint()` replaces only the streaming message's own object each token, but the
- * un-memoized `.map()` this replaced re-ran EVERY row's `MessageContent` markdown parse on every
- * delta. Every prop below is either primitive or a `useCallback`'d function so an unrelated row's
- * props stay reference-equal across a streaming tick and this memo actually skips it.
- */
-const ChatMessageRow = memo(function ChatMessageRow({
-  msg,
-  isStreaming,
-  buildId,
-  showSession,
-  sessionStatus,
-  sessionPreviewUrl,
-  newestPlanCallId,
-  planErrors,
-  applyPlanOverride,
-  onBuildIt,
-  onRefined,
-  retracted,
-}: ChatMessageRowProps) {
-  const buildPart = (msg.parts || []).find((p): p is BuildPart => p?.type === 'build')
-  const planPart = (msg.parts || []).find(
-    (p): p is Extract<MessagePart, { type: 'plan_options' }> => p?.type === 'plan_options',
-  )
-  // A just-created assistant turn is empty until the first delta lands; a pure card row has no
-  // prose. Render the bubble only when it would say something.
-  const bodyParts = msg.parts
-  const hasBody = partsToText(bodyParts) !== '' || attachmentsFromParts(msg.parts).length > 0
-  return (
-    <div>
-      <div className={`flex gap-2 ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
-        <div className={`w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5 ${msg.role === 'assistant' ? 'bg-primary/10' : 'bg-secondary/10'}`}>
-          {msg.role === 'assistant'
-            ? <Sparkles size={10} className="text-primary" />
-            : <User size={10} className="text-secondary" />
-          }
-        </div>
-        <div className="max-w-[85%] min-w-0">
-          {hasBody && (
-            <div className={`rounded-2xl px-3 py-2.5 text-xs leading-relaxed ${
-              msg.role === 'user'
-                ? 'bg-tertiary text-white rounded-tr-sm'
-                : 'bg-bial-bg text-tertiary rounded-tl-sm'
-            }`}>
-              {/* U4 — THE STANDING CLAIM IS ANNOTATED IN PLACE, NOT DELETED. The app stopped
-                  running after this message, so the message is no longer true — but it is still
-                  what happened, and rewriting history would leave a citizen scrolling a
-                  transcript that reads like a working app with no explanation of why it isn't.
-                  Struck through and dimmed says "this was true then"; the line under it says
-                  what changed. Deliberately content-agnostic: it renders over whatever the
-                  completion message happens to say, model prose or otherwise. */}
-              <div className={retracted ? 'line-through opacity-50' : undefined}>
-                <MessageContent parts={bodyParts} isUser={msg.role === 'user'} compact isStreaming={isStreaming} />
-              </div>
-              {retracted && (
-                <p data-testid="claim-retracted" className="text-[10px] mt-1.5 text-danger">
-                  Your app stopped running after this message.
-                </p>
-              )}
-              <p className="text-[10px] mt-1 opacity-40">
-                {msg.createdAt ? new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
-              </p>
-            </div>
-          )}
-          {buildPart && (
-            <BuildOutcome
-              part={buildPart}
-              live={showSession && isActiveBuildStatus(sessionStatus) && sessionPreviewUrl === buildPart.previewUrl}
-            />
-          )}
-          {planPart && (
-            <div className="mt-2" data-testid="plan-options-card">
-              <PlanOptionsCard
-                conversationId={buildId}
-                item={applyPlanOverride(planPart.item)}
-                expired={planPart.item.toolCallId !== newestPlanCallId}
-                onBuildIt={(id) => void onBuildIt(id)}
-                onRefined={onRefined}
-              />
-              {planErrors[planPart.item.toolCallId] && (
-                <p className="mt-1 text-[11px] text-danger" role="alert">
-                  {planErrors[planPart.item.toolCallId]}
-                </p>
-              )}
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  )
-})
-
-/**
- * The PROJECT THREAD, rendered by ChatRoute at the flat `/chat/:chatId` — one conversation where
- * an app is specified, built, and iterated for its whole life (003-U4).
+ * THE CONVERSATION SURFACE — one surface, both kinds (Plan D U17, R72).
  *
- * THE ROUTING RULE (load-bearing — read before changing any send path). EVERY composer send is a
- * TURN on this conversation (`startTurn` + the frame stream); what differs by KIND is the toolset
- * the server hands the model, not the pipeline. This page renders a BUILD chat, whose every send
- * holds the write toolset and works directly against the live sandbox — there is no card-confirm
- * gate in front of it, and no per-send setting that could put one there. A chat's kind is fixed
- * when it is created, so there is nothing on this page that can change what a send does.
+ * ══ IT REPLACES TWO PAGES, AND IT CONSULTS NO KIND ══
  *
- * BUILD-IT IS A HANDOFF, NOT A FLIP. A plan chat's `present_plan_options` card starts a build by
- * creating a SECOND, brand-new build chat seeded with the plan, and sending the citizen to it.
- * The plan chat is left exactly as it stands — no flip, no marker, nothing recorded in either
- * direction. `handleBuildIt` below is the interim caller for that press (Plan D's offer strip
- * takes it over); the turn it starts is watched from the chat it actually runs in, on arrival,
- * by the ordinary reattach path — not from here.
+ * `BuilderPage.tsx` (2,665 lines) and `ChatPage.tsx` (1,026) are deleted. This file IS the former,
+ * moved and re-rendered: the four stream consumers, the gate chain, the send discipline, the
+ * save-state model and the preview/app-pane wiring came across unchanged, and only the render
+ * layer is new. That is why the move is a `git mv` — the logic is auditable as a diff rather than
+ * retyped, which on a page this size is the difference between a review and a hope.
+ *
+ * NOTHING BELOW ASKS WHAT KIND OF CHAT THIS IS. A Plan chat's transcript cannot show a build
+ * because no build parts arrive in it, never because a renderer checked; what differs between the
+ * kinds is the TOOLSET the server hands the model, which is decided when the conversation is
+ * created and is not a thing a surface can branch on. `ChatPage`'s send path is not carried
+ * forward: the builder's discipline — hold the draft until the server confirms, roll both bubbles
+ * back on a refused turn — is the generalisation, and the planning page's blind restore is the
+ * defect it fixes (R58).
+ *
+ * ══ THE ROUTING RULE (load-bearing — read before changing any send path) ══
+ *
+ * EVERY composer send is a TURN on this conversation (`startTurn` + the frame stream). A send
+ * never starts a build; builds fire only from the offer strip's confirmation, first build and
+ * iteration alike. The direct-fire send this surface once did is what made the agent silently
+ * guess at a vague prompt.
+ *
+ * BUILD-IT IS A HANDOFF, NOT A FLIP. The offer strip's `Build this plan` creates a SECOND,
+ * brand-new build chat seeded with the plan, and sends the citizen to it. The originating chat is
+ * left exactly as it stands — no flip, no marker, nothing recorded in either direction. The turn
+ * it starts is watched from the chat it actually runs in, on arrival, by the ordinary reattach
+ * path — not from here.
  *
  * "Existing refine semantics" now means: a live LEGACY build session in this project is stopped
  * (`session.stop()`) before the handoff fires. `session.start()` is no longer called anywhere in
@@ -323,11 +165,11 @@ const ChatMessageRow = memo(function ChatMessageRow({
  *
  * @param {{
  *   chatId?: string, projectId?: string | null, projectName?: string | null,
- *   buildSessionDeps?: { client?: import('../utils/buildSessionApi').BuildSessionClient,
- *                        eventSourceFactory?: import('../utils/buildSessionEvents').EventSourceFactory },
+ *   buildSessionDeps?: { client?: import('../../utils/buildSessionApi').BuildSessionClient,
+ *                        eventSourceFactory?: import('../../utils/buildSessionEvents').EventSourceFactory },
  * }} [props]
  */
-interface BuilderPageProps {
+export interface ConversationSurfaceProps {
   chatId?: string
   projectId?: string | null
   projectName?: string | null
@@ -345,16 +187,101 @@ type PlanOverrideValue = 'build' | 'refine'
  * stream settles (`streamAssistant`/`reattachToTurn`/`fireRelayTurn`'s shared shape). */
 interface TurnSink {
   text: string
+  /**
+   * THE LIVE TURN'S STEPS, keyed by tool-call id, and they live in the sink because the
+   * TRANSCRIPT is what renders them now.
+   *
+   * They used to go only into `turnSteps` state, which fed the deleted progress card. The
+   * activity group (U6) draws from message PARTS instead, so the streaming assistant message has
+   * to carry them — and the frame handler is created once per turn with an empty dependency list,
+   * so it cannot read a state value that changes under it. The sink is the per-turn accumulator
+   * that already exists for exactly this reason.
+   *
+   * `turnSteps` state is still set alongside, and that is not duplication for its own sake: the
+   * narrative it feeds answers two different questions (what phase the app pane is in, and
+   * whether today's budget is spent) that have nothing to do with what the transcript draws.
+   */
+  steps: Record<string, StepItem>
   terminal: 'completed' | 'failed' | 'stopped' | null
   reason: string | null
   snapshotCommitted: boolean | null
   /** WHICH turn this settled — needed after the stream ends, when `liveTurnIdRef` has already
-   *  been cleared by the terminal frame. The outcome card dedupes on it, so without it every
-   *  build on one page instance would dedupe on `undefined` and only the first would show. */
+   *  been cleared by the terminal frame. The outcome dedupes on it, so without it every build on
+   *  one surface instance would dedupe on `undefined` and only the first would show. */
   turnId: string | null
 }
 
-export default function BuilderPage({ chatId: chatIdProp, projectId = null, projectName = null, projectHasSavedBuild = null, buildSessionDeps }: BuilderPageProps = {}) {
+/**
+ * The part kinds `convertMessage` maps to no rendered element, restated here because this is the
+ * one place that has to know a message made ONLY of them should not reach the thread at all.
+ *
+ * Kept as data rather than as a condition so the two files can be read against each other: if a
+ * fourth kind stops rendering, it belongs in both, and a mismatch shows up as a stray action bar
+ * rather than as a type error.
+ */
+const UNDRAWN_PARTS: ReadonlySet<MessagePart['type']> = new Set<MessagePart['type']>([
+  'build',
+  'build_in_progress',
+  'plan_options',
+])
+
+/**
+ * THE COMMITTED FALLBACK for a diagnostic that carries no citizen-facing sentence.
+ *
+ * RE-HOMED FROM `BuildProgress.tsx`'s `ERROR_FALLBACK_MESSAGE`, which U17 deleted. It is needed
+ * because the legacy C7 feed carries no `user_message` at all and the turn stream may send a
+ * diagnostic class the server has no sentence for — and a row with no label reads as the
+ * unrecognised-step phrase, which would say "working on your app" over a problem.
+ *
+ * Its ACTION half does not come across. The old card printed "Try describing what you want again,
+ * or ask for something simpler." beside the message, because the card was the whole account of a
+ * failure; this is one row inside a group, and a next action on a run that is still repairing
+ * itself would be advice to abandon something the platform is already fixing. The action belongs
+ * to a terminal, and the terminal has its own prose.
+ */
+export const DIAGNOSTIC_FALLBACK = 'We hit a problem finishing that change.'
+
+/**
+ * The durable truth for a build that began and whose outcome never landed.
+ *
+ * Carried over verbatim from the row it replaces. It is deliberately PAST TENSE and deliberately
+ * says nothing about what to do next: the platform does not know whether that build's work
+ * survived, and a next action invented here would be a guess presented as advice.
+ */
+export const BUILD_WAS_RUNNING = 'A build was running here when this chat was last open.'
+
+/** A fresh accumulator. One helper, so a new field cannot be added to the type and forgotten at
+ *  one of the two call sites that open a stream. */
+function newSink(): TurnSink {
+  return { text: '', steps: {}, terminal: null, reason: null, snapshotCommitted: null, turnId: null }
+}
+
+/**
+ * The parts of the STREAMING assistant message: this turn's activity, then its prose.
+ *
+ * ORDER IS THE RENDER. `groupPartByType` coalesces ADJACENT tool-call parts into one activity
+ * group, so the steps must be contiguous and must precede the text — the group draws above the
+ * reply, which is what the canvas shows and what reads correctly as "it did this, then said this".
+ *
+ * Steps are ordered by their own `seq`, never by object insertion order: a step arrives twice
+ * (started, then finished) under one tool-call id and the second REPLACES the first in place, so
+ * insertion order records when a step was last touched rather than when it happened.
+ *
+ * A NEW ARRAY EVERY TIME, deliberately. The runtime caches the converted message on OBJECT
+ * IDENTITY (convertMessage trap 4), so a mutated-in-place part list is invisible and the UI simply
+ * never re-renders.
+ */
+function streamingParts(sink: TurnSink): MessagePart[] {
+  const steps = Object.values(sink.steps)
+    .filter((step) => !step.hidden)
+    .sort((a, b) => a.seq - b.seq)
+    .map((step): MessagePart => ({ type: 'step', step }))
+  // An empty text part renders no element, so an in-flight turn with steps and no prose yet is
+  // just its activity — which is exactly what should be on screen at that moment.
+  return [...steps, { type: 'text', text: sink.text }]
+}
+
+export default function ConversationSurface({ chatId: chatIdProp, projectId = null, projectName = null, projectHasSavedBuild = null, buildSessionDeps }: ConversationSurfaceProps = {}) {
   const navigate = useNavigate()
   const location = useLocation()
   const params = useParams()
@@ -375,13 +302,23 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const session = useBuildSession(buildSessionDeps ?? {})
 
   const [messages, setMessages] = useState<ChatMessage[]>([])
-  const [input, setInput] = useState('')
   const [builds, setBuilds] = useState<ConversationHeader[]>([])
   // Hides the chat panel so the preview can take the full cockpit width (#42 chat-collapse).
   // The panel stays MOUNTED (CSS-collapsed, not unmounted) so the composer draft, pending
   // attachments, and scroll position survive a hide/show cycle.
   const [chatCollapsed, setChatCollapsed] = useState(false)
-  const [viewer, setViewer] = useState<{ name: string; src: string } | null>(null)
+  /**
+   * THE ASSERTIVE SLOT (R65) — the things that genuinely interrupt.
+   *
+   * A refused send, a failed handoff, a refused stop, a cap the citizen has hit. It is one value
+   * and the newest wins, for the same reason `TurnBanner` is: two platform sentences about the
+   * same moment are a contradiction, not extra information.
+   *
+   * It replaces `attachToast`'s fixed-corner box AND the per-offer `planErrors` map. The map was
+   * keyed by tool-call id to put an error under one card among several; there is one offer strip
+   * on the composer now, so a keyed map would be a lookup that can only ever have one entry.
+   */
+  const [urgent, setUrgent] = useState<string | null>(null)
   // WHICH CHAT has a turn streaming, not merely whether one does (G2). One BuilderPage instance
   // survives a chat switch under flat routing, so the boolean form gated chat B's send on chat A's
   // turn — the same per-chat scoping `buildActiveHere` already applies to the build half.
@@ -408,17 +345,14 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // unscoped flag over that span gates every sibling chat in the tab: exactly the leak
   // `generatingChatId` and the per-chat `sendingRef` already exist to prevent.
   const [buildStartingChatId, setBuildStartingChatId] = useState<string | null>(null)
-  // The build-chat id minted for each card, kept so a RETRY after a refusal re-sends the SAME
-  // id. Minting a fresh one per attempt would turn the server's idempotency arm off: a press
-  // that failed at the workspace claim and then succeeded would be indistinguishable, to the
-  // server, from two different builds of the same plan.
-  const mintedBuildChatRef = useRef<Record<string, string>>({})
-  // The LIVE plan-options card (a `plan_options` frame mid-turn, before the row reaches a
-  // reload's projection) + per-card local overrides so a Build-it outcome updates the card
-  // instantly (the stored record catches up on the next hydration).
+  // The LIVE offer (a `plan_options` frame mid-turn, before the row reaches a reload's
+  // projection) + per-offer local overrides so a press updates the strip instantly (the stored
+  // record catches up on the next hydration).
+  //
+  // THE PER-PRESS MINTED CHAT ID USED TO LIVE HERE and it moved to the strip (U16, D4): the id
+  // belongs to the press-session, and the control that is pressed is the one that can hold it.
   const [livePlanOptions, setLivePlanOptions] = useState<PlanOptionsItem | null>(null)
   const [planOverrides, setPlanOverrides] = useState<Record<string, PlanOverrideValue>>({})
-  const [planErrors, setPlanErrors] = useState<Record<string, string | null>>({})
   // `turnError` covers the chat half (429 daily cap, refused turn, in-band failure);
   // `session.error` covers the build half. Distinct sources, both above the composer.
   const [turnError, setTurnError] = useState<string | null>(null)
@@ -480,8 +414,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // switching projects cannot inherit another project's answer.
   const [savedBuildProjectId, setSavedBuildProjectId] = useState<string | null>(null)
   const [turnTerminal, setTurnTerminal] = useState<'completed' | 'failed' | 'stopped' | null>(null)
-  const [turnStartedAt, setTurnStartedAt] = useState<number | null>(null)
-  const [stoppingTurn, setStoppingTurn] = useState(false)
+  // THE ELAPSED-TIME CLOCK AND THE STOPPING FLAG BOTH WENT WITH THE CARD THEY DRESSED. The card
+  // showed "3m 12s" beside a spinner and greyed its own Stop button while a stop was in flight;
+  // the composer's stop control owns its busy state internally, and the activity group counts
+  // steps rather than seconds. Neither value has a reader left.
   // WHICH CHAT this narrative belongs to. Same scoping `sessionChatRef` gives the build half,
   // and for the same reason (CC3): the page does not remount on a chat switch, so without it a
   // sibling chat renders the neighbouring chat's build narrative — complete with a working Stop
@@ -515,33 +451,25 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const turnBuildStatus = useMemo(
     () =>
       turnNarrativeIsThisChat
-        ? narrativeStatus(turnNarrative, {
+        ? turnPhase(turnNarrative, {
             running: generatingChatId === buildId,
             terminal: turnTerminal,
-            // ALWAYS, on this page. This used to ask whether the conversation's current setting
-            // happened to be the writing one; the page it is asked on is now the answer, because
-            // this page renders a build chat and a build chat has no other kind of send.
-            isBuild: true,
+            // `isBuild: true` USED TO BE PASSED HERE and it is gone rather than moved: the frames
+            // answer the question now. It was always the literal `true` on this page, which is
+            // what made the read-turn arm unreachable — and a hardcoded answer is exactly what a
+            // surface serving both kinds cannot keep.
           })
         : null,
     [turnNarrative, turnNarrativeIsThisChat, generatingChatId, buildId, turnTerminal],
   )
 
-  /** Stop the LIVE turn. Same endpoint an ordinary reply uses — a build has no separate
-   *  stop any more, which is the point: one working indicator, one way to interrupt it. */
-  const handleStopTurn = async () => {
-    const activeId = buildIdRef.current
-    const turnId = liveTurnIdRef.current
-    if (!activeId || !turnId || stoppingTurn) return
-    setStoppingTurn(true)
-    try {
-      await stopTurn(activeId, turnId)
-    } catch {
-      setTurnError('Could not stop this turn. Try again.')
-    } finally {
-      setStoppingTurn(false)
-    }
-  }
+  /**
+   * STOPPING A LIVE TURN USED TO BE THIS SURFACE'S OWN HANDLER, with its own in-flight flag and
+   * its own failure sentence. It is `StopTurnControl` now (U3) — the control owns the busy state,
+   * reads its target at press time and reports a failure through `onUrgent` — and `handleCancel`
+   * below hands the same target to the runtime's `cancel` capability. Two callers, one target
+   * resolver, and neither of them can stop a turn other than the one on screen.
+   */
 
   /** Ask the SERVER whether there is unsaved work. Deliberately not a local flag: the
    *  comparison is container-HEAD vs saved-bundle-HEAD, which is the only one that survives a
@@ -602,28 +530,32 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // every later verify came back green on silence the platform itself had caused.
     clientErrorRelayRef.current?.reset()
     setTurnTerminal(null)
-    setTurnStartedAt(Date.now())
-    setStoppingTurn(false)
   }, [])
 
-  // The newest plan card in the transcript — the only actionable one (older render expired).
-  const newestPlanCallId = useMemo(() => {
-    if (livePlanOptions) return livePlanOptions.toolCallId
-    for (let i = messages.length - 1; i >= 0; i -= 1) {
-      const part = (messages[i].parts || []).find(
-        (pp): pp is Extract<MessagePart, { type: 'plan_options' }> => pp?.type === 'plan_options',
-      )
-      if (part) return part.item.toolCallId
-    }
-    return null
-  }, [messages, livePlanOptions])
+  /**
+   * R35c — WHICH ASSISTANT MESSAGES BELONG TO A TURN THAT WAS INTERRUPTED.
+   *
+   * A fact about the TURN, not about any part, which is why the activity group cannot work it out
+   * for itself: a stopped build's steps look exactly like a finished one's, and the group would
+   * otherwise seal as "9 steps" over work that never completed. The group asks this set and says
+   * "stopped before it finished" instead.
+   *
+   * Only `stopped` goes in. A `failed` turn has a reason and says it in prose; an interruption is
+   * the one terminal with nothing to show for itself.
+   */
+  const [interruptedIds, setInterruptedIds] = useState<ReadonlySet<string>>(() => new Set())
+  const markInterrupted = useCallback((assistantId: string, terminal: TurnSink['terminal']) => {
+    if (terminal !== 'stopped') return
+    setInterruptedIds((prev) => new Set(prev).add(assistantId))
+  }, [])
 
-  const { pendingAttachments, handleFileSelect, removePending, clearPending, attachToast, showAttachToast, draggingFiles, dragHandlers } =
-    usePendingAttachments()
-
-  const bottomRef = useRef<HTMLDivElement>(null)
-  const inputRef = useRef<HTMLTextAreaElement>(null)
-  const fileInputRef = useRef<HTMLInputElement>(null)
+  // ATTACHMENTS, THE DRAFT AND THE SCROLL SENTINEL ALL MOVED (U10, U8). `usePendingAttachments`,
+  // `readDraft`/`writeDraft`, the file input and the `scrollIntoView` sentinel were this surface's
+  // and are the composer's and the thread's now. The sentinel in particular is not merely
+  // relocated: it scrolled on EVERY `[messages]` change, so a reader who had scrolled up was
+  // dragged back to the bottom on every delta and reading the middle of a long build was
+  // impossible. The viewport's own bottom-proximity check replaces it.
+  //
   // Build sessions whose outcome this instance has already appended. The in-memory half of the
   // dedupe; the transcript scan in `appendBuildOutcome` is the half that survives a reload.
   const outcomeWrittenRef = useRef<Set<string>>(new Set())
@@ -681,12 +613,14 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // simply cannot submit it into a running turn. Not disabling the textarea IS the focus fix
   // (KTD-3) — `disabled` on the focused element blurs it to `document.body`, which is the
   // mechanism behind "it blurs mid-sentence and focus never comes back".
-  const buildStarting = buildStartingChatId === buildId
-  const turnInFlight = generating || buildActiveHere || buildStarting
+  //
   // Send additionally waits on the adopt round-trip: an unresolved gate means we do not yet know
-  // whether a build is live here, and "probably fine" is not a thing to guess about a send that
-  // the server would refuse.
-  const sendUnavailable = turnInFlight || gateCheck !== 'resolved'
+  // whether a build is live here, and "probably fine" is not a thing to guess about a send the
+  // server would refuse. The arms are assembled into one sentence-per-cause by `gate` below and
+  // enforced in `handleSubmit`; there is no boolean here for a render to read, because a gate
+  // that renders from one value and enforces from another is a gate that can disagree with
+  // itself.
+  const buildStarting = buildStartingChatId === buildId
   // `sendingRef` records WHICH CHAT is mid-send, and it is stamped synchronously before the first
   // await so a second Enter — or the seeded prompt racing a manual send — cannot start a second
   // session (the one-per-user 409 collision). Per-chat for the same reason `generating` is (G2):
@@ -787,9 +721,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     let alive = true
     buildIdRef.current = buildId
 
-    // Drop every scrap of the PREVIOUS chat before a byte of this one arrives (no remount under flat
-    // routing). The composer draft belongs to the OLD chat — a leaked draft would send into this
-    // one — so restore THIS chat's saved draft rather than blanking unconditionally (G3).
+    // Drop every scrap of the PREVIOUS chat before a byte of this one arrives (no remount under
+    // flat routing). THE DRAFT AND THE STAGED FILES ARE NOT LISTED BELOW and their absence is the
+    // point: the composer is keyed by conversation and re-hydrates its own draft on the switch
+    // (G3), so a leaked draft cannot send into the wrong chat and this effect has one fewer thing
+    // it can forget.
     setMessages([])
     // AND THE GUARD ABOVE IS INVALIDATED IN THE SAME BREATH. `loadedBuildRef` means "the chat
     // whose transcript is on screen", and one line ago that stopped being true — so it has to
@@ -799,8 +735,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // still named it. The guard then skipped the whole hydration and left the citizen looking
     // at the empty transcript this line just made, recoverable only by reloading the page.
     loadedBuildRef.current = null
-    setInput(readDraft(buildId))
-    clearPending()
     // Re-ask the live-build question for the chat we are arriving at. Carrying the previous chat's
     // answer forward would open send over a build this chat has not been checked for.
     setGateCheck('checking')
@@ -808,7 +742,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     streamAbortRef.current?.abort()
     setLivePlanOptions(null)
     setPlanOverrides({})
-    setPlanErrors({})
+    setUrgent(null)
     setTurnError(null)
     setWorkspaceSays(null)
     setWorkspaceLost(false)
@@ -881,10 +815,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [buildId])
-
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
 
   /**
    * Send a prompt handed off from another surface (the project composer's Generate, or the
@@ -1061,12 +991,17 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   /**
    * The ONE turn-frame reducer, shared by both stream consumers — the send path below and the
    * mid-turn RE-ATTACH on reload. A frame must not be interpreted two different ways depending
-   * on which consumer happened to open the socket; `sink` carries the two mutable accumulators
-   * (`text` so far, the terminal status) back out to the caller.
+   * on which consumer happened to open the socket; `sink` carries the mutable accumulators
+   * (`text` so far, this turn's steps, the terminal status) back out to the caller.
    */
   const turnFrameHandler = useCallback((activeId: string, assistantId: string, sink: TurnSink) => {
+    // A NEW OBJECT FOR THE CHANGED MESSAGE, IDENTITY PRESERVED FOR EVERY OTHER — the runtime
+    // caches the conversion on object identity, so an in-place mutation is invisible and the
+    // transcript simply never re-renders (convertMessage trap 4). `.map` gives exactly that.
     const paint = () =>
-      setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, parts: [{ type: 'text', text: sink.text }] } : m)))
+      setMessages((prev) =>
+        prev.map((m) => (m.id === assistantId ? { ...m, parts: streamingParts(sink) } : m)),
+      )
     return (frame: TurnFrame) => {
       if (buildIdRef.current !== activeId) return // navigated away — drop the frame
       // UnknownFrame's index signature defeats discriminated-union narrowing on `frame.type`
@@ -1110,11 +1045,16 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
           }))
         }
         if (frame.steps?.length) {
+          // THE SINK FIRST, then the state — `paint()` reads the sink, and a snapshot that
+          // updated only the state would leave a reloaded tab's whole recovered narrative out of
+          // the transcript it is meant to be restoring.
+          for (const step of frame.steps) sink.steps[`snap_${step.seq}_${step.tool}`] = step
           setTurnSteps((prev) => {
             const next = { ...prev }
             for (const step of frame.steps) next[`snap_${step.seq}_${step.tool}`] = step
             return next
           })
+          paint()
         }
       } else if (frame.type === 'plan_options') {
         setLivePlanOptions(frame.item)
@@ -1122,10 +1062,17 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         setTurnError(frame.message)
         setWorkspaceSays(frame.message)
       } else if (frame.type === 'step') {
-        // U5: the arm this handler used to DROP entirely. A Write turn's whole narrative —
-        // every file written, every command run — arrives as step frames, so without this a
-        // build streamed a blank bubble for several minutes and then a finished app.
+        // A Write turn's whole narrative — every file written, every command run — arrives as
+        // step frames. KEYED BY TOOL-CALL ID, so the `finished` frame REPLACES its own `started`
+        // one in place: appending would stack a spinner beside its own result, and the activity
+        // group's live count would climb while the same step re-rendered.
+        sink.steps[frame.toolCallId] = frame.item
         setTurnSteps((prev) => ({ ...prev, [frame.toolCallId]: frame.item }))
+        // The transcript is what draws activity now (U6), so a step has to reach the message it
+        // belongs to. Without this the group renders nothing until the next text delta happens
+        // to repaint — which on a build that writes for minutes before saying anything is the
+        // whole build.
+        paint()
       } else if (frame.type === 'workspace') {
         setTurnWorkspace({ state: frame.state, message: frame.message ?? null })
         // U2 — `notice`, never `message`. The ordinary lifecycle pair carries a `message`
@@ -1141,10 +1088,31 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
           state: frame.state,
         }))
       } else if (frame.type === 'diagnostic') {
-        // NOT `setTurnError`. The turn is not failing — a repair run follows — and showing
-        // this as a failure would tell the user their build died four times on its way to
-        // succeeding. It renders as an in-narrative alert row instead.
+        // NOT `setTurnError`. The turn is not failing — a repair run follows — and showing this as
+        // a failure would tell the citizen their build died four times on its way to succeeding.
         setTurnDiagnostics((prev) => [...prev, frame])
+        // IT JOINS THE ACTIVITY GROUP AS A FAILED ROW, which is where the self-heal narrative
+        // lives now. The deleted card drew diagnostics as their own amber "trying another way"
+        // block that vanished at the terminal; the group counts them instead — "4 steps · one
+        // problem" — so a citizen reading a finished build still learns it hit something, which
+        // the vanishing block could not tell them. Dropping the frame here would have removed the
+        // self-heal narrative from the product silently, which is the one disposition not open.
+        //
+        // ONLY `userMessage` CROSSES. The frame's developer half (source, and the compiler title
+        // that rides with it) is exactly what R36's wall exists to keep off the screen; it still
+        // travels to the agent, which is the party that can act on it.
+        const key = `diagnostic-${frame.seq}`
+        sink.steps[key] = {
+          type: 'step',
+          seq: frame.seq,
+          // The classifier's own vocabulary is for real tool calls; this row is the platform
+          // speaking, and `tool` is never rendered (convertPart deliberately drops it).
+          tool: 'diagnostic',
+          label: frame.userMessage || DIAGNOSTIC_FALLBACK,
+          state: 'failed',
+          hidden: false,
+        }
+        paint()
       } else if (frame.type === 'compile') {
         setTurnCompile(frame.state)
       } else if (frame.type === 'quota') {
@@ -1176,7 +1144,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     const assistantSeq = seqRef.current
     seqRef.current += 1
     const assistantId = `local_${Date.now()}_r`
-    const sink: TurnSink = { text: '', terminal: null, reason: null, snapshotCommitted: null, turnId: null }
+    const sink = newSink()
     setGeneratingChatId(activeId)
     setTurnError(null)
     resetTurnNarrative()
@@ -1205,10 +1173,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     if (!stillHere()) return
     if (outcome === 'stalled') setTurnError('The reply stalled. Reload to catch up.')
     else if (outcome === 'truncated' && !sink.terminal) setTurnError('The connection dropped. Reload to catch up.')
-    if (sink.terminal !== 'completed' && sink.text === '') {
+    if (sink.terminal !== 'completed' && sink.text === '' && Object.keys(sink.steps).length === 0) {
       setMessages((prev) => prev.filter((m) => m.id !== assistantId))
       seqRef.current = assistantSeq
     }
+    markInterrupted(assistantId, sink.terminal)
     announceTerminal(sink)
     refreshBuilds()
   }
@@ -1225,6 +1194,14 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    *
    * Create-before-stream is load-bearing: the stateless relay 404s an unknown conversation,
    * and the row is what carries the project parentage + context that ground the first turn.
+   *
+   * ══ `onSent` IS THE MOMENT THE COMPOSER MAY EMPTY, AND IT IS NOT THE END OF THE TURN ══
+   *
+   * It fires when the server has the message — the row created, or the turn about to stream on an
+   * existing thread — not when the reply finishes. That distinction is the whole of R58: waiting
+   * for the terminal would leave a citizen's text sitting in the composer for the several minutes
+   * a build runs, and clearing before it would lose the text on every refusal. `onAbort` is its
+   * opposite number and fires on every path that leaves the server holding nothing.
    */
   const fireRelayTurn = async (
     rawText: string,
@@ -1248,7 +1225,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     } catch (err) {
       // ABORT — never fall through to a turn that silently forgets the attachment (R3). The user
       // attached a spreadsheet; answering as if they hadn't is the wrong-build bug in miniature.
-      showAttachToast(err instanceof Error ? err.message : 'Could not upload the attachment. Please try again.')
+      setUrgent(err instanceof Error ? err.message : 'Could not upload the attachment. Please try again.')
       if (stillHere()) onAbort?.()
       return
     }
@@ -1283,7 +1260,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         onSent?.()
       } catch (err) {
         releaseUploadedAttachments(parts)
-        showAttachToast(describeSaveFailure(err, 'Could not start this thread. Check your connection.'))
+        setUrgent(describeSaveFailure(err, 'Could not start this thread. Check your connection.'))
         // Roll back ONLY if we still own this chat — a mid-await switch means the snapshot/seq
         // describe the OTHER chat, and writing them here would clobber the current transcript.
         if (stillHere()) {
@@ -1306,7 +1283,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     const assistantSeq = seqRef.current
     seqRef.current += 1
     const assistantId = `local_${Date.now()}_a`
-    const sink: TurnSink = { text: '', terminal: null, reason: null, snapshotCommitted: null, turnId: null }
+    const sink = newSink()
     setGeneratingChatId(activeId)
     setTurnError(null)
     resetTurnNarrative()
@@ -1370,6 +1347,12 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
           // let the error banner be the only account of what happened.
           setMessages((prev) => prev.filter((m) => m.id !== assistantId && m.id !== userMsg.id))
           seqRef.current = userSeq
+          // AND TELL THE COMPOSER TO KEEP EVERYTHING. A refused turn persisted nothing, so the
+          // citizen's text and staged files must survive — this is the path a 429 over the daily
+          // cap takes, and it is exactly when losing the message would be least forgivable.
+          // Without this the send promise never settles: the text would stay (correctly) but by
+          // accident, on a promise nobody resolves.
+          onAbort?.()
         }
       }
       endGenerating(activeId)
@@ -1378,12 +1361,13 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     endGenerating(activeId)
 
     if (stillHere()) {
-      if (sink.terminal !== 'completed' && sink.text === '') {
+      if (sink.terminal !== 'completed' && sink.text === '' && Object.keys(sink.steps).length === 0) {
         // Failed/stopped with nothing streamed — drop the empty bubble; the error banner
         // (or the stopped state) is the feedback.
         setMessages((prev) => prev.filter((m) => m.id !== assistantId))
         seqRef.current = assistantSeq
       }
+      markInterrupted(assistantId, sink.terminal)
       announceTerminal(sink)
       refreshBuilds()
     }
@@ -1528,72 +1512,76 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   /**
    * A composer send is ALWAYS a chat turn — never a build.
    *
-   * That is the routing rule: the model decides when there is enough to build and says so with a
-   * brief card; the user confirms it. A post-build "add a chart" goes down this exact path too
-   * (the protocol emits an updated brief immediately for a concrete change, so iteration costs one
-   * model turn + one click).
+   * That is the routing rule: the model decides when there is enough to build and says so with an
+   * offer; the citizen presses it. A post-build "add a chart" goes down this exact path too.
+   *
+   * ══ IT RESOLVES ON CONFIRMATION AND REJECTS ON FAILURE, AND THAT IS THE CONTRACT ══
+   *
+   * The composer clears its text and its staged files ONLY when this resolves. So every refusal
+   * below must THROW rather than return quietly: returning would look like success and empty a
+   * composer whose message never went anywhere. That inverts the old shape, where this function
+   * returned after a toast and cleared the draft through an `onSent` callback — the callback is
+   * gone, and "the send succeeded" is now one thing (this promise) instead of two that could
+   * disagree.
+   *
+   * ══ THE ONE GATE, ENFORCED HERE AND ONLY HERE ══
+   *
+   * The composer's attributes are the AFFORDANCE: `aria-disabled` deliberately keeps Send
+   * focusable (KTD-2), the textarea is never disabled at all (KTD-3), and Enter calls straight
+   * through. So every arm has to be re-checked at the one place that actually starts a turn.
    */
-  const handleSend = async () => {
-    const text = input.trim()
-    const attachments = pendingAttachments
-    if (!text && attachments.length === 0) return // nothing to send
-    // THE ONE GATE, ENFORCED HERE AND ONLY HERE. The composer's attributes are the AFFORDANCE:
-    // `aria-disabled` deliberately keeps Send focusable (KTD-2), the textarea is never disabled at
-    // all (KTD-3), and Enter on it calls straight through to this function. So every arm of the
-    // gate has to be re-checked at the one place that actually starts a turn.
+  const handleSubmit = async ({ text: rawText, attachments, conversationId }: ComposerSubmission) => {
+    const text = rawText.trim()
+    if (!text && attachments.length === 0) return
     if (buildActiveHere || buildStarting) {
-      showAttachToast('Your app is being built — send unlocks when it finishes. Keep typing meanwhile.')
-      return
+      throw new Error('Your app is being built — send unlocks when it finishes. Keep typing meanwhile.')
     }
     if (generating) {
-      showAttachToast('Send unlocks when the current reply finishes. Keep typing meanwhile.')
-      return
+      throw new Error('Send unlocks when the current reply finishes. Keep typing meanwhile.')
     }
     if (gateCheck !== 'resolved') {
-      showAttachToast(
+      throw new Error(
         gateCheck === 'unreachable'
           ? 'Still can’t tell whether a build is running here. Try the Retry above.'
           : 'Just checking whether a build is running here — one moment.',
       )
-      return
     }
     // Synchronous, and a REF rather than state: the two keydowns of a fast double-Enter land in the
     // SAME tick, so `generating` — set after an await — is still false for the second one. The
     // draft is deliberately held until the server confirms the turn, so that second read sees the
     // very same text and fires a second relay turn: a duplicate persisted message, a duplicate
-    // model call, and on a builder thread two brief cards for one request. Silent on purpose —
-    // this is one keystroke burst, not a second intention worth a toast.
-    // `handleConfirmBrief` holds this same ref, for the same reason, over the build trigger.
+    // model call, and two offers for one request.
+    //
+    // SILENTLY, and it is the one refusal here that does not throw: this is one keystroke burst,
+    // not a second intention, and throwing would put an error sentence on screen for a press the
+    // citizen did not knowingly make — and empty nothing, since the first send is still running.
     if (sendingRef.current === buildIdRef.current) return
     // Project-first: a thread REQUIRES a project (no lazy Default — never reintroduce).
-    if (!projectId) {
-      showAttachToast('Open a project to start a build.')
-      return
-    }
+    if (!projectId) throw new Error('Open a project to start a build.')
     if (attachments.length > 0) {
       const cap = validateConversationAttachmentCap(countAttachments(messages), attachments.length)
-      if ('error' in cap) {
-        showAttachToast(cap.error)
-        return
-      }
+      if ('error' in cap) throw new Error(cap.error)
     }
 
-    // Guarded above by the adopt effect having run (buildId is set on mount) — non-null by
-    // the time a send fires, same invariant `fireRelayTurn`'s callers already assume.
-    const sendChatId = buildIdRef.current as string
+    // R60 — THE CHAT THE COMPOSER STAMPED AT PRESS TIME, not whichever one is open when this
+    // settles. A reader who moves to a sibling chat mid-send must not have their message land in
+    // the one they are now looking at.
+    const sendChatId = conversationId
     sendingRef.current = sendChatId
     try {
-      // The draft is held until the turn is STORED, then cleared by `onSent`. Clearing it here —
-      // optimistically, on the click — is what made every save failure unrecoverable: the toast
-      // tells the user to send it again, and their text and staged files are already gone.
-      await fireRelayTurn(text, attachments, sendChatId, {
-        onSent: () => {
-          setInput('')
-          // Clear the PERSISTED draft with the in-memory one, or the next reload re-populates the
-          // composer with the message that was just sent — which is easy to send twice by accident.
-          clearDraft(sendChatId)
-          clearPending()
-        },
+      // RESOLVE WHEN THE SERVER HAS THE MESSAGE, not when the reply finishes — see
+      // `fireRelayTurn`'s `onSent`. Awaiting the whole turn would hold the citizen's text in the
+      // composer for the minutes a build takes; rejecting on `onAbort` is what keeps it there on
+      // every path that leaves the server holding nothing.
+      //
+      // The rejection reason is deliberately EMPTY of copy: `fireRelayTurn` has already said what
+      // went wrong, in the banner, with the server's own words. The composer's catch only needs
+      // to know that it must not empty itself.
+      await new Promise<void>((resolve, reject) => {
+        void fireRelayTurn(text, attachments, sendChatId, {
+          onSent: resolve,
+          onAbort: () => reject(new Error('send-aborted')),
+        })
       })
     } finally {
       // Release only OUR claim: a send begun in the chat the user has since switched to must not
@@ -1609,22 +1597,37 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * chat's frames into another chat's transcript and persist nothing, and the assistant bubble
    * it seeded would be a permanent artefact of a reply that was never made here.
    *
-   * The subscription is not lost, it MOVED. `handleBuildIt` sends the citizen to the new chat,
-   * and this page's own hydration attaches to whatever turn is live on the chat it opens
+   * The subscription is not lost, it MOVED. This sends the citizen to the new chat, and the
+   * surface's own hydration attaches to whatever turn is live on the chat it opens
    * (`reattachToTurn`, via the `activeTurn` the read projection carries) — which is the same
    * path a reload mid-build has always taken, and the only one that survives closing the tab.
+   *
+   * ══ THE NEW CHAT'S ID ARRIVES; IT IS NO LONGER MINTED HERE (U16, D4) ══
+   *
+   * The offer strip mints it, once per press-session, and hands it over — so a double press and
+   * a retry carry the same id and collide on the primary key, and the server answers with the
+   * chat that already exists. This used to hold its own `mintedBuildChatRef` keyed by tool-call
+   * id; two mints for one press would be two build chats for one plan.
+   *
+   * ══ A REFUSAL IS SAID HERE, VERBATIM, AND THIS DOES NOT THROW FOR IT ══
+   *
+   * Each refusal has a different remedy and only the server knows which one this is: another
+   * chat holds the workspace, there is nowhere to build, the daily cap is spent, the offer
+   * carried no usable plan. So the server's own sentence goes to the urgent slot and the promise
+   * RESOLVES — the strip's own `catch` would replace four remedies with one generic apology. The
+   * strip is left pressable either way, which is what R29 asks for.
    */
-  const handleBuildIt = useCallback(async (toolCallId: string) => {
+  const handleBuildIt = useCallback(async ({ toolCallId, newChatId }: BuildHandoff) => {
     if (sendingRef.current === buildIdRef.current) return
     if (!projectId) {
-      showAttachToast('Open a project to start a build.')
+      setUrgent('Open a project to start a build.')
       return
     }
-    // Non-null: the adopt effect sets buildIdRef.current on mount, before any card can render.
+    // Non-null: the adopt effect sets buildIdRef.current on mount, before any offer can render.
     const activeBuildId = buildIdRef.current as string
     const blocked = buildBlockedMessage(activeBuildId)
     if (blocked) {
-      setPlanErrors((prev) => ({ ...prev, [toolCallId]: blocked }))
+      setUrgent(blocked)
       return
     }
     sendingRef.current = activeBuildId
@@ -1632,15 +1635,12 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // round-trip (lock acquire + sandbox provision) and the build is already the user's
     // answer for every second of it.
     setBuildStartingChatId(activeBuildId)
-    setPlanErrors((prev) => ({ ...prev, [toolCallId]: null }))
+    setUrgent(null)
     try {
       const session = sessionRef.current
       const sessionLive = isActiveBuildStatus(session.status) && session.sessionId != null
       if (sessionLive && sessionProjectRef.current !== projectId) {
-        setPlanErrors((prev) => ({
-          ...prev,
-          [toolCallId]: 'You already have a build running in another project. Stop it before starting one here.',
-        }))
+        setUrgent('You already have a build running in another project. Stop it before starting one here.')
         return
       }
       if (sessionLive) {
@@ -1649,22 +1649,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         // snapshot + terminal clean).
         const stopped = await session.stop()
         if (!stopped) {
-          setPlanErrors((prev) => ({
-            ...prev,
-            [toolCallId]: session.error || 'Could not stop the running build — try again.',
-          }))
+          setUrgent(session.error || 'Could not stop the running build — try again.')
           return
         }
       }
-      // THE ID IS MINTED HERE, and that is what makes a double-press safe. Both presses carry
-      // the same id, so the second one finds the first's chat already there and is answered
-      // `already_started` naming it — where a server-minted id would leave the citizen looking
-      // at the second of two build chats made from one plan. Minted through the SHARED
-      // `uuidv7`, never an inline `crypto.randomUUID()`: this id becomes a conversation's
-      // PRIMARY KEY and ADR-0006 wants v7 (the same trap `ProjectBuilder`'s mint documents).
-      const mintedChatId = mintedBuildChatRef.current[toolCallId] ?? uuidv7()
-      mintedBuildChatRef.current[toolCallId] = mintedChatId
-      const outcome = await buildFromPlan(activeBuildId, toolCallId, mintedChatId)
+      const outcome = await buildFromPlan(activeBuildId, toolCallId, newChatId)
       setPlanOverrides((prev) => ({ ...prev, [toolCallId]: 'build' }))
       // THE CROSS-TAB CLAIM, made for the chat that will actually hold the workspace — not for
       // this one, which is about to stop being where anything happens. Advisory only: the
@@ -1676,20 +1665,16 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       // hydration picks up the live turn on arrival.
       navigate(`/chat/${outcome.chatId}`)
     } catch (err) {
-      // The server's message, verbatim, because each refusal has a different remedy and only
-      // the server knows which one this is: another chat holds the workspace, there is nowhere
-      // to build, the daily cap is spent, the offer carried no usable plan.
-      setPlanErrors((prev) => ({
-        ...prev,
-        [toolCallId]: err instanceof Error ? err.message : 'The build could not be started. Try again.',
-      }))
+      // Verbatim, and NOT rethrown — see the docblock. The strip's own catch would collapse four
+      // different remedies into one generic apology.
+      setUrgent(err instanceof Error ? err.message : 'The build could not be started. Try again.')
     } finally {
       if (sendingRef.current === activeBuildId) sendingRef.current = null
       setBuildStartingChatId((prev) => (prev === activeBuildId ? null : prev))
     }
-  }, [projectId, showAttachToast, buildBlockedMessage, navigate])
+  }, [projectId, buildBlockedMessage, navigate])
 
-  /** A card's effective item: the stored record, overlaid with this page's just-made choice. */
+  /** An offer's effective state: the stored record, overlaid with this surface's just-made choice. */
   const applyPlanOverride = useCallback(
     (item: PlanOptionsItem): PlanOptionsItem => {
       const override = planOverrides[item.toolCallId]
@@ -1699,46 +1684,53 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     [planOverrides],
   )
 
-  const handleRefined = useCallback((toolCallId: string) => {
-    setPlanOverrides((prev) => ({ ...prev, [toolCallId]: 'refine' }))
-    setLivePlanOptions((prev) => (prev && prev.toolCallId === toolCallId ? null : prev))
-  }, [])
+  /**
+   * "Keep planning" — answer the tool call with `refine`, which hands the composer straight back.
+   *
+   * ANSWERING IS THE WHOLE POINT, not a bookkeeping detail: an open tool call blocks the
+   * conversation, so a typed message while one is pending would be rejected by the server. That
+   * is why the strip has two buttons rather than one, and why this one has to reach the server
+   * before the composer opens.
+   */
+  const handleKeepPlanning = useCallback(
+    async (toolCallId: string) => {
+      const activeId = buildIdRef.current
+      if (!activeId) return
+      await resolvePlanOptions(activeId, toolCallId)
+      setPlanOverrides((prev) => ({ ...prev, [toolCallId]: 'refine' }))
+      setLivePlanOptions((prev) => (prev && prev.toolCallId === toolCallId ? null : prev))
+    },
+    [],
+  )
+
+  /**
+   * THE OFFER ON THE COMPOSER (U16) — the newest `present_plan_options` call, live or stored.
+   *
+   * `livePlanOptions` is the frame this turn just streamed; the transcript's own newest one is
+   * what a reload finds. The live one wins because it is the newer of the two by construction,
+   * and the stored row replaces it identically on the next hydration.
+   *
+   * A SPENT OFFER STILL RENDERS AND STAYS PRESSABLE (D2). Only a PENDING one blocks the composer,
+   * which is what "only one offer is live" actually means.
+   */
+  const offer = useMemo(() => {
+    if (livePlanOptions) return applyPlanOverride(livePlanOptions)
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const part = (messages[i].parts || []).find(
+        (p): p is Extract<MessagePart, { type: 'plan_options' }> => p?.type === 'plan_options',
+      )
+      if (part) return applyPlanOverride(part.item)
+    }
+    return null
+  }, [messages, livePlanOptions, applyPlanOverride])
 
   // Reset the terminal banners so the operator can start fresh (Start-again / Dismiss).
   const handleStartAgain = () => {
     session.reset()
     sessionChatRef.current = null
     sessionProjectRef.current = null
-    inputRef.current?.focus()
   }
 
-  // U15: the live session's stored half. While the LIVE bubble below re-tells exactly this
-  // session (reattach replays its envelopes), the hydrated step/in-progress rows that belong
-  // to it are suppressed — one narrative, told once. Rows from OLDER builds always render.
-  // The seq of the `build_in_progress` anchor belonging to the ATTACHED session, or null.
-  // Rows at or after it describe the build the live bubble is currently speaking for.
-  const attachedAnchorSeq = useMemo(() => {
-    if (!showSession) return null
-    for (let i = messages.length - 1; i >= 0; i -= 1) {
-      const anchor = (messages[i].parts || []).find((p) => p?.type === 'build_in_progress')
-      if (anchor) return anchor.sessionId === session.sessionId ? messages[i].seq : null
-    }
-    return null
-  }, [messages, showSession, session.sessionId])
-  // CC2 — STORED STEPS ARE SUPPRESSED ONLY WHEN THE LIVE BUBBLE CAN ACTUALLY RE-TELL THEM.
-  //
-  // The one-narrative rule is right for the tab that STARTED the build: its bubble holds every
-  // envelope, so rendering the stored rows too would double-render each step. But the
-  // justification in the old comment — "reattach replays its envelopes" — is false. `reattach()`
-  // calls `reset()`, which CLEARS `envelopes`, then subscribes to the live feed from the current
-  // point. It replays nothing. So a reload ten minutes into a build suppressed the entire visible
-  // history and re-told none of it: the transcript went blank.
-  //
-  // The discriminator is whether THIS page instance has envelopes to show — not "is a session
-  // attached" (the reloaded tab has one, holding nothing), and not the blunt "stop suppressing"
-  // (which double-renders in the originating tab). A server-side replay would be better still,
-  // but it needs a cursor on the build-session feed: backend work, outside this unit.
-  const liveStoryAnchorSeq = session.envelopes.length > 0 ? attachedAnchorSeq : null
   // The #43 "come back later" journey: after a reload there is no live session, but a persisted
   // BuildOutcome part proves a build once ran — so the preview pane must offer the terminal
   // placeholder (with its Relaunch action), not the idle "submit a prompt" empty state. The
@@ -1752,42 +1744,147 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     }
     return null
   }, [messages])
-  // Groups a RUN of consecutive stored `step` messages into one collapsed presentation —
-  // the reload half of the build narrative rendered through the SAME `StepHistoryCollapsible`
-  // BuildProgress uses post-build, so a finished build reads identically whether you watched
-  // it finish live or came back to a reloaded tab. A non-step message (or a superseded step,
-  // already re-told by the live bubble) breaks the run — a later step starts a NEW group
-  // rather than joining one across an unrelated message.
-  const renderItems = useMemo(() => {
-    const items: RenderItem[] = []
-    let currentGroup: StepGroupItem | null = null
+
+  /**
+   * R7 — A BUILD THAT RAN AND DID NOT SAVE IS NOT A SUCCESS, and the citizen has to know before
+   * they build again on top of it.
+   *
+   * IT MOVED TO THE BANNER RATHER THAN DYING WITH THE OUTCOME CARD. The card read
+   * `snapshotCommitted` off the newest build part and printed this line inside itself; U17 deleted
+   * the card, and dropping the sentence with it would have removed a warning about lost work —
+   * which is the one class of thing this plan's success criterion names by hand.
+   *
+   * DERIVED FROM THE TRANSCRIPT, so it survives a reload exactly as the card's version did: the
+   * server's own row carries `snapshotCommitted`, and a citizen who comes back tomorrow still
+   * needs to be told before their next build starts from the wrong code.
+   *
+   * ONLY AN EXPLICIT `false`. `null` is UNKNOWN — a graceful stop closes the feed before the real
+   * terminal arrives — and warning on unknown would tell people their code was thrown away about
+   * builds that saved perfectly well.
+   */
+  const unsavedBuildWarning = useMemo(() => {
+    if (!newestOutcome) return null
+    const committed = 'snapshotCommitted' in newestOutcome ? newestOutcome.snapshotCommitted : undefined
+    return committed === false
+      ? 'This build’s code wasn’t saved, so the next build won’t start from it.'
+      : null
+  }, [newestOutcome])
+  /**
+   * WHERE THE TURN IN FLIGHT BEGINS — the seq of the newest user message while a turn is
+   * streaming here, and `null` otherwise.
+   *
+   * It exists for ONE case, and only the reattach path can produce it. A reload landing
+   * mid-build re-subscribes (`reattachToTurn`) and re-tells the turn so far into a fresh
+   * assistant message, while the transcript it just hydrated ALREADY holds that same turn's
+   * persisted step rows. Without a boundary both are drawn and every step appears twice.
+   *
+   * THE TURN BOUNDARY IS THE USER MESSAGE, not the anchor row this replaced. The old rule keyed
+   * on a `build_in_progress` part belonging to the attached legacy SESSION — a narrower question
+   * that could not see a turn-stream build at all, and one whose own comment records it going
+   * wrong in both directions (suppressing a whole history it then failed to re-tell). A user
+   * message is where a turn starts by definition, on both transports and for both kinds.
+   *
+   * An ordinary send needs none of this: the server has persisted no steps for a turn that has
+   * only just started, so the rule finds nothing to drop and costs nothing.
+   */
+  const liveTurnFromSeq = useMemo(() => {
+    if (generatingChatId !== buildId) return null
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i].role === 'user') return messages[i].seq ?? null
+    }
+    return null
+  }, [generatingChatId, buildId, messages])
+
+  /**
+   * Append one stored step row to the run it continues, PRESERVING OBJECT IDENTITY when nothing
+   * about that run has changed.
+   *
+   * The identity half is not tidiness. The runtime caches each converted message on the message
+   * OBJECT (convertMessage trap 4), so a merged row rebuilt on every render would re-convert — and
+   * re-render — the whole stored history on every streamed token of the turn happening now. The
+   * cache is keyed on the exact ids in the run, so a run that has not changed hands back the same
+   * object and the cache holds.
+   */
+  const mergedRunsRef = useRef(new Map<string, ChatMessage>())
+  const mergeStepRun = useCallback((run: ChatMessage, next: ChatMessage): ChatMessage => {
+    const parts = [...(run.parts ?? []), ...(next.parts ?? [])]
+    // The run's own id names it; every merged part's id rides in the key so a changed run misses.
+    const key = `${run.id}|${parts.length}|${next.id}`
+    const cached = mergedRunsRef.current.get(key)
+    if (cached) return cached
+    // The FIRST row's id and seq, because the merged message stands where the run starts —
+    // taking the last row's would move the group down the transcript as it grew.
+    const merged: ChatMessage = { ...run, parts }
+    mergedRunsRef.current.set(key, merged)
+    return merged
+  }, [])
+
+  /**
+   * THE TRANSCRIPT AS THE THREAD RECEIVES IT.
+   *
+   * Two filters, and no grouping — the grouping is the thread's, via `groupPartByType`, which is
+   * most of what U6 bought. What is left here is the two things a renderer cannot decide:
+   *
+   *  1. A MESSAGE WITH NOTHING TO DRAW IS NOT DRAWN. `convertMessage` maps `build`,
+   *     `build_in_progress` and `plan_options` to no part at all — the first two are covered by
+   *     the activity group's own terminal handling and the third is the offer, which renders on
+   *     the composer. A message made only of those would otherwise reach the thread as an EMPTY
+   *     assistant message, and an empty assistant message still draws its action bar: a stray
+   *     Copy button floating in a reloaded transcript with nothing above it.
+   *
+   *     The streaming placeholder — one text part holding `''` — is deliberately KEPT. It looks
+   *     droppable and is not: the library appends an optimistic assistant message with an id we
+   *     do not control the moment `isRunning` is true and the last message is not an assistant's
+   *     (`hasUpcomingMessage`), so dropping it hands identity for the whole turn to the library.
+   *     An empty text part renders no element anyway, so keeping it costs nothing on screen.
+   *
+   *  2. THE TURN IN FLIGHT IS TOLD ONCE. See `liveTurnFromSeq`.
+   */
+  const transcript = useMemo(() => {
+    const kept: ChatMessage[] = []
     for (const msg of messages) {
-      const stepPart = (msg.parts || []).find(
-        (p): p is Extract<MessagePart, { type: 'step' }> => p?.type === 'step',
-      )
-      const stepSuperseded =
-        liveStoryAnchorSeq != null && msg.seq != null && msg.seq >= liveStoryAnchorSeq
-      if (stepPart && stepSuperseded) continue
-      if (stepPart) {
-        const item: StepHistoryItem = {
-          id: msg.id,
-          seq: msg.seq ?? 0,
-          label: stepPart.step.label,
-          state: stepPart.step.state,
-        }
-        if (currentGroup) {
-          currentGroup.steps.push(item)
-        } else {
-          currentGroup = { type: 'step-group', key: msg.id, steps: [item] }
-          items.push(currentGroup)
-        }
+      const parts = msg.parts ?? []
+      const stepOnly = parts.length > 0 && parts.every((p) => p?.type === 'step')
+      if (stepOnly && liveTurnFromSeq !== null && (msg.seq ?? 0) >= liveTurnFromSeq) continue
+
+      // ── 2. THE ANCHOR ROW BECOMES ITS OWN SENTENCE, when nothing is re-telling it ────────────
+      //
+      // A `build_in_progress` part means a build began here and no outcome ever closed it: the
+      // reattach lost it, or the server went down mid-build. It converts to no part, so left
+      // alone it would vanish — and a citizen returning to that chat would see a transcript that
+      // simply stops, with no account of what happened to the build they started.
+      //
+      // Stating the durable truth is better than either a dead spinner (what it replaced) or
+      // silence (what deleting it would give). It is SUPPRESSED while a build is genuinely live
+      // here, because then the past tense is a lie about something still happening.
+      if (parts.length > 0 && parts.every((p) => p?.type === 'build_in_progress')) {
+        if (buildActiveHere || generatingChatId === buildId) continue
+        kept.push({ ...msg, parts: [{ type: 'text', text: BUILD_WAS_RUNNING }] })
         continue
       }
-      currentGroup = null
-      items.push(msg)
+
+      if (parts.length !== 0 && !parts.some((p) => p != null && !UNDRAWN_PARTS.has(p.type))) continue
+
+      // ── 3. A RUN OF STORED STEP ROWS IS ONE MESSAGE, so it is one group ──────────────────────
+      //
+      // The reload projection emits ONE MESSAGE PER STEP; the live path puts every step of a turn
+      // on a single streaming message. `groupPartByType` coalesces ADJACENT PARTS WITHIN A
+      // MESSAGE, so without this a build watched live shows one group of nine and the same build
+      // after a reload shows nine groups of one — which is precisely the live/reload parity
+      // (AE43) that having one converter was supposed to make automatic.
+      //
+      // Merging here rather than in the converter is deliberate: the converter maps one message
+      // to one library message and must stay that shape, and this is a fact about the PROJECTION
+      // (how the server chose to store a turn) rather than about any part.
+      const previous = kept[kept.length - 1]
+      if (stepOnly && previous && (previous.parts ?? []).every((p) => p?.type === 'step')) {
+        kept[kept.length - 1] = mergeStepRun(previous, msg)
+        continue
+      }
+      kept.push(msg)
     }
-    return items
-  }, [messages, liveStoryAnchorSeq])
+    return kept
+  }, [messages, liveTurnFromSeq, mergeStepRun, buildActiveHere, generatingChatId, buildId])
   // WHAT GETS FRAMED, and what the pane says about it — resolved in `utils/previewAddress.ts` and
   // nowhere else (Plan A, U2). The precedence and its two scoping predicates used to be spelled
   // out inline at each of the framing sites, which is why they could not be asked from ABOVE the
@@ -1845,12 +1942,15 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const handlePreviewRevealed = useCallback(() => {
     markAppVisible(projectId ?? null)
   }, [projectId])
-  // The build bubble's two sources, resolved ONCE — the turn wins when it has something to say.
-  // Naming them here is what lets the wrapper ask `hasBuildNarrative` the same question
-  // BuildProgress asks itself, instead of rendering chrome around a `null`.
-  const narratingTurn = turnBuildStatus !== null
-  const buildEnvelopes = narratingTurn ? turnEnvelopes : session.envelopes
-  const buildStatus = turnBuildStatus ?? session.status
+  // THE BUBBLE'S TWO SOURCES ARE GONE WITH THE BUBBLE. `buildEnvelopes` and `buildStatus` merged
+  // the turn stream and the legacy session feed so ONE card could draw either; the transcript
+  // draws activity from message parts now, and the legacy feed's envelopes have exactly two
+  // readers left — the at-limit sentence and the session banners — each asking its own question.
+  //
+  // `narratingTurn` went with them. It gated the bubble AND the stop control on "the turn has
+  // said something about the app yet", which for the stop control meant a build was unstoppable
+  // between the press of Send and its first step frame. `isRunning` is the honest predicate and
+  // is what the control reads now.
   // #13/R2 — "done, preview live": this LIVE session completed, so the server pardoned its
   // container (idle lease) and the framed URL still serves. Gated on `showSession`
   // deliberately: a reloaded page (no live session, `framedStatus` synthesized from the
@@ -2286,388 +2386,246 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     onRevealed: handlePreviewRevealed,
   })
 
+
+  // ─── THE RENDER ──────────────────────────────────────────────────────────────────────────────
+  //
+  // NO PAGE FRAME AND NO NAVBAR. Both belong to the workspace shell, which is what lets this
+  // surface be replaced without the app pane going with it. The reclaim dialog is the shell's too
+  // — its open state is published above, its classification stayed here.
+  //
+  // WHAT USED TO BE HERE: a hand-rolled transcript loop with its own bubble, avatar and timestamp
+  // per row, a build-progress card, a plan-options card, a pending-attachment chip row, a
+  // fixed-corner toast, an image lightbox and a composer. All of it is one `ChatThread` and one
+  // `Composer` now, and both are shared with the kind of chat that used to have its own page.
+
+  /**
+   * A TURN IS RUNNING IN THIS CHAT — the one signal the transcript, the stop control and the
+   * composer all read.
+   *
+   * It is `generating`, and deliberately NOT the old `narratingTurn` (`turnPhase(...) !== null`).
+   * That derivation could not answer until a frame saying something about the app had arrived, so
+   * between pressing send and the first step frame a running build had no stop control at all —
+   * the seconds in which someone who has just realised they asked for the wrong thing is most
+   * likely to reach for it.
+   */
+  const isRunning = generating
+
+  /**
+   * The runtime's `onNew`, which NOTHING ON THIS SURFACE CALLS — and that is the design, not a
+   * stub left behind.
+   *
+   * `useExternalStoreRuntime` requires it, and it is reached only through the library's own
+   * composer. That composer is not rendered: `createActionButton` gives its Send a real
+   * `disabled` for the whole of every turn (R45/R64), so ours is the only send path and it goes
+   * to `handleSubmit`. Registering a working `onNew` here would create a SECOND way to start a
+   * turn, bypassing the gate chain, the attachment cap and the double-Enter guard — which is why
+   * this refuses rather than quietly duplicating them.
+   */
+  const handleAppend = useCallback(async () => {
+    throw new Error(
+      'The library composer is not mounted on this surface — sends go through `handleSubmit`, ' +
+        'which owns the gate chain. Reaching this means a library send path was rendered.',
+    )
+  }, [])
+
+  /** R55's stop, shared by the composer's control and the runtime's `cancel` capability. */
+  const stopTarget = useCallback(() => {
+    // Read at PRESS time. `liveTurnIdRef` is a ref precisely because a value captured at render
+    // stops the wrong turn — see its declaration.
+    const conversationId = buildIdRef.current
+    const turnId = liveTurnIdRef.current
+    return conversationId && turnId ? { conversationId, turnId } : null
+  }, [])
+
+  const handleStopSession = useCallback(async () => {
+    await sessionRef.current.stop()
+  }, [])
+
+  /**
+   * The thread's own cancel, which is what registers the runtime's `cancel` capability (U4).
+   *
+   * It shares `stopTarget` with the composer's control rather than deriving a second one: two
+   * paths to one stop is two chances to stop a different turn from the one on screen.
+   */
+  const handleCancel = useCallback(async () => {
+    const target = stopTarget()
+    if (target) {
+      await stopTurn(target.conversationId, target.turnId)
+      return
+    }
+    await handleStopSession()
+  }, [stopTarget, handleStopSession])
+
+  /**
+   * WHY SEND IS UNAVAILABLE, when the reason is not simply "a reply is in flight".
+   *
+   * The composer states the running case itself; everything here is a fact only this surface
+   * knows. `undefined` means Send is free as far as this surface is concerned.
+   */
+  const gate = useMemo(() => {
+    if (gateCheck === 'unreachable') {
+      return { blocked: true, reason: 'Couldn’t check whether a build is running here. Try Retry below.' }
+    }
+    if (gateCheck === 'checking') {
+      return { blocked: true, reason: 'Checking whether a build is still running here…' }
+    }
+    if (buildActiveHere || buildStarting) {
+      return { blocked: true, reason: 'Building your app — keep typing if you like; send unlocks when it’s done.' }
+    }
+    // U24 — today's budget is spent. The composer stays live so the citizen can copy their draft
+    // out; only sending waits, and the sentence names the moment it works again.
+    if (atLimit) return { blocked: true, reason: atLimit.title }
+    return undefined
+  }, [gateCheck, buildActiveHere, buildStarting, atLimit])
+
+  const hasPendingOffer = offer !== null && offer.state === 'pending'
+
+  /**
+   * The return-to-latest control, rendered under the viewport (U8, R29a).
+   *
+   * MEMOISED, because `ViewportFooter` is a component TYPE: a fresh function identity every render
+   * would unmount and remount whatever it draws. This one is stateless, so a remount would only be
+   * waste — but the COMPOSER is deliberately not rendered through this slot for exactly that
+   * reason, and the rule is worth stating where someone would be tempted to move it here.
+   */
+  const ViewportFooter = useMemo(() => {
+    const Footer: FC = () => <ScrollToLatest isRunning={isRunning} hasPendingOffer={hasPendingOffer} />
+    return Footer
+  }, [isRunning, hasPendingOffer])
+
+  /**
+   * R66 — the agent started working. The other half (what a group amounted to when it sealed) is
+   * the activity group's own to announce; this covers the turn's start, which nothing else says
+   * out loud.
+   */
+  const announcement = useActivityAnnouncement({ isRunning, sealedSummary: null })
+
   return (
-    // NO PAGE FRAME AND NO NAVBAR. Both belong to the workspace shell now, which is what lets this
-    // surface be replaced by another without the app pane going with it. The reclaim dialog moved
-    // there too — its open state is published above, its classification stayed here.
-    <>
-      <div className="flex flex-1 min-h-0 overflow-hidden">
-        {/* Chat panel — stays mounted when collapsed (CSS width:0), so the composer draft and
-            scroll position survive a hide/show cycle rather than resetting on remount. The
-            hidden-but-mounted treatment itself comes from `HIDDEN_BUT_MOUNTED`, which carries the
-            WCAG reasoning: zero width and overflow:hidden clip the panel visually but do NOT
-            remove its descendants from the tab order, so `aria-hidden` alone left the
-            composer/Send/attach controls keyboard-reachable while collapsed. This surface is that
-            constant's first caller; Plan F's rail modes are its second. */}
-        <div
-          id="chat-panel"
-          data-testid="chat-panel"
-          aria-hidden={chatCollapsed}
-          className={`flex flex-col bg-white border-r border-bial-border flex-shrink-0 overflow-hidden transition-[width] duration-200 ${
-            chatCollapsed ? `w-0 border-r-0 ${HIDDEN_BUT_MOUNTED}` : 'w-72 xl:w-80'
-          }`}
-        >
-          {/* Chat header: back-navigation + project name ONLY (F7/F10). The redundant in-rail
-              usage meter (the Navbar shows real usage), the AI branding block + avatar, and the
-              "Recent" builds dropdown are gone — past conversations live on the project page the
-              breadcrumb links back to (ProjectPage lists every conversation). */}
-          <div className="p-4 border-b border-bial-border">
-            <ProjectBreadcrumb projectId={projectId} projectName={projectName} />
-          </div>
+    <div className="flex flex-1 min-h-0 overflow-hidden">
+      {/* The chat panel stays MOUNTED when collapsed (CSS width:0), so the composer draft and the
+          scroll position survive a hide/show cycle rather than resetting on remount. The
+          hidden-but-mounted treatment comes from `HIDDEN_BUT_MOUNTED`, which carries the WCAG
+          reasoning: zero width and overflow:hidden clip the panel visually but do NOT remove its
+          descendants from the tab order, so `aria-hidden` alone left the composer, Send and attach
+          keyboard-reachable while collapsed. */}
+      <div
+        id="chat-panel"
+        data-testid="chat-panel"
+        aria-hidden={chatCollapsed}
+        className={`flex flex-col bg-white border-r border-bial-border flex-shrink-0 overflow-hidden transition-[width] duration-200 ${
+          chatCollapsed ? `w-0 border-r-0 ${HIDDEN_BUT_MOUNTED}` : 'w-72 xl:w-80'
+        }`}
+      >
+        {/* Back-navigation and the project name, and nothing else (F7/F10). Past conversations
+            live on the project page the breadcrumb links to. */}
+        <div className="p-4 border-b border-bial-border">
+          <ProjectBreadcrumb projectId={projectId} projectName={projectName} />
+        </div>
 
-          {/* Messages */}
-          <div data-testid="chat-messages" className="flex-1 overflow-y-auto p-4 space-y-3 scrollbar-thin">
-            {renderItems.map((item) => {
-              if (isStepGroupItem(item)) {
-                // Contiguous stored friendly steps (U6 projection), grouped and rendered through
-                // the SAME `StepHistoryCollapsible` BuildProgress uses post-build — so a finished
-                // build reads identically whether watched live or found on a reloaded tab.
-                return (
-                  <div key={item.key} className="ml-8" data-kind="step-group">
-                    <StepHistoryCollapsible steps={item.steps} />
-                  </div>
-                )
-              }
-              const msg = item
-              const inProgressPart = (msg.parts || []).find(
-                (p): p is Extract<MessagePart, { type: 'build_in_progress' }> => p?.type === 'build_in_progress',
-              )
-              // The ANCHOR row asks "is this build over?" — it is the past-tense "a build was
-              // running here" line, and it must stay hidden for as long as a live session is
-              // ATTACHED, envelopes or not. A reloaded tab has no envelopes yet but the build
-              // is still running; showing the anchor there narrates a finished build over a
-              // live one.
-              const anchorSuperseded =
-                attachedAnchorSeq != null && msg.seq != null && msg.seq >= attachedAnchorSeq
-              if (inProgressPart && anchorSuperseded) return null
-              if (inProgressPart) {
-                // A build began here and no outcome closed it — and no live session is
-                // re-telling it (that case returned above): reattach lost it or the server
-                // crashed mid-build. State the durable truth rather than a dead spinner.
-                return (
-                  <div key={msg.id} className="ml-8 text-xs text-neutral" data-kind="build-in-progress">
-                    A build was running here when this chat was last open.
-                  </div>
-                )
-              }
-              // Only the LAST message in the thread, and only while it is still streaming in, gets
-              // the plain-text render (finding 11) — every earlier bubble is done and gets its real
-              // markdown, which also means `isStreaming` (and therefore the row's props) settles to
-              // `false` FOREVER for a given message once it does, so this can never thrash a row
-              // back and forth between the two renders.
-              const isStreaming = generating && msg === messages[messages.length - 1]
-              return (
-                <ChatMessageRow
-                  key={msg.id}
-                  msg={msg}
-                  isStreaming={isStreaming}
-                  buildId={buildId as string}
-                  showSession={showSession}
-                  sessionStatus={session.status}
-                  sessionPreviewUrl={session.previewUrl}
-                  newestPlanCallId={newestPlanCallId}
-                  planErrors={planErrors}
-                  applyPlanOverride={applyPlanOverride}
-                  onBuildIt={handleBuildIt}
-                  onRefined={handleRefined}
-                  retracted={workspaceLost && msg.id === standingClaimId}
-                />
-              )
-            })}
+        {/* ONE SCROLL CONTAINER, and it is the thread's own viewport — not this wrapper, which
+            only gives the thread a box to fill. `min-h-0` is what lets it shrink inside the column
+            instead of pushing the composer off the bottom. */}
+        <div className="flex-1 min-h-0">
+          <ChatThread
+            messages={transcript}
+            isRunning={isRunning}
+            onNew={handleAppend}
+            onCancel={handleCancel}
+            interruptedMessageIds={interruptedIds}
+            footer={ViewportFooter}
+          />
+        </div>
 
-            {/* The LIVE plan-options card: streamed by this turn's frames; on reload the
-                projection row takes its place identically. Hidden once that row exists. */}
-            {livePlanOptions &&
-              !messages.some((m) =>
-                (m.parts || []).some(
-                  (pp) => pp?.type === 'plan_options' && pp.item.toolCallId === livePlanOptions.toolCallId,
-                ),
-              ) && (
-                <div className="ml-8" data-testid="plan-options-card">
-                  <PlanOptionsCard
-                    conversationId={buildId as string}
-                    item={applyPlanOverride(livePlanOptions)}
-                    onBuildIt={(id) => void handleBuildIt(id)}
-                    onRefined={handleRefined}
-                  />
-                  {planErrors[livePlanOptions.toolCallId] && (
-                    <p className="mt-1 text-[11px] text-danger" role="alert">
-                      {planErrors[livePlanOptions.toolCallId]}
-                    </p>
-                  )}
-                </div>
-              )}
+        {/* The polite region for turn activity, permanently mounted so its text is announced when
+            it arrives rather than being injected together with its region. */}
+        <Announcer message={announcement} />
 
-            {/* The assistant is composing a reply. Shown only until the first delta lands —
-                after that the streaming bubble is the feedback. */}
-            {generating && partsToText(messages[messages.length - 1]?.parts) === '' && (
-              <div className="flex gap-2 items-center">
-                <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center flex-shrink-0">
-                  <Sparkles size={10} className="text-primary" />
-                </div>
-                <div className="bg-bial-bg rounded-2xl px-3 py-2.5 flex gap-1" role="status" aria-label="Thinking">
-                  {[0, 1, 2].map((i) => (
-                    <div key={i} className="w-1.5 h-1.5 bg-primary rounded-full animate-bounce" style={{ animationDelay: `${i * 0.15}s` }} />
-                  ))}
-                </div>
-              </div>
-            )}
+        {/* Session lifecycle banners (U15) — right where the operator is looking. */}
+        <SessionBanners
+          blocked={sessionProjectMatches ? session.blocked : null}
+          feedDisconnected={showSession && session.feedDisconnected}
+          quota={showSession ? session.quota : null}
+          onForceEnd={(sid) => session.forceEnd(sid)}
+          onReconnect={() => session.reconnect()}
+          onStartAgain={handleStartAgain}
+        />
 
-            {/* The assistant's build turn — the whole live narrative in ONE bubble (U15):
-                headline + friendly steps + elapsed time + Stop/Force-end, raw output behind
-                Details. The right pane frames only the app now. */}
-            {/* CC3 — scoped to the chat that OWNS the session, not merely to its project.
-                `showSession` is project-scoped while the composer's gate is chat-scoped, so a
-                sibling chat rendered another chat's build narrative complete with a WORKING Stop
-                button: one click ended a build the reader had not started and could not see the
-                composer state of. */}
-            {/* AND the narrative's own emptiness check (2026-07-30): the wrapper used to render
-                on state alone, so a terminal with nothing to say left an empty grey bubble
-                sitting under the answer. */}
-            {(narratingTurn || (showSession && sessionChatRef.current === buildId && (buildActive || session.envelopes.length > 0))) && hasBuildNarrative(buildStatus, buildEnvelopes) && (
-              <div className="flex gap-2" data-testid="build-bubble">
-                <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center flex-shrink-0 mt-0.5">
-                  <Sparkles size={10} className="text-primary" />
-                </div>
-                <div className="max-w-[85%] min-w-0 flex-1 rounded-2xl rounded-tl-sm px-3 py-2.5 leading-relaxed bg-bial-bg text-tertiary">
-                  {/* ONE bubble, two sources. A Write turn narrates itself through turn frames
-                      (U5); a legacy build session still narrates through the C7 feed until U5b
-                      retires it. The turn wins when it has something to say, and the adapter
-                      means both reach the SAME renderer — so the two can never tell different
-                      stories about what a build looks like. */}
-                  <BuildProgress
-                    envelopes={buildEnvelopes}
-                    status={buildStatus}
-                    startedAt={turnBuildStatus !== null ? turnStartedAt : session.startedAt}
-                    stopping={turnBuildStatus !== null ? stoppingTurn : session.stopping}
-                    onStop={turnBuildStatus !== null ? handleStopTurn : () => session.stop()}
-                    // undefined on a turn build: force-end has no turn equivalent, and
-                    // BuildProgress hides the button rather than render a kill switch that
-                    // confirms "this kills in-progress work" and then does nothing.
-                    onForceEnd={turnBuildStatus === null ? () => session.forceEnd() : undefined}
-                    // U24 — the server's at-limit sentence, which names when the budget resets
-                    // and who to ask. The row renders the address as a real `mailto:` anchor;
-                    // the sentence itself stays plain text because it also lands in the banner
-                    // slot, which is a plain-text surface.
-                    atLimitText={turnError}
-                  />
-                </div>
-              </div>
-            )}
-            <div ref={bottomRef} />
-          </div>
+        {/* The one banner slot: the state the app is in NOW, newest wins. A workspace sentence
+            ENDS the turn, so nothing later in the same turn can be more current — which is why
+            precedence is one expression here rather than fifteen mirrored `setTurnError` calls. */}
+        {/* The unsaved-build warning is LAST in the precedence and that is deliberate: it is a
+            standing fact about the newest build, so anything the platform has to say about the
+            turn happening NOW is more current and outranks it. It comes back on its own once the
+            newer sentence is cleared, because it is derived from the transcript rather than set. */}
+        <TurnBanner text={workspaceSays ?? turnError ?? unsavedBuildWarning} />
 
-          {/* Input. The drag-drop handlers + drop-target highlight live on THIS wrapper, not
-              just the inner composer row below — the pending-attachment chips and the
-              gate/banner copy above the row are visually "the composer" too (the attach
-              button's title says "drop them anywhere in the composer"), and a drop that lands
-              on them instead of the row falls through to the browser's default handler, which
-              navigates the tab away and discards the draft + staged files. */}
-          <div
-            data-testid="composer"
-            data-dragging={draggingFiles || undefined}
-            {...dragHandlers}
-            className={`p-3 border-t border-bial-border space-y-2 transition ${
-              draggingFiles ? 'ring-2 ring-primary ring-offset-4 ring-offset-white bg-primary/5' : ''
-            }`}
-          >
-            {/* Session lifecycle banners (U15) — right where the operator is looking. */}
-            <SessionBanners
-              blocked={sessionProjectMatches ? session.blocked : null}
-              feedDisconnected={showSession && session.feedDisconnected}
-              quota={showSession ? session.quota : null}
-              onForceEnd={(sid) => session.forceEnd(sid)}
-              onReconnect={() => session.reconnect()}
-              onStartAgain={handleStartAgain}
-            />
-            <TurnBanner text={workspaceSays ?? turnError} />
-            {sessionProjectMatches && session.error && (
-              <div
-                aria-live="assertive"
-                className="text-[11px] text-danger bg-danger/5 border border-danger/20 rounded-lg px-2.5 py-1.5"
-              >
-                {session.error}
-              </div>
-            )}
-            {/* Pending attachment preview row */}
-            {pendingAttachments.length > 0 && (
-              <div className="flex flex-wrap gap-1.5">
-                {pendingAttachments.map((a) => (
-                  <div
-                    key={a.id}
-                    className="flex items-center gap-1 bg-bial-bg border border-bial-border rounded-lg px-1.5 py-1 text-[11px] text-tertiary"
-                  >
-                    {TEXT_MEDIA_TYPES.has(a.mediaType) ? (
-                      <span className="flex-shrink-0 text-primary" title={a.name}>
-                        {a.mediaType === 'text/csv' ? <FileSpreadsheet size={11} /> : <FileText size={11} />}
-                      </span>
-                    ) : a.mediaType === 'application/pdf' ? (
-                      <button
-                        type="button"
-                        onClick={() => openPdf(a.base64, a.name)}
-                        title={`Open ${a.name}`}
-                        className="flex-shrink-0 text-primary hover:opacity-80 transition"
-                      >
-                        <FileText size={11} />
-                      </button>
-                    ) : (
-                      <img
-                        src={`data:${a.mediaType};base64,${a.base64}`}
-                        alt={a.name}
-                        title={`View ${a.name}`}
-                        onClick={() => setViewer({ name: a.name, src: `data:${a.mediaType};base64,${a.base64}` })}
-                        className="h-6 w-6 object-cover rounded cursor-zoom-in hover:opacity-90 transition"
-                      />
-                    )}
-                    <span className="truncate max-w-[7rem]">{a.name}</span>
-                    <button onClick={() => removePending(a.id)} className="text-neutral hover:text-danger transition" title="Remove">
-                      <X size={11} />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {/* WHY SEND IS UNAVAILABLE — always stated, with a distinct reason per cause. Plain
-                language, no product vocabulary: a citizen reading this has asked for an app and is
-                watching it get made. Note what the copy no longer says — the chat does not "open
-                back up", because it never closed; only sending waits. */}
-            {sendUnavailable && (
-              <p className="text-[11px] text-neutral" data-testid="composer-gate-note" role="status">
-                {gateCheck === 'unreachable' ? (
-                  <>
-                    Couldn’t check whether a build is running here.{' '}
-                    <button
-                      type="button"
-                      onClick={retryGateCheck}
-                      className="underline underline-offset-2 text-primary hover:text-primary-600"
-                    >
-                      Retry
-                    </button>
-                  </>
-                ) : gateCheck === 'checking' ? (
-                  'Checking whether a build is still running here…'
-                ) : buildActiveHere || buildStarting ? (
-                  'Building your app — keep typing if you like; send unlocks when it’s done.'
-                ) : (
-                  'Replying — keep typing if you like; send unlocks when it’s done.'
-                )}
-              </p>
-            )}
-            {/* STOP, RELOCATED TO THE COMPOSER (R55, Plan D U3). It ships here BEFORE anything is
-                deleted, so no commit in this plan leaves a build startable and not stoppable.
-                `BuildProgress`'s own Stop is deliberately left in place for now — two stop
-                controls for one turn is a transient state, and it is the safe direction of the
-                two. U10 gives this its permanent home on the new composer; U17 asserts a running
-                turn is still stoppable once the card is gone.
-
-                SCOPED TO THIS CHAT, the same way the bubble above is. The page does not remount
-                on a chat switch (CC3), so an unscoped condition renders a working Stop button in
-                a sibling chat for a build its reader never started. */}
-            {isActiveBuildStatus(buildStatus) &&
-              (narratingTurn || (showSession && sessionChatRef.current === buildId)) && (
-                <div className="flex justify-end">
-                  <StopTurnControl
-                    running
-                    // Read at PRESS time. `liveTurnIdRef` is a ref precisely because a value
-                    // captured at render stops the wrong turn — see its declaration.
-                    resolveTarget={() => {
-                      const conversationId = buildIdRef.current
-                      const turnId = liveTurnIdRef.current
-                      return conversationId && turnId ? { conversationId, turnId } : null
-                    }}
-                    onStopTurn={stopTurn}
-                    onStopSession={async () => {
-                      await session.stop()
-                    }}
-                    onStopFailed={setTurnError}
-                  />
-                </div>
-              )}
-            <div className="flex gap-2 items-end rounded-2xl">
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept={ACCEPT_ATTR}
-                multiple
-                onChange={handleFileSelect}
-                className="hidden"
-              />
-              {/* Attach NEVER disables. Staging a file is composing, not sending — and the
-                  attachment rides the next send, which is exactly the message being composed. */}
-              <button
-                onClick={() => fileInputRef.current?.click()}
-                title="Attach images, PDFs, Word, Excel, or text files (CSV, TXT), or drop them anywhere in the composer"
-                className="flex-shrink-0 w-9 h-9 bg-bial-bg hover:bg-surface-muted text-neutral hover:text-primary border border-bial-border rounded-xl flex items-center justify-center transition"
-              >
-                <Paperclip size={13} />
-              </button>
-              {/* THE TEXTAREA IS NEVER DISABLED, and that is the whole focus fix (KTD-3):
-                  `disabled` on the currently-focused element blurs it and drops focus to
-                  `document.body`, which is the mechanism behind "it blurs mid-sentence and focus
-                  never comes back". There is also no programmatic focus grab at the turn's start
-                  or terminal — stealing focus at an async moment is its own bug class. */}
-              <textarea
-                ref={inputRef}
-                value={input}
-                onChange={(e) => {
-                  setInput(e.target.value)
-                  writeDraft(buildIdRef.current, e.target.value)
-                }}
-                onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() } }}
-                rows={2}
-                placeholder="Describe what you need, or ask for a change…"
-                className="flex-1 resize-none text-xs text-tertiary bg-bial-bg border border-bial-border rounded-xl px-3 py-2 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary/20 transition placeholder:text-gray-300"
-              />
-              {/* `aria-disabled`, never `disabled` (KTD-2). A keyboard user who has tabbed to Send
-                  when a turn starts would otherwise be blurred to `body` mid-compose — the same
-                  mechanism as the textarea, on the control they are actually standing on.
-                  `handleSend` is the enforcement; this is affordance only. */}
-              <button
-                onClick={handleSend}
-                // U24 — when today's budget is spent, the SEND control is what says so, and its
-                // title names the moment sending works again. The composer itself stays enabled
-                // (KTD-2) so the citizen can copy their draft out rather than losing it.
-                title={atLimit?.title}
-                aria-label="Send message"
-                aria-disabled={
-                  atLimit?.disabled ||
-                  sendUnavailable ||
-                  (!input.trim() && pendingAttachments.length === 0)
-                }
-                className={`flex-shrink-0 w-9 h-9 bg-secondary text-white rounded-xl flex items-center justify-center transition ${
-                  atLimit?.disabled ||
-                  sendUnavailable ||
-                  (!input.trim() && pendingAttachments.length === 0)
-                    ? 'opacity-40 cursor-default'
-                    : 'hover:bg-secondary-600'
-                }`}
-              >
-                <Send size={13} />
-              </button>
+        {/* ASSERTIVE, and reserved for the things that genuinely interrupt: a refused send, a
+            failed handoff, a failed relaunch or save. Permanently mounted for the same reason the
+            polite regions are — a region injected together with its text is frequently not
+            announced at all. */}
+        <div aria-live="assertive" role="alert">
+          {urgent ?? (sessionProjectMatches ? session.error : null) ? (
+            <div
+              data-testid="urgent-banner"
+              className="mx-3 mb-1 rounded-lg border border-danger/20 bg-danger/5 px-2.5 py-1.5 text-[11px] text-danger"
+            >
+              {urgent ?? (sessionProjectMatches ? session.error : null)}
             </div>
+          ) : null}
+        </div>
+
+        {/* Arm (d)'s way out. It sits beside the composer's gate note rather than inside it: the
+            note says what is happening, and this is the one thing a citizen can DO about a gate
+            that otherwise has nothing to offer them. */}
+        {gateCheck === 'unreachable' && (
+          <div className="px-3 pb-1">
+            <button
+              type="button"
+              onClick={retryGateCheck}
+              data-testid="gate-retry"
+              className="text-[11px] text-primary underline underline-offset-2 hover:text-primary-600"
+            >
+              Retry
+            </button>
           </div>
-        </div>
+        )}
 
+        <Composer
+          conversationId={buildId ?? null}
+          placeholder="Describe what you need, or ask for a change…"
+          onSubmit={handleSubmit}
+          isRunning={isRunning}
+          gate={gate}
+          // R55 — BOTH ways a build can be live here. `isRunning` is a turn this tab is streaming;
+          // `buildActiveHere` is a LEGACY build session adopted on a reload, which sets no
+          // streaming flag at all. Gating on the turn alone left a reloaded mid-build tab with a
+          // running build and no way to stop it — the exact hole the deleted bubble's own
+          // session-scoped condition used to cover. `resolveTarget` returns `null` when there is
+          // no turn id, which is precisely how the control reaches `onStopSession`.
+          stop={
+            isRunning || buildActiveHere
+              ? {
+                  running: true,
+                  resolveTarget: stopTarget,
+                  onStopTurn: stopTurn,
+                  onStopSession: handleStopSession,
+                }
+              : undefined
+          }
+          offer={
+            offer
+              ? {
+                  toolCallId: offer.toolCallId,
+                  conversationId: buildId ?? null,
+                  spent: offer.state !== 'pending',
+                  onBuild: handleBuildIt,
+                  onKeepPlanning: handleKeepPlanning,
+                }
+              : undefined
+          }
+          onUrgent={setUrgent}
+        />
       </div>
-
-      {/* Attachment validation / cap toast. Announced, because KTD-2 deliberately keeps the send
-          button focusable — a screen-reader user who activates it gets no state change to hear,
-          and this toast is the only feedback there is. */}
-      {attachToast && (
-        <div
-          role="status"
-          aria-live="polite"
-          className="fixed bottom-6 left-6 z-50 bg-white border border-bial-border rounded-xl shadow-xl px-4 py-3 text-sm text-tertiary font-medium max-w-xs"
-        >
-          {attachToast}
-        </div>
-      )}
-
-      {/* Pending-attachment image lightbox */}
-      {viewer && (
-        <AttachmentLightbox name={viewer.name} src={viewer.src} onClose={() => setViewer(null)} />
-      )}
-    </>
+    </div>
   )
 }

@@ -86,7 +86,7 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
   resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
 
-import BuilderPage from '../BuilderPage'
+import ConversationSurface from '../../components/chat/ConversationSurface'
 
 function renderThread(chatId = 'thread-1') {
   const fake = new FakeEventSource(chatId)
@@ -94,7 +94,7 @@ function renderThread(chatId = 'thread-1') {
   return render(
     <MemoryRouter initialEntries={[`/chat/${chatId}`]}>
       <Routes>
-        {inWorkspace(<Route path="/chat/:chatId" element={<BuilderPage projectId="p1" buildSessionDeps={deps} />} />)}
+        {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface projectId="p1" buildSessionDeps={deps} />} />)}
       </Routes>
     </MemoryRouter>,
   )

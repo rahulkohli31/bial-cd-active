@@ -22,9 +22,9 @@ vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.list
 vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
-vi.mock('../../hooks/useClaudeAPI', () => ({
-  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null, clearError: vi.fn() }),
-}))
+// THE LEGACY RELAY MOCK IS GONE WITH THE HOOK (Plan D U17). It stood in for `useClaudeAPI`, which
+// no longer exists; a mock kept here would have invented a module for the surface to import and
+// this suite would have gone on passing against a transport that ships nowhere.
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -85,7 +85,7 @@ describe('BuilderPage — hideable chat panel (#42)', () => {
 
   it('keeps scroll position across a hide/show cycle — the property that actually discriminates CSS-hide from unmount (mutation-checked: fails against a conditionally-unmounted panel, since a freshly mounted node has no prior scrollTop)', async () => {
     await renderReady()
-    const before = screen.getByTestId('chat-messages')
+    const before = screen.getByTestId('thread-viewport')
     before.scrollTop = 40
 
     fireEvent.click(screen.getByRole('button', { name: /hide chat panel/i }))
@@ -94,7 +94,7 @@ describe('BuilderPage — hideable chat panel (#42)', () => {
     // Re-query rather than reuse `before` — reusing it would still read 40 even if the panel
     // WAS unmounted (the stale, detached node keeps whatever was last set on it), which is
     // exactly the false-pass the composer-draft test above has.
-    const after = screen.getByTestId('chat-messages')
+    const after = screen.getByTestId('thread-viewport')
     expect(after.scrollTop).toBe(40)
   })
 
