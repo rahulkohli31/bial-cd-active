@@ -4,7 +4,7 @@ import {
   Send, Sparkles, User, Paperclip, FileText, FileSpreadsheet, Presentation, X,
   CheckCircle2, XCircle, ExternalLink, PanelLeftOpen, PanelLeftClose,
 } from 'lucide-react'
-import PublishButton from '../components/PublishButton'
+import PublishStatusChip from '../components/PublishStatusChip'
 import BuildProgress, { hasBuildNarrative, StepHistoryCollapsible } from '../components/chat/BuildProgress'
 import type { StepHistoryItem } from '../components/chat/BuildProgress'
 import MessageContent from '../components/chat/MessageContent'
@@ -2209,8 +2209,16 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   useAppPaneVisible(true)
   usePublishPaneView({
     /* Publish, right where the build just finished. Only once the route resolved a project — a
-       chat with no project behind it has nothing to publish. */
-    toolbarTrailing: projectId ? <PublishButton projectId={projectId} /> : null,
+       chat with no project behind it has nothing to publish.
+       THE SAME COMPONENT the project page mounts beside the name, not a second control that
+       could word the same state differently. This page and that one are sibling routes under
+       one Outlet, so the two mount sites are never live at once — the chip owns its own read
+       either way, which is what makes a second site correct rather than merely tolerated.
+       Its popover is portalled, and here that is load-bearing rather than inherited: four
+       nested `overflow-hidden` ancestors sit between this toolbar and the document, so
+       anything anchored here without a portal disappears rather than overflows. Plan F
+       retires this mount when it merges the two screens. */
+    toolbarTrailing: projectId ? <PublishStatusChip projectId={projectId} /> : null,
     /* The chat-panel toggle renders IN-FLOW in the pane's leading slot rather than floating
        absolutely over it — it used to sit in the same top-left corner as the pane's own
        device-width toolbar group and visibly overlap it. */

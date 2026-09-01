@@ -222,10 +222,8 @@ export function readDeclaration(declaration: Record<string, unknown> | null): Re
   }
 }
 
-/** First 7 of a commit — the length this screen and the citizen's publish dialog show.
- *  (The publish CARD and the review status card show 12 for the same commit; nobody chose
- *  that, and only one of the two can be right. Left alone here because changing either is
- *  a visible change, not a refactor.) */
-export function shortSha(sha: string | null): string {
-  return sha === null ? '—' : sha.slice(0, 7)
-}
+/** Moved to `utils/shortSha.ts` and re-exported here so this module's consumers keep their
+ *  one import. It left because it stopped being an admin detail: the two citizen surfaces
+ *  that disagreed with it — showing 12 where this screen showed 7 — are retired, and the
+ *  one publish chip that replaced them shares this. */
+export { shortSha } from '../../utils/shortSha'

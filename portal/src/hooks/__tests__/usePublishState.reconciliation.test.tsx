@@ -1,31 +1,32 @@
 /**
- * The cross-surface reconciliation event — the mechanism that stops the three publish
- * surfaces disagreeing, and the one thing about it that had no test at all.
+ * The cross-surface reconciliation event — the mechanism that stops two mounts of the
+ * publish surface disagreeing, and the one thing about it that had no test at all.
  *
- * `DeployControl`, `PublishButton` and `SubmitControl` each run their OWN `useDeployment`
- * instance. That is deliberate (they mount on different pages), but it means a mutation in
- * one leaves the other two reading stale rows until a poll tick or a tab switch — and the
- * publish card and the status card sit two inches apart on one screen, where nothing is
- * ever re-entered. A withdrawal in one that left the other saying "waiting for review" is
- * exactly the disagreement commit b36faf7 ("three surfaces that told the truth about the
- * wrong thing") was written to remove.
+ * WHAT IT PINS IS A CONTRACT, NOT A SHIPPED ARRANGEMENT — and saying so is the point of
+ * this note. It was written when three controls each ran their own `useDeployment`, two of
+ * them two inches apart on one screen, where nothing is ever re-entered and a withdrawal in
+ * one left the other saying "waiting for review". Those three are now one chip with two
+ * mount SITES, and the two sites are sibling routes under one Outlet: at most one is live,
+ * so in the shipped product the nudge has nobody to notify today.
  *
- * Nothing in the suite referenced `bial:deployment-changed`, and `ProjectPage.test.tsx`
- * stubs `SubmitControl` to `() => null`, so the two real surfaces were never mounted
- * together anywhere. The regression this code prevents could have returned silently.
+ * The suite is kept because the mechanism is, and for the same reason — it is what makes a
+ * second publish surface in one document safe, and re-learning that the hard way is the
+ * outcome deleting it buys. These tests render two hooks EXPLICITLY, which is the only way
+ * the contract can be exercised at all now; do not read that as a claim about how many the
+ * app mounts.
  *
  * These mount TWO hooks on the same project — the shape the event exists for — and assert
  * the reconciliation without leaning on focus or visibility, which have their own paths.
  *
  * The event is dispatched directly rather than through the hook's own `announce`, which is
  * internal: what matters is the CONTRACT on `window` (name, `projectId`, `origin`), since
- * that is what the three surfaces actually share. A test reaching for a private callback
- * would pin the implementation and miss a renamed event entirely.
+ * that is what every mount actually shares. A test reaching for a private callback would
+ * pin the implementation and miss a renamed event entirely.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { renderHook, act, cleanup, waitFor } from '@testing-library/react'
 
-import { useDeployment } from '../useDeployment'
+import { usePublishState } from '../usePublishState'
 import * as deployApi from '../../utils/deployApi'
 
 vi.mock('../../utils/deployApi', async () => {
@@ -70,8 +71,8 @@ afterEach(cleanup)
 
 describe('two surfaces on one project reconcile through the shared event', () => {
   it('re-reads a sibling mount when one announces a change', async () => {
-    const first = renderHook(() => useDeployment('p1'))
-    const second = renderHook(() => useDeployment('p1'))
+    const first = renderHook(() => usePublishState('p1'))
+    const second = renderHook(() => usePublishState('p1'))
     await waitFor(() => expect(getDeployment).toHaveBeenCalled())
     getDeployment.mockClear()
 
@@ -87,8 +88,8 @@ describe('two surfaces on one project reconcile through the shared event', () =>
   })
 
   it('ignores an announcement for a different project', async () => {
-    const mine = renderHook(() => useDeployment('p1'))
-    const other = renderHook(() => useDeployment('p2'))
+    const mine = renderHook(() => usePublishState('p1'))
+    const other = renderHook(() => usePublishState('p2'))
     await waitFor(() => expect(getDeployment).toHaveBeenCalled())
     getDeployment.mockClear()
 
@@ -104,8 +105,8 @@ describe('two surfaces on one project reconcile through the shared event', () =>
   })
 
   it('stops listening once a surface unmounts', async () => {
-    const first = renderHook(() => useDeployment('p1'))
-    const second = renderHook(() => useDeployment('p1'))
+    const first = renderHook(() => usePublishState('p1'))
+    const second = renderHook(() => usePublishState('p1'))
     await waitFor(() => expect(getDeployment).toHaveBeenCalled())
 
     second.unmount()

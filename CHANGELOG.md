@@ -4,6 +4,42 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.1] - 2026-09-01
+
+### Changed
+
+- **Publishing is one chip beside your project's name.** The Publish card, the Review &
+  approval card and the small button in the builder's toolbar are gone; there is one chip,
+  it says where your app stands, and pressing it opens one sentence and — where there is
+  something to do — exactly one button. Where there is nothing to do there is no button,
+  rather than one that fails when pressed.
+- **The chip stops guessing.** Every label it shows is read from a single answer the server
+  works out, instead of each screen recombining the same four or five fields and sometimes
+  reaching a different conclusion. That guesswork had produced the same kind of mistake four
+  times in this one feature, most recently promising "this can publish automatically" beside
+  a Publish button moments before the app was sent to an administrator instead.
+- **Being live and having newer unsaved work are now visibly different**, without opening
+  anything. A published app with nothing newer reads "Live"; one you have saved since reads
+  "Live · newer work saved"; and on the rare occasion the platform cannot check, it says so
+  plainly rather than telling you nothing of yours is waiting.
+- **"Taken offline" and "Switched off" are two different things again**, because they have
+  two different remedies — a taken-offline app can be published straight back to the same
+  address, and a switched-off one cannot be published at all until an administrator says so.
+- **Approved apps say they are approved and stop there.** The old wording promised whether
+  pressing Publish would publish or send for review; that promise was not the interface's to
+  make, because the decision is taken inside the request against a version that can change on
+  the way. The button now says what it will attempt and the answer says what happened.
+- The word "deploy", and the pipeline's own vocabulary — "Packaging your app", "Setting up
+  the server" — are gone from everything you read. While a publish runs, the chip says
+  "Starting up".
+
+### Added
+
+- **"Take it back."** A version waiting with an administrator can be withdrawn from the chip,
+  with one confirmation. This existed on the server and in the old review card; carrying it
+  across is what keeps you from being stuck behind a decision that is not yours to make.
+- The chip now shows **when** a version was approved, not only which one.
+
 ## [1.7.0] - 2026-09-01
 
 ### Added

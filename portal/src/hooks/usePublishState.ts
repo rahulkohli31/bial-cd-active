@@ -1,27 +1,38 @@
 /**
- * The publish state machine, shared by the THREE places a citizen meets it: the compact
- * button in the builder toolbar (where they are the moment a build finishes), the card on
- * the project page (where they go back to check on it), and the review status card beside
- * that card (where they watch a routed version wait for an administrator).
+ * The publish read and the publish request, behind one lifetime — everything the chip
+ * needs to say where an app stands and to act on it.
  *
- * Extracted rather than duplicated because the fiddly parts — the generation token, the
- * poll lifetime, treating `unsaved_changes` as a question rather than a failure — are exactly
- * the parts that rot when copied. Three presentations, one behaviour.
+ * RENAMED, NOT REWRITTEN. This was `useDeployment`, and 287 of its 290 lines are
+ * unchanged: the generation token, the poll lifetime, the cross-mount nudge and the
+ * treatment of `unsaved_changes` as a question rather than a failure are exactly the parts
+ * that rot when copied, which is why they were not. What changed is three derived values
+ * that went, because the server now computes the one state they were guessing at.
  *
- * THE APPROVAL LIFECYCLE COMES THROUGH HERE TOO (U12), off the same status response, and
- * that is what makes the surfaces agree. The status card used to read `/apps/:id/status`
- * itself, once, on mount — so a citizen who pressed Publish and watched their app route
- * into the queue sat there being told it was still a draft. Routing the lifecycle through
- * this hook hands every surface the refresh lifetime that already exists here instead of a
- * second one that rots, and it is the only way the toolbar button can show pending at all:
- * that one is mounted with a project id and no app id.
+ * THE APPROVAL LIFECYCLE COMES THROUGH HERE TOO (U12), off the same status response. The
+ * status card used to read `/apps/:id/status` itself, once, on mount — so a citizen who
+ * pressed Publish and watched their app route into the queue sat there being told it was
+ * still a draft. Hanging the lifecycle off this read is also the only way a surface with
+ * no app id can show anything at all, and the builder's mount is exactly that.
  *
- * MUTATIONS ANNOUNCE THEMSELVES to every other mount watching the same project. The
- * visibility/focus listeners below already exist because a publish can start from the
- * OTHER surface — but they only fire when the tab is re-entered, and the publish card and
- * the status card sit two inches apart on one screen, where nothing is ever re-entered. A
- * withdrawal in one that left the other saying "waiting for review" is precisely the
- * disagreement this unit exists to remove.
+ * TWO REFRESH TRIGGERS BESIDES THE POLL, and they are worth telling apart.
+ *
+ * The visibility/focus listeners are what make the poll safe to stop: a publish can be
+ * started from another tab, so a settled state is re-read whenever somebody actually looks
+ * at this one. That is the cross-tab story, and it still works exactly as it did.
+ *
+ * The `bial:deployment-changed` nudge is NOT that. It is a `window` CustomEvent, so it never
+ * leaves the document that dispatched it — it exists to reconcile two mounts on ONE screen,
+ * which is what the retired publish card and review status card were: two inches apart,
+ * where nothing is ever re-entered and a withdrawal in one left the other saying "waiting
+ * for review". There is now one chip, and its two mount sites (the project page and the
+ * builder's pane toolbar) are SIBLING ROUTES under one Outlet — so at most one is live and
+ * the nudge currently has nobody to notify.
+ *
+ * IT IS KEPT ANYWAY, deliberately, and this is the whole reason: it is three lines and a
+ * listener, it costs nothing while it has no second mount, and the moment anything puts two
+ * publish surfaces in one document again it is the difference between them agreeing and
+ * them contradicting each other. Deleting it would be re-learning that lesson later. Its
+ * test renders two hooks explicitly and so still pins the contract.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
@@ -30,8 +41,8 @@ import {
   startDeploy,
   type ApprovalState,
   type DataClassificationAnswers,
+  type DeployOutcome,
   type DeploymentView,
-  type RoutedForReview,
 } from '../utils/deployApi'
 import { withdrawSubmission } from '../utils/approvalApi'
 import { ApiError } from '../utils/apiError'
@@ -54,27 +65,45 @@ interface DeploymentChanged {
 
 let mountCounter = 0
 
-export interface UseDeployment {
+/**
+ * THREE DERIVED VALUES ARE GONE FROM HERE, and their absence is the point of the unit
+ * that removed them: `running` (`status === 'running'`), `waitingForReview`
+ * (`approval.status === 'pending'`) and `routed` (the last routed POST, held so a surface
+ * could re-render it). Each was the browser re-deciding something the server had already
+ * decided, and each was a place where two surfaces could disagree. The one publish state
+ * on `deployment.publishState` says all three, and says them the same way to everyone.
+ *
+ * NOTHING HERE MAY GROW A PREDICATE BACK. If a consumer needs to know "is it live", "is it
+ * waiting", "did it drift" — that is `publishState`, and if `publishState` cannot say it,
+ * the fix is in the server that authors it.
+ */
+export interface UsePublishState {
   deployment: DeploymentView | null
   /** The app's approval lifecycle, off the same status response — null only when the
-   *  project has no app yet. */
+   *  project has no app yet. It is here for the VERSION ROWS the chip renders (which
+   *  commit was submitted, which was approved, and when), never to decide a state. */
   approval: ApprovalState | null
-  running: boolean
-  /** A version is in the administrator's queue: publishing is closed until it is approved
-   *  or withdrawn (R15b). Both publish surfaces branch on THIS, never on their own idea
-   *  of what pending means. */
-  waitingForReview: boolean
   loadError: string | null
+  /** Read it again. The publish surface offers this as its one action when the read
+   *  itself failed — a chip that rendered nothing there would be indistinguishable from
+   *  a broken page. */
+  refresh: () => Promise<void>
   /** The server's `unsaved_changes` message, or null. Non-null means the "Save and publish"
    *  choice is outstanding. */
   unsaved: string | null
   saving: boolean
-  /** The publish request that ROUTED instead of publishing, until the next attempt. An
-   *  outcome, not an error — it resolves, and the surfaces render it informationally. */
-  routed: RoutedForReview | null
-  /** Hand to the modal's `onConfirm`. Throws so the modal renders the refusal itself. */
-  onConfirm: (answers: DataClassificationAnswers) => Promise<void>
-  saveAndPublish: () => Promise<void>
+  /** Hand to the modal's `onConfirm`. Throws so the modal renders the refusal itself.
+   *
+   *  RESOLVES WITH THE OUTCOME, because the two successes are two different answers and
+   *  only the caller can say them: `202 started` and `200 routed_for_review` both resolve,
+   *  and a surface that could not tell them apart would have to guess which of the
+   *  server's two sentences to speak. `null` means the request became the
+   *  `unsaved_changes` QUESTION rather than an outcome — the one refusal that is not a
+   *  failure and is therefore not thrown. */
+  onConfirm: (answers: DataClassificationAnswers) => Promise<DeployOutcome | null>
+  /** The second answer to that question. Same two outcomes; `null` when it failed, in
+   *  which case the failure is already in `unsaved`. */
+  saveAndPublish: () => Promise<DeployOutcome | null>
   dismissUnsaved: () => void
   /** Pull the owner's own pending submission back out of the queue (P6). */
   withdraw: () => Promise<void>
@@ -82,12 +111,11 @@ export interface UseDeployment {
   withdrawError: string | null
 }
 
-export function useDeployment(projectId: string): UseDeployment {
+export function usePublishState(projectId: string): UsePublishState {
   const [deployment, setDeployment] = useState<DeploymentView | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [unsaved, setUnsaved] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
-  const [routed, setRouted] = useState<RoutedForReview | null>(null)
   const [withdrawing, setWithdrawing] = useState(false)
   const [withdrawError, setWithdrawError] = useState<string | null>(null)
   // Held here, not in the modal, so the "Save and publish" retry resends exactly what was
@@ -110,14 +138,14 @@ export function useDeployment(projectId: string): UseDeployment {
       setLoadError(null)
     } catch (err) {
       if (generation.current !== mine) return
-      // 503 means publishing is not switched on for this environment — a configuration fact,
-      // not a failure of anything the citizen did, so it renders as no control rather than an
-      // error they cannot act on.
-      if (err instanceof ApiError && err.status === 503) {
-        setDeployment(null)
-        setLoadError(null)
-        return
-      }
+      // EVERY FAILED READ LANDS IN ONE PLACE, and the 503 arm that used to sit above this
+      // — blank the surface, report nothing — is deliberately gone. Three reasons, and the
+      // first two are new since it was written. This is now the ONLY publishing surface
+      // the citizen has, so a chip that renders nothing is indistinguishable from a broken
+      // page. The server no longer 503s on a storage blip either: it degrades that to the
+      // explicit unknown state and answers 200, so a 503 would not be what catches it
+      // anyway. And the arm predates the change that made this read work without a deploy
+      // pipeline at all, which is the configuration it was written for.
       setLoadError(err instanceof ApiError ? err.message : 'Could not read the publish status.')
     }
   }, [projectId])
@@ -132,7 +160,6 @@ export function useDeployment(projectId: string): UseDeployment {
     generation.current += 1
     setDeployment(null)
     setUnsaved(null)
-    setRouted(null)
     setWithdrawError(null)
     pendingAnswers.current = null
     void refresh()
@@ -166,33 +193,38 @@ export function useDeployment(projectId: string): UseDeployment {
     )
   }, [projectId])
 
-  const running = deployment?.status === 'running'
   const approval = deployment?.approval ?? null
-  const waitingForReview = approval?.status === 'pending'
 
   // Poll ONLY while something is in flight. A deploy is the only state that changes on its
   // own, so a timer outliving it is pure traffic — a finished deploy left this hitting the
   // API every five seconds for as long as the page stayed open, forever.
+  //
+  // THE GATE READS THE FIELD, not `status === 'running'` as it used to. Same answer in the
+  // ordinary case and a better one at the edges: an app an administrator disabled or a
+  // submission that routed while an OLD deployment row still sat `running` used to poll
+  // for as long as the page stayed open, because the row alone never settles. The server's
+  // own ordering rules those out before it ever says `starting_up`.
+  const inFlight = deployment?.publishState === 'starting_up'
   useEffect(() => {
-    if (!running) return undefined
+    if (!inFlight) return undefined
     const mine = generation.current
     const timer = window.setInterval(() => {
       if (generation.current === mine) void refresh()
     }, POLL_MS)
     return () => window.clearInterval(timer)
-  }, [running, refresh])
+  }, [inFlight, refresh])
 
   const send = useCallback(
-    async (answers: DataClassificationAnswers, saveFirst: boolean): Promise<void> => {
+    async (answers: DataClassificationAnswers, saveFirst: boolean): Promise<DeployOutcome> => {
       // TWO success shapes (U9). Routing is not an error and must not be thrown: the
       // modal would render it in red beside the button, and the citizen would read "your
       // app was sent for review" as a failure of the thing they just asked for.
       const outcome = await startDeploy(projectId, { answers, saveFirst })
       pendingAnswers.current = null
       setUnsaved(null)
-      setRouted(outcome.outcome === 'routed_for_review' ? outcome : null)
       await refresh()
       announce()
+      return outcome
     },
     [projectId, refresh, announce],
   )
@@ -209,14 +241,14 @@ export function useDeployment(projectId: string): UseDeployment {
   // last poll. Rethrowing alone left the modal open on state the server had already
   // contradicted, until the next tick happened to correct it.
   const onConfirm = useCallback(
-    async (answers: DataClassificationAnswers): Promise<void> => {
+    async (answers: DataClassificationAnswers): Promise<DeployOutcome | null> => {
       pendingAnswers.current = answers
       try {
-        await send(answers, false)
+        return await send(answers, false)
       } catch (err) {
         if (err instanceof ApiError && err.code === UNSAVED_CHANGES) {
           setUnsaved(err.message)
-          return
+          return null
         }
         // Fire-and-forget on purpose: the caller is about to see the error either way, and
         // making them wait on a second round trip to read it would be worse.
@@ -227,16 +259,17 @@ export function useDeployment(projectId: string): UseDeployment {
     [send, refresh],
   )
 
-  const saveAndPublish = useCallback(async (): Promise<void> => {
+  const saveAndPublish = useCallback(async (): Promise<DeployOutcome | null> => {
     const answers = pendingAnswers.current
-    if (!answers) return
+    if (!answers) return null
     setSaving(true)
     try {
-      await send(answers, true)
+      return await send(answers, true)
     } catch (err) {
       setUnsaved(
         err instanceof ApiError ? err.message : 'Could not save and publish. Please try again.',
       )
+      return null
     } finally {
       setSaving(false)
     }
@@ -257,8 +290,6 @@ export function useDeployment(projectId: string): UseDeployment {
     setWithdrawError(null)
     try {
       await withdrawSubmission(appId)
-      // The routed banner described the submission that just left the queue.
-      setRouted(null)
       await refresh()
       announce()
     } catch (err) {
@@ -274,12 +305,10 @@ export function useDeployment(projectId: string): UseDeployment {
   return {
     deployment,
     approval,
-    running,
-    waitingForReview,
     loadError,
+    refresh,
     unsaved,
     saving,
-    routed,
     onConfirm,
     saveAndPublish,
     dismissUnsaved,

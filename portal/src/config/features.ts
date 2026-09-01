@@ -10,8 +10,16 @@
 
 // The old deploy feature flag is DELETED, not flipped (team doctrine: remove
 // non-functional affordances). The approval surfaces it hid are now real and
-// always on: the citizen submit control (SubmitControl) and the Admin → App
-// Registry review queue.
+// always on: the citizen's publish chip (PublishStatusChip, which replaced the
+// Publish card, the review-status card and the toolbar button) and the
+// Admin → App Registry review queue.
+//
+// AND THERE IS NO FLAG FOR THE CHIP EITHER, deliberately. This file is the
+// portal's only flag mechanism and it is compile-time constants — no runtime
+// switch, no per-environment toggle — so there is no way to dark-ship the
+// publish swap or roll it back without a redeploy. That is exactly why the
+// three retired controls' 48 test cases were walked before they were deleted:
+// the parity pass is the only safety net that exists here.
 
 /**
  * DECK_ATTACHMENTS_ENABLED surfaces PowerPoint (.pptx) chat attachments in the

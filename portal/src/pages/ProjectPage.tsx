@@ -6,11 +6,13 @@
  *     of the main column — Build/Plan toggle, sample prompts, and all —
  *     whether or not the project already has an app. It is never collapsed or pushed
  *     below an app card.
- *   - the description sits in a text-only right rail, joined by the Publish card and the
- *     review status card once the project has an app. Both take a PROJECT id and read one
- *     deploy status response, so neither can report a lifecycle the other contradicts —
- *     the review card has no submit button, because publishing is the only way into the
- *     queue (R15a). The passive "View app" preview is
+ *   - publishing is ONE CHIP beside the project name (R37), in both the plain and the
+ *     renaming header rows so it does not move when a rename starts. It reads a single
+ *     server-computed state and is not gated on the project having an app: "nothing built
+ *     yet" is a state it names, and a citizen should learn that from the same place they
+ *     learn everything else about their app rather than from an absence. The Publish card
+ *     and the review-status card that used to stack in the rail are gone with it.
+ *   - the description sits in a text-only right rail. The passive "View app" preview is
  *     HIDDEN in Phase-1: a stored app is not a running sandbox, and the live preview now
  *     comes only from a per-session C3 build (`BuilderPage`). A passive stored-app view is
  *     genuinely unavailable until Track DEPLOY provides a live app URL.
@@ -36,8 +38,7 @@ import { Badge } from '../components/ui/badge'
 import { useWorkspaceProject } from '../components/workspace/workspaceChannel'
 import ProjectBuilder from '../components/projects/ProjectBuilder'
 import ProjectDescriptionEditor from '../components/projects/ProjectDescriptionEditor'
-import DeployControl from '../components/DeployControl'
-import SubmitControl from '../components/SubmitControl'
+import PublishStatusChip from '../components/PublishStatusChip'
 import { getProject, patchProject } from '../utils/projectApi'
 import type { Project } from '../utils/projectApi'
 import { ApiError, isRecord } from '../utils/apiError'
@@ -264,6 +265,10 @@ export default function ProjectPage() {
                 }}
                 className="flex-1 min-w-0 text-2xl font-extrabold text-tertiary bg-white border border-bial-border rounded-lg px-2 py-1 focus:outline-none focus:ring-2 focus:ring-primary/30"
               />
+              {/* Second child of an identical `flex items-center gap-2` row in BOTH
+                  branches — name, then chip, then the action buttons — so starting a
+                  rename does not move it. */}
+              <PublishStatusChip projectId={project.id} />
               <button
                 type="button"
                 aria-label="Save name"
@@ -284,6 +289,10 @@ export default function ProjectPage() {
           ) : (
             <div className="flex items-center gap-2">
               <h1 className="text-2xl font-extrabold text-tertiary">{project.name}</h1>
+              {/* R37's "beside the project name", literally. NOT gated on `project.appId`:
+                  a project with nothing built learns that from the same place it learns
+                  everything else about its app, rather than from an absence. */}
+              <PublishStatusChip projectId={project.id} />
               <button
                 type="button"
                 aria-label="Rename project"
@@ -397,11 +406,12 @@ export default function ProjectPage() {
             </section>
           </div>
 
-          {/* Right rail: the description (text-only, Save + Generate, no attach) and — once
-              the project has an app — the submit-for-review control (APPROVAL). The passive
-              "View app" preview is HIDDEN in Phase-1 — a stored app is not a running sandbox, so
-              there is nothing live to frame here until Track DEPLOY provides a deployed app URL.
-              The live preview now comes only from a per-session C3 build in the builder. */}
+          {/* Right rail: the description (text-only, Save + Generate, no attach). Nothing
+              about publishing lives here any more — that is the chip beside the project
+              name. The passive "View app" preview is HIDDEN in Phase-1 — a stored app is
+              not a running sandbox, so there is nothing live to frame here until Track
+              DEPLOY provides a deployed app URL. The live preview now comes only from a
+              per-session C3 build in the builder. */}
           {/* RE-BASED, not left alone. Sticky resolves against the nearest SCROLL CONTAINER, and
               this page's is now its own `<main>` rather than the document — so the old `top-20`,
               which was the navbar's 56px plus a 24px gap measured from the viewport, would leave
@@ -415,13 +425,10 @@ export default function ProjectPage() {
                 onProjectUpdate={setProject}
               />
             </div>
-            {/* Publish sits ABOVE the review status card because it is the only action:
-                there is one route into the review queue and it runs THROUGH publishing
-                (R15a), so the card below is where a routed version is watched and
-                withdrawn, never where one is sent. Both read the same project-scoped
-                deploy status, so they cannot tell the citizen two different things. */}
-            {project.appId && <DeployControl projectId={project.id} />}
-            {project.appId && <SubmitControl projectId={project.id} />}
+            {/* The Publish card and the review-status card that used to stack here are
+                GONE. Two cards reading one response could still tell a citizen two
+                different things, and did; publishing is now one chip beside the project
+                name, which is the one place R37 asks for. The rail is the description. */}
           </aside>
         </div>
       </div>
