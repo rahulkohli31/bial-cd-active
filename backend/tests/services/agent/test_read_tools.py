@@ -10,9 +10,11 @@ truthful NORMAL result, redacted command output).
 
 from __future__ import annotations
 
+import inspect
 import re
 import time
 import uuid
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -32,8 +34,10 @@ from src.services.agent.read_tools import (
     ExtractedSnapshotWorkspace,
     WorkspacePathError,
     check_the_guest_list,
+    read_only_toolset,
 )
 from src.services.agent.toolsets import ReadDeps, toolsets_for_kind, workspace_from_read_deps
+from src.services.classification.agent import ReviewDeps
 from src.services.orchestrator.constants import (
     REDACT_INPUT_MAX_CHARS,
     RUN_COMMAND_OUTPUT_MAX_CHARS,
@@ -305,6 +309,90 @@ def test_read_only_classics_are_admitted(argv: list[str]) -> None:
     assert check_the_guest_list(argv) is None
 
 
+def test_the_guest_list_has_no_way_to_learn_which_chat_it_is_in() -> None:
+    """★ R71, asserted from the signature — the cheapest proof there is.
+
+    A policy that takes only `argv` cannot vary by chat kind, by deps, by settings or by
+    which agent resolved the toolset, because none of those are reachable from inside it.
+    That is stronger than any number of per-kind cases, which could only ever sample the
+    behaviour; this closes the question.
+
+    The import half matters too: `ChatKind` is not in this module's namespace at all, so no
+    body here can name one even by accident."""
+    parameters = list(inspect.signature(check_the_guest_list).parameters)
+    assert parameters == ["argv"]
+    assert check_the_guest_list.__closure__ is None
+    assert not hasattr(read_tools, "ChatKind")
+
+
+async def test_the_same_refusal_reaches_two_different_agents_byte_for_byte(
+    workspace: ExtractedSnapshotWorkspace,
+) -> None:
+    """★ THE ONE THAT CARRIES R71 END TO END, through two genuinely different consumers.
+
+    `read_only_toolset` is shared: a Plan chat resolves it through `toolsets_for_kind` over
+    `ReadDeps`, and the classification review agent resolves it through its own accessor over
+    `ReviewDeps` — a deps type with no chat kind on it at all, in a run that has no
+    conversation behind it. If what the ability allows were a question about the surrounding
+    run, these two are where the answers would differ.
+
+    ZERO TRANSPORT CALLS IN BOTH is the other half of the claim, and it is the half that says
+    WHERE the policy runs. The guest list is the first statement of the tool body, before any
+    workspace call — so a refusal is not a command that ran and was judged afterwards, and a
+    future approval layer could not be positioned to skip it."""
+    reached: list[Sequence[str]] = []
+
+    class SpyWorkspace:
+        """Delegates everything, and records any argv that got as far as the transport."""
+
+        label = workspace.label
+
+        async def read_file(self, rel_path: str) -> str:
+            return await workspace.read_file(rel_path)
+
+        async def list_files(self) -> list[str]:
+            return await workspace.list_files()
+
+        async def search_files(
+            self, pattern: re.Pattern[str], subdir: str | None
+        ) -> list[read_tools.SearchHit]:
+            return await workspace.search_files(pattern, subdir)
+
+        async def exec_readonly(self, argv: Sequence[str]) -> read_tools.ReadExecResult:
+            reached.append(argv)
+            return await workspace.exec_readonly(argv)
+
+    argv = ["npm", "install", "zod"]
+
+    plan_capture: dict[str, Any] = {}
+    plan_spy = SpyWorkspace()
+    await _agent().run(
+        "install zod",
+        deps=ReadDeps(workspace=plan_spy, user_id=uuid.uuid4()),
+        model=_capturing_model(
+            [tool_turn("run_command", {"command": argv}), text_turn("ok")], plan_capture
+        ),
+        toolsets=toolsets_for_kind(ChatKind.PLAN, workspace_from_read_deps).toolsets,
+    )
+
+    review_capture: dict[str, Any] = {}
+    review_spy = SpyWorkspace()
+    review_agent: Agent[ReviewDeps, str] = Agent(deps_type=ReviewDeps)
+    await review_agent.run(
+        "install zod",
+        deps=ReviewDeps(user_id=uuid.uuid4(), workspace=review_spy),
+        model=_capturing_model(
+            [tool_turn("run_command", {"command": argv}), text_turn("ok")], review_capture
+        ),
+        toolsets=[read_only_toolset(lambda ctx: ctx.deps.workspace)],
+    )
+
+    # Byte-identical, not merely both-refused: a policy written down once produces one string.
+    assert plan_capture["incoming"][1] == review_capture["incoming"][1]
+    assert "not on the guest list" in plan_capture["incoming"][1]
+    assert reached == []
+
+
 @pytest.mark.parametrize("binary", ["npm", "node", "rm", "sh", "bash", "psql", "curl", "python3"])
 def test_non_guest_binaries_are_bounced_with_teaching(binary: str) -> None:
     refusal = check_the_guest_list([binary, "anything"])
@@ -459,7 +547,7 @@ async def test_run_command_tool_bounces_npm_in_run(
         toolsets=toolsets_for_kind(ChatKind.PLAN, workspace_from_read_deps).toolsets,
     )
     # The refusal came back to the model as a retry, teaching the alternative.
-    assert "not available in this read-only mode" in captured["incoming"][1]
+    assert "not on the guest list for this read-only `run_command`" in captured["incoming"][1]
 
 
 async def test_run_command_tool_output_is_redacted(
