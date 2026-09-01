@@ -215,6 +215,45 @@ describe('the chip names the state, and the closed chip is a complete answer', (
     expect(screen.getByTestId('publish-chip-pending')).toBeTruthy()
     expect(screen.queryByTestId('publish-chip')).toBeNull()
   })
+
+  it('announces a state that arrives on its own, not only one the citizen pressed for', () => {
+    // THE PARITY CASE. Both retired controls derived their live region from the loaded
+    // state, so a version approved overnight, a publish routed from another tab, or an
+    // administrator switching the app off announced itself to a screen-reader user. A
+    // region filled only by this mount's own presses is silent for every mount that did
+    // not press anything — which is most of them.
+    //
+    // Mutation receipt: make the region's text `answer ?? ''` again and this goes red on
+    // the very first assertion.
+    wire(view('in_review'))
+    const { rerender } = render(<PublishStatusChip projectId="p1" />)
+
+    const region = screen.getByTestId('publish-announce')
+    expect(region.getAttribute('role')).toBe('status')
+    expect(region.getAttribute('aria-live')).toBe('polite')
+    expect(region.textContent).toContain('In review')
+
+    wire(view('switched_off'))
+    rerender(<PublishStatusChip projectId="p1" />)
+
+    expect(screen.getByTestId('publish-announce').textContent).toContain('Switched off')
+  })
+
+  it('keeps the region mounted and empty before there is anything to say', () => {
+    // A region injected together with its text is frequently not announced at all, so it
+    // must exist before the first read answers.
+    wire(null)
+    mount()
+
+    expect(screen.getByTestId('publish-announce').textContent).toBe('')
+  })
+
+  it('says the status is unavailable through the region too, not only on the chip', () => {
+    wire(null, { loadError: 'Could not read the publish status.' })
+    mount()
+
+    expect(screen.getByTestId('publish-announce').textContent).toContain('unavailable')
+  })
 })
 
 // ── U3 — one sentence, the version row, at most one action ──────────────────────────
@@ -236,7 +275,9 @@ describe('the popover explains the state and offers at most one thing to do', ()
     mount()
     const pop = await openChip()
 
-    expect(pop.textContent).toContain('checked by an administrator before it goes live')
+    // Conditional on purpose — a zero-score declaration publishes unattended under ladder
+    // rule 7, so promising a review outright would be untrue for the common case.
+    expect(pop.textContent).toContain('if it handles anything sensitive')
     expect(within(pop).getAllByRole('button')).toHaveLength(1)
     expect(screen.getByTestId('publish-action').textContent).toBe('Send for review')
   })
@@ -293,9 +334,11 @@ describe('the popover explains the state and offers at most one thing to do', ()
     mount()
     const pop = await openChip()
 
-    expect(pop.textContent).toContain('pinned to one exact build')
-    // Routing pins a submission and publishes nothing, so this reassurance is true.
-    expect(pop.textContent).toContain('keeps serving the approved version')
+    expect(pop.textContent).toContain('one exact build')
+    // Routing pins a submission and publishes nothing, so the reassurance is true — and it
+    // says "that build" rather than "the approved version", because an app published
+    // unattended under ladder rule 7 has no approval to serve.
+    expect(pop.textContent).toContain('keeps serving that build')
     expect(within(pop).getAllByRole('button')).toHaveLength(1)
     expect(screen.getByTestId('publish-action').textContent).toBe('Send update for review')
   })
@@ -397,6 +440,58 @@ describe('the popover explains the state and offers at most one thing to do', ()
     expect(pop.textContent).not.toMatch(/administrator/i)
   })
 
+  it('claims no administrator in any state an app can reach without one', async () => {
+    // THE FEATURE'S OWN DEFECT CLASS, pointed at the reassuring direction. Ladder rule 7
+    // publishes unattended when nothing on the declaration is weighted, and
+    // `AppStatus.APPROVED` is written in exactly one place — the admin approve route — so
+    // every state below is reachable with NO administrator ever involved and
+    // `approved_commit_sha` NULL. A sentence that says one approved this app, or that a
+    // review always happens, is as untrue as the "this can publish automatically" promise
+    // that started all of this; it just runs the comforting way.
+    //
+    // Mutation receipt: restore the canvas's "It was approved but would not start", or
+    // "Every app is checked by an administrator before it goes live", or "keeps serving
+    // the approved version" — each goes red here by name.
+    const REACHABLE_WITHOUT_AN_ADMIN: readonly PublishState[] = [
+      'nothing_built',
+      'draft',
+      'starting_up',
+      'live_current',
+      'live_newer_work',
+      'live_drift_unknown',
+      'did_not_start',
+    ]
+
+    for (const state of REACHABLE_WITHOUT_AN_ADMIN) {
+      wire(view(state, { url: 'https://x.example/' }))
+      mount()
+      const text = (await openChip()).textContent ?? ''
+
+      expect(text).not.toMatch(/\bapproved\b/i)
+      expect(text).not.toMatch(/an administrator (approved|checked|signed)/i)
+      expect(text).not.toMatch(/every app is checked/i)
+      cleanup()
+    }
+  })
+
+  it('still names the administrator in the states that genuinely have one', async () => {
+    // The paired positive, so the rule above cannot be satisfied by scrubbing the word
+    // everywhere. These four are only reachable THROUGH an administrator.
+    const ADMIN_STATES: ReadonlyArray<readonly [PublishState, RegExp]> = [
+      ['in_review', /with an administrator/i],
+      ['changes_requested', /an administrator asked/i],
+      ['approved_ready_to_publish', /an administrator approved/i],
+      ['taken_offline', /an administrator has taken/i],
+    ]
+
+    for (const [state, phrase] of ADMIN_STATES) {
+      wire(view(state))
+      mount()
+      expect((await openChip()).textContent ?? '').toMatch(phrase)
+      cleanup()
+    }
+  })
+
   it('puts the administrator note where a citizen reads it before acting', async () => {
     wire(
       view('changes_requested', {
@@ -415,6 +510,78 @@ describe('the popover explains the state and offers at most one thing to do', ()
       'Explain where the vendor key is stored.',
     )
     expect(within(pop).getAllByRole('button')).toHaveLength(1)
+  })
+
+  it('gives every state the version row it is ABOUT, and no other', async () => {
+    // The whole table, not the five states the cases above happen to cover. A version row
+    // is the one place this component reads a field other than the publish state, so a
+    // wrong mapping shows a citizen the wrong version's date and commit — or, worse, a
+    // "Live now" heading on an app that is not live.
+    //
+    // Mutation receipt: change any `version:` in `presentationFor` and this goes red on
+    // the state whose row moved.
+    const ROWS: ReadonlyArray<readonly [PublishState, string | null]> = [
+      ['nothing_built', null],
+      ['draft', null],
+      ['in_review', 'Sent for review'],
+      ['changes_requested', 'Sent for review'],
+      ['approved_ready_to_publish', 'Approved version'],
+      ['approved_needs_review_again', 'Approved version'],
+      ['starting_up', null],
+      ['live_current', 'Live now'],
+      ['live_newer_work', 'Live now'],
+      ['live_drift_unknown', 'Live now'],
+      ['taken_offline', 'Last published'],
+      ['switched_off', null],
+      ['did_not_start', null],
+    ]
+
+    for (const [state, heading] of ROWS) {
+      wire(
+        view(state, {
+          url: 'https://x.example/',
+          headSha: SHA,
+          finishedAt: '2026-08-20T09:14:00Z',
+          approval: approval({
+            submittedSha: SHA,
+            submittedAt: '2026-08-19T10:00:00Z',
+            approvedCommitSha: APPROVED_SHA,
+            approvedAt: '2026-08-19T10:00:00Z',
+          }),
+        }),
+      )
+      mount()
+      await openChip()
+
+      if (heading === null) {
+        expect(screen.queryByTestId('publish-version')).toBeNull()
+        // Liveness — an absent row must mean "this state has none", never "the component
+        // threw and rendered nothing".
+        expect(screen.getByTestId('publish-chip')).toBeTruthy()
+      } else {
+        expect(screen.getByTestId('publish-version').textContent).toContain(heading)
+      }
+      cleanup()
+    }
+  })
+
+  it('links an address only from the states that are actually serving one', async () => {
+    for (const state of ['live_current', 'live_newer_work', 'live_drift_unknown'] as const) {
+      wire(view(state, { url: 'https://x.example/', headSha: SHA }))
+      mount()
+      await openChip()
+      expect(screen.getByTestId('publish-url')).toBeTruthy()
+      cleanup()
+    }
+    // Every other state either has no row or has one that must not be linked.
+    for (const state of ['taken_offline', 'draft', 'in_review', 'did_not_start'] as const) {
+      wire(view(state, { url: 'https://x.example/', headSha: SHA }))
+      mount()
+      await openChip()
+      expect(screen.queryByTestId('publish-url')).toBeNull()
+      expect(screen.getByTestId('publish-chip')).toBeTruthy()
+      cleanup()
+    }
   })
 
   it('carries no count anywhere — one metadata head names a commit, never a number', async () => {
@@ -678,6 +845,20 @@ describe('taking a version back out of the queue', () => {
     const pop = await openChip()
 
     expect(within(pop).getByRole('alert').textContent).toContain('already decided')
+  })
+
+  it('announces the new state once the version is back with the citizen', async () => {
+    // The withdrawal's own success has no sentence of its own — what the citizen needs to
+    // know is that their app is a draft again, and the state IS the announcement now that
+    // the region speaks from the loaded state rather than only from a press.
+    wire(IN_REVIEW)
+    const { rerender } = render(<PublishStatusChip projectId="p1" />)
+    expect(screen.getByTestId('publish-announce').textContent).toContain('In review')
+
+    wire(view('draft'))
+    rerender(<PublishStatusChip projectId="p1" />)
+
+    expect(screen.getByTestId('publish-announce').textContent).toContain('Draft')
   })
 
   it('shows which version is with an administrator, and when it went', async () => {

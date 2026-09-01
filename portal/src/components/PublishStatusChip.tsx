@@ -126,14 +126,24 @@ function presentationFor(state: PublishState): Presentation {
         version: 'none',
       }
     case 'draft':
-      // Canvas, verbatim. "Draft" survived two earlier words: "Ready to send" described a
-      // button rather than the app, and "Only you can see it" made a privacy claim nobody
-      // asked this chip to make.
+      // Canvas's label, verbatim — "Draft" survived two earlier words: "Ready to send"
+      // described a button rather than the app, and "Only you can see it" made a privacy
+      // claim nobody asked this chip to make.
+      //
+      // ITS SENTENCE IS A DEPARTURE, and a correction rather than a preference. The canvas
+      // wrote "Every app is checked by an administrator before it goes live", and that is
+      // NOT TRUE: ladder rule 7 publishes unattended when nothing on the declaration is
+      // weighted, and `AppStatus.APPROVED` is written in exactly one place — the admin
+      // approve route — so no administrator is involved at all on that path. Promising a
+      // review that will not happen is the same class of untrue assertion about server
+      // behaviour that this whole feature exists to stop making; it just happens to run in
+      // the reassuring direction. So the sentence says what a press ATTEMPTS and leaves the
+      // outcome to the server, exactly as the button does (R38).
       return {
         label: 'Draft',
         sentence:
-          'Every app is checked by an administrator before it goes live. ' +
-          "Send this version when you're happy with it.",
+          "Nobody else can see this yet. Send it when you're happy with it — if it " +
+          'handles anything sensitive, an administrator checks it first.',
         action: 'send_for_review',
         version: 'none',
       }
@@ -209,15 +219,23 @@ function presentationFor(state: PublishState): Presentation {
         version: 'live',
       }
     case 'live_newer_work':
-      // Canvas: its explanation and its reassurance, both. The second half is a statement
-      // about server behaviour and it is true — routing pins a submission and publishes
-      // nothing, so the live app keeps serving the approved build throughout.
+      // Canvas: its explanation and its reassurance, both — with ONE WORD CORRECTED. The
+      // canvas says "an approval is pinned to one exact build" and "keeps serving the
+      // APPROVED version", and neither is true of an app that published unattended under
+      // ladder rule 7: no administrator was involved, and `approved_commit_sha` is NULL.
+      // What IS true either way is that one exact BUILD is live and saving does not change
+      // which. That is the whole substance of the explanation, so nothing is lost by saying
+      // the true version of it.
+      //
+      // The reassurance's second half stands as a statement about server behaviour, because
+      // routing pins a submission and publishes nothing — the live build keeps serving
+      // throughout, whichever way it got there.
       return {
         label: 'Live · newer work saved',
         sentence:
-          'An approval is pinned to one exact build, so anything you have saved since ' +
-          'going live is a different version. Your live app keeps serving the approved ' +
-          'version the whole time a new one is being checked.',
+          'What is live is one exact build, so anything you have saved since is a ' +
+          'different version. Your live app keeps serving that build the whole time a ' +
+          'new one is being checked.',
         action: 'send_update_for_review',
         version: 'live',
       }
@@ -234,7 +252,7 @@ function presentationFor(state: PublishState): Presentation {
         sentence:
           'Your app is live. We could not check just now whether anything newer of ' +
           'yours is saved — try again in a minute. Your live app keeps serving the ' +
-          'approved version the whole time a new one is being checked.',
+          'build it is on the whole time a new one is being checked.',
         action: 'send_update_for_review',
         version: 'live',
       }
@@ -264,14 +282,19 @@ function presentationFor(state: PublishState): Presentation {
         version: 'none',
       }
     case 'did_not_start':
-      // Canvas, minus "Trying again does not go back to an administrator." That clause is
-      // true only while the approval pin still matches, and the pin is NULL for every app
-      // that published unattended under ladder rule 7 — the common case. A second field
-      // value to condition one clause of one sentence is not worth its cost, so the clause
-      // is CUT rather than conditioned.
+      // Canvas, minus BOTH of its assertions, and the same fact retires them both: an app
+      // that published unattended under ladder rule 7 was never seen by an administrator,
+      // and `approved_commit_sha` is NULL for every one of them — the common case.
+      //
+      // So "Trying again does not go back to an administrator" is cut (it is true only
+      // while an approval pin still matches, and usually there is no pin), and so is the
+      // canvas's "It WAS APPROVED but would not start", which states outright that somebody
+      // signed this off. This state is reached from any failed deployment with a non-routed
+      // code, including one a draft app started itself. What is left says only what
+      // happened, which is all the citizen needs to press the button below.
       return {
         label: "Didn't start",
-        sentence: 'It was approved but would not start.',
+        sentence: 'The publish got as far as starting your app up, and then stopped.',
         action: 'try_again',
         version: 'none',
       }
@@ -453,6 +476,37 @@ export default function PublishStatusChip({
     speak(await saveAndPublish())
   }, [saving, saveAndPublish, speak])
 
+  /**
+   * ONE permanently-mounted, initially-empty polite live region, rendered in every arm
+   * below. A region injected together with its text is frequently not announced at all —
+   * the portal already states this convention at `LivePreview.tsx` — which is why it is
+   * mounted before it has anything to say and never unmounted.
+   *
+   * IT SPEAKS THE STATE, NOT ONLY THE ANSWERS. Both retired controls derived their live
+   * region straight from the loaded state, so a state that arrived while the citizen was
+   * looking at something else — a version approved overnight, a publish that routed from
+   * another tab, an administrator switching the app off — announced itself. Filling this
+   * only from `speak()` would have made it silent for any mount that did not itself press
+   * something, which is most of them. The answer wins while there is one, because it is
+   * the more specific thing to say about a press that just happened.
+   *
+   * It sits OUTSIDE the popover on purpose: an announcement is owed whether or not the
+   * popover happens to be open.
+   */
+  const announcement =
+    answer ??
+    (loadError !== null
+      ? 'Publish status: unavailable'
+      : presentation === null
+        ? ''
+        : `Publish status: ${presentation.label}`)
+
+  const liveRegion = (
+    <span data-testid="publish-announce" role="status" aria-live="polite" className="sr-only">
+      {announcement}
+    </span>
+  )
+
   // ── The read itself failed ────────────────────────────────────────────────────────
   // One honest presentation for all of it: the narrower threw on a value it did not
   // recognise, the network failed, or the server 500'd. Never a blank space where the
@@ -464,7 +518,9 @@ export default function PublishStatusChip({
   // ordinary state with its own words and its own action.
   if (loadError !== null) {
     return (
-      <Popover open={open} onOpenChange={onOpenChange}>
+      <>
+        {liveRegion}
+        <Popover open={open} onOpenChange={onOpenChange}>
         <PopoverTrigger asChild>
           <button
             type="button"
@@ -489,39 +545,31 @@ export default function PublishStatusChip({
             Check again
           </button>
         </PopoverContent>
-      </Popover>
+        </Popover>
+      </>
     )
   }
 
   // ── The first read has not answered yet ───────────────────────────────────────────
   // Holds the space beside the project name so nothing jumps, and claims no state. Not a
-  // button: there is nothing yet to explain.
+  // button: there is nothing yet to explain, and the live region has nothing to say.
   if (presentation === null) {
     return (
-      <span
-        data-testid="publish-chip-pending"
-        className="inline-flex items-center rounded-md border border-transparent bg-surface-muted px-2 py-0.5 text-xs font-semibold text-neutral"
-      >
-        Checking…
-      </span>
+      <>
+        {liveRegion}
+        <span
+          data-testid="publish-chip-pending"
+          className="inline-flex items-center rounded-md border border-transparent bg-surface-muted px-2 py-0.5 text-xs font-semibold text-neutral"
+        >
+          Checking…
+        </span>
+      </>
     )
   }
 
   return (
     <>
-      {/* ONE permanently-mounted, initially-empty polite live region. A region injected
-          together with its text is frequently not announced at all — the portal already
-          states this convention at `LivePreview.tsx`. It sits outside the popover on
-          purpose: an answer that arrives must be announced whether or not the popover
-          happens to be open. */}
-      <span
-        data-testid="publish-announce"
-        role="status"
-        aria-live="polite"
-        className="sr-only"
-      >
-        {answer ?? ''}
-      </span>
+      {liveRegion}
 
       <Popover open={open} onOpenChange={onOpenChange}>
         <PopoverTrigger asChild>
