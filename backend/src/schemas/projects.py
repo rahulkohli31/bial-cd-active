@@ -13,16 +13,35 @@ from datetime import datetime
 
 from pydantic import field_validator
 
-from src.db.models.project import MAX_PROJECT_DESCRIPTION, MAX_PROJECT_NAME
+from src.core.words import count_words
+from src.db.models.project import (
+    MAX_PROJECT_DESCRIPTION,
+    MAX_PROJECT_NAME,
+    MAX_PROJECT_NAME_WORDS,
+)
 from src.schemas.base import CamelModel
 
 
 def _clean_name(value: str) -> str:
+    """The ONE name rule, shared by `ProjectCreate` and `ProjectPatch` — so create and
+    RENAME are both covered. #158 §14 is explicit that fixing only create leaves the limit
+    half real, and rename was the half with no client-side guard at all.
+
+    The messages are written for a person. They used to reach the screen verbatim as
+    "Value error, name must be at most 120 characters", because the portal flattens
+    Pydantic's `detail[].msg` straight through — so a validator string IS product copy
+    here, whether or not anyone intended it to be.
+    """
     value = value.strip()
     if not value:
-        raise ValueError("name must not be empty")
+        raise ValueError("Give the project a name.")
+    # The character bound stays: it is the column width, and it is what stops a paste of
+    # arbitrary size reaching the database. The WORD rule is the one a person is told
+    # about; this one is a backstop they should never meet.
     if len(value) > MAX_PROJECT_NAME:
-        raise ValueError(f"name must be at most {MAX_PROJECT_NAME} characters")
+        raise ValueError(f"That name is too long. Keep it under {MAX_PROJECT_NAME} characters.")
+    if count_words(value) > MAX_PROJECT_NAME_WORDS:
+        raise ValueError("Keep the title short — about 6 to 8 words.")
     return value
 
 
