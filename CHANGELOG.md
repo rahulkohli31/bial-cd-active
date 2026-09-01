@@ -10,6 +10,70 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 > `1.7.0` section is added above them and tagged `v1.7.0`; the betas stay as the record of how it
 > got there. A version number marks a build, not a merge.
 
+## [1.7.0-beta.5] - 2026-09-02
+
+The project screen becomes the app.
+
+### Added
+
+- **Your app is on the project screen now, beside everything else about the project.** Opening a
+  project shows the app on the right and its details on the left — the composer, what the app is
+  doing, and the description. The app does not start because you opened the screen: it starts when
+  you press **Launch Application**, once, and it stays running while you work.
+- **The pane answers for every state, in plain language.** Saved and waiting for you, getting ready,
+  running, another project is using your workspace (and which one, with a way to get there), and
+  "we could not check". It never says an app is running on a signal that does not prove it is
+  serving a page, and it never names a number nobody has measured.
+- **You can choose a Plan chat or a Build chat before you type.** Until now the project screen could
+  only ever start a Build chat — the other kind of chat existed but nothing in the product could
+  reach it.
+- **A Plan chat says everything the app pane would have said.** It has no pane, deliberately, and it
+  is not silent about the workspace: the same sentence, in words, above the composer.
+- **A warning before you leave the workspace with unsaved work**, on the ways out that the browser's
+  own "are you sure" cannot cover — a link in the header, the breadcrumb, opening another project.
+  Where the platform could not check, it says so instead of reassuring you.
+- **A way past the app with the keyboard.** The app is somebody else's page inside a frame, and it
+  swallows the Tab key; there is now a control that steps back out to the rail.
+
+### Changed
+
+- **You are asked before another project's app is stopped — every time, not only when there is
+  something to lose.** It used to stop silently whenever the platform judged there was nothing at
+  risk, which is a fair judgement about the work and the wrong one about the person. When the other
+  project genuinely has nothing unsaved, the question says so plainly and offers no Save button for
+  work that does not exist.
+- **The question comes before the chat is created, not after.** Sending the first message in a new
+  chat used to create the chat, then ask whether the workspace was free — so a refusal left an empty
+  conversation behind, named after the message it had just refused. Nothing is created until the
+  answer is known. *(Closes #161.)*
+- **The switch dialog leads with the app you are starting**, not the one you are leaving, and both
+  its buttons name the project whose changes are at stake. A non-technical audience could not tell
+  which app "Switch without saving" applied to, and said so.
+- One control collapses the details rail, and it lives beside the app so it is still reachable once
+  the rail is hidden.
+
+### Fixed
+
+- **An unreadable answer from the platform can no longer cost you your work.** Pressing Launch
+  Application on a container the platform could not reach fell into the branch written for "it is
+  definitely gone", which tears the container down before restoring the last saved copy. It now
+  refuses and offers a retry — the saved version is intact, and so is whatever was in the container.
+- **Signing out when the sign-out fails now warns you where you can read it.** The warning said this
+  browser might still hold a live session, then navigated away in the same instant and destroyed
+  itself. Nobody had ever seen it.
+- **The admin console tells a failure from a confirmation.** Both arrived looking identical, on the
+  surface where being wrong costs the most, and a failure faded after three seconds. Failures now
+  wait to be dismissed.
+- A planning chat on a brand-new project now talks about what could be built, instead of stopping at
+  what is there.
+
+### Notes
+
+- Sandbox-first turns a planning question, not just a save, into something that can create a build
+  container — multiplying how often the fleet is built up — while the pass that would reclaim
+  orphaned ones stays on its own deferred track (C10 §7), not shipped with this change.
+- There is no feature flag. The primary project screen changes for everyone at once.
+
 ## [1.7.0-beta.4] - 2026-09-01
 
 Finishing the removal, and putting back the guardrail it dropped.
