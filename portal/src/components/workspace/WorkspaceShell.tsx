@@ -42,19 +42,72 @@
  * below then declares its OWN scroller, because sticky positioning and overflow both resolve
  * against the nearest scroll container and that container has moved.
  */
-import { Outlet } from 'react-router-dom'
-import { useEffect, useState } from 'react'
+import { Outlet, useLocation } from 'react-router-dom'
+import { useEffect, useLayoutEffect, useState } from 'react'
 import Navbar from '../layout/Navbar'
 import ReclaimWorkspaceDialog from '../projects/ReclaimWorkspaceDialog'
 import AppPaneHost from './AppPaneHost'
+import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
 import {
   WorkspaceChannelProvider,
   createWorkspaceChannel,
   useRailSlot,
+  useWorkspaceChannel,
   useWorkspacePaneVisible,
   useWorkspaceReclaim,
   useWorkspaceSaveState,
 } from './workspaceChannel'
+
+/**
+ * THE ID THE COLLAPSE CONTROL POINTS AT. The control that hides the rail is published into the
+ * pane's toolbar — it has to be, because a collapsed rail is invisible and untabbable and a toggle
+ * inside it would be a one-way door — so `aria-controls` is the only thing tying the two together
+ * for anyone reading the markup or navigating it. One constant so the two ends cannot drift.
+ */
+export const WORKSPACE_RAIL_ID = 'workspace-rail'
+
+/**
+ * WHICH RAIL IS SHOWING, DERIVED FROM THE ADDRESS AND FROM NOTHING ELSE (Plan F, U1).
+ *
+ * A chat address means the rail IS the conversation; anything else in the workspace is the
+ * project's own details. There is no third mode — chat history was withheld — and there is no
+ * route and no `?rail=` query behind this, deliberately: a query param would make a rail mode a
+ * shareable link, which is a different feature from the one R9 asks for ("leaving a chat returns
+ * to the mode it was opened from, as it was"), and shell state gives that for free.
+ */
+export type RailMode = 'details' | 'conversation'
+
+function railModeFor(pathname: string): RailMode {
+  return pathname.startsWith('/chat/') ? 'conversation' : 'details'
+}
+
+/**
+ * THE RAIL'S WIDTH IS A CLASS ON ONE PERSISTENT ELEMENT — never a conditional render of two trees.
+ *
+ * Two settled widths and a collapse, taken from the canvas's 400px and 520px. The conversation
+ * gets the wider one because it holds a transcript and a composer; the project's details do not.
+ *
+ * TWO THINGS THIS DELIBERATELY IS NOT. It is not a draggable divider — two settled widths plus one
+ * collapse is the whole requirement, and the panel library the obvious path reaches for has renamed
+ * its exports. And it is not a measured breakpoint: the stacked crossing below is a responsive
+ * class on the same container, so no `matchMedia` and no `ResizeObserver` enters this plan and
+ * AE37 holds by construction.
+ *
+ * WHEN NOTHING WANTS THE PANE the rail is the whole surface and takes the remaining space — a
+ * planning conversation, which has no pane at all, must not be pinned to 520px with a void beside
+ * it. That is why `paneVisible` is read before either width.
+ */
+function railWidthClass(mode: RailMode, collapsed: boolean, paneVisible: boolean): string {
+  // Zero width AND out of reach. Width alone would only clip it, leaving its composer, its links
+  // and its menus in the tab order — the WCAG 4.1.2 violation `hiddenSubtree.ts` records. The
+  // subtree stays MOUNTED, so a draft and a scroll position survive a hide/show cycle.
+  if (collapsed) return `w-0 flex-shrink-0 border-r-0 overflow-hidden ${HIDDEN_BUT_MOUNTED}`
+  if (!paneVisible) return 'flex-1'
+  // Stacked below the threshold (`flex-1`, sharing the column), settled beside the pane above it.
+  return mode === 'conversation'
+    ? 'flex-1 lg:flex-none lg:w-[520px]'
+    : 'flex-1 lg:flex-none lg:w-[400px]'
+}
 
 /**
  * THE ONE WARNING THE SAVE MODEL OWES THE CITIZEN (Plan A, U7).
@@ -123,10 +176,33 @@ function ReclaimSlot() {
   )
 }
 
+/**
+ * THE RAIL MODE IS THE SHELL'S FOURTH RESPONSIBILITY, ADDED BY PLAN F.
+ *
+ * Plan A's docblock says the shell holds "no data fetching and no chat state", and that is still
+ * true: a rail mode is state about the SHELL'S OWN CHROME, derived from the address the router
+ * already resolved, not about any conversation. It is published downward so a surface can read
+ * which rail it is rendering into without re-deriving the same predicate from `useLocation` in
+ * three places — and it is the alternative to the `?rail=` query param this plan rejected.
+ *
+ * A LAYOUT effect, matching every other publisher on this channel: the pane host is a sibling
+ * reading from the store, so a passive publish would leave it one committed frame behind.
+ */
+function usePublishRailMode(mode: RailMode): void {
+  const channel = useWorkspaceChannel()
+  useLayoutEffect(() => {
+    const held = channel?.rail.get()
+    if (!held || held.mode === mode) return
+    channel?.rail.set({ ...held, mode })
+  })
+}
+
 /** Everything inside the provider, so it can read the channel it is mounted under. */
 function ShellFrame() {
   useUnsavedWorkWarning()
   const rail = useRailSlot()
+  const mode = railModeFor(useLocation().pathname)
+  usePublishRailMode(mode)
   // WHICH COLUMN GROWS, and it is not a cosmetic choice. The two columns are the conversation and
   // the app, and the conversation is the SIZED one whenever the app is on screen: the builder
   // surface's chat panel sets its own 288px and the pane takes everything left over, which is
@@ -150,13 +226,23 @@ function ShellFrame() {
           threshold — the pane host is its SIBLING, so a direction swap cannot remount the frame. */}
       <div
         data-testid="workspace-grid"
-        className={`flex flex-1 min-h-0 overflow-hidden ${rail.stacked ? 'flex-col' : 'flex-row'}`}
+        /* R13's crossing, AS A RESPONSIVE CLASS ON THIS ONE ELEMENT. Below the threshold the pane
+           stacks under the rail; above it they sit side by side. Never a conditional render of a
+           stacked tree and a side-by-side tree — that is a remount, and AE37 forbids it. Because
+           the pane host is this element's SIBLING and the rail's contents are its Outlet child,
+           the direction swap happens on their COMMON parent, which is the whole reason the grid
+           has to be in one place. `rail.stacked` stays a deliberate force-stack override. */
+        className={`flex flex-1 min-h-0 overflow-hidden ${rail.stacked ? 'flex-col' : 'flex-col lg:flex-row'}`}
       >
-        {/* The outlet column: the project surface or the chat surface. A flex child that may not
-            overflow the frame — each surface declares its own scroller inside it. */}
+        {/* The outlet column — THE RAIL. The project surface or the chat surface renders inside
+            it, and its width is a class on this one persistent element: the details width, the
+            conversation width, or collapsed. The element is never conditionally rendered, so a
+            width change and a collapse both leave every descendant mounted. */}
         <div
+          id={WORKSPACE_RAIL_ID}
           data-testid="workspace-outlet"
-          className={`min-w-0 min-h-0 flex flex-col overflow-hidden ${paneVisible ? '' : 'flex-1'}`}
+          data-rail-mode={mode}
+          className={`min-w-0 min-h-0 flex flex-col overflow-hidden ${railWidthClass(mode, rail.collapsed, paneVisible)}`}
         >
           <Outlet />
         </div>

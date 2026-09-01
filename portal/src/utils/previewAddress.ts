@@ -94,6 +94,12 @@ export interface PreviewAddressInputs {
    * the three above it all need a live turn, a relaunch performed in this session, or a session.
    * At a bare project address on a fresh load there is none of that, so without this arm the
    * project screen frames nothing.
+   *
+   * ITS CALLER EXISTS. `components/workspace/ProjectWorkspace.tsx` is the project-scoped publisher
+   * this arm was written for, and it feeds only the `alive` case — the one state whose `previewUrl`
+   * the wire's own contract calls framable. Until it landed, this arm had no caller at all and the
+   * bare project screen published nothing, so the pane host hit its "no pane and no address" early
+   * return and rendered nothing on a fresh load.
    */
   projectPreviewUrl: string | null
   /** THE PROJECT PREDICATE. Do the project-scoped signals above belong to the OPEN project? */

@@ -292,32 +292,61 @@ describe('AppPaneHost — which column grows, and which one is sized', () => {
   // 288px chat panel sat beside a `flex-1` preview. Split across the shell's grid with BOTH columns
   // at `flex-1`, the workspace halves: the panel keeps its 288px inside a column twice its width
   // and the app loses half the screen it had. Nothing in the unit suite would have said a word.
+  //
+  // REWRITTEN FOR PLAN F'S SETTLED WIDTHS, and the property is the same one. When Plan A shipped
+  // this, the rail had no width of its own, so "not `flex-1`" WAS the whole signal — the column
+  // fell back to its content. Plan F gives it two settled widths and a stacked crossing, both
+  // expressed as classes on this same element, so the honest assertion is now: at the two-column
+  // breakpoint the rail is the SIZED column (`lg:flex-none` plus a settled `lg:w-[…]`) and the
+  // pane is the growing one. The `flex-1` that remains is the STACKED case, where the two share a
+  // column and both must grow — asserting its absence would now be asserting that the layout below
+  // the threshold is broken.
   const outlet = () => screen.getByTestId('workspace-outlet')
 
-  it('with the pane visible, the conversation column is sized by its content and the pane takes the rest', () => {
+  /** The rail is the sized column: a settled width, and not the one that grows, at `lg`. */
+  const expectRailIsSized = (className: string) => {
+    expect(className).toMatch(/lg:flex-none/)
+    expect(className).toMatch(/lg:w-\[\d+px\]/)
+  }
+
+  /** The rail is the whole surface: it grows, and carries no settled width to be pinned to. */
+  const expectRailIsEverything = (className: string) => {
+    expect(className).toMatch(/flex-1/)
+    expect(className).not.toMatch(/lg:w-\[/)
+    expect(className).not.toMatch(/lg:flex-none/)
+  }
+
+  it('with the pane visible, the conversation column is SIZED and the pane takes the rest', () => {
     render(<Workspace chatSurface={<ChatSurface />} />)
 
-    expect(outlet().className).not.toMatch(/flex-1/)
+    expectRailIsSized(outlet().className)
     expect(paneWrapper()?.className).toMatch(/flex-1/)
   })
 
   it('with nothing asking for the pane, the conversation column IS the whole surface', () => {
-    // Every planning conversation, and the project screen before Plan F.
+    // Every planning conversation — which under Plan F is the one surface with no pane at all.
     render(<Workspace chatSurface={<ChatSurface visible={false} />} />)
 
-    expect(outlet().className).toMatch(/flex-1/)
+    expectRailIsEverything(outlet().className)
     expect(paneWrapper()?.className).toMatch(/w-0/)
   })
 
   it('and the split follows the pane back and forth across a navigation', () => {
     render(<Workspace chatSurface={<ChatSurface />} />)
-    expect(outlet().className).not.toMatch(/flex-1/)
+    expectRailIsSized(outlet().className)
 
     fireEvent.click(screen.getByText('to project'))
-    expect(outlet().className).toMatch(/flex-1/)
+    expectRailIsEverything(outlet().className)
 
     fireEvent.click(screen.getByText('to chat'))
-    expect(outlet().className).not.toMatch(/flex-1/)
+    expectRailIsSized(outlet().className)
+  })
+
+  it('gives the conversation the WIDER of the two settled widths', () => {
+    // Two settled widths, and which is which is not arbitrary: a conversation holds a transcript
+    // and a composer, the project's details do not. Taken from the canvas's 400px and 520px.
+    render(<Workspace chatSurface={<ChatSurface />} />)
+    expect(outlet().className).toMatch(/lg:w-\[520px\]/)
   })
 })
 
@@ -444,7 +473,7 @@ describe('AppPaneHost — a layout change does not remount the frame (AE37)', ()
         <>
           <button
             type="button"
-            onClick={() => { setStacked(!stacked); channel?.rail.set({ mode: null, state: {}, stacked: !stacked }) }}
+            onClick={() => { setStacked(!stacked); channel?.rail.set({ mode: null, state: {}, stacked: !stacked, collapsed: false }) }}
           >
             flip
           </button>

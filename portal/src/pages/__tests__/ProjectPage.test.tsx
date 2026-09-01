@@ -1,31 +1,41 @@
 /**
- * ProjectPage: the project home is the builder.
+ * ProjectPage: the project screen IS the app (Plan F, U9 — the deliberate inversion).
  *
- * What this pins:
- *   - the Sandbox builder (`ProjectBuilder`) renders UNCONDITIONALLY and first — its
- *     composer is present whether or not the project has an app (the exact regression that
- *     caused the reverted app-first fold; F6 dropped the idea-starter cards). The composer
- *     is the proxy for "the builder rendered"; it used to be the theme selector, which was
- *     removed as dead UI in #157 B1 — the invariant is unchanged, only the handle on it;
- *   - the passive "View app" preview is HIDDEN in Phase-1 (U6): a stored app is not a running
- *     sandbox, so a built project shows NO "View app" button and fires no getAppSource read —
- *     the live preview now comes only from a per-session C3 build in the builder;
- *   - the removed doors stay gone: no "Continue building" reroute, no "Open app" link;
- *   - the description sits in a right rail with Save + Generate and NO attach control (R3);
- *   - conversations are a plain recents list (icon · title · KIND BADGE · date · ⋮) with no
- *     new-chat buttons; the ⋮ menu opens + deletes optimistically. The badge's ABSENCE used to
- *     be pinned here as an invariant; R16 inverted that decision deliberately — a reader should
- *     not have to infer "Build" from a wrench — so the assertion was flipped and this sentence
- *     rewritten rather than the test quietly deleted. The liveness assertions beside it stay,
- *     because a negative assertion also passes on a render that threw;
- *   - a 404 (deleted elsewhere) bounces to /projects, and rename is blocked before any request.
+ * ═══ WHAT CHANGED HERE, AND WHY IT IS AN INVERSION RATHER THAN A DELETION ═══
  *
- * projectApi + conversationApi + builderHistory are mocked at the module boundary; the REAL
- * ProjectBuilder and ProjectDescriptionEditor render (they only need the mocked APIs). A
- * LocationProbe on a catch-all route reports where navigation actually landed. LivePreview is
- * stubbed to null — ProjectPage no longer mounts it (the passive preview is hidden, U6), and the
- * The old stored-app read (`getAppSource`) is retired from appRegistryApi entirely
- *  (owner surface gone; pinned by appRegistryApi.test.js).
+ * This suite used to pin the app's ABSENCE from the project screen — the Phase-1 decision that "a
+ * stored app is not a running sandbox". That decision was right about what it removed: a passive
+ * view of stored code, a lifecycle badge, and a reroute into a chat. What arrives now is not that.
+ * It is the RUNNING sandbox, in a pane beside the rail, behind one control a person presses. So
+ * the assertions split in two rather than all flipping:
+ *
+ *   INVERTED — the app's presence. The start control exists on a saved-not-running project and does
+ *     not exist on a project with nothing built. Nothing on the screen starts a container.
+ *   KEPT AS INERTNESS GUARDS — "View app", "Continue building", "Open app" and the lifecycle badge
+ *     stay gone. Those were the passive-artefact affordances, and none of them is coming back.
+ *
+ * ═══ THE ASSERTIONS THAT WERE VACUOUS, AND WHY THEY ARE NOT THE ONES TO INVERT ═══
+ *
+ * `queryByTestId('live-preview')` appeared three times and was worthless in both directions: no
+ * product code has ever set that testid, and `LivePreview` is additionally stubbed to `() => null`
+ * in this file. Those lines could not have gone red however the page changed. They are replaced by
+ * assertions on things this suite can actually observe — the start control, and the absence of any
+ * server call that would start something.
+ *
+ * ═══ WHAT THIS SUITE CAN AND CANNOT SEE ═══
+ *
+ * It renders the page WITHOUT the workspace shell, so there is no pane host and no iframe in the
+ * tree at all. That is deliberate: the pane's own behaviour — its identity across a navigation, the
+ * stacked crossing, the framed URL — belongs to `ProjectWorkspace.test.tsx`, which renders through
+ * the real shell, because a test that mounts this page alone cannot see any of it. What THIS file
+ * owns is the page: its data, its beacon, its rail's contents, and the affordances that must and
+ * must not be on it.
+ *
+ * projectApi, conversationApi and buildSessionApi are mocked at the module boundary; the REAL
+ * `ProjectWorkspace`, `WorkspaceRail`, `RailComposer` and `ProjectDescriptionEditor` render. A
+ * LocationProbe on a catch-all route reports where navigation actually landed. The old stored-app
+ * read (`getAppSource`) is retired from appRegistryApi entirely (owner surface gone; pinned by
+ * appRegistryApi.test.js).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { StrictMode } from 'react'
@@ -43,6 +53,9 @@ const h = vi.hoisted(() => ({
   generateDescription: vi.fn(),
   listProjectConversations: vi.fn(),
   deleteConversation: vi.fn(),
+  fetchPreviewState: vi.fn(),
+  fetchSaveState: vi.fn(),
+  relaunchPreview: vi.fn(),
 }))
 
 // The REAL `observe` module runs in these tests — its once-per-project-id-per-page-load guard IS
@@ -70,6 +83,18 @@ vi.mock('../../components/PublishStatusChip', () => ({
   default: ({ projectId }: { projectId: string }) => (
     <span data-testid="publish-chip-stub" data-project={projectId} />
   ),
+}))
+// THE WORKSPACE READ, stubbed at the module boundary. `ProjectWorkspace` polls `fetchPreviewState`
+// on a cadence; every scenario below sets its own answer through `h.fetchPreviewState`. The two
+// container-exec reads are stubbed as REJECTING rather than resolving, so a regression that starts
+// calling them on a stopped project fails loudly here instead of quietly costing an attach.
+vi.mock('../../utils/buildSessionApi', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../utils/buildSessionApi')>()),
+  fetchPreviewState: h.fetchPreviewState,
+  fetchSaveState: h.fetchSaveState,
+  fetchCompileState: vi.fn(async () => { throw new Error('a container exec on the project screen') }),
+  checkWorkspace: vi.fn(async () => { throw new Error('a container exec on the project screen') }),
+  relaunchPreview: h.relaunchPreview,
 }))
 vi.mock('../../utils/chatHistory.js', () => ({ relativeTime: () => '1h ago' }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
@@ -120,10 +145,23 @@ function renderProjectPage(projectId = 'p1') {
   )
 }
 
+/** A preview-state read, in the shape the wire parser produces one. */
+const preview = (over: Record<string, unknown> = {}) => ({
+  state: 'never_built',
+  alive: false,
+  previewUrl: null,
+  occupyingProjectName: null,
+  occupyingProjectId: null,
+  restorable: null,
+  ...over,
+})
+
 beforeEach(() => {
   vi.clearAllMocks()
   h.authFetch.mockResolvedValue({ ok: true } as Response)
   h.listProjectConversations.mockResolvedValue([])
+  h.fetchPreviewState.mockResolvedValue(preview())
+  h.fetchSaveState.mockResolvedValue({ appId: 'a1', dirty: false, containerHead: null, savedHead: null })
 })
 
 afterEach(() => {
@@ -134,24 +172,23 @@ afterEach(() => {
 /** The observation bodies this render posted — see `_observeBeacons` for the mock contract. */
 const beacons = () => beaconsFrom(h.authFetch)
 
-describe('ProjectPage — the builder is unconditional', () => {
-  it('no-app project: renders the builder (composer), recents, and the description rail — no app affordances', async () => {
+describe('ProjectPage — the composer is unconditional', () => {
+  it('no-app project: renders the composer, the description block and the recents — and no app affordances', async () => {
     h.getProject.mockResolvedValue(makeProject({ appId: null, appStatus: null }))
     renderProjectPage()
 
     expect(await screen.findByRole('heading', { name: 'VIP Movement' })).toBeTruthy()
-    // The builder is present: its composer renders. (F6: no idea-starter cards inside a
-    // dedicated project — the composer + mode helper are the first-run guidance.)
+    // The composer is present whether or not the project has an app — the exact regression that
+    // caused the reverted app-first fold. (F6: no idea-starter cards inside a dedicated project.)
     expect(screen.getByPlaceholderText(/Describe the app you want built/i)).toBeTruthy()
-    // The description rail — a read view with an Edit button (U7: the pop-up editor).
+    // The description block — a read view with an Edit button (U7: the pop-up editor).
     expect(within(screen.getByTestId('description-rail')).getByRole('button', { name: /edit/i })).toBeTruthy()
-    // No app affordances for a project with no app: no "View app", no preview, no Continue building.
+    // The passive-artefact affordances stay gone.
     expect(screen.queryByRole('button', { name: /view app/i })).toBeNull()
-    expect(screen.queryByTestId('live-preview')).toBeNull()
     expect(screen.queryByRole('button', { name: /continue building/i })).toBeNull()
   })
 
-  it('built project: builder still on top (composer) — and NO "View app" / lifecycle badge / Continue building / inline preview', async () => {
+  it('built project: the composer is still on top, and the retired affordances are still retired', async () => {
     h.getProject.mockResolvedValue(makeProject({ appId: 'a1', appStatus: 'draft' }))
     h.listProjectConversations.mockResolvedValue([
       { id: 'c2', kind: 'build', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
@@ -159,43 +196,93 @@ describe('ProjectPage — the builder is unconditional', () => {
     renderProjectPage()
 
     await screen.findByRole('heading', { name: 'VIP Movement' })
-    // The builder is NOT collapsed — this is the reverted regression the fold must avoid.
+    // NOT collapsed under an app card — this is the reverted regression the fold must avoid.
     expect(screen.getByPlaceholderText(/Describe the app you want built/i)).toBeTruthy()
-    // U6: the passive "View app" preview is HIDDEN — a stored app is not a running sandbox.
-    const rail = screen.getByTestId('description-rail')
-    expect(within(rail).queryByRole('button', { name: /view app/i })).toBeNull()
-    // The removed affordances: no draft/lifecycle badge, no Continue building, no inline preview.
+    // INERTNESS GUARDS, kept through the inversion rather than deleted with it. What Phase-1
+    // removed was a passive view of stored code, a lifecycle badge and a reroute; none of the
+    // three comes back with the running sandbox.
+    expect(screen.queryByRole('button', { name: /view app/i })).toBeNull()
     expect(screen.queryByText('draft')).toBeNull()
     expect(screen.queryByRole('button', { name: /continue building/i })).toBeNull()
-    expect(screen.queryByTestId('live-preview')).toBeNull()
+    expect(screen.queryByRole('link', { name: /open app/i })).toBeNull()
   })
 })
 
-describe('ProjectPage — the passive app preview is hidden (U6)', () => {
-  it('a built project renders NO "View app" affordance and NO modal', async () => {
-    h.getProject.mockResolvedValue(makeProject({ appId: 'a1', appStatus: 'draft' }))
-    h.listProjectConversations.mockResolvedValue([
-      { id: 'built', kind: 'build', projectId: 'p1', title: 'Build it', updatedAt: '2026-07-09T00:00:00Z' },
-    ])
+describe('ProjectPage — the app arrives behind one deliberate press (R3, AE1, AE2)', () => {
+  it('AE1: a saved, not-running project offers exactly one start control, and says what IS', async () => {
+    // THE INVERSION. This is the assertion the old suite could not have: it used to pin that the
+    // project screen offered no way to reach the app at all.
+    h.getProject.mockResolvedValue(makeProject({ appId: 'a1', hasRelaunchableSnapshot: true }))
+    h.fetchPreviewState.mockResolvedValue(preview({ state: 'asleep', restorable: true }))
     renderProjectPage()
 
     await screen.findByRole('heading', { name: 'VIP Movement' })
-    expect(screen.queryByRole('button', { name: /view app/i })).toBeNull()
-    expect(screen.queryByRole('dialog')).toBeNull()
-    expect(screen.queryByTestId('live-preview')).toBeNull()
+    // R-16's exact sentence, and no negation of it anywhere on the screen.
+    await waitFor(() => expect(screen.getAllByText('Your app is saved.').length).toBeGreaterThan(0))
+    expect(document.body.textContent).not.toMatch(/not running/i)
+    expect(document.body.textContent).not.toMatch(/\bstopped\b/i)
   })
 
-  it('renders the landing path without any stored-app read (the getAppSource export is retired)', async () => {
-    h.getProject.mockResolvedValue(makeProject({ appId: 'a1', appStatus: 'draft' }))
-    h.listProjectConversations.mockResolvedValue([
-      { id: 'hi', kind: 'build', projectId: 'p1', title: 'hi', updatedAt: '2026-07-11T00:00:00Z' },
-    ])
+  it('AE2: a project with nothing built offers no start control at all', async () => {
+    h.getProject.mockResolvedValue(makeProject({ appId: null, hasRelaunchableSnapshot: false }))
+    h.fetchPreviewState.mockResolvedValue(preview({ state: 'never_built', restorable: false }))
     renderProjectPage()
 
     await screen.findByRole('heading', { name: 'VIP Movement' })
-    // The whole passive-preview read is retired — never fired, with or without a modal to open.
-    // The retired stored-app read cannot fire: appRegistryApi no longer exports it
-    // (pinned by appRegistryApi.test.js).
+    await waitFor(() => expect(h.fetchPreviewState).toHaveBeenCalled())
+    expect(screen.queryByRole('button', { name: /launch application/i })).toBeNull()
+  })
+
+  it('★ opening the screen STARTS NOTHING — the read is the only call it makes (R3)', async () => {
+    // The whole basis on which the Phase-1 removal is reversed. A screen that started a container
+    // by being opened would be the thing that decision was right to refuse.
+    //
+    // Mutation receipt: make `ProjectWorkspace` call `relaunchPreview` on mount and this goes red.
+    h.getProject.mockResolvedValue(makeProject({ appId: 'a1', hasRelaunchableSnapshot: true }))
+    h.fetchPreviewState.mockResolvedValue(preview({ state: 'asleep', restorable: true }))
+    renderProjectPage()
+
+    await screen.findByRole('heading', { name: 'VIP Movement' })
+    await waitFor(() => expect(h.fetchPreviewState).toHaveBeenCalledWith('p1'))
+    expect(h.relaunchPreview).not.toHaveBeenCalled()
+  })
+
+  it('★ never asks a stopped project whether it has unsaved work (R3)', async () => {
+    // `fetchSaveState` runs two `git` executions inside the container. On a stopped workspace that
+    // is an attach the screen caused, so the rail shows the status sentence and no save state.
+    h.getProject.mockResolvedValue(makeProject({ appId: 'a1', hasRelaunchableSnapshot: true }))
+    h.fetchPreviewState.mockResolvedValue(preview({ state: 'asleep', restorable: true }))
+    renderProjectPage()
+
+    await screen.findByRole('heading', { name: 'VIP Movement' })
+    await waitFor(() => expect(h.fetchPreviewState).toHaveBeenCalled())
+    expect(h.fetchSaveState).not.toHaveBeenCalled()
+    expect(screen.queryByTestId('rail-save-state')).toBeNull()
+  })
+
+  it('shows the save half only once the workspace is alive (R6, delivered in the running state)', async () => {
+    h.getProject.mockResolvedValue(makeProject({ appId: 'a1', hasRelaunchableSnapshot: true }))
+    h.fetchPreviewState.mockResolvedValue(preview({ state: 'alive', alive: true, previewUrl: 'https://app.example/' }))
+    h.fetchSaveState.mockResolvedValue({ appId: 'a1', dirty: true, containerHead: 'deadbeefcafe', savedHead: 'abc1234def' })
+    renderProjectPage()
+
+    await screen.findByRole('heading', { name: 'VIP Movement' })
+    const saved = await screen.findByTestId('rail-save-state')
+    expect(saved.textContent).toMatch(/not saved yet/i)
+    // The short commit, not the full sha.
+    expect(saved.textContent).toContain('abc1234')
+    expect(saved.textContent).not.toContain('abc1234def')
+  })
+
+  it('R62: an unreadable save state says so rather than reporting that everything is saved', async () => {
+    h.getProject.mockResolvedValue(makeProject({ appId: 'a1' }))
+    h.fetchPreviewState.mockResolvedValue(preview({ state: 'alive', alive: true, previewUrl: 'https://app.example/' }))
+    h.fetchSaveState.mockResolvedValue({ appId: 'a1', dirty: null, containerHead: null, savedHead: null })
+    renderProjectPage()
+
+    const saved = await screen.findByTestId('rail-save-state')
+    expect(saved.textContent).toMatch(/could not check/i)
+    expect(saved.textContent).not.toMatch(/everything is saved/i)
   })
 
   it('the removed doors stay gone: no "Open app" link and no "Continue building" anywhere', async () => {
@@ -315,18 +402,20 @@ describe('ProjectPage — an outlet child that owns its own scroller (Plan A, U3
     expect(container.innerHTML).not.toMatch(/100vh/)
   })
 
-  it('the description rail\'s sticky offset is re-based on the scroller that now exists', async () => {
+  it('★ builds NO second two-column frame of its own', async () => {
+    // REPLACES the sticky-offset assertion, which no longer describes anything: the description was
+    // a right-hand sticky `aside` beside a two-column grid inside the page, and the rail IS the
+    // left column now — there is no second grid for it to stick inside. What replaced that risk is
+    // this one, and it is bigger: an implementer who rebuilds rail-plus-pane in here produces a
+    // grid nested in the shell's own, and every "the app did not remount" assertion in this plan
+    // fails on the first navigation to a chat.
     h.getProject.mockResolvedValue(makeProject())
-    renderProjectPage()
+    const { container } = renderProjectPage()
     await screen.findByRole('heading', { name: 'VIP Movement' })
 
-    const rail = screen.getByTestId('description-rail')
-    expect(rail.className).toMatch(/lg:sticky/)
-    // `top-20` was the navbar's 56px plus a 24px gap, measured from the VIEWPORT. Sticky resolves
-    // against the nearest scroll container, and that container starts below the navbar now — so
-    // the offset is the 24px gap alone.
-    expect(rail.className).toMatch(/lg:top-6/)
-    expect(rail.className).not.toMatch(/lg:top-20/)
+    // No grid template, and no second iframe host — the pane is the SHELL's sibling of the Outlet.
+    expect(container.innerHTML).not.toMatch(/grid-cols-/)
+    expect(container.querySelector('iframe')).toBeNull()
   })
 })
 
@@ -338,6 +427,13 @@ function rowFor(title: string): HTMLElement {
   return row as HTMLElement
 }
 
+/**
+ * KEPT ENTIRELY, AND THE REASON IS RECORDED RATHER THAN IMPLIED. This block was going to move into
+ * a chat-history rail; history was withheld by a client call before it was built. So the recents
+ * section stays exactly where it is — it is the only project-scoped way to delete a conversation
+ * and the only route back to an EXISTING chat, and deleting it with nothing to replace it would
+ * retire both silently. Nothing here is inverted and nothing moves.
+ */
 describe('ProjectPage — conversations as a plain recents list (U3)', () => {
   it('renders icon · title · kind badge · relative date · ⋮ with no new-chat buttons', async () => {
     h.getProject.mockResolvedValue(makeProject())
@@ -559,5 +655,28 @@ describe('ProjectPage — the project-open mark (U4; R104, R105)', () => {
 
     await screen.findByText(/couldn.t load this project/i)
     expect(beacons()).toEqual([])
+  })
+
+  it('★ fires the beacon from exactly ONE production call site (the double-fire guard)', async () => {
+    // A STRUCTURAL assertion, and it catches what the four behavioural ones above cannot. The
+    // realistic way this breaks is not defeating `observe.ts`'s per-project guard — that guard
+    // makes a repeated call a safe no-op — but BYPASSING it: a second tracker added inside
+    // `ProjectWorkspace.tsx`, which independently needs `project.appId` for the rail's status line
+    // and is therefore exactly where somebody would put one. A second mechanism is not covered by
+    // the guard, and nothing in the UI reflects the number, so it would be wrong in silence.
+    const files = import.meta.glob('../../{pages,components}/**/*.{ts,tsx}', {
+      query: '?raw',
+      import: 'default',
+      eager: true,
+    })
+    const callers = Object.entries(files as Record<string, string>)
+      // Vite normalises a glob key relative to THIS file, so a sibling suite comes back as
+      // `./ChatRoute.test.tsx` with no `__tests__` left in it — filter on the suffix, not the dir.
+      .filter(([path]) => !/\.test\.tsx?$/.test(path) && !path.includes('__tests__'))
+      .filter(([, source]) => /markProjectOpened\s*\(/.test(source))
+      .map(([path]) => path.replace(/^.*\/src\//, '').replace(/^\.\.\/\.\.\//, ''))
+      .sort()
+
+    expect(callers).toEqual(['../ProjectPage.tsx'])
   })
 })

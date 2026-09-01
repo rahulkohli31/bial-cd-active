@@ -157,7 +157,7 @@ describe('WorkspaceShell — the grid is the shell\'s own', () => {
         type="button"
         onClick={() => {
           setStacked(!stacked)
-          channel?.rail.set({ mode: null, state: {}, stacked: !stacked })
+          channel?.rail.set({ mode: null, state: {}, stacked: !stacked, collapsed: false })
         }}
       >
         flip

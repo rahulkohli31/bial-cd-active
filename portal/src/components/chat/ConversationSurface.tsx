@@ -1970,10 +1970,15 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
     sessionStatus: session.status,
     sessionId: session.sessionId,
     // NOT `previewState?.previewUrl`, and the reason is a cycle rather than an oversight: this
-    // page's preview-state poll only runs while an address is ALREADY framed (see its effect
+    // surface's preview-state poll only runs while an address is ALREADY framed (see its effect
     // below), so feeding its answer back in could never bootstrap one and would only widen the
-    // window in which a dropped address keeps framing. The arm exists for the caller that has a
-    // project and no chat — the project surface — which is Plan F's.
+    // window in which a dropped address keeps framing.
+    //
+    // THE ARM IS NOW POPULATED — by its intended caller, not by this one. It exists for the
+    // surface that has a project and no chat, and `components/workspace/ProjectWorkspace.tsx` is
+    // it: its own read has no framed-URL precondition, precisely because the no-frame case is what
+    // the project screen's pane exists to describe. Nothing changes here; the note is updated
+    // because a closed gap must stop reading as an open one.
     projectPreviewUrl: null,
     sessionBelongsToOpenProject: sessionProjectMatches,
     transcriptHasBuildOutcome: newestOutcome !== null,
