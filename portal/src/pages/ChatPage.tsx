@@ -3,7 +3,7 @@ import type { FormEvent as ReactFormEvent, KeyboardEvent as ReactKeyboardEvent }
 import { useNavigate, useParams, useLocation } from 'react-router-dom'
 import { AssistantRuntimeProvider, ComposerPrimitive, useExternalStoreRuntime, useAuiState } from '@assistant-ui/react'
 import type { ThreadMessage, AppendMessage } from '@assistant-ui/react'
-import { Sparkles, User, Send, Hammer, Paperclip, X, FileText, FileSpreadsheet, Presentation } from 'lucide-react'
+import { Sparkles, User, Send, Hammer, Paperclip, X, FileText, FileSpreadsheet } from 'lucide-react'
 import MessageContent from '../components/chat/MessageContent'
 import AttachmentLightbox from '../components/AttachmentLightbox'
 import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
@@ -12,7 +12,7 @@ import { useClaudeAPI, getContextLimits, estimateConversationTokens } from '../h
 import { usePendingAttachments } from '../hooks/usePendingAttachments'
 import { newConversation, createConversation, getConversation, deriveTitle } from '../utils/chatHistory'
 import { wireMessageFromParts, buildUserParts, partsToText, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
-import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../utils/attachmentInput'
+import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES } from '../utils/attachmentInput'
 import type { PendingAttachment } from '../utils/attachmentInput'
 import { openPdf } from '../utils/attachmentViewer'
 import { describeSaveFailure, isConversationGone } from '../utils/chatErrors'
@@ -795,15 +795,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                         <span className="flex-shrink-0 text-primary" title={a.name}>
                           {a.mediaType === 'text/csv' ? <FileSpreadsheet size={13} /> : <FileText size={13} />}
                         </span>
-                      ) : OFFICE_MEDIA_TYPES.has(a.mediaType) ? (
-                        <span className="flex-shrink-0 text-primary" title={a.name}>
-                          {officeFormat(a.mediaType) === 'excel' ? <FileSpreadsheet size={13} /> : <FileText size={13} />}
-                        </span>
-                      ) : DECK_MEDIA_TYPES.has(a.mediaType) ? (
-                        <span className="flex-shrink-0 text-primary" title={a.name}>
-                          <Presentation size={13} />
-                        </span>
-                      ) : a.mediaType === 'application/pdf' ? (
+                    ) : a.mediaType === 'application/pdf' ? (
                         <button
                           type="button"
                           onClick={() => openPdf(a.base64, a.name)}

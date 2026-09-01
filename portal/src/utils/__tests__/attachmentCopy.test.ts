@@ -24,13 +24,20 @@
  * whose removal is already part of the change that breaks it buys nothing.
  */
 import { describe, it, expect } from 'vitest'
-import {
-  validateAttachmentFiles,
-  ALLOWED_MEDIA_TYPES,
-  WORD_MEDIA_TYPE,
-  EXCEL_MEDIA_TYPE,
-  PPTX_MEDIA_TYPE,
-} from '../attachmentInput'
+import { validateAttachmentFiles, ALLOWED_MEDIA_TYPES } from '../attachmentInput'
+
+/**
+ * The formats this sentence is ABOUT, as literal media types.
+ *
+ * They were imported constants until Plan D's narrowing deleted three of them — which is the
+ * gate working: the test could not compile against an allowlist that no longer names them. They
+ * are literals now precisely SO the reconciliation survives the next narrowing: a format that
+ * stops being exported must still be checked for ABSENCE from the copy, and an inventory built
+ * out of the module's own exports can only ever check what the module still offers.
+ */
+const WORD_MEDIA_TYPE = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+const EXCEL_MEDIA_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+const PPTX_MEDIA_TYPE = 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
 
 /** The user-facing message for a file the composer refuses — fails loudly if it accepted it. */
 function refusalFor(file: File): string {
@@ -60,7 +67,7 @@ describe('the composer refusal sentence agrees with the real allowlist', () => {
       [EXCEL_MEDIA_TYPE, /Excel|\.xlsx/i],
       [PPTX_MEDIA_TYPE, /PowerPoint|\.pptx/i],
     ] as const) {
-      if (ALLOWED_MEDIA_TYPES.includes(type)) {
+      if ((ALLOWED_MEDIA_TYPES as readonly string[]).includes(type)) {
         expect(message, `the picker accepts ${type} but the refusal never names it`).toMatch(phrase)
       } else {
         expect(message, `the picker refuses ${type} but the refusal still offers it`).not.toMatch(phrase)
@@ -76,13 +83,26 @@ describe('the composer refusal sentence agrees with the real allowlist', () => {
   })
 
   it('never advises a citizen to bring back a format the picker would also refuse', () => {
-    // R56 as behaviour rather than as a constant: advice is only honest while it leads
-    // somewhere. `LEGACY_PPT_REJECT_MSG` says "save as .pptx" and is gated on the deck flag
-    // precisely so it cannot be reached while .pptx is off the allowlist — which is what
-    // driving the validator proves, instead of trusting the gate by reading it.
-    const message = refusalFor(new File(['x'], 'gate-plan.ppt', { type: 'application/vnd.ms-powerpoint' }))
-    if (!ALLOWED_MEDIA_TYPES.includes(PPTX_MEDIA_TYPE)) {
-      expect(message, 'the refusal tells the citizen to re-save as a format the picker refuses').not.toMatch(/\.pptx/i)
+    // R56 as behaviour rather than as a constant: advice is only honest while it leads somewhere.
+    // The two legacy messages used to say "save as .docx" and "save as .pptx"; both stopped being
+    // followable when those formats were refused too, so both are gone and there is one refusal
+    // that names what IS accepted. Driving the validator is what proves that, rather than trusting
+    // a constant by reading it.
+    for (const legacy of [
+      new File(['x'], 'gate-plan.ppt', { type: 'application/vnd.ms-powerpoint' }),
+      new File(['x'], 'terminal-brief.doc', { type: 'application/msword' }),
+      new File(['x'], 'rota.xlsx', { type: EXCEL_MEDIA_TYPE }),
+    ]) {
+      // The ADVICE is what is under test, not the whole sentence: the message quotes the
+      // citizen's own filename back to them, so `"rota.xlsx" isn't supported` legitimately
+      // contains `.xlsx`. Reading the advice half is what separates "we echoed your file's name"
+      // from "we told you to bring it back in a format we also refuse".
+      const advice = refusalFor(legacy).replace(/^"[^"]*"/, '')
+      expect(advice, 'the refusal sends the citizen to a format the picker also refuses').not.toMatch(
+        /\.pptx|\.docx|\.xlsx|save as/i,
+      )
+      // …and it still tells them what WOULD work, rather than only saying no.
+      expect(advice).toMatch(/PDF/i)
     }
   })
 })

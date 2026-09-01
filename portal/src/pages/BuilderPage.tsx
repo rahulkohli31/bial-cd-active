@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo, memo } from 'react'
 import { useNavigate, useLocation, useParams } from 'react-router-dom'
 import {
-  Send, Sparkles, User, Paperclip, FileText, FileSpreadsheet, Presentation, X,
+  Send, Sparkles, User, Paperclip, FileText, FileSpreadsheet, X,
   CheckCircle2, XCircle, ExternalLink, PanelLeftOpen, PanelLeftClose,
 } from 'lucide-react'
 import PublishStatusChip from '../components/PublishStatusChip'
@@ -51,7 +51,7 @@ import { fetchSaveState, saveProject, releaseProject, stopActiveBuild, asReclaim
 import type { ReclaimBlocked, PreviewState, PreviewLifeState } from '../utils/buildSessionApi'
 import { PlanOptionsCard } from '../components/chat/PlanOptionsCard'
 import { wireMessageFromParts, buildUserParts, partsToText, attachmentsFromParts, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
-import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../utils/attachmentInput'
+import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES } from '../utils/attachmentInput'
 import { openPdf } from '../utils/attachmentViewer'
 import { loadBuilds, createBuild, getBuild, deriveTitle } from '../utils/builderHistory'
 import type { ChatMessage, MessagePart, BuildPart, BuildPartLive } from '../utils/messageTypes'
@@ -2500,14 +2500,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                     {TEXT_MEDIA_TYPES.has(a.mediaType) ? (
                       <span className="flex-shrink-0 text-primary" title={a.name}>
                         {a.mediaType === 'text/csv' ? <FileSpreadsheet size={11} /> : <FileText size={11} />}
-                      </span>
-                    ) : OFFICE_MEDIA_TYPES.has(a.mediaType) ? (
-                      <span className="flex-shrink-0 text-primary" title={a.name}>
-                        {officeFormat(a.mediaType) === 'excel' ? <FileSpreadsheet size={11} /> : <FileText size={11} />}
-                      </span>
-                    ) : DECK_MEDIA_TYPES.has(a.mediaType) ? (
-                      <span className="flex-shrink-0 text-primary" title={a.name}>
-                        <Presentation size={11} />
                       </span>
                     ) : a.mediaType === 'application/pdf' ? (
                       <button

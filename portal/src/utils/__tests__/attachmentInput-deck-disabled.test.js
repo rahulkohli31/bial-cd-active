@@ -1,55 +1,86 @@
-// Deck (.pptx) composer behavior with the feature flag DISABLED. This is the SHIPPED
-// state as of #157 B2 — the mock below pins the behaviour to the off-world explicitly
-// so these tests keep their meaning if the default ever flips back, and so they read
-// as the deliberate mirror of attachmentInput-deck.test.js (ENABLED) rather than as
-// an accident of today's constant. The shipped VALUE itself is asserted against the
-// real, unmocked flag in attachmentInput.test.js; a mocked module can never pin that.
-// (vi.mock is hoisted before the attachmentInput import, so its module-load gating
-// sees `false`.)
-import { describe, it, expect, vi } from 'vitest'
+/**
+ * PRESENTATIONS ARE GONE — the inertness guard (L8).
+ *
+ * This file used to mock `DECK_ATTACHMENTS_ENABLED` to `false` and describe one of the flag's two
+ * positions. There is no flag now: Plan D's U13 deleted it along with the arms it guarded and the
+ * media type itself, so there is no "off world" left to pin. What remains worth asserting is that
+ * the capability is UNREACHABLE — which is what a removal's tests become, rather than being
+ * deleted with the code.
+ *
+ * IT STOPS MOCKING, and that matters. A mocked flag is exactly what let the old suite pass in both
+ * positions while a citizen met a third behaviour; every assertion below runs against the real,
+ * unmocked module. Its ENABLED sibling (`attachmentInput-deck.test.js`, 6 cases) is deleted rather
+ * than converted: every one of its cases asserted a capability that can no longer exist, and a
+ * test that mocks a deleted constant into existence proves nothing about the shipped product. That
+ * deletion is a documented inertness conversion, and its count is named in the PR so the suite
+ * arithmetic reconciles rather than being waved through.
+ */
+import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
 
-vi.mock('../../config/features', () => ({
-  DECK_ATTACHMENTS_ENABLED: false,
-}))
+import { validateAttachmentFiles, ACCEPT_ATTR, ALLOWED_MEDIA_TYPES } from '../attachmentInput'
 
-const { validateAttachmentFiles, ACCEPT_ATTR, ALLOWED_MEDIA_TYPES, PPTX_MEDIA_TYPE, LEGACY_PPT_REJECT_MSG } =
-  await import('../attachmentInput')
+const PPTX_MEDIA_TYPE =
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+const WORD_MEDIA_TYPE =
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+const EXCEL_MEDIA_TYPE =
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 
 const file = (name, type, size = 1024) => ({ name, type, size })
-const SAVE_AS_PPTX = /save as \.pptx/i
 const UNSUPPORTED = /isn't supported/
 
-describe('deck (.pptx) — feature DISABLED', () => {
-  it('does NOT offer .pptx in the allowlist or the OS picker ACCEPT_ATTR', () => {
-    expect(ALLOWED_MEDIA_TYPES).not.toContain(PPTX_MEDIA_TYPE)
-    expect(ACCEPT_ATTR).not.toContain('.pptx')
-    expect(ACCEPT_ATTR).not.toContain(PPTX_MEDIA_TYPE)
+describe('formats that need a conversion step are unreachable (R46)', () => {
+  it('offers no presentation, spreadsheet or document type in the allowlist or the OS picker', () => {
+    for (const type of [PPTX_MEDIA_TYPE, WORD_MEDIA_TYPE, EXCEL_MEDIA_TYPE]) {
+      expect(ALLOWED_MEDIA_TYPES).not.toContain(type)
+      expect(ACCEPT_ATTR).not.toContain(type)
+    }
+    for (const ext of ['.pptx', '.docx', '.xlsx']) {
+      expect(ACCEPT_ATTR).not.toContain(ext)
+    }
+    // The liveness half: the picker still offers what it should, so the four absences above
+    // mean "narrowed" rather than "emptied".
+    expect(ACCEPT_ATTR).toContain('application/pdf')
+    expect(ACCEPT_ATTR).toContain('.csv')
   })
 
-  it('rejects a .pptx upload with the generic "isn\'t supported" copy (no PowerPoint mention)', () => {
-    const res = validateAttachmentFiles([file('q3.pptx', PPTX_MEDIA_TYPE)], 0)
-    expect(res.error).toMatch(/isn't supported/)
-    expect(res.error).not.toMatch(/powerpoint/i) // copy doesn't advertise it when off
-  })
-
-  it('sends a legacy .ppt down the SAME generic path, not to a .pptx that is also refused', () => {
-    // The flag-off half of the pair whose flag-on half lives in attachmentInput-deck.test.js.
-    // With decks off the legacy-.ppt branch does not run, because its only advice
-    // ("save as .pptx") leads to a file this very allowlist refuses. Both PowerPoint
-    // formats get one honest message that names what IS accepted.
-    for (const f of [file('old.ppt', 'application/vnd.ms-powerpoint'), file('deck.ppt', '')]) {
+  it('refuses each of them at the moment of drop, with one honest message', () => {
+    for (const f of [
+      file('q3.pptx', PPTX_MEDIA_TYPE),
+      file('brief.docx', WORD_MEDIA_TYPE),
+      file('rota.xlsx', EXCEL_MEDIA_TYPE),
+      file('old.ppt', 'application/vnd.ms-powerpoint'),
+      file('legacy.doc', 'application/msword'),
+      file('deck.ppt', ''),
+    ]) {
       const res = validateAttachmentFiles([f], 0)
-      expect(res.error).not.toBe(LEGACY_PPT_REJECT_MSG)
-      expect(res.error).not.toMatch(SAVE_AS_PPTX)
-      expect(res.error).toMatch(UNSUPPORTED)
+      expect(res.error, `"${f.name}" was accepted`).toMatch(UNSUPPORTED)
+      // Advice only, not the echoed filename — the message quotes the citizen's own file back.
+      const advice = res.error.replace(/^"[^"]*"/, '')
+      expect(advice).not.toMatch(/save as|\.pptx|\.docx|\.xlsx/i)
+      expect(advice).toMatch(/PDF/i)
     }
   })
 
-  it('a real .pptx the OS mislabels as ms-powerpoint is still not the legacy reject', () => {
-    // The gate must not swallow the extension-wins rule: with the branch skipped this
-    // file reaches the allowlist like any other, so it gets the generic message too.
-    const res = validateAttachmentFiles([file('real.pptx', 'application/vnd.ms-powerpoint')], 0)
-    expect(res.error).not.toBe(LEGACY_PPT_REJECT_MSG)
-    expect(res.error).toMatch(UNSUPPORTED)
+  it('the deck flag is not exported from config/features, and nothing imports it', () => {
+    // L8's fifth link. The constant, its thirty-line docblock and every branch reading it are
+    // gone together — a flag left behind with no arms is read by the next person as a capability
+    // that still exists somewhere.
+    const src = path.resolve(__dirname, '../../..')
+    const features = readFileSync(path.join(src, 'src/config/features.ts'), 'utf8')
+    expect(features).not.toMatch(/DECK_ATTACHMENTS_ENABLED/)
+  })
+
+  it('still accepts everything that needs no conversion', () => {
+    for (const f of [
+      file('plan.pdf', 'application/pdf'),
+      file('shot.png', 'image/png'),
+      file('rows.csv', 'text/csv'),
+      file('notes.txt', 'text/plain'),
+    ]) {
+      expect(validateAttachmentFiles([f], 0)).toEqual({ ok: true })
+    }
   })
 })
