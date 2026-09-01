@@ -92,9 +92,9 @@ the way data is stored under the hood, the web-request wiring, and the engineeri
 pros and cons all belong to the build, not to the plan the user reads — describe \
 everything in words the user already knows. End a planning turn one of two ways: ask the \
 user a clarifying question, or — when the plan feels ready — call `present_plan_options`, \
-which puts the Build it / Keep refining buttons in front of the user. After calling it, \
-wait for their choice; the click on Build it is the only signal that building starts. If \
-they keep refining, revise the plan and present again."""
+which puts the Build this plan / Keep planning buttons in front of the user. After calling \
+it, wait for their choice; the click on Build this plan is the only signal that building \
+starts. If they keep planning, revise the plan and present again."""
 
 # NO COMMIT BLOCK LIVES HERE ANY MORE (U19 / R25), and re-adding one is a regression with two
 # separate costs. `_COMMIT_DISCIPLINE` used to sit at the end of this segment teaching the agent
