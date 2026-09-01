@@ -6,6 +6,7 @@ builder. Public surface via explicit `from .x import Y as Y` re-exports
 from src.schemas.base import CamelModel as CamelModel
 from src.schemas.marketplace import MarketplaceEntry as MarketplaceEntry
 from src.schemas.marketplace import MarketplaceListResponse as MarketplaceListResponse
+from src.schemas.projects import ProjectCountsResponse as ProjectCountsResponse
 from src.schemas.projects import ProjectCreate as ProjectCreate
 from src.schemas.projects import ProjectListResponse as ProjectListResponse
 from src.schemas.projects import ProjectPatch as ProjectPatch

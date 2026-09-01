@@ -91,6 +91,16 @@ class ProjectResponse(CamelModel):
     # learn whether (and in what lifecycle state) an app exists.
     app_id: str | None = None
     app_status: str | None = None
+    # IS IT SERVING RIGHT NOW? Settled on the #158 call: "live = deployed / published — if
+    # the application is published and has url". That is a DEPLOYMENT fact and cannot be
+    # read off `app_status`: APPROVED means an administrator said yes, not that anything is
+    # running, and `PublishStatusChip` keeps `Approved` and `Live` apart for the same
+    # reason. Derived by `services/deploy/liveness.live_app_ids`, the one definition the
+    # marketplace and the dashboard count also read, so a row and the number above it can
+    # never disagree.
+    #
+    # `False` for a project with no app at all — there is nothing that could be live.
+    is_live: bool = False
     # N7 — whether this project has a bundle a Relaunch could actually restore.
     # THREE-STATE ON PURPOSE: `true` = there is one, `false` = confirmed there is not,
     # `null` = the object store could not be reached, so the platform declines to claim
@@ -114,6 +124,32 @@ class ProjectResponse(CamelModel):
     has_relaunchable_snapshot: bool | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class ProjectCountsResponse(CamelModel):
+    """The three numbers above the project list (#158 §1).
+
+    A DEDICATED route rather than a count derived from the listing, for the reason
+    `/admin/apps/counts` gives: the list projects rows and joins, and polling it for three
+    integers would pay that on a cadence. It is also the only honest option — the list is
+    PAGINATED, so a client holding 8 of 12 rows cannot compute any of these.
+
+    `in_production` reads the SAME `live_app_ids` collapse the status column does, so the
+    headline number and the rows beneath it cannot disagree. That is the failure this shape
+    exists to prevent: a dashboard saying three are live above a list showing two.
+    """
+
+    # "Live = deployed / published — if the application is published and has url" (#158
+    # call). NOT `AppStatus.APPROVED`, which means an administrator said yes and nothing
+    # about whether anything is serving.
+    in_production: int
+    # Every application the citizen has ever created, whatever its state.
+    total_applications: int
+    # Moving through the pipeline: submitted, approved-but-not-yet-live, or changes
+    # requested. Deliberately NOT "everything that is not live" — a project with nothing
+    # built yet has not entered the pipeline, and counting it would make this number read
+    # as a backlog that nobody can act on.
+    in_pipeline: int
 
 
 class ProjectListResponse(CamelModel):

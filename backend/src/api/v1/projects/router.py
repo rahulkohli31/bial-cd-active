@@ -42,6 +42,7 @@ from src.schemas import (
     DailyTokenLimitBody,
     ErrorEnvelope,
     OkResponse,
+    ProjectCountsResponse,
     ProjectCreate,
     ProjectListResponse,
     ProjectPatch,
@@ -52,6 +53,7 @@ from src.services.appdb.provision import ensure_project_database
 from src.services.appdb.teardown import salt_the_earth, teardown_handles
 from src.services.audit.log import append_audit
 from src.services.build_sessions.manager import restorable_presence
+from src.services.deploy.liveness import live_app_ids
 from src.services.deploy.teardown import sweep_published_apps
 from src.services.projects import (
     delete_project_cascade,
@@ -95,6 +97,7 @@ def _to_response(
     app_id: uuid.UUID | None = None,
     app_status: AppStatus | None = None,
     has_relaunchable_snapshot: bool | None = None,
+    is_live: bool = False,
 ) -> ProjectResponse:
     return ProjectResponse(
         id=project.id,
@@ -103,6 +106,7 @@ def _to_response(
         app_id=str(app_id) if app_id is not None else None,
         app_status=app_status.value if app_status is not None else None,
         has_relaunchable_snapshot=has_relaunchable_snapshot,
+        is_live=is_live,
         created_at=project.created_at,
         updated_at=project.updated_at,
     )
@@ -195,12 +199,21 @@ async def list_projects(
     # LEFT-JOIN the project's ONE app (uq_app_registry_project) so the page carries the
     # read-only appId/appStatus discovery without an N+1; the outer join keeps app-less
     # projects, and the app side carries its own owner scope (ADR-0004).
+    # ONE JOIN, not one request per row. The status column needs to know whether each app is
+    # SERVING, and "live = deployed / published, with a url" is a deployment fact rather than
+    # a lifecycle one (#158). `PublishStatusChip` gets it from `getDeployment(projectId)`,
+    # which is fine for one project page and is an N-way fan-out on a list — so the list
+    # reads the same definition set-wise instead, via the shared `live_app_ids` collapse.
+    live = live_app_ids().subquery()
     query = (
-        sa.select(Project, AppRegistry.id, AppRegistry.status)
+        sa.select(Project, AppRegistry.id, AppRegistry.status, live.c.app_id.is_not(None))
         .outerjoin(
             AppRegistry,
             sa.and_(AppRegistry.project_id == Project.id, AppRegistry.user_id == user.id),
         )
+        # OUTER on the liveness side too: a project with no app, or an app that has never
+        # deployed, has no row here and is simply not live — it must still be listed.
+        .outerjoin(live, live.c.app_id == AppRegistry.id)
         .where(Project.user_id == user.id)
     )
     if search is not None:
@@ -216,9 +229,60 @@ async def list_projects(
     rows = (await db.execute(query)).all()
     page, next_cursor, has_more = split_keyset(rows, limit, key=lambda row: row[0].id)
     return ProjectListResponse(
-        items=[_to_response(project, app_id, app_status) for project, app_id, app_status in page],
+        items=[
+            _to_response(project, app_id, app_status, is_live=is_live)
+            for project, app_id, app_status, is_live in page
+        ],
         next_cursor=next_cursor,
         has_more=has_more,
+    )
+
+
+@router.get("/counts", responses=error_responses(AUTH_401))
+async def project_counts(user: CurrentUser, db: DbSession) -> ProjectCountsResponse:
+    """The three numbers above the project list (#158 §1).
+
+    DECLARED BEFORE `/{project_id}`, and that ordering is load-bearing: FastAPI matches in
+    declaration order, so a `/counts` registered after the parameterised route would be
+    swallowed by it and answer 422 on a UUID parse instead.
+
+    Owner-scoped like every route here (ADR-0004) — these are the citizen's own projects,
+    unlike `/admin/apps/counts`, which counts across owners.
+
+    Three aggregates over one owner's rows, no row projection and no per-app probing. The
+    liveness half reads the SHARED `live_app_ids` collapse, which is the whole reason this
+    is not three ad-hoc queries: the list's status column reads the same definition, so
+    "3 in production" above a list showing two live apps is not expressible.
+    """
+    live = live_app_ids().subquery()
+
+    total = (
+        sa.select(sa.func.count()).select_from(AppRegistry).where(AppRegistry.user_id == user.id)
+    )
+    in_production = (
+        sa.select(sa.func.count())
+        .select_from(AppRegistry)
+        .join(live, live.c.app_id == AppRegistry.id)
+        .where(AppRegistry.user_id == user.id)
+    )
+    # In the pipeline: submitted or decided, but not yet serving. PENDING and REJECTED are
+    # unambiguous. APPROVED belongs here only while it is NOT live — an approved app that is
+    # serving is counted by `in_production`, and counting it twice would make the three
+    # numbers sum to more than the citizen has.
+    in_pipeline = (
+        sa.select(sa.func.count())
+        .select_from(AppRegistry)
+        .outerjoin(live, live.c.app_id == AppRegistry.id)
+        .where(
+            AppRegistry.user_id == user.id,
+            AppRegistry.status.in_((AppStatus.PENDING, AppStatus.REJECTED, AppStatus.APPROVED)),
+            live.c.app_id.is_(None),
+        )
+    )
+    return ProjectCountsResponse(
+        in_production=(await db.execute(in_production)).scalar_one(),
+        total_applications=(await db.execute(total)).scalar_one(),
+        in_pipeline=(await db.execute(in_pipeline)).scalar_one(),
     )
 
 
