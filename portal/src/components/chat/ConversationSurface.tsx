@@ -18,6 +18,7 @@ import { describeSaveFailure, isConversationGone } from '../../utils/chatErrors'
 
 import { resolvePreviewAddress } from '../../utils/previewAddress'
 import { HIDDEN_BUT_MOUNTED } from '../workspace/hiddenSubtree'
+import { PREVIEW_PROBE_MS, SETTLED_GONE } from '../workspace/workspaceState'
 import {
   useAppPaneVisible,
   usePublishAddress,
@@ -45,7 +46,7 @@ import { contextState } from '../../utils/contextLimits'
 import { atLimitSendState, narrativeEnvelopes, turnPhase } from '../../utils/turnNarrative'
 import type { TurnNarrative } from '../../utils/turnNarrative'
 import { fetchSaveState, saveProject, releaseProject, stopActiveBuild, asReclaimBlocked, fetchPreviewState, fetchCompileState, checkWorkspace } from '../../utils/buildSessionApi'
-import type { ReclaimBlocked, PreviewState, PreviewLifeState } from '../../utils/buildSessionApi'
+import type { ReclaimBlocked, PreviewState } from '../../utils/buildSessionApi'
 import { resolvePlanOptions } from '../../utils/turnStreamApi'
 import { wireMessageFromParts, buildUserParts, partsToText, countAttachments, releaseUploadedAttachments } from '../../utils/attachmentStore'
 import { validateConversationAttachmentCap } from '../../utils/attachmentInput'
@@ -55,23 +56,17 @@ import type { ChatMessage, MessagePart, BuildPartLive } from '../../utils/messag
 
 // The from-scratch greeting (ephemeral — never persisted, and never sent to the model: it is
 // chrome, not a turn, and replaying it as history would have the model answering its own hello).
-// #83 — the background cadence for the preview-liveness probe. Deliberately slow: focus and
-// visibilitychange carry the real flow (a user tabbing back to the project whose workspace was
-// taken), and this only covers the tab left open on a second monitor. One Redis hash read per
-// tick server-side, so the cost is small — but it is honesty, not telemetry, and polling faster
-// would buy nothing a user could perceive.
-const PREVIEW_PROBE_MS = 45_000
-
-// U22/R16 — the answers that END the asking. All three are SETTLED FACTS about a workspace:
-// nothing that could change one of them can happen without the page hearing about it first
-// (a workspace frame, a preview frame, or a relaunch — the poll effect's invalidation list).
-// `unknown` is deliberately absent: it is the one answer that decided nothing, so it must
-// leave the timer running rather than pin "we could not check" for the life of the tab.
-const SETTLED_GONE: ReadonlySet<PreviewLifeState> = new Set<PreviewLifeState>([
-  'asleep',
-  'slot_taken',
-  'never_built',
-])
+// #83's background cadence and U22/R16's terminal answers now live in
+// `components/workspace/workspaceState.ts`, imported above. They moved when the project screen
+// gained a read of its own (Plan F, U2): two surfaces polling the same endpoint on two private
+// copies of "how often" and "when to stop" is the drift this file already has a scar from — the
+// mint comment in `ProjectBuilder.tsx` records two sites keeping private copies of a one-liner
+// and both going wrong together. A cadence that drifts is worse, because the symptom is a poll
+// that stops on one surface and not the other, with nothing red anywhere.
+//
+// The reasoning is unchanged and lives beside the constants: the cadence is deliberately slow
+// because focus and visibilitychange carry the real flow, and `unknown` is deliberately not
+// terminal because it is the one answer that decided nothing.
 
 const WELCOME_TEXT = "Hello! I'm Citizen Developer AI. Tell me what you'd like to build for BIAL operations."
 const welcomeMessage = (): ChatMessage => ({ id: 'welcome', ephemeral: true, role: 'assistant', parts: [{ type: 'text', text: WELCOME_TEXT }], createdAt: new Date().toISOString() })
