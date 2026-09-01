@@ -30,7 +30,6 @@ from typing import Any, Final, Literal
 from pydantic import Field
 
 from src.core.prompt_blocks import APPLY_SCHEMA_CHANGE_TOOL
-from src.db.models.conversation import ChatKind
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.schemas import CamelModel
 from src.services.messages.store import ATTACHMENT_REF_KIND, SCHEMA_VERSION
@@ -38,6 +37,40 @@ from src.services.messages.store import ATTACHMENT_REF_KIND, SCHEMA_VERSION
 # The Plan-mode options tool (U8 stub, U11 mechanics). The projection derives the card's
 # resolution state from this tool's stored call/return pair.
 PLAN_OPTIONS_TOOL: Final = "present_plan_options"
+
+TELL_THE_USER_TOOL: Final = "tell_the_user"
+"""The mid-work voice channel's wire name (U3 / R75). Named HERE, beside the parser both
+emitters call, for the same reason `PLAN_OPTIONS_TOOL` is: the live emitter and this one must
+agree on the spelling or a spoken line renders on one side and not the other."""
+
+PROPOSE_SLICE_TOOL: Final = "propose_first_slice"
+"""The scope-negotiation tool's wire name (U10 / R83–R88). Named here for the same reason the
+other two are: the live emitter and this one must agree on the spelling, and the stored call is
+the record both of them read."""
+
+MAX_FIRST_SLICE: Final = 4
+"""R83's binding half — never more than four pieces in a first round.
+
+THE FLOOR IS DELIBERATELY NOT ENFORCED, and that is a decision rather than an omission. R83
+says "roughly two to four, FEWER when the pieces are large", and R84 gives the case outright:
+twenty pages describing one screen is one piece. A hard floor of two would refuse an honest
+single-piece slice inside the tool body and leave the model no recovery except to split a piece
+that should not be split, or to name one it does not intend to build — which then shows up as a
+padded remainder in the closing account. So the code bound is 1..4 and the two-piece preference
+is prompt copy, which is the right home for a soft preference and is not a guardrail claim."""
+
+UPDATE_MAX_CHARS: Final = 280
+"""The whole of what bounds the voice channel, and it is a NUMBER rather than a sentence.
+
+R76 asks for a bounded channel, and the plan's rule is that an instruction is never counted as
+a guardrail — a prompt asking for brevity is a request the model stops honouring at exactly
+the moment it matters, which is a build going wrong. Two plain sentences about an app run to
+roughly two hundred characters; this leaves room without leaving room for a paragraph.
+
+ONE CEILING, ON CHARACTERS, AND NO PER-TURN CALL LIMIT. Nothing has been observed spamming
+this channel, a run's model requests are already bounded, and a second bound would buy
+per-turn counter state, a second retry path and its own refusal copy against a failure nobody
+has seen. Add it if traffic shows it."""
 
 TURN_TERMINAL_KIND: Final = "turn_terminal"
 """`meta.kind` of the durable turn-terminal row. Named here, beside the arm that reads it, and
@@ -597,6 +630,209 @@ def _plan_argument(args: Any) -> str | None:
     return plan.strip() or None
 
 
+def update_from_args(args: Any) -> str | None:
+    """The words a `tell_the_user` call carries, or None when it carries none that may be shown.
+
+    ★ THE SINGLE PLACE THE VOICE CHANNEL'S RULE LIVES. Both emitters call this — the live one
+    at `FunctionToolCallEvent`, this one at the call's stored part — so a refused update
+    reaches neither, and neither of them re-checks a ceiling the other might read differently.
+    The tool body raises the teaching `ModelRetry` so the model learns what happened; this
+    decides what a human sees, and the two read the same constant.
+
+    Both stored shapes go through `_args_dict`: pydantic-ai persists a tool call's `args` as a
+    JSON string or as an object depending on the provider. A malformed argument is the same
+    answer as a missing one — there is nothing to show — and a projection that raised would take
+    a whole transcript down over one row."""
+    parsed = _args_dict(args)
+    update = parsed.get("update")
+    if not isinstance(update, str):
+        return None
+    text = update.strip()
+    if not text or len(text) > UPDATE_MAX_CHARS:
+        return None
+    return text
+
+
+def _slice_argument(args: Any) -> dict[str, Any] | None:
+    """A proposal call's arguments, or None when the call carries nothing renderable.
+
+    ★ THE ONE PLACE THE PROPOSAL'S SHAPE IS DECIDED, read by three callers that must agree: the
+    live emitter, this projection, and the engine computing what is still outstanding. The tool
+    body enforces the same bounds so the model is taught when it trips them — but nothing
+    downstream re-derives them, and a call the body would refuse renders nowhere and counts as
+    no agreement.
+
+    Both stored shapes go through `_args_dict`: a tool call's `args` is a JSON string or an
+    object depending on the provider, and a malformed one is the same answer as a missing one."""
+    parsed = _args_dict(args)
+    found = clean_pieces(parsed.get("found"))
+    first = clean_pieces(parsed.get("first"))
+    why = parsed.get("why")
+    question = parsed.get("question")
+    if not found or not first or not isinstance(why, str) or not isinstance(question, str):
+        return None
+    if len(first) > MAX_FIRST_SLICE or not set(first) <= set(found):
+        return None
+    if not why.strip() or not question.strip():
+        return None
+    return {"found": found, "first": first, "why": why.strip(), "question": question.strip()}
+
+
+def clean_pieces(raw: Any) -> list[str]:
+    """A list-of-strings argument, emptied of anything that is not a usable piece name.
+
+    PUBLIC BECAUSE THE TOOL BODY READS IT TOO. `propose_first_slice` enforces the ceiling on
+    the list this returns, not on the raw argument, so the body and the renderer agree on what
+    "four pieces" counts. They did not always: the body counted the raw list while the renderer
+    counted the cleaned one, so a call naming the same piece five times was refused by the body
+    and drawn by the renderer at the same moment.
+
+    DE-DUPLICATED, ORDER PRESERVED. A piece named twice is one piece — the citizen reads a list,
+    and a repeated line reads as two things to do. Order is the agent's, because it is the order
+    the citizen agreed to and the order the remainder will name them back in."""
+    if not isinstance(raw, list):
+        return []
+    return list(
+        dict.fromkeys(item.strip() for item in raw if isinstance(item, str) and item.strip())
+    )
+
+
+def render_proposal(proposal: dict[str, Any]) -> str:
+    """R85's message, built by the PLATFORM from the call's arguments.
+
+    THE SHAPE IS THE RENDERER'S, NOT THE MODEL'S PROSE — which is the whole reason the proposal
+    is a tool rather than an instruction. "Lists everything back, names the first slice, says
+    what happens to the rest, asks one question" is true here by construction; asked for in a
+    prompt it would be true most of the time.
+
+    THE "REST" SENTENCE IS CONDITIONAL. A slice that covers everything found has no remainder,
+    and promising to come back to nothing is the platform inventing an outstanding item.
+
+    EXACTLY ONE QUESTION, because the argument is singular. A model that wrote three questions
+    into one string is not prevented by this — but nothing in the platform's frame adds a
+    second, and the prompt asks for one."""
+    # IMPORTED HERE, NOT AT MODULE SCOPE, and the cycle is real rather than theoretical:
+    # `services/turns/__init__` re-exports the engine, which imports this module, so a
+    # top-level `from src.services.turns.copy import ...` fails at import time with a partially
+    # initialised projection. The sentences belong in `copy.py` regardless — that module's
+    # jargon guard iterates over it, and a frame written anywhere else would be outside the one
+    # check that exists for citizen-facing wording.
+    from src.services.turns.copy import (
+        PROPOSAL_EVERYTHING_LEAD,
+        PROPOSAL_FIRST_LEAD,
+        PROPOSAL_REST_TEXT,
+    )
+
+    lines = [PROPOSAL_EVERYTHING_LEAD, ""]
+    lines += [f"- {piece}" for piece in proposal["found"]]
+    lines += ["", PROPOSAL_FIRST_LEAD, ""]
+    lines += [f"- {piece}" for piece in proposal["first"]]
+    lines += ["", proposal["why"]]
+    if len(proposal["first"]) < len(proposal["found"]):
+        lines += ["", PROPOSAL_REST_TEXT]
+    lines += ["", proposal["question"]]
+    return "\n".join(lines)
+
+
+def proposal_from_args(args: Any) -> str | None:
+    """The rendered proposal for a stored call, or None when the call carries none."""
+    proposal = _slice_argument(args)
+    return None if proposal is None else render_proposal(proposal)
+
+
+def finished_from_args(args: Any) -> str | None:
+    """The piece a `tell_the_user` call marked finished, or None when it marked none.
+
+    Separate from `update_from_args` because the two answer different questions and either can
+    be present without the other: an update with no mark is the ordinary case, and a mark whose
+    update was over the ceiling still happened — the piece IS finished, and losing that because
+    the sentence was too long would corrupt the closing account over a copy problem."""
+    finished = _args_dict(args).get("finished")
+    if not isinstance(finished, str):
+        return None
+    return finished.strip() or None
+
+
+def agreed_slice(messages: Sequence[Any]) -> list[str]:
+    """What the citizen last agreed to build first, read out of the conversation's own record.
+
+    ★ LATEST WINS, and there is no stored linkage anywhere: the agreed list is the arguments of
+    the most recent honourable `propose_first_slice` call in these messages. That is the same
+    route the plan itself travels — the conversation's own rows — so re-proposing mid-build
+    replaces the agreement without a column, a table or anything that can go stale when a later
+    build quietly delivers a deferred piece.
+
+    ORDER-DEPENDENT ON PURPOSE, and callers must pass messages oldest-first. Both do: the run's
+    `message_history` and `load_rows`'s `ORDER BY seq` are the only two sources.
+
+    Takes serialized payload dicts OR pydantic-ai message objects, because the two callers hold
+    different shapes of the same fact — the engine has live `ModelResponse`s, a reader over
+    stored rows has payload dicts."""
+    agreed: list[str] = []
+    for message in messages:
+        for part in _parts_of(message):
+            if _part_field(part, "part_kind") != "tool-call":
+                continue
+            if _part_field(part, "tool_name") != PROPOSE_SLICE_TOOL:
+                continue
+            proposal = _slice_argument(_part_field(part, "args"))
+            if proposal is not None:
+                agreed = proposal["first"]
+    return agreed
+
+
+def finished_slice(messages: Sequence[Any]) -> set[str]:
+    """Which pieces of the CURRENT agreement have already been marked finished, from the record.
+
+    THE OTHER HALF OF `agreed_slice`, AND IT HAS TO EXIST FOR THE SAME REASON. The agreement is
+    re-derived from history on every turn, so it survives one; the marks were per-turn memory,
+    so they did not. A citizen who builds one piece per turn — which is the ordering this whole
+    plan asks for — would have turn two tell them that turn one's finished piece is still to do.
+    The platform asserting that finished work is outstanding is the exact false fact U12 exists
+    to prevent; it was simply arriving through the other door.
+
+    A NEW PROPOSAL CLEARS THEM, mirroring the live rule exactly. Marks made against a slice that
+    has since been re-proposed are not evidence about the new one — the same reasoning
+    `_already_marked_against` gives, and the same thing the live emitter does when it clears the
+    set on an honourable proposal. Scoping by position rather than by name matters because a
+    piece can be named in both the old agreement and the new one.
+
+    SCOPED TO WHAT WAS AGREED. A mark naming something outside the current agreement is ignored
+    here, exactly as the live emitter ignores it — the model can invent a name, and a set that
+    accepted one would make the remainder's honest arm unreachable."""
+    agreed = agreed_slice(messages)
+    if not agreed:
+        return set()
+    marked: set[str] = set()
+    for message in messages:
+        for part in _parts_of(message):
+            tool_name = _part_field(part, "tool_name")
+            if tool_name == PROPOSE_SLICE_TOOL:
+                if _slice_argument(_part_field(part, "args")) is not None:
+                    marked.clear()
+                continue
+            if tool_name != TELL_THE_USER_TOOL:
+                continue
+            piece = finished_from_args(_part_field(part, "args"))
+            if piece is not None and piece in agreed:
+                marked.add(piece)
+    return marked
+
+
+def _parts_of(message: Any) -> list[Any]:
+    if isinstance(message, dict):
+        return [p for p in message.get("parts", []) if isinstance(p, dict)]
+    return list(getattr(message, "parts", []))
+
+
+def _part_field(part: Any, name: str) -> Any:
+    if isinstance(part, dict):
+        return part.get(name)
+    if name == "part_kind":
+        return getattr(part, "part_kind", None)
+    return getattr(part, name, None)
+
+
 def _project_response_parts(
     row: Message,
     message: dict[str, Any],
@@ -615,25 +851,34 @@ def _project_response_parts(
     # class. `NARRATION_VOICE` asks the model for this; a build that fails is exactly when it
     # stops complying, so the guarantee cannot live in the prompt alone.
     #
-    # STRUCTURAL, NOT A WORD LIST, and deliberately not keyed on `meta.kind`. A Write turn
-    # that mutates nothing never calls `declare_done` and is persisted as an ordinary
+    # STRUCTURAL, NOT A WORD LIST, and deliberately not keyed on `meta.kind`. A turn that
+    # mutates nothing never calls `declare_done` and is persisted as an ordinary
     # `write_step` — the citizen asked a question and this prose IS the answer (the
     # zero-mutation ending at `engine._TurnState.expects_mutation`). "Has a tool call beside
     # it" keeps that answer and drops only narration; `kind == "write_completion"` would
     # silently eat it. Mirrored live in `engine._stream_text` — change both or reload and
     # the live feed disagree.
     #
-    # AND IT IS GATED ON WHEN THE ROW WAS WRITTEN, which is the half revision 0035 forced.
-    # 0035 rewrites every historical row's stamp to `build`, so without this guard the drop
-    # would become RETROACTIVE: a migrated Plan or Ask turn that read files and then wrote
-    # prose — the ordinary shape, not an edge case — would silently stop rendering its prose
-    # on reload. `schema_version` is a fact about when a row was written, never a per-row
-    # exemption keyed on the migrated stamp, so it costs the "behaviour lives in the toolset"
-    # claim nothing. Rows written before 0035 keep rendering exactly as they always did.
-    narrating_between_tools = (
-        row.schema_version >= SCHEMA_VERSION
-        and row.kind is ChatKind.BUILD
-        and any(p.get("part_kind") == "tool-call" for p in parts)
+    # IT NO LONGER ASKS WHICH KIND OF CHAT THIS IS (U4/R74/N2). The rule was always about the
+    # structural fact — this response also called a tool, so its prose was the model narrating
+    # its way there — and that fact is exactly as true in a planning chat. Keying it on the
+    # kind said the opposite: that the same response means one thing in one chat and something
+    # else in another. What replaced the guarantee the kind was standing in for is the voice
+    # channel (`TELL_THE_USER_TOOL`): prose beside a tool call is dropped in both kinds, and
+    # in both kinds there is one deliberate way to say something anyway.
+    #
+    # IT IS STILL GATED ON WHEN THE ROW WAS WRITTEN, which is the half revision 0035 forced.
+    # 0035 rewrites every historical row's stamp, so a row written before it cannot be read as
+    # evidence of anything: those transcripts render exactly as they always did. Note what
+    # this guard does NOT cover — a row written between 0035 and this change carries the new
+    # version and now takes the widened rule, so a planning response that wrote prose beside a
+    # tool call loses that prose on reload. That window exists only on unreleased branches
+    # (0035 has never been on `main`), and closing it would mean spending the payload
+    # SCHEMA_VERSION on a rendering rule: the version means "can this server parse this row",
+    # a rollback to the previous server must keep working, and nothing about the payload
+    # changed here.
+    narrating_between_tools = row.schema_version >= SCHEMA_VERSION and any(
+        p.get("part_kind") == "tool-call" for p in parts
     )
     for part in parts:
         part_kind = part.get("part_kind")
@@ -678,6 +923,37 @@ def _project_response_parts(
                         state=_plan_options_state(stored),
                     )
                 )
+                continue
+            if tool_name == PROPOSE_SLICE_TOOL:
+                # THE PROPOSAL, RENDERED FROM ITS ARGUMENTS at the position the call occupies —
+                # the same shape as the voice channel and the offer, and for the same reason:
+                # one stored field, two emitters, no agreement to keep in step.
+                #
+                # NOT A STEP. Above `_step_label` like the other two, so the transcript shows
+                # the proposal and never `Used propose_first_slice`.
+                proposed = proposal_from_args(part.get("args"))
+                if proposed:
+                    items.append(AssistantTextItem(seq=row.seq, text=proposed))
+                continue
+            if tool_name == TELL_THE_USER_TOOL:
+                # THE WORDS, AT THE POSITION THE CALL OCCUPIES — the `present_plan_options`
+                # shape, and the reason live order and reload order are the same order. The
+                # live stream pushes this same string from this same call at
+                # `FunctionToolCallEvent`, so a reloaded transcript reads as the citizen
+                # watched it arrive.
+                #
+                # AND IT IS NOT A STEP. Handled above `_step_label`, exactly as the offer is,
+                # so the transcript shows what was said and never a row announcing that the
+                # agent decided to say it — and never `Used tell_the_user`, which is what the
+                # label fallback would have printed into a citizen's feed.
+                #
+                # A refused call renders nothing here because `update_from_args` returns None
+                # for the same argument the tool body refused. No second copy of the rule, and
+                # no consulting the stored RESULT: a turn cut short before the tool return
+                # landed still said the words, and the citizen saw them.
+                spoken = update_from_args(part.get("args"))
+                if spoken:
+                    items.append(AssistantTextItem(seq=row.seq, text=spoken))
                 continue
             args = _args_dict(part.get("args"))
             label, hidden = _step_label(tool_name, args)

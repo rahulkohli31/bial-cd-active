@@ -17,7 +17,9 @@ import json
 from typing import get_args
 
 import pytest
+import sqlalchemy as sa
 from pydantic import SecretStr
+from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models.function import (
     AgentInfo,
     DeltaToolCall,
@@ -29,7 +31,7 @@ from src.api.v1.conversations._shared import MAX_MESSAGE_TEXT_CHARS
 from src.api.v1.conversations.turns import ResolvePlanOptionsResponse
 from src.config import settings
 from src.db.models.conversation import ChatKind
-from src.db.models.message import MessageEntryKind
+from src.db.models.message import Message, MessageEntryKind
 from src.services.agent import toolsets as toolsets_module
 from src.services.agent.mode_prompts import PromptContext
 from src.services.build_sessions.manager import SessionManager
@@ -38,7 +40,7 @@ from src.services.messages.store import load_history, load_rows
 from src.services.sandbox.config import SandboxConfig
 from src.services.turns import engine as engine_module
 from src.services.turns import plan_options as plan_options_module
-from src.services.turns.copy import PLAN_NOT_KEPT_TEXT
+from src.services.turns.copy import NOTHING_TO_SHOW_YET_TEXT, PLAN_NOT_KEPT_TEXT
 from src.services.turns.engine import TurnEngine, plan_from_call, set_turn_engine_for_tests
 from src.services.turns.guard import _mid_reply
 from src.services.turns.plan_options import (
@@ -767,3 +769,176 @@ async def test_build_started_after_a_raced_refine_writes_no_second_wire_return(
     )
     projected = [i for i in project_rows(list(fresh_rows)) if isinstance(i, PlanOptionsItem)]
     assert projected[0].state == "build"
+
+
+# --- U11 / R77: where the agent said nothing, the platform still speaks ---------------------
+#
+# WIDENING THE DROP CREATED THIS NEED, which is why the two ship together. Before U4 a planning
+# turn always had its prose; now a turn whose every response called a tool renders a row of
+# activity and not one word. R75 sanctions an agent CHOOSING to stay quiet — but at the
+# terminal those two states are indistinguishable, and telling them apart would mean reading
+# the agent's prose, which is the one thing nothing here does. So R77 wins outright.
+
+
+async def test_a_turn_that_never_said_anything_still_ends_readable(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    """★ R77 — the failure mode is a screen of finished steps and no message.
+
+    The turn reads a file and then produces nothing a person can read. Without the fallback
+    the citizen is left looking at a COMPLETED turn that never spoke: not "the agent had
+    nothing to add", which is legitimate, but a product that appears to have forgotten to
+    answer.
+
+    THE SHAPE HERE IS NARROWER THAN THE PLAN ASSUMED, and it is worth saying why rather than
+    writing a fixture that passes. "Every response called a tool" cannot end a pydantic-ai run
+    at all — the loop only stops on a response with no tool call, and one with no usable text
+    either is retried and then fails the turn, which is a different terminal with its own
+    message. What reaches THIS arm is a final response whose text is there but empty of
+    content, which the flush correctly declines to push. That is the reachable case, so it is
+    the one under test.
+
+    IT IS DURABLE TOO, not merely on the wire. A line the live feed shows and a reload removes
+    is worse than no line, so it travels the same write-before-done seam as every other reply
+    on this path.
+
+    Mutation check: delete the `if not state.text_parts` arm in the chat run and this goes red
+    on both assertions at once."""
+    engine, (user, conv) = _fresh_engine, await _plan_conversation(db_session)
+
+    requests = 0
+
+    async def _all_tools_no_words(messages: list[ModelMessage], info: AgentInfo):
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            yield {
+                0: DeltaToolCall(
+                    name="read_file", json_args='{"path": "app/page.tsx"}', tool_call_id="r1"
+                )
+            }
+            return
+        yield "   "
+
+    state = await _run_turn(
+        engine,
+        db_session,
+        session_factory,
+        FunctionModel(stream_function=_all_tools_no_words),
+        user,
+        conv,
+    )
+
+    assert state.status == "completed"
+    assert state.text_so_far() == NOTHING_TO_SHOW_YET_TEXT
+    rows = (
+        await db_session.scalars(
+            sa.select(Message)
+            .where(Message.conversation_id == conv.id, Message.entry_kind == MessageEntryKind.TURN)
+            .order_by(Message.seq)
+        )
+    ).all()
+    assert any(NOTHING_TO_SHOW_YET_TEXT in str(row.payload) for row in rows), (
+        "the closing line reached the screen but not the transcript"
+    )
+
+
+async def test_a_turn_that_answered_gains_no_extra_closing_line(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    """The other half, and the one that keeps the fallback from becoming noise on every turn.
+
+    A response that calls no tool IS the answer; U4's flush releases it, `text_parts` is not
+    empty, and the platform stays quiet. Without this, every ordinary turn would end with a
+    line telling the citizen there was nothing to show underneath the thing they were shown."""
+    engine, (user, conv) = _fresh_engine, await _plan_conversation(db_session)
+
+    async def _just_answers(messages: list[ModelMessage], info: AgentInfo):
+        yield "Your visitor list already records arrival times."
+
+    state = await _run_turn(
+        engine,
+        db_session,
+        session_factory,
+        FunctionModel(stream_function=_just_answers),
+        user,
+        conv,
+    )
+
+    assert "arrival times" in state.text_so_far()
+    assert NOTHING_TO_SHOW_YET_TEXT not in state.text_so_far()
+
+
+async def test_a_turn_whose_only_words_were_spoken_mid_work_needs_no_closing_line(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    """★ THE INTERACTION BETWEEN THE TWO UNITS, and the reason the test is on `text_parts`
+    rather than on "did the model write a final message".
+
+    This turn calls tools all the way through and writes no closing prose — but it SPOKE, so
+    the citizen has something to read and the platform must not add a second, contradictory
+    line saying there was nothing to show."""
+    engine, (user, conv) = _fresh_engine, await _plan_conversation(db_session)
+    spoken = "Looking at how your visitor list works today."
+
+    requests = 0
+
+    async def _speaks_then_reads(messages: list[ModelMessage], info: AgentInfo):
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            yield {
+                0: DeltaToolCall(
+                    name="tell_the_user",
+                    json_args=json.dumps({"update": spoken}),
+                    tool_call_id="s1",
+                )
+            }
+            return
+        yield "   "
+
+    state = await _run_turn(
+        engine,
+        db_session,
+        session_factory,
+        FunctionModel(stream_function=_speaks_then_reads),
+        user,
+        conv,
+    )
+
+    assert spoken in state.text_so_far()
+    assert NOTHING_TO_SHOW_YET_TEXT not in state.text_so_far()
+
+
+async def test_a_planning_answer_survives_the_widened_drop(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    """★ U4's flush, at the seam that needed it. `chat_agent.run` has no node boundary, so
+    without the flush added at run completion a planning turn's held answer would never be
+    released and every ordinary question would end in the R77 fallback instead of an answer.
+
+    Mutation check: remove `self._flush_pending_text(state)` after the run and this goes red
+    with the closing line in place of the answer — which is exactly how the bug would present
+    in production, and why it is worth a test that names it."""
+    engine, (user, conv) = _fresh_engine, await _plan_conversation(db_session)
+
+    async def _reads_then_answers(messages: list[ModelMessage], info: AgentInfo):
+        if len(messages) == 1:
+            yield {
+                0: DeltaToolCall(
+                    name="read_file", json_args='{"path": "app/page.tsx"}', tool_call_id="r1"
+                )
+            }
+            return
+        yield "Your visitor list shows who arrived and when."
+
+    state = await _run_turn(
+        engine,
+        db_session,
+        session_factory,
+        FunctionModel(stream_function=_reads_then_answers),
+        user,
+        conv,
+    )
+
+    assert state.text_so_far() == "Your visitor list shows who arrived and when."

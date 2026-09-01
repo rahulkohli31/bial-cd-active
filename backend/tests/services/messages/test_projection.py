@@ -1005,9 +1005,18 @@ async def test_build_text_with_no_tool_call_survives(db_session) -> None:
     assert [t.text for t in texts] == ["Yes — the arrival time is stamped for you."]
 
 
-async def test_a_plan_chat_keeps_its_prose_beside_a_tool_call(db_session) -> None:
-    """★ A Plan chat's prose IS the deliverable — the same drop there would delete the feature,
-    so the gate must be kind-scoped rather than universal.
+async def test_a_plan_chat_drops_prose_beside_a_tool_call_exactly_as_a_build_chat_does(
+    db_session,
+) -> None:
+    """★ AE43 / R74 / N2 — the drop stopped asking which kind of chat this is.
+
+    THIS TEST USED TO ASSERT THE OPPOSITE, and the reason it did was real: a planning chat's
+    prose IS the deliverable, and dropping it would have deleted the feature. What changed is
+    where the deliverable lives. The plan now travels in the offer tool's argument and a
+    mid-work word travels through `tell_the_user`, so the prose this rule drops is what it
+    always was on the other side — the model narrating its way to a tool call. Keeping the
+    kind conjunct meant one response meaning two different things depending on which chat it
+    was in, which is exactly what N2 forbids.
 
     `entry_kind=TURN`, not STEP, because that is the only shape the product can actually
     produce: every production writer of a STEP row stamps the Build kind (the BRAIN build loop
@@ -1036,8 +1045,11 @@ async def test_a_plan_chat_keeps_its_prose_beside_a_tool_call(db_session) -> Non
     )
     items = project_rows(await _rows(db_session, user, conversation))
 
-    texts = [i for i in items if isinstance(i, AssistantTextItem)]
-    assert [t.text for t in texts] == ["Here is what your visitor log will do."]
+    assert [i for i in items if isinstance(i, AssistantTextItem)] == []
+    # LIVENESS, because an empty list is what a crashed projection also returns: the step the
+    # prose was narrating its way to is still rendered, so this asserts a DROP rather than a
+    # transcript that failed to project at all.
+    assert [i.tool for i in items if isinstance(i, StepItem)] == ["read_file"]
 
 
 # --- R-10: the drop must not become RETROACTIVE over migrated transcripts -------------

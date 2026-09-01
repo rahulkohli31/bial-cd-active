@@ -32,7 +32,12 @@ from src.services.sandbox import SandboxClient, SandboxError
 from src.services.sandbox.base import ExecResult, SandboxHandle
 from src.services.storage import recovery_key
 from src.services.turns import copy as copy_module
-from src.services.turns.copy import AT_LIMIT_TEXT, COULD_NOT_KEEP_A_COPY, KEPT_A_COPY
+from src.services.turns.copy import (
+    AT_LIMIT_TEXT,
+    COULD_NOT_KEEP_A_COPY,
+    KEPT_A_COPY,
+    SPENT_ENOUGH_TEXT,
+)
 from src.services.usage import gate as gate_module
 from src.services.usage.gate import (
     DailyTokenLimitExceededError,
@@ -525,3 +530,100 @@ def test_a_configured_address_is_stripped_rather_than_trusted_verbatim() -> None
     env = _api_env()
     env["SUPPORT_CONTACT_EMAIL"] = "  help@bial.com  "
     assert _boot(env).SUPPORT_CONTACT_EMAIL == "help@bial.com"
+
+
+# =============================================================================
+# U13 / R91 — the same securing path, carrying a second sentence
+# =============================================================================
+#
+# The per-run spend bound has to end a turn exactly the way the daily budget does: copy taken
+# here, on the way out of the model loop, confirmed before the turn's `finally` pardons the
+# container. Writing a second function to do that would put a second snapshot→teardown ordering
+# on the one path in this codebase where getting the ordering wrong loses a citizen's tree — so
+# `at_limit_ending` takes the sentence, and everything above it stays as it was.
+
+
+async def test_the_daily_budget_endings_bytes_are_unchanged_by_the_parameterisation(
+    store: FakeStorage,
+) -> None:
+    """★★ THE REGRESSION THAT PROTECTS THE INCIDENT PATH.
+
+    The daily-budget caller passes no sentence and must come out BYTE-IDENTICAL — not "still
+    contains the right words", byte-identical — so that adding a parameter to this function is
+    provably a no-op for the path that already shipped.
+
+    Mutation check: make the `sentence is None` arm fall through to any other template and this
+    goes red on an exact comparison, which no later edit can quietly weaken into a substring."""
+    await _seed_recovery(store)
+    workspace = _Workspace(_container(bundles=THIS_TURN, head=ON_RECORD), _HANDLE, APP)
+
+    ending = await at_limit_ending(workspace)
+
+    assert ending.message == AT_LIMIT_TEXT.format(
+        kept=KEPT_A_COPY, contact=settings.SUPPORT_CONTACT_EMAIL
+    )
+
+
+async def test_the_spend_bound_secures_the_tree_before_its_sentence_exists(
+    store: FakeStorage, alarms: list[tuple[str, dict[str, object]]]
+) -> None:
+    """★ THE ORDERING, asserted for the NEW caller rather than inherited from the old one.
+
+    The recovery slot holds THIS turn's tree by the time the message exists. It matters because
+    of what comes next: the turn's `finally` pardons the container and frees the slot, after
+    which the reclamation path may take it, and anything not stored by then is stored on a
+    machine somebody else is entitled to reclaim.
+
+    Mutation check: give the spend bound its own securing function that composes the sentence
+    first, and this goes red on the slot's head — which is precisely why `at_limit_ending` took
+    a parameter instead of gaining a sibling."""
+    await _seed_recovery(store)
+    workspace = _Workspace(_container(bundles=THIS_TURN, head=ON_RECORD), _HANDLE, APP)
+
+    ending = await at_limit_ending(workspace, sentence=SPENT_ENOUGH_TEXT)
+
+    assert await _head_in_recovery_slot(store) == THIS_TURN
+    assert ending.work_is_secured is True
+    assert KEPT_A_COPY in ending.message
+    # It really is the spend sentence — a shared function makes passing the wrong one easy.
+    assert "working" in ending.message
+    assert "midnight" not in ending.message
+    assert alarms == [], "a copy that landed must not alarm"
+
+
+async def test_a_failed_copy_changes_the_spend_sentence_and_alarms_it_too(
+    store: FakeStorage, alarms: list[tuple[str, dict[str, object]]]
+) -> None:
+    """The failure trade is the same on both endings, and it has to be: the citizen is told
+    either way, the reassurance stops being made, and an operator gets the pinned event.
+
+    Raising instead would turn a bounded run into a crash for a citizen who did nothing wrong;
+    swallowing is what left the 2026-08-18 reframe unfalsifiable."""
+    await _seed_recovery(store)
+    client = FakeSandboxClient()
+
+    def wedged(cmd: list[str]) -> ExecResult:
+        raise SandboxError("the container stopped answering")
+
+    client.exec_handler = wedged
+    workspace = _Workspace(client, _HANDLE, APP)
+
+    ending = await at_limit_ending(workspace, sentence=SPENT_ENOUGH_TEXT)
+
+    assert ending.work_is_secured is False
+    assert COULD_NOT_KEEP_A_COPY in ending.message
+    assert KEPT_A_COPY not in ending.message
+    assert [event for event, _ in alarms] == [RECOVERY_WRITE_DID_NOT_LAND_EVENT]
+
+
+async def test_a_turn_with_no_container_reaches_the_spend_bound_without_a_fault(
+    alarms: list[tuple[str, dict[str, object]]],
+) -> None:
+    """A planning turn can reach a bound too, and it has nothing to secure. That is the one case
+    where the reassurance is withheld without anything having gone wrong — which is why the
+    wording asks the reader to save rather than announcing a fault, and why it must not alarm."""
+    ending = await at_limit_ending(None, sentence=SPENT_ENOUGH_TEXT)
+
+    assert ending.work_is_secured is False
+    assert COULD_NOT_KEEP_A_COPY in ending.message
+    assert alarms == [], "no container is not a missed recovery write"

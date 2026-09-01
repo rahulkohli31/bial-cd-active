@@ -238,3 +238,102 @@ exactly the register this module exists to keep out. Making it clickable is the 
 single-tenant deployment in one timezone, and a rendered timestamp would invite the reader to
 work out whether it means tonight or tomorrow. The exact instant is still on the wire
 (`QuotaFrame.resets_at`) for the surfaces that want to show it."""
+
+
+NOTHING_TO_SHOW_YET_TEXT: Final = (
+    "I looked into that but haven't got anything to show you yet. "
+    "Tell me a bit more about what you're after and I'll take another run at it."
+)
+"""R77 — the last thing a turn says when the agent said nothing at all.
+
+WHY A TURN CAN NOW END WORDLESS. Prose written in the same response as a tool call does not
+reach the user, in either kind — so a turn whose every response called a tool renders a row of
+activity and not one word. Before that rule widened, a planning turn always had its prose; now
+it can have none, and a screen showing several finished steps and no message reads as the
+product having forgotten to answer.
+
+IT DOES NOT APOLOGISE AND IT DOES NOT DIAGNOSE. The platform genuinely does not know why there
+are no words — an agent that chose to stay quiet and one whose every sentence was dropped are
+the same state at the terminal, and finding out would mean reading the agent's prose, which is
+the one thing nothing here does. So it says the true, small thing: nothing came of it, and
+here is what to do next.
+
+THE NEXT ACTION IS THE POINT. "Tell me a bit more" is something the citizen can act on in the
+composer that is already in front of them, and it is honest about where the turn got to."""
+
+
+PROPOSAL_EVERYTHING_LEAD: Final = "Here is everything I picked up from that:"
+"""R85's first move — say the whole thing back before narrowing it.
+
+WITHOUT THIS THE PROPOSAL READS AS A REFUSAL. A citizen who asked for nine things and is
+answered with three has been told "no" to six of them unless they can see that all nine were
+heard. Listing them back costs a few lines and turns the same message from a decline into a
+running order.
+
+The list under it is the agent's own words for its own pieces, and nothing here filters them:
+that would be a vocabulary check over model text, which this plan rejects everywhere else."""
+
+PROPOSAL_FIRST_LEAD: Final = "I would start with:"
+"""What this round is. Present tense and first person, matching the register the agent narrates
+in — the platform is framing the agent's proposal, not announcing a decision of its own."""
+
+PROPOSAL_REST_TEXT: Final = (
+    "The rest stays on the list — say the word once these are working and I will carry on."
+)
+"""What happens to everything else, and it is only true when something IS left.
+
+RENDERED CONDITIONALLY, because a slice that covers everything found has no remainder and a
+sentence promising to come back to nothing is the platform inventing an outstanding item. The
+renderer omits it rather than softening it.
+
+IT NAMES THE NEXT ACTION. "Say the word" is something the citizen can do in the composer
+already in front of them; "the rest is deferred" tells them a state and leaves them nowhere."""
+
+REMAINDER_TEXT: Final = "Still to do from what we agreed: {pieces}."
+"""R89 — what was agreed and not built, named by the platform from its own record.
+
+NOT THE AGENT'S RECOLLECTION, which is the requirement. The agreed list is the arguments of the
+proposal call the citizen read; the finished list is what the agent marked as it landed; this
+sentence is the difference. Nothing here reads the closing summary or any other prose.
+
+`{pieces}` is filled from the agreed list, so the citizen sees the same words in the same order
+they agreed to — not a re-description of them."""
+
+CANNOT_TELL_WHAT_REMAINS_TEXT: Final = (
+    "Some of what we agreed may still be outstanding — I could not tell which pieces landed. "
+    "Have a look and say what is missing."
+)
+"""R89's honest middle, and the reason U12 is not simply `agreed − marked`.
+
+THE DESIGN COULD HAVE SHIPPED A LIE HERE. The finished half is agent-supplied: an agent that
+built all four pieces and marked none is indistinguishable, from the marks alone, from one that
+built nothing. Rendering "these four remain" in the platform's own voice would be a false fact
+the citizen has no reason to doubt — strictly worse than the agent's own recollection, which is
+what this whole unit exists to replace.
+
+So the claim is keyed on something the platform DOES hold: whether the workspace was touched.
+Marks and no touch, marks and touch, no marks and no touch are all answerable. No marks and
+work landed is not, and this is what it says instead. The same tri-state discipline the
+workspace note keeps, where "could not tell" is never collapsed into a verdict."""
+
+
+SPENT_ENOUGH_TEXT: Final = (
+    "This one has taken as much as I want to spend on it in a single go, {kept}. "
+    "Your app is working — have a look, and send me the next bit when you are ready."
+)
+"""R91 — how a turn ends when it reaches the platform's spend bound.
+
+IT DOES NOT NAME A BOUND, AND THAT IS DELIBERATE. Three internal ceilings can end a run —
+requests, wall clock, spend — and which one fired is not something a citizen can act on
+differently: the next move is the same message either way. Naming one would also run straight
+into this module's own register rule, since "token budget", "request limit" and "wall clock"
+are all words for the platform's problem rather than theirs. Which bound fired is in the record
+and the logs, where the person who can act on it will look.
+
+"AS MUCH AS I WANT TO SPEND" rather than "you have run out". The citizen has not done anything
+wrong and has not hit a limit of their own — the daily budget is a different sentence, and
+confusing the two would tell them to wait until midnight when they can carry on right now.
+
+IT SAYS THE APP IS WORKING, because that is what the piece-at-a-time ordering buys and it is
+the fact that makes this ending survivable. `{kept}` is filled by the same securing function
+the daily-budget ending uses, so the reassurance is conditional on a copy actually landing."""

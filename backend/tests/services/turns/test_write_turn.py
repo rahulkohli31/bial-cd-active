@@ -75,6 +75,8 @@ from src.services.turns.copy import (
     COULD_NOT_CONFIRM_TEXT,
     DID_NOT_COME_TOGETHER_TEXT,
     KEPT_A_COPY,
+    REMAINDER_TEXT,
+    SPENT_ENOUGH_TEXT,
     STILL_SHOWING_EARLIER,
     STILL_SHOWING_NOTHING,
     STILL_SHOWING_TEMPLATE,
@@ -2269,15 +2271,67 @@ def test_write_prose_with_no_tool_call_after_it_is_still_the_citizens_answer(
     assert "arrival times" in "".join(state.text_parts)
 
 
-def test_ask_mode_prose_is_never_held(_fresh_engine) -> None:
-    """The hold is WRITE's alone: in Ask/Plan the prose IS the deliverable, and holding it would
-    be a dead screen for the length of the answer."""
+def test_a_plan_chat_holds_its_prose_exactly_as_a_build_chat_does(_fresh_engine) -> None:
+    """★ THE INVERSION (U4 / R74 / N2), and the reason it is safe to invert.
+
+    This test used to assert the opposite: that holding was Build's alone, because in a
+    planning chat the prose IS the deliverable and holding it would be a dead screen. Both
+    halves of that were true when it was written, and the first half is what changed — the
+    plan travels in the offer tool's argument now, and a mid-work word travels through
+    `tell_the_user`, so what the hold catches on this side is the same thing it always caught
+    on the other: the model narrating its way to a tool call.
+
+    What it costs is real and is not hidden: the answer no longer streams token by token in a
+    planning chat. It arrives whole, when its response ends, at the same moment it always did.
+
+    Mutation check: restore the `state.kind is not ChatKind.BUILD` early return in
+    `_stream_text` and this goes red while nothing else does."""
     engine = _fresh_engine
     state = _bare_state(ChatKind.PLAN)
 
     engine._on_event(state, _narrated("The visitor list lives in app/visitors/page.tsx."))
 
-    assert "app/visitors/page.tsx" in _text_on_the_wire(state)
+    # HELD, not lost: it is on the pending buffer and not on the wire.
+    assert _text_on_the_wire(state) == ""
+    assert "app/visitors/page.tsx" in "".join(state.pending_text)
+
+
+def test_a_plan_chats_narration_beside_a_tool_call_never_reaches_the_live_feed(
+    _fresh_engine,
+) -> None:
+    """★ AE43, live half — the same response means the same thing in both kinds.
+
+    The twin of `test_write_narration_beside_a_tool_call_never_reaches_the_live_feed`, one
+    chat kind over, and the pair is the whole of what N2 asks for here: a response that writes
+    prose and calls a tool is the model narrating its way to the call, and nothing about which
+    chat it is in changes that."""
+    engine = _fresh_engine
+    state = _bare_state(ChatKind.PLAN)
+
+    engine._on_event(state, _narrated("Let me look at how the visitor list works today. "))
+    engine._on_event(state, _called("read_file", '{"path": "app/page.tsx"}', "p1"))
+    engine._flush_pending_text(state)
+
+    assert _step_labels(state, phase="started"), "no step frame — the seam under test never ran"
+    assert _text_on_the_wire(state) == ""
+    assert "".join(state.text_parts) == ""
+
+
+def test_a_plan_chats_answer_with_no_tool_call_after_it_still_reaches_the_citizen(
+    _fresh_engine,
+) -> None:
+    """The other half on the planning side: a response that calls NO tool is the answer, and
+    the flush is what releases it. Without a flush on this path a planning turn goes silent —
+    which is why U4 adds one at the chat run's completion, `chat_agent.run` having no node
+    boundary to hook."""
+    engine = _fresh_engine
+    state = _bare_state(ChatKind.PLAN)
+
+    engine._on_event(state, _narrated("Your visitor list already records arrival times."))
+    engine._flush_pending_text(state)
+
+    assert "arrival times" in _text_on_the_wire(state)
+    assert "arrival times" in "".join(state.text_parts)
 
 
 async def test_a_long_operation_gets_a_status_line_refreshed_until_it_completes(
@@ -2377,3 +2431,124 @@ async def test_an_unclassified_command_says_nothing_about_its_argv(_fresh_engine
         assert token not in frame.item.label
         assert token not in restated
     await engine._drain_long_operations(state)
+
+
+# --- U13 / R91: the spend bound, end to end -------------------------------------------------
+
+
+async def test_a_build_that_reaches_the_spend_bound_ends_saying_the_app_works(
+    _fresh_engine,
+    db_session,
+    session_factory,
+    fake_redis: aioredis.Redis,
+    fake_storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ AE47 / R91 — the bound fires inside the loop, before a request, and ends the turn.
+
+    THE SEAM IS THE POINT. It is checked at the same place the daily quota is: inside the node
+    loop, before the model request fires, where the run's accumulated spend is already known and
+    nothing can route around it. A check anywhere else — at the top of the turn, or in the
+    `finally` — either fires before there is anything to measure or fires after the money is
+    spent.
+
+    The bound is compressed to ZERO rather than spent for real: what is under test is "the loop
+    stops when the number is reached, before it asks for anything more, and says so" — not the
+    specific number, which is a named constant precisely so a test need not burn it. Zero also
+    makes the placement claim unambiguous, because a check anywhere after the request would let
+    one through.
+
+    Mutation check: move the check below `node.stream(...)` and this goes red on the request
+    count — the model gets one more turn after the bound was already reached."""
+    monkeypatch.setattr(engine_module, "RUN_TOKEN_BUDGET", 0)
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "rb1@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+    model, counts = _scripted([[_WROTE_A_FILE, _DECLARED_DONE]])
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+        expects_mutation=True,
+    )
+
+    # THE ENDING IS A NAMED ONE, not a crash — it travels the same route every other bounded
+    # ending on this path travels: `error_message` plus a `TurnErrorFrame`, so the client draws
+    # a banner rather than a generic failure.
+    assert state.status == "failed"
+    assert state.error_message is not None
+    assert SPENT_ENOUGH_TEXT.split("{")[0].strip() in state.error_message
+    assert "working" in state.error_message  # the app survives the bound, and it says so
+    # WHICH BOUND FIRED IS IN THE RECORD, and only in the record: the citizen reads one ending
+    # whichever of the three ceilings ended the turn, because the next move is the same either
+    # way and no word for an internal ceiling belongs in front of them.
+    assert state.end_reason == "run_budget_reached"
+    assert "budget" not in state.error_message.lower()
+    # And it did not spend a request it had no budget for: the bound is checked BEFORE the
+    # model is asked, so the very first request never fires.
+    assert counts["requests"] == 0
+
+
+async def test_the_spend_bound_names_what_was_agreed_and_not_built(
+    _fresh_engine,
+    db_session,
+    session_factory,
+    fake_redis: aioredis.Redis,
+    fake_storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★★ AE47 / R91's second clause — "and says what remains", end to end.
+
+    THE BOUND FIRING IS HALF THE REQUIREMENT. A run that stops where the app works, and then
+    leaves the citizen to work out which of the pieces they agreed to actually landed, has done
+    the mechanical half and skipped the half they can act on. This is the assertion that the
+    ending carries U12's remainder rather than merely existing.
+
+    THE NAMES COME FROM THE AGREED LIST. `agreed_slice` reads them off the proposal call the
+    citizen read — the platform's own record — so the sentence is derived, not recalled. The
+    seeding is stubbed here because WHERE the agreed list comes from is `test_scope_negotiation`'s
+    subject; what is under test is that this ending consults it at all.
+
+    NOTHING WAS MARKED AND NOTHING WAS TOUCHED, which is the tri-state's first arm: no container
+    took a write, so naming the whole agreed list is true rather than a guess. The arm that would
+    have shipped a lie — work landed, nothing marked — is pinned in `test_scope_negotiation`.
+
+    Mutation check: drop the remainder from `_bounded_run_ending` and this goes red on the
+    pieces while the sentence itself still passes."""
+    agreed = ["A visitor list", "A sign-out button"]
+    monkeypatch.setattr(engine_module, "RUN_TOKEN_BUDGET", 0)
+    monkeypatch.setattr(engine_module, "agreed_slice", lambda _history: list(agreed))
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "rb2@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+    model, _ = _scripted([[_WROTE_A_FILE, _DECLARED_DONE]])
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+        expects_mutation=True,
+    )
+
+    assert state.end_reason == "run_budget_reached"
+    assert state.error_message is not None
+    # BOTH HALVES, IN ONE MESSAGE: the app works, and here is what is left.
+    assert "working" in state.error_message
+    assert REMAINDER_TEXT.format(pieces=", ".join(agreed)) in state.error_message
+    # ORDER IS THE CITIZEN'S, not the set's: they agreed to these in this sequence.
+    assert state.error_message.index("A visitor list") < state.error_message.index(
+        "A sign-out button"
+    )

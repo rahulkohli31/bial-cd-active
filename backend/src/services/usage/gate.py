@@ -142,6 +142,40 @@ _CACHE_READ_DIVISOR = 10  # read ≈ fresh / 10
 _CACHE_WRITE_SURCHARGE_DIVISOR = 4  # write ≈ fresh + fresh / 4 (125%)
 
 
+def weighted_spend(
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int,
+    cache_write_tokens: int,
+) -> int:
+    """`billable_spend`'s weighting, applied to an in-memory usage object rather than a row.
+
+    THE SECOND READER OF ONE POLICY, NOT A SECOND POLICY. `billable_spend` below is a SQL
+    column expression and cannot be evaluated against a live `RunUsage`, which is what a
+    running turn holds. Both spell the same arithmetic from the same two divisors, and the
+    test suite pins them to agree on the same numbers — a per-run bound that weighted tokens
+    differently from the daily meter would mean two ceilings measuring two different things
+    while both are described to the citizen as spend.
+
+    WHY WEIGHTED AT ALL, AND THIS IS THE PART THAT COST US ONCE. Under pydantic-ai
+    `input_tokens` is the grand-total prompt size and `cache_read`/`cache_write` are sub-buckets
+    ALREADY INSIDE it, so a naive `input + output` counts a cached prefix at full price on every
+    step. Billing reads at face value is what let one simple-calculator build book 956k of a 1M
+    daily cap while its real fresh input was 68 tokens (2026-07-30 prod incident). A per-run
+    bound reading the raw total would repeat that: it would end long-but-legitimate builds early
+    and be a function of how many steps a build took rather than how much work it did.
+    """
+    fresh = max(input_tokens - cache_read_tokens - cache_write_tokens, 0)
+    return int(
+        fresh
+        + output_tokens
+        + cache_read_tokens / _CACHE_READ_DIVISOR
+        + cache_write_tokens
+        + cache_write_tokens / _CACHE_WRITE_SURCHARGE_DIVISOR
+    )
+
+
 def billable_spend() -> sa.ColumnElement[int]:
     """The daily billable token total as a column expression, COST-WEIGHTED per token class:
     `fresh_input + output + cache_read/10 + cache_write*1.25`.
@@ -288,8 +322,10 @@ class AtLimitEnding:
     work_is_secured: bool
 
 
-async def at_limit_ending(workspace: SecurableWorkspace | None) -> AtLimitEnding:
-    """Make the citizen's work durable, THEN tell them their budget is gone (R31, AE18).
+async def at_limit_ending(
+    workspace: SecurableWorkspace | None, *, sentence: str | None = None
+) -> AtLimitEnding:
+    """Make the citizen's work durable, THEN tell them why the turn is ending (R31, AE18, R91).
 
     THE ORDER IS THE POINT. What this replaces told the user "your changes are still in the
     workspace — click Save to keep them", which secured nothing and asserted something nobody
@@ -315,6 +351,17 @@ async def at_limit_ending(workspace: SecurableWorkspace | None) -> AtLimitEnding
     the cap too, and it has nothing to secure. That is the one case where the reassurance is
     withheld without anything having gone wrong, which is why the wording of
     `COULD_NOT_KEEP_A_COPY` asks the reader to save rather than announcing a fault.
+
+    ★ TWO ENDINGS, ONE SECURING PATH, AND THAT IS WHY `sentence` IS A PARAMETER (U13/R91). The
+    per-run spend bound has to end a turn exactly the way the daily budget does — copy taken
+    here, on the way out of the model loop, confirmed before the turn's `finally` pardons the
+    container — and it says something different when it gets there. Writing a second function
+    to do that would put a second snapshot→teardown ordering on the one path in this codebase
+    where getting the ordering wrong loses a citizen's tree.
+
+    So the caller passes its own `copy.py` constant and everything above stays exactly as it
+    is. `sentence` must carry a `{kept}` field and nothing else; omitting it keeps the daily
+    budget's own wording, which also keeps that path's bytes unchanged by this refactor.
     """
     # FUNCTION-SCOPED FOR THE PACKAGE CYCLE, exactly as `orchestrator/selfheal.py` documents its
     # own. `src.services.build_sessions.__init__` reaches `manager` → `appdata` →
@@ -327,9 +374,11 @@ async def at_limit_ending(workspace: SecurableWorkspace | None) -> AtLimitEnding
     from src.services.build_sessions.snapshot import RecoveryOutcome, write_recovery_copy
     from src.services.turns.copy import AT_LIMIT_TEXT, COULD_NOT_KEEP_A_COPY, KEPT_A_COPY
 
+    template = AT_LIMIT_TEXT if sentence is None else sentence
+
     def _say(*, secured: bool) -> AtLimitEnding:
         return AtLimitEnding(
-            message=AT_LIMIT_TEXT.format(
+            message=template.format(
                 kept=KEPT_A_COPY if secured else COULD_NOT_KEEP_A_COPY,
                 # A PLAIN ADDRESS, not a `mailto:` URI. This sentence is read as text in the
                 # banner above the composer, and a URI scheme printed mid-sentence is the exact

@@ -50,6 +50,62 @@ served at, and must be left exactly as it is:
                             configuration in your own files instead.
 Add routes, components, libraries, and dependencies as your app needs them."""
 
+FIRST_SLICE_RULE = """\
+WHEN A LOT ARRIVES AT ONCE — if a single message asks for many separate things, do not start \
+by building all of them. Call `propose_first_slice` with every piece you picked up, the two to \
+four you would build now, one sentence saying why those, and one question. Prefer two or three \
+pieces; take fewer when the pieces are large — twenty pages describing one screen is ONE \
+piece, and proposing it alone is right. Choose the pieces that give them something they can \
+actually use soonest, not the ones that are quickest for you.
+
+This is for NEW work arriving in bulk, and for nothing else. A question, a fix, a change to \
+something already built, or the next round of something already agreed is simply done. \
+Negotiating a small request wastes the user's turn and reads as reluctance, which is a failure \
+rather than caution.
+
+If they say they want all of it, say once what actually happens — everything at once takes \
+longer to get right and is harder to check — and then build in the order you proposed, \
+finishing each piece to something usable before starting the next.
+
+As each agreed piece lands, say so through `tell_the_user` and pass that piece's name as \
+`finished`. That is how the closing account knows what is left; without it the platform can \
+only say it could not tell."""
+"""R83–R88 — when to negotiate scope, and when negotiating is itself the failure.
+
+THE TRIGGER IS THE AGENT'S JUDGEMENT, DELIBERATELY. "Is this new work arriving in bulk, or a
+question, a fix, or the next round?" is a categorisation, and categorisation is what a model is
+for. The platform does not read the user's message to detect an oversized request — doing so
+would be the anti-pattern this plan names everywhere else, and it would be wrong on the cases
+that matter most.
+
+WHAT IS ENFORCED IS THE CEILING, and it is enforced in the tool body rather than here: never
+more than four pieces, and every proposed piece named in the found list. The two-piece
+PREFERENCE is prompt copy because it is soft by requirement — R83 says "fewer when the pieces
+are large" — and a soft preference in a guardrail would refuse honest single-piece slices.
+
+THE ENDING DIFFERS BY KIND WITH NO BRANCH ANYWHERE. A planning chat has the offer tool and no
+write tools, so the only ending available to it is an offer bound to the agreed slice. A build
+chat has the write tools and no offer tool, so the natural continuation is to build the slice
+in the same turn. Nothing in code chooses between those; the toolset already did."""
+
+BUILD_THIS_PLAN_LABEL = "Build this plan"
+KEEP_PLANNING_LABEL = "Keep planning"
+"""The two buttons under a plan, and the ONE spelling of each (R-15, client-approved).
+
+THREE SURFACES MUST CARRY THE IDENTICAL STRINGS: the prompt segment that tells the model what
+the user will see, the offer tool's own description (which the model reads on every request),
+and the buttons the interface actually draws. An agent that tells a citizen to press a button
+the interface does not draw is a broken instruction at the one moment the product asks them to
+decide something.
+
+THEY LIVE IN THIS LEAF because two of those three are on the server and must not disagree —
+the prompt segment and the tool description are composed from different packages. The stored
+values behind the buttons (`build` / `refine`) are a separate, unchanged vocabulary: they are
+what the platform records, and renaming a label must never migrate a record.
+
+"Keep refining" was the previous second label; the client found it confusing, and it is not a
+synonym worth keeping alive in a comment."""
+
 APPLY_SCHEMA_CHANGE_TOOL = "apply_schema_change"
 """The ONE sanctioned channel for a schema change, and the ONE spelling of it (U23 / R29 / F4).
 
@@ -126,35 +182,58 @@ migrations-are-the-channel rule for feature-removing schema changes."""
 
 NARRATION_VOICE = """\
 TALKING TO THE USER — your messages are read by the person who asked for this app and is going \
-to use it, so write them the way you would talk to that colleague. A couple of lines at each \
-milestone is the whole message: what you are building for them right now, and what they will be \
-able to do once it is there. Say it in plain, everyday words, about the app they use. Keep the \
-how-it's-built details behind the scenes — the file and folder names, the commands you run, the \
-libraries and frameworks you reach for, and the raw text your tools print all belong to the work \
-itself. Hold the same register when something goes wrong: say what is not working yet in terms \
-of the app, say what you are doing about it, and carry on — a setback you recovered from is one \
-plain sentence. The work itself is recorded step by step as you do it, so the technical account \
-already exists; what you write here is what the user reads."""
-"""R20/R22's audience block (U15) — WHO the Write narration is written for, and how long it runs.
+to use it, so write them the way you would talk to that colleague. Say it in plain, everyday \
+words, about the app they use. Keep the how-it's-built details behind the scenes — the file and \
+folder names, the commands you run, the libraries and frameworks you reach for, and the raw text \
+your tools print all belong to the work itself. Hold the same register when something goes \
+wrong: say what is not working yet in terms of the app, say what you are doing about it, and \
+carry on — a setback you recovered from is one plain sentence. The work itself is recorded step \
+by step as you do it, so the technical account already exists; what you write here is what the \
+user reads."""
+"""R79/R80/R81 — the audience contract. ONE statement of how the agent talks to the user, and
+every chat kind inherits it.
 
-WHY IT EXISTS: Write mode carried NO audience instruction at all. The 2026-08-18 demo build wrote
-2,397 words of file paths, commands, library names, and framework concepts to a citizen who had
-asked for an app — while Plan mode, the one mode with a plain-language contract, read fine. This is
-that contract for the mode that does the building, in the SAME voice (no second register invented).
-The bar is stated concretely — a couple of lines per milestone, failures and recoveries included —
-so a reviewer can check it rather than admire it. R23 holds: the technical work and its
-step-by-step record are untouched, which is exactly why the narration can afford to be short.
+WHY IT EXISTS: the build side carried NO audience instruction at all. The 2026-08-18 demo build
+wrote 2,397 words of file paths, commands, library names, and framework concepts to a citizen who
+had asked for an app — while the planning side, the one with a plain-language contract, read fine.
+R23 holds: the technical work and its step-by-step record are untouched, which is exactly why the
+narration can afford to be short.
 
-SINGLE SOURCE, EMITTED ONCE. It reaches both Write prompts through `BUILD_WORKING_RULES_TAIL`,
-which `_WRITE_SEGMENT` (`services/agent/mode_prompts.py`) and `BUILD_SYSTEM_PROMPT`
-(`services/orchestrator/prompt.py`) each compose exactly once — the same discipline
-`DATA_INTEGRITY_RULES` follows, and for the same reason: a second copy is how two Write prompts
-start speaking differently. Naming it again alongside the TAIL at either composition site would
-print the whole block twice (a test counts it).
+IT IS KIND-BLIND ON PURPOSE (U5/R79). It used to be Build's alone, and the planning prompt carried
+its own paragraph saying the same thing in different words — two wordings of one contract, which
+is the drift R79 forbids. What could not be shared was one sentence about LENGTH, so that sentence
+left this block and became the one per-kind variable: `BUILD_MESSAGE_LENGTH` and
+`PLAN_MESSAGE_LENGTH` below. Everything about WHO is being written for, and in what register, is
+here and is identical in both.
 
-ASK MODE IS DELIBERATELY WITHOUT IT: "name the actual files and quote the actual code" is right for
-someone reading an answer ABOUT code. This is the register for someone watching their app get
-built."""
+NAMED BY TWO COMPOSITION SITES, EMITTED ONCE EACH. `mode_prompts._base()` carries it into both
+composed chat prompts; `BUILD_SYSTEM_PROMPT` names it separately because it cannot call `_base`
+(that needs a `PromptContext` the standalone build harness has no source for). It deliberately
+does NOT ride inside `BUILD_WORKING_RULES_TAIL` any more: riding the TAIL is what made it
+Build-only, and lifting it out without naming it at the standalone site would have silently
+deleted the audience contract from a live prompt. A test counts it at exactly one in each — `== 1`
+rather than `<= 1`, because the deletion this guard exists to catch passes a `<=`."""
+
+BUILD_MESSAGE_LENGTH = """\
+HOW LONG — a couple of lines at each milestone is the whole message: what you are building for \
+them right now, and what they will be able to do once it is there."""
+"""The audience contract's one per-kind variable, on the building side.
+
+The bar is stated concretely so a reviewer can check it rather than admire it. It rides
+`BUILD_WORKING_RULES_TAIL`, which both build prompts compose exactly once, so neither composition
+site names it a second time — the discipline `NARRATION_VOICE` itself used to follow."""
+
+PLAN_MESSAGE_LENGTH = """\
+HOW LONG — a plan is as long as it needs to be, because the person is about to decide whether to \
+build it and everything that decision rests on has to be in front of them. Every other message \
+in a planning chat is a couple of lines: answer what was asked, say what you looked at, stop."""
+"""The same variable on the planning side, and the reason the length sentence could not stay
+inside the shared block.
+
+A plan that stops at "a couple of lines" is a plan the citizen cannot agree to — the one message
+in the product that has to be complete rather than brief. Stating both halves matters: without the
+second sentence, "as long as it needs to be" reads as licence for every message in the chat, which
+is how a planning conversation turns into an essay per turn."""
 
 WRITE_IDENTITY = """\
 WRITE MODE — you build. You are an expert Next.js engineer working on this citizen developer's \
@@ -172,8 +251,10 @@ the cross-package edge this module exists to avoid."""
 # mode_prompts.py`) compose Write mode from the SAME text — single source, no drift.
 # HEAD ends before DATA INTEGRITY (which BASE carries once in mode composition) and TAIL
 # resumes after it; `BUILD_SYSTEM_PROMPT` reassembles all three byte-identically.
-# TAIL is also where `NARRATION_VOICE` (U15's audience block) rides, so every Write prompt gets
-# it exactly once without either composition site naming it a second time.
+# TAIL is where `BUILD_MESSAGE_LENGTH` rides, so every build prompt gets the length half of the
+# audience contract exactly once without either composition site naming it a second time. The
+# contract's shared half (`NARRATION_VOICE`) is NOT here — it is kind-blind now, and the two
+# sites that name it are `mode_prompts._base()` and `BUILD_SYSTEM_PROMPT`.
 #
 # THE TYPE-CHECK LINE IS A PROHIBITION, NOT A PERMISSION (U19 / R25), and softening it back is a
 # regression. It used to end "you do not need to run `tsc` yourself, though you may" — which is
@@ -277,7 +358,10 @@ generates the migration and runs it in one call, and tells you truthfully which 
 either did.
 - `list_files` — List every file in the app (relative paths; heavy dirs like node_modules \
 excluded).
-- `search_files` — Search the app's files for a regex `pattern` (grep-like; case-sensitive)."""
+- `search_files` — Search the app's files for a regex `pattern` (grep-like; case-sensitive).
+- `tell_the_user` — Say one thing to the person waiting, in the middle of your work.
+- `propose_first_slice` — When a request arrives with a lot of separate things in it, \
+propose what to build first."""
 """GENERATED, NOT WRITTEN (U20 / R26) — a checked-in snapshot of
 `services/agent/toolsets.render_tool_surface(ChatKind.BUILD)`, which renders one line per
 tool from the tool definitions pydantic-ai hands the model at registration.
@@ -327,7 +411,7 @@ most of it: a TOOLBAR stacks instead of overflowing below Tailwind's `sm:` break
 (wrap it in `overflow-x-auto`, as `components/ui/table.tsx` already does); and a FORM's fields \
 stack to one column on a phone and pair up from `sm:` up (`grid sm:grid-cols-2`).
 
-{NARRATION_VOICE}
+{BUILD_MESSAGE_LENGTH}
 
 {WRITE_TOOL_SURFACE}
 
