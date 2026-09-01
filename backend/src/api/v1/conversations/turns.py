@@ -339,10 +339,6 @@ async def start_turn(
     if project is None:  # FK guarantees this; fail loudly if it ever breaks
         raise AppApiError(404, "Conversation not found.")
 
-    # Free text while plan options are pending resolves them as an implicit "keep
-    # refining" (U11) — BEFORE history loads, so the model always sees a resolved call.
-    await resolve_pending_as_refine(db, user_id=user.id, conversation_id=conversation.id)
-
     rehydrate = history_rehydrator(db, storage, user.id)
     try:
         history = await load_history(
@@ -353,18 +349,38 @@ async def start_turn(
     binaries = await resolve_binaries(db, storage, user.id, body.message.attachment_ids)
     prompt = prompt_content(body.message, binaries)
 
-    # The per-conversation guardrail, at the last moment it can still refuse cleanly: the
-    # history is loaded so the size is knowable, and NOTHING has been persisted, so a refusal
-    # leaves no turn row, no usage row and no claim to release. The same slot the daily cap
-    # occupies, for the same reason.
+    # The per-conversation guardrail — STILL ABOVE THE FIRST WRITE, which is what the ordering
+    # below it is arranged to keep true. Nothing has been persisted, so a refusal leaves no
+    # turn row, no usage row, no claim to release, and no spent plan-options card.
+    #
+    # IT CANNOT RELY ON A ROLLBACK, and that is why it is here rather than three lines lower.
+    # `resolve_pending_as_refine` reaches `append_batch`, which OWNS ITS COMMIT — so a refusal
+    # raised after it would leave the citizen's card resolved on disk with `get_db`'s rollback
+    # powerless to take it back: their message refused AND their offer silently consumed.
     #
     # It is a REFUSAL, not a run bound. The three ceilings inside the engine stop a run already
     # under way; this one declines to start a turn whose prompt would not fit — which is why it
-    # copies the pre-start gate above rather than the mid-run terminal.
+    # copies the daily cap's pre-start gate rather than the mid-run terminal.
     try:
         await enforce_context_limit(db, user.id, history=history, prompt=prompt)
     except ContextWindowExceededError:
         raise AppApiError(413, CHAT_TOO_LONG_TEXT, code=CHAT_TOO_LONG_CODE) from None
+
+    # Free text while plan options are pending resolves them as an implicit "keep refining"
+    # (U11). The model must see a RESOLVED call — the dangling-call repair never has to guess
+    # about a card the user typed past — so when this actually writes one, the history is read
+    # again. Only then: the common case is no pending card, and a second full load of a long
+    # conversation on every turn to serve the rare one would be a poor trade.
+    #
+    # It moved BELOW the guardrail above (it used to lead this block) because it is this
+    # route's first committing write, and every side-effect-free refusal has to land above it.
+    if await resolve_pending_as_refine(db, user_id=user.id, conversation_id=conversation.id):
+        try:
+            history = await load_history(
+                db, user_id=user.id, conversation_id=conversation.id, rehydrate=rehydrate
+            )
+        except AttachmentRehydrationError as exc:
+            raise AppApiError(400, str(exc)) from None
 
     display_name = user.display_name or user.email
     prompt_context = PromptContext(

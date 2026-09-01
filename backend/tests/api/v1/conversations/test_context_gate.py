@@ -46,6 +46,7 @@ from src.services.messages.store import append_batch
 from src.services.turns.copy import CHAT_TOO_LONG_CODE, CHAT_TOO_LONG_TEXT
 from src.services.turns.engine import TurnEngine, set_turn_engine_for_tests
 from src.services.turns.guard import _mid_reply
+from src.services.turns.plan_options import find_pending
 from src.services.usage.context_window import SYSTEM_PROMPT_RESERVE
 from src.services.usage.limits import DEFAULT_CONTEXT_HARD
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
@@ -141,6 +142,16 @@ def _offering_model(call_id: str = "opt-build", plan: str = "Build the visitor l
                 )
             }
         )
+
+    return FunctionModel(stream_function=_stream)
+
+
+def _plain_model() -> FunctionModel:
+    """A turn that answers with prose and offers nothing — so the card under test is the one
+    the PREVIOUS turn left pending, never a fresh one this turn presented."""
+
+    async def _stream(_messages: list[ModelMessage], _info: AgentInfo):
+        yield "here is a revised idea"
 
     return FunctionModel(stream_function=_stream)
 
@@ -363,3 +374,65 @@ def test_the_code_is_byte_stable() -> None:
     `assertNever`. Every code is an open string compared by hand, so a rename is free and silent
     and every reader keeps compiling. This is the guard that notices."""
     assert CHAT_TOO_LONG_CODE == "context_hard_limit_exceeded"
+
+
+async def test_a_refused_turn_does_not_burn_a_pending_plan_card(
+    client, app, db_session, _fresh_engine
+) -> None:
+    """★ THE ORDERING TRAP, AND IT WAS REAL — this test failed before the gate was moved.
+
+    `start_turn` resolves a pending plan-options card as an implicit "keep refining" when the
+    citizen types free text past it. That is a WRITE, and the route's own comment states the
+    invariant: "a refused start must never burn the user's pending plan-options card."
+
+    THE ROLLBACK DOES NOT COVER IT. `resolve_pending_as_refine` reaches `append_batch`, whose
+    docstring says it OWNS ITS COMMIT — so a refusal raised after it leaves the card resolved on
+    disk however cleanly `get_db` rolls the session back. The citizen's message is refused AND
+    their offer is silently consumed, and nothing on screen says the second thing happened.
+
+    The gate therefore sits ABOVE that write, and the history is re-read afterwards only when
+    the resolve actually wrote something.
+
+    Mutation check: move `enforce_context_limit` back below `resolve_pending_as_refine` and this
+    goes red while every other test in this file stays green.
+    """
+    user, _project, conversation = await _a_conversation(db_session)
+    app.dependency_overrides[chat_model_dep] = lambda: _offering_model()
+    assert (await _send(client, user, conversation.id, "plan it")).status_code == 202
+    await _settle(_fresh_engine, conversation.id)
+    assert await find_pending(db_session, user_id=user.id, conversation_id=conversation.id), (
+        "the offer has to be pending, or this test asserts nothing"
+    )
+
+    await _stuff_the_conversation(db_session, user, conversation, tokens=DEFAULT_CONTEXT_HARD)
+
+    refused = await _send(client, user, conversation.id, "actually, more like this")
+    assert refused.status_code == 413
+    assert refused.json()["error"]["code"] == CHAT_TOO_LONG_CODE
+
+    # The card the citizen can still press.
+    still_pending = await find_pending(
+        db_session, user_id=user.id, conversation_id=conversation.id
+    )
+    assert still_pending is not None
+
+
+async def test_an_accepted_turn_still_resolves_a_pending_card(
+    client, app, db_session, _fresh_engine
+) -> None:
+    """The other half, so the fix above cannot be "never resolve anything".
+
+    Moving the guardrail above `resolve_pending_as_refine` reordered a write. This is the test
+    that the write still happens on the path where it should: free text past a pending card, in
+    a conversation comfortably under the limit, resolves the card as U11 intends."""
+    user, _project, conversation = await _a_conversation(db_session)
+    app.dependency_overrides[chat_model_dep] = lambda: _offering_model()
+    assert (await _send(client, user, conversation.id, "plan it")).status_code == 202
+    await _settle(_fresh_engine, conversation.id)
+    assert await find_pending(db_session, user_id=user.id, conversation_id=conversation.id)
+
+    app.dependency_overrides[chat_model_dep] = lambda: _plain_model()
+    assert (await _send(client, user, conversation.id, "more like this")).status_code == 202
+    await _settle(_fresh_engine, conversation.id)
+
+    assert await find_pending(db_session, user_id=user.id, conversation_id=conversation.id) is None
