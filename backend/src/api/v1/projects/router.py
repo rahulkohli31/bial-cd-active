@@ -11,6 +11,7 @@ the shared `error_responses(...)` + `AUTH_401` builders (KD-7).
 
 from __future__ import annotations
 
+import math
 import uuid
 from typing import Annotated
 
@@ -24,15 +25,13 @@ from src.api.deps import CurrentUser, DbSession
 from src.api.v1.attachments.router import storage_dependency
 from src.api.v1.conversations._shared import ModelDep
 from src.api.v1.live_build import refuse_while_build_session_live
+from src.api.v1.offset_pagination import PageQuery, clean_page
 from src.api.v1.pagination import (
     DEFAULT_PAGE_SIZE,
-    CursorQuery,
     LimitQuery,
     SearchQuery,
     clean_limit,
     clean_search,
-    parse_cursor,
-    split_keyset,
 )
 from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry, AppStatus
@@ -97,7 +96,7 @@ def _to_response(
     app_id: uuid.UUID | None = None,
     app_status: AppStatus | None = None,
     has_relaunchable_snapshot: bool | None = None,
-    is_live: bool = False,
+    is_serving: bool = False,
 ) -> ProjectResponse:
     return ProjectResponse(
         id=project.id,
@@ -106,7 +105,7 @@ def _to_response(
         app_id=str(app_id) if app_id is not None else None,
         app_status=app_status.value if app_status is not None else None,
         has_relaunchable_snapshot=has_relaunchable_snapshot,
-        is_live=is_live,
+        is_serving=is_serving,
         created_at=project.created_at,
         updated_at=project.updated_at,
     )
@@ -187,13 +186,40 @@ async def _provision_database_or_shrug(db: DbSession, project_id: uuid.UUID) -> 
 async def list_projects(
     user: CurrentUser,
     db: DbSession,
-    cursor: CursorQuery = None,
+    page: PageQuery = 1,
     limit: LimitQuery = DEFAULT_PAGE_SIZE,
     q: SearchQuery = None,
 ) -> ProjectListResponse:
-    """Keyset page of the caller's projects, newest-first, optionally filtered by a
-    case-insensitive name/description substring (R6). Stable under concurrent inserts (R5)."""
-    after = parse_cursor(cursor)
+    """One NUMBERED page of the caller's projects, newest-first, optionally filtered by a
+    case-insensitive name/description substring (R6).
+
+    IT PAGES BY OFFSET, and `pagination.py` says the platform does not. #158 §2 specifies
+    numbered pages and a rows-per-page selector — `Showing 1-8 of 12`, `Page 1 of 2` — and
+    neither is expressible without a `total`, which keyset deliberately does not provide.
+
+    THE MARKETPLACE'S ARGUMENT DOES NOT TRANSFER, and reaching for it would be the quiet
+    kind of wrong. That one reads: "KD-1's keyset rule protects a list you are writing to,
+    this catalog is read-only and small". This list is written to — `create` and `delete`
+    both act on it, and under `ORDER BY id DESC` a new project lands at position 0, which is
+    the worst case for OFFSET rather than a benign one.
+
+    What makes it acceptable here is different and narrower: the list is OWNER-SCOPED and
+    effectively SINGLE-WRITER. Every row is `WHERE user_id = :me`, and the only person who
+    inserts or deletes rows in it is the person reading it. So the skew KD-1 guards against
+    — a busy shared table shifting under a stranger's page walk — is here a citizen with two
+    tabs open, creating a project in one while paging in the other. That is a real window
+    and it is bounded by one person's own actions, which is a different risk from the one
+    the rule was written for.
+
+    `total` is a SEPARATE READ from the page under READ COMMITTED, not one snapshot, so a
+    create landing between them can make the count and the rows disagree for one render.
+    The client is expected to say something true when they do, rather than assert either
+    number over the other.
+
+    A page past the end returns an empty `items` with the real `total`, not a 404: paging
+    past the end while a project is deleted elsewhere is ordinary, not an error.
+    """
+    page = clean_page(page)
     search = clean_search(q)
     limit = clean_limit(limit)
     # LEFT-JOIN the project's ONE app (uq_app_registry_project) so the page carries the
@@ -223,18 +249,22 @@ async def list_projects(
                 Project.description.icontains(search, autoescape=True),
             )
         )
-    if after is not None:
-        query = query.where(Project.id < after)
-    query = query.order_by(Project.id.desc()).limit(limit + 1)
-    rows = (await db.execute(query)).all()
-    page, next_cursor, has_more = split_keyset(rows, limit, key=lambda row: row[0].id)
+    # The COUNT runs over the same filtered query the page does, minus the ordering and
+    # window — a total computed over a different predicate would render page numbers the
+    # user can click and find empty, and only at a boundary.
+    total = int(await db.scalar(sa.select(sa.func.count()).select_from(query.subquery())) or 0)
+    rows = (
+        await db.execute(query.order_by(Project.id.desc()).limit(limit).offset((page - 1) * limit))
+    ).all()
     return ProjectListResponse(
         items=[
-            _to_response(project, app_id, app_status, is_live=is_live)
-            for project, app_id, app_status, is_live in page
+            _to_response(project, app_id, app_status, is_serving=is_serving)
+            for project, app_id, app_status, is_serving in rows
         ],
-        next_cursor=next_cursor,
-        has_more=has_more,
+        page=page,
+        page_size=limit,
+        total=total,
+        total_pages=math.ceil(total / limit) if total else 0,
     )
 
 

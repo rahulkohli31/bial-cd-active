@@ -36,24 +36,26 @@ const sampleProject = {
 
 describe('listProjects', () => {
   it('GETs /api/projects with NO query string when no args are passed', async () => {
-    const fetchImpl = fetchReturning(200, { items: [sampleProject], nextCursor: 'c1', hasMore: true })
+    const fetchImpl = fetchReturning(200, { items: [sampleProject], page: 1, pageSize: 25, total: 1, totalPages: 1 })
     const page = await listProjects({}, deps(fetchImpl))
     expect(fetchImpl.mock.calls[0][0]).toBe('/api/projects')
     // N7: the wire sample carries no `hasRelaunchableSnapshot` — the list never computes one —
     // and the narrower defaults it to `null`, the "cannot say" answer that withholds the claim.
     expect(page).toEqual({
-      items: [{ ...sampleProject, hasRelaunchableSnapshot: null }],
-      nextCursor: 'c1',
-      hasMore: true,
+      items: [{ ...sampleProject, hasRelaunchableSnapshot: null, isServing: false }],
+      page: 1,
+      pageSize: 25,
+      total: 1,
+      totalPages: 1,
     })
   })
 
-  it('URL-encodes cursor, limit, and q into the query string', async () => {
-    const fetchImpl = fetchReturning(200, { items: [], nextCursor: null, hasMore: false })
-    await listProjects({ cursor: 'x', limit: 50, q: 'vip movement' }, deps(fetchImpl))
+  it('URL-encodes page, limit, and q into the query string', async () => {
+    const fetchImpl = fetchReturning(200, { items: [], page: 1, pageSize: 25, total: 0, totalPages: 0 })
+    await listProjects({ page: 3, limit: 50, q: 'vip movement' }, deps(fetchImpl))
     const url = String(fetchImpl.mock.calls[0][0])
     expect(url.startsWith('/api/projects?')).toBe(true)
-    expect(url).toContain('cursor=x')
+    expect(url).toContain('page=3')
     expect(url).toContain('limit=50')
     expect(url).toContain('q=vip+movement')
   })
@@ -61,7 +63,7 @@ describe('listProjects', () => {
   it('normalizes an empty envelope to a safe page shape', async () => {
     const fetchImpl = fetchReturning(200, {})
     const page = await listProjects({}, deps(fetchImpl))
-    expect(page).toEqual({ items: [], nextCursor: null, hasMore: false })
+    expect(page).toEqual({ items: [], page: 1, pageSize: 25, total: 0, totalPages: 0 })
   })
 })
 
@@ -184,7 +186,7 @@ describe('response narrowing (parse, do not validate)', () => {
   })
 
   it('throws when a page carries an unreadable project', async () => {
-    const fetchImpl = fetchReturning(200, { items: [sampleProject, { name: 'broken' }], nextCursor: null, hasMore: false })
+    const fetchImpl = fetchReturning(200, { items: [sampleProject, { name: 'broken' }], page: 1, pageSize: 25, total: 2, totalPages: 1 })
     await expect(listProjects({}, deps(fetchImpl))).rejects.toBeInstanceOf(ApiError)
   })
 

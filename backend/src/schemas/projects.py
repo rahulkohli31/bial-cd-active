@@ -100,7 +100,7 @@ class ProjectResponse(CamelModel):
     # never disagree.
     #
     # `False` for a project with no app at all — there is nothing that could be live.
-    is_live: bool = False
+    is_serving: bool = False
     # N7 — whether this project has a bundle a Relaunch could actually restore.
     # THREE-STATE ON PURPOSE: `true` = there is one, `false` = confirmed there is not,
     # `null` = the object store could not be reached, so the platform declines to claim
@@ -153,9 +153,26 @@ class ProjectCountsResponse(CamelModel):
 
 
 class ProjectListResponse(CamelModel):
-    """The keyset page envelope (KD-1): items + the next cursor + whether more remain. No
-    `total`/`totalPages` — keyset does not cheaply provide them and they are not required."""
+    """An OFFSET page envelope — deliberately NOT the keyset one the admin rosters use.
+
+    This list was keyset (`nextCursor` + `hasMore`, a forward-only "Load more") until #158
+    specified numbered pages and a rows-per-page selector: `Showing 1-8 of 12`,
+    `Page 1 of 2`. Neither sentence is expressible without a `total`, and a total is exactly
+    what the keyset envelope declines to compute. The design is the requirement, so the
+    envelope changed rather than the design.
+
+    THE COST, STATED RATHER THAN ASSUMED AWAY. `pagination.py` refuses offset because a row
+    inserted underneath a page walk duplicates or skips an entry at a boundary, and because
+    `total` is a second read under READ COMMITTED rather than one snapshot with the page.
+    Both remain true here. What makes it acceptable is written at `list_projects`, and it is
+    NOT the marketplace's argument — see there.
+
+    `total` is the count AFTER `q` is applied, so "Showing 1-8 of 12" describes the search
+    the rows answer, never the whole collection.
+    """
 
     items: list[ProjectResponse]
-    next_cursor: str | None
-    has_more: bool
+    page: int
+    page_size: int
+    total: int
+    total_pages: int

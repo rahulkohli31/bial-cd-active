@@ -13,7 +13,7 @@ is live when it may never have been deployed.
 Two things these tests hold, and the second is the reason the predicate is shared rather
 than written twice:
 
-1.  **`isLive` follows the deployment, not the lifecycle.** An approved app that never
+1.  **`isServing` follows the deployment, not the lifecycle.** An approved app that never
     deployed is not live; a draft app that did deploy is.
 2.  **The count and the rows cannot disagree.** `in_production` and the per-row flag read
     the same `live_app_ids` collapse, so "3 in production" above a list showing two live
@@ -71,7 +71,7 @@ async def _deploy(
 async def _rows(client, headers) -> dict[str, bool]:
     resp = await client.get(_PROJECTS, headers=headers)
     assert resp.status_code == 200, resp.text
-    return {item["name"]: item["isLive"] for item in resp.json()["items"]}
+    return {item["name"]: item["isServing"] for item in resp.json()["items"]}
 
 
 # --- what the flag actually tracks --------------------------------------------

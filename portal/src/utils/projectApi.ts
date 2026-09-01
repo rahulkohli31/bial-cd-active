@@ -47,19 +47,61 @@ export interface Project {
    * Only the single-project GET computes it; the list leaves it `null` and no caller reads it.
    */
   hasRelaunchableSnapshot: boolean | null
+  /**
+   * Is the app SERVING right now? "Live = deployed / published — if the application is
+   * published and has url" (#158). Deliberately not derivable from `appStatus`: APPROVED
+   * means an administrator said yes, and one-click deploy never writes `status` at all, so
+   * the ordinary live app is still `draft`. The server computes it from the deployment
+   * history; `false` for a project with no app.
+   *
+   * NAMED `isServing` even though the badge reads "Live", and deliberately not the
+   * obvious name: that one is a RETIRED symbol — one of the client-side predicates that
+   * used to re-decide in the browser what the server had already decided, and
+   * `jsx-deploy-retirement.test.ts` guards against it returning. This field is the opposite
+   * of that predicate; it IS the server's answer. Reusing the retired name would make every
+   * future grep ambiguous, so the field says how the server knows and the label says what
+   * the reader cares about. (The guard is a plain text scan, so even this note has to avoid
+   * spelling the old name.)
+   */
+  isServing: boolean
   createdAt: string
   updatedAt: string
 }
 
-/** One keyset page of projects, newest-first. */
+/**
+ * One NUMBERED page of projects, newest-first.
+ *
+ * Was `{items, nextCursor, hasMore}` — a forward-only "Load more" — until #158 §2 specified
+ * numbered pages and a rows-per-page selector. `Showing 1-8 of 12` and `Page 1 of 2` both
+ * need a `total`, which the keyset envelope deliberately did not carry.
+ *
+ * `total` is counted AFTER the search is applied, so it describes the rows it sits under.
+ */
 export interface ProjectsPage {
   items: Project[]
-  nextCursor: string | null
-  hasMore: boolean
+  page: number
+  pageSize: number
+  total: number
+  totalPages: number
+}
+
+/**
+ * The three numbers above the project list (#158 §1).
+ *
+ * A dedicated route rather than a count derived from the list: the page holds 8 of 12 rows,
+ * so none of these is computable client-side, and polling the list for three integers would
+ * pay for row projection and joins it does not need.
+ */
+export interface ProjectCounts {
+  /** Apps SERVING right now — "live = deployed / published, with a url". Not `approved`. */
+  inProduction: number
+  totalApplications: number
+  inPipeline: number
 }
 
 export interface ListProjectsArgs {
-  cursor?: string | null
+  /** 1-based. The server 422s outside 1..100000 rather than overflowing its OFFSET. */
+  page?: number
   limit?: number
   q?: string
 }
@@ -131,19 +173,33 @@ function toProject(value: unknown): Project {
     // Anything that is not a literal boolean — absent, null, or a shape we do not recognize —
     // is the "cannot say" answer. That is the fail-safe direction: it withholds the claim.
     hasRelaunchableSnapshot: typeof value.hasRelaunchableSnapshot === 'boolean' ? value.hasRelaunchableSnapshot : null,
+    // Absent or non-boolean means NOT live: the badge claims something, so an unknown
+    // must never render as a claim.
+    isServing: value.isServing === true,
     createdAt: asString(value.createdAt),
     updatedAt: asString(value.updatedAt),
   }
 }
 
-/** Narrow the `{items, nextCursor, hasMore}` keyset envelope. */
+/** Narrow the `{items, page, pageSize, total, totalPages}` offset envelope. */
 function toProjectsPage(value: unknown): ProjectsPage {
   const doc = isRecord(value) ? value : {}
   return {
     items: Array.isArray(doc.items) ? doc.items.map(toProject) : [],
-    nextCursor: asStringOrNull(doc.nextCursor),
-    hasMore: doc.hasMore === true,
+    page: asPositiveInt(doc.page, 1),
+    pageSize: asPositiveInt(doc.pageSize, DEFAULT_PAGE_SIZE),
+    // Defaulting to 0 rather than to `items.length`: an absent total is unknown, and
+    // guessing it from the page would render a confident "of 8" that is simply wrong.
+    total: asPositiveInt(doc.total, 0),
+    totalPages: asPositiveInt(doc.totalPages, 0),
   }
+}
+
+/** The server's page size when the caller does not choose one (`DEFAULT_PAGE_SIZE`). */
+export const DEFAULT_PAGE_SIZE = 25
+
+function asPositiveInt(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : fallback
 }
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' }
@@ -151,13 +207,31 @@ const JSON_HEADERS = { 'Content-Type': 'application/json' }
 /** One page of the caller's projects, newest-first. Only the args the caller passed hit the query string. */
 export async function listProjects(args: ListProjectsArgs = {}, deps: AuthFetchDeps = {}): Promise<ProjectsPage> {
   const params = new URLSearchParams()
-  if (args.cursor) params.set('cursor', args.cursor)
+  if (args.page !== undefined) params.set('page', String(args.page))
   if (args.limit !== undefined) params.set('limit', String(args.limit))
   if (args.q) params.set('q', args.q)
   const qs = params.toString()
   const res = await authFetch(`/api/projects${qs ? `?${qs}` : ''}`, {}, deps)
   if (!res.ok) throw await readApiError(res, 'Failed to load projects')
   return toProjectsPage(await res.json())
+}
+
+/** The three summary numbers for the landing screen.
+ *
+ *  Each field falls back to 0 only when the wire value is not a number. That is a narrowing
+ *  decision, not a guess at the data: the caller renders a skeleton while `counts` is null
+ *  and never treats a fetch failure as "you have nothing".
+ */
+export async function listProjectCounts(deps: AuthFetchDeps = {}): Promise<ProjectCounts> {
+  const res = await authFetch('/api/projects/counts', {}, deps)
+  if (!res.ok) throw await readApiError(res, 'Failed to load project counts')
+  const body: unknown = await res.json()
+  const doc = isRecord(body) ? body : {}
+  return {
+    inProduction: asPositiveInt(doc.inProduction, 0),
+    totalApplications: asPositiveInt(doc.totalApplications, 0),
+    inPipeline: asPositiveInt(doc.inPipeline, 0),
+  }
 }
 
 /** One project by id. */

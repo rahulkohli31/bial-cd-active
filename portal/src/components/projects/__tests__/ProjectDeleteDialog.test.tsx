@@ -30,6 +30,7 @@ const project: Project = {
   appId: null,
   appStatus: null,
   hasRelaunchableSnapshot: null,
+  isServing: false,
   createdAt: '',
   updatedAt: '',
 }
