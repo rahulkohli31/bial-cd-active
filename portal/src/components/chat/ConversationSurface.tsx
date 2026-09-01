@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo, type FC } from 'react'
 import { useNavigate, useLocation, useParams } from 'react-router-dom'
-import { PanelLeftOpen, PanelLeftClose } from 'lucide-react'
 import PublishStatusChip from '../PublishStatusChip'
 import Announcer, { useActivityAnnouncement } from './Announcer'
 import ChatThread from './ChatThread'
@@ -14,17 +13,17 @@ import { listProjectConversations } from '../../utils/conversationApi'
 import type { ConversationHeader } from '../../utils/conversationApi'
 import { ApiError } from '../../utils/apiError'
 import { markAppVisible } from '../../utils/observe'
-import { describeSaveFailure, isConversationGone } from '../../utils/chatErrors'
+import { isConversationGone } from '../../utils/chatErrors'
 
 import { resolvePreviewAddress } from '../../utils/previewAddress'
-import { HIDDEN_BUT_MOUNTED } from '../workspace/hiddenSubtree'
-import { PREVIEW_PROBE_MS, SETTLED_GONE } from '../workspace/workspaceState'
+import { PREVIEW_PROBE_MS, SETTLED_GONE, resolveWorkspaceState } from '../workspace/workspaceState'
 import {
   useAppPaneVisible,
   usePublishAddress,
   usePublishPaneView,
   usePublishReclaim,
   usePublishSaveState,
+  usePublishWorkspaceReport,
   useWorkspaceProject,
 } from '../workspace/workspaceChannel'
 import { notifyUsageChanged } from '../../utils/usage'
@@ -37,6 +36,8 @@ import { isActiveBuildStatus } from '../../utils/buildSessionTypes'
 
 
 import type { PendingAttachment } from '../../utils/attachmentInput'
+import type { ChatKind } from '../../pages/ChatRoute'
+import PlanChatWorkspaceLine from '../workspace/PlanChatWorkspaceLine'
 import { startTurn, readTurnStream, buildFromPlan, stopTurn, TurnStartError } from '../../utils/turnStreamApi'
 import { isKnownFrame } from '../../utils/turnStreamApi'
 import type { CompileState } from '../../utils/compileState'
@@ -51,7 +52,7 @@ import { resolvePlanOptions } from '../../utils/turnStreamApi'
 import { wireMessageFromParts, buildUserParts, partsToText, countAttachments, releaseUploadedAttachments } from '../../utils/attachmentStore'
 import { validateConversationAttachmentCap } from '../../utils/attachmentInput'
 
-import { loadBuilds, createBuild, getBuild, deriveTitle } from '../../utils/builderHistory'
+import { loadBuilds, getBuild, deriveTitle } from '../../utils/builderHistory'
 import type { ChatMessage, MessagePart, BuildPartLive } from '../../utils/messageTypes'
 
 // The from-scratch greeting (ephemeral — never persisted, and never sent to the model: it is
@@ -170,6 +171,8 @@ export interface ConversationSurfaceProps {
   chatId?: string
   projectId?: string | null
   projectName?: string | null
+  /** Which kind of conversation this is. Read for ONE thing: whether the app pane is seen. */
+  kind?: ChatKind
   projectHasSavedBuild?: boolean | null
   buildSessionDeps?: UseBuildSessionDeps
 }
@@ -278,7 +281,12 @@ function streamingParts(sink: TurnSink): MessagePart[] {
   return [...steps, { type: 'text', text: sink.text }]
 }
 
-export default function ConversationSurface({ chatId: chatIdProp, projectId = null, projectName = null, projectHasSavedBuild = null, buildSessionDeps }: ConversationSurfaceProps = {}) {
+export default function ConversationSurface({ chatId: chatIdProp, kind = 'build', projectId = null, projectName = null, projectHasSavedBuild = null, buildSessionDeps }: ConversationSurfaceProps = {}) {
+  // R11/R12 — THE ONE THING THE KIND DECIDES ON THIS SURFACE. A Plan chat shows no app pane; a
+  // Build chat shows it. `build` is the default because fifteen existing suites mount this surface
+  // with no kind at all and every one of them is about the build surface — defaulting to `plan`
+  // would silently retire the pane from all of them.
+  const isPlanChat = kind === 'plan'
   const navigate = useNavigate()
   const location = useLocation()
   const params = useParams()
@@ -300,10 +308,21 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
 
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [builds, setBuilds] = useState<ConversationHeader[]>([])
-  // Hides the chat panel so the preview can take the full cockpit width (#42 chat-collapse).
-  // The panel stays MOUNTED (CSS-collapsed, not unmounted) so the composer draft, pending
-  // attachments, and scroll position survive a hide/show cycle.
-  const [chatCollapsed, setChatCollapsed] = useState(false)
+  // THE #42 CHAT-COLLAPSE THAT USED TO LIVE HERE IS GONE (Plan 006, R13) — not moved, retired.
+  // Under Plan 006 this surface no longer owns a column; it FILLS the rail, and the rail's
+  // collapse belongs to `WorkspaceShell` (`usePublishRail` / `railWidthClass`), with the control
+  // for it drawn by `AppPane`, which is the part of the pane that always renders. Two reasons this
+  // one had to go rather than move over unchanged:
+  //   1. IT WAS A SECOND COLLAPSE FOR THE SAME COLUMN. Once the conversation IS the rail, a toggle
+  //      here and the shell's own toggle would collapse the identical column through two
+  //      independent booleans — exactly the "two controls, one column" shape R13 forbids.
+  //   2. IT WAS UNREACHABLE EXACTLY WHEN IT MATTERED. This toggle rendered into `LivePreview`'s
+  //      toolbar, and `LivePreview` only mounts when there is something to frame — so on a Plan
+  //      chat, on a project with nothing built yet, or on an app that had gone to sleep, the
+  //      toggle simply did not exist, and a panel collapsed while an app was running lost its way
+  //      back the moment the container stopped. That is the identical defect `AppPane`'s own
+  //      collapse control was written to fix (see its docblock) — fixing it twice, once per
+  //      collapse, is not a thing this surface gets to do.
   /**
    * THE ASSERTIVE SLOT (R65) — the things that genuinely interrupt.
    *
@@ -1274,43 +1293,28 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
     const userMsg: ChatMessage = { id: `local_${Date.now()}`, role: 'user', parts, seq: userSeq, createdAt: new Date().toISOString() }
     setMessages([...priorMessages, userMsg])
 
-    // U7: the thread row must EXIST before the first turn (the relay 404s otherwise).
-    // Idempotent per owner, so re-confirming after a reload costs one cheap 200.
-    if (userSeq === 0) {
-      try {
-        await createBuild(activeId, {
-          // UNCHECKED (matches pre-migration behavior): handleSend guards `projectId` before
-          // calling fireRelayTurn, but fireHandoffPrompt (the other caller) does not — asserted
-          // non-null per this route's contract, not enforced here.
-          projectId: projectId as string,
-          title: deriveTitle(partsToText(parts)),
-          context: contextRef.current,
-          // NO KIND HERE, and that is the store's job rather than an omission: `createBuild`
-          // is `builderHistory`'s bound store, which supplies the one kind it exists for. This
-          // used to also carry the conversation's per-send setting; a chat's kind is fixed when
-          // it is created, so there is nothing left for a send to say about it.
-        })
-      } catch (err) {
-        releaseUploadedAttachments(parts)
-        setUrgent(describeSaveFailure(err, 'Could not start this thread. Check your connection.'))
-        // Roll back ONLY if we still own this chat — a mid-await switch means the snapshot/seq
-        // describe the OTHER chat, and writing them here would clobber the current transcript.
-        if (stillHere()) {
-          setMessages(priorMessages)
-          seqRef.current = userSeq
-        }
-        // OUTSIDE the guard. `onAbort` settles the composer's send promise, and a promise that
-        // never settles never runs `handleSubmit`'s `finally` — which is what clears `sendingRef`.
-        // Leaving it unsettled because the reader had moved on wedged that chat's Send silently
-        // for the rest of the session: every later press matched the stale double-Enter guard and
-        // returned as though it had sent.
-        onAbort?.()
-        // The thread was deleted out from under us (elsewhere, or in another tab): leave, rather
-        // than sit on a page whose every send will fail the same way.
-        if (isConversationGone(err)) navigate('/projects', { replace: true })
-        return
-      }
-    }
+    // R-18 — THE ROW'S PARENTAGE RIDES THE TURN, AND THERE IS NO SEPARATE CREATE CALL.
+    //
+    // This used to be a `createBuild` round trip: the conversation was COMMITTED here, a full
+    // request before the turn — and that route's only workspace awareness was a project-ownership
+    // check. So a first message the workspace then refused left a real, titled, empty conversation
+    // in the project's list, named by `deriveTitle` after the very text that had been refused.
+    // Observed live: a citizen submitted a build, watched it run for nearly two minutes, and was
+    // then asked whether they wanted the workspace at all.
+    //
+    // The server now creates the row inside the turn's own transaction, AFTER every side-effect-free
+    // refusal and with a flush rather than a commit — so a refusal rolls it back. The whole change
+    // on this side is that one round trip is gone and its arguments moved onto the next one.
+    const parentage =
+      userSeq === 0 && projectId
+        ? {
+            projectId,
+            kind,
+            title: deriveTitle(partsToText(parts)),
+            // `context` is whatever this surface was seeded with; it travels unchanged.
+            context: contextRef.current,
+          }
+        : undefined
     dropTransientQuery(activeId)
     refreshBuilds()
 
@@ -1332,11 +1336,18 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
     // catch below must split on it: everything after the accept is subscription plumbing.
     let posted = false
     try {
-      await startTurn(activeId, {
-        text: wire.text ?? '',
-        attachmentTexts: wire.attachmentTexts ?? [],
-        attachmentIds: wire.attachmentIds ?? [],
-      })
+      await startTurn(
+        activeId,
+        {
+          text: wire.text ?? '',
+          attachmentTexts: wire.attachmentTexts ?? [],
+          attachmentIds: wire.attachmentIds ?? [],
+        },
+        {},
+        // R-18: present only on a first message, and the whole reason this call can now be the
+        // ONE server call the send path makes.
+        parentage,
+      )
       posted = true
       // THE ONE PLACE THE COMPOSER MAY EMPTY, and it is here because this is the first instant the
       // server is holding the message. A 202 means it is persisted and the reply runs detached, so
@@ -1397,6 +1408,14 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
           // let the error banner be the only account of what happened.
           setMessages((prev) => prev.filter((m) => m.id !== assistantId && m.id !== userMsg.id))
           seqRef.current = userSeq
+          // CARRIED OVER FROM THE RETIRED CREATE CALL (R-18, U13), because the failures it
+          // handled did not go away with it — they moved one round trip later. A refused first
+          // message persisted nothing, so the blobs uploaded for it have no owner and must be
+          // released, or a citizen who is refused three times leaves three orphans behind.
+          releaseUploadedAttachments(parts)
+          // …and a conversation deleted out from under this tab is a page whose every send will
+          // fail the same way. Leaving is the only useful thing left to do.
+          if (isConversationGone(err)) navigate('/projects', { replace: true })
         }
       }
       // TELL THE COMPOSER TO KEEP EVERYTHING, on every path out of here. A refused turn persisted
@@ -1682,7 +1701,8 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
    * RESOLVES — the strip's own `catch` would replace four remedies with one generic apology. The
    * strip is left pressable either way, which is what R29 asks for.
    */
-  const handleBuildIt = useCallback(async ({ toolCallId, newChatId }: BuildHandoff) => {
+  const handleBuildIt = useCallback(async (handoff: BuildHandoff) => {
+    const { toolCallId, newChatId } = handoff
     if (sendingRef.current === buildIdRef.current) return
     if (!projectId) {
       setUrgent('Open a project to start a build.')
@@ -1730,6 +1750,17 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
       // hydration picks up the live turn on arrival.
       navigate(`/chat/${outcome.chatId}`)
     } catch (err) {
+      // THE THIRD DOOR, and it could not open the dialog at all (plan 006, U5).
+      //
+      // A reclaim refusal arriving here rendered as plain red text — no Save, no Switch, no way to
+      // act — even though the error shape is identical to the composer path's and the classifier
+      // was already imported in this very file. Two paths reached the one dialog and the third did
+      // not, so "nothing can release another project's workspace without the person pressing one
+      // of the dialog's buttons" was simply false on this one.
+      //
+      // R94's widening makes it fire far more often than it used to: a clean incumbent now raises
+      // where it previously reclaimed silently, so this path went from rare to ordinary.
+      if (captureReclaim(err, () => handleBuildItRef.current(handoff))) return
       // Verbatim, and NOT rethrown — see the docblock. The strip's own catch would collapse four
       // different remedies into one generic apology.
       setUrgent(err instanceof Error ? err.message : 'The build could not be started. Try again.')
@@ -1737,7 +1768,16 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
       if (sendingRef.current === activeBuildId) sendingRef.current = null
       setBuildStartingChatId((prev) => (prev === activeBuildId ? null : prev))
     }
+    // `captureReclaim` and the retry ref are both read through refs / stable identities, so they
+    // are deliberately absent here: listing them would rebuild this callback on every keystroke
+    // for no behavioural gain.
   }, [projectId, buildBlockedMessage, navigate])
+
+  // THE RETRY THE DIALOG RUNS, through a ref so the callback can name itself without a cycle.
+  // Assigned during render rather than in an effect: a refusal can arrive on the very first press,
+  // and a ref filled by an effect would still be empty when the dialog needs its retry.
+  const handleBuildItRef = useRef(handleBuildIt)
+  handleBuildItRef.current = handleBuildIt
 
   /** An offer's effective state: the stored record, overlaid with this surface's just-made choice. */
   const applyPlanOverride = useCallback(
@@ -1961,11 +2001,19 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
   //
   // `buildActive` still reads the session's own status, so Stop and the delete-gate never light up
   // on a relaunch, which has no build lifecycle at all.
+  // The URL the workspace's own start control just produced — see `onStarted` at the publish
+  // block below for why this arm needs a second producer at all. Declared here rather than beside
+  // the poll's epoch because the address resolution reads it, and that runs further up.
+  const [startedPreviewUrl, setStartedPreviewUrl] = useState<string | null>(null)
   const address = resolvePreviewAddress({
     turnPreviewUrl: turnPreview.url,
     turnStatus: turnBuildStatus,
     narratingChatIsOpenChat: turnNarrativeIsThisChat,
-    relaunchedUrl: session.relaunchedPreviewUrl,
+    // TWO PRODUCERS FOR ONE ARM, and the newer one wins. `session.relaunchedPreviewUrl` comes from
+    // this surface's own relaunch path; `startedPreviewUrl` from the workspace's start control,
+    // which calls the same endpoint directly. Neither can be dropped: the first still fires from
+    // the build-session hook, and the second is the only producer the pane's own control has.
+    relaunchedUrl: startedPreviewUrl ?? session.relaunchedPreviewUrl,
     sessionUrl: session.previewUrl,
     sessionStatus: session.status,
     sessionId: session.sessionId,
@@ -2323,11 +2371,23 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
   // surface's knowledge and a second classifier is how a refusal loses its one authority.
   usePublishReclaim(
     useMemo(
-      () => (reclaim ? { blocked: reclaim.blocked, resolve: resolveReclaim, cancel: () => setReclaim(null) } : null),
+      () =>
+        reclaim
+          ? {
+              blocked: reclaim.blocked,
+              // Issue #161's framing half: the dialog leads with the app being STARTED, and this
+              // surface is that app. `null` while the route is still resolving the project name —
+              // the dialog then falls back to the plain phrasing rather than quoting an empty
+              // string, which is the failure that framing fix must not introduce.
+              startingProjectName: projectName,
+              resolve: resolveReclaim,
+              cancel: () => setReclaim(null),
+            }
+          : null,
       // `resolveReclaim` is redefined every render and is not worth memoising on its own — it
       // reads `reclaim` directly. Keyed on the refusal itself, which is what the dialog renders.
       // eslint-disable-next-line react-hooks/exhaustive-deps
-      [reclaim],
+      [reclaim, projectName],
     ),
   )
 
@@ -2350,18 +2410,10 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
     })
   }
 
-  // Collapsing the chat panel hides SessionBanners + turnError along with everything else in
-  // it — and collapsing to watch a build at full width is exactly when a reclaim/quota-hit/error
-  // is most likely and least visible, since the toggle otherwise gives no cue. Mirrors the same
-  // conditions SessionBanners/turnError already render on below, so the dot lights up exactly
-  // when there'd be something to see if the panel were open.
-  const chatNeedsAttention = Boolean(
-    workspaceSays ||
-    turnError ||
-    (sessionProjectMatches && session.error) ||
-    (sessionProjectMatches && session.blocked) ||
-    (showSession && (session.feedDisconnected || session.quota)),
-  )
+  // `chatNeedsAttention` — the badge on the retired chat-panel toggle below — is gone with it.
+  // Nothing else read it: SessionBanners and TurnBanner already render these same conditions
+  // in-flow a few lines below, on a rail that is always reachable once R13's single collapse is
+  // the only one there is.
 
   // ─── THE APP PANE, PUBLISHED UPWARD (Plan A, U4) ─────────────────────────────────────────────
   //
@@ -2374,9 +2426,52 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
   // a move like this is that someone narrows the app-scoped ones "for consistency" on the way past.
   useWorkspaceProject(projectId)
   usePublishAddress(address, projectId)
-  // A Build chat wants the pane seen, exactly as today. Plan F is what gives the project screen a
-  // reason to say this too; until then the surface `ChatRoute` picked by kind is the only caller.
-  useAppPaneVisible(true)
+  // R11/R12. A Build chat wants the pane seen; a Plan chat does not.
+  //
+  // HIDDEN, NOT UNMOUNTED, and that distinction is the whole reason this is a visibility
+  // declaration rather than an address that is withheld. A planning question READS the running app
+  // and starts it if it is stopped — the origin document reverses the canvas on this — so the app
+  // may well be up and held by this very conversation. Retiring the address here would tear down a
+  // container the citizen is about to build in.
+  useAppPaneVisible(!isPlanChat)
+  // WHAT TO SAY ABOUT THE WORKSPACE, from the SAME map the project screen uses (Plan F, U2/U4).
+  //
+  // NO SECOND READ AND NO SECOND POLL: this is `previewState`, which the effect above already
+  // fetched on this surface's own cadence, put through the pure map. What it buys is that the
+  // sentence a citizen reads when this chat's pane has nothing to frame has exactly one author in
+  // the product — the same one the project screen's pane and a Plan chat's line read from.
+  //
+  // NO START OUTCOME HERE. This surface has its own relaunch path with its own error handling
+  // (`session.relaunchError`, rendered by the pane's own arms), and threading a second outcome
+  // through would give one state two authors again. `onStartOutcome` therefore only refreshes.
+  usePublishWorkspaceReport(
+    projectId
+      ? {
+          state: resolveWorkspaceState({
+            preview: previewState,
+            projectHasSavedBuild,
+            startOutcome: null,
+          }),
+          projectId,
+          // R-18/U4 — WHERE A START'S URL LANDS ON THIS SURFACE, and without it the start control
+          // did nothing visible here. This surface feeds the resolver's project-scoped arm with
+          // `null` (its own poll only runs over an ALREADY framed URL, by design), and its
+          // `relaunchedUrl` arm used to be fed by a Relaunch button inside the pane that this plan
+          // retired — so a fresh start had no arm left to populate and the app came up in a
+          // container nothing framed. The relaunched arm is exactly right for it: a restore has no
+          // build lifecycle, which is why that arm resolves its own status to `ready`.
+          onStarted: setStartedPreviewUrl,
+          onStartOutcome: () => setPreviewProbeEpoch((n) => n + 1),
+          onRefresh: () => setPreviewProbeEpoch((n) => n + 1),
+          // The SAME single-slot capture the composer and the relaunch button use — first refusal
+          // wins, so the dialog cannot change under the person reading it. Set directly rather
+          // than through `captureReclaim`, which classifies a raw error; by the time a refusal
+          // arrives here the pane's control has already classified it, and re-classifying an
+          // already-narrowed value is how a second authority on a refusal gets created.
+          onReclaimRefusal: (blocked, retry) => setReclaim((current) => current ?? { blocked, retry }),
+        }
+      : null,
+  )
   usePublishPaneView({
     /* Publish, right where the build just finished. Only once the route resolved a project — a
        chat with no project behind it has nothing to publish.
@@ -2389,34 +2484,16 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
        anything anchored here without a portal disappears rather than overflows. Plan F
        retires this mount when it merges the two screens. */
     toolbarTrailing: projectId ? <PublishStatusChip projectId={projectId} /> : null,
-    /* The chat-panel toggle renders IN-FLOW in the pane's leading slot rather than floating
-       absolutely over it — it used to sit in the same top-left corner as the pane's own
-       device-width toolbar group and visibly overlap it. */
-    toolbarLeading: (
-      <button
-        type="button"
-        onClick={() => setChatCollapsed((collapsed) => !collapsed)}
-        aria-expanded={!chatCollapsed}
-        aria-controls="chat-panel"
-        aria-label={
-          chatCollapsed
-            ? chatNeedsAttention
-              ? 'Show chat panel — needs attention'
-              : 'Show chat panel'
-            : 'Hide chat panel'
-        }
-        title={chatCollapsed ? 'Show chat panel' : 'Hide chat panel'}
-        className="relative p-1.5 rounded-lg text-neutral hover:text-primary hover:bg-bial-bg transition"
-      >
-        {chatCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
-        {/* A silent toggle would otherwise hide session banners (reclaim/quota/errors) with no
-            cue — collapsing to watch a build at full width is exactly when those are most likely
-            and least visible. */}
-        {chatCollapsed && chatNeedsAttention && (
-          <span aria-hidden="true" className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-danger rounded-full" />
-        )}
-      </button>
-    ),
+    // NO LEADING CONTROL ANY MORE. This used to be the chat-panel toggle — a SECOND collapse for
+    // the column `WorkspaceShell` already collapses (`usePublishRail` / `railWidthClass`), with a
+    // control drawn by `AppPane` because that is the part of the pane that always renders, even
+    // when this surface's own `LivePreview` mount does not exist yet (a Plan chat, a project with
+    // nothing built) or has gone away (a stopped app). Two independent booleans hiding the same
+    // rail is exactly what R13's "ONE control that collapses it entirely" forbids, and the second
+    // one was unreachable in precisely the states where a way back mattered most. See
+    // `ProjectWorkspace.test.tsx`'s "the collapse control" suite for where that property is pinned
+    // now, and `AppPane.tsx`'s own docblock for the fuller account of why its home moved there.
+    toolbarLeading: null,
     iterating: showSession && session.iterating,
     onRelaunch: handleRelaunch,
     relaunching: sessionProjectMatches && session.relaunching,
@@ -2581,19 +2658,15 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
 
   return (
     <div className="flex flex-1 min-h-0 overflow-hidden">
-      {/* The chat panel stays MOUNTED when collapsed (CSS width:0), so the composer draft and the
-          scroll position survive a hide/show cycle rather than resetting on remount. The
-          hidden-but-mounted treatment comes from `HIDDEN_BUT_MOUNTED`, which carries the WCAG
-          reasoning: zero width and overflow:hidden clip the panel visually but do NOT remove its
-          descendants from the tab order, so `aria-hidden` alone left the composer, Send and attach
-          keyboard-reachable while collapsed. */}
+      {/* NO COLLAPSE HERE ANY MORE. This panel used to CSS-collapse itself (width:0,
+          `HIDDEN_BUT_MOUNTED`) behind its own `chatCollapsed` state — the whole mechanism R13
+          retired (see the state's removal note above). The rail this surface fills is collapsed
+          by `WorkspaceShell` instead, as a class on the `workspace-outlet` element one level up;
+          from here that is invisible; this panel always renders at its own width. */}
       <div
         id="chat-panel"
         data-testid="chat-panel"
-        aria-hidden={chatCollapsed}
-        className={`flex flex-col bg-white border-r border-bial-border flex-shrink-0 overflow-hidden transition-[width] duration-200 ${
-          chatCollapsed ? `w-0 border-r-0 ${HIDDEN_BUT_MOUNTED}` : 'w-72 xl:w-80'
-        }`}
+        className="flex flex-col bg-white border-r border-bial-border flex-shrink-0 overflow-hidden w-72 xl:w-80"
       >
         {/* Back-navigation and the project name, and nothing else (F7/F10). Past conversations
             live on the project page the breadcrumb links to. */}
@@ -2669,6 +2742,11 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
             </button>
           </div>
         )}
+
+        {/* R97 — A PLAN CHAT SAYS EVERYTHING THE PANE WOULD HAVE SAID. Above the composer, from the
+            same computed workspace value the pane renders, so there is one author for every
+            workspace sentence in the product and "no pane" cannot mean "says nothing". */}
+        {isPlanChat && <PlanChatWorkspaceLine />}
 
         <Composer
           conversationId={buildId ?? null}

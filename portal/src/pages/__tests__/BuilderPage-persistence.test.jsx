@@ -7,9 +7,13 @@
  * U8/F10 removed the in-rail "Recent builds" dropdown (and with it the per-chat delete + its
  * live-session gate) — past conversations, and their deletion, live on the project page now — so the
  * delete-gating tests that drove that dropdown are gone too. What REMAINS and is pinned here:
- *   - the user turn — INCLUDING its attachment parts — is persisted via createBuild on the
- *     SEND, hence before the confirmed build starts, so BRAIN reads the image/PDF/office/deck
- *     context server-side (C3 §2.1).
+ *   - the user turn — INCLUDING its attachment parts — is persisted on the SEND, hence before
+ *     the confirmed build starts, so BRAIN reads the image/PDF/office/deck context server-side
+ *     (C3 §2.1). R-18/U13 (plan 006) retired the separate `createBuild` round trip this used to
+ *     go through: the row's parentage now rides the turn's own `POST .../turns` request as a
+ *     `create` block, so the server can check the workspace BEFORE creating anything — see
+ *     `fireRelayTurn`'s R-18 comment in `ConversationSurface.tsx`. `h.createBuild` stays mocked
+ *     below for the harness's sake but is never called; nothing in this file asserts on it.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
@@ -104,7 +108,7 @@ beforeEach(() => {
 afterEach(() => cleanup())
 
 describe('BuilderPage — the attachment user-turn is persisted before the build starts', () => {
-  it('sends the attachment as an OWNED REF on the wire message, created-before-started (U7/R3)', async () => {
+  it('sends the attachment as an OWNED REF on the wire message, WITH the row\'s own create block, before the build starts (R-18/U13, was U7/R3)', async () => {
     // buildUserParts stands in for the upload: it yields a text part + a file part.
     h.buildUserParts.mockImplementation(async (text) => [
       { type: 'text', text },
@@ -115,11 +119,21 @@ describe('BuilderPage — the attachment user-turn is persisted before the build
 
     // U13: the turn reaches the SERVER with the attachment as an owned reference — the
     // server persists it into the thread BRAIN later reads.
-    const [, wire] = h.startTurn.mock.calls[0]
+    const [, wire, , create] = h.startTurn.mock.calls[0]
     expect(wire.text).toBe('use this layout')
     expect(wire.attachmentIds).toEqual(['a1'])
-    // …and the row exists BEFORE the build is started (create → stream → confirm → build).
-    expect(h.createBuild.mock.invocationCallOrder[0]).toBeLessThan(
+    // R-18/U13 — THE ROW'S PARENTAGE RIDES THIS SAME CALL NOW, so there is no separate
+    // `createBuild` round trip left to order against `buildFromPlan`: `create` is this call's
+    // 4th argument, present because this is the FIRST message on an empty thread, and it is
+    // what lets the server check the workspace before creating the row at all (rather than
+    // committing it a round trip earlier, as the retired two-call protocol did — see
+    // `fireRelayTurn`'s R-18 comment in `ConversationSurface.tsx`).
+    expect(create).toMatchObject({ projectId: 'p1', kind: 'build' })
+    // …and this ONE call — carrying both the message and the row's parentage — still happens
+    // BEFORE the build is started (create+turn → stream → confirm → build). The two-call
+    // ordering this test used to prove via `createBuild` vs `buildFromPlan` collapses to a
+    // single call ordered against `buildFromPlan`, because there is only one call left to order.
+    expect(h.startTurn.mock.invocationCallOrder[0]).toBeLessThan(
       h.buildFromPlan.mock.invocationCallOrder[0],
     )
   })
@@ -145,9 +159,10 @@ describe('BuilderPage — the attachment user-turn is persisted before the build
     fireEvent.keyDown(textarea, { key: 'Enter' })
 
     await screen.findByText(/Upload failed: storage is full./i)
-    expect(h.createBuild).not.toHaveBeenCalled()
-    // The turn never reaches the server, so no plan comes back and there is nothing to
-    // confirm — the file-less build is unreachable rather than merely un-triggered.
+    // The turn never reaches the server AT ALL — no `create` block, no message, nothing — so no
+    // plan comes back and there is nothing to confirm — the file-less build is unreachable rather
+    // than merely un-triggered. (There is no separate `createBuild` call left to assert absent:
+    // R-18 folded the row's creation into this same, never-attempted `startTurn`.)
     expect(h.startTurn).not.toHaveBeenCalled()
     expect(screen.queryByRole('button', { name: /^Build this plan$/ })).toBeNull()
     expect(h.buildFromPlan).not.toHaveBeenCalled() // no build ignoring the file

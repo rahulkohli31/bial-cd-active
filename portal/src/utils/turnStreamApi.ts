@@ -507,10 +507,29 @@ export interface StartTurnMessage {
   attachmentIds?: string[]
 }
 
+/**
+ * THE PARENTAGE OF A CHAT THAT DOES NOT EXIST YET (R-18, plan 006 U13).
+ *
+ * Sent only with a chat's FIRST message. Until this existed, the row was created by a separate
+ * `POST /conversations` a round trip earlier — and that call's only workspace awareness was a
+ * project-ownership check, so a message the workspace then refused left a real, titled, empty
+ * conversation in the project's list, named after the text that had just been refused.
+ *
+ * Carrying it here lets the server check first and create second, inside one transaction, so a
+ * refusal rolls the row back with it.
+ */
+export interface NewConversationParentage {
+  projectId: string
+  kind: 'plan' | 'build'
+  title?: string
+  context?: unknown
+}
+
 export async function startTurn(
   conversationId: string,
   message: StartTurnMessage,
-  deps: AuthFetchDeps = {}
+  deps: AuthFetchDeps = {},
+  create?: NewConversationParentage,
 ): Promise<{ turnId: string }> {
   const resp = await authFetch(
     `/api/conversations/${conversationId}/turns`,
@@ -523,6 +542,10 @@ export async function startTurn(
           attachmentTexts: message.attachmentTexts ?? [],
           attachmentIds: message.attachmentIds ?? [],
         },
+        // OMITTED, not `undefined`, for every turn after the first: the server treats a `create`
+        // block on an existing conversation as a retry and ignores it, but sending one where none
+        // is meant would make the wire say something the client does not intend.
+        ...(create ? { create } : {}),
       }),
     },
     deps
