@@ -13,7 +13,7 @@
  */
 import { useCallback, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Plus, Search, Loader2, FolderPlus, X } from 'lucide-react'
+import { Plus, Search, Loader2, FolderPlus, X, AlertCircle } from 'lucide-react'
 import Navbar from '../components/layout/Navbar'
 import { listProjects, deleteProject, type Project } from '../utils/projectApi'
 import { ApiError } from '../utils/apiError'
@@ -205,11 +205,20 @@ export default function ProjectsPage(): React.JSX.Element {
         />
       )}
 
+      {/* U15: this channel only ever carries a failure (a successful delete is silent — the
+          row is just gone), so it is deliberately NOT wired to a dismiss timer the way
+          Navbar's and AdminPage's toasts once were. A confirmation may fade on its own;
+          something that went wrong waits for the reader to dismiss it, and the reader is the
+          only thing that clears this one. The AlertCircle marks it as a failure the same way
+          the other two sites now mark theirs, so the appearance carries the fact even
+          without reading the words. */}
       {toast !== null && (
         <div
           role="alert"
+          data-testid="projects-toast"
           className="fixed bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-3 bg-red-600 text-white text-sm font-medium px-4 py-2.5 rounded-xl shadow-lg"
         >
+          <AlertCircle size={15} className="flex-shrink-0" data-testid="projects-toast-marker" />
           {toast}
           <button onClick={() => setToast(null)} aria-label="Dismiss" className="text-white/80 hover:text-white">
             <X size={15} />

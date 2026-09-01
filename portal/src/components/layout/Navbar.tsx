@@ -134,17 +134,21 @@ export default function Navbar() {
 
   const handleLogout = async () => {
     // Await the server-side revoke (bumps token_version + revokes refresh
-    // families + clears cookies). logout() records the LOGGED_OUT banner and
-    // never throws — on failure we still leave, surfacing a toast so the user
-    // knows this device's session may linger until it expires. Never trap the
-    // user's intent to sign out.
+    // families + clears cookies). logout() never throws. Never trap the
+    // user's intent to sign out — the very next statement always leaves.
     const ok = await logout()
     // Attachment BYTES now live server-side, scoped per user — nothing local to
     // wipe on logout. Release any in-memory attachment object URLs so the next
     // user's tab doesn't inherit cached blob handles (memory hygiene only).
     revokeAllAttachmentUrls()
-    if (!ok) showToast('Sign-out may be incomplete on this device.')
-    navigate('/login')
+    // U15: a failed revoke means this browser's session MAY still be live — a fact worth
+    // telling the user — but this component cannot be the one to show it. `navigate` below
+    // unmounts this page in the same tick, which unmounts the navbar, which owns
+    // `toastMsg` — a local toast set here would be destroyed before a single frame renders
+    // it (nobody has ever seen it). A message that must outlive its own page cannot be
+    // owned by that page: hand it forward as router state instead, so the screen it
+    // actually reaches — LoginPage — is the one that renders it, *after* the redirect.
+    navigate('/login', ok ? undefined : { state: { signoutWarning: 'Sign-out may be incomplete on this device.' } })
   }
 
   return (

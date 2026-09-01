@@ -10,7 +10,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
 
 const h = vi.hoisted(() => ({
   fetchUsageToday: vi.fn(),
@@ -287,5 +287,63 @@ describe('the avatar menu opens and closes (#157 A)', () => {
     expect(menuIsOpen()).toBe(true)
     fireEvent.click(screen.getByTitle('Send feedback'))
     expect(menuIsOpen()).toBe(false)
+  })
+})
+
+/**
+ * U15 — THE HEADLINE. A failed sign-out used to call `showToast(...)` and then
+ * `navigate('/login')` on the very next line: the navigate unmounts ProjectsPage —
+ * unmounts the navbar — which OWNS the toast state, destroying the message in the same
+ * tick it was created. Nobody has ever seen it, on any device. The fix hands the warning
+ * forward as router state instead, so the screen the person actually LANDS ON renders it.
+ *
+ * `LoginScreenProbe` stands in for LoginPage here — it reads exactly the same
+ * `location.state.signoutWarning` LoginPage reads, so a passing test proves what reaches
+ * the destination screen, not merely what Navbar tried to render before leaving.
+ */
+function LoginScreenProbe() {
+  const location = useLocation()
+  return <div data-testid="login-screen">{location.state?.signoutWarning ?? ''}</div>
+}
+
+const renderNavbarWithLoginRoute = () =>
+  render(
+    <MemoryRouter initialEntries={['/dashboard']}>
+      <Routes>
+        <Route path="/dashboard" element={<Navbar />} />
+        <Route path="/login" element={<LoginScreenProbe />} />
+      </Routes>
+    </MemoryRouter>,
+  )
+
+const signOut = async () => {
+  await waitFor(() => expect(h.fetchUsageToday).toHaveBeenCalled())
+  const trigger = screen.getByText('Asha', { selector: 'p' }).closest('button')
+  fireEvent.click(trigger)
+  fireEvent.click(screen.getByRole('button', { name: /sign out/i }))
+}
+
+describe('the sign-out warning outlives the navigation (U15)', () => {
+  it('THE BUG: a failed sign-out leaves the warning readable on the screen the person lands on', async () => {
+    h.logout.mockResolvedValue(false)
+    renderNavbarWithLoginRoute()
+
+    await signOut()
+
+    // The navbar (and the toast state it used to own) is gone — this asserts the
+    // destination screen, not a message that flashed before the redirect.
+    const loginScreen = await screen.findByTestId('login-screen')
+    expect(loginScreen.textContent).toBe('Sign-out may be incomplete on this device.')
+    expect(screen.queryByText('Asha')).toBeNull()
+  })
+
+  it('carries no warning across on a clean sign-out', async () => {
+    h.logout.mockResolvedValue(true)
+    renderNavbarWithLoginRoute()
+
+    await signOut()
+
+    const loginScreen = await screen.findByTestId('login-screen')
+    expect(loginScreen.textContent).toBe('')
   })
 })

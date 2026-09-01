@@ -12,6 +12,20 @@ function renderAt(path) {
   )
 }
 
+// U15: the other half of the sign-out-warning fix. Navbar's handleLogout hands this
+// exact shape to `navigate('/login', { state })` on a failed revoke — a real in-SPA
+// `initialEntries` array entry (not just a path string) is how MemoryRouter lets a test
+// seed that router state without going through Navbar at all. `pathname`/`search` are
+// split out explicitly so a query string in `path` still reaches `useSearchParams()`.
+function renderAtWithState(path, state) {
+  const [pathname, search = ''] = path.split('?')
+  return render(
+    <MemoryRouter initialEntries={[{ pathname, search: search ? `?${search}` : '', state }]}>
+      <LoginPage />
+    </MemoryRouter>,
+  )
+}
+
 beforeEach(() => {
   localStorage.clear()
 })
@@ -124,5 +138,28 @@ describe('LoginPage — Entra "Sign in with Microsoft" only', () => {
   it('shows no banner on a clean visit', () => {
     renderAt('/login')
     expect(screen.queryByTestId('login-notice')).toBeNull()
+  })
+
+  // U15: the sign-out warning carried across the redirect as router state. This is the
+  // rendering half of the headline fix — Navbar.test.jsx proves the state reaches this
+  // route at all; this proves LoginPage reads it and shows it.
+  it('shows the sign-out warning carried as router state', () => {
+    renderAtWithState('/login', { signoutWarning: 'Sign-out may be incomplete on this device.' })
+    expect(screen.getByTestId('login-notice').textContent).toBe(
+      'Sign-out may be incomplete on this device.',
+    )
+  })
+
+  it('does not crash and shows no banner when the router state has no signoutWarning key', () => {
+    renderAtWithState('/login', { somethingElse: true })
+    expect(screen.getByTestId('login-microsoft')).toBeTruthy()
+    expect(screen.queryByTestId('login-notice')).toBeNull()
+  })
+
+  it('an authError still wins over a carried sign-out warning', () => {
+    renderAtWithState('/login?authError=wrong_tenant', {
+      signoutWarning: 'Sign-out may be incomplete on this device.',
+    })
+    expect(screen.getByTestId('login-notice').textContent).toContain('BIAL organization')
   })
 })

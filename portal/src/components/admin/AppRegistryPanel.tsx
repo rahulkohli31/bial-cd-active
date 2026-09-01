@@ -415,7 +415,9 @@ function AuditDrawer({ app, onClose }: AuditDrawerProps) {
  * the admin-gated /api/admin/apps endpoints. Loads via useCallback+useEffect.
  */
 export interface AppRegistryPanelProps {
-  onToast: (msg: string) => void
+  // U15: severity is optional (default 'ok' on the AdminPage side) so a plain confirmation
+  // call reads exactly as it always has — only `act()`'s catch branch below passes 'problem'.
+  onToast: (msg: string, severity?: 'ok' | 'problem') => void
 }
 
 export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
@@ -467,10 +469,15 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
   // inspect which failure it was. (It used to return a bare boolean; the withdrawal race
   // needs the error's `code`, and re-throwing after already toasting would have made the
   // one caller that cares wrap every call in a second try.)
+  //
+  // U15: this is the one channel a confirmation AND a raw failure both travel down —
+  // `okMsg` on the happy path, `e`'s message on the catch. They must not render the same
+  // way: an administrator reading a channel that looks identical either way cannot tell,
+  // without reading the words, whether the action they just took worked.
   const act = async (appId: string, fn: () => Promise<unknown>, okMsg?: string): Promise<unknown> => {
     setBusyIds((s) => new Set(s).add(appId))
     try { await fn(); if (okMsg) onToast(okMsg) ; await load(); return null }
-    catch (e) { onToast(e instanceof Error ? e.message : String(e)); return e }
+    catch (e) { onToast(e instanceof Error ? e.message : String(e), 'problem'); return e }
     finally { setBusyIds((s) => { const n = new Set(s); n.delete(appId); return n }) }
   }
 

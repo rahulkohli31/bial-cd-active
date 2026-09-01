@@ -1,3 +1,8 @@
+// U15: `act()`'s catch branch now calls `onToast(message, 'problem')` — the severity
+// AdminPage's shared toast channel uses to render a failure differently from a
+// confirmation, so an administrator can tell which one they're looking at without
+// reading the words. Every failure-path `onToast` assertion below carries that second
+// argument; the success-path ones (a bare `onToast(okMsg)`) are unchanged.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup, waitFor, fireEvent } from '@testing-library/react'
 import AppRegistryPanel from '../AppRegistryPanel.jsx'
@@ -205,7 +210,7 @@ describe('AppRegistryPanel — registry vocabulary + actions', () => {
     await screen.findByText('Gate Tool')
     fireEvent.click(screen.getByTestId('review-app-1'))
     fireEvent.click(screen.getByTestId('approve-btn'))
-    await waitFor(() => expect(onToast).toHaveBeenCalledWith(copy))
+    await waitFor(() => expect(onToast).toHaveBeenCalledWith(copy, 'problem'))
     // The modal stays OPEN on the 409 — the admin still needs the submission metadata
     // to re-review; act() reports failure so onApprove does not setReview(null).
     expect(screen.getByTestId('approve-btn')).toBeTruthy()
@@ -260,7 +265,7 @@ describe('AppRegistryPanel — registry vocabulary + actions', () => {
     render(<AppRegistryPanel onToast={onToast} />)
     await screen.findByText('Live Tool')
     fireEvent.click(screen.getByTestId('mark-deployed-app-2'))
-    await waitFor(() => expect(onToast).toHaveBeenCalledWith('URL scheme should be https'))
+    await waitFor(() => expect(onToast).toHaveBeenCalledWith('URL scheme should be https', 'problem'))
     prompted.mockRestore()
   })
 
@@ -591,7 +596,7 @@ describe('a submission withdrawn while the modal was open', () => {
     await openReview()
     fireEvent.click(screen.getByTestId('approve-btn'))
 
-    await waitFor(() => expect(onToast).toHaveBeenCalledWith(copy))
+    await waitFor(() => expect(onToast).toHaveBeenCalledWith(copy, 'problem'))
     expect(screen.queryByTestId('review-withdrawn')).toBeNull()
     expect(screen.getByTestId('approve-btn')).toBeTruthy()
   })
