@@ -260,10 +260,18 @@ describe('LivePreview — a reclaimed container is never an error (R17)', () => 
 })
 
 describe('LivePreview — the restore offer is driven by `restorable` (R18)', () => {
-  it('offers the way back when the server says it can restore — with NO live container (AE10)', async () => {
-    // AE10 exactly: the builder never pressed Save, so there is no saved bundle and no live
-    // sandbox — only the platform's recovery copy. `recoveryAt` cannot serve this case at all
-    // (it needs a successful attach), which is why `restorable` exists.
+  it('INERTNESS GUARD: the four start buttons are gone, and the explanation is not', async () => {
+    // AE10 used to be asserted here by pressing "Bring it back". That control moved — R3 says
+    // exactly ONE control starts the app, and four scattered through this file's placeholder arms
+    // is the same requirement satisfied five times over, in a vocabulary the client replaced
+    // ("preview" is the developer's word; the person's word is their app).
+    //
+    // TWO HALVES, AND THE SECOND IS WHY THIS IS NOT JUST A DELETION. The absence assertion below
+    // would pass just as happily on a pane that renders nothing at all, so it is paired with the
+    // copy that must survive: this placeholder still has to SAY what happened. The affordance's
+    // new home is asserted where it lives — `AppPane.test.tsx` pins that every no-frame state
+    // still offers a reachable way to start the app, which is the half that would otherwise go
+    // missing silently.
     const verdict = await asTheBrowserSeesIt({
       state: 'asleep',
       alive: false,
@@ -273,10 +281,15 @@ describe('LivePreview — the restore offer is driven by `restorable` (R18)', ()
     expect(verdict.restorable).toBe(true)
 
     const onRelaunch = vi.fn()
-    paneFor(verdict, { onRelaunch })
+    const { container } = paneFor(verdict, { onRelaunch })
 
-    fireEvent.click(screen.getByRole('button', { name: /bring it back/i }))
-    expect(onRelaunch).toHaveBeenCalledTimes(1)
+    // Liveness: the pane still explains the state.
+    expect(container.textContent).toMatch(/workspace is asleep/i)
+    // Inertness: no start control, under any of its retired labels, and the prop it was wired to
+    // is never called from here.
+    expect(screen.queryByRole('button', { name: /bring it back/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
+    expect(onRelaunch).not.toHaveBeenCalled()
   })
 
   it('claims NOTHING when `restorable` is null — the object store was unreachable', async () => {
@@ -427,5 +440,34 @@ describe('a workspace found reverted while the tab sat idle', () => {
     // LIVENESS: the cover really is up, so the absence above is a choice of wording rather than
     // a component that rendered nothing at all.
     expect(screen.getAllByText(/Getting your app ready/i).length).toBeGreaterThan(0)
+  })
+})
+
+describe('LivePreview — what Plan F removed, and what it deliberately did not', () => {
+  it('defines and exports no start affordance at all', async () => {
+    // A STRUCTURAL guard, because the behavioural ones above can only see the states they set up.
+    // Four render sites shared one component; deleting three and leaving the fourth is exactly the
+    // partial removal that made this worth pinning, and no rendered assertion would have caught it.
+    const source = (await import('../LivePreview?raw')).default as string
+    const uses = source.split('RelaunchAffordance').length - 1
+
+    // One mention survives — the note recording the removal and where the control went.
+    expect(uses).toBe(1)
+    expect(source).toMatch(/`RelaunchAffordance` IS GONE/)
+    expect(source).not.toMatch(/function RelaunchAffordance/)
+  })
+
+  it('keeps everything from the frame inward untouched', async () => {
+    // The removal was of NO-FRAME chrome. The security seam, the cover, the frame key and the
+    // device widths are the parts of this component the workspace redesign explicitly does not
+    // touch, and a sweep that took them with the placeholders would be a silent regression on the
+    // one thing this file is genuinely load-bearing for.
+    const source = (await import('../LivePreview?raw')).default as string
+
+    expect(source).toMatch(/e\.source/)          // the inbound-message gate, on origin AND source
+    expect(source).toMatch(/sandbox=/)           // the sandbox token list
+    expect(source).toMatch(/const frameKey =/)   // the frame's identity
+    expect(source).toMatch(/const DEVICES/)      // the device widths
+    expect(source).toMatch(/setCovered/)         // the cover that holds on an unknown
   })
 })

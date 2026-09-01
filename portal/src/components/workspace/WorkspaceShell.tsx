@@ -46,8 +46,9 @@ import { Outlet, useLocation } from 'react-router-dom'
 import { useEffect, useLayoutEffect, useState } from 'react'
 import Navbar from '../layout/Navbar'
 import ReclaimWorkspaceDialog from '../projects/ReclaimWorkspaceDialog'
-import AppPaneHost from './AppPaneHost'
+import AppPane from './AppPane'
 import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
+import { WorkspaceExitProvider, useUnsavedWorkGuard } from './UnsavedWorkGuard'
 import {
   WorkspaceChannelProvider,
   createWorkspaceChannel,
@@ -55,6 +56,7 @@ import {
   useWorkspaceChannel,
   useWorkspacePaneVisible,
   useWorkspaceReclaim,
+  useWorkspaceReport,
   useWorkspaceSaveState,
 } from './workspaceChannel'
 
@@ -169,6 +171,7 @@ function ReclaimSlot() {
   return (
     <ReclaimWorkspaceDialog
       blocked={reclaim.blocked}
+      startingProjectName={reclaim.startingProjectName}
       onSaveAndSwitch={() => reclaim.resolve(true)}
       onSwitchAnyway={() => reclaim.resolve(false)}
       onCancel={reclaim.cancel}
@@ -177,23 +180,31 @@ function ReclaimSlot() {
 }
 
 /**
- * THE RAIL MODE IS THE SHELL'S FOURTH RESPONSIBILITY, ADDED BY PLAN F.
+ * THE RAIL IS THE SHELL'S FOURTH RESPONSIBILITY, ADDED BY PLAN F — and it has ONE writer.
  *
  * Plan A's docblock says the shell holds "no data fetching and no chat state", and that is still
- * true: a rail mode is state about the SHELL'S OWN CHROME, derived from the address the router
- * already resolved, not about any conversation. It is published downward so a surface can read
- * which rail it is rendering into without re-deriving the same predicate from `useLocation` in
- * three places — and it is the alternative to the `?rail=` query param this plan rejected.
+ * true: a rail mode and a collapse are state about the SHELL'S OWN CHROME — one derived from the
+ * address the router already resolved, the other a toggle on the shell's own grid — and neither is
+ * about any conversation. They are published downward so a surface can READ which rail it is
+ * rendering into without re-deriving the same predicate from `useLocation` in three places, and
+ * they are the alternative to the `?rail=` query param this plan rejected.
+ *
+ * WHY THE SHELL OWNS THE COLLAPSE RATHER THAN THE OUTLET CHILD. The control that undoes a collapse
+ * cannot live in the rail — a collapsed rail is `w-0` and `invisible`, so a toggle inside it is a
+ * one-way door. It has to live on the pane side, and the pane is the shell's SIBLING of the Outlet.
+ * An Outlet child owning the state would have to publish both the flag and its toggle upward
+ * through the channel, which puts a function on a value-compared cell and gives one piece of chrome
+ * two writers. Holding it here is one `useState` and a prop.
  *
  * A LAYOUT effect, matching every other publisher on this channel: the pane host is a sibling
  * reading from the store, so a passive publish would leave it one committed frame behind.
  */
-function usePublishRailMode(mode: RailMode): void {
+function usePublishRail(mode: RailMode, collapsed: boolean): void {
   const channel = useWorkspaceChannel()
   useLayoutEffect(() => {
     const held = channel?.rail.get()
-    if (!held || held.mode === mode) return
-    channel?.rail.set({ ...held, mode })
+    if (!held || (held.mode === mode && held.collapsed === collapsed)) return
+    channel?.rail.set({ ...held, mode, collapsed })
   })
 }
 
@@ -202,7 +213,8 @@ function ShellFrame() {
   useUnsavedWorkWarning()
   const rail = useRailSlot()
   const mode = railModeFor(useLocation().pathname)
-  usePublishRailMode(mode)
+  const [collapsed, setCollapsed] = useState(false)
+  usePublishRail(mode, collapsed)
   // WHICH COLUMN GROWS, and it is not a cosmetic choice. The two columns are the conversation and
   // the app, and the conversation is the SIZED one whenever the app is on screen: the builder
   // surface's chat panel sets its own 288px and the pane takes everything left over, which is
@@ -216,9 +228,33 @@ function ShellFrame() {
   // than becoming a per-mode table here.
   const paneVisible = useWorkspacePaneVisible()
 
+  // THE IN-PLACE GUARD (U8), MOUNTED HERE AND NOT IN THE OUTLET CHILD. The exits it exists for —
+  // the navbar's links, the breadcrumb — sit ABOVE the Outlet, so a guard mounted below it would
+  // lose coverage of exactly the departing controls it was written for.
+  //
+  // `workspaceIsAlive` comes from the one computed state rather than from a second read: a `null`
+  // save state means "could not tell" only while the workspace is running, and means "nobody
+  // asked" otherwise. Conflating them fires a warning on every exit from every stopped project.
+  const report = useWorkspaceReport()
+  const { guard, dialog: unsavedWorkDialog } = useUnsavedWorkGuard({
+    saveDirty: useWorkspaceSaveState(),
+    workspaceIsAlive: report?.state.name === 'running',
+    projectId: report?.projectId ?? null,
+  })
+
+  // A RAIL COLLAPSED BESIDE A PANE MUST NOT SURVIVE THE PANE GOING AWAY. The control that restores
+  // it lives on the pane side, so a planning conversation — which has no pane at all — would
+  // inherit a hidden rail with nothing on screen and no way back. Reset when the pane leaves,
+  // rather than trying to keep a toggle reachable on a surface that has nowhere to put one.
+  useEffect(() => {
+    if (!paneVisible) setCollapsed(false)
+  }, [paneVisible])
+
   return (
+    <WorkspaceExitProvider value={guard}>
     <div className="h-screen flex flex-col font-manrope bg-bial-bg overflow-hidden">
       <ReclaimSlot />
+      {unsavedWorkDialog}
       <Navbar />
       {/* THE TWO-COLUMN GRID, BUILT ONCE, ABOVE THE OUTLET. Plan F supplies the rail's contents
           and the threshold that flips `stacked`; it does not build a second two-column frame
@@ -242,15 +278,19 @@ function ShellFrame() {
           id={WORKSPACE_RAIL_ID}
           data-testid="workspace-outlet"
           data-rail-mode={mode}
-          className={`min-w-0 min-h-0 flex flex-col overflow-hidden ${railWidthClass(mode, rail.collapsed, paneVisible)}`}
+          className={`min-w-0 min-h-0 flex flex-col overflow-hidden ${railWidthClass(mode, collapsed, paneVisible)}`}
         >
           <Outlet />
         </div>
         {/* The pane column — a SIBLING of the Outlet, which is what stops any route change from
-            reaching it. This is the whole of R8's mechanism, in one line of JSX. */}
-        <AppPaneHost />
+            reaching it. This is the whole of R8's mechanism, in one line of JSX.
+            `AppPane` (Plan F, U4) wraps the host with the region label, the skip control and the
+            sentence for when there is nothing to frame; the iframe and its identity stay in the
+            host, because a second mount of it is the remount AE4 and AE37 exist to forbid. */}
+        <AppPane collapsed={collapsed} onToggleCollapsed={() => setCollapsed((was) => !was)} />
       </div>
     </div>
+    </WorkspaceExitProvider>
   )
 }
 

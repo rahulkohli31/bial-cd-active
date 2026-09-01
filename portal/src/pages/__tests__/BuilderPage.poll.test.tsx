@@ -247,6 +247,12 @@ describe('BuilderPage — the preview poll stops on a terminal answer (R16)', ()
     expect(framedUrl()).toBe(PREVIEW_URL)
   })
 
+  // R3/U4 (Plan F) — RE-POINTED, NOT AN INERTNESS GUARD. This test's real subject is the POLL's
+  // stopping rule, not the button: it pins that a settled-but-undecided `restorable: null` keeps
+  // the timer running, and that it stops the moment the store gives a DEFINITE answer. That
+  // precedence is exactly as testable without the button as with it — `hasSavedBuild`'s tri-state
+  // copy on the card is still driven by the same resolved value the button used to gate on, so
+  // the copy is the liveness half now instead of the button's presence.
   it('KEEPS asking when the workspace is settled but `restorable` decided nothing', async () => {
     // HALF AN ANSWER IS NOT A TERMINAL ANSWER. `asleep` is a settled fact about the container;
     // `restorable: null` is the tri-state's explicit "no claim", returned when the object store
@@ -263,17 +269,20 @@ describe('BuilderPage — the preview poll stops on a terminal answer (R16)', ()
     // The worst screen this pane can render: the workspace is gone, the store was unreachable,
     // and the prop was a cold `false` — so the builder is told their work never existed.
     expect(screen.getByTestId('preview-unavailable-card').textContent).toContain('no saved build yet')
-    expect(screen.queryByRole('button', { name: /bring it back/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /bring it back|relaunch/i })).toBeNull()
 
     expect(probeCount()).toBe(1)
     await tick(3)
     expect(probeCount()).toBe(4)
 
-    // ...and the moment the store answers, the poll settles and the restore is on offer.
+    // ...and the moment the store answers, the poll settles — pinned by the copy flipping to the
+    // confirmed-true reassurance ("Nothing is lost"), since the button that used to carry the
+    // same claim is gone (R3: it moved to `StartAppControl`, which is not reachable from this
+    // still-framed pane state — see the session report for that finding).
     h.fetchPreviewState.mockResolvedValue(answer('asleep', true))
     await tick(1)
     const settledAt = probeCount()
-    expect(screen.getByRole('button', { name: /bring it back/i })).toBeTruthy()
+    expect(screen.getByTestId('preview-unavailable-card').textContent).toContain('Nothing is lost')
     await tick(3)
     expect(probeCount()).toBe(settledAt)
   })
@@ -448,11 +457,14 @@ describe('BuilderPage — `restorable` vs the `projectHasSavedBuild` prop (U17, 
   // the server does not spend the round trip) must fall through to the older-but-real reading
   // instead of retracting a claim the server once made confidently.
 
+  // U4 (Plan F) — RE-POINTED, NOT AN INERTNESS GUARD. The precedence under test (poll overrides a
+  // stale cold-load prop) is a claim about the CARD'S COPY, which `hasSavedBuild` still drives
+  // identically to before — only the button that used to accompany the same claim is gone (R3).
   it('the poll can OFFER a restore the cold-load prop denied — the recovery copy the prop never saw', async () => {
     h.fetchPreviewState.mockResolvedValue(answer('asleep', true))
     await framedBuild(false)
 
-    expect(screen.getByRole('button', { name: /bring it back/i })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /bring it back|relaunch/i })).toBeNull()
     expect(screen.getByTestId('preview-unavailable-card').textContent).toContain('Nothing is lost')
   })
 
@@ -461,7 +473,7 @@ describe('BuilderPage — `restorable` vs the `projectHasSavedBuild` prop (U17, 
     await framedBuild(true)
 
     expect(goneCard()).not.toBeNull()
-    expect(screen.queryByRole('button', { name: /bring it back/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /bring it back|relaunch/i })).toBeNull()
     expect(screen.getByTestId('preview-unavailable-card').textContent).toContain('no saved build yet')
   })
 
@@ -469,9 +481,10 @@ describe('BuilderPage — `restorable` vs the `projectHasSavedBuild` prop (U17, 
     h.fetchPreviewState.mockResolvedValue(answer('asleep', null))
     await framedBuild(true)
 
-    expect(screen.getByRole('button', { name: /bring it back/i })).toBeTruthy()
-    // The copy is driven by the SAME resolved value as the button, so the prop's confirmed
-    // `true` is what the card promises. `null` withdraws nothing — it only declines to speak.
+    expect(screen.queryByRole('button', { name: /bring it back|relaunch/i })).toBeNull()
+    // The copy is driven by the SAME resolved value the button used to gate on, so the prop's
+    // confirmed `true` is what the card promises. `null` withdraws nothing — it only declines to
+    // speak.
     expect(screen.getByTestId('preview-unavailable-card').textContent).toContain('Nothing is lost')
   })
 })

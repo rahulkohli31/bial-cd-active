@@ -809,12 +809,20 @@ describe('BuilderPage — the "come back later" relaunch entry point (#43)', () 
     expect(await screen.findByRole('button', { name: /relaunch last saved version/i })).toBeTruthy()
   })
 
+  // U4 (Plan F) — RE-POINTED, NOT AN INERTNESS GUARD. This pane's empty-state copy is not
+  // `LivePreview`'s any more — `showEmpty` is gone, and `AppPane` mounts `NoFrame` (drawn from
+  // `workspaceState.ts`'s state map) whenever the address resolver has no URL, which is exactly
+  // this scenario (no transcript, no build, nothing to frame). The specific sentence rendered
+  // here is `couldNotRead()`'s honest "nothing decided yet" copy — this file never mocks
+  // `fetchPreviewState`, so the poll's real, unmocked fetch fails and the pane says so rather than
+  // guessing — but the assertion that matters for THIS test's title survives untouched: no phantom
+  // Relaunch/start control appears over a project nothing has been built in.
   it('a fresh mount with NO outcome keeps the idle empty state — nothing to relaunch', async () => {
     h.getBuild.mockResolvedValue(null)
     const { deps: sessionDeps } = deps()
     const { container } = renderBuilder({ deps: sessionDeps })
     await screen.findByPlaceholderText(/describe what you need/i)
-    expect(container.textContent).toMatch(/preview will appear here/i)
+    expect(container.textContent).toMatch(/we could not check on your app/i)
     expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
   })
 })

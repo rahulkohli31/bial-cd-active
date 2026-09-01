@@ -44,17 +44,14 @@
  * defeating that guard but BYPASSING it with a second mechanism it does not cover.
  */
 import { useCallback, useMemo, useState } from 'react'
-import { PanelLeftClose, PanelLeftOpen } from 'lucide-react'
 import WorkspaceRail from './WorkspaceRail'
 import type { ChatSummary } from './WorkspaceRail'
-import { WORKSPACE_RAIL_ID } from './WorkspaceShell'
 import { useWorkspaceState } from './useWorkspaceState'
 import type { StartOutcome } from './workspaceState'
 import {
   useAppPaneVisible,
   usePublishAddress,
   usePublishPaneView,
-  usePublishRailSlot,
   usePublishReclaim,
   usePublishSaveState,
   usePublishWorkspaceReport,
@@ -85,12 +82,13 @@ export interface ProjectWorkspaceProps {
   onToggleMenu: (chatId: string | null) => void
 }
 
-/** The bag the rail hands the shell. Frozen, so the channel's value comparison stays meaningful. */
-const NO_RAIL_STATE: Record<string, unknown> = Object.freeze({})
-
 export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   const { project } = props
-  const [collapsed, setCollapsed] = useState(false)
+  // THE URL A START JUST PRODUCED, fed into the resolver's RELAUNCHED arm — the one arm that needs
+  // no session and no chat, and which resolves its own status to `ready` because a restore has no
+  // build lifecycle. Without it the pane waits for the next poll tick to frame an app the citizen
+  // just pressed a button to bring up, which reads as the press having done nothing.
+  const [startedPreviewUrl, setStartedPreviewUrl] = useState<string | null>(null)
   const [reclaim, setReclaim] = useState<{ blocked: ReclaimBlocked; retry: () => Promise<void> } | null>(null)
 
   const workspace = useWorkspaceState({
@@ -110,7 +108,7 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
     turnPreviewUrl: null,
     turnStatus: null,
     narratingChatIsOpenChat: false,
-    relaunchedUrl: null,
+    relaunchedUrl: startedPreviewUrl,
     sessionUrl: null,
     sessionStatus: null,
     sessionId: null,
@@ -134,6 +132,8 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
     if (!reclaim) return null
     return {
       blocked: reclaim.blocked,
+      // The project this surface IS — the one being started, which is what the dialog leads with.
+      startingProjectName: project.name,
       resolve: async (save: boolean) => {
         // STOP, THEN SAVE, THEN RELEASE, THEN RETRY — the existing ordering, which is load-bearing:
         // save and release both refuse while a live session owns the container, so the stop is what
@@ -147,17 +147,13 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
       },
       cancel: () => setReclaim(null),
     }
-  }, [reclaim])
-
-  const railSlot = useMemo(
-    () => ({ mode: null, state: NO_RAIL_STATE, stacked: false, collapsed }),
-    [collapsed],
-  )
+  }, [reclaim, project.name])
 
   const report = useMemo(
     () => ({
       state: workspace.state,
       projectId: project.id,
+      onStarted: setStartedPreviewUrl,
       onStartOutcome: (outcome: StartOutcome | null) => {
         workspace.reportStartOutcome(outcome)
         // A start that reached the app clears the outcome AND asks again immediately, so the pane
@@ -172,24 +168,11 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
 
   const paneView = useMemo(
     () => ({
-      // THE COLLAPSE CONTROL LIVES IN THE PANE, and it has to. A collapsed rail is `w-0` and
-      // `invisible` — out of the tab order and out of the accessibility tree — so a toggle inside
-      // it would be a one-way door. The pane is what stays on screen, which makes it the only place
-      // the control is reachable in both states. `aria-controls` is what ties the two ends together
-      // for anyone reading or navigating the markup.
-      toolbarLeading: (
-        <button
-          type="button"
-          onClick={() => setCollapsed((was) => !was)}
-          aria-expanded={!collapsed}
-          aria-controls={WORKSPACE_RAIL_ID}
-          aria-label={collapsed ? 'Show project details' : 'Hide project details'}
-          title={collapsed ? 'Show project details' : 'Hide project details'}
-          className="p-1.5 rounded-lg text-neutral hover:text-primary hover:bg-bial-bg transition"
-        >
-          {collapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
-        </button>
-      ),
+      // NO TOOLBAR CHROME FROM HERE. The rail's collapse control is the shell's — it is drawn by
+      // `AppPane` itself, which is the part of the pane that renders whether or not there is
+      // anything to frame. Publishing it into `LivePreview`'s toolbar left a project with nothing
+      // built without a toggle at all.
+      toolbarLeading: null,
       // The publishing chip is the rail's, beside the project name (R37). Nothing here.
       toolbarTrailing: null,
       // NO TURN RUNS ON THIS SURFACE. Every one of these describes a build in flight, and there is
@@ -219,13 +202,12 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
       saving: false,
       saveError: null,
     }),
-    [collapsed, workspace.preview, workspace.save, project.hasRelaunchableSnapshot],
+    [workspace.preview, workspace.save, project.hasRelaunchableSnapshot],
   )
 
   useWorkspaceProject(project.id)
   usePublishAddress(address, project.id)
   usePublishPaneView(paneView)
-  usePublishRailSlot(railSlot)
   usePublishWorkspaceReport(report)
   usePublishSaveState(workspace.save?.dirty ?? null)
   usePublishReclaim(request)

@@ -179,6 +179,12 @@ void _paneViewIsASubsetOfLivePreviewProps
  */
 export interface ReclaimRequest {
   blocked: ReclaimBlocked
+  /**
+   * The project being STARTED — issue #161's framing half. The refusal carries only the incumbent,
+   * so the name of the app the person is actually trying to open has to travel with the request:
+   * the dialog leads with it, because "can I build THIS one?" is the question being asked.
+   */
+  startingProjectName: string | null
   /** `true` saves the other project before releasing it; `false` releases without saving. */
   resolve: (save: boolean) => Promise<void>
   cancel: () => void
@@ -270,6 +276,17 @@ export interface WorkspaceReport {
   projectId: string | null
   /** Record how a start attempt ended; `null` clears it (a start that reached the app). */
   onStartOutcome: (outcome: StartOutcome | null) => void
+  /**
+   * THE URL A SUCCESSFUL START JUST PRODUCED — and the publisher decides what to do with it.
+   *
+   * Without this, pressing the start control inside a Build chat did nothing visible: that surface
+   * feeds the resolver's project-scoped arm with `null` (its own poll only runs over a framed URL),
+   * and its `relaunchedUrl` arm was fed by a Relaunch button this plan retired — so the address had
+   * no arm left that a fresh start could populate, and the app came up in a container nothing
+   * framed. `previewAddress.ts`'s relaunched arm is exactly the right home for it: a restore has no
+   * build lifecycle at all, which is why that arm resolves its own status to `ready`.
+   */
+  onStarted: (previewUrl: string) => void
   /** Ask the platform again, now. A retry press, or a start that just finished. */
   onRefresh: () => void
   /**

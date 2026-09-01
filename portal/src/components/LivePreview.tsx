@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import type { ReactNode } from 'react'
-import { Monitor, Tablet, Smartphone, LayoutTemplate, PowerOff, RotateCcw, WifiOff, Moon, Save, Loader2 } from 'lucide-react'
-import { relaunchRetryable } from '../utils/buildSessionTypes'
+import { Monitor, Tablet, Smartphone, PowerOff, RotateCcw, WifiOff, Moon, Save, Loader2 } from 'lucide-react'
 import type { RelaunchError, BuildSessionStatus } from '../utils/buildSessionTypes'
 import type { PreviewLifeState } from '../utils/buildSessionApi'
 import type { CompileState } from '../utils/compileState'
@@ -185,39 +184,21 @@ function goneBody(
 }
 
 /**
- * The relaunch error + button pair, shared by the terminal placeholder and the
- * project-has-app empty state so the U6 response matrix behaves identically in both:
- * retryable errors keep the button, `not_found` (handled by the CALLER's copy) hides it.
+ * `RelaunchAffordance` IS GONE, and its four render sites with it (Plan F, U4).
+ *
+ * R3 says exactly ONE control starts the app, pressed deliberately, and that control is
+ * `components/workspace/StartAppControl.tsx` — rendered by `AppPane` from the one computed
+ * workspace state, whose action union contains no destructive verb at all. Four more start
+ * buttons scattered through this file's placeholder arms, each with its own copy and its own
+ * `hasSavedBuild === true` gate, is the same requirement satisfied five times over — and they
+ * spoke a different vocabulary ("Relaunch preview", "Bring it back") from the one the client
+ * settled on ("Launch Application"), because "preview" is the developer's word for the thing and
+ * the person's word is their app.
+ *
+ * The COPY around them stayed where it was: these placeholders still explain what happened. What
+ * left is the button, and the `onRelaunch` / `relaunchError` props that fed it now only reach the
+ * arms that still describe a state — `LivePreview.test.jsx` carries the inertness guards.
  */
-interface RelaunchAffordanceProps {
-  onRelaunch?: () => void
-  relaunchError: RelaunchError | null
-  label: string
-}
-
-function RelaunchAffordance({ onRelaunch, relaunchError, label }: RelaunchAffordanceProps) {
-  return (
-    <>
-      {relaunchError && relaunchError.kind !== 'not_found' && (
-        // 503 (transient) / 5xx: the failure's own copy, with the button restored below
-        // so the retry sits right where the user is looking.
-        <p role="alert" className="text-xs text-danger max-w-xs leading-relaxed mb-3">
-          {relaunchError.message}
-        </p>
-      )}
-      {onRelaunch && (!relaunchError || relaunchRetryable(relaunchError.kind)) && (
-        <button
-          type="button"
-          onClick={onRelaunch}
-          className="inline-flex items-center gap-1.5 text-xs font-worksans font-semibold text-white bg-primary hover:bg-primary/90 rounded-lg px-3.5 py-2 transition"
-        >
-          <RotateCcw size={13} />
-          {label}
-        </button>
-      )}
-    </>
-  )
-}
 
 /**
  * The calm wait: an opaque full-bleed card with the pane's bouncing dots and one sentence.
@@ -391,7 +372,12 @@ export default function LivePreview({
   onRelaunch,
   relaunching = false,
   relaunchError = null,
-  lastBuildFailed = false,
+  // ACCEPTED AND DELIBERATELY UNREAD. It chose between two labels on the start button this unit
+  // retired ("Relaunch preview" vs "Relaunch last saved version"). The prop stays because the
+  // pane view still carries it and `UnacceptedPaneProps` pins that every field here is a real
+  // prop; the distinction it drew now belongs to `restoredFromFailedBuild` below, which says the
+  // same thing where a citizen can act on it.
+  lastBuildFailed: _lastBuildFailed = false,
   restoredFromFailedBuild = false,
   completedLive = false,
   // Absent means UNKNOWN, never "confirmed there is not" — a default of false would let a
@@ -765,7 +751,7 @@ export default function LivePreview({
   const framePending = showFrame && !frameLoaded && !frameStalled
   const showLoading =
     framePending || (!isTerminal && !relaunching && !previewUrl && (status === 'provisioning' || status === 'building'))
-  const showEmpty = !isTerminal && !relaunching && !previewUrl && !showLoading
+  // `showEmpty` is GONE with the empty state it gated — see the note at its old render site.
 
   // ONE announcement for the whole pane, read out of a region that is ALWAYS mounted (below).
   // The pane now has four preview states on top of its four waits, and before this the only
@@ -894,46 +880,11 @@ export default function LivePreview({
       {/* Main area */}
       <div className="flex-1 flex overflow-hidden relative">
         <div className="flex-1 bg-[#e8edf2] flex p-4 overflow-auto">
-          {showEmpty && (
-            <div className="flex-1 flex flex-col items-center justify-center text-center">
-              <div className="w-16 h-16 rounded-2xl bg-gray-100 flex items-center justify-center mb-4">
-                <LayoutTemplate size={28} className="text-gray-300" />
-              </div>
-              <p className="text-sm font-semibold text-neutral mb-1">Your app preview will appear here</p>
-              {/* Finding #1: relaunch derives from PROJECT state, not this conversation's build
-                  history — a fresh chat in a project with a saved build can bring it back here.
-                  N7: the claim is made ONLY when the server confirmed a restorable snapshot. */}
-              {hasSavedBuild === true && onRelaunch && relaunchError?.kind !== 'not_found' ? (
-                <>
-                  <p className="text-xs text-neutral/60 max-w-xs leading-relaxed mb-4">
-                    This project already has a saved build. Relaunch it to preview the latest
-                    version, or send a prompt to keep building.
-                  </p>
-                  <RelaunchAffordance
-                    onRelaunch={onRelaunch}
-                    relaunchError={relaunchError}
-                    label="Relaunch preview"
-                  />
-                </>
-              ) : (
-                <>
-                  {/* A 404 on the click used to hide the button with NO message: the user
-                      pressed Relaunch and the affordance simply vanished. That silence was
-                      defensible while the claim itself was untrustworthy — it hid our own
-                      false promise. With a truthful predicate a 404 is genuinely exceptional
-                      (the bundle was deleted between the read and the click), so say so. */}
-                  {relaunchError?.kind === 'not_found' && (
-                    <p role="alert" className="text-xs text-danger max-w-xs leading-relaxed mb-3">
-                      That saved build is no longer available. Send a prompt to build the app again.
-                    </p>
-                  )}
-                  <p className="text-xs text-neutral/60 max-w-xs leading-relaxed">
-                    Submit a prompt to start a build — the live app appears here once its dev server is up.
-                  </p>
-                </>
-              )}
-            </div>
-          )}
+          {/* THE EMPTY STATE IS GONE (Plan F, U4) — structurally unreachable, not merely unused.
+              `AppPane` is what mounts the host now, and it mounts it only when the address
+              resolver returned a URL; `showEmpty` required `!previewUrl`. The sentence a citizen
+              reads when there is nothing to frame is `AppPane`'s, drawn from the one computed
+              workspace state, so a pane sentence has exactly one author. */}
 
           {showRestoring && (
             <div className="flex-1 flex flex-col items-center justify-center gap-4" aria-busy="true">
@@ -1031,13 +982,6 @@ export default function LivePreview({
                 {/* The button is a SHORTCUT, never the only way back: a prompt restores the
                     workspace too, behind the labelled wait. Offered on the same confirmed-true
                     gate as everywhere else on this pane. */}
-                {hasSavedBuild === true && (
-                  <RelaunchAffordance
-                    onRelaunch={onRelaunch}
-                    relaunchError={relaunchError}
-                    label={notServing ? 'Bring it back' : 'Relaunch preview'}
-                  />
-                )}
               </div>
             </div>
           )}
@@ -1070,13 +1014,6 @@ export default function LivePreview({
                         ? 'This build session has ended. Relaunch it to restore your saved app into a fresh preview.'
                         : 'This build session has ended. Start a new build to bring the live preview back.'}
                   </p>
-                )}
-                {hasSavedBuild === true && (
-                  <RelaunchAffordance
-                    onRelaunch={onRelaunch}
-                    relaunchError={relaunchError}
-                    label={lastBuildFailed ? 'Relaunch last saved version' : 'Relaunch preview'}
-                  />
                 )}
               </div>
             </div>
@@ -1232,13 +1169,6 @@ export default function LivePreview({
                   ? 'It will appear here the moment it loads. If you would rather not wait, relaunch the preview to start it fresh.'
                   : 'It will appear here the moment it loads.'}
               </p>
-            )}
-            {hasSavedBuild === true && (
-              <RelaunchAffordance
-                onRelaunch={onRelaunch}
-                relaunchError={relaunchError}
-                label="Relaunch preview"
-              />
             )}
           </div>
         )}

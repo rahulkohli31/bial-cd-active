@@ -1,0 +1,184 @@
+/**
+ * THE APP PANE (Plan F, U4) — what the pane is called, and how to get past it.
+ *
+ * ═══ IT CONTRIBUTES THREE THINGS AND MOUNTS NO IFRAME ═══
+ *
+ * The region label, the skip control, and the sentence for when there is nothing to frame. The
+ * frame's mounting, its identity, its hiding and its reload nonce all stay in Plan A's
+ * `AppPaneHost`. An implementer who calls `LivePreview` from here has built a SECOND host, and a
+ * second host is the remount that AE4 and AE37 exist to forbid — the app would reload on every
+ * navigation and every crossing of the layout threshold, with nothing red anywhere.
+ *
+ * This removes work rather than adding it: the pane needs no framing logic of its own.
+ *
+ * ═══ THE SEAM: THE RESOLVED ADDRESS, AND THE STATE THAT CAN INVALIDATE IT ═══
+ *
+ * The address comes from `previewAddress.ts` — never `PreviewState.previewUrl` — with its
+ * precedence intact: the live turn's preview outranks the session URL, because the live turn is
+ * the app being built in front of the person while the session URL describes the previous build.
+ *
+ * TWO THINGS AN EARLIER CUT OF THIS FILE GOT WRONG BY READING ONLY `address.url`, both caught by
+ * the suites that pin the surfaces around this one:
+ *
+ *  1. A URL IS NOT THE ONLY THING THE RESOLVER RETURNS. Its own docblock says so: "a build that is
+ *     provisioning has a STATUS and no URL yet, and that pair is what renders the loading state
+ *     instead of an empty pane". Gating on the URL alone put "We could not check on your app." in
+ *     front of a citizen watching their first build come up.
+ *  2. AN ADDRESS OUTLIVES ITS PUBLISHER, DELIBERATELY — that is R8's whole mechanism — so a URL
+ *     stays held after the container behind it has stopped. Framing it regardless meant an app
+ *     that went to sleep showed a card saying "nothing is lost" with NO way to bring it back:
+ *     R3's "exactly one control starts it", satisfied by zero, in an ordinary state.
+ *
+ * So the workspace state gets a veto, and only for the states that DEFINITELY mean nothing is
+ * serving. `could-not-read` is pointedly not one of them: an answer that decided nothing must not
+ * pull a working app off the screen, which is the rule the whole preview reshape exists for.
+ *
+ * ═══ WHY A SKIP CONTROL, AND WHY IT CANNOT LIVE INSIDE THE FRAME ═══
+ *
+ * The pane is a cross-origin iframe. It swallows the tab sequence into a document whose length
+ * nothing here can know, and whose focus behaviour is the generated app's business — so a way PAST
+ * it has to exist outside it. Without one, a person navigating by keyboard is trapped in somebody
+ * else's application (R67).
+ *
+ * Nothing here makes any claim about the framed document's own accessibility. The pane says what it
+ * is; what is inside is the app's.
+ *
+ * ═══ L10 — DO NOT ASSUME THE APPS ROUTER SERVES A BRANDED PAGE ═══
+ *
+ * ACA wildcard DNS answers for hostnames whose container is long gone, so an "app is gone" 404 is
+ * not a reliable discriminator and a framed URL can resolve to a working-looking host serving
+ * nothing. The empty, stopped and gone states are therefore drawn HERE, from the workspace state,
+ * rather than left to whatever the framed origin happens to return.
+ */
+import { useCallback } from 'react'
+import { PanelLeftClose, PanelLeftOpen } from 'lucide-react'
+import AppPaneHost from './AppPaneHost'
+import StartAppControl from './StartAppControl'
+import { WORKSPACE_RAIL_ID } from './WorkspaceShell'
+import { useWorkspaceAddress, useWorkspacePaneVisible, useWorkspaceReport } from './workspaceChannel'
+import type { WorkspaceStateName } from './workspaceState'
+
+/** See `frameIt` below. Kept beside the component so the veto's members are readable at a glance. */
+const NOTHING_IS_SERVING: ReadonlySet<WorkspaceStateName> = new Set<WorkspaceStateName>([
+  'not-running',
+  'never-built',
+  'held-by-another-project',
+  'held-unattributed',
+])
+
+export interface AppPaneProps {
+  /** The rail's collapse, owned by the shell — see its `usePublishRail` note for why. */
+  collapsed: boolean
+  onToggleCollapsed: () => void
+}
+
+export default function AppPane({ collapsed, onToggleCollapsed }: AppPaneProps) {
+  const address = useWorkspaceAddress()
+  const report = useWorkspaceReport()
+  const visible = useWorkspacePaneVisible()
+
+  /**
+   * MOVE FOCUS BACK TO THE RAIL, and do it by focusing the region rather than hunting for its
+   * first control. A `tabindex="-1"` container is programmatically focusable without joining the
+   * tab order, so the next Tab continues from the rail's top — which is what a person escaping the
+   * frame actually wants. Querying for "the first button" would break the moment the rail's first
+   * element is not one.
+   */
+  // THE STATES THAT MEAN NOTHING IS SERVING, and therefore that a held address is stale.
+  //
+  // `could-not-read` is deliberately absent: a read that decided nothing must not retire a frame
+  // somebody is looking at. So are the three start outcomes — they describe a press that did not
+  // land, not a container that went away, and a frame already up is evidence enough.
+  const stale = report !== null && NOTHING_IS_SERVING.has(report.state.name)
+  // A STATUS WITH NO URL IS THE LOADING STATE, not an empty pane — see the docblock.
+  const frameIt = !stale && (address.url !== null || address.status !== null)
+
+  const skipPastTheApp = useCallback(() => {
+    const rail = document.getElementById(WORKSPACE_RAIL_ID)
+    if (!rail) return
+    if (!rail.hasAttribute('tabindex')) rail.setAttribute('tabindex', '-1')
+    rail.focus()
+  }, [])
+
+  return (
+    <section
+      data-testid="app-pane-region"
+      aria-label="Your app"
+      className="flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden"
+    >
+      {/* VISIBLE ON FOCUS ONLY. It is the standard skip-link treatment: out of the way for a
+          pointer, and the first thing a keyboard reaches on its way into the frame. */}
+      <button
+        type="button"
+        onClick={skipPastTheApp}
+        className="sr-only focus:not-sr-only focus:absolute focus:z-30 focus:m-2 focus:rounded-lg focus:bg-white focus:px-3 focus:py-2 focus:text-sm focus:font-semibold focus:text-primary focus:shadow-lg focus:outline-none focus:ring-2 focus:ring-primary/40"
+      >
+        Skip past your app
+      </button>
+
+      {/* THE RAIL'S COLLAPSE CONTROL, ON THE PANE SIDE — and it is drawn HERE rather than published
+          into the framed pane's toolbar, which is the version that failed. That toolbar is rendered
+          by `LivePreview`, which only mounts when there is something to frame; a project with
+          nothing built therefore had no toggle at all, and one collapsed from a running app would
+          have lost its way back the moment the container stopped. Its home has to be the part of
+          the pane that always renders, which is this component.
+
+          Rendered only while the pane is visible: a planning conversation has no pane, and
+          collapsing the rail there would leave an empty screen. */}
+      {visible && (
+        <div className="flex items-center px-3 pt-2">
+          <button
+            type="button"
+            onClick={onToggleCollapsed}
+            aria-expanded={!collapsed}
+            aria-controls={WORKSPACE_RAIL_ID}
+            aria-label={collapsed ? 'Show project details' : 'Hide project details'}
+            title={collapsed ? 'Show project details' : 'Hide project details'}
+            className="rounded-lg p-1.5 text-neutral transition hover:bg-bial-bg hover:text-primary"
+          >
+            {collapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
+          </button>
+        </div>
+      )}
+
+      {frameIt ? (
+        // THE FRAME IS THE HOST'S. Everything from the frame inward — the cover that holds on an
+        // unknown, the `load`-gated reveal, the frame key, the inbound-message gate on origin AND
+        // source, the sandbox token list, the device widths — is unchanged and stays there.
+        <AppPaneHost />
+      ) : (
+        <NoFrame report={report} />
+      )}
+    </section>
+  )
+}
+
+/**
+ * WHAT THE PANE SAYS WHEN THERE IS NOTHING TO FRAME — one author, and it is the state map.
+ *
+ * These arms used to live inside `LivePreview` as a six-prop placeholder precedence spelled at the
+ * pane's edge (`showRestoring` / `showTerminal` / `showReconnecting` / `showUnavailable`). They are
+ * removed there and drawn here from one computed value, so a pane sentence has exactly one author
+ * and a state nobody is in cannot have chrome drawn for it.
+ */
+function NoFrame({ report }: { report: ReturnType<typeof useWorkspaceReport> }) {
+  // NOBODY HAS COMPUTED A STATE. A surface mounted outside a workspace, or one still resolving its
+  // project. Saying nothing is the honest answer — inventing a sentence here would be a second
+  // author for the one thing this whole design gives a single one.
+  if (!report) return null
+
+  const { state } = report
+  return (
+    <div data-testid="app-pane-empty" className="flex flex-1 items-center justify-center p-8">
+      <div className="max-w-sm text-center">
+        <p className="text-base font-bold text-tertiary">{state.headline}</p>
+        {state.detail && <p className="mt-2 text-sm text-neutral leading-relaxed">{state.detail}</p>}
+        {state.action && (
+          <div className="mt-5 flex justify-center">
+            <StartAppControl action={state.action} report={report} />
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}

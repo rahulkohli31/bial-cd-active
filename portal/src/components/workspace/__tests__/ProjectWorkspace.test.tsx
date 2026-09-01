@@ -152,7 +152,13 @@ function Workspace({ entry = '/projects/pA', project = PROJECT }: { entry?: stri
 }
 
 const frame = () => document.querySelector('iframe')
-const pane = () => screen.queryByTestId('app-pane')
+// TWO DIFFERENT ELEMENTS, and the distinction is load-bearing. `app-pane-region` is `AppPane`'s
+// own named region — always rendered, whether or not there is anything to frame, and where the
+// skip control and the rail's collapse toggle live. `app-pane` is `AppPaneHost`'s frame wrapper,
+// which exists only once an address resolved. A test that queries the second when it means the
+// first reads "the pane is missing" for a project that simply has nothing built yet.
+const paneRegion = () => screen.queryByTestId('app-pane-region')
+const frameWrapper = () => screen.queryByTestId('app-pane')
 const grid = () => screen.getByTestId('workspace-grid')
 const rail = () => screen.getByTestId('workspace-outlet')
 
@@ -186,9 +192,33 @@ describe('R3 — loading a project address frames the running app, with no chat 
     render(<Workspace project={{ ...PROJECT, appId: null, hasRelaunchableSnapshot: false }} />)
 
     await waitFor(() => expect(api.fetchPreviewState).toHaveBeenCalled())
-    expect(pane()).toBeTruthy()
-    expect(pane()?.getAttribute('aria-hidden')).toBe('false')
+    // The pane is on screen and SAYING something — not a hidden column the citizen has to
+    // interpret. There is no frame, because there is nothing to frame; there is a sentence.
+    expect(paneRegion()).toBeTruthy()
+    expect(screen.getByTestId('app-pane-empty').textContent).toMatch(/describe what you want to build/i)
     expect(frame()).toBeNull()
+    expect(frameWrapper()).toBeNull()
+  })
+
+  it('★ AE1 — a saved, not-running project offers the ONE start control, on the project screen', () => {
+    // THE INVERSION THIS WHOLE PLAN TURNS ON, asserted where a citizen would meet it: through the
+    // real shell, at a project address, with no conversation in the story.
+    //
+    // It cannot live in `ProjectPage.test.tsx`. That suite renders the page WITHOUT the shell, so
+    // there is no pane in its tree at all and no assertion it can make would go red if the control
+    // disappeared — which is exactly the vacuous shape U9 exists to replace.
+    //
+    // Mutation receipt: stop rendering `state.action` in `AppPane`'s no-frame arm and this goes red,
+    // along with eight scenarios in `AppPane.test.tsx`.
+    api.fetchPreviewState.mockResolvedValue(preview({ state: 'asleep', restorable: true }))
+    render(<Workspace />)
+
+    return waitFor(() => {
+      expect(screen.getByRole('button', { name: /launch application/i })).toBeTruthy()
+      // …and exactly one of them. The rail shows the same SENTENCE, deliberately, and no second
+      // control: R3 says one control starts the app, and two would race the same endpoint.
+      expect(screen.getAllByRole('button', { name: /launch application/i })).toHaveLength(1)
+    })
   })
 
   it('frames NOTHING when the read says the workspace is asleep', async () => {
@@ -298,7 +328,7 @@ describe('the collapse control — hidden, not unmounted, and never a one-way do
     await waitFor(() => expect(frame()).toBeTruthy())
 
     const toggle = screen.getByRole('button', { name: /hide project details/i })
-    expect(pane()?.contains(toggle)).toBe(true)
+    expect(paneRegion()?.contains(toggle)).toBe(true)
     expect(rail().contains(toggle)).toBe(false)
 
     fireEvent.click(toggle)
@@ -324,6 +354,25 @@ describe('the collapse control — hidden, not unmounted, and never a one-way do
     // The subtree is still in the document — a draft and a scroll position survive the cycle.
     expect(screen.getByTestId('description-editor')).toBeTruthy()
     expect(rail().className).toMatch(/invisible/)
+  })
+
+  it('★ is reachable on a project with NOTHING BUILT, where there is no frame to hang it on', async () => {
+    // THE BUG THIS CAUGHT, found by this suite rather than by review. The toggle was first
+    // published into the pane's toolbar slot — the same place the conversation surface puts its
+    // chat-panel toggle. That toolbar is rendered by `LivePreview`, which only mounts once there is
+    // something to frame, so a project with nothing built had NO toggle at all; and a rail
+    // collapsed while an app was running would have lost its way back the moment the container
+    // stopped. Its home has to be the part of the pane that always renders.
+    api.fetchPreviewState.mockResolvedValue(preview({ state: 'never_built', restorable: false }))
+    render(<Workspace project={{ ...PROJECT, appId: null, hasRelaunchableSnapshot: false }} />)
+    await waitFor(() => expect(api.fetchPreviewState).toHaveBeenCalled())
+    expect(frame()).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: /hide project details/i }))
+    expect(rail().className).toMatch(/(^|\s)w-0(\s|$)/)
+    // …and back again, with no frame in the story at any point.
+    fireEvent.click(screen.getByRole('button', { name: /show project details/i }))
+    expect(rail().className).not.toMatch(/(^|\s)w-0(\s|$)/)
   })
 
   it('leaves the frame alone across a collapse — it is a class change, not a remount', async () => {
