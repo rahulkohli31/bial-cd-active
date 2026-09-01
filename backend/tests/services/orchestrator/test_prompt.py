@@ -130,16 +130,22 @@ def test_system_prompt_carries_the_generated_app_quality_rules() -> None:
 
 
 def test_system_prompt_tells_the_agent_who_is_reading() -> None:
-    """U15 / R20 / R22 — the build prompt narrates to a citizen, so it carries the audience block
-    from the one shared source (`prompt_blocks.NARRATION_VOICE`) that the live Write segment also
-    composes. Counted, not merely present: the block reaches this prompt through
-    `BUILD_WORKING_RULES_TAIL`, so a future author naming it again beside the TAIL would emit the
-    whole rule twice here and stutter at the model."""
+    """★ THE SCENARIO THE MOVE EXISTS TO MAKE SAFE (U5/R79).
+
+    The audience contract is shared by both chat kinds now, so it lives in
+    `mode_prompts._base()` — which this prompt CANNOT call, because `_base(context)` needs a
+    `PromptContext` the standalone build harness has no source for. It therefore names
+    `NARRATION_VOICE` itself, and this test is what stands between that line and its deletion.
+
+    `== 1`, NOT `in` AND NOT `<=`. The failure mode here is a count of ZERO — the block lifted
+    out of `BUILD_WORKING_RULES_TAIL` and never named at this site, which silently deletes the
+    audience contract from a live prompt and reinstates the 2026-08-18 defect it was written
+    for. An `in` assertion catches that; a `<= 1` does not, and the pair also catches the
+    opposite slip of naming it twice."""
     from src.core.prompt_blocks import NARRATION_VOICE
 
-    assert NARRATION_VOICE in BUILD_SYSTEM_PROMPT
     assert BUILD_SYSTEM_PROMPT.count(NARRATION_VOICE) == 1
-    assert BUILD_SYSTEM_PROMPT.count("A couple of lines at each milestone") == 1
+    assert BUILD_SYSTEM_PROMPT.lower().count("a couple of lines at each milestone") == 1
     lowered = BUILD_SYSTEM_PROMPT.lower()
     assert "talking to the user" in lowered
     assert "plain, everyday words" in lowered

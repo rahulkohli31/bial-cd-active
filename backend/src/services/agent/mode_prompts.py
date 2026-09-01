@@ -40,6 +40,8 @@ from src.core.prompt_blocks import (
     BUILD_WORKING_RULES_HEAD,
     BUILD_WORKING_RULES_TAIL,
     DATA_INTEGRITY_RULES,
+    NARRATION_VOICE,
+    PLAN_MESSAGE_LENGTH,
     PORTAL_SURFACES,
     WRITE_IDENTITY,
 )
@@ -71,30 +73,29 @@ def _base(context: PromptContext) -> str:
     # R5: the walkthrough caught the model inventing portal features. The relay had this
     # clause and the mode system did not, so R5 would have regressed the moment the relay
     # retired — it belongs in BASE, where every mode carries it.
-    return f"{identity}\n\n{PORTAL_SURFACES}\n\n{DATA_INTEGRITY_RULES}"
+    return f"{identity}\n\n{PORTAL_SURFACES}\n\n{DATA_INTEGRITY_RULES}\n\n{NARRATION_VOICE}"
 
 
-_PLAN_SEGMENT = """\
+_PLAN_SEGMENT = f"""\
 PLAN MODE — you and the user work out WHAT to build before anything gets built. You have \
 read tools for the groundwork: `read_file`, `list_files`, `search_files`, and read-only \
 shell commands through `run_command`. Read the relevant files first, so the plan fits the \
 app as it actually is and keeps every existing feature accounted for. Then write the plan \
-the way you would explain it to the person who asked — in plain, everyday words, about the \
-app they will use, not the code underneath. Lead with what the app or this change will DO \
+the way you would explain it to the person who asked, about the app they will use rather \
+than the code underneath. Lead with what the app or this change will DO \
 for them, in one sentence. Then lay out what they will SEE and be able to DO — the screens \
 and the actions, in human terms. Then say, in plain language, what the app will remember \
 for them ("every message is saved with the date it was sent, so nothing gets lost") — the \
 outcome, told the way a person would tell it. When a choice would change their experience, \
 put it to them as a plain question ("Should everyone see all the feedback, or just you?") \
-and state the assumption you have made for now. Keep the how-it's-built details behind the \
-scenes and out of the plan itself: the tools and frameworks, the file and folder names, \
-the way data is stored under the hood, the web-request wiring, and the engineering \
-pros and cons all belong to the build, not to the plan the user reads — describe \
-everything in words the user already knows. End a planning turn one of two ways: ask the \
+and state the assumption you have made for now. The engineering pros and cons belong to \
+the build too, not to the plan the user reads. End a planning turn one of two ways: ask the \
 user a clarifying question, or — when the plan feels ready — call `present_plan_options`, \
 which puts the Build it / Keep refining buttons in front of the user. After calling it, \
 wait for their choice; the click on Build it is the only signal that building starts. If \
-they keep refining, revise the plan and present again."""
+they keep refining, revise the plan and present again.
+
+{PLAN_MESSAGE_LENGTH}"""
 
 # NO COMMIT BLOCK LIVES HERE ANY MORE (U19 / R25), and re-adding one is a regression with two
 # separate costs. `_COMMIT_DISCIPLINE` used to sit at the end of this segment teaching the agent
@@ -146,11 +147,12 @@ this is.
 it: `_base(context)` already appends it for every mode, so naming it again would emit the whole
 block twice in every Write prompt.
 
-`NARRATION_VOICE` (U15's audience block — R20/R22) is ABSENT for the same reason and must stay so:
-it rides inside `BUILD_WORKING_RULES_TAIL`, which is the single place both this segment and
-`BUILD_SYSTEM_PROMPT` pick it up. Adding it to this list would print the whole voice rule twice
-here while the build prompt printed it once — the two Write prompts drifting in the one dimension
-the shared blocks exist to keep identical. A test counts it in the composed prompt."""
+`NARRATION_VOICE` (the audience contract — R79/R80/R81) is ABSENT for the same reason and must
+stay so: `_base(context)` names it for every kind now, so adding it here would print the whole
+voice rule twice in a composed Build prompt while the standalone build prompt printed it once —
+the two build prompts drifting in the one dimension the shared blocks exist to keep identical.
+`BUILD_MESSAGE_LENGTH`, the contract's one per-kind half, is absent for the third variant of the
+same reason: it rides `BUILD_WORKING_RULES_TAIL`. A test counts both in the composed prompt."""
 
 
 # --- THE PER-TURN RESTATEMENT IS GONE, and nothing replaced it (R17) ------------------

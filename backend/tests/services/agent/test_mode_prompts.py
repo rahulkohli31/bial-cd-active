@@ -158,16 +158,26 @@ def test_write_speaks_to_the_person_who_asked_for_the_app() -> None:
 
 
 def test_the_audience_block_is_emitted_exactly_once() -> None:
-    """The DATA_INTEGRITY_RULES trap, one block over. The audience wording rides
-    `BUILD_WORKING_RULES_TAIL`, which `_WRITE_SEGMENT` already composes — so "adding" it to the
-    segment's block list (the obvious move) would print the whole voice rule twice in every Write
-    prompt while the build prompt printed it once. Counting is the point: an `in` assertion is
-    green at one copy and at five."""
-    composed = compose_kind_prompt(ChatKind.BUILD, _CONTEXT)
-    assert composed.count(NARRATION_VOICE) == 1
-    assert composed.count("A couple of lines at each milestone") == 1
-    assert composed.count("TALKING TO THE USER") == 1
+    """The DATA_INTEGRITY_RULES trap, one block over, and now at three sites instead of one.
+
+    The contract is named by `_base()` (both kinds) and separately by `BUILD_SYSTEM_PROMPT`
+    (which cannot call `_base`), while its length half rides `BUILD_WORKING_RULES_TAIL`. Each of
+    those is a place a second copy could appear, and two prompts that state the same contract
+    twice in slightly different places are how two prompts start drifting.
+
+    COUNTING IS THE POINT, and `== 1` rather than `<= 1` is the point of the counting: the
+    failure this guard was extended to catch — the block being lifted out of the TAIL and never
+    named at the standalone build prompt — is a count of ZERO, which every `<=` and every `in`
+    formulation passes."""
+    for kind in ChatKind:
+        composed = compose_kind_prompt(kind, _CONTEXT)
+        assert composed.count(NARRATION_VOICE) == 1
+        assert composed.count("TALKING TO THE USER") == 1
+        assert composed.count("HOW LONG —") == 1
+    build = compose_kind_prompt(ChatKind.BUILD, _CONTEXT)
+    assert build.lower().count("a couple of lines at each milestone") == 1
     assert BUILD_SYSTEM_PROMPT.count(NARRATION_VOICE) == 1
+    assert BUILD_SYSTEM_PROMPT.lower().count("a couple of lines at each milestone") == 1
 
 
 def test_the_name_the_files_instruction_went_with_the_segment_that_carried_it() -> None:
@@ -191,16 +201,40 @@ def test_the_name_the_files_instruction_went_with_the_segment_that_carried_it() 
         )
 
 
-def test_a_plan_chat_keeps_its_own_contract_untouched() -> None:
-    """Plan's plain-language contract is what U15 MATCHED, not what it replaced. It stays exactly
-    where it was, and a Plan chat does not inherit the Build block — which would drag build
-    framing ("what you are building right now") into a turn where nothing is being built yet."""
-    composed = compose_kind_prompt(ChatKind.PLAN, _CONTEXT)
-    assert NARRATION_VOICE not in composed
-    lowered = _PLAN_SEGMENT.lower()
+def test_a_plan_chat_inherits_the_contract_and_only_the_length_differs() -> None:
+    """★ AE44 / R79 — the two kinds are told the same thing about their reader.
+
+    A Plan chat used to carry its OWN plain-language paragraph, saying what the audience block
+    says in different words. Two wordings of one contract is the drift R79 forbids, and the
+    earlier version of this test enforced the split: it asserted the shared block was ABSENT
+    from a Plan prompt, on the grounds that build framing ("what you are building right now")
+    had no place in a turn where nothing is being built yet.
+
+    That objection was real and it is what the split fixed — the build framing was one SENTENCE,
+    about length, and it is now the one per-kind variable. The rest was never build-specific.
+    So the assertion inverts: the shared block is present in both, and what differs is which
+    length clause the segment carried in."""
+    plan = compose_kind_prompt(ChatKind.PLAN, _CONTEXT)
+    build = compose_kind_prompt(ChatKind.BUILD, _CONTEXT)
+    assert NARRATION_VOICE in plan
+    assert NARRATION_VOICE in build
+
+    # The register survives the move — asserted on the COMPOSED prompt, because the wording no
+    # longer lives in the Plan segment; deleting the duplicate is the point of the unit.
+    lowered = plan.lower()
     assert "plain, everyday words" in lowered
     assert "keep the how-it's-built details behind the scenes" in lowered
-    assert "present_plan_options" in composed
+    assert "present_plan_options" in plan
+
+    # The one difference, in both directions.
+    assert "a plan is as long as it needs to be" in lowered
+    assert "a couple of lines at each milestone" not in lowered
+    assert "a couple of lines at each milestone" in build.lower()
+    assert "a plan is as long as it needs to be" not in build.lower()
+
+    # AE44's other half: apart from the length clause, the two prompts say the same thing about
+    # voice. Nothing in the shared block is reachable from only one kind.
+    assert plan.count(NARRATION_VOICE) == build.count(NARRATION_VOICE) == 1
 
 
 # --- U19 / R25: the version control the agent no longer does ---------------------------------
@@ -327,8 +361,13 @@ def test_plan_segment_is_citizen_facing_not_a_developer_spec() -> None:
     assert "the files you would touch" not in lowered
     assert "trade-offs the user should weigh" not in lowered
     assert "trade-offs" not in lowered
-    # citizen framing is present: outcome-first + see/do + plain words + the options contract
-    assert "plain, everyday words" in lowered
+    # citizen framing is present: outcome-first + see/do + the options contract. "Plain,
+    # everyday words" is NO LONGER asserted here on purpose — it moved to the shared audience
+    # block, and a Plan chat inherits it through `_base` rather than restating it. Asserting it
+    # against the segment again would recreate the second copy R79 exists to prevent;
+    # `test_a_plan_chat_inherits_the_contract_and_only_the_length_differs` holds that ground on
+    # the composed prompt, where the model actually reads it.
+    assert "plain, everyday words" in compose_kind_prompt(ChatKind.PLAN, _CONTEXT).lower()
     assert "will do" in lowered  # "what the app or this change will DO for them"
     assert "see and be able to do" in lowered
     assert "present_plan_options" in _PLAN_SEGMENT
