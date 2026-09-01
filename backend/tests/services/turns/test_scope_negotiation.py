@@ -509,3 +509,60 @@ async def test_a_broken_counter_never_refuses_the_tool_it_is_counting(
 
     assert await propose_first_slice(_ctx(), _NINE, _THREE, _WHY, _QUESTION)
     assert await _counted(db_session, HarnessCounter.FIRST_SLICE_PROPOSED) == []
+
+
+async def test_a_mark_naming_a_piece_nobody_agreed_to_cannot_defeat_the_could_not_tell_arm() -> (
+    None
+):
+    """★★ THE TRI-STATE'S GUARD, ATTACKED FROM THE ONE ANGLE THAT REACHES IT.
+
+    `FunctionToolCallEvent` is emitted while pydantic-ai VALIDATES a batch of calls, before any
+    tool body runs — `_validate_function_calls` yields every event, then `_call_tools` executes.
+    So at the moment the live emitter records a mark, `tell_the_user`'s refusal of a piece nobody
+    agreed to HAS NOT HAPPENED YET, and a site that assumed otherwise was trusting a body that
+    runs afterwards.
+
+    WHY THAT IS NOT MERELY AN UNTIDY SET. The remainder's third arm is selected by
+    `if not state.finished_pieces` — so a single hallucinated mark makes the set truthy and routes
+    the run past "I could not tell which pieces landed" into "Still to do: <everything agreed>".
+    On a turn where the agent built all three and named one piece wrongly, the platform would
+    assert in its own voice that finished work was outstanding: precisely the false fact the
+    tri-state exists to prevent, arriving through the one door that skipped the check.
+
+    So the recording site validates for itself, exactly as the proposal branch does — the marks
+    that survive are a subset of what was agreed, whatever the model sent and whenever the body
+    runs.
+
+    Mutation check: drop the membership guard on the add and this goes red on the remainder."""
+    engine = TurnEngine()
+    state = _state()
+    state.agreed_pieces = list(_THREE)
+
+    engine._on_event(
+        state,
+        FunctionToolCallEvent(
+            part=ToolCallPart(
+                tool_name="tell_the_user",
+                args=json.dumps({"update": "That one is in.", "finished": "A thing nobody asked"}),
+                tool_call_id="m1",
+            )
+        ),
+    )
+
+    # LIVENESS: the branch ran — the words reached the citizen.
+    assert "That one is in." in "".join(state.text_parts)
+    # The bogus mark is not recorded, so the honest arm is still reachable.
+    assert state.finished_pieces == set()
+    assert _remainder(state, touched=True) == CANNOT_TELL_WHAT_REMAINS_TEXT
+    # And a real mark from the same shape still lands, so the guard did not simply mute marking.
+    engine._on_event(
+        state,
+        FunctionToolCallEvent(
+            part=ToolCallPart(
+                tool_name="tell_the_user",
+                args=json.dumps({"update": "Done.", "finished": _THREE[0]}),
+                tool_call_id="m2",
+            )
+        ),
+    )
+    assert state.finished_pieces == {_THREE[0]}

@@ -908,6 +908,12 @@ class TurnEngine:
             # Plan chat that proposed and a Build chat that then builds are two conversations,
             # so this is empty in the second — and an empty agreement produces no closing
             # remainder at all, which is the honest answer rather than a missing one.
+            #
+            # SEEDED FOR BOTH KINDS, AND IT HAS TO BE. Only a Build turn renders the remainder,
+            # so this looks like work a Plan turn could skip — but the live emitter checks every
+            # mark against this list before recording it, and that branch is kind-blind because
+            # the voice channel is on both arms of the toolset. Moving this inside the Build
+            # fork would silently drop legitimate marks in a Plan chat that proposed a slice.
             state.agreed_pieces = agreed_slice(history)
             if state.kind is ChatKind.BUILD:
                 # A READER OF THE KIND, AND IT ASKS WHICH HARNESS RUNS THE TURN — the node loop
@@ -2729,12 +2735,28 @@ class TurnEngine:
                 spoken = update_from_args(event.part.args)
                 if spoken:
                     self._push_block(state, spoken)
-                # THE MARK, RECORDED FROM THE SAME CALL that carried the words (U12). The tool
-                # body has already refused a mark naming a piece nobody agreed to, so what
-                # reaches here is either on the agreed list or the call was retried and never
-                # got this far.
+                # THE MARK, RECORDED FROM THE SAME CALL that carried the words (U12), and
+                # CHECKED HERE RATHER THAN TRUSTED FROM THE BODY.
+                #
+                # A call event is emitted while pydantic-ai validates the batch — every
+                # `FunctionToolCallEvent` is yielded by `_validate_function_calls`, and only
+                # then does `_call_tools` run a body — so `tell_the_user`'s refusal of a piece
+                # nobody agreed to has NOT happened at this point. An earlier version of this
+                # site assumed it had.
+                #
+                # THE COST OF BEING WRONG IS THE TRI-STATE, not an untidy set. The remainder
+                # picks its honest "I could not tell" arm on `not finished_pieces`, so one
+                # hallucinated mark makes the set truthy and turns "could not tell" into
+                # "still to do: <everything agreed>" — the platform asserting in its own voice
+                # that finished work is outstanding, which is the exact false fact U12 exists
+                # to prevent, arriving through the one door that skipped the check.
+                #
+                # So it validates for itself, like the proposal branch below: what survives is
+                # a subset of what was agreed, whatever the model sent and whenever the body
+                # runs. The body still refuses too — that is what teaches the model — but no
+                # reader downstream depends on the ordering between the two.
                 marked = finished_from_args(event.part.args)
-                if marked is not None:
+                if marked is not None and marked in state.agreed_pieces:
                     state.finished_pieces.add(marked)
                 return
             if event.part.tool_name == PROPOSE_SLICE_TOOL:

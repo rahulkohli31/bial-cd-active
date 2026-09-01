@@ -81,11 +81,12 @@ async def tell_the_user(ctx: RunContext[Any], update: str, finished: str | None 
     you write while you are still calling tools does not reach them, so this is how you speak
     before the turn ends. When the update is that one of the pieces you agreed to build is
     done, pass that piece's name as `finished`, spelled exactly as you named it."""
-    # THE CONTEXT IS TAKEN AND NEVER READ, and the underscore is the whole comment: nothing
-    # here resolves anything off the run, and nothing here should. Reaching through it to push
-    # text from this body is the placement `update_from_args` exists to avoid (see the module
-    # docstring). It is in the signature because pydantic-ai's `FunctionToolset` is typed to
-    # accept a context-first callable — dropping it works at run time and fails `ty`.
+    # THE CONTEXT IS READ FOR THE RECORD, AND FOR NOTHING ELSE. `ctx.messages` is how a mark
+    # is checked against the slice the citizen actually agreed to (below) — the agreement lives
+    # in the conversation, not in a column, so reading it back IS reading the run's messages.
+    # What this body must never do is reach through the context to PUSH text: the words are
+    # rendered from this call's arguments by whichever emitter is drawing, which is the
+    # placement `update_from_args` exists to keep (see the module docstring).
     text = update.strip()
     if not text:
         raise ModelRetry(
@@ -198,6 +199,10 @@ async def propose_first_slice(
     Use it for new work arriving in bulk. A question, a fix, a change to something already
     built, or the next round of something already agreed is just done — negotiating a small
     request wastes the user's turn and reads as reluctance."""
+    # THE CONTEXT IS TAKEN AND NEVER READ, and the underscore is the whole comment: this call's
+    # own arguments are the agreement, so there is nothing to resolve off the run and nothing
+    # here should try. It is in the signature because pydantic-ai's `FunctionToolset` is typed
+    # to accept a context-first callable — dropping it works at run time and fails `ty`.
     pieces_found = [piece.strip() for piece in found if piece.strip()]
     pieces_first = [piece.strip() for piece in first if piece.strip()]
     refusal = _bad_slice(pieces_found, pieces_first)
