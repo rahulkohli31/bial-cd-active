@@ -9,7 +9,7 @@
  * their entire daily budget watching a number that never moved — or that was not on screen.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react'
+import { render, screen, waitFor, cleanup, fireEvent, act } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
 
 const h = vi.hoisted(() => ({
@@ -35,6 +35,12 @@ vi.mock('../../../utils/appRegistryApi', () => ({ fetchAppStatusCounts: h.fetchA
 vi.mock('../../FeedbackModal', () => ({ default: () => null }))
 
 import Navbar from '../Navbar'
+import { WorkspaceExitProvider } from '../../workspace/UnsavedWorkGuard'
+
+/** Where a navigation actually landed. */
+function LocationProbe() {
+  return <span data-testid="where">{useLocation().pathname}</span>
+}
 
 // Deliberately NOT named "Admin": the display name is rendered in the avatar block, and a
 // `getByText('Admin')` on the nav entry would then match two nodes.
@@ -345,5 +351,57 @@ describe('the sign-out warning outlives the navigation (U15)', () => {
 
     const loginScreen = await screen.findByTestId('login-screen')
     expect(loginScreen.textContent).toBe('')
+  })
+})
+
+/**
+ * THE WORKSPACE'S IN-PLACE EXITS ROUTE THROUGH ITS GUARD (Plan F, U8).
+ *
+ * `beforeunload` cannot cover a nav link: a single-page navigation is not an unload, so leaving the
+ * workspace this way used to discard unsaved work in silence.
+ *
+ * Two halves, and the second is the one that keeps this from being a regression for every other
+ * page: inside a workspace the link consults the guard, and OUTSIDE one it navigates exactly as it
+ * always did. A guard that made the projects list ask before every click would be worse than the
+ * bug it fixed.
+ */
+describe('Navbar — the workspace exit guard', () => {
+  it('★ routes a nav link through the guard when one is provided', () => {
+    const exits = []
+    render(
+      <MemoryRouter initialEntries={['/projects/p1']}>
+        <WorkspaceExitProvider value={(go) => exits.push(go)}>
+          <Routes>
+            <Route path="*" element={<><Navbar /><LocationProbe /></>} />
+          </Routes>
+        </WorkspaceExitProvider>
+      </MemoryRouter>,
+    )
+
+    fireEvent.click(screen.getByRole('link', { name: /^projects$/i }))
+
+    // Handed to the guard, and NOT performed: the guard decides whether it happens.
+    expect(exits).toHaveLength(1)
+    expect(screen.getByTestId('where').textContent).toBe('/projects/p1')
+
+    // …and running it is what actually navigates, so nothing is lost when the guard says yes.
+    act(() => exits[0]())
+    expect(screen.getByTestId('where').textContent).toBe('/projects')
+  })
+
+  it('★ navigates straight through on a page with no workspace', () => {
+    // Every other page in the portal renders this navbar. Without the pass-through default, this
+    // unit would put a guard in front of navigation everywhere.
+    render(
+      <MemoryRouter initialEntries={['/dashboard']}>
+        <Routes>
+          <Route path="*" element={<><Navbar /><LocationProbe /></>} />
+        </Routes>
+      </MemoryRouter>,
+    )
+
+    fireEvent.click(screen.getByRole('link', { name: /^projects$/i }))
+
+    expect(screen.getByTestId('where').textContent).toBe('/projects')
   })
 })

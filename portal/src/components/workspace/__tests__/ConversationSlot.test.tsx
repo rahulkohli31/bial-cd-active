@@ -26,9 +26,10 @@ import { MemoryRouter } from 'react-router-dom'
 import ConversationSlot, { type MountedConversation } from '../ConversationSlot'
 import { HIDDEN_BUT_MOUNTED } from '../hiddenSubtree'
 
-// ONE STUB, because there is one body. It reports the props it was handed AND the kind it was NOT
-// handed — `kind` is deliberately absent from what the slot passes down, and a stub that printed
-// only `chatId` could not tell the difference between "not passed" and "passed and ignored".
+// ONE STUB, because there is one body. It reports the props it was handed INCLUDING the kind: a
+// stub that printed only `chatId` could not tell "not passed" from "passed and ignored", and after
+// Plan F's U6 the kind IS passed — for one declaration (does this surface want the app pane seen?)
+// rather than for a body.
 vi.mock('../../chat/ConversationSurface', () => ({
   default: (props: Record<string, unknown>) => (
     <div data-testid="conversation-body" data-kind={String(props.kind)}>
@@ -73,13 +74,24 @@ describe('ConversationSlot — one body, whatever the kind (R72)', () => {
     expect(screen.getByTestId('conversation-body')).toBeTruthy()
   })
 
-  it('hands the resolved conversation through, and does NOT hand down its kind', () => {
+  it('hands the resolved conversation through, INCLUDING its kind (Plan F, U6)', () => {
+    // INVERTED DELIBERATELY. This used to assert `data-kind === 'undefined'` — the surface cannot
+    // branch on what it is never given — and that was the right shape while nothing needed the
+    // kind. R11/R12 need exactly one thing from it: a Plan chat has no app pane, a Build chat shows
+    // it, and only the route knows which this is.
+    //
+    // WHAT DID NOT COME BACK is the thing the old assertion was really protecting, and the two
+    // scenarios either side of this one are what still hold it: one BODY for both kinds, and the
+    // same DOM node across a kind change. The retired branch picked a whole page; this picks a
+    // visibility declaration.
     renderSlot({ kind: 'build', chatId: 'build-7' })
     const body = screen.getByTestId('conversation-body')
     expect(body.textContent).toContain('build-7')
-    // The surface cannot branch on what it is never given. Asserted on the stub's own record of
-    // the prop rather than by reading the slot's source, so it stays true through a refactor.
-    expect(body.getAttribute('data-kind')).toBe('undefined')
+    expect(body.getAttribute('data-kind')).toBe('build')
+
+    cleanup()
+    renderSlot({ kind: 'plan', chatId: 'plan-7' })
+    expect(screen.getByTestId('conversation-body').getAttribute('data-kind')).toBe('plan')
   })
 
   it('changing kind does NOT swap or remount the body — it is one component', () => {

@@ -10,7 +10,9 @@
  *     collapse would make R72's surface half sound delivered while a citizen still gets a
  *     different React page per kind. What it did was give the branch exactly ONE home, so Plan D
  *     had one line to delete — and it has now deleted it. The slot mounts `ConversationSurface`
- *     for both kinds and no longer reads `kind` at all.
+ *     for both kinds. It reads `kind` again after Plan F's U6, but for ONE declaration rather than
+ *     for a body: whether the surface asks for the app pane to be seen (R11/R12). See the comment
+ *     at the destructure for why that is presentation and not a reinstated page branch.
  *  2. WHETHER THE MOUNTED CONVERSATION IS VISIBLE. The slot is where the hide treatment is
  *     APPLIED — `hiddenSubtree.ts` is where it is defined and where its WCAG reasoning lives,
  *     because the builder surface's chat-panel collapse is its other caller and a page importing
@@ -68,10 +70,18 @@ interface Props {
 }
 
 export default function ConversationSlot({ conversation, hidden = false }: Props) {
-  // `kind` is deliberately NOT destructured. It is still resolved by the route and still carried
-  // on `MountedConversation`, but nothing here reads it — and pulling it into scope is the first
-  // step back toward branching on it.
-  const { chatId, projectId, projectName, projectHasSavedBuild } = conversation
+  // `kind` IS destructured now, and the reason is narrow enough to write down (Plan F, U6).
+  //
+  // The branch this file retired picked a whole PAGE per kind — a different root layout, a
+  // different height model, a different opinion about the app pane. That branch stays retired: one
+  // surface renders both kinds and everything about a conversation is still decided by what is
+  // present or absent in it.
+  //
+  // What the kind now decides is ONE declaration: whether this surface asks for the app pane to be
+  // SEEN. R11 and R12 are explicit — a Plan chat has no app pane, a Build chat shows it — and that
+  // is presentation, not a guardrail. A Plan chat cannot change the app because the mutating tools
+  // are not on its list (the server's toolset registry), never because a renderer checked.
+  const { chatId, kind, projectId, projectName, projectHasSavedBuild } = conversation
   const shared = { chatId, projectId, projectName }
 
   return (
@@ -80,15 +90,16 @@ export default function ConversationSlot({ conversation, hidden = false }: Props
       aria-hidden={hidden}
       className={`flex-1 min-h-0 flex flex-col overflow-hidden ${hidden ? HIDDEN_BUT_MOUNTED : ''}`}
     >
-      {/* THE KIND COMPARISON THAT LIVED HERE IS GONE (Plan D U17). It picked one of two page
-          components; there is one surface now, and it renders identically for both kinds because
-          nothing in it — or below it — asks what kind a conversation is. `kind` is still resolved
-          by `ChatRoute` and still travels on `MountedConversation`, because the route genuinely
-          knows it and a later reader may need it; what has stopped is anything BRANCHING on it.
-          Everything about a conversation is decided by what is present or absent instead: a Plan
-          chat shows no build because no build parts arrive in it, never because a renderer
-          checked. */}
-      <ConversationSurface {...shared} projectHasSavedBuild={projectHasSavedBuild} />
+      {/* THE PAGE-PER-KIND COMPARISON THAT LIVED HERE IS STILL GONE (Plan D U17). It picked one of
+          two page components; there is one surface now, and its transcript, composer, attachments
+          and activity groups render identically for both kinds because nothing in them asks what
+          kind a conversation is. A Plan chat shows no build because no build parts arrive in it,
+          never because a renderer checked.
+          `kind` travels one level further after Plan F's U6, and for exactly one thing: whether the
+          surface declares the app pane VISIBLE (R11/R12), and the line that stands in for it. That
+          is presentation — the pane's absence is not what stops a Plan chat changing the app; the
+          toolset is. */}
+      <ConversationSurface {...shared} kind={kind} projectHasSavedBuild={projectHasSavedBuild} />
     </div>
   )
 }
