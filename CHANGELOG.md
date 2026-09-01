@@ -50,6 +50,21 @@ Finishing the removal, and putting back the guardrail it dropped.
   including four inside the new chat screen that referred to it by the name of the page it replaced,
   and one that would have led the next reader to delete a working feature. Guards in both the
   frontend and backend test suites now fail if a future removal leaves the same trail.
+- Switching between chats could briefly show the previous conversation's "getting long" warning on
+  the new one's composer.
+- A message refused for length no longer quietly consumes a "Build this plan" card you had not
+  pressed yet. It used to refuse the message and spend the offer at the same time, with nothing on
+  screen saying the second thing had happened.
+
+### Known limitations
+
+- **The length warning does not yet count attached documents properly.** A PDF is measured as though
+  it were a single image, so a conversation carrying several long documents can still pass the limit
+  without warning and fail the way it did before. Chats made mostly of writing are measured
+  correctly. Fixing this needs the page count recorded when a file is uploaded.
+- An administrator can set a per-conversation maximum low enough to refuse every chat for that user,
+  including a brand-new empty one. The lowest useful value is around 8,000; below that the person is
+  locked out until the number is raised.
 
 ## [1.7.0-beta.3] - 2026-09-01
 
