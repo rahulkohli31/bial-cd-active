@@ -639,18 +639,12 @@ def update_from_args(args: Any) -> str | None:
     The tool body raises the teaching `ModelRetry` so the model learns what happened; this
     decides what a human sees, and the two read the same constant.
 
-    Tolerant of both stored shapes, like `_plan_argument`: pydantic-ai persists a tool call's
-    `args` as a JSON string or as an object depending on the provider. A malformed argument is
-    the same answer as a missing one — there is nothing to show — and a projection that raised
-    would take a whole transcript down over one row."""
-    if isinstance(args, str):
-        try:
-            args = json.loads(args)
-        except ValueError:
-            return None
-    if not isinstance(args, dict):
-        return None
-    update = args.get("update")
+    Both stored shapes go through `_args_dict`: pydantic-ai persists a tool call's `args` as a
+    JSON string or as an object depending on the provider. A malformed argument is the same
+    answer as a missing one — there is nothing to show — and a projection that raised would take
+    a whole transcript down over one row."""
+    parsed = _args_dict(args)
+    update = parsed.get("update")
     if not isinstance(update, str):
         return None
     text = update.strip()
@@ -668,20 +662,13 @@ def _slice_argument(args: Any) -> dict[str, Any] | None:
     downstream re-derives them, and a call the body would refuse renders nowhere and counts as
     no agreement.
 
-    Tolerant of both stored shapes, like `_plan_argument`: a tool call's `args` is a JSON string
-    or an object depending on the provider, and a malformed one is the same answer as a missing
-    one."""
-    if isinstance(args, str):
-        try:
-            args = json.loads(args)
-        except ValueError:
-            return None
-    if not isinstance(args, dict):
-        return None
-    found = _clean_pieces(args.get("found"))
-    first = _clean_pieces(args.get("first"))
-    why = args.get("why")
-    question = args.get("question")
+    Both stored shapes go through `_args_dict`: a tool call's `args` is a JSON string or an
+    object depending on the provider, and a malformed one is the same answer as a missing one."""
+    parsed = _args_dict(args)
+    found = _clean_pieces(parsed.get("found"))
+    first = _clean_pieces(parsed.get("first"))
+    why = parsed.get("why")
+    question = parsed.get("question")
     if not found or not first or not isinstance(why, str) or not isinstance(question, str):
         return None
     if len(first) > MAX_FIRST_SLICE or not set(first) <= set(found):
@@ -699,11 +686,9 @@ def _clean_pieces(raw: Any) -> list[str]:
     the citizen agreed to and the order the remainder will name them back in."""
     if not isinstance(raw, list):
         return []
-    seen: dict[str, None] = {}
-    for item in raw:
-        if isinstance(item, str) and item.strip():
-            seen.setdefault(item.strip(), None)
-    return list(seen)
+    return list(
+        dict.fromkeys(item.strip() for item in raw if isinstance(item, str) and item.strip())
+    )
 
 
 def render_proposal(proposal: dict[str, Any]) -> str:
@@ -756,14 +741,7 @@ def finished_from_args(args: Any) -> str | None:
     be present without the other: an update with no mark is the ordinary case, and a mark whose
     update was over the ceiling still happened — the piece IS finished, and losing that because
     the sentence was too long would corrupt the closing account over a copy problem."""
-    if isinstance(args, str):
-        try:
-            args = json.loads(args)
-        except ValueError:
-            return None
-    if not isinstance(args, dict):
-        return None
-    finished = args.get("finished")
+    finished = _args_dict(args).get("finished")
     if not isinstance(finished, str):
         return None
     return finished.strip() or None

@@ -1018,7 +1018,7 @@ class TurnEngine:
                         )
                         persistable = _without_the_call(persistable, deferred.tool_call_id)
                         deferred = None
-                        self._push_plan(state, PLAN_NOT_KEPT_TEXT)
+                        self._push_block(state, PLAN_NOT_KEPT_TEXT)
                         persistable = [
                             *persistable,
                             ModelResponse(parts=[TextPart(content=PLAN_NOT_KEPT_TEXT)]),
@@ -2156,12 +2156,7 @@ class TurnEngine:
         TAKES THE FACT, NOT THE SESSION. `workspace_touched` is the only thing this reads off
         the run, and a parameter that says so IS the whole dependency — a `SandboxSession` here
         would suggest the rule could grow to consult the container, which is the one thing it
-        must not do.
-
-        TAKES THE FACT, NOT THE SESSION. `workspace_touched` is the only thing this reads off
-        the run, and a parameter that says so is the whole dependency — a `SandboxSession`
-        here would suggest the rule could grow to consult the container, which is exactly what
-        it must not do."""
+        must not do."""
         if not state.agreed_pieces:
             return None
         if not state.finished_pieces:
@@ -2622,25 +2617,24 @@ class TurnEngine:
             lambda seq: StepFrame(seq=seq, tool_call_id=tool_call_id, phase="started", item=item),
         )
 
-    def _push_plan(self, state: _TurnState, plan: str) -> None:
-        """The plan onto the live stream, through the ungated text sink.
+    def _push_block(self, state: _TurnState, text: str) -> None:
+        """A platform-rendered block onto the live stream, through the ungated text sink.
 
         Separated from `_push_text` only by the block separator: an earlier response in the
         same turn may already have flushed prose, and `text_parts` joins with nothing between
-        entries, so without this the plan runs into that prose's last sentence."""
+        entries, so without this the block runs into that prose's last sentence.
+
+        NAMED FOR THE JOB, NOT THE FIRST CALLER. Three things now arrive this way — a plan, a
+        voice-channel line, a first-slice proposal — and they differ only in what the platform
+        rendered upstream, never in how the block is seated. A per-caller copy of these three
+        lines is how the separator rule drifts between them.
+
+        UNGATED ON PURPOSE. What travels here was rendered by the platform from a tool call's
+        arguments, so the narration drop that holds the model's own prose does not apply: there
+        is no model text in it to hold."""
         if state.text_parts:
             self._push_text(state, TEXT_BLOCK_SEPARATOR)
-        self._push_text(state, plan)
-
-    def _push_spoken(self, state: _TurnState, update: str) -> None:
-        """A voice-channel line onto the live stream, through the ungated text sink.
-
-        Separated from `_push_text` by the block separator for the same reason `_push_plan`
-        is: an earlier response in this turn may already have flushed prose, and `text_parts`
-        joins with nothing between entries."""
-        if state.text_parts:
-            self._push_text(state, TEXT_BLOCK_SEPARATOR)
-        self._push_text(state, update)
+        self._push_text(state, text)
 
     def _emit_plan_options(self, state: _TurnState, tool_call_id: str) -> None:
         item = PlanOptionsItem(
@@ -2712,7 +2706,7 @@ class TurnEngine:
                 # own closing line says so, once, from the persist path below.
                 plan = plan_from_call(event.part)
                 if plan is not None:
-                    self._push_plan(state, plan)
+                    self._push_block(state, plan)
                     # The options card, not a step: the call defers (the user's click is the
                     # result), so there is no 'finished' counterpart to wait for. It REPLACES
                     # the status on the same tool_call_id rather than stacking beside it.
@@ -2734,7 +2728,7 @@ class TurnEngine:
                 # speak is the row this channel exists to avoid.
                 spoken = update_from_args(event.part.args)
                 if spoken:
-                    self._push_spoken(state, spoken)
+                    self._push_block(state, spoken)
                 # THE MARK, RECORDED FROM THE SAME CALL that carried the words (U12). The tool
                 # body has already refused a mark naming a piece nobody agreed to, so what
                 # reaches here is either on the agreed list or the call was retried and never
@@ -2751,7 +2745,7 @@ class TurnEngine:
                 # turn start, and this replaces it the moment a new proposal is made.
                 proposal = proposal_from_args(event.part.args)
                 if proposal:
-                    self._push_spoken(state, proposal)
+                    self._push_block(state, proposal)
                     state.agreed_pieces = agreed_slice([ModelResponse(parts=[event.part])])
                     state.finished_pieces.clear()
                 return
