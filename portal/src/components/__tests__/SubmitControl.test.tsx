@@ -59,6 +59,7 @@ function wire(over: Partial<UseDeployment> = {}): void {
     running: false,
     waitingForReview: state?.status === 'pending',
     loadError: null,
+    refresh: vi.fn(),
     unsaved: null,
     saving: false,
     routed: null,

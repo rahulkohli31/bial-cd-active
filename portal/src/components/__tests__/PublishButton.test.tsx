@@ -58,6 +58,7 @@ function wire(deployment: DeploymentView, over: Partial<UseDeployment> = {}): vo
     running: deployment.status === 'running',
     waitingForReview: deployment.approval?.status === 'pending',
     loadError: null,
+    refresh: vi.fn(),
     unsaved: null,
     saving: false,
     routed: null,

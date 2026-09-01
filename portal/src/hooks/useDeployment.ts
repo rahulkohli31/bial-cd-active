@@ -30,6 +30,7 @@ import {
   startDeploy,
   type ApprovalState,
   type DataClassificationAnswers,
+  type DeployOutcome,
   type DeploymentView,
   type RoutedForReview,
 } from '../utils/deployApi'
@@ -65,6 +66,10 @@ export interface UseDeployment {
    *  of what pending means. */
   waitingForReview: boolean
   loadError: string | null
+  /** Read it again. The publish surface offers this as its one action when the read
+   *  itself failed — a chip that rendered nothing there would be indistinguishable from
+   *  a broken page. */
+  refresh: () => Promise<void>
   /** The server's `unsaved_changes` message, or null. Non-null means the "Save and publish"
    *  choice is outstanding. */
   unsaved: string | null
@@ -72,9 +77,18 @@ export interface UseDeployment {
   /** The publish request that ROUTED instead of publishing, until the next attempt. An
    *  outcome, not an error — it resolves, and the surfaces render it informationally. */
   routed: RoutedForReview | null
-  /** Hand to the modal's `onConfirm`. Throws so the modal renders the refusal itself. */
-  onConfirm: (answers: DataClassificationAnswers) => Promise<void>
-  saveAndPublish: () => Promise<void>
+  /** Hand to the modal's `onConfirm`. Throws so the modal renders the refusal itself.
+   *
+   *  RESOLVES WITH THE OUTCOME, because the two successes are two different answers and
+   *  only the caller can say them: `202 started` and `200 routed_for_review` both resolve,
+   *  and a surface that could not tell them apart would have to guess which of the
+   *  server's two sentences to speak. `null` means the request became the
+   *  `unsaved_changes` QUESTION rather than an outcome — the one refusal that is not a
+   *  failure and is therefore not thrown. */
+  onConfirm: (answers: DataClassificationAnswers) => Promise<DeployOutcome | null>
+  /** The second answer to that question. Same two outcomes; `null` when it failed, in
+   *  which case the failure is already in `unsaved`. */
+  saveAndPublish: () => Promise<DeployOutcome | null>
   dismissUnsaved: () => void
   /** Pull the owner's own pending submission back out of the queue (P6). */
   withdraw: () => Promise<void>
@@ -183,7 +197,7 @@ export function useDeployment(projectId: string): UseDeployment {
   }, [running, refresh])
 
   const send = useCallback(
-    async (answers: DataClassificationAnswers, saveFirst: boolean): Promise<void> => {
+    async (answers: DataClassificationAnswers, saveFirst: boolean): Promise<DeployOutcome> => {
       // TWO success shapes (U9). Routing is not an error and must not be thrown: the
       // modal would render it in red beside the button, and the citizen would read "your
       // app was sent for review" as a failure of the thing they just asked for.
@@ -193,6 +207,7 @@ export function useDeployment(projectId: string): UseDeployment {
       setRouted(outcome.outcome === 'routed_for_review' ? outcome : null)
       await refresh()
       announce()
+      return outcome
     },
     [projectId, refresh, announce],
   )
@@ -209,14 +224,14 @@ export function useDeployment(projectId: string): UseDeployment {
   // last poll. Rethrowing alone left the modal open on state the server had already
   // contradicted, until the next tick happened to correct it.
   const onConfirm = useCallback(
-    async (answers: DataClassificationAnswers): Promise<void> => {
+    async (answers: DataClassificationAnswers): Promise<DeployOutcome | null> => {
       pendingAnswers.current = answers
       try {
-        await send(answers, false)
+        return await send(answers, false)
       } catch (err) {
         if (err instanceof ApiError && err.code === UNSAVED_CHANGES) {
           setUnsaved(err.message)
-          return
+          return null
         }
         // Fire-and-forget on purpose: the caller is about to see the error either way, and
         // making them wait on a second round trip to read it would be worse.
@@ -227,16 +242,17 @@ export function useDeployment(projectId: string): UseDeployment {
     [send, refresh],
   )
 
-  const saveAndPublish = useCallback(async (): Promise<void> => {
+  const saveAndPublish = useCallback(async (): Promise<DeployOutcome | null> => {
     const answers = pendingAnswers.current
-    if (!answers) return
+    if (!answers) return null
     setSaving(true)
     try {
-      await send(answers, true)
+      return await send(answers, true)
     } catch (err) {
       setUnsaved(
         err instanceof ApiError ? err.message : 'Could not save and publish. Please try again.',
       )
+      return null
     } finally {
       setSaving(false)
     }
@@ -277,6 +293,7 @@ export function useDeployment(projectId: string): UseDeployment {
     running,
     waitingForReview,
     loadError,
+    refresh,
     unsaved,
     saving,
     routed,
