@@ -278,8 +278,8 @@ export async function listProjectConversations(
  * Header + display projection for one conversation; null if not found (404).
  * U7: `messages` is derived from the server-side projection (one read rebuilds the
  * chat — R8). `activeTurn` is `{turnId, lastSeq}` while a turn is running server-side and
- * null otherwise — BuilderPage re-subscribes to it on adopt, which is the other half of
- * R8: a reload mid-reply keeps streaming instead of freezing.
+ * null otherwise — `ConversationSurface` re-subscribes to it on adopt, which is the other half
+ * of R8: a reload mid-reply keeps streaming instead of freezing.
  */
 export interface ActiveTurn {
   turnId: string

@@ -678,7 +678,7 @@ export async function readTurnStream(options: ReadStreamOptions): Promise<Stream
   //
   // THE WATCHDOG COVERS THIS AWAIT TOO (#137). `raceAgainst` guards `reader.read()`, which
   // only begins once response HEADERS have arrived — so a server that accepted the socket
-  // and then went quiet left this promise PENDING FOREVER. `BuilderPage`'s `endGenerating`
+  // and then went quiet left this promise PENDING FOREVER. The caller's `endGenerating`
   // sits after the await, so `generatingChatId` never cleared and the composer animated
   // "Setting up your sandbox… running Nm Ns", with a live Stop button, on a turn the server
   // had already failed in under a second. The 60s stall window

@@ -10,7 +10,7 @@
  *
  * Plan A's `ConversationSlot` owns the slot's height and its hide treatment. This builds nothing
  * that positions itself against the viewport and adds no `calc(100vh - …)` — the one in
- * `ChatPage.tsx` was the only one in the repo and it dies with that file.
+ * `ChatPage.tsx` was the only one in the repo, and it died with that file.
  *
  * ── `MessageContent` IS RE-HOSTED, NOT REPLACED ──
  *

@@ -14,7 +14,7 @@
  *     and the review-status card that used to stack in the rail are gone with it.
  *   - the description sits in a text-only right rail. The passive "View app" preview is
  *     HIDDEN in Phase-1: a stored app is not a running sandbox, and the live preview now
- *     comes only from a per-session C3 build (`BuilderPage`). A passive stored-app view is
+ *     comes only from a per-session build in the conversation surface. A passive stored-app view is
  *     genuinely unavailable until Track DEPLOY provides a live app URL.
  *   - the project's conversations list below the builder as a plain recents list
  *     (no new-chat buttons). Build and chat happen inline here, so there is no separate

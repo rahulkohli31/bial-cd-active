@@ -43,8 +43,8 @@
  * !callback}>`, and `useComposerSend` returns no callback while `isRunning && !capabilities.queue`
  * — and `queue` is never registered. So every library Send button renders a HARD `disabled` for the
  * whole of every turn, which is exactly the focus-dropping bug R45 and R64 forbid. `isSendDisabled`
- * stays unwired for the reason ChatPage already records — it gates a code path nothing executes —
- * and that stays true only while the composer's Send is ours.
+ * stays unwired because it gates a code path nothing executes — and that stays true only while
+ * the composer's Send is ours.
  */
 import { useMemo } from 'react'
 import {

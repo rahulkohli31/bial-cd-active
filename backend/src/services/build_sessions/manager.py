@@ -990,8 +990,8 @@ class SessionManager:
 
     def __init__(self, session_factory: SessionFactory | None = None) -> None:
         # The end sequence outlives the request that started the build, so it cannot borrow the
-        # request's session — it opens its OWN, exactly as the chat relay's disconnect-safe
-        # billing drain does. Injectable so tests bind it to their rolled-back session instead of
+        # request's session — it opens its OWN, the same discipline the turn engine's billing
+        # follows. Injectable so tests bind it to their rolled-back session instead of
         # committing to the real database.
         self._session_factory: SessionFactory = session_factory or async_session_factory
         self._sessions: dict[uuid.UUID, BuildSession] = {}
@@ -3193,7 +3193,7 @@ class SessionManager:
         # Build activity = liveness: renew the lock + heartbeat SERVER-side so an active
         # build whose tab is closed keeps its lock and is never reaped as idle. Skipped for
         # a terminal frame (the lock is about to be released) and best-effort (a redis blip
-        # must not break the relay).
+        # must not break the feed).
         if not isinstance(env, EndedEvent) and session.lock_token:
             try:
                 redis = get_redis()

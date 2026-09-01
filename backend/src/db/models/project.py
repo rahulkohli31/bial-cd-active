@@ -78,7 +78,7 @@ class Project(UUIDv7PrimaryKeyMixin, TimestampMixin, OwnedByUserMixin, Base):
     #
     # `deferred=True`: this column is otherwise mapped, non-deferred, and `Project` is
     # loaded as a full entity on the chat hot path (`conversations/turns.py`,
-    # `conversations/transition.py`, `claude/router.py`, `services/projects/resolve.py`) —
+    # `conversations/transition.py`, `services/projects/resolve.py`) —
     # every one of those was pulling the tsvector along for no reason. Deferred loading
     # does NOT affect the marketplace router: it never loads `Project` as an ORM instance,
     # it references `Project.description_tsv` as a raw column expression in `.where()` /

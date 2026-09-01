@@ -422,7 +422,7 @@ async def generate_description(
         )
     except Exception as exc:
         # A Foundry/model failure is this route's own explicit 500 envelope, never the
-        # generic `{detail}` handler (mirrors the chat relay's drain failure).
+        # generic `{detail}` handler.
         logger.exception("project_description_generation_failed")
         raise AppApiError(
             status.HTTP_500_INTERNAL_SERVER_ERROR, "The description generation failed."

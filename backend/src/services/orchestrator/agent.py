@@ -30,6 +30,6 @@ model in-run before it becomes a hard error."""
 
 @build_agent.instructions
 def _build_system_prompt() -> str:
-    # The system prompt is FROZEN (not per-request, unlike the chat relay), applied via
+    # The system prompt is FROZEN (not per-request, unlike a conversation turn's), applied via
     # `instructions` so it stays out of any persisted message history.
     return BUILD_SYSTEM_PROMPT

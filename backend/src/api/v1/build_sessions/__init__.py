@@ -10,8 +10,8 @@ level. Doing so drags FastAPI, the session manager and the whole route tree into
 that merely wants a C7 shape, which is what made `src.services.build_sessions.reaper`
 unimportable outside the API process — the blocker to running reclamation on a worker at all
 (ADR-0011, ADR-0029). The re-exports that were here were also dead: every consumer already
-imports the submodule (`src/api/v1/router.py`, `deploy/router.py`, `claude/router.py`,
-`admin/router.py`, `conversations/{transition,turns}.py`). Pinned by
+imports the submodule (`src/api/v1/router.py`, `deploy/router.py`, `admin/router.py`,
+`conversations/{transition,turns}.py`). Pinned by
 `tests/test_import_graph.py`, which imports in a COLD-CACHE SUBPROCESS — an in-process
 assertion passes spuriously because conftest has already imported the app.
 

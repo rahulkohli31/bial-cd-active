@@ -99,9 +99,12 @@ export default function App() {
             not, so an SPA route there would work locally and 404 in the deployed container. */}
         <Route element={<RequireAuth><WorkspaceShell /></RequireAuth>}>
           <Route path="/projects/:projectId" element={<ProjectPage />} />
-          {/* One flat chat URL for both kinds. ChatRoute reads the conversation's `kind` and
-              renders ChatPage (planning) or BuilderPage (builder). The project is a breadcrumb
-              resolved from the chat, never a path segment. */}
+          {/* One flat chat URL for both kinds, and ONE surface behind it: `ChatRoute` renders
+              `ConversationSurface` whatever the conversation's `kind` is — the kind changes the
+              tools a turn is handed on the server, never which component mounts here. (This
+              used to fork between two pages, which is exactly the branch the unified surface
+              removed.) The project is a breadcrumb resolved from the chat, never a path
+              segment. */}
           <Route path="/chat/:chatId" element={<ChatRoute />} />
         </Route>
 

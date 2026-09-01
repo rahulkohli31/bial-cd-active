@@ -8,15 +8,16 @@ prove gap-free continuity, plain replay for one that can (`?turn=&cursor=`). Mul
 simultaneous subscribers each get the identical stream — fan-out is the engine's, the
 route only walks the ring.
 
-Wire discipline (copied from the build feed + relay, D6): commit the SSE response and
+Wire discipline (copied from the build feed and the since-retired relay, D6): commit the
+SSE response and
 emit the first frame BEFORE any model byte (the snapshot serves that role), `: ping`
 keepalives only between complete frames, errors travel in-band, and the terminal
 `turn_ended` frame is followed by `data: [DONE]` which closes the transport.
 
-The turn plumbing this route shares with the relay (binaries resolution, prompt assembly,
-history rehydration, the model/session-factory/storage dependencies) lives in `_shared.py`
-alongside this module — one source, no copies, and no reaching into another router's
-underscore-private names (ADR-0010).
+The turn plumbing this route shares with the plan→build handoff (binaries resolution, prompt
+assembly, history rehydration, the model/session-factory/storage dependencies) lives in
+`_shared.py` alongside this module — one source, no copies, and no reaching into another
+router's underscore-private names (ADR-0010).
 """
 
 from __future__ import annotations
@@ -251,7 +252,7 @@ async def start_turn(
     # Daily-token gate BEFORE anything persists — a capped user's message is refused
     # whole, never half-recorded. The error carries its own byte-stable body (limit/used/
     # remaining, what the SPA's interceptor reads), so it is RETURNED, not flattened into
-    # the plain envelope — the same contract `claude/router.py` honours.
+    # the plain envelope. The context refusal below chooses the opposite and says why.
     try:
         await enforce_daily_limit(db, user.id)
     except DailyTokenLimitExceededError as exc:

@@ -1,7 +1,6 @@
 /**
- * Pure helpers for the chat attachment composer (shared by ChatPage and
- * BuilderPage). Validation + base64 reading + ref-building live here so the
- * composer logic is testable without a DOM render. The real trust boundary is
+ * Pure helpers for the chat attachment composer. Validation + base64 reading +
+ * ref-building live here so the composer logic is testable without a DOM render. The real trust boundary is
  * the server (media-type allowlist + magic-byte check); these checks are UX.
  */
 /**

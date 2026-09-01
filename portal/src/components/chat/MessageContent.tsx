@@ -8,10 +8,10 @@ import type { MessagePart } from '../../utils/messageTypes'
 export interface MessageContentProps {
   parts: MessagePart[] | string
   isUser?: boolean
-  /** Shrinks the assistant markdown's typography to match a narrow rail (BuilderPage) —
-   *  `prose-sm`'s own font-size otherwise wins over the bubble's inherited `text-xs`,
-   *  rendering assistant text visibly larger than user text in the same thread. Leave
-   *  unset for a wider surface (ChatPage's planning chat), where `prose-sm` was sized for. */
+  /** Shrinks the assistant markdown's typography to match a narrow rail (the chat panel
+   *  beside a live app pane) — `prose-sm`'s own font-size otherwise wins over the bubble's
+   *  inherited `text-xs`, rendering assistant text visibly larger than user text in the same
+   *  thread. Leave unset for a full-width surface, which `prose-sm` was sized for. */
   compact?: boolean
   /** True only while THIS message is the one actively streaming in. An incomplete
    *  markdown document re-parses per token — bold popping in when the closing `**`
@@ -26,8 +26,8 @@ export interface MessageContentProps {
  *  the URL came from model output, which is prompt-injection reachable. A fragment-only
  *  href (`remark-gfm`'s footnote links, e.g. `#user-content-fn-1`) or a relative href the
  *  model emits does NOT get `target="_blank"`: opening either in a new tab doesn't scroll
- *  to anything, it just opens a second tab at the current URL — which in BuilderPage races
- *  a second reattach to the same build session.
+ *  to anything, it just opens a second tab at the current URL — which races a second
+ *  reattach to the same build session.
  *
  *  Streamdown still computes its own default `target="_blank"`/`rel="noopener noreferrer"`
  *  for EVERY link and passes them down as props to whichever component renders `a` — a
@@ -64,7 +64,7 @@ function MarkdownStrong({ node: _node, ...props }: HTMLAttributes<HTMLElement> &
 
 /**
  * Render one chat message bubble's inner content from the neutral `parts[]` model — the
- * Streamdown variant, shared by ChatPage (the planning chat) and BuilderPage.
+ * Streamdown variant, used by the one conversation surface for both chat kinds.
  *
  * `partsToText` yields the prose for display (text parts only); `attachmentsFromParts`
  * yields the attachment descriptors (file parts + inline-text attachments) rendered

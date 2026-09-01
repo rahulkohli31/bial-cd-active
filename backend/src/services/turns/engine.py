@@ -19,13 +19,12 @@ not a gap (the review's buffer-eviction finding, answered structurally).
 
 Mode gating happens HERE (the server's record, never the client request): the run gets
 exactly `toolsets_for_kind(conversation.kind)` over the turn-pinned workspace, and the
-U9-composed instructions for that kind. Plan turns bill like the relay (one drain,
-disconnect-safe by construction — the task IS the drain); Write turns arrive with U12's
+U9-composed instructions for that kind. Plan turns bill once for the whole turn,
+disconnect-safe by construction — the task IS the drain; Write turns arrive with U12's
 warm sessions and bill per step through the harness.
 
-Ownership: the engine holds the per-conversation guard (`turns/guard.py`, shared with the
-relay until U13 retires it) from claim to the task's `finally` — a crashed run can never
-wedge its conversation shut.
+Ownership: the engine holds the per-conversation guard (`turns/guard.py`) from claim to the
+task's `finally` — a crashed run can never wedge its conversation shut.
 """
 
 from __future__ import annotations
@@ -230,9 +229,15 @@ TEXT_BLOCK_SEPARATOR: Final = "\n\n"
 
 ACK_TEXT = "Getting started on that…"
 # The reserved tool name the acknowledgement rides under, so it is identifiable as the
-# harness's own row rather than a step the agent took. The portal keys on the same string
-# (`ACK_STEP_NAME` in `BuildProgress.tsx`) to keep it out of the finished build's step history
-# — it is REPLACED by the first real step, never listed beside it.
+# harness's own row rather than a step the agent took.
+#
+# THE FILTERING IS ENTIRELY ON THIS SIDE, and the comment here used to say otherwise — it
+# claimed the portal keyed on the same string in `BuildProgress.tsx` to keep the ack out of a
+# finished build's step history. `BuildProgress.tsx` was deleted with the two-page era, and no
+# portal-side constant of that name ever existed in this repo. Nothing is missing: the ack is
+# held in `_TurnState.acknowledgement` rather than in `steps`, so it never reaches the
+# persisted rows, and it is cleared by the first real step. A reader who went looking for the
+# client-side half would have found nothing and reasonably concluded a filter had been lost.
 ACK_TOOL = "__ack__"
 ACK_TOOL_CALL_ID = "__ack__"
 
@@ -862,7 +867,7 @@ class TurnEngine:
         sandbox_client: SandboxClient | None,
     ) -> None:
         """The whole turn, detached: workspace pin → mode-gated run (streaming frames) →
-        transcript append → billing → terminal. Mirrors the relay drain's ordering; every
+        transcript append → billing → terminal. Every
         exit path funnels to exactly one terminal frame, the guard release, AND the billing of
         whatever tokens the model actually consumed.
 
@@ -881,7 +886,7 @@ class TurnEngine:
         async def _bill_once() -> None:
             """Fold the accumulated spend into today's cap exactly once, in a FRESH session
             (the run's own session may already be unwound on the cancel/error paths).
-            Best-effort like the relay drain — a billing failure must never mask the outcome."""
+            Best-effort — a billing failure must never mask the outcome."""
             nonlocal billed
             if billed:
                 return
@@ -1170,7 +1175,7 @@ class TurnEngine:
                 conversation_id=str(state.conversation_id),
                 turn_id=str(state.turn_id),
             )
-            # Partial spend before the failure still counts (mirrors the relay's bill-what-ran).
+            # Partial spend before the failure still counts: bill what actually ran.
             await _bill_once()
             state.error_message = _TURN_FAILED_MESSAGE
             self._emit(

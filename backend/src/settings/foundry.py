@@ -48,7 +48,7 @@ class FoundryConfig(BaseModel):
     # Present only in api_key mode; the validator enforces the pairing.
     api_key: SecretStr | None = None
 
-    # Anti-hang socket timeouts for the SHARED model client (the planning-chat relay AND the build
+    # Anti-hang socket timeouts for the SHARED model client (the turn engine AND the build
     # harness both build it via `build_foundry_client`). These bound one SDK request, NOT the whole
     # build turn — the harness owns that budget (`RUN_WALL_CLOCK_DEADLINE_S`, checked BETWEEN
     # iterations, never mid-stream), which is exactly why a finite `read` is needed: without it a

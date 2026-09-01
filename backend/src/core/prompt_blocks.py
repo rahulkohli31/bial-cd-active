@@ -157,9 +157,10 @@ directing the user to it."""
 """R5's truthful portal self-description, single-sourced here for BOTH prompt systems.
 
 The walkthrough caught the model inventing portal features and sending users to views that do
-not exist, so the fix is a closed-world statement of what IS there. The relay carries its own
-copy in `api/v1/claude/prompts.py` (`PORTAL_SELF_DESCRIPTION`) and dies with U13; this is the
-wording for the unified chat layout, where the right pane is the APP and nothing else (R10).
+not exist, so the fix is a closed-world statement of what IS there. The legacy relay carried its
+own copy of this wording, which is the duplicate that made "single-sourced" worth saying; it went
+with the relay, and this is now the only one. The wording is the unified chat layout's, where the
+right pane is the APP and nothing else (R10).
 The surface list is verified against `portal/src/App.jsx`'s actual routes — extend it when the
 portal grows a surface, never before."""
 

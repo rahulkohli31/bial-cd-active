@@ -90,8 +90,8 @@ export default function ChatRoute() {
     if (!chatId) return undefined
     let alive = true
     // Keep rendering the chat we already resolved while the next one loads. Falling back to a
-    // spinner here would unmount the page — and an in-flight build turn lives in its state,
-    // with useClaudeAPI aborting the stream on unmount. Only a cold open shows the spinner.
+    // spinner here would unmount the surface — and an in-flight turn's subscription lives in
+    // its state, aborted on unmount. Only a cold open shows the spinner.
     setResolution((prev) => (prev.status === 'ready' ? prev : { status: 'loading' }))
 
     const ready = (kind: ChatKind, projectId: string | null): void => {
@@ -224,7 +224,7 @@ export default function ChatRoute() {
         //
         // R18: the server now answers this from the recovery copy OR the saved bundle (the pair a
         // restore actually consults), so the builder who never pressed Save is offered their work
-        // back. This is the COLD-LOAD value; once the preview poll lands, BuilderPage prefers its
+        // back. This is the COLD-LOAD value; once the preview poll lands, the surface prefers its
         // `restorable`, which is the same predicate asked more recently.
         projectHasSavedBuild: resolved?.hasRelaunchableSnapshot ?? null,
       }}

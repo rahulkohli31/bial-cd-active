@@ -14,7 +14,7 @@ Two contracts land here as executable, TESTED code (U8):
   tagged-union progress envelope (`ProgressEnvelope`), `BuildResult`, and the
   `run_build` protocol typing. Unlike C3's REST bodies, the envelope keeps
   **snake_case field names and snake_case `type` literals** — it is a streaming
-  frame shape (kin to the chat relay's `{"delta":{"text":…}}`), byte-stable across
+  frame shape, byte-stable across
   BRAIN-emit → SESSION-API-relay → portal-consume. So the C7 models subclass plain
   `BaseModel` (no camelCase alias generator), discriminating on `type` exactly like
   the C2 `FileOp` union discriminates on `action` (`services/sandbox/base.py`).
@@ -659,8 +659,8 @@ signature is frozen at four params, the factory is a **construction-time depende
 of BRAIN's orchestrator (not a `run_build` argument): BRAIN opens its own
 `AsyncSession` per model step from it and OWNS the commit — `record_usage` does not
 commit, and there is no request-scoped `get_db` on a background task. Tests bind it to
-the rolled-back test session (the exact substitution `claude/router.py` makes via
-`dependency_overrides` on its `billing_session_factory`). Same shape as the chat relay.
+the rolled-back test session — the same substitution the conversation suites make via
+`dependency_overrides` on `_shared.billing_session_factory`.
 """
 
 

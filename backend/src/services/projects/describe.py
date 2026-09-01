@@ -49,9 +49,13 @@ def extract_source(current_code: dict[str, Any] | None) -> str:
 
 
 def bound_source(source: str, budget: int) -> str:
-    """Bound code fed to the model to `budget` chars, appending a truncation marker when cut
-    — the single truncate-with-marker shared by description generation (here) and the builder
-    code seed (`/v1/claude`), each supplying its own budget."""
+    """Bound code fed to the model to `budget` chars, appending a truncation marker when cut.
+
+    IT HAS ONE CALLER NOW. The second was the retired relay's builder code seed, which is what
+    made this a shared truncate-with-marker rather than four lines inline — so by ADR-0010 the
+    seam no longer earns its keep, and inlining it is a live option rather than a regression.
+    Left standing here because collapsing it is a code change and this pass is a comment sweep;
+    what is not acceptable is the docstring going on naming a caller that does not exist."""
     if len(source) <= budget:
         return source
     return source[:budget] + "\n\n[... code truncated to fit the model context window ...]"

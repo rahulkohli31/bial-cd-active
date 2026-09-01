@@ -37,11 +37,14 @@ export interface UsePendingAttachmentsResult {
 }
 
 /**
- * Shared composer state for image/PDF attachments (used by ChatPage and
- * BuilderPage). Owns the pending-attachment list (each item carries transient
- * base64 until the message is sent) and a short-lived validation/cap toast.
- * Each page renders the toast + preview row in its own style; the behaviour
- * lives here so the two composers can't drift.
+ * Composer state for image/PDF attachments. Owns the pending-attachment list (each item
+ * carries transient base64 until the message is sent) and a short-lived validation/cap toast.
+ *
+ * It is a hook rather than state inside `Composer` because it predates the one composer: two
+ * pages each rendered the toast and preview row in their own style and this was what stopped
+ * their BEHAVIOUR drifting. There is one composer now, so the drift it guarded against cannot
+ * happen — the seam survives on its own merit, which is that this is testable without a DOM
+ * render and `Composer` is not.
  */
 export function usePendingAttachments(): UsePendingAttachmentsResult {
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([])

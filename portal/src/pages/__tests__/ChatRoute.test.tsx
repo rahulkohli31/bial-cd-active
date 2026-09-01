@@ -246,8 +246,8 @@ describe('ChatRoute — load failure', () => {
 describe('ChatRoute — the page is never torn down mid-turn', () => {
   // A brand-new chat rewrites `/chat/{id}?projectId=…` to `/chat/{id}` the instant its first
   // append lands. If that rewrite re-runs the resolve effect, ChatRoute falls back to its
-  // spinner, the page unmounts, and useClaudeAPI's unmount cleanup ABORTS the very stream the
-  // append was for — killing the first turn of every new chat.
+  // spinner, the surface unmounts, and its unmount cleanup ABORTS the very stream the append
+  // was for — killing the first turn of every new chat.
   it('dropping the transient query does not re-resolve the conversation or unmount the page', async () => {
     h.getConversation.mockResolvedValue(conversation())
     render(

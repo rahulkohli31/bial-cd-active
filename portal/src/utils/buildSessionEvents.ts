@@ -3,12 +3,12 @@
  * `EventSource` that turns the SSE stream at `/api/build-sessions/{id}/events` into
  * dispatched, parsed C7 envelopes.
  *
- * WHY `EventSource` (not the `fetchClaudeStream` idiom). C3 §4 designs the feed
- * around `EventSource` semantics — it is cookie-authed BY CONSTRUCTION (`EventSource`
- * cannot set an `Authorization` header, exactly what C3 §4.1 specifies) and gives
- * `Last-Event-ID` auto-reconnect/replay for free (C3 §4.2). The `fetchClaudeStream`
- * parser has no `event:`/`id:`/reconnect handling — reusing it would re-implement
- * what the platform primitive already provides (KTD-1).
+ * WHY `EventSource` (not the fetch-and-parse idiom the turn stream uses). C3 §4 designs
+ * the feed around `EventSource` semantics — it is cookie-authed BY CONSTRUCTION
+ * (`EventSource` cannot set an `Authorization` header, exactly what C3 §4.1 specifies) and
+ * gives `Last-Event-ID` auto-reconnect/replay for free (C3 §4.2). A hand-rolled SSE parser
+ * has no `event:`/`id:`/reconnect handling — reusing one would re-implement what the
+ * platform primitive already provides (KTD-1).
  *
  * SCOPE OF "for free" (KTD-1, corrected): native `EventSource` attaches
  * `Last-Event-ID` ONLY on its OWN auto-reconnect (a transient mid-stream drop) — it

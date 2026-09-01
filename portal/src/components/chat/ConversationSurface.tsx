@@ -76,9 +76,9 @@ const SETTLED_GONE: ReadonlySet<PreviewLifeState> = new Set<PreviewLifeState>([
 const WELCOME_TEXT = "Hello! I'm Citizen Developer AI. Tell me what you'd like to build for BIAL operations."
 const welcomeMessage = (): ChatMessage => ({ id: 'welcome', ephemeral: true, role: 'assistant', parts: [{ type: 'text', text: WELCOME_TEXT }], createdAt: new Date().toISOString() })
 
-// U7: the whole system prompt is server-owned now (`backend/src/api/v1/claude/prompts.py`,
-// selected by the conversation's kind) — the thin client identity line moved there as
-// ASSISTANT_IDENTITY_PROMPT, and the interview protocol keeps riding server-side.
+// U7: the whole system prompt is server-owned (`backend/src/services/agent/mode_prompts.py`,
+// composed per turn from the conversation's kind). The thin client identity line this file
+// used to hold moved there, and nothing about the prompt is decided in the browser.
 
 // The three hardcoded "refinement chips" are GONE (user, 2026-07-30). They were a fixed list —
 // dark mode, a real-time data table, a mobile layout — offered after every build regardless of
@@ -321,9 +321,10 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
    * on the composer now, so a keyed map would be a lookup that can only ever have one entry.
    */
   const [urgent, setUrgent] = useState<string | null>(null)
-  // WHICH CHAT has a turn streaming, not merely whether one does (G2). One BuilderPage instance
-  // survives a chat switch under flat routing, so the boolean form gated chat B's send on chat A's
-  // turn — the same per-chat scoping `buildActiveHere` already applies to the build half.
+  // WHICH CHAT has a turn streaming, not merely whether one does (G2). ONE INSTANCE OF THIS
+  // COMPONENT survives a chat switch under flat routing — the URL changes, this does not
+  // remount — so the boolean form gated chat B's send on chat A's turn. Same per-chat scoping
+  // `buildActiveHere` already applies to the build half.
   const [generatingChatId, setGeneratingChatId] = useState<string | null>(null)
   // Has the adopt round-trip settled the question "is a build still running in this chat?" (G1).
   //
@@ -566,8 +567,9 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
   // Build sessions whose outcome this instance has already appended. The in-memory half of the
   // dedupe; the transcript scan in `appendBuildOutcome` is the half that survives a reload.
   const outcomeWrittenRef = useRef<Set<string>>(new Set())
-  // The transcript, readable from async callbacks without a stale closure (the relay send
-  // assembles the API messages after an await — mirrors ChatPage's `messagesRef`).
+  // The transcript, readable from async callbacks without a stale closure: the send path
+  // assembles its optimistic pair after an await, and a closure over `messages` would be one
+  // render behind by the time it read them.
   const messagesRef = useRef(messages)
   messagesRef.current = messages
   const buildIdRef = useRef<string | null>(null) // the active CONVERSATION being viewed/persisted — never a session id
@@ -603,15 +605,15 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
   const sessionProjectMatches = sessionProjectRef.current === projectId
   const showSession = session.sessionId != null && sessionProjectMatches
   // TRUE for a build's whole duration (provisioning → building → ready) and false at its
-  // terminal. PROJECT-SCOPED on purpose: one BuilderPage instance survives a project switch, so
-  // the project-agnostic form would let project A's build lock project B's composer.
+  // terminal. PROJECT-SCOPED on purpose: one instance of this component survives a project
+  // switch, so the project-agnostic form would let project A's build lock project B's composer.
   const buildActive = showSession && isActiveBuildStatus(session.status)
   // The COMPOSER's half of that gate is per-CHAT, matching the server's own per-conversation
   // 409 (`live_session_for_conversation`). A sibling builder chat in the same project is NOT
   // the chat that is building: the server would accept its turn, so shutting its composer and
   // telling its reader "building your app" is a lie about someone else's build. `buildActive`
   // stays project-scoped — the cockpit, the live bubble and the delete gate all speak for the
-  // project's one session, and one BuilderPage instance survives a project switch.
+  // project's one session, and one instance of this component survives a project switch.
   const buildActiveHere = buildActive && sessionChatRef.current === buildId
   const generating = generatingChatId === buildId
   // THE ONE GATE, AND ITS ONLY TERM IS TURN STATE (KTD-1). What a chat IS appears nowhere in it: a
@@ -836,8 +838,8 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
    * planning chat's Launch Builder) as a RELAY turn — never as a build. The interview runs
    * first; a build starts only from the brief card the model returns.
    *
-   * Fire-once per chat (`initFiredRef`), mirroring ChatPage's `initialMessage` discipline: a
-   * remount (StrictMode, a re-render) must not send the prompt twice. Called from BOTH adopt
+   * Fire-once per chat (`initFiredRef`): a remount (StrictMode, a re-render) must not send the
+   * prompt twice. Called from BOTH adopt
    * branches, because the thread is only empty on its very first open and the handoff has to
    * work for the whole life of the project.
    */
@@ -2416,8 +2418,8 @@ export default function ConversationSurface({ chatId: chatIdProp, projectId = nu
        leaves an error screen uncovered. */
     compileState: turnCompile,
     /* Which of the cover's sentences is true — see `turnRunning` below. SCOPED TO THIS PROJECT,
-       not merely to "some turn somewhere". One BuilderPage instance survives a project switch and
-       `generatingChatId` is cleared only by the finishing chat's own handler, so the bare
+       not merely to "some turn somewhere". One instance of this component survives a project
+       switch and `generatingChatId` is cleared only by the finishing chat's own handler, so the bare
        `!== null` form kept project B's pane claiming "putting the latest change together" about a
        turn running on project A. `builds` is this project's conversations; the open chat is
        checked separately because a brand-new one is not in that list yet. */

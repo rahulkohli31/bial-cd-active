@@ -25,8 +25,8 @@
  * The button in `BuildProgress` used a real `disabled={stopping}`. That is the bug R64 forbids:
  * `disabled` on the currently-focused element blurs it to `document.body`, so a keyboard
  * user who has just pressed Stop loses their place at the exact moment they were promised
- * feedback. This codebase records the mechanism twice already (`BuilderPage`'s textarea and its
- * Send button) and it is not a style preference. Enforcement lives in the handler; the attribute
+ * feedback. This codebase recorded the mechanism twice before that (the old builder page's
+ * textarea and its Send button) and it is not a style preference. Enforcement lives in the handler; the attribute
  * is affordance only.
  *
  * THE ACCESSIBLE NAME IS STABLE. The old button's label flips "Stop" → "Stopping…", which renames
@@ -51,7 +51,7 @@ export interface StopTurnControlProps {
    * Resolve the live turn AT PRESS TIME, returning `null` when there is no turn id — which means
    * a legacy build session, not an error.
    *
-   * A getter rather than a plain `turnId` prop, and that is not ceremony. `BuilderPage` holds the
+   * A getter rather than a plain `turnId` prop, and that is not ceremony. The surface holds the
    * live turn id in a REF, with a comment saying why: the stop handler is created once and would
    * otherwise close over whichever turn was live at its first render. A prop read during render
    * reintroduces exactly that staleness one layer up, and it would do so silently — stopping the
