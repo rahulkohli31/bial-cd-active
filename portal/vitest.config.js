@@ -18,6 +18,15 @@ export default defineConfig({
     name: 'frontend',
     environment: 'jsdom',
     include: ['src/**/*.test.{js,jsx,ts,tsx}'],
+    // jsdom implements neither observer, no `matchMedia`, none of the pointer-capture methods
+    // and no `navigator.clipboard`, so the component libraries this portal renders cannot be
+    // mounted at all without these. There was no `setupFiles` key here before — which is why
+    // `scrollIntoView` ended up hand-stubbed in seventeen files.
+    //
+    // This single line has no compiler and no linter behind it. `src/__tests__/test-setup.test.tsx`
+    // is its canary: it renders a real Radix component that stubs nothing, so losing this key
+    // fails one obvious test instead of a dozen obscure ones three units away.
+    setupFiles: ['./src/test-setup.ts'],
     // Vitest's default is 5s, and that is a WALL-CLOCK budget the whole suite competes for.
     // The heavy BuilderPage specs finish in ~300ms each when their file runs alone, but the
     // full 80-file run executes them in parallel, so on a loaded machine (or a small CI
