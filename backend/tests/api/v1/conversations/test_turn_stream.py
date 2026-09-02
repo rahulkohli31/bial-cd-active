@@ -121,11 +121,16 @@ async def test_post_202_then_stream_replays_full_turn(
     assert frames[0].turn_id == turn_id
     assert frames[0].turn_status == "completed"
     # THE SNAPSHOT'S ORDERED PARTS, asserted as a LIST because the order is the whole point.
-    # The acknowledgement rides first — nothing retired it, this turn called no tool — and the
-    # prose follows it. Both deltas belong to one text part, so they are ONE block rather than
-    # two paragraphs: `new_block` is what draws that line, not the number of deltas.
-    assert [part.type for part in frames[0].parts] == ["step", "text"]
-    assert frames[0].parts[0].tool_call_id == engine_module.ACK_TOOL_CALL_ID
+    # Prose is all this turn produced: the opening acknowledgement is retracted by the FIRST
+    # WORDS on screen (`_push_text`), so a settled prose-only turn carries no step at all — see
+    # `test_a_turn_that_only_writes_prose_retracts_the_acknowledgement_too`. Both deltas belong
+    # to one text part, so they are ONE block rather than two paragraphs: `new_block` is what
+    # draws that line, not the number of deltas.
+    assert [part.type for part in frames[0].parts] == ["text"]
+    assert not any(
+        part.type == "step" and part.tool_call_id == engine_module.ACK_TOOL_CALL_ID
+        for part in frames[0].parts
+    )
     assert [part.text for part in frames[0].parts if part.type == "text"] == ["hello world"]
     # The persisted user turn rides the snapshot's projected items.
     assert any(item.type == "user_text" and item.text == "hello" for item in frames[0].items)
@@ -171,7 +176,9 @@ async def test_mid_turn_subscribe_gets_snapshot_then_tail(
     # called no tool, so a citizen who reconnected mid-answer read the steps and none of the
     # words. Nothing is held any more — a block is on the wire and in the turn's ordered parts
     # the moment it is written — so a reattaching reader picks the answer up where it really is.
-    assert [part.type for part in frames[0].parts] == ["step", "text"]  # the ack, then prose
+    # PROSE ALONE: the opening acknowledgement is retracted by the first words on screen, so a
+    # reader who reattaches mid-answer is handed the answer and nothing else.
+    assert [part.type for part in frames[0].parts] == ["text"]
     snapshot_text = [part.text for part in frames[0].parts if part.type == "text"]
     assert snapshot_text == ["first "]
     # …AND THE TAIL CONTINUES THAT BLOCK RATHER THAN OPENING A SECOND ONE. `new_block` is the
@@ -219,12 +226,14 @@ async def test_a_turn_that_writes_acts_and_writes_again_reads_the_same_live_and_
     from pydantic_ai.models.function import DeltaToolCall, DeltaToolCalls
 
     gate = asyncio.Event()
+    at_the_door = asyncio.Event()
 
     async def _writes_acts_writes(messages: list[ModelMessage], info: AgentInfo):
         if len(messages) == 1:
             # HELD AT THE DOOR so the subscription below is open for the whole turn: its
             # snapshot must carry nothing but the acknowledgement, or the tail is not the whole
             # record and the comparison at the end proves less than it claims to.
+            at_the_door.set()
             await gate.wait()
             yield "Let me see what is on the page. "
             yield DeltaToolCalls(
@@ -246,6 +255,13 @@ async def test_a_turn_that_writes_acts_and_writes_again_reads_the_same_live_and_
 
     state = _fresh_engine.peek(conv.id)
     assert state is not None
+    # WAIT UNTIL THE MODEL IS ACTUALLY AT THE DOOR before opening the subscription. The app and
+    # the fixtures share ONE session here, and the turn task holds it while it writes the user's
+    # message row; a GET issued before that finishes waits on the same session, while the turn
+    # waits on a gate this test only opens once the GET has subscribed — a circular wait that
+    # hangs the suite rather than failing it. Once the stream function has been entered that
+    # write is done and the session is free, which is the state the comment below assumes.
+    await asyncio.wait_for(at_the_door.wait(), timeout=10)
     # httpx's ASGITransport buffers a streaming response until the app completes, so the GET
     # rides a concurrent task: it subscribes while the model is still at the gate, then the
     # gate releases and the buffered result carries the snapshot plus the whole tail.
@@ -318,8 +334,10 @@ async def test_the_acknowledgement_actually_reaches_a_subscriber(
     asserts the acknowledgement is in the DELIVERED frames. Assert against the wire, not the ring:
     that distinction is the entire defect."""
     gate = asyncio.Event()
+    at_the_door = asyncio.Event()
 
     async def _paced(messages: list[ModelMessage], info: AgentInfo):
+        at_the_door.set()
         await gate.wait()
         yield "done"
 
@@ -331,6 +349,9 @@ async def test_the_acknowledgement_actually_reaches_a_subscriber(
     state = _fresh_engine.peek(conv.id)
     assert state is not None
 
+    # The turn task must be AT THE DOOR before the subscription opens — see the test above for
+    # why a GET issued while the turn still holds the shared session hangs instead of failing.
+    await asyncio.wait_for(at_the_door.wait(), timeout=10)
     reader = asyncio.create_task(
         client.get(f"/v1/conversations/{conv.id}/events", headers=_headers(user))
     )
@@ -374,6 +395,14 @@ async def test_second_post_while_running_is_409(
     set_chat_model(FunctionModel(stream_function=_stall))
     headers = _headers(user)
     assert (await _post_turn(client, headers, conv)).status_code == 202
+    # LET THE TURN REACH THE MODEL before posting again, the way the two tests below do. The app
+    # and the fixtures share ONE session here, so a second request issued while the turn task is
+    # still mid-flush lands on a session in `prepared` state and the test fails on plumbing
+    # rather than on the 409 it is about. The first delta is proof the flush is behind us.
+    state = _fresh_engine.peek(conv.id)
+    assert state is not None
+    while not state.text_blocks():
+        await asyncio.sleep(0.01)
     second = await _post_turn(client, headers, conv, text="again")
     assert second.status_code == 409
     gate.set()
@@ -1524,6 +1553,7 @@ async def test_a_create_block_on_a_conversation_that_already_exists_is_ignored(
     assert await _conversation_count(db_session, user_id) == before
 
 
+@pytest.mark.route_rollback
 async def test_a_first_message_that_loses_the_insert_race_joins_the_winners_chat(
     client, db_session, set_chat_model, fake_redis, fake_storage, _fresh_engine, monkeypatch
 ) -> None:
@@ -1545,11 +1575,23 @@ async def test_a_first_message_that_loses_the_insert_race_joins_the_winners_chat
     and not bookkeeping: a blind that failed to take effect would leave this test passing on the
     ordinary fast path, proving nothing about the branch it claims to cover.
 
-    IT IS REACHABLE AT ALL BECAUSE `db_session` JOINS WITH `create_savepoint` (tests/conftest.py).
-    The route's `db.rollback()` used to unwind the one transaction the fixtures and the app share,
-    so the next statement died before any assertion could run — which is why this arm and its
-    sibling in `transition.py` both shipped with no coverage of the branch that only runs when
-    something has already gone wrong. It now unwinds the route's own savepoint and nothing else.
+    IT IS REACHABLE AT ALL BECAUSE OF `@pytest.mark.route_rollback`, which makes `db_session`
+    join the fixtures' transaction by SAVEPOINT (tests/conftest.py). Without it the route's
+    `db.rollback()` unwinds the one transaction the fixtures and the app share, so the next
+    statement dies before any assertion can run — which is why this arm and its sibling in
+    `transition.py` both shipped with no coverage of the branch that only runs when something
+    has already gone wrong. With it the rollback unwinds the route's own savepoint and nothing
+    else. The marker is per-test on purpose: a savepoint-joined session provisions its
+    connection lazily, and every test whose detached task shares that session breaks under it.
+
+    AND THAT IS ALSO WHAT MAKES THE FIXTURE LIE, so the expiry is put back by hand below. A
+    savepoint rollback expires only what changed inside the savepoint; the real one expires the
+    WHOLE identity map, so in production every instance this request had already loaded — the
+    `user` and the `project` the prompt context is built from — comes back from `db.rollback()`
+    needing a lazy SELECT, which an async session cannot perform inline and answers with
+    `MissingGreenlet`. That is a 500 on the one path written to prevent a 500. `expire_all()`
+    on the way out of the rollback reproduces it exactly, and it is what makes the route's two
+    `db.refresh` calls mutation-detectable: delete either one and this test goes red.
     """
     from src.api.v1.conversations import turns as turns_module
     from src.db.models.message import Message
@@ -1575,6 +1617,22 @@ async def test_a_first_message_that_loses_the_insert_race_joins_the_winners_chat
     user_id, project_id, chat_id = user.id, project.id, winner.id
     headers = _headers(user)
     before = await _conversation_count(db_session, user_id)
+
+    # THE PRODUCTION ROLLBACK, not the fixture's. See the docstring: the joined session turns the
+    # route's rollback into a savepoint rollback, which leaves the identity map loaded. Expiring
+    # it here restores the state the real one leaves behind, at the exact moment it leaves it.
+    real_rollback = db_session.rollback
+
+    async def _rollback_like_production() -> None:
+        # THE ONE THING A SAVEPOINT ROLLBACK DOES NOT DO. A savepoint rollback expires only what
+        # changed inside the savepoint; the real one expires the WHOLE identity map, so every
+        # instance the request had already loaded comes back needing a lazy SELECT. That is what
+        # makes the route's two `db.refresh` calls load-bearing, and deleting either of them
+        # turns this test red on `MissingGreenlet` — which is the 500 it is here to prevent.
+        await real_rollback()
+        db_session.expire_all()
+
+    monkeypatch.setattr(db_session, "rollback", _rollback_like_production)
 
     real_read = turns_module._conversation_or_none
     reads = {"n": 0}

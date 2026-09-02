@@ -206,7 +206,7 @@ async def test_stateless_multiturn_journey_with_reload_parity(
     assert events.headers["content-type"].startswith("text/event-stream")
     assert events.text.endswith("data: [DONE]\n\n")
     # A settled turn replays as snapshot-only (the terminal IS the snapshot), so the answer
-    # rides `textSoFar` rather than deltas — assert on whichever carried it.
+    # rides the snapshot's ordered `parts` rather than deltas — assert on whichever carried it.
     snapshot = json.loads(
         next(
             line.removeprefix("data: ")
@@ -214,7 +214,8 @@ async def test_stateless_multiturn_journey_with_reload_parity(
             if line.startswith("data: ") and '"snapshot"' in line
         )
     )
-    assert snapshot["textSoFar"] + "".join(_delta_texts(events.text)) == "Dark mode enabled."
+    snapshot_text = "".join(part["text"] for part in snapshot["parts"] if part["type"] == "text")
+    assert snapshot_text + "".join(_delta_texts(events.text)) == "Dark mode enabled."
 
     assert len(runs) == 3
 

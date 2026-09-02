@@ -141,7 +141,10 @@ def _answer_of(sse: str) -> str:
             continue
         frame = json.loads(payload)
         if frame.get("type") == "snapshot":
-            text += frame["textSoFar"]
+            # The snapshot carries the turn's ORDERED parts now — text blocks interleaved with
+            # steps — rather than the flat `textSoFar` string it replaced. Joining the text ones
+            # reassembles the same answer.
+            text += "".join(part["text"] for part in frame["parts"] if part["type"] == "text")
         elif frame.get("type") == "text_delta":
             text += frame["text"]
     return text
