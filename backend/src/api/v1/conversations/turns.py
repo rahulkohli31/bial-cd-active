@@ -509,6 +509,16 @@ async def start_turn(
             # read would mean the id belongs to another owner, and the 404 below is then the
             # same non-leaking answer every other cross-owner lookup gives.
             await db.rollback()
+            # THE ROLLBACK EXPIRES EVERY ORM INSTANCE THIS REQUEST HAS LOADED, and both of the
+            # ones below are read after it — `user.id` scopes the re-read on the very next line
+            # and every query under it, and `user.display_name`/`user.email` and `project.name`
+            # compose the prompt context. An expired attribute is fetched lazily, which in an
+            # ASYNC session is IO in a place SQLAlchemy cannot await: it raises `MissingGreenlet`
+            # and the citizen gets exactly the bare 500 this arm exists to replace. Refreshed
+            # explicitly, awaited, so the reads below are ordinary attribute reads again — two
+            # SELECTs on a path that only runs when two first messages genuinely raced.
+            await db.refresh(user)
+            await db.refresh(project)
             conversation = await _conversation_or_none(db, user.id, conversation_id)
         else:
             # The refresh is not optional: server-default timestamps on a fresh row raise
