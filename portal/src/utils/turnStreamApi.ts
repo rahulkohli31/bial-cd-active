@@ -56,14 +56,41 @@ export interface PlanOptionsItem {
   state: 'pending' | 'refine' | 'build'
 }
 
+/** One block of the turn's prose, at the position it took. */
+export interface TurnTextPart {
+  type: 'text'
+  text: string
+}
+
+/** One of the turn's steps, at the position it took. `toolCallId` is the SAME key the live
+ *  `StepFrame` carries, so a step that resolves after the snapshot replaces the one the
+ *  snapshot delivered rather than stacking a second copy beside it. */
+export interface TurnStepPart {
+  type: 'step'
+  toolCallId: string
+  item: StepItem
+}
+
+/** What the turn has produced so far, prose and steps INTERLEAVED in emission order.
+ *
+ *  The snapshot used to carry a flat `textSoFar` string beside an unordered step list, which
+ *  cannot express a turn that wrote, acted and wrote again — the two shapes agreed only while
+ *  a turn was guaranteed at most one block of text, always last. That guarantee came from
+ *  prose beside a tool call being thrown away; with it gone, a citizen who reloads mid-turn
+ *  would otherwise read the same turn in a different order from one who never left. */
+export type TurnPart = TurnTextPart | TurnStepPart
+
 export interface SnapshotFrame {
   type: 'snapshot'
   seq: number
   turnId: string | null
   turnStatus: 'idle' | 'running' | 'completed' | 'failed' | 'stopped'
   items: ProjectionItem[]
-  textSoFar: string
-  steps: StepItem[]
+  parts: TurnPart[]
+  /** Was the model mid-thought when this snapshot was taken? Same catch-up reasoning as the
+   *  fields below — a client that reattaches while it is thinking would otherwise sit on a
+   *  still screen until the next frame changed something. */
+  working: boolean
   /** WHY a failed turn failed. The in-band `error` frame lives only in the ring, so a
    *  subscriber that arrives after the failure reads the reason from here or not at all. */
   errorMessage: string | null
@@ -83,6 +110,25 @@ export interface TextDeltaFrame {
   type: 'text_delta'
   seq: number
   text: string
+  /** This slice OPENS a block rather than continuing the current one — the live half of the
+   *  boundary the reload projection gets for free from one stored text part per item. Without
+   *  it a client could only concatenate, and a turn that wrote, acted and wrote again would
+   *  render as one paragraph under all of its steps live, and as two paragraphs around them
+   *  after a reload. */
+  newBlock: boolean
+}
+
+/** The model is REASONING — and this is the whole of what reasoning becomes.
+ *
+ *  A BOOLEAN, NEVER THE TEXT. Reasoning blocks are stored server-side so the provider can be
+ *  given them back on the next turn, and they are never projected, never framed and never sent
+ *  here. What the citizen reads is one status line saying the agent is working.
+ *
+ *  Edge-triggered: the server emits it when the flag CHANGES, not per reasoning delta. */
+export interface WorkingFrame {
+  type: 'working'
+  seq: number
+  working: boolean
 }
 
 export interface StepFrame {
@@ -195,6 +241,7 @@ export interface UnknownFrame {
 export type KnownTurnFrame =
   | SnapshotFrame
   | TextDeltaFrame
+  | WorkingFrame
   | StepFrame
   | PlanOptionsFrame
   | TurnErrorFrame
@@ -213,6 +260,7 @@ export type TurnFrame = KnownTurnFrame | UnknownFrame
 const KNOWN_FRAME_TYPES = new Set([
   'snapshot',
   'text_delta',
+  'working',
   'step',
   'plan_options',
   'error',
@@ -304,6 +352,28 @@ export function toPlanOptionsItem(value: unknown): PlanOptionsItem | null {
   }
 }
 
+/** A snapshot's ordered parts, narrowed field by field like every other wire shape here.
+ *
+ *  A part that is neither a text block nor a resolvable step is DROPPED rather than guessed
+ *  at: the list IS the turn's order, and an entry that renders nothing is better than one
+ *  that renders a placeholder in a real position. */
+function toTurnParts(value: unknown): TurnPart[] {
+  if (!Array.isArray(value)) return []
+  const parts: TurnPart[] = []
+  for (const entry of value) {
+    if (!isRecord(entry)) continue
+    if (entry.type === 'text') {
+      parts.push({ type: 'text', text: asString(entry.text) })
+    } else if (entry.type === 'step') {
+      const item = toStepItem(entry.item)
+      const toolCallId = entry.toolCallId
+      if (item === null || typeof toolCallId !== 'string' || toolCallId === '') continue
+      parts.push({ type: 'step', toolCallId, item })
+    }
+  }
+  return parts
+}
+
 function toProjectionItems(value: unknown): ProjectionItem[] {
   if (!Array.isArray(value)) return []
   const items: ProjectionItem[] = []
@@ -351,10 +421,8 @@ function toTurnFrame(parsed: unknown): TurnFrame | null {
             ? status
             : 'idle',
         items: toProjectionItems(parsed.items),
-        textSoFar: asString(parsed.textSoFar),
-        steps: Array.isArray(parsed.steps)
-          ? parsed.steps.map(toStepItem).filter((step): step is StepItem => step !== null)
-          : [],
+        parts: toTurnParts(parsed.parts),
+        working: parsed.working === true,
         errorMessage: typeof parsed.errorMessage === 'string' ? parsed.errorMessage : null,
         workspaceState: asWorkspaceState(parsed.workspaceState),
         previewUrl: typeof parsed.previewUrl === 'string' ? parsed.previewUrl : null,
@@ -364,10 +432,16 @@ function toTurnFrame(parsed: unknown): TurnFrame | null {
         compileState: parsed.compileState == null ? null : asCompileState(parsed.compileState),
       }
     }
+    case 'working':
+      return { type: 'working', seq, working: parsed.working === true }
     case 'text_delta':
       // A delta with no text is nothing to append — but it is not corruption either; the
       // empty string is the honest reading.
-      return { type: 'text_delta', seq, text: asString(parsed.text) }
+      //
+      // `newBlock` fails CLOSED to false: a missing flag continues the block already open,
+      // which at worst runs two paragraphs together. Defaulting it true would split a single
+      // paragraph at every delta boundary, one block per token.
+      return { type: 'text_delta', seq, text: asString(parsed.text), newBlock: parsed.newBlock === true }
     case 'step': {
       const item = toStepItem(parsed.item)
       if (item === null) return null // a step frame IS its item; without one there is nothing to show

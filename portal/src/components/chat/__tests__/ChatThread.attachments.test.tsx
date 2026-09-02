@@ -69,10 +69,13 @@ const TextPart: ThreadComponents['TextPart'] = ({ text, isUser }) => (
 const ToolGroup: ThreadComponents['ToolGroup'] = ({ children }) => <div>{children}</div>
 const ToolPart: ThreadComponents['ToolPart'] = () => null
 
+const ReasoningGroup: ThreadComponents['ReasoningGroup'] = () => null
+
 const components: ThreadComponents = {
   TextPart,
   ToolGroup,
   ToolPart,
+  ReasoningGroup,
   UserAttachments: AttachmentChips,
 }
 

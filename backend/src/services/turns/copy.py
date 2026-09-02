@@ -269,28 +269,6 @@ work out whether it means tonight or tomorrow. The exact instant is still on the
 (`QuotaFrame.resets_at`) for the surfaces that want to show it."""
 
 
-NOTHING_TO_SHOW_YET_TEXT: Final = (
-    "I looked into that but haven't got anything to show you yet. "
-    "Tell me a bit more about what you're after and I'll take another run at it."
-)
-"""R77 — the last thing a turn says when the agent said nothing at all.
-
-WHY A TURN CAN NOW END WORDLESS. Prose written in the same response as a tool call does not
-reach the user, in either kind — so a turn whose every response called a tool renders a row of
-activity and not one word. Before that rule widened, a planning turn always had its prose; now
-it can have none, and a screen showing several finished steps and no message reads as the
-product having forgotten to answer.
-
-IT DOES NOT APOLOGISE AND IT DOES NOT DIAGNOSE. The platform genuinely does not know why there
-are no words — an agent that chose to stay quiet and one whose every sentence was dropped are
-the same state at the terminal, and finding out would mean reading the agent's prose, which is
-the one thing nothing here does. So it says the true, small thing: nothing came of it, and
-here is what to do next.
-
-THE NEXT ACTION IS THE POINT. "Tell me a bit more" is something the citizen can act on in the
-composer that is already in front of them, and it is honest about where the turn got to."""
-
-
 PROPOSAL_EVERYTHING_LEAD: Final = "Here is everything I picked up from that:"
 """R85's first move — say the whole thing back before narrowing it.
 

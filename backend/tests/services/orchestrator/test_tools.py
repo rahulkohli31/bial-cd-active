@@ -482,12 +482,43 @@ async def test_run_command_blocked_sql_emits_a_friendly_failed_label(sink: Colle
         assert leaked not in rc.label
 
 
-async def test_run_command_read_only_emits_a_hidden_step(sink: CollectingSink) -> None:
+async def test_a_read_only_command_is_a_visible_step_and_housekeeping_is_not(
+    sink: CollectingSink,
+) -> None:
+    """★ WHAT `hidden` MEANS NOW, asserted as the pair that defines the line.
+
+    Reads used to be hidden as a class, which is why a build's activity opened on a write with
+    no account of what the agent had looked at to get there. Looking at the app before changing
+    it is work the citizen recognises, so it is drawn. Housekeeping — `mkdir`, `mv`, `touch` —
+    is not: drawing it prints a generic line that says nothing about their app.
+
+    BOTH HALVES IN ONE TEST, deliberately. Asserting only that a read is visible would pass just
+    as well against a change that deleted the flag outright, which is the thing this unit
+    explicitly did not do.
+
+    Mutation check: flip either arm's `hidden` in `_classify_command` and exactly one of these
+    two assertions goes red."""
     fake = FakeSandbox()
-    fake.queue_commands(ExecResult(stdout="app/page.tsx", stderr="", exit=0))
-    await _run(fake, sink, [tool_turn("run_command", {"command": ["ls", "app"]}), text_turn()])
-    rc = next(e for e in _steps(sink) if e.name == "run_command")
-    assert rc.hidden is True
+    fake.queue_commands(
+        ExecResult(stdout="app/page.tsx", stderr="", exit=0),
+        ExecResult(stdout="", stderr="", exit=0),
+    )
+    await _run(
+        fake,
+        sink,
+        [
+            tool_turn("run_command", {"command": ["ls", "app"]}),
+            tool_turn("run_command", {"command": ["mkdir", "-p", "app/visitors"]}),
+            text_turn(),
+        ],
+    )
+    read, housekeeping = (e for e in _steps(sink) if e.name == "run_command")
+    assert read.hidden is False
+    assert housekeeping.hidden is True
+    # And neither one puts the raw command on screen, whichever side of the line it falls.
+    for step in (read, housekeeping):
+        for leaked in ("ls", "mkdir", "-p", "$ "):
+            assert leaked not in step.label
 
 
 # --- run_command (U1 / U4 / R1 / R3 / R11) -----------------------------------

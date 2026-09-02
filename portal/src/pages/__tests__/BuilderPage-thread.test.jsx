@@ -393,14 +393,16 @@ describe('R8 live clause — a reload MID-TURN re-attaches to the running reply'
     })
     h.readTurnStream.mockImplementation(
       turnStreaming([
-        { type: 'snapshot', seq: 4, turnId: 't-live', turnStatus: 'running', textSoFar: 'It tracks visitor', items: [], steps: [] },
-        { type: 'text_delta', seq: 5, text: ' passes.' },
+        { type: 'snapshot', seq: 4, turnId: 't-live', turnStatus: 'running', parts: [{ type: 'text', text: 'It tracks visitor' }], working: false, items: [], steps: [] },
+        { type: 'text_delta', seq: 5, text: ' passes.', newBlock: false },
         { type: 'turn_ended', seq: 6, turnId: 't-live', status: 'completed' },
       ]),
     )
     renderThread()
 
-    // The snapshot's textSoFar plus the tail — the whole reply, not just what arrived after.
+    // The snapshot's own block plus the tail that CONTINUES it — the whole reply, not just what
+    // arrived after, and not two paragraphs where the model wrote one. `newBlock: false` is what
+    // says the delta belongs to the block the snapshot delivered.
     expect(await screen.findByText(/It tracks visitor passes\./)).toBeTruthy()
     const [args] = h.readTurnStream.mock.calls[0]
     expect(args.conversationId).toBe('thread-1')

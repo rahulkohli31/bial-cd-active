@@ -41,6 +41,7 @@ from typing import Any, Final, Literal
 
 import structlog
 from pydantic_ai import Agent, BinaryContent, RunContext
+from pydantic_ai._agent_graph import AgentNode
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import (
     AgentStreamEvent,
@@ -53,14 +54,18 @@ from pydantic_ai.messages import (
     PartStartEvent,
     TextPart,
     TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
 )
 from pydantic_ai.models import Model
 from pydantic_ai.models.anthropic import AnthropicModelSettings
+from pydantic_ai.result import FinalResult
 from pydantic_ai.tools import DeferredToolRequests
 from pydantic_ai.usage import RequestUsage, RunUsage, UsageLimits
+from pydantic_graph import End
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.api.v1.build_sessions.schemas import LIVENESS_LEASE_RENEW_CADENCE_SECONDS, ErrorSource
@@ -79,7 +84,11 @@ from src.api.v1.conversations.schemas import (
     TextDeltaFrame,
     TurnEndedFrame,
     TurnErrorFrame,
+    TurnPart,
+    TurnStepPart,
     TurnStreamFrame,
+    TurnTextPart,
+    WorkingFrame,
     WorkspaceFrame,
 )
 from src.core.integrity_types import BaselineIdentity
@@ -131,10 +140,13 @@ from src.services.messages.projection import (
 from src.services.messages.store import append_batch
 from src.services.orchestrator.client_errors import discard_client_errors
 from src.services.orchestrator.constants import (
+    ADAPTIVE_THINKING,
+    BUILD_EFFORT,
     CACHE_TTL,
     CRASH_EDGE_CONSECUTIVE_POLLS,
     MAX_OUTPUT_TOKENS,
     MODEL_TURN_CEILING,
+    PLAN_EFFORT,
     READINESS_MAX_POLLS,
     READINESS_POLL_S,
     RUN_TOKEN_BUDGET,
@@ -163,7 +175,6 @@ from src.services.turns.copy import (
     COULD_NOT_CONFIRM_TEXT,
     DID_NOT_COME_TOGETHER_TEXT,
     NOT_RECOVERED_TEXT,
-    NOTHING_TO_SHOW_YET_TEXT,
     PLAN_NOT_KEPT_TEXT,
     RECOVERED_TEXT,
     REMAINDER_TEXT,
@@ -201,6 +212,20 @@ ENDED_TURN_TTL_S = 300.0
 _STEPS_CAP = 256
 
 TurnStatus = Literal["running", "completed", "failed", "stopped"]
+
+PLATFORM_TEXT_KIND: Final = "platform_text"
+"""The row meta that says a sentence in the transcript is the PLATFORM's, not the model's.
+
+WHAT IT BUYS TODAY is the record: the row is a `SYSTEM_EVENT` carrying the platform's own
+words, so nothing downstream — a reader, an operator, an audit — has to infer authorship from
+a sentence that looks exactly like a reply. It renders to the citizen exactly as it did
+before, through the projection's arm for a visible system row with text, which exists so a
+lifecycle entry degrades to prose rather than vanishing.
+
+WHAT IT IS FOR NEXT is plan 009, which is building the durable, typed home for platform
+speech on the turn-terminal row. This is the marker that row adopts. Naming it here rather
+than inventing a second rendering now is deliberate: two homes would show the citizen the
+same sentence twice."""
 
 # What a turn failure tells the subscriber. Internal detail stays in the server log.
 _TURN_FAILED_MESSAGE = "The assistant hit a problem and this turn was stopped."
@@ -408,6 +433,36 @@ class TurnNotRunningError(Exception):
     """Stop named a turn that is not the conversation's in-flight turn."""
 
 
+THINKING_TOKENS_KEY: Final = "thinking_tokens"
+"""Where the provider reports what it spent THINKING, inside `RunUsage.details`.
+
+Anthropic bills thinking WITHIN `output_tokens` rather than beside it, so this is a readable
+SUBSET of the output total and never an addition to it — subtracting it is sound, adding it
+would double-count. The key is omitted entirely when a response used no thinking, which is why
+every reader defaults it to zero rather than requiring it."""
+
+
+def _citizen_output_tokens(usage: RunUsage | RequestUsage) -> int:
+    """The output tokens that are the CITIZEN's, with the platform's thinking taken back out.
+
+    THE OWNER'S RULING (2026-09-02): the meter shows what they spent on their app, not what the
+    platform spent thinking about it. Reasoning is a choice this platform made on their behalf —
+    they did not ask for it, cannot see it, and cannot turn it off — so charging their daily
+    allowance for it would make their own budget move for a reason they have no way to act on.
+
+    SUBTRACTED HERE, ONCE, so both readers of a turn's spend get it: the per-run ceiling and the
+    row the daily meter sums. Those two are deliberately one policy — a per-run bound and a
+    per-day bound that counted tokens differently would be two numbers the citizen is told are
+    the same word — and excluding reasoning from only one of them would break exactly that.
+    The consequence is real and worth stating: a reasoning-heavy build gets more room under the
+    run budget than it used to, because the budget now measures the same thing the meter does.
+
+    Floored at zero. The subtraction is arithmetic on two numbers the provider reports
+    separately, and a negative answer would mean one of them is wrong — in which case charging
+    nothing is the honest failure, not charging a negative."""
+    return max(usage.output_tokens - usage.details.get(THINKING_TOKENS_KEY, 0), 0)
+
+
 def _run_spend(usage: RunUsage) -> int:
     """What this run has spent, weighted the way the citizen's daily meter weights it.
 
@@ -426,7 +481,7 @@ def _run_spend(usage: RunUsage) -> int:
     differently would be two numbers described to the citizen as the same word."""
     return weighted_spend(
         input_tokens=usage.input_tokens,
-        output_tokens=usage.output_tokens,
+        output_tokens=_citizen_output_tokens(usage),
         cache_read_tokens=usage.cache_read_tokens,
         cache_write_tokens=usage.cache_write_tokens,
     )
@@ -494,6 +549,38 @@ class ActiveTurnInfo:
 
 
 @dataclass
+class _TextBlock:
+    """One contiguous stretch of the turn's prose, as the citizen reads it.
+
+    A BLOCK, NOT A DELTA. `text` grows while the model is still writing the same `TextPart`
+    and is sealed the moment anything else — a step, or a fresh `TextPart` — takes its place
+    in `_TurnState.parts`. That is what makes one stretch of writing render as one paragraph
+    block live, exactly as the reload projection renders one item per stored text part."""
+
+    text: str
+
+
+@dataclass
+class _StepRef:
+    """A step's PLACE in the turn, held apart from the step itself.
+
+    `_TurnState.steps` is keyed by tool-call id because a step arrives twice (started, then
+    finished) and the second must replace the first in place. That map cannot also record
+    ORDER — a resolved step would move to the end of it — so the position lives here and the
+    item is resolved through the map when the snapshot is built. A ref whose id has left the
+    map (evicted at the cap, or withdrawn like the plan-options status) is dropped with it."""
+
+    tool_call_id: str
+
+
+_TurnPart = _TextBlock | _StepRef
+"""What a turn produced, in the order it produced it — the thing the live stream and the
+reload projection have to agree about. Reload has always emitted one item per part in part
+order; before this existed the live path could only append every step and then one block of
+text, so the two agreed only while a turn was guaranteed at most one text block."""
+
+
+@dataclass
 class _TurnState:
     """One turn's in-memory story: the frame ring (replay), the consolidated tail
     (snapshot material), and the fan-out wakeups."""
@@ -505,14 +592,10 @@ class _TurnState:
     status: TurnStatus = "running"
     seq: int = 0
     ring: deque[TurnStreamFrame] = field(default_factory=lambda: deque(maxlen=RING_MAXLEN))
-    text_parts: list[str] = field(default_factory=list)
-    # U15/R20 — BUILD-chat prose, held until we know what it is. Text streams BEFORE the tool
-    # call that would mark it as narration-between-tools, so the decision cannot be made at
-    # delta time; one model response's prose accumulates here and is either dropped by
-    # `_discard_pending_text` (a tool call followed → it was narration) or committed by
-    # `_flush_pending_text` (the response ended with no tool call → it was the turn's answer).
-    # Never used in a Plan chat, where the prose IS the deliverable and streams as it arrives.
-    pending_text: list[str] = field(default_factory=list)
+    #: The turn's prose and its steps, INTERLEAVED, in emission order — the catch-up
+    #: snapshot's whole content and the reason a reattached citizen reads the same turn as
+    #: one who never left.
+    parts: list[_TurnPart] = field(default_factory=list)
     steps: dict[str, StepItem] = field(default_factory=dict)  # tool_call_id → newest item
     # U17's acknowledgement, held OUT of `steps` and beside it. The distinction the original
     # comment collapsed: `steps` is what gets PERSISTED, so the ack must stay out of it — but the
@@ -521,6 +604,13 @@ class _TurnState:
     # of both meant it reached nobody. Cleared by the first real step, which is what "replaced by
     # the first real step" has to mean on a transport where the ring frame is unreachable.
     acknowledgement: StepItem | None = None
+    #: Is the model REASONING right now — the only thing reasoning is allowed to become.
+    #:
+    #: A boolean, never the text. The blocks are stored so the next turn can replay them and
+    #: are never projected, never framed and never sent to the browser; what the citizen gets
+    #: is one status line saying the agent is working. Set when a reasoning part opens, cleared
+    #: when anything else does or when the turn ends.
+    working: bool = False
     subscribers: set[asyncio.Queue[None]] = field(default_factory=set)
     task: asyncio.Task[None] | None = None
     # U17 — the per-tool-call "this is still running" narrators, keyed by tool call id.
@@ -609,8 +699,22 @@ class _TurnState:
     #: able to make a piece disappear from it twice or appear as still outstanding.
     finished_pieces: set[str] = field(default_factory=set)
 
-    def text_so_far(self) -> str:
-        return "".join(self.text_parts)
+    def text_blocks(self) -> list[str]:
+        """The prose the citizen has been given so far, one entry per block."""
+        return [part.text for part in self.parts if isinstance(part, _TextBlock)]
+
+    def drop_step(self, tool_call_id: str) -> None:
+        """Withdraw a step entirely — from the map AND from the order.
+
+        Dropping it from the map alone would leave a ref pointing at nothing, which the
+        snapshot skips but never reclaims; on a build that runs for minutes and evicts at the
+        cap that is an unbounded list of dead positions."""
+        self.steps.pop(tool_call_id, None)
+        self.parts = [
+            part
+            for part in self.parts
+            if not (isinstance(part, _StepRef) and part.tool_call_id == tool_call_id)
+        ]
 
     def claim_preview_frame(self) -> bool:
         """True for exactly one caller. Synchronous on purpose — no await between the read
@@ -899,7 +1003,7 @@ class TurnEngine:
                         bill_db,
                         state.user_id,
                         input_tokens=turn_usage.input_tokens,
-                        output_tokens=turn_usage.output_tokens,
+                        output_tokens=_citizen_output_tokens(turn_usage),
                         cache_read_tokens=turn_usage.cache_read_tokens,
                         cache_write_tokens=turn_usage.cache_write_tokens,
                     )
@@ -1024,28 +1128,22 @@ class TurnEngine:
                         # cut mid-string, the offer is refused, and the citizen pays for a turn
                         # that produced nothing they can press. The same two settings the build
                         # loop already passes, for the same reason.
+                        #
+                        # REASONING AT MEDIUM EFFORT, and it is the ONLY thing the kind decides
+                        # about how the model is asked to think. A plan is a conversation about
+                        # what to build with the person still in it; a build is where the
+                        # thinking is spent on something that has to compile, and it gets high.
+                        # Adaptive rather than a token budget because the deployed model
+                        # refuses a budget outright — see `ADAPTIVE_THINKING`.
                         model_settings=AnthropicModelSettings(
-                            max_tokens=MAX_OUTPUT_TOKENS, temperature=TEMPERATURE
+                            max_tokens=MAX_OUTPUT_TOKENS,
+                            temperature=TEMPERATURE,
+                            anthropic_thinking=ADAPTIVE_THINKING,
+                            anthropic_effort=PLAN_EFFORT,
                         ),
                     )
                     persistable = _persistable_messages(result.new_messages())
                     deferred = _deferred_call(result.output)
-
-                    # THE FLUSH THIS RUN DID NOT HAVE (U4). Prose is held in every kind now,
-                    # and the Build node loop releases it at each node boundary — but
-                    # `chat_agent.run` has no node boundary to hook, so once anything is held
-                    # on this path nothing would ever release it and the turn would go silent.
-                    #
-                    # RUN COMPLETION IS THE RIGHT MOMENT, not a manufactured per-response one.
-                    # A response that wrote prose AND called a tool has already had that prose
-                    # discarded at the call event; a response that calls no tool ENDS the run.
-                    # So what is held here is exactly the trailing answer, and this releases it
-                    # at the same instant a per-response boundary would.
-                    #
-                    # BEFORE THE REFUSAL ARM BELOW, deliberately: that arm pushes a
-                    # platform-authored line, and flushing after it would print the citizen's
-                    # own answer underneath "that plan didn't arrive".
-                    self._flush_pending_text(state)
 
                     # AN OFFER IS EITHER HONOURABLE OR IT IS NOT WRITTEN AT ALL (R28a / R44).
                     # An empty plan, one past the stored-message ceiling, or a pre-migration
@@ -1054,6 +1152,16 @@ class TurnEngine:
                     # one platform-authored line. Nothing unbuildable is left on screen, and
                     # the live feed already agreed: the event handler pushed no plan and
                     # emitted no card for the same call.
+                    #
+                    # A TURN THAT PRODUCED NO WORDS NOW PRODUCES NO ASSISTANT MESSAGE. There
+                    # used to be a second arm here that pushed a platform-written sentence
+                    # whenever the turn had said nothing, because the narration drop had made a
+                    # wordless turn possible for the first time and a screen of finished steps
+                    # with no message read as the product forgetting to answer. The drop is
+                    # gone, so a wordless turn now means the model genuinely chose not to
+                    # speak — and putting words in its mouth to cover a case that no longer
+                    # exists is the thing this unit removes.
+                    platform_text: str | None = None
                     if deferred is not None and plan_from_call(deferred) is None:
                         _log.info(
                             "plan_options_offer_refused",
@@ -1062,38 +1170,32 @@ class TurnEngine:
                         )
                         persistable = _without_the_call(persistable, deferred.tool_call_id)
                         deferred = None
-                        self._push_block(state, PLAN_NOT_KEPT_TEXT)
-                        persistable = [
-                            *persistable,
-                            ModelResponse(parts=[TextPart(content=PLAN_NOT_KEPT_TEXT)]),
-                        ]
+                        self._push_text(state, PLAN_NOT_KEPT_TEXT)
+                        platform_text = PLAN_NOT_KEPT_TEXT
 
-                    # R77 — WHERE THE AGENT SAID NOTHING, THE PLATFORM STILL SPEAKS. Widening
-                    # the drop made a wordless turn possible on this path for the first time:
-                    # a turn whose every response called a tool now renders activity and not
-                    # one word. R75 sanctions an agent CHOOSING not to speak, but after the
-                    # drop those two states are indistinguishable at the terminal — nothing
-                    # here can tell "it had nothing to add" from "everything it wrote was
-                    # dropped" — so R77 wins outright and every turn ends readable.
-                    #
-                    # `text_parts` IS THE WHOLE TEST, and it is a platform record rather than a
-                    # reading of the agent's prose: it holds what actually reached the citizen,
-                    # including a flushed answer, a spoken line and the plan. Empty means they
-                    # have nothing to read, whatever the reason.
-                    #
-                    # It travels the same persist seam as every other reply on this path, so a
-                    # reload shows what the live feed showed — the failure mode this replaces
-                    # is a line on screen that a refresh removes.
-                    if not state.text_parts:
-                        self._push_text(state, NOTHING_TO_SHOW_YET_TEXT)
-                        persistable = [
-                            *persistable,
-                            ModelResponse(parts=[TextPart(content=NOTHING_TO_SHOW_YET_TEXT)]),
-                        ]
-
-                    batches: list[tuple[list[ModelMessage], dict[str, Any] | None]] = [
-                        (persistable, self._pending_meta(deferred))
-                    ]
+                    batches: list[
+                        tuple[list[ModelMessage], dict[str, Any] | None, MessageEntryKind]
+                    ] = [(persistable, self._pending_meta(deferred), MessageEntryKind.TURN)]
+                    if platform_text is not None:
+                        # ITS OWN ROW, AND NOT IN THE MODEL'S NAME. This sentence is the
+                        # platform's — it explains a refusal the platform made — and it used to
+                        # be appended to the run's own messages as a `ModelResponse`, which
+                        # stored it as something the model had written. It renders to the
+                        # citizen exactly as it did: a visible system row carrying text already
+                        # projects as assistant prose, which is the arm that exists so a
+                        # lifecycle entry degrades to prose rather than vanishing.
+                        #
+                        # NO SECOND LIVE HOME. Plan 009 is building the durable, typed home for
+                        # platform speech on the turn-terminal row; when it lands this is the
+                        # row it adopts. Routing the sentence to a live-only banner in the
+                        # meantime would give the citizen the same words twice.
+                        batches.append(
+                            (
+                                [ModelResponse(parts=[TextPart(content=platform_text)])],
+                                {"kind": PLATFORM_TEXT_KIND, "turnId": str(state.turn_id)},
+                                MessageEntryKind.SYSTEM_EVENT,
+                            )
+                        )
 
                     # NO SECOND MODEL REQUEST IS ISSUED HERE, and none is issued anywhere as a
                     # consequence of what the model wrote. The forced retry that used to sit at
@@ -1108,14 +1210,14 @@ class TurnEngine:
                     # The user request is already durable (pre-run write) — append the
                     # responses PLUS their tool-return requests.
                     try:
-                        for messages, meta in batches:
+                        for messages, meta, entry_kind in batches:
                             if messages:
                                 await append_batch(
                                     db,
                                     user_id=state.user_id,
                                     conversation_id=state.conversation_id,
                                     messages=messages,
-                                    entry_kind=MessageEntryKind.TURN,
+                                    entry_kind=entry_kind,
                                     kind=state.kind,
                                     meta=meta,
                                 )
@@ -1855,6 +1957,8 @@ class TurnEngine:
             model_settings=AnthropicModelSettings(
                 max_tokens=MAX_OUTPUT_TOKENS,
                 temperature=TEMPERATURE,
+                anthropic_thinking=ADAPTIVE_THINKING,
+                anthropic_effort=BUILD_EFFORT,
                 anthropic_cache_instructions=CACHE_TTL,
                 anthropic_cache_tool_definitions=CACHE_TTL,
                 anthropic_cache=CACHE_TTL,
@@ -1862,10 +1966,23 @@ class TurnEngine:
             # Deliberately NO `usage=`: this run's spend is folded per step below, and
             # passing the turn accumulator as well would bill every token twice.
         ) as run:
-            node = run.next_node
+            # ANNOTATED, AND WALKED WITH `isinstance` RATHER THAN `Agent.is_end_node`.
+            #
+            # The library offers that classmethod and its docstring recommends it over isinstance
+            # "to preserve the generic parameters while narrowing". That is true of the POSITIVE
+            # branch and is not what this loop needs: it needs the NEGATIVE one, and the guard is
+            # a `TypeIs[End[FinalResult[S]]]` whose `S` is inferable only from the argument. Call
+            # it on the bare class and `ty` binds `S` to `Unknown`, so `End[FinalResult[str]]`
+            # survives the negation and every `run.next(node)` below it reads as possibly-End.
+            #
+            # Annotating the variable is what makes plain `isinstance` exact instead: the union
+            # is written down, so the negative branch is precisely the node type, and all four
+            # checkers agree. The annotation is also the honest documentation — this loop walks
+            # a graph, and what it walks was previously inferred and invisible.
+            node: AgentNode[ChatDeps, str] | End[FinalResult[str]] = run.next_node
             cut_short = False
             pending_answers: ModelRequest | None = None
-            while not Agent.is_end_node(node):
+            while not isinstance(node, End):
                 if Agent.is_model_request_node(node):
                     # THE SESSION CLOSES BEFORE THE ENDING IS BUILT, which is why the `try`
                     # is on the outside now (U24). `at_limit_ending` bundles and uploads the
@@ -1940,15 +2057,6 @@ class TurnEngine:
                     async with node.stream(run.ctx) as tool_stream:
                         async for tool_event in tool_stream:
                             self._on_event(state, tool_event)
-                    # THE FLUSH BOUNDARY, and it has to be here rather than at the end of the
-                    # model-request stream above (U15/R20). pydantic-ai streams a response's
-                    # TEXT and its TOOL CALLS from two different nodes, text first, so at the
-                    # end of the text stream we do not yet know which kind of prose this was.
-                    # By this line the tool-call node has been drained: a response that called
-                    # tools has already emptied the buffer via `_discard_pending_text`, so this
-                    # is a no-op for it, and a response that called none still holds its prose —
-                    # which is the citizen's answer, and the only thing that will ever say it.
-                    self._flush_pending_text(state)
                     node = await run.next(node)
                     # The step's tools have executed and their returns are in the history,
                     # so the step is complete — persist before the next request fires.
@@ -2025,14 +2133,18 @@ class TurnEngine:
     ) -> None:
         """Fold ONE model step's spend, in its own session with its own commit. Best-effort
         by design: a metering failure must not kill a build that is otherwise going fine, and
-        the next step's `enforce_daily_limit` still reads whatever did land."""
+        the next step's `enforce_daily_limit` still reads whatever did land.
+
+        THE PLATFORM'S THINKING IS TAKEN OFF THE ROW, not off the reader — see
+        `_citizen_output_tokens`. Subtracting here is what makes the daily meter, the admin
+        roster and the per-run ceiling agree without any of them knowing reasoning exists."""
         try:
             async with session_factory() as db:
                 await record_usage(
                     db,
                     state.user_id,
                     input_tokens=usage.input_tokens,
-                    output_tokens=usage.output_tokens,
+                    output_tokens=_citizen_output_tokens(usage),
                     cache_read_tokens=usage.cache_read_tokens,
                     cache_write_tokens=usage.cache_write_tokens,
                 )
@@ -2095,8 +2207,8 @@ class TurnEngine:
         obtain it.
 
         BOTH FRAMES AND THE ROW, because the completion has to survive a reload. `_push_text`
-        puts it on the live stream and into `text_so_far` for a mid-turn re-snapshot; the row
-        is what the transcript projects tomorrow. Persisting it also closes the exchange
+        puts it on the live stream and onto the turn's parts for a mid-turn re-snapshot; the
+        row is what the transcript projects tomorrow. Persisting it also closes the exchange
         honestly — cutting the run at the tool leaves a tool return with no response after it,
         and this is that response.
 
@@ -2109,12 +2221,11 @@ class TurnEngine:
         )
         if remainder is not None:
             text = f"{text}{TEXT_BLOCK_SEPARATOR}{remainder}"
-        # An earlier iteration of this same turn can have flushed prose of its own (a response
-        # that called no tool — see `_flush_pending_text`), and `text_parts` is joined with
-        # nothing between entries. Without this the closing message runs into that prose's last
-        # sentence, which is the defect `TEXT_BLOCK_SEPARATOR` exists to prevent.
-        if state.text_parts:
-            self._push_text(state, TEXT_BLOCK_SEPARATOR)
+        # ITS OWN BLOCK, which `_push_text` now guarantees rather than this call site. An
+        # earlier response in the same turn has very likely written prose of its own, and the
+        # closing message running into that prose's last sentence is the defect the separator
+        # constant exists to prevent — inside a composed message, which is what it still does
+        # for the remainder sentence above.
         self._push_text(state, text)
         try:
             async with session_factory() as db:
@@ -2654,31 +2765,12 @@ class TurnEngine:
             state="pending",
             hidden=False,
         )
-        state.acknowledgement = None
-        state.steps[tool_call_id] = item
+        self._retire_acknowledgement(state)
+        self._open_step(state, tool_call_id, item)
         self._emit(
             state,
             lambda seq: StepFrame(seq=seq, tool_call_id=tool_call_id, phase="started", item=item),
         )
-
-    def _push_block(self, state: _TurnState, text: str) -> None:
-        """A platform-rendered block onto the live stream, through the ungated text sink.
-
-        Separated from `_push_text` only by the block separator: an earlier response in the
-        same turn may already have flushed prose, and `text_parts` joins with nothing between
-        entries, so without this the block runs into that prose's last sentence.
-
-        NAMED FOR THE JOB, NOT THE FIRST CALLER. Three things now arrive this way — a plan, a
-        voice-channel line, a first-slice proposal — and they differ only in what the platform
-        rendered upstream, never in how the block is seated. A per-caller copy of these three
-        lines is how the separator rule drifts between them.
-
-        UNGATED ON PURPOSE. What travels here was rendered by the platform from a tool call's
-        arguments, so the narration drop that holds the model's own prose does not apply: there
-        is no model text in it to hold."""
-        if state.text_parts:
-            self._push_text(state, TEXT_BLOCK_SEPARATOR)
-        self._push_text(state, text)
 
     def _emit_plan_options(self, state: _TurnState, tool_call_id: str) -> None:
         item = PlanOptionsItem(
@@ -2699,11 +2791,10 @@ class TurnEngine:
         """The pydantic-ai event_stream_handler: model/tool events → typed frames.
 
         ASK/PLAN ONLY — Write drives its own node loop (`_run_write_once`) and calls
-        `_on_event` directly. No flush here on purpose: pydantic-ai invokes this handler once
-        per NODE, and a response's text and its tool calls arrive from two different nodes,
-        text first. Flushing at the end of this iteration would therefore commit prose before
-        the tool call that classifies it has been seen — which is the leak, restated. Ask/Plan
-        never hold anything anyway (`_stream_text` commits immediately outside Write).
+        `_on_event` directly. There is nothing to reconcile at the end of an iteration any
+        more: pydantic-ai invokes this handler once per NODE, and a response's text and its
+        tool calls arrive from two different nodes, text first — which is exactly the order
+        the citizen reads them in, so each event goes straight out as it lands.
         """
 
         async def handle(
@@ -2716,8 +2807,16 @@ class TurnEngine:
 
     def _on_event(self, state: _TurnState, event: AgentStreamEvent) -> None:
         if isinstance(event, PartStartEvent):
+            if isinstance(event.part, ThinkingPart):
+                # THE FLAG, AND NOTHING ELSE. `event.part.content` is the reasoning text and is
+                # deliberately not read here or anywhere on the way to the browser: the whole
+                # of what reasoning is allowed to become is a status line saying the agent is
+                # working. The blocks themselves go to the payload, because the provider
+                # rejects the NEXT turn's tool call if its reasoning block is missing.
+                self._set_working(state, True)
+                return
             if isinstance(event.part, TextPart) and event.part.content:
-                self._stream_text(state, event.part.content, new_block=True)
+                self._push_text(state, event.part.content, new_block=True)
             elif (
                 isinstance(event.part, ToolCallPart) and event.part.tool_name == PLAN_OPTIONS_TOOL
             ):
@@ -2726,23 +2825,29 @@ class TurnEngine:
                 # The name is available before any argument is: the provider's
                 # `content_block_start` for a tool use carries `name` with an empty `input`,
                 # which pydantic-ai surfaces here as a `ToolCallPart` whose `tool_name` is
-                # already set. That matters because the plan now rides the argument —
-                # thousands of tokens stream between this event and the call resolving, and
-                # with prose held beside a tool call the screen shows nothing new for the
-                # whole of it.
+                # already set. That matters because the plan now rides the ARGUMENT, not the
+                # response text: thousands of tokens stream between this event and the call
+                # resolving, and none of them are prose, so without this the screen shows
+                # nothing new for the whole of it.
                 #
                 # NOT WIDENED TO EVERY TOOL, deliberately: the others resolve fast and already
                 # emit at `FunctionToolCallEvent`, so emitting at both events would double
                 # every step row in the transcript.
                 self._emit_plan_status(state, event.part.tool_call_id)
         elif isinstance(event, PartDeltaEvent):
+            if isinstance(event.delta, ThinkingPartDelta):
+                # A reasoning delta says the model is STILL thinking and says nothing else. The
+                # delta's own content is never read, for the same reason its part's is not.
+                self._set_working(state, True)
+                return
             if isinstance(event.delta, TextPartDelta) and event.delta.content_delta:
-                self._stream_text(state, event.delta.content_delta, new_block=False)
+                self._push_text(state, event.delta.content_delta, new_block=False)
         elif isinstance(event, FunctionToolCallEvent):
-            # This response is DOING something, so any prose it opened with was the model
-            # narrating its way to the tool — not a message to the citizen. Dropped before
-            # it can reach the wire, which is why the live feed and a later reload agree.
-            self._discard_pending_text(state)
+            # NOTHING IS DISCARDED HERE, and that is the change. This call used to delete
+            # every paragraph the response had opened with, on the rule that prose beside a
+            # tool call is narration. The prose was stored all along and suppressed on the way
+            # out; now it reaches the citizen in the place it was written, and the step this
+            # event opens takes the position after it.
             if event.part.tool_name == PLAN_OPTIONS_TOOL:
                 # The plan FIRST, then the card beneath it — the order the citizen reads, and
                 # the same order the reload projection produces from this one stored call.
@@ -2750,12 +2855,12 @@ class TurnEngine:
                 # own closing line says so, once, from the persist path below.
                 plan = plan_from_call(event.part)
                 if plan is not None:
-                    self._push_block(state, plan)
+                    self._push_text(state, plan)
                     # The options card, not a step: the call defers (the user's click is the
                     # result), so there is no 'finished' counterpart to wait for. It REPLACES
                     # the status on the same tool_call_id rather than stacking beside it.
                     self._emit_plan_options(state, event.part.tool_call_id)
-                state.steps.pop(event.part.tool_call_id, None)
+                state.drop_step(event.part.tool_call_id)
                 return
             if event.part.tool_name == TELL_THE_USER_TOOL:
                 # THE WORDS, AND NOT A STEP. Rendered here at the CALL event rather than at
@@ -2772,7 +2877,7 @@ class TurnEngine:
                 # speak is the row this channel exists to avoid.
                 spoken = update_from_args(event.part.args)
                 if spoken:
-                    self._push_block(state, spoken)
+                    self._push_text(state, spoken)
                 # THE MARK, RECORDED FROM THE SAME CALL that carried the words (U12), and
                 # CHECKED HERE RATHER THAN TRUSTED FROM THE BODY.
                 #
@@ -2805,15 +2910,16 @@ class TurnEngine:
                 # turn start, and this replaces it the moment a new proposal is made.
                 proposal = proposal_from_args(event.part.args)
                 if proposal:
-                    self._push_block(state, proposal)
+                    self._push_text(state, proposal)
                     state.agreed_pieces = agreed_slice([ModelResponse(parts=[event.part])])
                     state.finished_pieces.clear()
                 return
             item = self._step_item(state, event.part.tool_name, event.part.args_as_json_str())
-            # REPLACED, not accumulated beside: the first real step retires the ack from the
-            # snapshot, so a client that subscribes later never sees both.
-            state.acknowledgement = None
-            state.steps[event.part.tool_call_id] = item
+            # REPLACED, not accumulated beside: the first real step retires the ack — from the
+            # snapshot a later subscriber reads AND from the feed an earlier one is already
+            # watching, which is the half that was missing.
+            self._retire_acknowledgement(state)
+            self._open_step(state, event.part.tool_call_id, item)
             self._emit(
                 state,
                 lambda seq: StepFrame(
@@ -2923,58 +3029,105 @@ class TurnEngine:
                     turn_id=str(state.turn_id),
                 )
 
-    def _push_text(self, state: _TurnState, text: str) -> None:
-        """Commit prose to the citizen: onto the snapshot tail AND onto the wire.
+    def _retire_acknowledgement(self, state: _TurnState) -> None:
+        """Take the opening acknowledgement off the screen, on the wire and in the snapshot.
 
-        DELIBERATELY UNGATED, and `_render_completion` is why — the completion message is
-        delivered through this same call (U18). A gate here rather than at the streaming
-        call site would silence the one message the U15 drop is relying on to survive.
-        """
-        state.text_parts.append(text)
-        self._emit(state, lambda seq: TextDeltaFrame(seq=seq, text=text))
+        THE ACK'S REAL DEFECT WAS THAT NOTHING RETRACTED IT. Clearing `state.acknowledgement`
+        retires it from the catch-up snapshot, so a client that subscribed LATER never saw it —
+        but a client that was already connected received it as a live step frame and had no way
+        to learn it was over. It sat in that turn's activity group as a step that never
+        resolved, which is a group that never seals: "Getting started on that…" beside a build
+        that finished ten minutes ago.
 
-    def _stream_text(self, state: _TurnState, text: str, *, new_block: bool) -> None:
-        """Prose arriving mid-response, before we know whether a tool call follows it.
+        IT RIDES `hidden`, and that is the cheapest correct answer rather than a shortcut. The
+        frame union is closed and the browser drops what it does not recognise, so a new frame
+        KIND would need the wire schema, the parser and the reducer changed together. `hidden`
+        already means "do not draw this", is already filtered on both paths, and already keys
+        by tool-call id — so re-emitting the same id hidden replaces the row in place and it
+        leaves the feed. The first frame still reaches the browser before the first model
+        request, which is the guarantee the ack exists for and the one thing that must not
+        change.
 
-        HELD IN EVERY KIND (U4/R74/N2), and this is the site that used to ask which one. The
-        rule was never about the kind of chat: prose written in the same response as a tool
-        call is the model narrating its way to the call, and that is as true when the tool is
-        `read_file` in a planning chat as when it is `write_file` in a build. Asking the kind
-        said something else — that the same response means one thing here and another there —
-        and it is what let 2,397 words of paths and commands through on one side while the
-        other side was clean.
-
-        WHAT IT COSTS, STATED RATHER THAN DISCOVERED. Holding is inherently non-streaming, so
-        a planning answer now arrives as one block when its response completes rather than
-        token by token, and `text_so_far` is empty while it is held — a mid-turn reconnect
-        sees steps and no partial answer. Build has always behaved this way. What keeps the
-        screen from being empty in between is the voice channel (`TELL_THE_USER_TOOL`), which
-        is why the two ship together; and the moment the answer itself arrives is unchanged.
-
-        `new_block` marks a fresh `TextPart` rather than a delta continuing the current one.
-        Blocks were previously concatenated with nothing between them, which ran the last
-        sentence of one into the first word of the next ("…the workspace.Now let me…") on
-        the live feed only — reload always kept them as separate items.
-        """
-        if new_block and state.pending_text:
-            state.pending_text.append(TEXT_BLOCK_SEPARATOR)
-        state.pending_text.append(text)
-
-    def _discard_pending_text(self, state: _TurnState) -> None:
-        """Drop held prose — a tool call proved it was narration between tools (U15/R20)."""
-        state.pending_text.clear()
-
-    def _flush_pending_text(self, state: _TurnState) -> None:
-        """Commit held prose — the response ended without calling a tool, so this is the
-        turn's own answer. The zero-mutation Write ending depends on this: that turn never
-        calls `declare_done`, so nothing else would ever say anything."""
-        held = "".join(state.pending_text)
-        state.pending_text.clear()
-        if not held.strip():
+        IDEMPOTENT: a turn whose ack was already retired emits nothing, so the plan-status arm
+        and the first real step cannot both retract it and leave two frames behind."""
+        ack = state.acknowledgement
+        if ack is None:
             return
-        if state.text_parts:
-            self._push_text(state, TEXT_BLOCK_SEPARATOR)
-        self._push_text(state, held)
+        state.acknowledgement = None
+        retired = ack.model_copy(update={"hidden": True})
+        self._emit(
+            state,
+            lambda seq: StepFrame(
+                seq=seq, tool_call_id=ACK_TOOL_CALL_ID, phase="finished", item=retired
+            ),
+        )
+
+    def _set_working(self, state: _TurnState, working: bool) -> None:
+        """Turn the working status on or off, and frame the CHANGE only.
+
+        THE FLAG RIDES THE TURN, NOT A MESSAGE, and that is the seam an earlier draft of this
+        got wrong. The browser's status renderer is reached only when a message actually
+        carries a part of the reasoning kind, so a boolean alone renders nothing — what the
+        chat surface does with this is synthesise a CONTENT-FREE reasoning part at the head of
+        the streaming message while it is true. Content-free is the point: the part carries no
+        text, so "status only, never the reasoning" is structural rather than a promise.
+
+        EDGE-TRIGGERED. Reasoning arrives as a stream of deltas, and a frame per delta would
+        put thousands of identical frames through a ring sized for a turn's whole narrative."""
+        if state.working == working:
+            return
+        state.working = working
+        self._emit(state, lambda seq: WorkingFrame(seq=seq, working=working))
+
+    def _open_step(self, state: _TurnState, tool_call_id: str, item: StepItem) -> None:
+        """Record a step and, the first time it is seen, its POSITION in the turn.
+
+        A step arrives twice — started, then finished — and the second must replace the first
+        in place rather than move it: a step that jumped to the end when it resolved would
+        reorder the turn under a citizen who is watching it. So the map is written every
+        time and the ref is appended only once."""
+        # A step means the model has stopped thinking and started doing.
+        self._set_working(state, False)
+        if tool_call_id not in state.steps:
+            state.parts.append(_StepRef(tool_call_id))
+        state.steps[tool_call_id] = item
+
+    def _push_text(self, state: _TurnState, text: str, *, new_block: bool = True) -> None:
+        """Prose to the citizen: onto the turn's ordered parts AND onto the wire, at once.
+
+        THE ONE TEXT SINK, AND IT NO LONGER HOLDS ANYTHING. Prose written in the same
+        response as a tool call used to accumulate in a `pending_text` buffer and be deleted
+        the moment the call arrived, on the rule that text beside a tool call is the model
+        narrating its way there. That rule threw away the explanation between the receipts —
+        the opposite of the voice this product is for — so the buffer, its discard and its
+        flush are gone and every paragraph goes straight through.
+
+        `new_block` is what makes the live feed match a reloaded one. The reload projection
+        emits ONE item per stored `TextPart`; here a `PartStartEvent` opens a block and every
+        delta after it extends the same one, so a stretch of writing is one block on both
+        paths. A delta that arrives when the newest part is a STEP opens a block anyway —
+        appending to a sealed block would silently reorder the turn — and the frame says so,
+        so the browser splits at exactly the same place.
+
+        DELIBERATELY UNGATED. Platform-rendered blocks travel this way too: the plan, a
+        voice-channel line, a first-slice proposal, the closing completion message. They are
+        rendered by the platform from a tool call's arguments and are always their own block,
+        which is the default this signature carries."""
+        # THE ACK IS OVER THE MOMENT THERE ARE WORDS ON SCREEN. A turn that answers in prose
+        # and calls nothing would otherwise keep the opening row under an answer the citizen is
+        # already reading — and the board's rule for that turn is that it shows nothing at all
+        # beyond the answer.
+        self._retire_acknowledgement(state)
+        # Words on screen mean the thinking is over — see `_set_working`.
+        self._set_working(state, False)
+        newest = state.parts[-1] if state.parts else None
+        if new_block or not isinstance(newest, _TextBlock):
+            state.parts.append(_TextBlock(text))
+            opened = True
+        else:
+            newest.text += text
+            opened = False
+        self._emit(state, lambda seq: TextDeltaFrame(seq=seq, text=text, new_block=opened))
 
     def _step_item(self, state: _TurnState, tool_name: str, args_json: str) -> StepItem:
         """A step, live. `args_json` is READ and never transmitted: it decides the friendly
@@ -3003,12 +3156,22 @@ class TurnEngine:
         # tool's return is the single richest thing a turn holds — file contents, command
         # output, whatever the sandbox said — and it used to be clipped, redacted and shipped
         # on every step. Whether the call succeeded is the whole of what a step reports now.
-        resolved = pending.model_copy(update={"state": "failed" if failed else "ok"})
+        # NOTHING IS HIDDEN WHEN SOMETHING WENT WRONG, whatever class it belongs to — the same
+        # rule the reload projection applies, restated here because a live feed and a reloaded
+        # one that disagree about which rows exist is the failure this whole seam is arranged
+        # to prevent. A housekeeping command is plumbing while it works and the whole story the
+        # moment it does not, and the group's problem count has to name a row the citizen can
+        # actually see.
+        resolved = pending.model_copy(
+            update={"state": "failed", "hidden": False} if failed else {"state": "ok"}
+        )
         state.steps[event.tool_call_id] = resolved
         if len(state.steps) > _STEPS_CAP:
             # Drop the oldest resolved step — snapshot material only; rows are authoritative.
-            oldest = next(iter(state.steps))
-            state.steps.pop(oldest, None)
+            # THROUGH `drop_step`, so its POSITION goes with it: a ref left pointing at an
+            # evicted step is skipped by the snapshot but never reclaimed, and a build that
+            # evicts for minutes would accumulate one dead entry per step it ever ran.
+            state.drop_step(next(iter(state.steps)))
         return resolved
 
     # -- frames, ring, fan-out ----------------------------------------------------------
@@ -3034,6 +3197,16 @@ class TurnEngine:
         # them (`_drain_long_operations`) — this only makes the ordering unloseable.
         for task in state.long_operation_tasks.values():
             task.cancel()
+        # NO GROUP IS LEFT OPEN BY THE PLATFORM'S OWN ROW. A turn that ran no tools and wrote
+        # nothing — one that failed at the first request, or was stopped before it started —
+        # never reached either of the sites that retire the acknowledgement, so it would end
+        # with "Getting started on that…" still spinning under a turn that is over. Idempotent,
+        # so the ordinary turn that already retired it emits nothing here.
+        self._retire_acknowledgement(state)
+        # THE STATUS CANNOT OUTLIVE THE TURN. A turn that ended while the last thing it did was
+        # think — a failure mid-reasoning, a stop — would otherwise leave "Working on your app"
+        # under a turn that is over.
+        self._set_working(state, False)
         state.status = status
         state.ended_monotonic = time.monotonic()
         self._emit(
@@ -3126,24 +3299,39 @@ class TurnEngine:
         Write turns ride this transport)."""
         if state is None:
             return SnapshotFrame(seq=0, turn_id=None, turn_status="idle")
+        # THE ACK GOES FIRST, and this is the only place it can. It is emitted at `seq == 1`
+        # before any client can subscribe, and the route sets `last_sent = snapshot.seq`, so
+        # the ring frame is already behind every subscriber's cursor. Same reasoning the
+        # preview/compile/error_message fields are carried for — a frame that fired before the
+        # client connected lives only in the ring, and the snapshot is what makes a
+        # subscription self-sufficient.
+        parts: list[TurnPart] = []
+        if state.acknowledgement is not None:
+            parts.append(TurnStepPart(tool_call_id=ACK_TOOL_CALL_ID, item=state.acknowledgement))
+        for part in state.parts:
+            if isinstance(part, _TextBlock):
+                parts.append(TurnTextPart(text=part.text))
+                continue
+            # EVERY in-flight step, hidden ones included. `hidden` is a RENDER hint (the live
+            # tail and the reload projection both ship hidden steps); making it a payload
+            # filter HERE meant a client that reconnected mid-turn silently lost steps the
+            # other two paths kept. A ref whose step has been withdrawn resolves to nothing
+            # and is skipped — see `_TurnState.drop_step`.
+            item = state.steps.get(part.tool_call_id)
+            if item is not None:
+                parts.append(TurnStepPart(tool_call_id=part.tool_call_id, item=item))
         return SnapshotFrame(
             seq=state.seq,
             turn_id=str(state.turn_id),
             turn_status=state.status,
             items=items or [],
-            text_so_far=state.text_so_far(),
-            # EVERY in-flight step, hidden ones included. `hidden` is a RENDER hint (the live
-            # tail and the reload projection both ship hidden steps with full detail); making
-            # it a payload filter HERE meant a client that reconnected mid-turn silently lost
-            # steps the other two paths kept.
-            # THE ACK RIDES HERE, and this is the only place it can. It is emitted at `seq == 1`
-            # before any client can subscribe, and the route sets `last_sent = snapshot.seq`, so
-            # the ring frame is already behind every subscriber's cursor. Same reasoning the
-            # preview/compile/error_message fields above are carried for — a frame that fired
-            # before the client connected lives only in the ring, and the snapshot is what makes
-            # a subscription self-sufficient. Ordered FIRST so it reads as the oldest row.
-            steps=([state.acknowledgement] if state.acknowledgement else [])
-            + list(state.steps.values()),
+            # PROSE AND STEPS IN ONE ORDERED LIST, because a reattaching citizen has to read
+            # the same turn as one who never left. The snapshot used to carry a flat
+            # `text_so_far` string beside an unordered step map, which cannot express a turn
+            # that wrote, acted, and wrote again — and the moment prose stopped being held
+            # beside a tool call, that became every interesting turn.
+            parts=parts,
+            working=state.working,
             error_message=state.error_message,
             workspace_state=state.workspace_state,
             preview_url=state.preview_url,

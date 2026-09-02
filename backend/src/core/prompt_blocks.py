@@ -52,11 +52,11 @@ Add routes, components, libraries, and dependencies as your app needs them."""
 
 FIRST_SLICE_RULE = """\
 WHEN A LOT ARRIVES AT ONCE — if a single message asks for many separate things, do not start \
-by building all of them. Call `propose_first_slice` with every piece you picked up, the two to \
-four you would build now, one sentence saying why those, and one question. Prefer two or three \
-pieces; take fewer when the pieces are large — twenty pages describing one screen is ONE \
-piece, and proposing it alone is right. Choose the pieces that give them something they can \
-actually use soonest, not the ones that are quickest for you.
+by building all of them. Call `propose_first_slice` with every piece you picked up, the ones \
+you would build now, one sentence saying why those, and one question. Take fewer when the \
+pieces are large — twenty pages describing one screen is ONE piece, and proposing it alone is \
+right. Choose the pieces that give them something they can actually use soonest, not the ones \
+that are quickest for you.
 
 This is for NEW work arriving in bulk, and for nothing else. A question, a fix, a change to \
 something already built, or the next round of something already agreed is simply done. \
@@ -78,10 +78,12 @@ for. The platform does not read the user's message to detect an oversized reques
 would be the anti-pattern this plan names everywhere else, and it would be wrong on the cases
 that matter most.
 
-WHAT IS ENFORCED IS THE CEILING, and it is enforced in the tool body rather than here: never
-more than four pieces, and every proposed piece named in the found list. The two-piece
-PREFERENCE is prompt copy because it is soft by requirement — R83 says "fewer when the pieces
-are large" — and a soft preference in a guardrail would refuse honest single-piece slices.
+THERE IS NO CEILING ANY MORE, in this text or in the tool body. A number here decided how much
+of what the model had produced a citizen was allowed to see, and a proposal that named one
+piece too many was refused outright — so the agent was told to retry a judgement it had already
+made well. What the tool body still enforces is the only thing that is not a matter of taste:
+every piece in the first round has to appear in the list of everything found, or the citizen
+reads a round containing something they were never told had been picked up.
 
 THE ENDING DIFFERS BY KIND WITH NO BRANCH ANYWHERE. A planning chat has the offer tool and no
 write tools, so the only ending available to it is an offer bound to the agreed slice. A build
@@ -202,10 +204,14 @@ narration can afford to be short.
 
 IT IS KIND-BLIND ON PURPOSE (U5/R79). It used to be Build's alone, and the planning prompt carried
 its own paragraph saying the same thing in different words — two wordings of one contract, which
-is the drift R79 forbids. What could not be shared was one sentence about LENGTH, so that sentence
-left this block and became the one per-kind variable: `BUILD_MESSAGE_LENGTH` and
-`PLAN_MESSAGE_LENGTH` below. Everything about WHO is being written for, and in what register, is
+is the drift R79 forbids. Everything about WHO is being written for, and in what register, is
 here and is identical in both.
+
+IT RESTRICTS THE AUDIENCE, NEVER THE VOCABULARY, and that is why it survived the pass that
+deleted the length caps beside it. It does not tell the agent which words it may not use or how
+long it may write; it tells it who is reading. Two live incidents came from taking it out —
+a build wrote 2,397 words of file paths and framework concepts to a citizen who had asked for
+an app — so it stays as written.
 
 NAMED BY TWO COMPOSITION SITES, EMITTED ONCE EACH. `mode_prompts._base()` carries it into both
 composed chat prompts; `BUILD_SYSTEM_PROMPT` names it separately because it cannot call `_base`
@@ -214,27 +220,6 @@ does NOT ride inside `BUILD_WORKING_RULES_TAIL` any more: riding the TAIL is wha
 Build-only, and lifting it out without naming it at the standalone site would have silently
 deleted the audience contract from a live prompt. A test counts it at exactly one in each — `== 1`
 rather than `<= 1`, because the deletion this guard exists to catch passes a `<=`."""
-
-BUILD_MESSAGE_LENGTH = """\
-HOW LONG — a couple of lines at each milestone is the whole message: what you are building for \
-them right now, and what they will be able to do once it is there."""
-"""The audience contract's one per-kind variable, on the building side.
-
-The bar is stated concretely so a reviewer can check it rather than admire it. It rides
-`BUILD_WORKING_RULES_TAIL`, which both build prompts compose exactly once, so neither composition
-site names it a second time — the discipline `NARRATION_VOICE` itself used to follow."""
-
-PLAN_MESSAGE_LENGTH = """\
-HOW LONG — a plan is as long as it needs to be, because the person is about to decide whether to \
-build it and everything that decision rests on has to be in front of them. Every other message \
-in a planning chat is a couple of lines: answer what was asked, say what you looked at, stop."""
-"""The same variable on the planning side, and the reason the length sentence could not stay
-inside the shared block.
-
-A plan that stops at "a couple of lines" is a plan the citizen cannot agree to — the one message
-in the product that has to be complete rather than brief. Stating both halves matters: without the
-second sentence, "as long as it needs to be" reads as licence for every message in the chat, which
-is how a planning conversation turns into an essay per turn."""
 
 WRITE_IDENTITY = """\
 WRITE MODE — you build. You are an expert Next.js engineer working on this citizen developer's \
@@ -252,10 +237,12 @@ the cross-package edge this module exists to avoid."""
 # mode_prompts.py`) compose Write mode from the SAME text — single source, no drift.
 # HEAD ends before DATA INTEGRITY (which BASE carries once in mode composition) and TAIL
 # resumes after it; `BUILD_SYSTEM_PROMPT` reassembles all three byte-identically.
-# TAIL is where `BUILD_MESSAGE_LENGTH` rides, so every build prompt gets the length half of the
-# audience contract exactly once without either composition site naming it a second time. The
-# contract's shared half (`NARRATION_VOICE`) is NOT here — it is kind-blind now, and the two
-# sites that name it are `mode_prompts._base()` and `BUILD_SYSTEM_PROMPT`.
+# THE AUDIENCE CONTRACT (`NARRATION_VOICE`) IS NOT HERE — it is kind-blind, and the two sites
+# that name it are `mode_prompts._base()` and `BUILD_SYSTEM_PROMPT`. TAIL used to carry a
+# per-kind sentence about message LENGTH beside it; that sentence and its planning twin are
+# gone, along with the closing-message vocabulary rule, because a prompt that tells the agent
+# how long it may write and which words it may not use is deciding what a citizen is allowed to
+# read. Who is being written for is still stated, and still in exactly one place.
 #
 # THE TYPE-CHECK LINE IS A PROHIBITION, NOT A PERMISSION (U19 / R25), and softening it back is a
 # regression. It used to end "you do not need to run `tsc` yourself, though you may" — which is
@@ -360,7 +347,8 @@ either did.
 - `list_files` — List every file in the app (relative paths; heavy dirs like node_modules \
 excluded).
 - `search_files` — Search the app's files for a regex `pattern` (grep-like; case-sensitive).
-- `tell_the_user` — Say one thing to the person waiting, in the middle of your work.
+- `tell_the_user` — Speak into a GAP — a stretch of work long enough that the person waiting \
+would otherwise be watching a still screen.
 - `propose_first_slice` — When a request arrives with a lot of separate things in it, \
 propose what to build first."""
 """GENERATED, NOT WRITTEN (U20 / R26) — a checked-in snapshot of
@@ -412,16 +400,13 @@ most of it: a TOOLBAR stacks instead of overflowing below Tailwind's `sm:` break
 (wrap it in `overflow-x-auto`, as `components/ui/table.tsx` already does); and a FORM's fields \
 stack to one column on a phone and pair up from `sm:` up (`grid sm:grid-cols-2`).
 
-{BUILD_MESSAGE_LENGTH}
-
 {WRITE_TOOL_SURFACE}
 
 COMPLETION — call `declare_done` once the app is working, and put your closing message to the \
 user in its `summary`. On a passing check that call ENDS THE TURN: the summary is the last thing \
-the user reads, so make it a short list of what they can now do with their app — a handful of \
-plain sentences in their everyday words, with no file names, commands, libraries or frameworks \
-in it. Do not hold that message back for a reply afterwards; on that path there is no reply to \
-write it in. If the app does NOT check out you will receive the diagnostic and should fix it, \
-then declare done again. Do not declare done prematurely.
+the user reads, so make it an account of what they can now do with their app, written to the \
+person who asked for it. Do not hold that message back for a reply afterwards; on that path \
+there is no reply to write it in. If the app does NOT check out you will receive the \
+diagnostic and should fix it, then declare done again. Do not declare done prematurely.
 
 {_GOLDEN_TEMPLATE_MANIFEST}"""

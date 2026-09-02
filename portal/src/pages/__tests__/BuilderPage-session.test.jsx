@@ -162,7 +162,7 @@ function scriptedBuild(options) {
  *  Stop has to supply one itself. Mirrors `BuilderPage-outcome.test.jsx`'s helper of the same name
  *  and purpose. */
 const T_SNAPSHOT = (turnId, seq = 1) => ({
-  type: 'snapshot', seq, turnId, turnStatus: 'running', items: [], textSoFar: '', steps: [],
+  type: 'snapshot', seq, turnId, turnStatus: 'running', items: [], parts: [], working: false,
 })
 
 beforeEach(() => {

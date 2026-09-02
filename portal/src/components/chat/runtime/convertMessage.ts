@@ -35,9 +35,14 @@
  *
  * ══ WHAT A PART BECOMES ══
  *
- * `text`   → a text part. Prose is prose.
- * `step`   → a `tool-call` part carrying LABEL AND STATE ONLY (R36; see the redaction note).
- * others   → nothing. `build`, `build_in_progress` and `plan_options` are not transcript prose:
+ * `text`      → a text part. Prose is prose.
+ * `step`      → a `tool-call` part carrying LABEL AND STATE ONLY (R36; see the redaction note).
+ * `reasoning` → a reasoning part carrying the platform's own status sentence and nothing else.
+ *               The library's own renderer for that kind is reached only when a message actually
+ *               carries one, which is why a boolean on the turn cannot drive the working status
+ *               on its own. The status-only guarantee is structural rather than a promise: OUR
+ *               part has nowhere for reasoning text to sit — see `REASONING_STATUS_TEXT`.
+ * others      → nothing. `build`, `build_in_progress` and `plan_options` are not transcript prose:
  *            the first two are replaced by the activity group's own terminal handling, and
  *            `plan_options` is the offer, which U16 renders on the composer rather than inline.
  *            Dropping a part is not the same as dropping a message — a message whose parts all
@@ -78,6 +83,24 @@ export type ActivityArgs = {
 export type LibraryPart = Exclude<ThreadMessageLike['content'], string>[number]
 
 const TOOL_NAME = 'activity'
+
+/**
+ * What a reasoning part carries into the library, and it is the PLATFORM's sentence.
+ *
+ * THE LIBRARY REFUSES AN EMPTY ONE. `fromThreadMessageLike` drops a reasoning part whose `text`
+ * and `unstable_summary` are both blank, so a genuinely content-free part never reaches the
+ * renderer and the status would simply never appear. This is the smallest thing that satisfies
+ * that requirement without weakening the guarantee: our own `ReasoningPart` still has NO field
+ * for reasoning text — the wire never carries any, and there is nowhere to put any — and what
+ * crosses here is a constant.
+ *
+ * IT IS NEVER RENDERED. `ReasoningGroup` draws its own line and ignores its children, and the
+ * `reasoning` part itself falls to the thread's `default: return null`. The words are the same
+ * words the status line shows anyway, so the one case where that stopped being true would put
+ * the correct sentence on screen rather than a placeholder — fail-safe rather than a marker
+ * nobody would recognise.
+ */
+export const REASONING_STATUS_TEXT = 'Working on your app'
 
 /** The one place a step's wire state becomes a rendered state. */
 function activityState(state: 'ok' | 'failed' | 'pending'): ActivityState {
@@ -120,6 +143,14 @@ export function convertPart(part: MessagePart): LibraryPart | null {
       // NOTHING ELSE — no `result`, no `artifact`, no `detail`. That omission is R36's wall.
     }
   }
+
+  // A CONTENT-FREE REASONING PART, and the emptiness of OUR shape is the guarantee.
+  // `part.type === 'reasoning'` carries no text — `ReasoningPart` has no field for it — so this
+  // cannot leak reasoning content even if a later change starts putting it on the wire. What it
+  // buys is the library's grouping: a message containing one is filed under the chain-of-thought
+  // key, which is what reaches the status renderer. See `REASONING_STATUS_TEXT` for why the
+  // library will not take a literally empty one.
+  if (part.type === 'reasoning') return { type: 'reasoning', text: REASONING_STATUS_TEXT }
 
   // `file` parts (image/PDF) have no library part either — like the inline-text attachments above
   // they are carried as descriptors on the message and drawn as chips, not as content.

@@ -183,25 +183,42 @@ export interface ConversationSurfaceProps {
  *  spent when it is still pressable. */
 type PlanOverrideValue = 'build' | 'refine'
 
+/** One entry of the live turn's ordered content — see `TurnSink.parts`. */
+type SinkPart = { kind: 'text'; text: string } | { kind: 'step'; toolCallId: string; step: StepItem }
+
 /** The turn-frame reducer's mutable accumulator, carried back out to the caller once the
  * stream settles (`streamAssistant`/`reattachToTurn`/`fireRelayTurn`'s shared shape). */
 interface TurnSink {
-  text: string
   /**
-   * THE LIVE TURN'S STEPS, keyed by tool-call id, and they live in the sink because the
-   * TRANSCRIPT is what renders them now.
+   * THE LIVE TURN, PROSE AND STEPS, IN THE ORDER IT PRODUCED THEM.
    *
-   * They used to go only into `turnSteps` state, which fed the deleted progress card. The
-   * activity group (U6) draws from message PARTS instead, so the streaming assistant message has
-   * to carry them — and the frame handler is created once per turn with an empty dependency list,
-   * so it cannot read a state value that changes under it. The sink is the per-turn accumulator
-   * that already exists for exactly this reason.
+   * This was a flat `text` string beside a step map, which could only ever draw every step and
+   * then one block of text — while a reloaded transcript drew text and steps interleaved in
+   * part order. The two agreed only because prose beside a tool call was thrown away, so a
+   * turn could hold at most one text block and it was always last. With that gone, the live
+   * path has to carry the order or the same turn reads differently after a refresh.
    *
-   * `turnSteps` state is still set alongside, and that is not duplication for its own sake: the
-   * narrative it feeds answers two different questions (what phase the app pane is in, and
-   * whether today's budget is spent) that have nothing to do with what the transcript draws.
+   * The steps live here rather than only in `turnSteps` state because the TRANSCRIPT is what
+   * renders them now: the activity group draws from message PARTS, and the frame handler is
+   * created once per turn with an empty dependency list, so it cannot read a state value that
+   * changes under it. `turnSteps` state is still set alongside, and that is not duplication
+   * for its own sake — the narrative it feeds answers two different questions (what phase the
+   * app pane is in, and whether today's budget is spent) that have nothing to do with what the
+   * transcript draws.
    */
-  steps: Record<string, StepItem>
+  parts: SinkPart[]
+  /** Is the model REASONING right now (the server's `working` flag)?
+   *
+   *  IT IS NOT A PART, because the server never sends one and never will: reasoning text is
+   *  stored for the provider's next turn and is never framed. The flag is turned INTO a
+   *  content-free reasoning part at the head of the streaming message by `streamingParts`,
+   *  because the library's status renderer is reached only when a message actually carries a
+   *  part of that kind — a boolean riding the turn renders nothing at all on its own. */
+  working: boolean
+  /** tool-call id → that step's index in `parts`. A step arrives twice (started, then
+   *  finished) and the second must replace the first IN PLACE: a step that moved to the end
+   *  when it resolved would reorder the turn under a citizen who is watching it. */
+  stepAt: Map<string, number>
   terminal: 'completed' | 'failed' | 'stopped' | null
   reason: string | null
   snapshotCommitted: boolean | null
@@ -250,35 +267,110 @@ const DIAGNOSTIC_FALLBACK = 'We hit a problem finishing that change.'
  */
 const BUILD_WAS_RUNNING = 'A build was running here when this chat was last open.'
 
+/** The key a diagnostic row takes in the turn's parts.
+ *
+ * A diagnostic is not a tool call, so it has no tool-call id of its own — but it IS drawn as a
+ * failed row inside the activity group, so it needs a position and a stable key like any other.
+ * The prefix is what lets a catch-up snapshot, which knows nothing about diagnostics, rebuild
+ * the turn's order without discarding the ones this tab has already collected. */
+const DIAGNOSTIC_KEY_PREFIX = 'diagnostic-'
+
 /** A fresh accumulator. One helper, so a new field cannot be added to the type and forgotten at
  *  one of the two call sites that open a stream. */
 function newSink(): TurnSink {
-  return { text: '', steps: {}, terminal: null, reason: null, snapshotCommitted: null, turnId: null }
+  return {
+    parts: [],
+    working: false,
+    stepAt: new Map(),
+    terminal: null,
+    reason: null,
+    snapshotCommitted: null,
+    turnId: null,
+  }
 }
 
 /**
- * The parts of the STREAMING assistant message: this turn's activity, then its prose.
+ * The parts of the STREAMING assistant message, in the order the turn produced them.
  *
  * ORDER IS THE RENDER. `groupPartByType` coalesces ADJACENT tool-call parts into one activity
- * group, so the steps must be contiguous and must precede the text — the group draws above the
- * reply, which is what the canvas shows and what reads correctly as "it did this, then said this".
+ * group, so a run of steps with nothing between them is one group and a paragraph written
+ * between two steps SEALS the first group and opens a second — which is the canvas's own rule
+ * and was unreachable while the live path could only draw every step and then one block of
+ * text. This function is the whole of the live half of that; the reload path has always
+ * produced part order.
  *
- * Steps are ordered by their own `seq`, never by object insertion order: a step arrives twice
- * (started, then finished) under one tool-call id and the second REPLACES the first in place, so
- * insertion order records when a step was last touched rather than when it happened.
+ * Hidden steps are dropped rather than positioned: a hidden step is plumbing the citizen never
+ * reasons about — a write to a configuration file, a housekeeping shell command — and leaving a
+ * gap where one was would break the adjacency the grouping reads. The flag no longer covers
+ * reads, and never covers a step that failed; both of those are the server's call, and this
+ * filter deliberately holds no opinion of its own.
  *
  * A NEW ARRAY EVERY TIME, deliberately. The runtime caches the converted message on OBJECT
- * IDENTITY (convertMessage trap 4), so a mutated-in-place part list is invisible and the UI simply
- * never re-renders.
+ * IDENTITY (convertMessage trap 4), so a mutated-in-place part list is invisible and the UI
+ * simply never re-renders — and this maps every entry to a fresh object for the same reason.
  */
 function streamingParts(sink: TurnSink): MessagePart[] {
-  const steps = Object.values(sink.steps)
-    .filter((step) => !step.hidden)
-    .sort((a, b) => a.seq - b.seq)
-    .map((step): MessagePart => ({ type: 'step', step }))
-  // An empty text part renders no element, so an in-flight turn with steps and no prose yet is
-  // just its activity — which is exactly what should be on screen at that moment.
-  return [...steps, { type: 'text', text: sink.text }]
+  // THE STATUS RIDES AT THE HEAD, and only while the model is actually thinking. It is
+  // synthesised rather than received: the server sends a boolean, never a reasoning part, so
+  // this is where the flag becomes something the thread can group and render. It carries no
+  // text — the shape has no field for any — which is what makes "status only, never the
+  // reasoning" structural rather than a promise.
+  const parts: MessagePart[] = sink.working ? [{ type: 'reasoning' }] : []
+  for (const part of sink.parts) {
+    if (part.kind === 'text') {
+      // An empty text part renders no element, so an in-flight turn with steps and no prose
+      // yet is just its activity — which is exactly what should be on screen at that moment.
+      parts.push({ type: 'text', text: part.text })
+    } else if (!part.step.hidden) {
+      parts.push({ type: 'step', step: part.step })
+    }
+  }
+  // THE STREAMING MESSAGE ALWAYS ENDS ON A TEXT PART, and the empty one is load-bearing twice
+  // over. It was implicit while this function appended the whole reply as one trailing block;
+  // once the parts became ordered it had to be said, because a turn that has only run steps so
+  // far now genuinely produces a step-only message.
+  //
+  //  1. `hasUpcomingMessage` — the library appends an optimistic assistant message with an id we
+  //     do not control the moment `isRunning` is true and the last message is not an assistant's
+  //     (convertMessage trap 3), and a message whose parts all convert to nothing is what makes
+  //     that reachable.
+  //  2. The transcript's step-only rule — a message made ONLY of steps is a STORED row that the
+  //     live message is re-telling, and it is dropped for the turn in flight. Without this the
+  //     live message matched that rule against itself and vanished mid-build.
+  //
+  // It renders no element either way, so it costs nothing on screen, and it is only appended
+  // when the newest part is not already text — a turn that has just written keeps its own block.
+  if (parts[parts.length - 1]?.type !== 'text') parts.push({ type: 'text', text: '' })
+  return parts
+}
+
+/** Append `text` to the block already open, or open a new one.
+ *
+ * A delta that arrives when the newest part is a STEP opens a block whatever the frame says:
+ * appending to a sealed block would move that prose back above the step it was written after,
+ * silently reordering the turn. */
+function appendText(sink: TurnSink, text: string, newBlock: boolean): void {
+  const newest = sink.parts[sink.parts.length - 1]
+  if (!newBlock && newest?.kind === 'text') {
+    newest.text += text
+    return
+  }
+  sink.parts.push({ kind: 'text', text })
+}
+
+/** Record a step at its position, or replace the one already there.
+ *
+ * The `finished` frame carries the same tool-call id as its `started` one and REPLACES it in
+ * place: appending would stack a spinner beside its own result, and the activity group's live
+ * count would climb while the same step re-rendered. */
+function putStep(sink: TurnSink, toolCallId: string, step: StepItem): void {
+  const at = sink.stepAt.get(toolCallId)
+  if (at !== undefined) {
+    sink.parts[at] = { kind: 'step', toolCallId, step }
+    return
+  }
+  sink.stepAt.set(toolCallId, sink.parts.length)
+  sink.parts.push({ kind: 'step', toolCallId, step })
 }
 
 export default function ConversationSurface({ chatId: chatIdProp, kind = 'build', projectId = null, projectName = null, projectHasSavedBuild = null, buildSessionDeps }: ConversationSurfaceProps = {}) {
@@ -1061,13 +1153,12 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       // the arms anyway, same as before).
       if (!isKnownFrame(frame)) return
       if (frame.type === 'text_delta') {
-        sink.text += frame.text
+        appendText(sink, frame.text, frame.newBlock)
+        paint()
+      } else if (frame.type === 'working') {
+        sink.working = frame.working
         paint()
       } else if (frame.type === 'snapshot') {
-        if (frame.textSoFar && frame.textSoFar.length > sink.text.length) {
-          sink.text = frame.textSoFar
-          paint()
-        }
         // A snapshot of an ALREADY-SETTLED turn is itself terminal: the `error`/`turn_ended`
         // frames it consolidates may have been evicted from the ring, so treating only those
         // as terminal left a failed turn looking like it was still thinking, with no reason
@@ -1096,14 +1187,38 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
             state: frame.previewState ?? prev.state,
           }))
         }
-        if (frame.steps?.length) {
+        // The catch-up half of the status: a tab that reattaches mid-thought would otherwise
+        // sit on a still screen until the next frame changed something else.
+        sink.working = frame.working
+        if (frame.parts.length) {
+          // THE SNAPSHOT IS THE ORDER, so the sink is REBUILT from it rather than merged into.
+          // It is the server's whole account of the turn up to `frame.seq`, and the tail that
+          // follows resumes from there — merging would interleave a recovered narrative with a
+          // partial local one and get the order wrong in both.
+          //
+          // Diagnostics are the one thing it cannot know: they arrive as their own frames and
+          // are drawn as failed rows, so they are carried across and re-appended rather than
+          // dropped. Losing them would silently remove the self-heal narrative from a build
+          // that reconnected.
+          const diagnostics = sink.parts.filter(
+            (part): part is Extract<SinkPart, { kind: 'step' }> =>
+              part.kind === 'step' && part.toolCallId.startsWith(DIAGNOSTIC_KEY_PREFIX),
+          )
+          sink.parts = []
+          sink.stepAt = new Map()
+          for (const part of frame.parts) {
+            if (part.type === 'text') appendText(sink, part.text, true)
+            else putStep(sink, part.toolCallId, part.item)
+          }
+          for (const part of diagnostics) putStep(sink, part.toolCallId, part.step)
           // THE SINK FIRST, then the state — `paint()` reads the sink, and a snapshot that
           // updated only the state would leave a reloaded tab's whole recovered narrative out of
           // the transcript it is meant to be restoring.
-          for (const step of frame.steps) sink.steps[`snap_${step.seq}_${step.tool}`] = step
           setTurnSteps((prev) => {
             const next = { ...prev }
-            for (const step of frame.steps) next[`snap_${step.seq}_${step.tool}`] = step
+            for (const part of frame.parts) {
+              if (part.type === 'step') next[part.toolCallId] = part.item
+            }
             return next
           })
           paint()
@@ -1118,7 +1233,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
         // step frames. KEYED BY TOOL-CALL ID, so the `finished` frame REPLACES its own `started`
         // one in place: appending would stack a spinner beside its own result, and the activity
         // group's live count would climb while the same step re-rendered.
-        sink.steps[frame.toolCallId] = frame.item
+        putStep(sink, frame.toolCallId, frame.item)
         setTurnSteps((prev) => ({ ...prev, [frame.toolCallId]: frame.item }))
         // The transcript is what draws activity now (U6), so a step has to reach the message it
         // belongs to. Without this the group renders nothing until the next text delta happens
@@ -1153,8 +1268,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
         // ONLY `userMessage` CROSSES. The frame's developer half (source, and the compiler title
         // that rides with it) is exactly what R36's wall exists to keep off the screen; it still
         // travels to the agent, which is the party that can act on it.
-        const key = `diagnostic-${frame.seq}`
-        sink.steps[key] = {
+        putStep(sink, `${DIAGNOSTIC_KEY_PREFIX}${frame.seq}`, {
           type: 'step',
           seq: frame.seq,
           // The classifier's own vocabulary is for real tool calls; this row is the platform
@@ -1163,13 +1277,17 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
           label: frame.userMessage || DIAGNOSTIC_FALLBACK,
           state: 'failed',
           hidden: false,
-        }
+        })
         paint()
       } else if (frame.type === 'compile') {
         setTurnCompile(frame.state)
       } else if (frame.type === 'quota') {
         setTurnQuota({ limit: frame.limit, used: frame.used, resetsAt: frame.resetsAt })
       } else if (frame.type === 'turn_ended') {
+        // A turn that ended while its last act was thinking would otherwise leave the status
+        // under a finished turn. The server clears the flag at its own terminal too; this is
+        // the half that survives a terminal the ring evicted.
+        sink.working = false
         sink.terminal = frame.status
         sink.reason = frame.reason ?? null
         sink.snapshotCommitted = frame.snapshotCommitted ?? null
@@ -1189,7 +1307,8 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
    * Deliberately subscribes with NO cursor even though the server reports `lastSeq`. That seq
    * counts frames THIS tab never received — passing it would put the server in tail-only replay
    * and the already-streamed prefix would be lost. Cursor-0 gets the consolidating snapshot,
-   * whose `textSoFar` is exactly the reply so far.
+   * whose ordered `parts` are exactly the turn so far — prose and steps in the order they were
+   * produced, so a reattached citizen reads the same turn as one who never left.
    */
   const reattachToTurn = async (activeId: string, activeTurn: { turnId: string; lastSeq: number }, isAlive: () => boolean) => {
     const stillHere = () => isAlive() && buildIdRef.current === activeId
@@ -1225,7 +1344,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     if (!stillHere()) return
     if (outcome === 'stalled') setTurnError('The reply stalled. Reload to catch up.')
     else if (outcome === 'truncated' && !sink.terminal) setTurnError('The connection dropped. Reload to catch up.')
-    if (sink.terminal !== 'completed' && sink.text === '' && Object.keys(sink.steps).length === 0) {
+    if (sink.terminal !== 'completed' && sink.parts.length === 0) {
       setMessages((prev) => prev.filter((m) => m.id !== assistantId))
       seqRef.current = assistantSeq
     }
@@ -1435,7 +1554,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     endGenerating(activeId)
 
     if (stillHere()) {
-      if (sink.terminal !== 'completed' && sink.text === '' && Object.keys(sink.steps).length === 0) {
+      if (sink.terminal !== 'completed' && sink.parts.length === 0) {
         // Failed/stopped with nothing streamed — drop the empty bubble; the error banner
         // (or the stopped state) is the feedback.
         setMessages((prev) => prev.filter((m) => m.id !== assistantId))

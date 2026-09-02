@@ -112,9 +112,21 @@ describe('the known-frame narrowing (a cast is not a parse)', () => {
     // A terminal with an unreadable status is still a terminal — never lost, read as failed.
     const [ended] = parseOne('{"type":"turn_ended","seq":9,"turnId":"t","status":"nonsense"}')
     expect(ended).toMatchObject({ type: 'turn_ended', status: 'failed' })
-    // An unreadable snapshot status reads as idle, and its bad steps are dropped, not spread.
-    const [snap] = parseOne('{"type":"snapshot","seq":1,"turnStatus":"nonsense","steps":["x"]}')
-    expect(snap).toMatchObject({ type: 'snapshot', turnStatus: 'idle', steps: [], textSoFar: '' })
+    // An unreadable snapshot status reads as idle, and its unusable PARTS are dropped one by
+    // one rather than spread through. Three shapes at once: a part that is not an object at
+    // all, a step part with no `toolCallId` (the key the live tail replaces it by — without one
+    // it is a row that can never resolve), and a good text part that must survive beside them.
+    const [snap] = parseOne(
+      '{"type":"snapshot","seq":1,"turnStatus":"nonsense","parts":' +
+        '["x",{"type":"step","item":{"type":"step","seq":1,"tool":"t","label":"l","state":"ok"}},' +
+        '{"type":"text","text":"kept"}]}',
+    )
+    expect(snap).toMatchObject({
+      type: 'snapshot',
+      turnStatus: 'idle',
+      parts: [{ type: 'text', text: 'kept' }],
+      working: false,
+    })
   })
 })
 

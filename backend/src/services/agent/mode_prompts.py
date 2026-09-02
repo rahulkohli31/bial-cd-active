@@ -14,12 +14,12 @@ reference doc, patterns cited by number below):
 - Patterns 4/5: Plan mode's output contract is a NAMED tool call (`present_plan_options`,
   the opencode `plan_exit` shape), and plan→build is gated on the user's explicit click,
   never conversational tone ("never treat the task request as approval" — Cline).
-- Pattern 9: the plan has a concrete shape — but a CITIZEN-facing one (F9): the outcome,
-  what the user will see and do, what the app remembers, and the one experience-level
-  decision as a plain question. The steps/files/trade-offs skeleton the pattern was
-  originally sourced from (opencode/OpenHands — developer CLIs) is the build's business,
-  kept out of the plan the user reads. Grounding stays: the model still reads the real
-  files first; only the OUTPUT register is citizen-plain.
+- Pattern 9 is DELIBERATELY NOT FOLLOWED any more. The plan segment used to mandate a
+  five-part shape, each part with its own heading, in a fixed order — a citizen-facing
+  skeleton rather than the developer-CLI one the pattern came from, but a skeleton either
+  way, and it made every plan read the same whatever was being planned. What survives is what
+  the plan is FOR and who reads it; the shape is the agent's. Grounding is untouched: the
+  model still reads the real files first.
 - Pattern 6: the rare cross-mode safety rules (DATA INTEGRITY) stay positive-first and
   are stated ONCE, in BASE — imported from the single source `DATA_INTEGRITY_RULES`
   (U1), never copied.
@@ -44,7 +44,6 @@ from src.core.prompt_blocks import (
     FIRST_SLICE_RULE,
     KEEP_PLANNING_LABEL,
     NARRATION_VOICE,
-    PLAN_MESSAGE_LENGTH,
     PORTAL_SURFACES,
     WRITE_IDENTITY,
 )
@@ -91,27 +90,9 @@ turns up nothing but the starter template, that is not a gap to apologize for �
 opening for the plan you are about to write: talk about what could be built for them.
 
 WHERE THE PLAN GOES — you write the plan as the `plan` argument of \
-`present_plan_options`, not as a message beside the call. Anything you write in the same \
-breath as a tool call does not reach the user, so a plan announced next to the call would \
-simply not be there. Say what you are looking at while you work through \
-`tell_the_user`, and put the plan itself in the argument.
-
-THE PLAN HAS FIVE PARTS, in this order, each a short paragraph with its own heading in your \
-own words:
-
-- What this gives you. What the app or this change will DO for them, led with in one \
-sentence.
-- What you will see. The screens and the actions, in human terms — what is on the page and \
-what they can press.
-- What the app will remember. In plain language, the outcome rather than the mechanism \
-("every message is saved with the date it was sent, so nothing gets lost").
-- What stays exactly as it is. Only when there is already an app: name the parts of it you \
-are leaving alone, so they can see nothing they rely on is at risk. Leave this part out \
-entirely for a first build — there is nothing yet to leave alone, and a section saying so \
-reads as padding.
-- What I assumed. Where a choice would change their experience, put it to them as a plain \
-question ("Should everyone see all the feedback, or just you?") and state the assumption \
-you have made for now.
+`present_plan_options`, not as a message beside the call. The argument is what the buttons \
+are attached to, so a plan announced next to the call would leave the user reading a plan \
+with nothing to press. Everything else you write does reach them, in the order you write it.
 
 Nothing in the plan names a file, a folder, a framework, a library, a command, or the way \
 data is stored underneath. The engineering pros and cons belong to the build. If something \
@@ -123,9 +104,7 @@ End a planning turn one of two ways: ask the user a clarifying question, or — 
 is ready — call `present_plan_options` with it, which puts the \
 `{BUILD_THIS_PLAN_LABEL}` and `{KEEP_PLANNING_LABEL}` buttons in front of them. After \
 calling it, wait for their choice; `{BUILD_THIS_PLAN_LABEL}` is the only signal that \
-building starts. If they choose `{KEEP_PLANNING_LABEL}`, revise the plan and present again.
-
-{PLAN_MESSAGE_LENGTH}"""
+building starts. If they choose `{KEEP_PLANNING_LABEL}`, revise the plan and present again."""
 
 # NO COMMIT BLOCK LIVES HERE ANY MORE (U19 / R25), and re-adding one is a regression with two
 # separate costs. `_COMMIT_DISCIPLINE` used to sit at the end of this segment teaching the agent
@@ -181,8 +160,8 @@ block twice in every Write prompt.
 stay so: `_base(context)` names it for every kind now, so adding it here would print the whole
 voice rule twice in a composed Build prompt while the standalone build prompt printed it once —
 the two build prompts drifting in the one dimension the shared blocks exist to keep identical.
-`BUILD_MESSAGE_LENGTH`, the contract's one per-kind half, is absent for the third variant of the
-same reason: it rides `BUILD_WORKING_RULES_TAIL`. A test counts both in the composed prompt."""
+A test counts it at exactly one in the composed prompt, and that count is the guard against the
+deletion this block has already suffered twice."""
 
 
 # --- THE PER-TURN RESTATEMENT IS GONE, and nothing replaced it (R17) ------------------

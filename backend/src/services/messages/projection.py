@@ -32,7 +32,7 @@ from pydantic import Field
 from src.core.prompt_blocks import APPLY_SCHEMA_CHANGE_TOOL
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.schemas import CamelModel
-from src.services.messages.store import ATTACHMENT_REF_KIND, SCHEMA_VERSION
+from src.services.messages.store import ATTACHMENT_REF_KIND
 
 # The Plan-mode options tool (U8 stub, U11 mechanics). The projection derives the card's
 # resolution state from this tool's stored call/return pair.
@@ -47,30 +47,6 @@ PROPOSE_SLICE_TOOL: Final = "propose_first_slice"
 """The scope-negotiation tool's wire name (U10 / R83–R88). Named here for the same reason the
 other two are: the live emitter and this one must agree on the spelling, and the stored call is
 the record both of them read."""
-
-MAX_FIRST_SLICE: Final = 4
-"""R83's binding half — never more than four pieces in a first round.
-
-THE FLOOR IS DELIBERATELY NOT ENFORCED, and that is a decision rather than an omission. R83
-says "roughly two to four, FEWER when the pieces are large", and R84 gives the case outright:
-twenty pages describing one screen is one piece. A hard floor of two would refuse an honest
-single-piece slice inside the tool body and leave the model no recovery except to split a piece
-that should not be split, or to name one it does not intend to build — which then shows up as a
-padded remainder in the closing account. So the code bound is 1..4 and the two-piece preference
-is prompt copy, which is the right home for a soft preference and is not a guardrail claim."""
-
-UPDATE_MAX_CHARS: Final = 280
-"""The whole of what bounds the voice channel, and it is a NUMBER rather than a sentence.
-
-R76 asks for a bounded channel, and the plan's rule is that an instruction is never counted as
-a guardrail — a prompt asking for brevity is a request the model stops honouring at exactly
-the moment it matters, which is a build going wrong. Two plain sentences about an app run to
-roughly two hundred characters; this leaves room without leaving room for a paragraph.
-
-ONE CEILING, ON CHARACTERS, AND NO PER-TURN CALL LIMIT. Nothing has been observed spamming
-this channel, a run's model requests are already bounded, and a second bound would buy
-per-turn counter state, a second retry path and its own refusal copy against a failure nobody
-has seen. Add it if traffic shows it."""
 
 TURN_TERMINAL_KIND: Final = "turn_terminal"
 """`meta.kind` of the durable turn-terminal row. Named here, beside the arm that reads it, and
@@ -87,12 +63,16 @@ hold their own string literal are one typo away from a row nobody projects."""
 # a fact — the field is gone, so no future expander can reach it. See `test_projection.py`'s
 # field-set guard, which is where the guarantee actually lives.
 
-# Read-only commands (U8's guest list) render as hidden inspection steps — same rule as the
-# structured read tools: reads are noise until the user opens the Details expander.
+# Read-only commands (U8's guest list) render as VISIBLE inspection steps — same rule as the
+# structured read tools. They were hidden for as long as `hidden` meant "a read", which left a
+# build's activity opening on a write with no account of what the agent had looked at to get
+# there; looking at the app before changing it is work the citizen recognises.
 _READ_ONLY_BINARIES: Final = frozenset({"ls", "cat", "head", "tail", "grep", "sed", "find", "wc"})
 
-# Housekeeping shell verbs — plumbing the citizen never needs to see. Hidden like the read-only
-# inspections: the model still gets the raw output, the chat stays quiet (F3/U3).
+# Housekeeping shell verbs — plumbing the citizen never needs to see, and one of the only two
+# things `hidden` still marks (the other is a write to a configuration file). Drawing these
+# prints a generic line that says nothing about the app; the model still gets the raw output,
+# and the chat stays quiet (F3/U3).
 _HOUSEKEEPING_BINARIES: Final = frozenset({"mkdir", "mv", "cp", "touch", "echo", "cd"})
 
 _INSTALL_SUBCOMMANDS: Final = frozenset({"install", "i", "ci", "add"})
@@ -298,8 +278,13 @@ def _classify_command(argv: list[str]) -> tuple[str, bool]:
     if ("run" in rest[:1] and "dev" in rest) or "next dev" in joined:
         return (_LBL_PREVIEW, False)
     if head in _READ_ONLY_BINARIES:
-        return ("Inspected the app's files", True)
+        # The shell half of the read class, and visible with the rest of it.
+        return ("Inspected the app's files", False)
     if head in _HOUSEKEEPING_BINARIES:
+        # STILL HIDDEN, and this is now one of only two things `hidden` marks. `mkdir`, `mv`,
+        # `touch` are plumbing between the steps that matter; drawing them prints a generic
+        # line into the feed that tells the citizen nothing about their app. The other is a
+        # write to a configuration file, in `_friendly_area`.
         return ("Organized the app's files", True)
     return (_LBL_FALLBACK, False)
 
@@ -359,18 +344,23 @@ def _step_label(tool_name: str, args: dict[str, Any]) -> tuple[str, bool]:
     if tool_name in _FILE_MUTATORS:
         return _file_step_label(tool_name, path)
     if tool_name == "read_file":
-        # Hidden regardless of the area's own noise verdict: a read is inspection, and the whole
-        # class stays out of the visible feed (F3/U3). The LABEL still has to be clean, because
-        # an expanded Details view renders it.
+        # VISIBLE, and the area's own noise verdict is deliberately NOT consulted. A read is
+        # work the citizen recognises — looking at their app before changing it — and the whole
+        # class used to be hidden, which is why a build's activity opened on a write with no
+        # account of what the agent had read to get there. Taking the area's verdict here would
+        # let the configuration-file rule leak into the read class and hide a read for a reason
+        # that is about WRITES being generic.
         label, _ = _file_step_label(tool_name, path)
-        return (label, True)
+        return (label, False)
     if tool_name in ("list_files", "search_files"):  # fmt: skip
-        return ("Looked through the app's files", True)
+        return ("Looked through the app's files", False)
     if tool_name == "fetch_output_slice":
-        # U22. Inspection, so it is hidden like a read — and it needs a branch of its own because
-        # the fallback below renders the RAW TOOL NAME ("Used fetch_output_slice") into a citizen's
-        # feed, which is exactly the raw-machinery leak `_friendly_area` exists to prevent (F3/U3).
-        return ("Looked at what a command printed", True)
+        # U22. Inspection, and visible with the rest of the read class. It needs a branch of its
+        # own because the fallback below renders the RAW TOOL NAME ("Used fetch_output_slice")
+        # into a citizen's feed, which is exactly the raw-machinery leak `_friendly_area` exists
+        # to prevent (F3/U3) — and that leak is the reason it cannot simply fall through now
+        # that it is drawn.
+        return ("Looked at what a command printed", False)
     if tool_name == APPLY_SCHEMA_CHANGE_TOOL:
         # U23. The composite runs `drizzle-kit generate` then `npm run db:migrate`, so it lands on
         # the SAME friendly label the two raw commands already classified to — a citizen watching
@@ -634,10 +624,15 @@ def update_from_args(args: Any) -> str | None:
     """The words a `tell_the_user` call carries, or None when it carries none that may be shown.
 
     ★ THE SINGLE PLACE THE VOICE CHANNEL'S RULE LIVES. Both emitters call this — the live one
-    at `FunctionToolCallEvent`, this one at the call's stored part — so a refused update
-    reaches neither, and neither of them re-checks a ceiling the other might read differently.
-    The tool body raises the teaching `ModelRetry` so the model learns what happened; this
-    decides what a human sees, and the two read the same constant.
+    at `FunctionToolCallEvent`, this one at the call's stored part — so a call carrying nothing
+    renders nothing on either path.
+
+    THE CHARACTER CEILING IS GONE, from here and from the tool body together. A number here
+    decided how much of what the model had written a citizen was allowed to read, and a call
+    one character over it vanished from the transcript entirely — the update was refused at the
+    tool and dropped at the renderer, so the citizen got silence where the agent had spoken.
+    Removing it from only one of the two would have been worse than leaving it: the model would
+    be taught it may write at length while the renderer went on deleting it.
 
     Both stored shapes go through `_args_dict`: pydantic-ai persists a tool call's `args` as a
     JSON string or as an object depending on the provider. A malformed argument is the same
@@ -648,9 +643,7 @@ def update_from_args(args: Any) -> str | None:
     if not isinstance(update, str):
         return None
     text = update.strip()
-    if not text or len(text) > UPDATE_MAX_CHARS:
-        return None
-    return text
+    return text or None
 
 
 def _slice_argument(args: Any) -> dict[str, Any] | None:
@@ -662,6 +655,14 @@ def _slice_argument(args: Any) -> dict[str, Any] | None:
     downstream re-derives them, and a call the body would refuse renders nowhere and counts as
     no agreement.
 
+    THE PIECE-COUNT CEILING IS GONE, from here and from the tool body together. How many pieces
+    belong in a first round is a judgement about the citizen's request, which is the thing the
+    agent is for; a number here refused proposals it had made well and, worse, drew nothing for
+    a call the body had already refused, so the citizen read silence. What is still enforced is
+    the one thing that is not taste: every piece in the first round must appear in the list of
+    everything found, or the citizen is shown a round containing something they were never told
+    had been picked up.
+
     Both stored shapes go through `_args_dict`: a tool call's `args` is a JSON string or an
     object depending on the provider, and a malformed one is the same answer as a missing one."""
     parsed = _args_dict(args)
@@ -671,7 +672,7 @@ def _slice_argument(args: Any) -> dict[str, Any] | None:
     question = parsed.get("question")
     if not found or not first or not isinstance(why, str) or not isinstance(question, str):
         return None
-    if len(first) > MAX_FIRST_SLICE or not set(first) <= set(found):
+    if not set(first) <= set(found):
         return None
     if not why.strip() or not question.strip():
         return None
@@ -681,11 +682,10 @@ def _slice_argument(args: Any) -> dict[str, Any] | None:
 def clean_pieces(raw: Any) -> list[str]:
     """A list-of-strings argument, emptied of anything that is not a usable piece name.
 
-    PUBLIC BECAUSE THE TOOL BODY READS IT TOO. `propose_first_slice` enforces the ceiling on
-    the list this returns, not on the raw argument, so the body and the renderer agree on what
-    "four pieces" counts. They did not always: the body counted the raw list while the renderer
-    counted the cleaned one, so a call naming the same piece five times was refused by the body
-    and drawn by the renderer at the same moment.
+    PUBLIC BECAUSE THE TOOL BODY READS IT TOO, and both sides must clean identically or they
+    disagree about what a piece IS — a call naming the same piece five times was once refused
+    by the body, which counted the raw list, and drawn by the renderer, which counted the
+    cleaned one, at the same moment.
 
     DE-DUPLICATED, ORDER PRESERVED. A piece named twice is one piece — the citizen reads a list,
     and a repeated line reads as two things to do. Order is the agent's, because it is the order
@@ -842,49 +842,23 @@ def _project_response_parts(
     """One stored ModelResponse → assistant text + friendly steps + plan-options cards, in
     part order (text streamed before a tool call renders before it, matching the live feed)."""
     parts = [p for p in message.get("parts", []) if isinstance(p, dict)]
-    # U15/R20 — BUILD NARRATION BETWEEN TOOLS IS NOT THE CITIZEN'S MESSAGE.
+    # EVERY TEXT PART REACHES THE CITIZEN, WHATEVER SAT BESIDE IT.
     #
-    # A Build response that ALSO calls a tool is doing the work, and its prose is the model
-    # talking to itself on the way there ("let me check the server logs", "drizzle's generic
-    # wrapper"). The work already has a citizen-readable account — the friendly step label
-    # this same loop emits below — so dropping the prose loses nothing and removes the whole
-    # class. `NARRATION_VOICE` asks the model for this; a build that fails is exactly when it
-    # stops complying, so the guarantee cannot live in the prompt alone.
+    # A response that also called a tool used to have its prose suppressed HERE, on the rule
+    # that text beside a tool call is the model narrating its way to the call. That threw away
+    # the explanation between the receipts and left a run of steps with nothing joining them,
+    # which is the opposite of the voice this product has. The rule is gone, and with it the
+    # gate on when the row was written: this is a render-time filter, so removing it also
+    # gives back the prose in transcripts already on disk — accepted deliberately, because
+    # persistence never dropped a word and every conversation older than that rule already
+    # renders this way.
     #
-    # STRUCTURAL, NOT A WORD LIST, and deliberately not keyed on `meta.kind`. A turn that
-    # mutates nothing never calls `declare_done` and is persisted as an ordinary
-    # `write_step` — the citizen asked a question and this prose IS the answer (the
-    # zero-mutation ending at `engine._TurnState.expects_mutation`). "Has a tool call beside
-    # it" keeps that answer and drops only narration; `kind == "write_completion"` would
-    # silently eat it. Mirrored live in `engine._stream_text` — change both or reload and
-    # the live feed disagree.
-    #
-    # IT NO LONGER ASKS WHICH KIND OF CHAT THIS IS (U4/R74/N2). The rule was always about the
-    # structural fact — this response also called a tool, so its prose was the model narrating
-    # its way there — and that fact is exactly as true in a planning chat. Keying it on the
-    # kind said the opposite: that the same response means one thing in one chat and something
-    # else in another. What replaced the guarantee the kind was standing in for is the voice
-    # channel (`TELL_THE_USER_TOOL`): prose beside a tool call is dropped in both kinds, and
-    # in both kinds there is one deliberate way to say something anyway.
-    #
-    # IT IS STILL GATED ON WHEN THE ROW WAS WRITTEN, which is the half revision 0035 forced.
-    # 0035 rewrites every historical row's stamp, so a row written before it cannot be read as
-    # evidence of anything: those transcripts render exactly as they always did. Note what
-    # this guard does NOT cover — a row written between 0035 and this change carries the new
-    # version and now takes the widened rule, so a planning response that wrote prose beside a
-    # tool call loses that prose on reload. That window exists only on unreleased branches
-    # (0035 has never been on `main`), and closing it would mean spending the payload
-    # SCHEMA_VERSION on a rendering rule: the version means "can this server parse this row",
-    # a rollback to the previous server must keep working, and nothing about the payload
-    # changed here.
-    narrating_between_tools = row.schema_version >= SCHEMA_VERSION and any(
-        p.get("part_kind") == "tool-call" for p in parts
-    )
+    # `thinking` parts fall through this loop untouched, and that is the guarantee rather than
+    # an omission: reasoning is stored so the next turn can replay it, and it is never
+    # projected, never framed and never sent to the browser.
     for part in parts:
         part_kind = part.get("part_kind")
         if part_kind == "text":
-            if narrating_between_tools:
-                continue
             content = part.get("content")
             if isinstance(content, str) and content.strip():
                 items.append(AssistantTextItem(seq=row.seq, text=content))
@@ -967,8 +941,14 @@ def _project_response_parts(
                     seq=row.seq,
                     tool=tool_name,
                     label=label,
+                    # NOTHING IS HIDDEN WHEN SOMETHING WENT WRONG, whatever class it belongs
+                    # to. The group opens itself saying one thing went wrong and then counts
+                    # the rows the citizen can see; a hidden failure makes that count name a
+                    # row nobody can find. A housekeeping command that failed is exactly the
+                    # case — plumbing while it works, and the whole story the moment it does
+                    # not. Mirrored live in `engine._resolve_step`.
+                    hidden=hidden and state != "failed",
                     state=state,
-                    hidden=hidden,
                 )
             )
         # thinking / builtin-tool / file / compaction parts render nothing (reasoning and

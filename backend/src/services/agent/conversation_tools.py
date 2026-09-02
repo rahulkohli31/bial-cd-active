@@ -17,9 +17,16 @@ two in one order live and the other order on reload. Both emitters render from t
 tool CALL instead, at the position the call occupies, which is the `present_plan_options`
 shape and the only placement where live order and reload order cannot disagree (R75a/R76).
 
-So the body's whole job is to enforce the bound and tell the model what happened. What
-reaches the screen is decided by `update_from_args`, which both emitters call — one rule, one
-place, and neither emitter re-deriving a ceiling the other might read differently.
+So the body's whole job is to tell the model what happened when a call cannot be honoured.
+What reaches the screen is decided by `update_from_args`, which both emitters call — one rule,
+one place.
+
+NEITHER TOOL COUNTS ANY MORE. Both used to carry a numeric ceiling — 280 characters on an
+update, four pieces in a first round — and the renderer carried a copy of each, so a call one
+over the line was refused at the body AND deleted at the renderer: the model was taught to
+retry and the citizen was shown nothing where the agent had spoken. How long a sentence should
+be and how much belongs in a first round are judgements about the person waiting, which is
+what the agent is for.
 """
 
 from __future__ import annotations
@@ -32,17 +39,15 @@ from pydantic_ai.toolsets.function import FunctionToolset
 
 from src.db.models.harness_counter import HarnessCounter
 from src.services.messages.projection import (
-    MAX_FIRST_SLICE,
-    UPDATE_MAX_CHARS,
-    agreed_slice,
-    clean_pieces,
-    finished_from_args,
-)
-from src.services.messages.projection import (
     PROPOSE_SLICE_TOOL as PROPOSE_SLICE_TOOL,
 )
 from src.services.messages.projection import (
     TELL_THE_USER_TOOL as TELL_THE_USER_TOOL,
+)
+from src.services.messages.projection import (
+    agreed_slice,
+    clean_pieces,
+    finished_from_args,
 )
 
 _SHOWN: Final = "Shown to the user. Carry on with the work."
@@ -61,26 +66,13 @@ did not: without this the model has no way to know the full list was shown and m
 prose, which is the duplication this tool exists to remove."""
 
 
-def _too_long(update: str) -> str:
-    """The teaching refusal, naming the bound rather than scolding.
-
-    THE BOUND IS THE PLATFORM'S, NOT AN INSTRUCTION'S (R70/R76). A prompt sentence asking for
-    brevity is a request; this is the thing that actually holds when a build goes wrong, which
-    is precisely when the model stops complying with requests. It names the number and the
-    register, so the retry has somewhere to go."""
-    return (
-        f"That update is {len(update)} characters and the limit is {UPDATE_MAX_CHARS}. This "
-        "channel is for one or two plain sentences about the app — what you are doing now, or "
-        "what just landed. Say the short version; the detail belongs to the work itself."
-    )
-
-
 async def tell_the_user(ctx: RunContext[Any], update: str, finished: str | None = None) -> str:
-    """Say one thing to the person waiting, in the middle of your work. Use it when you are
-    starting something they would want to know about, or when a piece of it has just landed —
-    one or two plain sentences about their app, in the words they already use. Anything else
-    you write while you are still calling tools does not reach them, so this is how you speak
-    before the turn ends. When the update is that one of the pieces you agreed to build is
+    """Speak into a GAP — a stretch of work long enough that the person waiting would
+    otherwise be watching a still screen. Everything you write ordinarily reaches them in the
+    order you write it, so this is not the way to talk to them; it is the one way to reach
+    them while a tool is still running, before you come back. Use it when you are starting
+    something slow, or when a piece has just landed: a plain sentence about their app, in the
+    words they already use. When the update is that one of the pieces you agreed to build is
     done, pass that piece's name as `finished`, spelled exactly as you named it."""
     # THE CONTEXT IS READ FOR THE RECORD, AND FOR NOTHING ELSE. `ctx.messages` is how a mark
     # is checked against the slice the citizen actually agreed to (below) — the agreement lives
@@ -94,8 +86,6 @@ async def tell_the_user(ctx: RunContext[Any], update: str, finished: str | None 
             "That update was empty. Say what is happening in one or two plain sentences, or "
             "carry on working without calling this."
         )
-    if len(text) > UPDATE_MAX_CHARS:
-        raise ModelRetry(_too_long(text))
     if finished is not None:
         # ONE FIELD RATHER THAN A SECOND TOOL (U12). The mark and the sentence arrive together
         # — "It is in." — so splitting them would ask for two calls to report one event, and
@@ -162,10 +152,16 @@ async def _count(name: HarnessCounter) -> None:
 def _bad_slice(found: list[str], first: list[str]) -> str | None:
     """The teaching refusal for a proposal that cannot be honoured, or None.
 
-    ONLY THE CEILING IS ENFORCED. A single large piece is a legitimate slice — twenty pages
-    describing one screen is one piece — and a floor of two would leave the model no recovery
-    but to split something that should not be split or name something it does not intend to
-    build. The two-piece preference is in the prompt, where a soft preference belongs."""
+    NO PIECE COUNT IS ENFORCED, in either direction. A floor of two would leave the model no
+    recovery but to split something that should not be split — twenty pages describing one
+    screen is one piece — and the ceiling that used to sit here refused proposals the agent had
+    made well, at a number nobody could defend against a particular citizen's request. Worse,
+    the renderer read the same ceiling, so a refused proposal was ALSO drawn nowhere: the model
+    was told to retry and the citizen was shown silence.
+
+    WHAT IS LEFT IS THE ONE RULE THAT IS NOT TASTE: every piece in the first round has to be a
+    piece the citizen was told had been picked up. That one is about what a person reads, not
+    about how many things an agent should do at once."""
     if not found:
         return (
             "List everything the user asked for in `found`, in your own words, one piece per "
@@ -173,12 +169,6 @@ def _bad_slice(found: list[str], first: list[str]) -> str | None:
         )
     if not first:
         return "Name at least one piece in `first` — the round you would actually build now."
-    if len(first) > MAX_FIRST_SLICE:
-        return (
-            f"That first round names {len(first)} pieces and the limit is {MAX_FIRST_SLICE}. "
-            "Pick the ones that give them something usable soonest; the rest stays on the list "
-            "and you will come back to it."
-        )
     stray = [piece for piece in first if piece not in found]
     if stray:
         return (
@@ -193,8 +183,8 @@ async def propose_first_slice(
     _ctx: RunContext[Any], found: list[str], first: list[str], why: str, question: str
 ) -> str:
     """When a request arrives with a lot of separate things in it, propose what to build first.
-    Pass every piece you picked up in `found`, the two to four you would build now in `first`,
-    one sentence saying why those in `why`, and exactly one question in `question`. The user is
+    Pass every piece you picked up in `found`, the ones you would build now in `first`, one
+    sentence saying why those in `why`, and exactly one question in `question`. The user is
     shown all of it, so write the piece names the way they would describe them.
 
     Use it for new work arriving in bulk. A question, a fix, a change to something already

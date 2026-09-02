@@ -95,7 +95,7 @@ describe('R55 — a running turn is STILL stoppable now the card is gone', () =>
     // (the server emits it before any model byte). Without it the control resolves no target and
     // correctly falls through to the legacy session stop — a real arm, but not the one under test.
     h.readTurnStream.mockImplementation(async ({ onFrame }) => {
-      onFrame({ type: 'snapshot', seq: 1, turnId: 'turn-7', turnStatus: 'running', items: [], textSoFar: '', steps: [] })
+      onFrame({ type: 'snapshot', seq: 1, turnId: 'turn-7', turnStatus: 'running', items: [], parts: [], working: false })
       return new Promise(() => {}) // …and then the turn never lands
     })
     renderBuilder({ deps: deps().deps })
