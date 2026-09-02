@@ -215,10 +215,6 @@ interface TurnSink {
    *  because the library's status renderer is reached only when a message actually carries a
    *  part of that kind — a boolean riding the turn renders nothing at all on its own. */
   working: boolean
-  /** tool-call id → that step's index in `parts`. A step arrives twice (started, then
-   *  finished) and the second must replace the first IN PLACE: a step that moved to the end
-   *  when it resolved would reorder the turn under a citizen who is watching it. */
-  stepAt: Map<string, number>
   terminal: 'completed' | 'failed' | 'stopped' | null
   reason: string | null
   snapshotCommitted: boolean | null
@@ -281,7 +277,6 @@ function newSink(): TurnSink {
   return {
     parts: [],
     working: false,
-    stepAt: new Map(),
     terminal: null,
     reason: null,
     snapshotCommitted: null,
@@ -310,12 +305,7 @@ function newSink(): TurnSink {
  * simply never re-renders — and this maps every entry to a fresh object for the same reason.
  */
 function streamingParts(sink: TurnSink): MessagePart[] {
-  // THE STATUS RIDES AT THE HEAD, and only while the model is actually thinking. It is
-  // synthesised rather than received: the server sends a boolean, never a reasoning part, so
-  // this is where the flag becomes something the thread can group and render. It carries no
-  // text — the shape has no field for any — which is what makes "status only, never the
-  // reasoning" structural rather than a promise.
-  const parts: MessagePart[] = sink.working ? [{ type: 'reasoning' }] : []
+  const parts: MessagePart[] = []
   for (const part of sink.parts) {
     if (part.kind === 'text') {
       // An empty text part renders no element, so an in-flight turn with steps and no prose
@@ -325,6 +315,22 @@ function streamingParts(sink: TurnSink): MessagePart[] {
       parts.push({ type: 'step', step: part.step })
     }
   }
+  // THE STATUS RIDES AT THE TAIL, and only while the model is actually thinking. It is
+  // synthesised rather than received: the server sends a boolean, never a reasoning part, so
+  // this is where the flag becomes something the thread can group and render. It carries no
+  // text — the shape has no field for any — which is what makes "status only, never the
+  // reasoning" structural rather than a promise.
+  //
+  // AT THE TAIL RATHER THAN THE HEAD, because `working` is not a turn-opening fact. It goes
+  // true again on every reasoning burst, and with adaptive thinking on, a build that loops
+  // through several tool calls thinks again between them — so pinning the row to index 0 put
+  // "Working on your app" ABOVE paragraphs and steps the citizen had already read, and the
+  // whole turn appeared to jump down the screen until the burst ended. ORDER IS THE RENDER,
+  // and the model is thinking HERE, at the end of what it has written so far.
+  //
+  // At the start of a turn `sink.parts` is empty, so this is still the first thing on screen —
+  // the case that mattered when the row was written is unchanged.
+  if (sink.working) parts.push({ type: 'reasoning' })
   // THE STREAMING MESSAGE ALWAYS ENDS ON A TEXT PART, and the empty one is load-bearing twice
   // over. It was implicit while this function appended the whole reply as one trailing block;
   // once the parts became ordered it had to be said, because a turn that has only run steps so
@@ -364,13 +370,9 @@ function appendText(sink: TurnSink, text: string, newBlock: boolean): void {
  * place: appending would stack a spinner beside its own result, and the activity group's live
  * count would climb while the same step re-rendered. */
 function putStep(sink: TurnSink, toolCallId: string, step: StepItem): void {
-  const at = sink.stepAt.get(toolCallId)
-  if (at !== undefined) {
-    sink.parts[at] = { kind: 'step', toolCallId, step }
-    return
-  }
-  sink.stepAt.set(toolCallId, sink.parts.length)
-  sink.parts.push({ kind: 'step', toolCallId, step })
+  const at = sink.parts.findIndex((part) => part.kind === 'step' && part.toolCallId === toolCallId)
+  if (at === -1) sink.parts.push({ kind: 'step', toolCallId, step })
+  else sink.parts[at] = { kind: 'step', toolCallId, step }
 }
 
 export default function ConversationSurface({ chatId: chatIdProp, kind = 'build', projectId = null, projectName = null, projectHasSavedBuild = null, buildSessionDeps }: ConversationSurfaceProps = {}) {
@@ -1136,7 +1138,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
    * The ONE turn-frame reducer, shared by both stream consumers — the send path below and the
    * mid-turn RE-ATTACH on reload. A frame must not be interpreted two different ways depending
    * on which consumer happened to open the socket; `sink` carries the mutable accumulators
-   * (`text` so far, this turn's steps, the terminal status) back out to the caller.
+   * (the turn's ordered `parts`, the reasoning flag, the terminal status) back out to the caller.
    */
   const turnFrameHandler = useCallback((activeId: string, assistantId: string, sink: TurnSink) => {
     // A NEW OBJECT FOR THE CHANGED MESSAGE, IDENTITY PRESERVED FOR EVERY OTHER — the runtime
@@ -1205,7 +1207,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
               part.kind === 'step' && part.toolCallId.startsWith(DIAGNOSTIC_KEY_PREFIX),
           )
           sink.parts = []
-          sink.stepAt = new Map()
           for (const part of frame.parts) {
             if (part.type === 'text') appendText(sink, part.text, true)
             else putStep(sink, part.toolCallId, part.item)
@@ -2067,8 +2068,23 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     const kept: ChatMessage[] = []
     for (const msg of messages) {
       const parts = msg.parts ?? []
+      // THE WHOLE RE-TOLD TURN, not just its steps. The live message is the authority for the
+      // turn in flight — the snapshot's ordered `parts` were built to make that true — so every
+      // STORED row it is re-telling has to go, prose included. It used to be steps alone, and
+      // that was sufficient only while the projection dropped a response's prose whenever the
+      // response also called a tool. That drop is gone, so a citizen who reloads mid-build now
+      // has each of those sentences on disk AND in the re-told turn, and read them twice.
+      //
+      // `srv_` IS WHAT KEEPS THE LIVE MESSAGE ALIVE. Only `messagesFromProjection` mints that
+      // prefix, so it names a STORED row exactly; the streaming message carries the local id
+      // this surface minted for it, and its seq is one past the newest stored row — so a rule
+      // written on seq and parts alone would delete the very message it is protecting.
       const stepOnly = parts.length > 0 && parts.every((p) => p?.type === 'step')
-      if (stepOnly && liveTurnFromSeq !== null && (msg.seq ?? 0) >= liveTurnFromSeq) continue
+      const reTold =
+        msg.id.startsWith('srv_') &&
+        parts.length > 0 &&
+        parts.every((p) => p?.type === 'step' || p?.type === 'text')
+      if (reTold && liveTurnFromSeq !== null && (msg.seq ?? 0) >= liveTurnFromSeq) continue
 
       // ── 2. THE ANCHOR ROW BECOMES ITS OWN SENTENCE, when nothing is re-telling it ────────────
       //
