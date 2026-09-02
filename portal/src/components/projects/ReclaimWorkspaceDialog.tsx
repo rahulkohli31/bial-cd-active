@@ -36,6 +36,19 @@ import type { ReclaimBlocked } from '../../utils/buildSessionApi'
 
 interface Props {
   blocked: ReclaimBlocked
+  /**
+   * THE PROJECT BEING STARTED — issue #161's framing half, and the reason this prop exists.
+   *
+   * Observed on a BIAL desk with the client watching: the modal opened with *"'Car pool apps' is
+   * still open"* — the app the citizen was NOT working on. The question they are actually asking
+   * is "can I build THIS one?", so the dialog has to answer that one first; the incumbent is the
+   * obstacle, not the subject. The refusal itself carries only the incumbent, so the name of the
+   * project being started has to be handed in by whoever made the call that was refused.
+   *
+   * `null` when the caller genuinely does not know it — a surface with no project resolved yet.
+   * The copy then falls back to naming only the incumbent, which is what it always did.
+   */
+  startingProjectName?: string | null
   /** Save the other project, then release it. Rejects if the save fails — the dialog stays
    *  open and says so, because a failed save that closed the workspace anyway is the exact
    *  data loss this whole dialog exists to prevent.
@@ -51,41 +64,90 @@ interface Props {
   onCancel: () => void
 }
 
-/** The two situations this dialog covers, which differ in what is TRUE, not just in tone.
+/**
+ * FOUR SITUATIONS NOW, NOT TWO, AND THE NEW ONE ARRIVES BECAUSE THE SERVER CHANGED.
  *
- *  An idle project holds a workspace with a settled tree, and the question is whether to save
- *  it. A building project has an agent writing into it: there is no settled tree to describe,
- *  the server refuses both Save and Release until the build stops, and the thing the user
- *  gives up by proceeding is work in progress rather than work already done.
+ * An idle project holds a workspace with a settled tree and the question is whether to save it. A
+ * BUILDING project has an agent writing into it: there is no settled tree to describe, the server
+ * refuses both Save and Release until the build stops, and what a person gives up by proceeding is
+ * work in progress rather than work already done.
  *
- *  Keeping the copy in one place because the failure it guards against is a mismatch — the
- *  first cut told a user mid-build that their project "has unsaved changes" and offered a Save
- *  the server then declined. */
-function copyFor(blocked: ReclaimBlocked): {
+ * The idle case then splits three ways on the tri-state, and the third arm is new. The old code
+ * collapsed it — `dirty === true ? 'has unsaved changes' : 'may have unsaved changes'` — which was
+ * CORRECT while a clean incumbent could never reach this dialog, because the server reclaimed it
+ * silently. R94 removed that, so `dirty === false` now arrives, and the old ternary would tell a
+ * person their confirmed-clean project "may have unsaved changes". The three arms:
+ *
+ *   true  → "has unsaved changes", with Save offered
+ *   false → a clean stop: NO unsaved-work claim, and NO Save button for work that does not exist
+ *   null  → "may have unsaved changes" (R62 — the platform says when it could not check)
+ *
+ * ═══ TWO THINGS THE COPY MUST NOT DO, BOTH FROM LIVE OBSERVATION ═══
+ *
+ * ISSUE #161, FRAMING. Lead with the app they are STARTING, not the one they are leaving. The
+ * observed modal opened with the name of the app the citizen was not working on, and the question
+ * they were asking was about the other one.
+ *
+ * ISSUE #161, AMBIGUITY. "Switch without saving" beside a build was found genuinely ambiguous by a
+ * non-technical audience: it does not say whether the unsaved work being dropped belongs to the app
+ * they are starting or the one being stopped. The button and the sentence above it NAME the project
+ * whose changes are lost. This audience could not reason it out from context, and the issue records
+ * that they did not.
+ *
+ * ═══ R95 — WHAT IS TRUE, SAID PLAINLY ═══
+ *
+ * The other project is STOPPED, not moved. Its saved work is untouched, and starting it again later
+ * rebuilds it from its own saved state. NOTHING TRAVELS BETWEEN PROJECTS, and no sentence here may
+ * imply that anything does — including softeners like "move your work over" or "bring it with you".
+ */
+function copyFor(
+  blocked: ReclaimBlocked,
+  startingProjectName: string | null,
+): {
   title: string
   body: string
-  save: string
+  /** `null` when there is nothing to save — the clean arm offers no Save button at all. */
+  save: string | null
   discard: string
 } {
+  // The app being started, in the first line. Falls back to the plain phrasing when the caller
+  // could not name it, rather than rendering an empty pair of quotes.
+  const starting = startingProjectName ? `“${startingProjectName}”` : 'this app'
+  const incumbent = `“${blocked.projectName}”`
+  const oneAtATime = 'You can work on one app at a time.'
+
   if (blocked.building) {
     return {
-      title: `“${blocked.projectName}” is still being built`,
-      body: `You can work on one app at a time, and the assistant is still writing “${blocked.projectName}”. Stopping keeps everything it has written so far — you can pick up where it left off.`,
-      save: 'Stop and save',
-      discard: 'Stop without saving',
+      title: `Start ${starting}?`,
+      body: `${oneAtATime} ${incumbent} is still being built, so it has to stop first. Stopping keeps everything the assistant has written into ${incumbent} so far — it stays where it is, and you can pick it up again later.`,
+      save: `Save ${incumbent} and stop it`,
+      discard: `Stop ${incumbent} without saving`,
     }
   }
-  const unsaved = blocked.dirty === true ? 'has unsaved changes' : 'may have unsaved changes'
+
+  if (blocked.dirty === false) {
+    // A CLEAN STOP. No unsaved-work claim, and no Save button — offering to save work that does
+    // not exist is how a person learns the dialog does not know what it is talking about.
+    return {
+      title: `Start ${starting}?`,
+      body: `${oneAtATime} ${incumbent} will stop so ${starting} can run. Everything saved in ${incumbent} stays exactly as it is, and starting it again later brings it back.`,
+      save: null,
+      discard: `Stop ${incumbent}`,
+    }
+  }
+
+  const unsaved = blocked.dirty === true ? 'has changes that are not saved yet' : 'may have changes that are not saved yet'
   return {
-    title: `“${blocked.projectName}” is still open`,
-    body: `You can work on one app at a time. “${blocked.projectName}” ${unsaved} — save it before switching, and you can pick it up exactly where you left off.`,
-    save: 'Save and switch',
-    discard: 'Switch without saving',
+    title: `Start ${starting}?`,
+    body: `${oneAtATime} ${incumbent} will stop so ${starting} can run, and it ${unsaved}. Save it first and it comes back exactly as you left it; stop without saving and those changes go.`,
+    save: `Save ${incumbent} and stop it`,
+    discard: `Stop ${incumbent} without saving`,
   }
 }
 
 export default function ReclaimWorkspaceDialog({
   blocked,
+  startingProjectName = null,
   onSaveAndSwitch,
   onSwitchAnyway,
   onCancel,
@@ -157,7 +219,7 @@ export default function ReclaimWorkspaceDialog({
     }
   }
 
-  const copy = copyFor(blocked)
+  const copy = copyFor(blocked, startingProjectName)
   const Icon = blocked.building ? Hammer : FolderOpen
 
   return (
@@ -192,16 +254,24 @@ export default function ReclaimWorkspaceDialog({
         ) : null}
 
         <div className="flex flex-col gap-2.5 mt-5">
+          {/* THE CLEAN ARM HAS NO SAVE BUTTON. `copy.save` is null exactly when the server
+              confirmed there is nothing to save, and a Save offered there is a control whose only
+              possible outcome is a no-op the person will read as a failure. */}
+          {copy.save !== null && (
+            <button
+              ref={saveRef}
+              type="button"
+              disabled={busy !== null}
+              onClick={() => void run('save', onSaveAndSwitch)}
+              className="w-full flex items-center justify-center gap-2 bg-primary hover:bg-primary/90 text-white font-semibold py-2.5 rounded-xl transition text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {busy === 'save' ? <Loader2 size={15} className="animate-spin" /> : null} {copy.save}
+            </button>
+          )}
           <button
-            ref={saveRef}
-            type="button"
-            disabled={busy !== null}
-            onClick={() => void run('save', onSaveAndSwitch)}
-            className="w-full flex items-center justify-center gap-2 bg-primary hover:bg-primary/90 text-white font-semibold py-2.5 rounded-xl transition text-sm disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {busy === 'save' ? <Loader2 size={15} className="animate-spin" /> : null} {copy.save}
-          </button>
-          <button
+            // The focus target when there is no Save button — the dialog must still take focus on
+            // open, or a keyboard user never learns it exists.
+            ref={copy.save === null ? saveRef : undefined}
             type="button"
             disabled={busy !== null}
             onClick={() => void run('discard', onSwitchAnyway)}

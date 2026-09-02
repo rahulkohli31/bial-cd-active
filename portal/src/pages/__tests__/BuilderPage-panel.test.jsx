@@ -1,12 +1,47 @@
 /**
- * The chat panel can be hidden so the preview can take the full cockpit width (#42 chat-collapse).
- * The toggle lives in the cockpit bar — not inside the chat panel it controls — so it stays
- * reachable even while that panel is invisible; these tests pin both halves of that contract, plus
- * that the panel is CSS-hidden (not unmounted), so the composer draft survives a hide/show cycle.
+ * THE #42 CHAT-COLLAPSE THIS FILE USED TO PIN IS RETIRED (Plan 006, R13), not moved — and this
+ * file is the record of that.
+ *
+ * `ConversationSurface` used to own a SECOND collapse for its own chat-panel column, independent
+ * of the one the workspace shell already owns for the rail. Under Plan 006 the conversation IS
+ * the rail (`WorkspaceShell`'s `usePublishRail` derives the rail's mode from the address), so a
+ * toggle here and the shell's `railWidthClass` toggle were two controls collapsing the identical
+ * column through two independent booleans — exactly what R13's "ONE control that collapses it
+ * entirely" forbids. Worse, this surface's toggle rendered into `LivePreview`'s toolbar, and
+ * `LivePreview` only mounts when there is something to frame — so on a Plan chat, a project with
+ * nothing built, or an app that had gone to sleep, the toggle did not exist at all, and a panel
+ * collapsed while an app was running lost its way back the moment the container stopped. See
+ * `AppPane.tsx`'s docblock for the fuller account; its collapse control is the survivor.
+ *
+ * WHY A PROBE, NOT A DOM QUERY, FOR THE TOGGLE ITSELF (mutation-check finding). The retired
+ * toggle rendered through `usePublishPaneView`'s `toolbarLeading` slot, which only reaches the
+ * DOM once `AppPaneHost`/`LivePreview` mount — and this suite's default fixture never resolves a
+ * preview address, so that pane never mounts AT ALL. A first draft of this file asserted
+ * `queryByRole('button', {name: /hide chat panel/i})` is null and it passed — but it would have
+ * passed identically had the retired toggle still been wired up, because nothing in this fixture
+ * ever gives it anywhere to render. Reintroducing the toggle and re-running proved it: every
+ * "no button" assertion stayed green. `PaneToolbarProbe` below reads the REAL channel cell
+ * `ConversationSurface` publishes to (`useWorkspacePane().toolbarLeading`) and renders it
+ * directly, which is the actual unit boundary for what this file is about — what this surface
+ * PUBLISHES, independent of whether `AppPane` later chooses to frame anything with it.
+ *
+ * EVERY TEST BELOW NOW PROVES THE SAME UNDERLYING FACT FROM A DIFFERENT ANGLE: this surface
+ * publishes no toggle, drives no width swap, and holds no collapse state of its own any more —
+ * each is an INERTNESS GUARD (never a bare deletion, per L8), paired with a LIVENESS assertion so
+ * none of them can pass by accident on a surface that rendered nothing at all. Where the ORIGINAL
+ * property they pinned (draft/scroll survive a hide-show cycle; the toggle stays reachable while
+ * collapsed) still genuinely holds, it holds at the SHELL level now — pinned in
+ * `src/components/workspace/__tests__/ProjectWorkspace.test.tsx`'s "the collapse control — hidden,
+ * not unmounted, and never a one-way door" suite — and each guard below says so rather than
+ * silently going quiet about where that coverage went.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { screen, cleanup, fireEvent } from '@testing-library/react'
-import { renderBuilder, composer } from './_builderSession.jsx'
+import { screen, render, cleanup, fireEvent } from '@testing-library/react'
+import { MemoryRouter, Routes, Route } from 'react-router-dom'
+import { composer } from './_builderSession.jsx'
+import ConversationSurface from '../../components/chat/ConversationSurface'
+import WorkspaceShell from '../../components/workspace/WorkspaceShell'
+import { useWorkspacePane } from '../../components/workspace/workspaceChannel'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), appendBuilderMessage: vi.fn(), getBuild: vi.fn(),
@@ -37,75 +72,102 @@ beforeEach(() => {
 })
 afterEach(() => cleanup())
 
-async function renderReady() {
-  renderBuilder()
-  await screen.findByRole('button', { name: /hide chat panel/i }) // panel has rendered
+/** Renders whatever `ConversationSurface` published into the pane's `toolbarLeading` slot —
+ *  see the file docblock for why this, rather than a DOM query, is the right boundary here. */
+function PaneToolbarProbe() {
+  const pane = useWorkspacePane()
+  return <div data-testid="pane-toolbar-leading-probe">{pane?.toolbarLeading}</div>
 }
 
-describe('BuilderPage — hideable chat panel (#42)', () => {
-  it('hides the chat panel on toggle and flips the button label, then shows it again', async () => {
+/** LIVENESS: the panel itself is on screen. The old `renderReady` waited for the retired
+ *  "hide chat panel" button — waiting on that here would hang forever, which is exactly the
+ *  false-negative shape L8 warns about (a removed control silently making every guard here
+ *  unreachable rather than failing loudly). `chat-panel` is the surface's own static container,
+ *  present the instant it renders, independent of the toggle that used to live in it. Mounted
+ *  through the REAL `WorkspaceShell`, with `PaneToolbarProbe` alongside it under the same
+ *  `WorkspaceChannelProvider` so the probe reads the channel this surface actually publishes to. */
+async function renderReady() {
+  render(
+    <MemoryRouter initialEntries={['/chat/build-X?projectId=p1&kind=build']}>
+      <Routes>
+        <Route element={<WorkspaceShell />}>
+          <Route
+            path="/chat/:chatId"
+            element={
+              <>
+                <ConversationSurface projectId="p1" projectName="VIP Movement" />
+                <PaneToolbarProbe />
+              </>
+            }
+          />
+        </Route>
+      </Routes>
+    </MemoryRouter>,
+  )
+  return screen.findByTestId('chat-panel')
+}
+
+describe('BuilderPage — the retired #42 chat-panel collapse (now the shell rail\'s, R13)', () => {
+  it('publishes no hide/show chat-panel toggle into the pane\'s toolbar — the rail\'s ONE collapse is drawn by AppPane now', async () => {
     await renderReady()
 
-    fireEvent.click(screen.getByRole('button', { name: /hide chat panel/i }))
-    expect(screen.getByRole('button', { name: /show chat panel/i })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: /hide chat panel/i })).toBeNull()
-
-    fireEvent.click(screen.getByRole('button', { name: /show chat panel/i }))
-    expect(screen.getByRole('button', { name: /hide chat panel/i })).toBeTruthy()
+    // LIVENESS: the composer is really on screen, so an empty probe below is not an artifact of
+    // the surface rendering nothing.
+    expect(composer()).toBeTruthy()
+    // INERTNESS: the channel cell this surface publishes `toolbarLeading` into is genuinely
+    // empty — read via the SAME hook `AppPaneHost` would spread into `LivePreview`, not via a DOM
+    // query that a mount-gated toolbar could make vacuously true either way (see docblock).
+    const probe = screen.getByTestId('pane-toolbar-leading-probe')
+    expect(probe.textContent).toBe('')
+    expect(probe.querySelector('button')).toBeNull()
   })
 
-  it('keeps the composer draft when the panel is hidden and re-shown', async () => {
-    // NOTE: this alone does NOT prove CSS-hide over unmount — `input` is BuilderPage's own
-    // state and the composer is a controlled textarea, so a conditionally-unmounted panel
-    // would pass this identically (React repopulates `value` from the same state on
-    // remount). The tests below are the ones that actually discriminate the two.
+  it('has no hide/show cycle left to run the composer draft through — draft-survival is pinned at the shell now (ProjectWorkspace.test.tsx, "keeps the rail MOUNTED while collapsed")', async () => {
     await renderReady()
 
     fireEvent.change(composer(), { target: { value: 'a visitor pass tracker' } })
+    // LIVENESS: the draft is genuinely held by this surface's own composer state.
     expect(composer().value).toBe('a visitor pass tracker')
-
-    fireEvent.click(screen.getByRole('button', { name: /hide chat panel/i })) // hide
-    fireEvent.click(screen.getByRole('button', { name: /show chat panel/i })) // show
-
-    expect(composer().value).toBe('a visitor pass tracker')
+    // INERTNESS: there is no toggle published that could hide/show this panel and put that draft
+    // at risk — the property this test used to exercise by cycling one no longer has a cycle to
+    // run on THIS component. (The shell's rail collapse still has it; that is the other file's job.)
+    expect(screen.getByTestId('pane-toolbar-leading-probe').textContent).toBe('')
   })
 
-  it('the panel itself CSS-collapses (its width class swaps), not just the toggle label', async () => {
+  it('keeps a fixed width class always — it no longer swaps its own width; `WorkspaceShell.railWidthClass` governs the rail\'s width now', async () => {
     await renderReady()
     const panel = screen.getByTestId('chat-panel')
-    expect(panel.className).toMatch(/w-72/)
 
-    fireEvent.click(screen.getByRole('button', { name: /hide chat panel/i }))
-    expect(panel.className).toMatch(/w-0/)
-    expect(panel.className).not.toMatch(/w-72/)
-
-    fireEvent.click(screen.getByRole('button', { name: /show chat panel/i }))
+    // LIVENESS: the panel carries its ordinary shown-state class.
     expect(panel.className).toMatch(/w-72/)
+    // INERTNESS: nothing on this surface can drive that class to `w-0` any more — there is no
+    // toggle left to press, and the class itself is no longer a ternary on any local state.
+    expect(screen.getByTestId('pane-toolbar-leading-probe').textContent).toBe('')
+    expect(panel.className).not.toMatch(/(^|\s)w-0(\s|$)/)
   })
 
-  it('keeps scroll position across a hide/show cycle — the property that actually discriminates CSS-hide from unmount (mutation-checked: fails against a conditionally-unmounted panel, since a freshly mounted node has no prior scrollTop)', async () => {
+  it('has no hide/show cycle left to preserve scroll position across — that property is pinned at the shell now (ProjectWorkspace.test.tsx, same suite)', async () => {
     await renderReady()
-    const before = screen.getByTestId('thread-viewport')
-    before.scrollTop = 40
+    const viewport = screen.getByTestId('thread-viewport')
+    viewport.scrollTop = 40
 
-    fireEvent.click(screen.getByRole('button', { name: /hide chat panel/i }))
-    fireEvent.click(screen.getByRole('button', { name: /show chat panel/i }))
-
-    // Re-query rather than reuse `before` — reusing it would still read 40 even if the panel
-    // WAS unmounted (the stale, detached node keeps whatever was last set on it), which is
-    // exactly the false-pass the composer-draft test above has.
-    const after = screen.getByTestId('thread-viewport')
-    expect(after.scrollTop).toBe(40)
+    // INERTNESS FIRST: there is no toggle published on this surface that could hide/show the
+    // panel and put the scroll position at risk in the first place.
+    expect(screen.getByTestId('pane-toolbar-leading-probe').textContent).toBe('')
+    // LIVENESS: the viewport this test is about is really mounted and really holds the value —
+    // proving the assertion above is not vacuous over a surface that rendered nothing.
+    expect(screen.getByTestId('thread-viewport').scrollTop).toBe(40)
   })
 
-  it('the toggle stays reachable while the panel is hidden', async () => {
+  it('publishes no toggle of its own to keep reachable — "stays reachable while collapsed" is entirely AppPane\'s property now (ProjectWorkspace.test.tsx, "★ lives in the PANE...")', async () => {
     await renderReady()
 
-    fireEvent.click(screen.getByRole('button', { name: /hide chat panel/i }))
-    const shown = screen.getByRole('button', { name: /show chat panel/i })
-    expect(shown).toBeTruthy()
-
-    fireEvent.click(shown)
-    expect(screen.getByRole('button', { name: /hide chat panel/i })).toBeTruthy()
+    // LIVENESS: the surface rendered its ordinary chrome.
+    expect(screen.getByTestId('chat-panel')).toBeTruthy()
+    // INERTNESS: there is nothing here to ask "does it stay reachable while hidden" about — this
+    // surface has retired the whole toggle, not merely relocated it, so the question the old test
+    // asked has no subject left on THIS component. The control that must answer it lives in
+    // `AppPane` and is pinned there.
+    expect(screen.getByTestId('pane-toolbar-leading-probe').textContent).toBe('')
   })
 })

@@ -1,8 +1,24 @@
 import { useState, useEffect } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams, useLocation } from 'react-router-dom'
 import { Zap, Shield, Cloud } from 'lucide-react'
 import BIALLogo from '../components/BIALLogo'
 import { consumeSignoutReason, SIGNOUT_REASONS, LOGIN_URL, bootstrapSession } from '../utils/auth'
+
+// The shape Navbar's handleLogout hands `navigate('/login', { state })` on a failed
+// sign-out (U15) — the ONLY way for a warning owned by a page that is about to unmount
+// to reach the screen the user actually lands on. `useLocation().state` is typed `any`
+// by react-router, so it is narrowed here rather than trusted.
+interface SignoutWarningState {
+  signoutWarning: string
+}
+function isSignoutWarningState(value: unknown): value is SignoutWarningState {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'signoutWarning' in value &&
+    typeof (value as { signoutWarning: unknown }).signoutWarning === 'string'
+  )
+}
 
 // The app's authenticated landing route — the primary RequireAuth-wrapped page in
 // App.jsx (`/` and any unknown path both redirect to `/login`; `/dashboard` is the
@@ -39,6 +55,7 @@ const GENERIC_AUTH_ERROR = 'Sign-in failed. Please try again.'
 export default function LoginPage() {
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
+  const location = useLocation()
   const [notice, setNotice] = useState('')
 
   // Forward an ALREADY-authenticated visitor into the app instead of dead-ending
@@ -78,9 +95,17 @@ export default function LoginPage() {
       )
       return
     }
+    // A failed sign-out's warning (U15 — see Navbar's handleLogout) arrives as router
+    // state on THIS navigation, not as a recorded reason to look up — it never touches
+    // localStorage, so it takes priority over `consumeSignoutReason()` below rather than
+    // racing it.
+    if (isSignoutWarningState(location.state)) {
+      setNotice(location.state.signoutWarning)
+      return
+    }
     const reason = consumeSignoutReason()
     if (reason && Object.hasOwn(SIGNOUT_BANNERS, reason)) setNotice(SIGNOUT_BANNERS[reason])
-  }, [searchParams])
+  }, [searchParams, location.state])
 
   // Full-page navigation to the FastAPI control-plane, which runs the OIDC
   // Authorization-Code + PKCE flow and redirects back to the app (or here with

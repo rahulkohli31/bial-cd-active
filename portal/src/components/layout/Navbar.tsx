@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { NavLink, useNavigate } from 'react-router-dom'
+import { useWorkspaceExit } from '../workspace/UnsavedWorkGuard'
 // `Info` is NOT left over from the removed settings menu — it is the toast's own icon
 // (see the toast render below). The nine icons that went with #157's dead header controls
 // are gone; these four all have live consumers.
@@ -43,6 +44,8 @@ const compactTokens = (n: number): string => _compactTokenFormat.format(n)
 
 export default function Navbar() {
   const navigate = useNavigate()
+  // The workspace's unsaved-work guard, or a pass-through on every page that has no workspace.
+  const exit = useWorkspaceExit()
   const [userMenuOpen, setUserMenuOpen] = useState(false)
   const [toastMsg, setToastMsg] = useState<string | null>(null)
   const [usage, setUsage] = useState<UsageToday | null>(null)
@@ -134,17 +137,21 @@ export default function Navbar() {
 
   const handleLogout = async () => {
     // Await the server-side revoke (bumps token_version + revokes refresh
-    // families + clears cookies). logout() records the LOGGED_OUT banner and
-    // never throws — on failure we still leave, surfacing a toast so the user
-    // knows this device's session may linger until it expires. Never trap the
-    // user's intent to sign out.
+    // families + clears cookies). logout() never throws. Never trap the
+    // user's intent to sign out — the very next statement always leaves.
     const ok = await logout()
     // Attachment BYTES now live server-side, scoped per user — nothing local to
     // wipe on logout. Release any in-memory attachment object URLs so the next
     // user's tab doesn't inherit cached blob handles (memory hygiene only).
     revokeAllAttachmentUrls()
-    if (!ok) showToast('Sign-out may be incomplete on this device.')
-    navigate('/login')
+    // U15: a failed revoke means this browser's session MAY still be live — a fact worth
+    // telling the user — but this component cannot be the one to show it. `navigate` below
+    // unmounts this page in the same tick, which unmounts the navbar, which owns
+    // `toastMsg` — a local toast set here would be destroyed before a single frame renders
+    // it (nobody has ever seen it). A message that must outlive its own page cannot be
+    // owned by that page: hand it forward as router state instead, so the screen it
+    // actually reaches — LoginPage — is the one that renders it, *after* the redirect.
+    navigate('/login', ok ? undefined : { state: { signoutWarning: 'Sign-out may be incomplete on this device.' } })
   }
 
   return (
@@ -153,7 +160,19 @@ export default function Navbar() {
         <div className="px-6 h-14 flex items-center justify-between gap-4">
           {/* Brand + Nav */}
           <div className="flex items-center gap-8">
-            <NavLink to="/dashboard" className="flex items-center whitespace-nowrap">
+            {/* THE WORKSPACE'S IN-PLACE EXITS ROUTE THROUGH ITS GUARD (Plan F, U8).
+                `beforeunload` cannot cover these: a single-page navigation is not an unload, so
+                leaving the workspace by a nav link used to discard unsaved work in silence. Outside
+                a workspace `useWorkspaceExit` hands back a function that simply goes, which is why
+                every other page's navigation is untouched by this. */}
+            <NavLink
+              to="/dashboard"
+              onClick={(e) => {
+                e.preventDefault()
+                exit(() => navigate('/dashboard'))
+              }}
+              className="flex items-center whitespace-nowrap"
+            >
               <BIALLogo />
             </NavLink>
             <div className="hidden md:flex items-center gap-6">
@@ -161,6 +180,10 @@ export default function Navbar() {
                 <NavLink
                   key={to}
                   to={to}
+                  onClick={(e) => {
+                    e.preventDefault()
+                    exit(() => navigate(to))
+                  }}
                   className={({ isActive }) =>
                     `text-sm font-medium transition pb-0.5 inline-flex items-center gap-1.5 ${
                       isActive ? 'text-primary font-bold border-b-2 border-primary' : 'text-neutral hover:text-primary'

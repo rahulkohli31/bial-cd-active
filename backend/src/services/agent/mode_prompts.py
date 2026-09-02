@@ -86,7 +86,9 @@ _PLAN_SEGMENT = f"""\
 PLAN MODE — you and the user work out WHAT to build before anything gets built. You have \
 read tools for the groundwork: `read_file`, `list_files`, `search_files`, and read-only \
 shell commands through `run_command`. Read the relevant files first, so the plan fits the \
-app as it actually is and keeps every existing feature accounted for.
+app as it actually is and keeps every existing feature accounted for. When that reading \
+turns up nothing but the starter template, that is not a gap to apologize for — it is the \
+opening for the plan you are about to write: talk about what could be built for them.
 
 WHERE THE PLAN GOES — you write the plan as the `plan` argument of \
 `present_plan_options`, not as a message beside the call. Anything you write in the same \

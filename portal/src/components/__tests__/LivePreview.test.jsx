@@ -184,10 +184,24 @@ describe('LivePreview — status-driven visuals (all 5 C3 statuses)', () => {
     expect(container.textContent).toMatch(/no longer running|ended/i)
   })
 
-  it('empty state when there is no status and no previewUrl', () => {
+  // U4 (Plan F) — `showEmpty` IS GONE, and the empty-state copy this test used to look for
+  // ("...will appear here") went with it: it moved to `AppPane`'s `NoFrame`, which is also the
+  // ONLY thing that can put a citizen in this exact state now — `AppPane` mounts this component
+  // at all ONLY when the address resolver has a URL, and renders `NoFrame` instead when it does
+  // not (`AppPane.tsx`: `address.url ? <AppPaneHost /> : <NoFrame .../>`). So the honest claim
+  // left to make here is not "here is the copy" (there is none) but "this component genuinely
+  // has nothing left to say for it" — proven below by checking every kind of chrome it knows how
+  // to draw, not merely the one sentence that used to live here. `workspaceState.test.ts` covers
+  // the state map that now owns this copy.
+  it('renders NOTHING for the no-previewUrl/no-status combination — the empty-state copy moved to AppPane', () => {
     const { container } = render(<LivePreview previewUrl={null} status={null} />)
     expect(container.querySelector('iframe')).toBeNull()
-    expect(container.textContent).toMatch(/preview will appear here/i)
+    expect(container.querySelector('[data-testid="preview-ended-card"]')).toBeNull()
+    expect(container.querySelector('[data-testid="preview-unavailable-card"]')).toBeNull()
+    expect(container.querySelector('[data-testid="device-card"]')).toBeNull()
+    expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
+    // The permanent live region is still mounted (it always is) — just silent.
+    expect(container.querySelector('[role="status"]')?.textContent).toBe('')
   })
 
   it('the "still working" overlay shows only while a LIVE preview keeps receiving activity', () => {
@@ -282,20 +296,31 @@ describe('LivePreview — the pardoned preview: completed builds stay framed (#1
 })
 
 describe('LivePreview — relaunch a torn-down preview (#43)', () => {
-  it('offers a Relaunch button on the terminal placeholder when the project HAS a saved build', () => {
-    // R5: the affordance needs the server-confirmed claim now — onRelaunch alone no longer
-    // conjures a button for a build that may not exist.
+  // R3/U4 (Plan F) — INERTNESS GUARD. This used to press "Relaunch preview" on the terminal
+  // placeholder; that control moved to `components/workspace/StartAppControl.tsx`, rendered by
+  // `AppPane` from the one computed workspace state (R3: exactly ONE control starts the app). The
+  // copy this placeholder still owns is what LIVENESS checks below — the button is what INERTNESS
+  // checks.
+  it('INERTNESS GUARD: the terminal placeholder still explains an ended session with a saved build, but offers no button', () => {
     const onRelaunch = vi.fn()
-    render(<LivePreview previewUrl={null} status="ended" onRelaunch={onRelaunch} hasSavedBuild />)
-    const button = screen.getByRole('button', { name: /relaunch preview/i })
-    fireEvent.click(button)
-    expect(onRelaunch).toHaveBeenCalledTimes(1)
+    const { container } = render(
+      <LivePreview previewUrl={null} status="ended" onRelaunch={onRelaunch} hasSavedBuild />,
+    )
+    // LIVENESS: the placeholder still says what happened.
+    expect(container.textContent).toMatch(/no longer running/i)
+    // INERTNESS: no button under any retired label, and the prop it used to fire is never called.
+    expect(screen.queryByRole('button', { name: /relaunch|bring it back/i })).toBeNull()
+    expect(onRelaunch).not.toHaveBeenCalled()
   })
 
-  it('offers Relaunch on a FAILED build too (its saved snapshot may still be restorable)', () => {
+  it('INERTNESS GUARD: a FAILED build with a saved snapshot gets the same terminal placeholder, no button', () => {
     const onRelaunch = vi.fn()
-    render(<LivePreview previewUrl={null} status="failed" onRelaunch={onRelaunch} hasSavedBuild />)
-    expect(screen.getByRole('button', { name: /relaunch preview/i })).toBeTruthy()
+    const { container } = render(
+      <LivePreview previewUrl={null} status="failed" onRelaunch={onRelaunch} hasSavedBuild />,
+    )
+    expect(container.textContent).toMatch(/no longer running/i)
+    expect(screen.queryByRole('button', { name: /relaunch|bring it back/i })).toBeNull()
+    expect(onRelaunch).not.toHaveBeenCalled()
   })
 
   it('without onRelaunch, the terminal keeps its plain "start a new build" copy (no button)', () => {
@@ -393,57 +418,47 @@ describe('LivePreview — relaunch a torn-down preview (#43)', () => {
   })
 })
 
-describe('LivePreview — relaunch from PROJECT state, not this transcript (finding #1 + N7)', () => {
-  it('a project the server CONFIRMS has a saved build offers Relaunch from a fresh chat', () => {
-    // status null + no previewUrl = the empty state a fresh chat lands in.
-    const onRelaunch = vi.fn()
-    const { container } = render(<LivePreview hasSavedBuild onRelaunch={onRelaunch} />)
-    expect(container.textContent).toMatch(/already has a saved build/i)
-    fireEvent.click(screen.getByRole('button', { name: /relaunch preview/i }))
-    expect(onRelaunch).toHaveBeenCalledTimes(1)
-  })
-
-  it('a project WITHOUT a saved build keeps the plain empty copy — no phantom relaunch', () => {
-    const { container } = render(<LivePreview onRelaunch={vi.fn()} />)
-    expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
-    expect(container.textContent).toMatch(/submit a prompt to start a build/i)
-  })
-
-  it('N7: an UNKNOWN answer (null) makes no claim in either direction', () => {
-    // The server could not reach the object store. Reading `null` as "yes" offers a button
-    // that 404s; reading it as "no" hides a Relaunch that would have worked. Say nothing.
-    const { container } = render(<LivePreview hasSavedBuild={null} onRelaunch={vi.fn()} />)
-    expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
-    expect(container.textContent).not.toMatch(/already has a saved build/i)
-    expect(container.textContent).toMatch(/submit a prompt to start a build/i)
-  })
-
-  it('N7: a 404 after the click is SHOWN, not silently swallowed', () => {
-    // The old behaviour hid the button with no message at all: the user pressed Relaunch and
-    // the affordance simply vanished. That silence covered our own false claim. With a
-    // truthful predicate a 404 is genuinely exceptional, so it gets said out loud.
-    const { container } = render(
-      <LivePreview
-        hasSavedBuild
-        onRelaunch={vi.fn()}
-        relaunchError={{ kind: 'not_found', message: 'No saved build to relaunch. Build the app first.' }}
-      />,
-    )
-    expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
-    expect(screen.getByRole('alert').textContent).toMatch(/no longer available/i)
-    expect(container.textContent).toMatch(/submit a prompt to start a build/i)
-  })
-
-  it('a retryable relaunch failure from the empty state keeps the button (U6 matrix holds here too)', () => {
-    render(
-      <LivePreview
-        hasSavedBuild
-        onRelaunch={vi.fn()}
-        relaunchError={{ kind: 'unavailable', message: 'Sandbox unavailable. Please try again later or contact the admin' }}
-      />,
-    )
-    expect(screen.getByRole('alert').textContent).toMatch(/try again later/i)
-    expect(screen.getByRole('button', { name: /relaunch preview/i })).toBeTruthy()
+// U4 (Plan F) — THIS WHOLE DESCRIBE BLOCK TESTED THE `showEmpty` ARM, and that arm is gone. Every
+// test here rendered `<LivePreview hasSavedBuild=... onRelaunch=... relaunchError=... />` with
+// NEITHER a previewUrl NOR a status — the exact no-frame, nothing-built condition `AppPane` now
+// owns outright. Two things moved together, not just the button:
+//
+//   1. THE COPY. "This project already has a saved build" / "Submit a prompt to start a build" /
+//      the N7 tri-state wording (a `hasSavedBuild === null` answer claiming nothing) all lived in
+//      this component's empty-state placeholder. That placeholder, and the state map that drives
+//      it, moved to `AppPane`'s `NoFrame` — and the map itself is `resolveWorkspaceState` in
+//      `workspaceState.ts`: its `atRest()` resolves the identical `restorable ?? projectHasSavedBuild`
+//      tri-state this block exercised (see `workspaceState.test.ts`).
+//   2. THE 404-SAID-AND-NOT-SWALLOWED DISCIPLINE (N7's other half). A failed start now surfaces
+//      through `StartAppControl`'s own outcome handling (`StartAppControl.test.tsx`), not through
+//      this component's old `relaunchError` prop — no `AppPane`-driven pane populates that prop
+//      for this arm any more.
+//
+// `AppPane` also structurally forecloses this exact prop combination from ever reaching
+// `LivePreview` in the product: it mounts `AppPaneHost` (and hence this component) only when the
+// address resolver has a URL, and renders `NoFrame` instead when it does not — so a real citizen
+// can no longer land on the state this whole block constructed by hand.
+//
+// ONE test replaces the five that were here, because all five failed for the identical reason
+// (asserting a button/copy pair that no longer exists on this component) and a second, third and
+// fourth copy of the same "this is gone, and moved to X" finding would not prove anything the
+// first did not.
+describe('LivePreview — the no-previewUrl/no-status combination (formerly "relaunch from PROJECT state")', () => {
+  it('stays inert across the whole former N7/U6 matrix — hasSavedBuild and relaunchError no longer reach any render here', () => {
+    for (const props of [
+      { hasSavedBuild: true },
+      { hasSavedBuild: false },
+      { hasSavedBuild: null },
+      { hasSavedBuild: true, relaunchError: { kind: 'not_found', message: 'gone' } },
+      { hasSavedBuild: true, relaunchError: { kind: 'unavailable', message: 'try later' } },
+    ]) {
+      const { container, unmount } = render(<LivePreview onRelaunch={vi.fn()} {...props} />)
+      expect(container.querySelector('iframe')).toBeNull()
+      expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
+      expect(screen.queryByRole('alert')).toBeNull()
+      expect(container.querySelector('[role="status"]')?.textContent).toBe('')
+      unmount()
+    }
   })
 })
 
@@ -461,25 +476,40 @@ describe('LivePreview — the U6 relaunch response matrix (#43)', () => {
     expect(container.textContent).toMatch(/nothing to relaunch/i)
   })
 
-  it('503 unavailable shows the transient copy WITH the button restored for a retry', () => {
-    const onRelaunch = vi.fn()
-    render(
+  // U4 (Plan F) — INERTNESS GUARD, AND A DOCUMENTED FINDING, NOT JUST A RE-POINT. This test used
+  // to assert the transient `unavailable` copy inside `screen.getByRole('alert')` — but tracing
+  // the current render arms shows `relaunchError` is read in exactly THREE places in
+  // `LivePreview.tsx`, and every one of them special-cases ONLY `kind === 'not_found'`
+  // (`grep -n 'relaunchError' src/components/LivePreview.tsx`). The `unavailable`/`failed` kinds
+  // fall through to the generic hasSavedBuild-only sentence below, and their own `.message` is
+  // never read anywhere — no `role="alert"`, no "try again later". The component's own docblock
+  // (`LivePreviewProps.relaunchError`) still SAYS "`unavailable`/`failed` show their copy with the
+  // button restored for a retry", which no longer matches what renders: this looks like the U4
+  // sweep took the message along with the button for these two kinds, not just the button, and
+  // the docblock was never updated to match. Filed as a finding rather than silently reasserted as
+  // correct — see the session report. What is left to pin honestly is that the generic
+  // saved-build sentence still renders and still makes no button.
+  it('INERTNESS GUARD: an `unavailable` relaunch error no longer gets its own alert copy — only the generic saved-build sentence survives', () => {
+    const { container } = render(
       <LivePreview
         previewUrl={null}
         status="ended"
-        onRelaunch={onRelaunch}
+        onRelaunch={vi.fn()}
         hasSavedBuild
         relaunchError={{ kind: 'unavailable', message: 'Sandbox unavailable. Please try again later or contact the admin' }}
       />,
     )
-    expect(screen.getByRole('alert').textContent).toMatch(/try again later/i)
-    const button = screen.getByRole('button', { name: /relaunch preview/i })
-    fireEvent.click(button)
-    expect(onRelaunch).toHaveBeenCalledTimes(1)
+    // LIVENESS: the terminal placeholder still renders and still makes the saved-build claim.
+    expect(container.textContent).toMatch(/your saved app is still there/i)
+    // The kind-specific copy is gone, not merely un-alerted — pinned so a reader does not assume
+    // it survives elsewhere on the pane.
+    expect(container.textContent).not.toMatch(/try again later/i)
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
   })
 
-  it('5xx failed shows the failure copy with the button restored', () => {
-    render(
+  it('INERTNESS GUARD: a `failed` relaunch error no longer gets its own alert copy — only the generic saved-build sentence survives', () => {
+    const { container } = render(
       <LivePreview
         previewUrl={null}
         status="ended"
@@ -488,13 +518,23 @@ describe('LivePreview — the U6 relaunch response matrix (#43)', () => {
         relaunchError={{ kind: 'failed', message: 'Failed to relaunch the preview' }}
       />,
     )
-    expect(screen.getByRole('alert').textContent).toMatch(/failed to relaunch/i)
-    expect(screen.getByRole('button', { name: /relaunch preview/i })).toBeTruthy()
+    expect(container.textContent).toMatch(/your saved app is still there/i)
+    expect(container.textContent).not.toMatch(/failed to relaunch/i)
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
   })
 
-  it('labels the button "Relaunch last saved version" when the newest build failed (U6/F1)', () => {
-    render(<LivePreview previewUrl={null} status="failed" onRelaunch={vi.fn()} hasSavedBuild lastBuildFailed />)
-    expect(screen.getByRole('button', { name: /relaunch last saved version/i })).toBeTruthy()
+  // R3/U4 — INERTNESS GUARD. `lastBuildFailed` used to pick between two button labels ("Relaunch
+  // preview" vs "Relaunch last saved version"); `LivePreview`'s own docblock records that the prop
+  // is now accepted and DELIBERATELY UNREAD — the distinction it drew belongs to
+  // `restoredFromFailedBuild` now, which says the same thing on a FRAMED pane where a citizen can
+  // actually see it (see "overlays the last-saved-version notice..." below, unaffected by this).
+  it('INERTNESS GUARD: `lastBuildFailed` no longer labels a button — there is no button left to label', () => {
+    const { container } = render(
+      <LivePreview previewUrl={null} status="failed" onRelaunch={vi.fn()} hasSavedBuild lastBuildFailed />,
+    )
+    expect(container.textContent).toMatch(/no longer running/i)
+    expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
   })
 
   it('overlays the last-saved-version notice on a frame restored from a failed build', () => {
@@ -678,7 +718,10 @@ describe('LivePreview — the frame is revealed on load, never on a timer (U5/R3
     }
   })
 
-  it('a frame that never loads degrades to a LABELLED state with Relaunch — never a bare white card', () => {
+  // R3/U4 — INERTNESS GUARD. The stall card still degrades to a LABELLED state (never a bare
+  // white card — that half of the unit is untouched); what it no longer does is offer its own
+  // Relaunch button, because R3 says exactly one control starts the app and this is not it.
+  it('INERTNESS GUARD: a frame that never loads still degrades to a LABELLED state — never a bare white card, and never a button', () => {
     vi.useFakeTimers()
     try {
       const onRelaunch = vi.fn()
@@ -686,10 +729,12 @@ describe('LivePreview — the frame is revealed on load, never on a timer (U5/R3
         <LivePreview previewUrl={SANDBOX_URL} status="ready" onRelaunch={onRelaunch} hasSavedBuild />,
       )
       act(() => vi.advanceTimersByTime(FRAME_LOAD_CAP_MS + 1))
-      expect(card(container).className).toMatch(/opacity-0/) // still nothing painted, so still not revealed
+      // LIVENESS: still nothing painted, so still not revealed, and still labelled.
+      expect(card(container).className).toMatch(/opacity-0/)
       expect(container.textContent).toMatch(/taking longer than usual/i)
-      fireEvent.click(screen.getByRole('button', { name: /relaunch preview/i }))
-      expect(onRelaunch).toHaveBeenCalledTimes(1)
+      // INERTNESS: no button, under any label, and the prop it used to fire is never called.
+      expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
+      expect(onRelaunch).not.toHaveBeenCalled()
     } finally {
       vi.useRealTimers()
     }
@@ -830,7 +875,9 @@ describe('LivePreview — the frame is revealed on load, never on a timer (U5/R3
 })
 
 describe('LivePreview — the reconnecting state is BOUNDED after a completed build (F8/U5)', () => {
-  it('after the cap with no recovery, collapses to "preview unavailable" + Relaunch (no forever spinner)', () => {
+  // R3/U4 — INERTNESS GUARD. The bound itself (never a forever spinner) is untouched and stays
+  // asserted; only the button half — this pane's own way to act on the collapse — moved off it.
+  it('INERTNESS GUARD: after the cap with no recovery, still collapses to "preview unavailable" (no forever spinner), with no button of its own', () => {
     vi.useFakeTimers()
     try {
       const onRelaunch = vi.fn()
@@ -839,10 +886,12 @@ describe('LivePreview — the reconnecting state is BOUNDED after a completed bu
       )
       expect(container.textContent).toMatch(/reconnecting/i) // before the cap
       act(() => vi.advanceTimersByTime(20001))
-      expect(container.textContent).toMatch(/preview unavailable/i) // the bounded terminal
+      // LIVENESS: the bounded terminal still fires.
+      expect(container.textContent).toMatch(/preview unavailable/i)
       expect(container.textContent).not.toMatch(/reconnecting to your preview/i)
-      fireEvent.click(screen.getByRole('button', { name: /relaunch preview/i }))
-      expect(onRelaunch).toHaveBeenCalledTimes(1)
+      // INERTNESS: no button, and the prop it used to fire is never called.
+      expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
+      expect(onRelaunch).not.toHaveBeenCalled()
     } finally {
       vi.useRealTimers()
     }
@@ -931,7 +980,7 @@ describe('LivePreview — the preview only claims a build that exists (R5)', () 
       <LivePreview previewUrl={null} status="ended" onRelaunch={vi.fn()} hasSavedBuild={false} />,
     )
     expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
-    expect(container.textContent).not.toMatch(/restore your saved app/i)
+    expect(container.textContent).not.toMatch(/relaunch it|relaunch the preview/i)
     expect(container.textContent).toMatch(/nothing to relaunch yet/i)
   })
 
@@ -951,35 +1000,44 @@ describe('LivePreview — the preview only claims a build that exists (R5)', () 
       act(() => vi.advanceTimersByTime(20001)) // past the reconnect cap → showUnavailable
       expect(container.textContent).toMatch(/preview unavailable/i)
       expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
-      expect(container.textContent).not.toMatch(/restore your saved app/i)
+      expect(container.textContent).not.toMatch(/relaunch it|relaunch the preview/i)
       expect(container.textContent).toMatch(/nothing to relaunch yet/i)
     } finally {
       vi.useRealTimers()
     }
   })
 
-  it('both branches with hasSavedBuild=true still offer Relaunch (the built-but-unsubmitted draft)', () => {
+  // R5/R3 — INERTNESS GUARD, and the interesting half is what SURVIVES. R5 was never about the
+  // button; it was about not promising a restore where none exists. That promise is still made —
+  // in the copy — in both branches; only the button that used to accompany it is gone.
+  it('INERTNESS GUARD: both branches with hasSavedBuild=true still MAKE the saved-app claim in copy, but neither offers its own button', () => {
     // Terminal:
+    const onRelaunchTerminal = vi.fn()
     const first = render(
-      <LivePreview previewUrl={null} status="ended" onRelaunch={vi.fn()} hasSavedBuild />,
+      <LivePreview previewUrl={null} status="ended" onRelaunch={onRelaunchTerminal} hasSavedBuild />,
     )
-    expect(screen.getByRole('button', { name: /relaunch preview/i })).toBeTruthy()
+    expect(first.container.textContent).toMatch(/your saved app is still there/i)
+    expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
+    expect(onRelaunchTerminal).not.toHaveBeenCalled()
     first.unmount()
-    // Unavailable:
+    // Unavailable (reconnect cap expired):
     vi.useFakeTimers()
     try {
-      render(
+      const onRelaunchUnavailable = vi.fn()
+      const { container } = render(
         <LivePreview
           previewUrl={SANDBOX_URL}
           status="ended"
           completedLive
           reconnecting
-          onRelaunch={vi.fn()}
+          onRelaunch={onRelaunchUnavailable}
           hasSavedBuild
         />,
       )
       act(() => vi.advanceTimersByTime(20001))
-      expect(screen.getByRole('button', { name: /relaunch preview/i })).toBeTruthy()
+      expect(container.textContent).toMatch(/your saved app is still there/i)
+      expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
+      expect(onRelaunchUnavailable).not.toHaveBeenCalled()
     } finally {
       vi.useRealTimers()
     }
@@ -990,7 +1048,7 @@ describe('LivePreview — the preview only claims a build that exists (R5)', () 
       <LivePreview previewUrl={null} status="ended" onRelaunch={vi.fn()} hasSavedBuild={null} />,
     )
     expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
-    expect(document.body.textContent).not.toMatch(/restore your saved app/i) // no "there is one"
+    expect(document.body.textContent).not.toMatch(/relaunch it|relaunch the preview/i) // no "there is one"
     expect(document.body.textContent).not.toMatch(/no saved build/i) // and no "there is none"
     expect(document.body.textContent).toMatch(/start a new build/i)
     first.unmount()
@@ -1008,7 +1066,7 @@ describe('LivePreview — the preview only claims a build that exists (R5)', () 
       )
       act(() => vi.advanceTimersByTime(20001))
       expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
-      expect(document.body.textContent).not.toMatch(/restore your saved app/i)
+      expect(document.body.textContent).not.toMatch(/relaunch it|relaunch the preview/i)
       expect(document.body.textContent).not.toMatch(/no saved build/i)
     } finally {
       vi.useRealTimers()
@@ -1104,14 +1162,16 @@ describe('LivePreview — compact ended-state card (#42 F3)', () => {
     expect(card.className).not.toMatch(/flex-1/)
   })
 
-  it('the relaunch button still works from inside the compact card', () => {
+  // R3/U4 — INERTNESS GUARD. The compact card itself (#42 F3) is untouched; what it no longer
+  // contains is a button of its own.
+  it('INERTNESS GUARD: the compact ended-state card contains no button of its own', () => {
     const onRelaunch = vi.fn()
     const { container } = render(<LivePreview previewUrl={null} status="ended" onRelaunch={onRelaunch} hasSavedBuild />)
     const card = container.querySelector('[data-testid="preview-ended-card"]')
-    const button = screen.getByRole('button', { name: /relaunch preview/i })
-    expect(card.contains(button)).toBe(true)
-    fireEvent.click(button)
-    expect(onRelaunch).toHaveBeenCalledTimes(1)
+    expect(card).toBeTruthy() // LIVENESS: the compact card still renders
+    expect(card.textContent).toMatch(/no longer running/i)
+    expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
+    expect(onRelaunch).not.toHaveBeenCalled()
   })
 })
 
@@ -1132,7 +1192,9 @@ describe('LivePreview — compact unavailable-state card (#42 F3)', () => {
     }
   })
 
-  it('the relaunch button still works from inside the compact unavailable card', () => {
+  // R3/U4 — INERTNESS GUARD. Same story as the ended-state card above: the compact unavailable
+  // card (#42 F3) is untouched, its button is not.
+  it('INERTNESS GUARD: the compact unavailable card contains no button of its own', () => {
     vi.useFakeTimers()
     try {
       const onRelaunch = vi.fn()
@@ -1141,10 +1203,10 @@ describe('LivePreview — compact unavailable-state card (#42 F3)', () => {
       )
       act(() => vi.advanceTimersByTime(20001))
       const card = container.querySelector('[data-testid="preview-unavailable-card"]')
-      const button = screen.getByRole('button', { name: /relaunch preview/i })
-      expect(card.contains(button)).toBe(true)
-      fireEvent.click(button)
-      expect(onRelaunch).toHaveBeenCalledTimes(1)
+      expect(card).toBeTruthy() // LIVENESS: the compact card still renders
+      expect(card.textContent).toMatch(/preview unavailable/i)
+      expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
+      expect(onRelaunch).not.toHaveBeenCalled()
     } finally {
       vi.useRealTimers()
     }

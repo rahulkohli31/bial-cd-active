@@ -25,6 +25,16 @@ import {
   inWorkspace,
 } from './_builderSession.jsx'
 
+/** A preview-state read, in the shape the wire parser produces one. */
+const previewState = (state, restorable = null) => ({
+  state,
+  alive: state === 'alive',
+  previewUrl: state === 'alive' ? PREVIEW_URL : null,
+  occupyingProjectName: null,
+  occupyingProjectId: null,
+  restorable,
+})
+
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(),
   newBuild: vi.fn(),
@@ -43,6 +53,7 @@ const h = vi.hoisted(() => ({
   stop: vi.fn(),
   getStatus: vi.fn(),
   forceEnd: vi.fn(),
+  fetchPreviewState: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
@@ -62,6 +73,18 @@ vi.mock('../../utils/conversationApi', async (importOriginal) => ({
   listProjectConversations: h.listProjectConversations,
 }))
 vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
+// THE WORKSPACE READ, and it is the difference between two very different sentences on the pane.
+//
+// This file mocked nothing here, so the poll's real fetch failed and the map answered honestly:
+// "We could not check on your app.", with a retry. That is CORRECT for an unmocked fetch and wrong
+// for what these scenarios are about — a project whose build once ran and whose workspace has since
+// gone to sleep. `relaunchPreview` reaches the module directly from the one start control, so it is
+// mocked here too rather than only on the injected client.
+vi.mock('../../utils/buildSessionApi', async (orig) => ({
+  ...(await orig()),
+  fetchPreviewState: (...a) => h.fetchPreviewState(...a),
+  relaunchPreview: (...a) => h.relaunchPreview(...a),
+}))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
 // `switchMode` is GONE from this list (U1/U19): the route it posted to no longer exists, and a
@@ -143,6 +166,10 @@ const T_SNAPSHOT = (turnId, seq = 1) => ({
 })
 
 beforeEach(() => {
+  // ALIVE by default, because that is what almost every scenario in this file is about: a build
+  // running, its preview framed, its terminal reached. The two "come back later" tests below
+  // override it — a workspace that has gone to sleep is what puts the start control on the pane.
+  h.fetchPreviewState.mockResolvedValue(previewState('alive'))
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
   primeClient(h)
@@ -781,41 +808,84 @@ describe('BuilderPage — the "come back later" relaunch entry point (#43)', () 
     ],
   })
 
-  it('a fresh mount with a persisted outcome and no live session offers Relaunch; clicking calls relaunch()', async () => {
+  it('a fresh mount with a persisted outcome and no live session offers the way back; pressing it starts the app', async () => {
+    // RE-POINTED, NOT INVERTED (Plan F, U4). The journey is unchanged and is still the subject:
+    // reload a project whose build once ran, find a way back to the app, press it, and watch the
+    // restored preview frame. What moved is the CONTROL. Four start buttons lived inside
+    // `LivePreview`'s placeholders, each with its own label; R3 says exactly one starts the app,
+    // and the client settled on `Launch Application` — "preview" is the developer's word for the
+    // thing, and the person's word is their app.
+    //
+    // It is also no longer inside the terminal card: `AppPane` draws it, because the pane is what
+    // renders whether or not there is something to frame.
+    h.fetchPreviewState.mockResolvedValue(previewState('asleep', true))
     h.getBuild.mockResolvedValue(outcomeTranscript())
     h.relaunchPreview.mockResolvedValue({
-      appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready', restoredFromFailedBuild: false,
+      appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready', restoredFromFailedBuild: false, ready: true,
     })
     const { deps: sessionDeps } = deps()
-    // R5: the affordance also needs the PROJECT's confirmed saved build now — an outcome in
-    // the transcript alone proves a build ran, not that a Save happened.
+    // R5: the affordance needs the PROJECT's confirmed saved build — an outcome in the transcript
+    // alone proves a build ran, not that a Save happened.
     renderBuilder({ deps: sessionDeps, hasSavedBuild: true })
 
-    // Wait for the TERMINAL placeholder (the persisted outcome resolved), not just any
-    // Relaunch button — with the saved build confirmed, the pre-resolution empty state offers
-    // one too, and that node is replaced when the transcript lands.
-    await waitFor(() => expect(screen.getAllByText(/no longer running/i).length).toBeGreaterThan(0))
-    const button = await screen.findByRole('button', { name: /relaunch preview/i })
+    const button = await screen.findByRole('button', { name: /launch application/i })
+    // The workspace is up from here on. Without this the fixture keeps answering `asleep` after a
+    // start that succeeded, and the pane is right to refuse to frame a container the platform is
+    // still calling stopped — a stale held address framed over a dead workspace is one of the
+    // defects this unit exists to prevent.
+    h.fetchPreviewState.mockResolvedValue(previewState('alive'))
     fireEvent.click(button)
     await waitFor(() => expect(h.relaunchPreview).toHaveBeenCalledWith({ projectId: 'p1' }))
-    // The restored preview frames — the whole point of the journey.
+    // The restored preview frames — the whole point of the journey, and the half an inertness
+    // assertion could never see.
     await waitFor(() => expect(document.querySelector('iframe')?.getAttribute('src')).toBe(PREVIEW_URL))
   })
 
-  it('labels the entry point "Relaunch last saved version" when the newest outcome FAILED (U6/F1)', async () => {
+  it('INERTNESS GUARD: a FAILED newest outcome no longer gets its own button label', async () => {
+    // This pinned "Relaunch last saved version" — one of two labels the retired affordance chose
+    // between. There is one control now and it says the same thing however the last build ended,
+    // so the label has nothing left to discriminate.
+    //
+    // THE DISTINCTION IT DREW IS NOT LOST. `restoredFromFailedBuild` still travels to the pane and
+    // still says "this is your last SAVED version, not that build's intent" — where a citizen can
+    // act on it, in a sentence rather than in a verb. Paired with a liveness assertion, because an
+    // absence alone would pass on a pane offering no way back at all.
+    h.fetchPreviewState.mockResolvedValue(previewState('asleep', true))
     h.getBuild.mockResolvedValue(outcomeTranscript('failed'))
     const { deps: sessionDeps } = deps()
     renderBuilder({ deps: sessionDeps, hasSavedBuild: true })
-    expect(await screen.findByRole('button', { name: /relaunch last saved version/i })).toBeTruthy()
+
+    // LIVENESS: there is still exactly one way back.
+    expect(await screen.findByRole('button', { name: /launch application/i })).toBeTruthy()
+    // INERTNESS: neither retired label survives, under any spelling.
+    expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /bring it back/i })).toBeNull()
   })
 
+  // U4 (Plan F) — RE-POINTED, NOT AN INERTNESS GUARD. This pane's empty-state copy is not
+  // `LivePreview`'s any more — `showEmpty` is gone, and `AppPane` mounts `NoFrame` (drawn from
+  // `workspaceState.ts`'s state map) whenever the address resolver has no URL, which is exactly
+  // this scenario (no transcript, no build, nothing to frame). The specific sentence rendered
+  // here is `couldNotRead()`'s honest "nothing decided yet" copy — this file never mocks
+  // `fetchPreviewState`, so the poll's real, unmocked fetch fails and the pane says so rather than
+  // guessing — but the assertion that matters for THIS test's title survives untouched: no phantom
+  // Relaunch/start control appears over a project nothing has been built in.
+  // A PROJECT WITH NOTHING BUILT, which is what this scenario is about — the file's `alive`
+  // default would frame an app the scenario says does not exist.
   it('a fresh mount with NO outcome keeps the idle empty state — nothing to relaunch', async () => {
+    h.fetchPreviewState.mockResolvedValue(previewState('never_built', false))
     h.getBuild.mockResolvedValue(null)
     const { deps: sessionDeps } = deps()
     const { container } = renderBuilder({ deps: sessionDeps })
     await screen.findByPlaceholderText(/describe what you need/i)
-    expect(container.textContent).toMatch(/preview will appear here/i)
+    // A PROJECT WITH NOTHING BUILT NOW HAS ITS OWN SENTENCE, and it is an invitation rather than a
+    // report of an absence — the pane's empty state, from the one computed workspace value. The
+    // earlier "we could not check on your app" was this file's poll failing on an unmocked fetch,
+    // which was honest for that fixture and is not what this scenario is about.
+    await waitFor(() => expect(container.textContent).toMatch(/describe what you want to build/i))
+    // The half that has not changed: no phantom way back for a project that has never been built.
     expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /launch application/i })).toBeNull()
   })
 })
 

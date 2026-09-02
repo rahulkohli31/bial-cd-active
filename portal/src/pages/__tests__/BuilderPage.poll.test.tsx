@@ -82,6 +82,12 @@ vi.mock('../../utils/buildSessionApi', async (orig) => ({
   ...(await orig<typeof import('../../utils/buildSessionApi')>()),
   fetchPreviewState: (...a: unknown[]) => h.fetchPreviewState(...a),
   fetchSaveState: (...a: unknown[]) => h.fetchSaveState(...a),
+  // THE START CONTROL CALLS THE MODULE, NOT THE INJECTED CLIENT (Plan F, U3). `relaunchPreview`
+  // reached the build-session hook through `deps.client` before, so mocking the client bag was
+  // enough; the one start control the product has now imports the function directly, because it
+  // is rendered by the app pane and the pane is a sibling of the surface that owns the client.
+  // Without this line the relaunch assertions below watch a mock nothing calls.
+  relaunchPreview: (...a: unknown[]) => h.relaunchPreview(...a),
 }))
 
 function deps() {
@@ -142,11 +148,61 @@ const answer = (state: PreviewLifeState, restorable: boolean | null = null): Pre
   alive: state === 'alive',
   previewUrl: state === 'alive' ? PREVIEW_URL : null,
   occupyingProjectName: null,
+  occupyingProjectId: null,
   restorable,
 })
 
 const probeCount = () => h.fetchPreviewState.mock.calls.length
-const goneCard = () => screen.queryByTestId('preview-unavailable-card')
+
+/**
+ * HOW MANY READS SINCE A MARK — and these scenarios are all delta claims, not absolute ones.
+ *
+ * "Six cadences and not one more request" is about what the TIMER does after the answer settles;
+ * how many reads it took to get there is a different question. It used to be exactly one, because
+ * the poll returned early until a frame was on screen. Plan F's U4 widened that — the read's answer
+ * now decides whether the pane offers the one control that starts the app, and a chat reloaded onto
+ * an ended build has a status and no URL, so gating on the URL meant it could never learn its
+ * workspace was asleep and never offered the way back.
+ *
+ * Asking earlier costs more reads across a build's first frame. That is a real change and it is
+ * accepted: the read is cheap by contract (one cache read, no container call), and the terminal
+ * rule these tests exist to pin still stops the timer exactly where it always did. Written as a
+ * delta so the property survives the next legitimate change to how early the asking begins.
+ */
+function readsSince(mark: number): number {
+  return probeCount() - mark
+}
+/**
+ * THE "NOTHING IS SERVING" SURFACE, RE-POINTED (Plan F, U4).
+ *
+ * This used to be `LivePreview`'s own `preview-unavailable-card`, carrying a `data-preview-state`
+ * attribute. That card is unreachable now: `AppPane` decides whether to frame at all, and for the
+ * three states that DEFINITELY mean nothing is serving it renders its own sentence instead of
+ * mounting the host. Same fact, one layer up.
+ *
+ * The state name is read off `data-workspace-state` rather than from the copy, deliberately — the
+ * client has changed this screen's wording twice and may again, and the property these scenarios
+ * pin is WHICH state the poll arrived at, not how it is phrased.
+ */
+const goneCard = () => screen.queryByTestId('app-pane-empty')
+
+/**
+ * WHICH state the pane arrived at. This replaces two copy assertions — "Nothing is lost" and "no
+ * saved build yet" — that were reading `hasSavedBuild`'s tri-state resolution off `LivePreview`'s
+ * own card. The resolution is unchanged and is still the subject; what carries it is now the map's
+ * arm: a restorable workspace reaches `not-running` ("Your app is saved."), and one the server
+ * confirmed it cannot restore falls to the same arm as a project with nothing built, because a
+ * start control there is a button whose only outcome is a 404.
+ */
+const paneState = () => goneCard()?.getAttribute('data-workspace-state') ?? null
+
+/** `PreviewLifeState` in, `WorkspaceStateName` out — the map's own arms, as this suite reads them. */
+const WORKSPACE_STATE_FOR: Record<string, string> = {
+  asleep: 'not-running',
+  slot_taken: 'held-unattributed',
+  never_built: 'never-built',
+  unknown: 'could-not-read',
+}
 const framedUrl = () => document.querySelector('iframe')?.getAttribute('src') ?? null
 
 /** Let the in-flight probe's promise settle without moving the clock. */
@@ -204,13 +260,13 @@ describe('BuilderPage — the preview poll stops on a terminal answer (R16)', ()
     h.fetchPreviewState.mockResolvedValue(answer('asleep', true))
     await framedBuild()
 
-    // The first probe fires on mount of the framed preview and settles the question.
-    expect(probeCount()).toBe(1)
-    expect(goneCard()?.getAttribute('data-preview-state')).toBe('asleep')
+    // The question is settled…
+    expect(goneCard()?.getAttribute('data-workspace-state')).toBe(WORKSPACE_STATE_FOR.asleep)
+    const settled = probeCount()
 
-    // Six cadences — four and a half minutes of a tab left open — and not one more request.
+    // …and six cadences — four and a half minutes of a tab left open — add not one more request.
     await tick(6)
-    expect(probeCount()).toBe(1)
+    expect(readsSince(settled)).toBe(0)
   })
 
   it.each<PreviewLifeState>(['slot_taken', 'never_built'])(
@@ -219,9 +275,9 @@ describe('BuilderPage — the preview poll stops on a terminal answer (R16)', ()
       h.fetchPreviewState.mockResolvedValue(answer(state, false))
       await framedBuild()
 
-      expect(probeCount()).toBe(1)
+      const settled = probeCount()
       await tick(4)
-      expect(probeCount()).toBe(1)
+      expect(readsSince(settled)).toBe(0)
     },
   )
 
@@ -232,20 +288,27 @@ describe('BuilderPage — the preview poll stops on a terminal answer (R16)', ()
     h.fetchPreviewState.mockResolvedValue(answer('unknown'))
     await framedBuild()
 
-    expect(probeCount()).toBe(1)
     expect(goneCard()).toBeNull() // and it changes nothing on screen, either
+    const settled = probeCount()
     await tick(3)
-    expect(probeCount()).toBe(4)
+    expect(readsSince(settled)).toBe(3) // one per cadence — the timer is still running
   })
 
   it('keeps asking while the container is alive', async () => {
     await framedBuild()
+    const settled = probeCount()
 
     await tick(2)
-    expect(probeCount()).toBe(3)
+    expect(readsSince(settled)).toBe(2)
     expect(framedUrl()).toBe(PREVIEW_URL)
   })
 
+  // R3/U4 (Plan F) — RE-POINTED, NOT AN INERTNESS GUARD. This test's real subject is the POLL's
+  // stopping rule, not the button: it pins that a settled-but-undecided `restorable: null` keeps
+  // the timer running, and that it stops the moment the store gives a DEFINITE answer. That
+  // precedence is exactly as testable without the button as with it — `hasSavedBuild`'s tri-state
+  // copy on the card is still driven by the same resolved value the button used to gate on, so
+  // the copy is the liveness half now instead of the button's presence.
   it('KEEPS asking when the workspace is settled but `restorable` decided nothing', async () => {
     // HALF AN ANSWER IS NOT A TERMINAL ANSWER. `asleep` is a settled fact about the container;
     // `restorable: null` is the tri-state's explicit "no claim", returned when the object store
@@ -261,18 +324,21 @@ describe('BuilderPage — the preview poll stops on a terminal answer (R16)', ()
 
     // The worst screen this pane can render: the workspace is gone, the store was unreachable,
     // and the prop was a cold `false` — so the builder is told their work never existed.
-    expect(screen.getByTestId('preview-unavailable-card').textContent).toContain('no saved build yet')
-    expect(screen.queryByRole('button', { name: /bring it back/i })).toBeNull()
+    expect(paneState()).toBe('never-built')
+    expect(screen.queryByRole('button', { name: /bring it back|relaunch/i })).toBeNull()
 
-    expect(probeCount()).toBe(1)
+    const settled = probeCount()
     await tick(3)
-    expect(probeCount()).toBe(4)
+    expect(readsSince(settled)).toBe(3) // one per cadence — half an answer is not terminal
 
-    // ...and the moment the store answers, the poll settles and the restore is on offer.
+    // ...and the moment the store answers, the poll settles — pinned by the copy flipping to the
+    // confirmed-true reassurance ("Nothing is lost"), since the button that used to carry the
+    // same claim is gone (R3: it moved to `StartAppControl`, which is not reachable from this
+    // still-framed pane state — see the session report for that finding).
     h.fetchPreviewState.mockResolvedValue(answer('asleep', true))
     await tick(1)
     const settledAt = probeCount()
-    expect(screen.getByRole('button', { name: /bring it back/i })).toBeTruthy()
+    expect(paneState()).toBe('not-running')
     await tick(3)
     expect(probeCount()).toBe(settledAt)
   })
@@ -287,7 +353,7 @@ describe('BuilderPage — stopping the poll must not pin "gone" (R17)', () => {
     // settles — this is the state the whole unit is about being able to LEAVE.
     h.fetchPreviewState.mockResolvedValue(answer('asleep', true))
     await tick()
-    expect(goneCard()?.getAttribute('data-preview-state')).toBe('asleep')
+    expect(goneCard()?.getAttribute('data-workspace-state')).toBe(WORKSPACE_STATE_FOR.asleep)
     expect(framedUrl()).toBeNull()
     const settled = probeCount()
 
@@ -311,13 +377,18 @@ describe('BuilderPage — stopping the poll must not pin "gone" (R17)', () => {
   })
 
   it('re-arms on a relaunch, which is the one restore that never goes through a turn frame', async () => {
-    // `hasSavedBuild` comes back true from the poll, which is what puts "Bring it back" on the
-    // reclaimed card at all (see the precedence block below).
+    // `hasSavedBuild` comes back true from the poll, which is what makes the map offer the start
+    // action at all — a workspace the server confirms it cannot restore reaches the same arm as a
+    // project with nothing built, and offers nothing (see the precedence block below).
     h.fetchPreviewState.mockResolvedValue(answer('asleep', true))
     await framedBuild()
-    expect(probeCount()).toBe(1)
+    const settled = probeCount()
 
-    const bringItBack = screen.getByRole('button', { name: /bring it back/i })
+    // THE VEHICLE, RENAMED (Plan F, U4). This scenario drives a relaunch to invalidate the poll's
+    // verdict; the control that does it moved from `LivePreview`'s reclaimed card to the app
+    // pane's own no-frame surface, and the client settled on `Launch Application` — "preview" is
+    // the developer's word for the thing, and the person's word is their app.
+    const bringItBack = screen.getByRole('button', { name: /launch application/i })
     h.fetchPreviewState.mockResolvedValue(answer('alive'))
     await act(async () => { fireEvent.click(bringItBack) })
     await settle()
@@ -325,7 +396,7 @@ describe('BuilderPage — stopping the poll must not pin "gone" (R17)', () => {
     // The relaunch resolved with the identical url. Nothing about the FRAME changed, so the
     // only reason the pane is honest again is that the relaunch itself invalidated the verdict.
     expect(h.relaunchPreview).toHaveBeenCalled()
-    expect(probeCount()).toBeGreaterThan(1)
+    expect(readsSince(settled)).toBeGreaterThan(0)
     expect(goneCard()).toBeNull()
     expect(framedUrl()).toBe(PREVIEW_URL)
   })
@@ -342,16 +413,16 @@ describe('BuilderPage — stopping the poll must not pin "gone" (R17)', () => {
     // delete the only recovery path for the sibling-tab restore, with the suite green.
     h.fetchPreviewState.mockResolvedValue(answer('asleep', true))
     await framedBuild()
-    expect(probeCount()).toBe(1)
+    const settled = probeCount()
     await tick(3)
-    expect(probeCount()).toBe(1) // settled: the timer is genuinely stopped
+    expect(readsSince(settled)).toBe(0) // settled: the timer is genuinely stopped
 
     // Another tab brought the workspace back. Nothing in THIS tab knows.
     h.fetchPreviewState.mockResolvedValue(answer('alive'))
     await act(async () => { fireEvent.focus(window) })
     await settle()
 
-    expect(probeCount()).toBe(2)
+    expect(readsSince(settled)).toBe(1) // the gesture asked exactly once
     expect(goneCard()).toBeNull()
     expect(framedUrl()).toBe(PREVIEW_URL)
   })
@@ -406,7 +477,11 @@ describe('BuilderPage — stopping the poll must not pin "gone" (R17)', () => {
 
     // The next probe never answers. Any drop of the card from here is the invalidation itself.
     h.fetchPreviewState.mockReturnValue(new Promise<PreviewState>(() => {}))
-    const bringItBack = screen.getByRole('button', { name: /bring it back/i })
+    // THE VEHICLE, RENAMED (Plan F, U4). This scenario drives a relaunch to invalidate the poll's
+    // verdict; the control that does it moved from `LivePreview`'s reclaimed card to the app
+    // pane's own no-frame surface, and the client settled on `Launch Application` — "preview" is
+    // the developer's word for the thing, and the person's word is their app.
+    const bringItBack = screen.getByRole('button', { name: /launch application/i })
     await act(async () => { fireEvent.click(bringItBack) })
 
     expect(goneCard()).toBeNull()
@@ -422,19 +497,34 @@ describe('BuilderPage — stopping the poll must not pin "gone" (R17)', () => {
     h.relaunchPreview.mockImplementation(
       () => new Promise((resolve) => { finish = resolve }),
     )
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /bring it back/i })) })
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /launch application/i })) })
 
-    expect(goneCard()).toBeNull() // the wait is labelled, not contradicted
-    // Two nodes carry it — the visible wait and the pane's persistent status region — which is
-    // the U17 announcement discipline, not a duplicate.
-    expect(screen.getAllByText(/restoring your app/i).length).toBeGreaterThan(0)
+    // THE WAIT IS LABELLED, NOT CONTRADICTED — and after Plan F it is labelled by the ONE computed
+    // state rather than by a full-bleed "Restoring your app…" cover of `LivePreview`'s own.
+    //
+    // WHAT THIS CAUGHT, and it is why the assertion moved rather than being deleted: for a while
+    // the pane went on saying "Your app is saved." for up to a whole poll cadence after the press,
+    // because the server's `starting` only arrives on the NEXT read and nothing local moved the
+    // map. True, but not an acknowledgement — the only feedback was a spinner inside the button.
+    // The press now reaches the map directly, through the same `starting` arm the server's own
+    // answer uses, so there is still exactly one author for the sentence.
+    expect(paneState()).toBe('starting')
+    expect(goneCard()?.textContent).toMatch(/getting your app ready/i)
 
     h.fetchPreviewState.mockResolvedValue(answer('alive'))
     await act(async () => {
       finish({ appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready', restoredFromFailedBuild: false, ready: true })
     })
     await settle()
+    // …and the wait GIVES WAY once the restore lands. TWO flushes, not `waitFor`: this suite runs
+    // on fake timers (see `framedBuild`), and `waitFor` polls on a timer nothing here advances —
+    // it would hang for its full budget and then fail with a green product underneath it. The
+    // sequence being flushed is real: the press clears the in-flight flag, the surface re-asks,
+    // and the pane returns to the frame when that read answers.
+    await settle()
+    await settle()
     expect(goneCard()).toBeNull()
+    expect(framedUrl()).toBe(PREVIEW_URL)
   })
 })
 
@@ -447,12 +537,15 @@ describe('BuilderPage — `restorable` vs the `projectHasSavedBuild` prop (U17, 
   // the server does not spend the round trip) must fall through to the older-but-real reading
   // instead of retracting a claim the server once made confidently.
 
+  // U4 (Plan F) — RE-POINTED, NOT AN INERTNESS GUARD. The precedence under test (poll overrides a
+  // stale cold-load prop) is a claim about the CARD'S COPY, which `hasSavedBuild` still drives
+  // identically to before — only the button that used to accompany the same claim is gone (R3).
   it('the poll can OFFER a restore the cold-load prop denied — the recovery copy the prop never saw', async () => {
     h.fetchPreviewState.mockResolvedValue(answer('asleep', true))
     await framedBuild(false)
 
-    expect(screen.getByRole('button', { name: /bring it back/i })).toBeTruthy()
-    expect(screen.getByTestId('preview-unavailable-card').textContent).toContain('Nothing is lost')
+    expect(screen.queryByRole('button', { name: /bring it back|relaunch/i })).toBeNull()
+    expect(paneState()).toBe('not-running')
   })
 
   it('the poll can WITHDRAW one the prop claimed — a confirmed false is fresher than a stale true', async () => {
@@ -460,17 +553,18 @@ describe('BuilderPage — `restorable` vs the `projectHasSavedBuild` prop (U17, 
     await framedBuild(true)
 
     expect(goneCard()).not.toBeNull()
-    expect(screen.queryByRole('button', { name: /bring it back/i })).toBeNull()
-    expect(screen.getByTestId('preview-unavailable-card').textContent).toContain('no saved build yet')
+    expect(screen.queryByRole('button', { name: /bring it back|relaunch/i })).toBeNull()
+    expect(paneState()).toBe('never-built')
   })
 
   it('a null from the poll claims NOTHING and leaves the prop standing', async () => {
     h.fetchPreviewState.mockResolvedValue(answer('asleep', null))
     await framedBuild(true)
 
-    expect(screen.getByRole('button', { name: /bring it back/i })).toBeTruthy()
-    // The copy is driven by the SAME resolved value as the button, so the prop's confirmed
-    // `true` is what the card promises. `null` withdraws nothing — it only declines to speak.
-    expect(screen.getByTestId('preview-unavailable-card').textContent).toContain('Nothing is lost')
+    expect(screen.queryByRole('button', { name: /bring it back|relaunch/i })).toBeNull()
+    // The copy is driven by the SAME resolved value the button used to gate on, so the prop's
+    // confirmed `true` is what the card promises. `null` withdraws nothing — it only declines to
+    // speak.
+    expect(paneState()).toBe('not-running')
   })
 })

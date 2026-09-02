@@ -24,6 +24,7 @@ import { useState, type ReactNode } from 'react'
 import { render, screen, fireEvent, cleanup } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import WorkspaceShell from '../WorkspaceShell'
+import { useWorkspaceExit } from '../UnsavedWorkGuard'
 import {
   useAppPaneVisible,
   usePublishAddress,
@@ -41,7 +42,24 @@ import {
 } from '../workspaceChannel'
 import type { ReclaimBlocked } from '../../../utils/buildSessionApi'
 
-vi.mock('../../layout/Navbar', () => ({ default: () => <div data-testid="navbar" /> }))
+// THE NAVBAR STUB CONSULTS THE EXIT HOOK, exactly as the real one does. That is the seam this
+// file is answerable for: does the SHELL provide a guard to the chrome sitting ABOVE its Outlet?
+// A `<div/>` stub could not see it, and the real navbar would drag a profile fetch, a usage poll
+// and a feedback modal into every scenario here. That the real navbar routes its links through the
+// hook is `Navbar.test.jsx`'s to prove; this proves there is something for it to route through.
+vi.mock('../../layout/Navbar', () => ({
+  // NAMED, because `default: () => …` is an anonymous arrow and the hooks lint rule reads a
+  // component's identity off its name — a hook inside one it cannot recognise is an error, and it
+  // is right to be: React itself keys a component's hook state on the same thing.
+  default: function StubNavbar() {
+    const exit = useWorkspaceExit()
+    return (
+      <div data-testid="navbar">
+        <button type="button" onClick={() => exit(() => {})}>leave to projects</button>
+      </div>
+    )
+  },
+}))
 
 /**
  * Mount `child` as the shell's outlet content, the way a route element is.
@@ -157,7 +175,7 @@ describe('WorkspaceShell — the grid is the shell\'s own', () => {
         type="button"
         onClick={() => {
           setStacked(!stacked)
-          channel?.rail.set({ mode: null, state: {}, stacked: !stacked })
+          channel?.rail.set({ mode: null, state: {}, stacked: !stacked, collapsed: false })
         }}
       >
         flip
@@ -193,7 +211,7 @@ describe('WorkspaceShell — the reclaim dialog is mounted here, its handlers st
     return (
       <button
         type="button"
-        onClick={() => setRequest({ blocked, resolve: onResolve, cancel: () => setRequest(null) })}
+        onClick={() => setRequest({ blocked, startingProjectName: 'Visitor Log', resolve: onResolve, cancel: () => setRequest(null) })}
       >
         refuse
       </button>
@@ -214,8 +232,12 @@ describe('WorkspaceShell — the reclaim dialog is mounted here, its handlers st
     // The refusal names the project standing in the way — the whole reason the state travels
     // rather than the shell inventing its own copy.
     expect(dialog.textContent).toMatch(/Other Project/)
+    // …and the STARTING project too, which travels for issue #161's framing half. The button copy
+    // moved with it (`Switch without saving` → a sentence that names whose changes are lost), so
+    // this assertion follows the copy rather than pinning the retired wording.
+    expect(dialog.textContent).toMatch(/Visitor Log/)
 
-    fireEvent.click(screen.getByRole('button', { name: /switch without saving/i }))
+    fireEvent.click(screen.getByRole('button', { name: /stop “Other Project” without saving/i }))
     expect(onResolve).toHaveBeenCalledWith(false)
   })
 })
@@ -439,5 +461,79 @@ describe('the workspace channel — what survives its publisher\'s unmount, and 
 
     view.rerender(<At project="p2" />) // a different project is a different app
     expect(probe()).toContain('none')
+  })
+})
+
+/**
+ * THE IN-PLACE GUARD, MOUNTED AT SHELL LEVEL (Plan F, U8).
+ *
+ * Two guards, one requirement pair, and the property that has to hold between them: `beforeunload`
+ * covers leaving the TAB and stays armed only on a definite `true`; this one covers leaving the
+ * WORKSPACE without an unload and warns on `null` too, because an in-app dialog can carry a reason
+ * the browser's fixed prompt cannot.
+ *
+ * Mounted HERE and not in the Outlet child, and the reason is structural: the exits it exists for —
+ * the navbar's links — sit above the Outlet, so a guard mounted below it would lose coverage of
+ * exactly the controls it was written for.
+ */
+describe('WorkspaceShell — the in-place unsaved-work guard (U8)', () => {
+  function SurfaceWithSaveState({ dirty, running }: { dirty: boolean | null; running: boolean }) {
+    usePublishSaveState(dirty)
+    useWorkspaceChannel()?.workspace.set({
+      state: running
+        ? { name: 'running', headline: 'Your app is running.', detail: null, action: null }
+        : { name: 'not-running', headline: 'Your app is saved.', detail: null, action: null },
+      projectId: 'p1',
+      onStarted: () => {},
+      onStartPending: () => {},
+      onStartOutcome: () => {},
+      onRefresh: () => {},
+      onReclaimRefusal: () => {},
+    })
+    return <div data-testid="surface" />
+  }
+
+  it('★ intercepts a navbar link when the workspace holds unsaved work', async () => {
+    renderShell(<SurfaceWithSaveState dirty running />)
+
+    fireEvent.click(await screen.findByRole('button', { name: /leave to projects/i }))
+
+    expect(screen.getByRole('dialog').textContent).toMatch(/changes that are not saved yet/i)
+  })
+
+  it('lets the same link through when the workspace is clean', async () => {
+    renderShell(<SurfaceWithSaveState dirty={false} running />)
+
+    fireEvent.click(await screen.findByRole('button', { name: /leave to projects/i }))
+
+    expect(screen.queryByRole('dialog')).toBeNull()
+  })
+
+  it('★ warns about nothing on a STOPPED project, where the check was never asked', async () => {
+    // The fourth case. A stopped project's save state is `null` because `fetchSaveState` may only
+    // be called on a live workspace — not because a check failed.
+    renderShell(<SurfaceWithSaveState dirty={null} running={false} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: /leave to projects/i }))
+
+    expect(screen.queryByRole('dialog')).toBeNull()
+  })
+
+  it('★ there is exactly ONE guard, not two', async () => {
+    // "Never two guards" is held by construction here rather than by remembering to delete one:
+    // Plan A hoisted the unload handler and this plan EXTENDS what A ships, adding no second
+    // `beforeunload` listener and no second hook.
+    const added: string[] = []
+    const original = window.addEventListener.bind(window)
+    const spy = vi.spyOn(window, 'addEventListener').mockImplementation((type, ...rest) => {
+      added.push(String(type))
+      return original(type, ...(rest as [EventListenerOrEventListenerObject]))
+    })
+
+    renderShell(<SurfaceWithSaveState dirty running />)
+    await screen.findByTestId('surface')
+
+    expect(added.filter((t) => t === 'beforeunload')).toHaveLength(1)
+    spy.mockRestore()
   })
 })

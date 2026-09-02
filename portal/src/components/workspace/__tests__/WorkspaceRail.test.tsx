@@ -1,0 +1,185 @@
+/**
+ * THE RAIL'S CONTENTS (Plan F, U1) — R6's four things, and the one control that must NOT be here.
+ *
+ * This suite is deliberately narrow. Everything about the rail's WIDTH, its collapse and its
+ * relationship to the pane is a claim about the shell and lives in `ProjectWorkspace.test.tsx`,
+ * which renders through the real one. What is left is what the rail itself is answerable for: that
+ * it carries what R6 says it carries, and that it does not carry a second way to start the app.
+ */
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import { render, screen, cleanup, within } from '@testing-library/react'
+import { MemoryRouter } from 'react-router-dom'
+import WorkspaceRail from '../WorkspaceRail'
+import type { WorkspaceState } from '../workspaceState'
+import type { Project } from '../../../utils/projectApi'
+import type { SaveState } from '../../../utils/buildSessionApi'
+
+vi.mock('../../PublishStatusChip', () => ({
+  default: ({ projectId }: { projectId: string }) => (
+    <span data-testid="publish-chip-stub" data-project={projectId} />
+  ),
+}))
+vi.mock('../../projects/ProjectDescriptionEditor', () => ({
+  default: () => <div data-testid="description-editor" />,
+}))
+vi.mock('../../../utils/chatHistory', () => ({ relativeTime: () => '1h ago' }))
+vi.mock('../../../utils/auth', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../utils/auth')>()),
+  getStoredUser: () => ({
+    chat_kinds: [
+      { value: 'plan', name: 'Plan', description: 'Shape a plan first.' },
+      { value: 'build', name: 'Build', description: 'Change the live app.' },
+    ],
+  }),
+}))
+
+const PROJECT: Project = {
+  id: 'p1',
+  name: 'VIP Movement',
+  description: 'A tracked movement.',
+  appId: 'a1',
+  appStatus: null,
+  hasRelaunchableSnapshot: true,
+  createdAt: '2026-07-10T00:00:00Z',
+  updatedAt: '2026-07-10T00:00:00Z',
+}
+
+const SAVED: WorkspaceState = {
+  name: 'not-running',
+  headline: 'Your app is saved.',
+  detail: 'It stays running while you work, so you only do this once.',
+  action: { kind: 'start', label: 'Launch Application' },
+}
+
+const noop = () => {}
+
+function renderRail(over: { workspace?: WorkspaceState; save?: SaveState | null } = {}) {
+  return render(
+    <MemoryRouter>
+      <WorkspaceRail
+        project={PROJECT}
+        workspace={over.workspace ?? SAVED}
+        save={over.save ?? null}
+        chats={[]}
+        chatsError={null}
+        onProjectUpdate={noop}
+        onBack={noop}
+        onOpenChat={noop}
+        onDeleteChat={noop}
+      />
+    </MemoryRouter>,
+  )
+}
+
+afterEach(() => cleanup())
+
+describe("R6 — what the rail carries at rest", () => {
+  it('carries the composer with its kind picker, the app status, and the description', () => {
+    renderRail()
+
+    expect(screen.getByPlaceholderText(/Describe the app you want built/i)).toBeTruthy()
+    expect(screen.getByRole('radio', { name: 'Build' })).toBeTruthy()
+    expect(screen.getByTestId('rail-app-status')).toBeTruthy()
+    expect(screen.getByTestId('description-editor')).toBeTruthy()
+  })
+
+  it('renders the workspace SENTENCE, from the one computed value', () => {
+    const status = screen.queryByTestId('rail-app-status')
+    expect(status).toBeNull() // nothing rendered yet — guards against a stale query below
+    renderRail()
+
+    const block = screen.getByTestId('rail-app-status')
+    expect(within(block).getByText('Your app is saved.')).toBeTruthy()
+  })
+
+  it('★ carries NO start control — R3 says exactly one, and it is the pane\'s', () => {
+    // The map OFFERS the start action here; the rail deliberately does not render it. A second
+    // Start button on the same screen satisfies "exactly one control starts it" with two, and both
+    // would race the same idempotent endpoint.
+    //
+    // Mutation receipt: render `workspace.action` as a button in the rail and this goes red.
+    renderRail()
+
+    expect(screen.queryByRole('button', { name: /launch application/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /try again/i })).toBeNull()
+  })
+
+  it('shows no save block at all when the workspace is not alive', () => {
+    // Not an omission: `fetchSaveState` costs two container `git` execs and may only be asked on a
+    // live workspace, so its caller hands `null` here for every other state.
+    renderRail({ save: null })
+
+    expect(screen.queryByTestId('rail-save-state')).toBeNull()
+  })
+})
+
+describe('the save half, which exists only while the app is running', () => {
+  const save = (over: Partial<SaveState> = {}): SaveState => ({
+    appId: 'a1',
+    dirty: false,
+    containerHead: 'aaaaaaabbbbbb',
+    savedHead: 'ccccccc1111111',
+    ...over,
+  })
+
+  it('says what is true for each arm of the TRI-STATE, and never reads null as clean', () => {
+    const readings: [boolean | null, RegExp][] = [
+      [true, /not saved yet/i],
+      [false, /everything is saved/i],
+      [null, /could not check/i],
+    ]
+    for (const [dirty, expected] of readings) {
+      renderRail({ save: save({ dirty }) })
+      expect(screen.getByTestId('rail-save-state').textContent, `dirty=${String(dirty)}`).toMatch(expected)
+      cleanup()
+    }
+  })
+
+  it('never reports "everything is saved" from an unknown state', () => {
+    // R62: where the platform cannot tell, it says so rather than reporting there is nothing to
+    // lose. This is the half a loose assertion on the null arm would let through.
+    renderRail({ save: save({ dirty: null }) })
+    expect(screen.getByTestId('rail-save-state').textContent).not.toMatch(/everything is saved/i)
+  })
+
+  it('shows the SHORT saved commit, and no time', () => {
+    // No endpoint returns a saved-AT time, and a wrong time is worse than no time (R62's own
+    // principle). The commit ships; the time waits for a server field.
+    renderRail({ save: save({ savedHead: 'ccccccc1111111' }) })
+
+    const block = screen.getByTestId('rail-save-state')
+    expect(block.textContent).toContain('ccccccc')
+    expect(block.textContent).not.toContain('ccccccc1111111')
+    expect(block.textContent).not.toMatch(/ago|:\d\d/)
+  })
+
+  it('omits the commit line entirely when nothing has been saved yet', () => {
+    renderRail({ save: save({ dirty: true, savedHead: null }) })
+
+    const block = screen.getByTestId('rail-app-status')
+    expect(block.textContent).not.toMatch(/last saved version/i)
+  })
+})
+
+describe('the publishing chip and the recents survive the rewrite', () => {
+  it('mounts the chip beside the project name, ungated on whether anything is built', () => {
+    // A live component carried forward from the page this rail replaces — not a slot left empty.
+    // "Nothing built yet" is a state the chip NAMES, so a citizen learns it from the same place
+    // they learn everything else rather than from an absence.
+    renderRail()
+
+    const chip = screen.getByTestId('publish-chip-stub')
+    expect(chip.getAttribute('data-project')).toBe('p1')
+    expect(chip.previousElementSibling?.tagName).toBe('H1')
+  })
+
+  it('keeps the recents section, with its empty-state copy', () => {
+    // It carries the only project-scoped way to delete a conversation and the only route back to an
+    // EXISTING chat. Chat history was withheld before it was built, so removing this now would
+    // retire both silently.
+    renderRail()
+
+    expect(screen.getByTestId('conversations')).toBeTruthy()
+    expect(screen.getByText('No conversations yet — start a build or plan above.')).toBeTruthy()
+  })
+})

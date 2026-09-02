@@ -42,19 +42,74 @@
  * below then declares its OWN scroller, because sticky positioning and overflow both resolve
  * against the nearest scroll container and that container has moved.
  */
-import { Outlet } from 'react-router-dom'
-import { useEffect, useState } from 'react'
+import { Outlet, useLocation } from 'react-router-dom'
+import { useEffect, useLayoutEffect, useState } from 'react'
 import Navbar from '../layout/Navbar'
 import ReclaimWorkspaceDialog from '../projects/ReclaimWorkspaceDialog'
-import AppPaneHost from './AppPaneHost'
+import AppPane from './AppPane'
+import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
+import { WorkspaceExitProvider, useUnsavedWorkGuard } from './UnsavedWorkGuard'
 import {
   WorkspaceChannelProvider,
   createWorkspaceChannel,
   useRailSlot,
+  useWorkspaceChannel,
   useWorkspacePaneVisible,
   useWorkspaceReclaim,
+  useWorkspaceReport,
   useWorkspaceSaveState,
 } from './workspaceChannel'
+
+/**
+ * THE ID THE COLLAPSE CONTROL POINTS AT. The control that hides the rail is published into the
+ * pane's toolbar — it has to be, because a collapsed rail is invisible and untabbable and a toggle
+ * inside it would be a one-way door — so `aria-controls` is the only thing tying the two together
+ * for anyone reading the markup or navigating it. One constant so the two ends cannot drift.
+ */
+export const WORKSPACE_RAIL_ID = 'workspace-rail'
+
+/**
+ * WHICH RAIL IS SHOWING, DERIVED FROM THE ADDRESS AND FROM NOTHING ELSE (Plan F, U1).
+ *
+ * A chat address means the rail IS the conversation; anything else in the workspace is the
+ * project's own details. There is no third mode — chat history was withheld — and there is no
+ * route and no `?rail=` query behind this, deliberately: a query param would make a rail mode a
+ * shareable link, which is a different feature from the one R9 asks for ("leaving a chat returns
+ * to the mode it was opened from, as it was"), and shell state gives that for free.
+ */
+export type RailMode = 'details' | 'conversation'
+
+function railModeFor(pathname: string): RailMode {
+  return pathname.startsWith('/chat/') ? 'conversation' : 'details'
+}
+
+/**
+ * THE RAIL'S WIDTH IS A CLASS ON ONE PERSISTENT ELEMENT — never a conditional render of two trees.
+ *
+ * Two settled widths and a collapse, taken from the canvas's 400px and 520px. The conversation
+ * gets the wider one because it holds a transcript and a composer; the project's details do not.
+ *
+ * TWO THINGS THIS DELIBERATELY IS NOT. It is not a draggable divider — two settled widths plus one
+ * collapse is the whole requirement, and the panel library the obvious path reaches for has renamed
+ * its exports. And it is not a measured breakpoint: the stacked crossing below is a responsive
+ * class on the same container, so no `matchMedia` and no `ResizeObserver` enters this plan and
+ * AE37 holds by construction.
+ *
+ * WHEN NOTHING WANTS THE PANE the rail is the whole surface and takes the remaining space — a
+ * planning conversation, which has no pane at all, must not be pinned to 520px with a void beside
+ * it. That is why `paneVisible` is read before either width.
+ */
+function railWidthClass(mode: RailMode, collapsed: boolean, paneVisible: boolean): string {
+  // Zero width AND out of reach. Width alone would only clip it, leaving its composer, its links
+  // and its menus in the tab order — the WCAG 4.1.2 violation `hiddenSubtree.ts` records. The
+  // subtree stays MOUNTED, so a draft and a scroll position survive a hide/show cycle.
+  if (collapsed) return `w-0 flex-shrink-0 border-r-0 overflow-hidden ${HIDDEN_BUT_MOUNTED}`
+  if (!paneVisible) return 'flex-1'
+  // Stacked below the threshold (`flex-1`, sharing the column), settled beside the pane above it.
+  return mode === 'conversation'
+    ? 'flex-1 lg:flex-none lg:w-[520px]'
+    : 'flex-1 lg:flex-none lg:w-[400px]'
+}
 
 /**
  * THE ONE WARNING THE SAVE MODEL OWES THE CITIZEN (Plan A, U7).
@@ -116,6 +171,7 @@ function ReclaimSlot() {
   return (
     <ReclaimWorkspaceDialog
       blocked={reclaim.blocked}
+      startingProjectName={reclaim.startingProjectName}
       onSaveAndSwitch={() => reclaim.resolve(true)}
       onSwitchAnyway={() => reclaim.resolve(false)}
       onCancel={reclaim.cancel}
@@ -123,10 +179,42 @@ function ReclaimSlot() {
   )
 }
 
+/**
+ * THE RAIL IS THE SHELL'S FOURTH RESPONSIBILITY, ADDED BY PLAN F — and it has ONE writer.
+ *
+ * Plan A's docblock says the shell holds "no data fetching and no chat state", and that is still
+ * true: a rail mode and a collapse are state about the SHELL'S OWN CHROME — one derived from the
+ * address the router already resolved, the other a toggle on the shell's own grid — and neither is
+ * about any conversation. They are published downward so a surface can READ which rail it is
+ * rendering into without re-deriving the same predicate from `useLocation` in three places, and
+ * they are the alternative to the `?rail=` query param this plan rejected.
+ *
+ * WHY THE SHELL OWNS THE COLLAPSE RATHER THAN THE OUTLET CHILD. The control that undoes a collapse
+ * cannot live in the rail — a collapsed rail is `w-0` and `invisible`, so a toggle inside it is a
+ * one-way door. It has to live on the pane side, and the pane is the shell's SIBLING of the Outlet.
+ * An Outlet child owning the state would have to publish both the flag and its toggle upward
+ * through the channel, which puts a function on a value-compared cell and gives one piece of chrome
+ * two writers. Holding it here is one `useState` and a prop.
+ *
+ * A LAYOUT effect, matching every other publisher on this channel: the pane host is a sibling
+ * reading from the store, so a passive publish would leave it one committed frame behind.
+ */
+function usePublishRail(mode: RailMode, collapsed: boolean): void {
+  const channel = useWorkspaceChannel()
+  useLayoutEffect(() => {
+    const held = channel?.rail.get()
+    if (!held || (held.mode === mode && held.collapsed === collapsed)) return
+    channel?.rail.set({ ...held, mode, collapsed })
+  })
+}
+
 /** Everything inside the provider, so it can read the channel it is mounted under. */
 function ShellFrame() {
   useUnsavedWorkWarning()
   const rail = useRailSlot()
+  const mode = railModeFor(useLocation().pathname)
+  const [collapsed, setCollapsed] = useState(false)
+  usePublishRail(mode, collapsed)
   // WHICH COLUMN GROWS, and it is not a cosmetic choice. The two columns are the conversation and
   // the app, and the conversation is the SIZED one whenever the app is on screen: the builder
   // surface's chat panel sets its own 288px and the pane takes everything left over, which is
@@ -140,9 +228,33 @@ function ShellFrame() {
   // than becoming a per-mode table here.
   const paneVisible = useWorkspacePaneVisible()
 
+  // THE IN-PLACE GUARD (U8), MOUNTED HERE AND NOT IN THE OUTLET CHILD. The exits it exists for —
+  // the navbar's links, the breadcrumb — sit ABOVE the Outlet, so a guard mounted below it would
+  // lose coverage of exactly the departing controls it was written for.
+  //
+  // `workspaceIsAlive` comes from the one computed state rather than from a second read: a `null`
+  // save state means "could not tell" only while the workspace is running, and means "nobody
+  // asked" otherwise. Conflating them fires a warning on every exit from every stopped project.
+  const report = useWorkspaceReport()
+  const { guard, dialog: unsavedWorkDialog } = useUnsavedWorkGuard({
+    saveDirty: useWorkspaceSaveState(),
+    workspaceIsAlive: report?.state.name === 'running',
+    projectId: report?.projectId ?? null,
+  })
+
+  // A RAIL COLLAPSED BESIDE A PANE MUST NOT SURVIVE THE PANE GOING AWAY. The control that restores
+  // it lives on the pane side, so a planning conversation — which has no pane at all — would
+  // inherit a hidden rail with nothing on screen and no way back. Reset when the pane leaves,
+  // rather than trying to keep a toggle reachable on a surface that has nowhere to put one.
+  useEffect(() => {
+    if (!paneVisible) setCollapsed(false)
+  }, [paneVisible])
+
   return (
+    <WorkspaceExitProvider value={guard}>
     <div className="h-screen flex flex-col font-manrope bg-bial-bg overflow-hidden">
       <ReclaimSlot />
+      {unsavedWorkDialog}
       <Navbar />
       {/* THE TWO-COLUMN GRID, BUILT ONCE, ABOVE THE OUTLET. Plan F supplies the rail's contents
           and the threshold that flips `stacked`; it does not build a second two-column frame
@@ -150,21 +262,35 @@ function ShellFrame() {
           threshold — the pane host is its SIBLING, so a direction swap cannot remount the frame. */}
       <div
         data-testid="workspace-grid"
-        className={`flex flex-1 min-h-0 overflow-hidden ${rail.stacked ? 'flex-col' : 'flex-row'}`}
+        /* R13's crossing, AS A RESPONSIVE CLASS ON THIS ONE ELEMENT. Below the threshold the pane
+           stacks under the rail; above it they sit side by side. Never a conditional render of a
+           stacked tree and a side-by-side tree — that is a remount, and AE37 forbids it. Because
+           the pane host is this element's SIBLING and the rail's contents are its Outlet child,
+           the direction swap happens on their COMMON parent, which is the whole reason the grid
+           has to be in one place. `rail.stacked` stays a deliberate force-stack override. */
+        className={`flex flex-1 min-h-0 overflow-hidden ${rail.stacked ? 'flex-col' : 'flex-col lg:flex-row'}`}
       >
-        {/* The outlet column: the project surface or the chat surface. A flex child that may not
-            overflow the frame — each surface declares its own scroller inside it. */}
+        {/* The outlet column — THE RAIL. The project surface or the chat surface renders inside
+            it, and its width is a class on this one persistent element: the details width, the
+            conversation width, or collapsed. The element is never conditionally rendered, so a
+            width change and a collapse both leave every descendant mounted. */}
         <div
+          id={WORKSPACE_RAIL_ID}
           data-testid="workspace-outlet"
-          className={`min-w-0 min-h-0 flex flex-col overflow-hidden ${paneVisible ? '' : 'flex-1'}`}
+          data-rail-mode={mode}
+          className={`min-w-0 min-h-0 flex flex-col overflow-hidden ${railWidthClass(mode, collapsed, paneVisible)}`}
         >
           <Outlet />
         </div>
         {/* The pane column — a SIBLING of the Outlet, which is what stops any route change from
-            reaching it. This is the whole of R8's mechanism, in one line of JSX. */}
-        <AppPaneHost />
+            reaching it. This is the whole of R8's mechanism, in one line of JSX.
+            `AppPane` (Plan F, U4) wraps the host with the region label, the skip control and the
+            sentence for when there is nothing to frame; the iframe and its identity stay in the
+            host, because a second mount of it is the remount AE4 and AE37 exist to forbid. */}
+        <AppPane collapsed={collapsed} onToggleCollapsed={() => setCollapsed((was) => !was)} />
       </div>
     </div>
+    </WorkspaceExitProvider>
   )
 }
 

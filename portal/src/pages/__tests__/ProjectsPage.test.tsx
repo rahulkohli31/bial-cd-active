@@ -242,6 +242,42 @@ describe('ProjectsPage — delete', () => {
     expect(await screen.findByRole('alert')).toBeTruthy() // error surfaced
     expect(await screen.findByText('Alpha')).toBeTruthy() // row restored by refetch
   })
+
+  // U15 — this channel carries only failures (a successful delete is silent), and unlike
+  // Navbar's and AdminPage's toasts it never had a 3-second dismiss timer wired to it in
+  // the first place. Pin that explicitly: something that went wrong waits for the reader
+  // to dismiss it, not for a clock. `getBy*` + manual `advanceTimersByTimeAsync` (not
+  // `findBy*`) matches this file's own established fake-timer pattern above.
+  it('a delete failure does not auto-dismiss, and carries a failure marker', async () => {
+    h.listProjects.mockResolvedValue({ items: [mkProject('p1', 'Alpha')], nextCursor: null, hasMore: false })
+    h.listProjectConversations.mockResolvedValue([{}])
+    h.deleteProject.mockRejectedValue(new ApiError('Could not delete the project.', 500))
+    vi.useFakeTimers()
+    try {
+      renderPage()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(screen.getByText('Alpha')).toBeTruthy()
+
+      fireEvent.click(screen.getByRole('button', { name: /delete alpha/i }))
+      await vi.advanceTimersByTimeAsync(0) // the dialog's own chat-count fetch resolves
+      fireEvent.change(screen.getByLabelText(/type the project name/i), { target: { value: 'Alpha' } })
+      fireEvent.click(screen.getByRole('button', { name: /delete project/i }))
+      await vi.advanceTimersByTimeAsync(0) // deleteProject's rejection resolves, toast is set
+
+      // The marker, not the text: an icon distinguishes this as a failure the same way
+      // Navbar's and AdminPage's toasts now do, so it reads at a glance without the words.
+      // A specific testid (not just "some svg in the toast") — the dismiss button's own
+      // X icon is also an svg, and would let a mutant that deletes the marker pass.
+      expect(screen.getByTestId('projects-toast-marker')).toBeTruthy()
+
+      // Advance well past the 3s window a confirmation elsewhere in this unit fades on —
+      // nothing here schedules a dismiss at all, and this proves it stays that way.
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(screen.getByTestId('projects-toast')).toBeTruthy()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })
 
 describe('ProjectsPage — a failure with rows on screen is never silent', () => {

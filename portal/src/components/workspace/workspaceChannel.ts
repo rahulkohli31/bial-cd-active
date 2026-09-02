@@ -16,7 +16,8 @@
  *  3. the reclaim dialog's open state
  *  4. the tri-state save state
  *  5. the app-revealed callback (R104's stop-clock)
- *  6. the rail mode, plus an opaque per-mode bag that outlives a chat
+ *  6. the rail mode, its collapse, and an opaque per-mode bag that outlives a chat
+ *  7. what to SAY about the workspace — one computed value, and the handlers for its one action
  *
  * TWO RULES MAKE IT SAFE, and they are the whole contract:
  *
@@ -44,8 +45,13 @@
  * re-renders once per character exactly as `LivePreview` did when the page rendered it directly.
  * What the split protects is the thing that matters: the address is the VALUE-compared cell and
  * the frame's identity input, so no amount of typing can move what is framed. Do not "fix" the
- * re-render with a shallow comparator — the handlers are unstable, so it would buy nothing without
- * memoising them too, and that is a behaviour change this refactor is not making.
+ * PANE's re-render with a shallow comparator — its view carries toolbar ReactNodes rebuilt every
+ * render, so a comparator would buy nothing without memoising those too, and that is a behaviour
+ * change this refactor is not making.
+ *
+ * THAT WARNING IS ABOUT THE PANE, AND ONLY THE PANE. `address`, `rail` and `workspace` are all
+ * value-compared, because each carries plain data (plus, for `workspace`, handlers that are
+ * provably interchangeable — see `sameReport`, which states the rule that keeps them so).
  *
  * The context carries the CHANNEL HANDLE, which is created once and never replaced. That handle is
  * stable for the life of the shell, so the context itself never re-renders anybody.
@@ -58,6 +64,8 @@ import type { PreviewAddress } from '../../utils/previewAddress'
 import type { CompileState } from '../../utils/compileState'
 import type { PreviewLifeState, ReclaimBlocked } from '../../utils/buildSessionApi'
 import type { RelaunchError } from '../../utils/buildSessionTypes'
+import { sameWorkspaceState } from './workspaceState'
+import type { StartOutcome, WorkspaceState } from './workspaceState'
 
 type Listener = () => void
 
@@ -89,6 +97,17 @@ function createCell<T>(initial: T, equals: (a: T, b: T) => boolean = Object.is):
 
 const sameAddress = (a: WorkspaceAddress, b: WorkspaceAddress) =>
   a.url === b.url && a.status === b.status && a.projectId === b.projectId
+
+/**
+ * VALUE-COMPARED, for the same reason the address is. The rail's flags are rebuilt on every render
+ * of the surface that publishes them, and that surface re-renders on every keystroke in its
+ * composer — so an identity comparison here would wake the shell's grid once per character and
+ * recompute the width class each time. `state` is compared by identity deliberately: it is opaque,
+ * so there is nothing here that could compare it by value, and its owner is expected to hold it
+ * stable across renders that did not change it.
+ */
+const sameRail = (a: RailSlot, b: RailSlot) =>
+  a.mode === b.mode && a.stacked === b.stacked && a.collapsed === b.collapsed && a.state === b.state
 
 /**
  * What the mounted surface asks the pane to SHOW — its visibility declaration, its toolbar slots,
@@ -166,6 +185,12 @@ void _paneViewIsASubsetOfLivePreviewProps
  */
 export interface ReclaimRequest {
   blocked: ReclaimBlocked
+  /**
+   * The project being STARTED — issue #161's framing half. The refusal carries only the incumbent,
+   * so the name of the app the person is actually trying to open has to travel with the request:
+   * the dialog leads with it, because "can I build THIS one?" is the question being asked.
+   */
+  startingProjectName: string | null
   /** `true` saves the other project before releasing it; `false` releases without saving. */
   resolve: (save: boolean) => Promise<void>
   cancel: () => void
@@ -180,6 +205,15 @@ export interface ReclaimRequest {
  * reads no mode.
  */
 export interface RailSlot {
+  /**
+   * WHICH RAIL IS SHOWING, and it is DERIVED FROM THE ADDRESS rather than chosen by anybody.
+   * `details` on a project address, `conversation` on a chat one. The shell computes it and
+   * publishes it here so surfaces below can read it; nothing writes it from below.
+   *
+   * There is no route for it and no `?rail=` query param, deliberately: a query param would make
+   * a rail mode a shareable link, and a link that reopens somebody else's view of a screen is a
+   * different feature from the one R9 asks for.
+   */
   mode: string | null
   /** Opaque to the shell; the Outlet child owns the contents. */
   state: Record<string, unknown>
@@ -188,8 +222,26 @@ export interface RailSlot {
    * threshold that flips this; THIS PLAN OWNS THE CONTAINER whose class it changes, which is what
    * makes the "a layout change does not remount the frame" claim assertable against the shell's
    * own grid rather than against an arbitrary test wrapper.
+   *
+   * PLAN F LEFT IT AS A FORCE-STACK OVERRIDE rather than as the threshold itself. The crossing is
+   * expressed as a responsive class on the same container — `flex-col lg:flex-row` — so it costs
+   * no `matchMedia`, no `ResizeObserver` and no state, and AE37 ("crossing the threshold is a
+   * layout change, not a remount") is true by construction rather than by a test. This flag stays
+   * because a caller that genuinely knows it wants one column should be able to say so.
    */
   stacked: boolean
+  /**
+   * THE RAIL IS HIDDEN, NOT UNMOUNTED. Zero width plus `HIDDEN_BUT_MOUNTED` on a subtree that
+   * stays in the document, so a draft and a scroll position survive a hide/show cycle and the
+   * collapsed subtree leaves the tab order.
+   *
+   * WHERE THE CONTROL THAT UNDOES THIS LIVES IS THE WHOLE DESIGN. It cannot be inside the rail:
+   * a collapsed rail is invisible and untabbable, so a toggle in it would be a one-way door. The
+   * project surface publishes it into the pane's leading toolbar slot instead — the same place the
+   * conversation surface already puts its own chat-panel toggle — where it stays reachable
+   * precisely because the pane is what remains on screen.
+   */
+  collapsed: boolean
 }
 
 /**
@@ -207,7 +259,58 @@ export interface WorkspaceAddress extends PreviewAddress {
 
 export const NO_ADDRESS: WorkspaceAddress = { url: null, status: null, projectId: null }
 
-export const NO_RAIL: RailSlot = { mode: null, state: {}, stacked: false }
+export const NO_RAIL: RailSlot = { mode: null, state: {}, stacked: false, collapsed: false }
+
+/**
+ * WHAT THE PANE NEEDS IN ORDER TO SAY WHAT THE WORKSPACE IS DOING (Plan F, U2/U3/U4).
+ *
+ * The `state` is the one computed value — a sentence and at most one action, with no destructive
+ * verb in its type. It travels on the channel for the same reason the address does: the pane host
+ * is a SIBLING of the Outlet, and the surface that made the read is below it.
+ *
+ * THE HANDLERS TRAVEL WITH IT because they are the publisher's, exactly as the reclaim request's
+ * are. Recording how a start ended, asking the platform again, and routing a refusal to the one
+ * dialog are all things the surface that owns the read knows how to do; a shell that re-derived
+ * them would be a second authority on a question that already has one.
+ *
+ * `null` MEANS NOBODY HAS COMPUTED ONE — a surface mounted outside a workspace, or one that has
+ * not resolved a project. The pane renders nothing rather than inventing a state to describe.
+ */
+export interface WorkspaceReport {
+  state: WorkspaceState
+  /** The project the state describes. `null` while a route is still resolving one. */
+  projectId: string | null
+  /** Record how a start attempt ended; `null` clears it (a start that reached the app). */
+  onStartOutcome: (outcome: StartOutcome | null) => void
+  /**
+   * A PRESS HAS BEGUN, OR FINISHED — and the pane needs to know before the server does.
+   *
+   * The server's `starting` state is the honest answer and it arrives on the NEXT read, which is up
+   * to a full poll cadence away. Without this the pane went on saying "Your app is saved." for that
+   * whole window after somebody pressed the button: true, but not an acknowledgement, and the only
+   * feedback was a spinner inside the control itself.
+   */
+  onStartPending: (pending: boolean) => void
+  /**
+   * THE URL A SUCCESSFUL START JUST PRODUCED — and the publisher decides what to do with it.
+   *
+   * Without this, pressing the start control inside a Build chat did nothing visible: that surface
+   * feeds the resolver's project-scoped arm with `null` (its own poll only runs over a framed URL),
+   * and its `relaunchedUrl` arm was fed by a Relaunch button this plan retired — so the address had
+   * no arm left that a fresh start could populate, and the app came up in a container nothing
+   * framed. `previewAddress.ts`'s relaunched arm is exactly the right home for it: a restore has no
+   * build lifecycle at all, which is why that arm resolves its own status to `ready`.
+   */
+  onStarted: (previewUrl: string) => void
+  /** Ask the platform again, now. A retry press, or a start that just finished. */
+  onRefresh: () => void
+  /**
+   * Route a reclaim refusal to the one dialog, carrying the retry that resumes what was refused.
+   * The CLASSIFICATION already happened at the call site — this is the slot, not a second
+   * classifier, and a bare 409 is not self-describing enough to have two of those.
+   */
+  onReclaimRefusal: (blocked: ReclaimBlocked, retry: () => Promise<void>) => void
+}
 
 export interface WorkspaceChannel {
   address: Cell<WorkspaceAddress>
@@ -223,7 +326,36 @@ export interface WorkspaceChannel {
   /** `null` means NOBODY HAS REPORTED, which is the same "could not tell" as a failed check. */
   saveDirty: Cell<boolean | null>
   rail: Cell<RailSlot>
+  /** What to SAY about the workspace, and the handlers for the one thing that may be pressed. */
+  workspace: Cell<WorkspaceReport | null>
 }
+
+/**
+ * Two reports that would render identically — SO THE HANDLERS ARE DELIBERATELY NOT COMPARED, and
+ * that is the whole of the risk in this function.
+ *
+ * WHY IT HAS TO EXIST. This cell's subscriber is `WorkspaceShell` itself, so a publish re-renders
+ * the shell, the navbar and both columns. Its two publishers both hand it a FRESH OBJECT on every
+ * render — one an inline literal, the other a `useMemo` keyed on a value that is itself rebuilt
+ * each call — so under `Object.is` every keystroke in a composer and every streamed frame woke the
+ * entire page chrome. This is the same treatment `sameAddress` and `sameRail` already get, applied
+ * to the cell with the widest blast radius of the three.
+ *
+ * WHAT MAKES SKIPPING THE HANDLERS SAFE, AND THE RULE A FUTURE EDITOR MUST KEEP. Holding the older
+ * closures is only sound while they are interchangeable with the newer ones. Every handler at both
+ * call sites is either a `useState` setter, a `useCallback([])`, or an arrow that touches nothing
+ * but a ref, a functional `setState`, and `projectId` — which IS compared. None of them reads a
+ * render-scoped value, so an older copy does exactly what a newer one would.
+ *
+ * PUBLISH A HANDLER THAT CLOSES OVER RENDER STATE AND THIS GOES WRONG SILENTLY: the pane would go
+ * on calling a closure from an earlier render for as long as the state and project held still.
+ * Such a handler must read that value through a ref, or this comparator must grow to compare it.
+ * The narrower fix — memoising both publishers' objects — was not taken because it leaves the
+ * default `Object.is` in place, so the next publisher added is one unmemoised literal away from
+ * restoring the whole cost.
+ */
+const sameReport = (a: WorkspaceReport | null, b: WorkspaceReport | null): boolean =>
+  a === b || (a !== null && b !== null && a.projectId === b.projectId && sameWorkspaceState(a.state, b.state))
 
 export function createWorkspaceChannel(): WorkspaceChannel {
   return {
@@ -233,7 +365,8 @@ export function createWorkspaceChannel(): WorkspaceChannel {
     visible: createCell<boolean>(false),
     reclaim: createCell<ReclaimRequest | null>(null),
     saveDirty: createCell<boolean | null>(null),
-    rail: createCell<RailSlot>(NO_RAIL),
+    rail: createCell<RailSlot>(NO_RAIL, sameRail),
+    workspace: createCell<WorkspaceReport | null>(null, sameReport),
   }
 }
 
@@ -302,6 +435,11 @@ export function useWorkspaceSaveState(): boolean | null {
 
 export function useRailSlot(): RailSlot {
   return useCell(useWorkspaceChannel()?.rail, NO_RAIL)
+}
+
+/** What the workspace is doing, and what may be pressed about it. `null` = nobody has said. */
+export function useWorkspaceReport(): WorkspaceReport | null {
+  return useCell(useWorkspaceChannel()?.workspace, null)
 }
 
 // ─── Publishing: what a mounted surface says upward ────────────────────────────────────────────
@@ -434,4 +572,31 @@ export function usePublishReclaim(request: ReclaimRequest | null): void {
  */
 export function usePublishSaveState(dirty: boolean | null): void {
   usePublish(useWorkspaceChannel()?.saveDirty, dirty)
+}
+
+/**
+ * Publish the rail's slot — its mode, its collapse and its opaque per-mode bag (Plan F, U1).
+ *
+ * CLEARED ON UNMOUNT, and the reason is the opposite of the address's. An address survives its
+ * publisher because the app it names is still running and R8 forbids destroying it on a
+ * navigation. A rail slot describes chrome that has just been unmounted: leaving `collapsed: true`
+ * standing after the surface that collapsed it is gone would hand the NEXT surface a rail already
+ * hidden, with the control that would restore it published by a component that no longer exists.
+ *
+ * ONE WRITER AT A TIME, by construction rather than by convention: the shell mounts exactly one
+ * Outlet child, and only that child publishes here.
+ */
+export function usePublishRailSlot(slot: RailSlot): void {
+  usePublish(useWorkspaceChannel()?.rail, slot, NO_RAIL)
+}
+
+/**
+ * Publish what to say about the workspace. CLEARED ON UNMOUNT, like the pane view and for the same
+ * reason: its handlers close over the departing surface's own read, its outcome slot and its
+ * refusal routing. A state left standing after they died would render a sentence whose one button
+ * calls into a component that no longer exists — the dead end the reclaim flow exists to remove,
+ * rebuilt one layer up.
+ */
+export function usePublishWorkspaceReport(report: WorkspaceReport | null): void {
+  usePublish(useWorkspaceChannel()?.workspace, report, null)
 }

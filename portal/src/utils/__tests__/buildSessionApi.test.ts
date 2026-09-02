@@ -9,6 +9,8 @@ import {
   BuildSessionAlreadyActiveError,
   asReclaimBlocked,
   releaseProject,
+  fetchPreviewState,
+  handOverWorkspace,
 } from '../buildSessionApi'
 import { ApiError } from '../apiError'
 
@@ -410,5 +412,155 @@ describe('asReclaimBlocked — a project that is still being built', () => {
       details: { projectId: 'p-a', projectName: 'A', dirty: true, building: 'yes' },
     }
     expect(asReclaimBlocked(err)?.building).toBe(false)
+  })
+})
+
+/**
+ * `fetchPreviewState` — the hand-written mirror of the server's preview-state shape.
+ *
+ * This module narrows the wire by hand, so a field the server sends and this parser does not
+ * read is discarded SILENTLY — no type error, no failing test, just a feature that never
+ * works. Both facts pinned below were exactly that: `starting` is a server state the narrower
+ * had to stop swallowing, and `occupyingProjectId` is the only thing the "another project
+ * holds your workspace" remedy has to navigate with.
+ */
+describe('handOverWorkspace — the stop → save → release ordering (#83)', () => {
+  /** Records the path of every call in order, and answers each of the three routes plausibly. */
+  function recordingFetch() {
+    const seen: string[] = []
+    const fetchImpl = vi.fn<FetchImpl>(async (url: string) => {
+      seen.push(new URL(url, 'http://x').pathname)
+      if (url.endsWith('/save')) return res(200, { appId: 'a-1', headSha: 'deadbeef' })
+      if (url.endsWith('/release')) return res(200, { released: true })
+      return res(200, { stopped: true })
+    })
+    return { seen, fetchImpl }
+  }
+
+  it('stops FIRST, then saves, then releases — save and release both refuse while a session is live', async () => {
+    const { seen, fetchImpl } = recordingFetch()
+    await handOverWorkspace('p-1', true, { fetchImpl })
+    expect(seen).toEqual([
+      '/api/build-sessions/projects/p-1/stop-active-build',
+      '/api/build-sessions/projects/p-1/save',
+      '/api/build-sessions/projects/p-1/release',
+    ])
+  })
+
+  it('SKIPS the save on Leave without saving, and still stops and releases', async () => {
+    const { seen, fetchImpl } = recordingFetch()
+    await handOverWorkspace('p-1', false, { fetchImpl })
+    expect(seen).toEqual([
+      '/api/build-sessions/projects/p-1/stop-active-build',
+      '/api/build-sessions/projects/p-1/release',
+    ])
+  })
+
+  it('does NOT release when the save fails — that is the data loss the whole flow exists to prevent', async () => {
+    const seen: string[] = []
+    const fetchImpl = vi.fn<FetchImpl>(async (url: string) => {
+      seen.push(new URL(url, 'http://x').pathname)
+      if (url.endsWith('/save')) return res(500, { error: { message: 'disk full' } })
+      return res(200, { stopped: true })
+    })
+    await expect(handOverWorkspace('p-1', true, { fetchImpl })).rejects.toBeInstanceOf(ApiError)
+    expect(seen.some((p) => p.endsWith('/release'))).toBe(false)
+  })
+
+  it('carries a reclaim refusal out to the caller rather than swallowing it', async () => {
+    // The dialog is the only thing mounted that can report a failed hand-over.
+    const fetchImpl = jsonFetch(409, {
+      error: {
+        message: '“Lost & Found” is still open and has unsaved changes.',
+        code: 'sandbox_reclaim_blocked',
+        projectId: 'p-a',
+        projectName: 'Lost & Found',
+        dirty: true,
+      },
+    })
+    const err = await handOverWorkspace('p-1', false, { fetchImpl }).catch((e: unknown) => e)
+    expect(asReclaimBlocked(err)?.projectName).toBe('Lost & Found')
+  })
+})
+
+describe('fetchPreviewState — the wire mirror (C3 §8.3)', () => {
+  const previewFetch = (body: unknown) =>
+    ({ fetchImpl: async () => res(200, body) })
+
+  it('narrows `starting` to itself, not to `unknown` (AE54a)', async () => {
+    // The one that degrades silently: a closed tuple without `starting` resolves it through
+    // the fallback to `unknown`, so the pane says "we could not check" and offers a retry for
+    // a start that is actively under way.
+    const state = await fetchPreviewState('p1', previewFetch({ state: 'starting', alive: false }))
+    expect(state.state).toBe('starting')
+  })
+
+  it('parses BOTH halves of the slot_taken attribution', async () => {
+    const state = await fetchPreviewState(
+      'p1',
+      previewFetch({
+        state: 'slot_taken',
+        alive: false,
+        occupyingProjectName: 'Car pool apps',
+        occupyingProjectId: 'proj-9',
+      }),
+    )
+    expect(state.occupyingProjectName).toBe('Car pool apps')
+    expect(state.occupyingProjectId).toBe('proj-9')
+  })
+
+  it('leaves a withheld attribution null on BOTH fields rather than inventing one', async () => {
+    // The server withholds the whole attribution when it cannot map the live container to a
+    // project this user owns — naming the wrong project is worse than naming none, and that
+    // now applies to the id as much as to the name.
+    const state = await fetchPreviewState('p1', previewFetch({ state: 'slot_taken', alive: false }))
+    expect(state.occupyingProjectName).toBeNull()
+    expect(state.occupyingProjectId).toBeNull()
+  })
+
+  it('does not fill in the half that is missing when only one arrives', async () => {
+    const nameOnly = await fetchPreviewState(
+      'p1',
+      previewFetch({ state: 'slot_taken', alive: false, occupyingProjectName: 'Roster' }),
+    )
+    expect(nameOnly.occupyingProjectName).toBe('Roster')
+    expect(nameOnly.occupyingProjectId).toBeNull()
+
+    const idOnly = await fetchPreviewState(
+      'p1',
+      previewFetch({ state: 'slot_taken', alive: false, occupyingProjectId: 'proj-9' }),
+    )
+    expect(idOnly.occupyingProjectName).toBeNull()
+    expect(idOnly.occupyingProjectId).toBe('proj-9')
+  })
+
+  it('refuses a non-string id rather than coercing it into a route', async () => {
+    // A number or an object here becomes a URL segment the go-to action navigates into and
+    // 404s on. Same discipline the name beside it already follows.
+    const state = await fetchPreviewState(
+      'p1',
+      previewFetch({ state: 'slot_taken', alive: false, occupyingProjectId: 42 }),
+    )
+    expect(state.occupyingProjectId).toBeNull()
+  })
+
+  it('keeps the deploy-outliving fallback: an unrecognised state is unknown, never gone', async () => {
+    const dead = await fetchPreviewState('p1', previewFetch({ state: 'teleporting', alive: false }))
+    expect(dead.state).toBe('unknown')
+
+    const live = await fetchPreviewState('p1', previewFetch({ state: 'teleporting', alive: true }))
+    expect(live.state).toBe('alive')
+  })
+
+  it('returns the all-null unknown shape for an unreadable body, id included', async () => {
+    const state = await fetchPreviewState('p1', previewFetch(null))
+    expect(state).toEqual({
+      state: 'unknown',
+      alive: false,
+      previewUrl: null,
+      occupyingProjectName: null,
+      occupyingProjectId: null,
+      restorable: null,
+    })
   })
 })

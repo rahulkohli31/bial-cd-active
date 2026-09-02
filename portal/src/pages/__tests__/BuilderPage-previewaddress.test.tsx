@@ -41,7 +41,7 @@ import { screen, waitFor, cleanup, fireEvent } from '@testing-library/react'
 import {
   FakeEventSource, makeClient, primeClient, primeTurn, renderBuilderAt, withLiveBuildAnchor,
   statusResp, send, scriptBuildTurn, T_PREVIEW, T_BUILD_END, turnStreaming,
-  T_DELTA, T_END,
+  T_DELTA, T_END, findStartAppControl, primeStandbyReattach,
 } from './_builderSession.jsx'
 
 /** The three arms, given URLs that cannot be confused with one another. */
@@ -98,6 +98,11 @@ vi.mock('../../utils/buildSessionApi', async (orig) => ({
   ...(await orig<typeof import('../../utils/buildSessionApi')>()),
   fetchPreviewState: (...a: unknown[]) => h.fetchPreviewState(...a),
   fetchSaveState: (...a: unknown[]) => h.fetchSaveState(...a),
+  // `StartAppControl.tsx` imports `relaunchPreview` DIRECTLY from this module rather than through
+  // the injected C3 client — it predates the client and was never moved onto it (Plan F, U3). This
+  // suite's vehicle for a relaunched URL is that control now (`RelaunchAffordance` is gone), so its
+  // call has to land on the same `h.relaunchPreview` the fixtures below already prime.
+  relaunchPreview: (...a: unknown[]) => h.relaunchPreview(...a),
 }))
 
 const deps = () => {
@@ -109,24 +114,6 @@ const frame = () => document.querySelector('iframe')
 const framedUrl = () => frame()?.getAttribute('src') ?? null
 /** The newest value the pane was handed for `name` — the app-scoped props read this. */
 const lastPaneProp = (name: string) => paneProps[paneProps.length - 1]?.[name]
-
-/** A transcript carrying a finished build, which is what makes the terminal placeholder render. */
-const withOutcome = () => ({
-  id: 'build-X',
-  kind: 'builder',
-  messages: [
-    { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'a visitor app' }] },
-    {
-      id: 'm1',
-      role: 'assistant',
-      seq: 1,
-      parts: [
-        { type: 'text', text: 'Build finished.' },
-        { type: 'build', status: 'ended', sessionId: 's-old', previewUrl: 'https://old.example/' },
-      ],
-    },
-  ],
-})
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -154,18 +141,30 @@ afterEach(() => cleanup())
 /**
  * Bring up a page whose RELAUNCH arm is live and stamped to `projectId`.
  *
- * `handleRelaunch` stamps `sessionProjectRef` itself, which is what puts the arm in scope — so
- * this is also the cheapest way to make the project predicate TRUE without a live session that
- * would gate the composer.
+ * RE-POINTED (Plan F, U3/U4). The old vehicle clicked a "Relaunch" button `LivePreview` rendered
+ * inside its own terminal placeholder, fed by `handleRelaunch` — which stamped `sessionProjectRef`
+ * as a side effect of the click itself. Both are gone: `RelaunchAffordance` and its four render
+ * sites are retired, and `handleRelaunch` has had no caller since — `onRelaunch` is still threaded
+ * onto the pane's props for typing continuity, but nothing in `LivePreview`'s JSX reads it any
+ * more (confirmed by reading the file: it is destructured and never invoked). The one control left
+ * is `StartAppControl`, and getting it a chance to press is the whole of what changed here —
+ * `primeStandbyReattach` stamps the ref `StartAppControl`'s OWN click path never touches, and
+ * `findStartAppControl` presses whichever label the map is currently showing (both call the exact
+ * same underlying `start()`). See its docblock in `_builderSession.jsx` for the full account,
+ * including the real product bug this chase turned up.
  */
 async function relaunchFramedAt(chatId: string, projectId: string) {
-  h.getBuild.mockResolvedValue(withOutcome())
+  const reattach = primeStandbyReattach(h, { chatId, projectId })
   const view = renderBuilderAt({ chatId, projectId, hasSavedBuild: true, deps: deps() })
-  // The TERMINAL placeholder, not merely any Relaunch button: with a saved build confirmed the
-  // pre-resolution empty state offers one too, and that node is replaced when the transcript lands.
-  await waitFor(() => expect(screen.getAllByText(/no longer running/i).length).toBeGreaterThan(0))
-  fireEvent.click(await screen.findByRole('button', { name: /relaunch/i }))
+  await waitFor(() => expect(h.getStatus).toHaveBeenCalled())
+  fireEvent.click(await findStartAppControl())
+  await waitFor(() => expect(h.relaunchPreview).toHaveBeenCalled())
   await waitFor(() => expect(framedUrl()).toBe(RELAUNCH_URL))
+  // Settle the standby reattach now that the relaunch has framed what this fixture needs: several
+  // callers send a turn right after this returns, and a reattach left pending forever would keep
+  // the composer gate shut on them for good (see the docblock on `primeStandbyReattach`).
+  reattach.settle()
+  await waitFor(() => expect(screen.queryByText(/checking whether a build/i)).toBeNull())
   return view
 }
 
@@ -230,14 +229,38 @@ describe('BuilderPage — the preview address: three sources, two predicates', (
   it('a relaunched URL outranks the session\'s own URL', async () => {
     // The middle of the precedence, which only shows when both lower arms are populated at once: a
     // relaunch restores an app the ENDED session's dead preview would otherwise still be naming.
+    //
+    // RE-POINTED. The session's own dead `SESSION_URL` is exactly what used to make `LivePreview`
+    // render its terminal placeholder WITH a Relaunch button — that button is gone, and framing a
+    // real (if dead) session URL is enough on its own to keep `AppPane` showing `AppPaneHost`'s own
+    // now-buttonless terminal card (`showTerminal`), never `NoFrame`. What gets `StartAppControl`
+    // a chance to press here is the SAME veto `AppPane.tsx` documents for every other state that
+    // definitely means nothing is serving: a settled `asleep`+`restorable` reading resolves the
+    // workspace map to `not-running`, and THAT swaps `AppPaneHost` for `NoFrame`. The poll only
+    // ever runs once something is framed, and the dead session URL is what starts it — so the
+    // sequence is mount, let the poll answer, THEN find and press the one control it leaves behind.
     h.getBuild.mockResolvedValue(withLiveBuildAnchor('live-7'))
     h.getStatus.mockResolvedValue(
       statusResp({ sessionId: 'live-7', status: 'ended', previewUrl: SESSION_URL }),
     )
+    h.fetchPreviewState.mockResolvedValue({
+      state: 'asleep', alive: false, previewUrl: null, occupyingProjectName: null, restorable: true,
+    })
     const view = renderBuilderAt({ chatId: 'chat-A', projectId: 'pA', hasSavedBuild: true, deps: deps() })
     await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('live-7'))
 
-    fireEvent.click(await screen.findByRole('button', { name: /relaunch/i }))
+    fireEvent.click(await findStartAppControl())
+    await waitFor(() => expect(h.relaunchPreview).toHaveBeenCalled())
+    // The veto that got `StartAppControl` on screen at all is still standing — `fetchPreviewState`
+    // is still answering the same `asleep`/`restorable` reading, and the press does not itself
+    // change what the workspace map says (`onStartOutcome` only asks it again; the resolved
+    // ADDRESS and what `AppPane` is willing to FRAME from it are two different questions — see its
+    // own veto note). Answer it `alive` now, the same way the poll suite re-arms one, so the frame
+    // this precedence claim is actually about gets a chance to mount.
+    h.fetchPreviewState.mockResolvedValue({
+      state: 'alive', alive: true, previewUrl: RELAUNCH_URL, occupyingProjectName: null, restorable: null,
+    })
+    fireEvent.focus(window)
 
     await waitFor(() => expect(framedUrl()).toBe(RELAUNCH_URL))
     view.unmount()

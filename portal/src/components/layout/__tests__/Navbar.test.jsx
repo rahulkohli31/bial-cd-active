@@ -9,8 +9,8 @@
  * their entire daily budget watching a number that never moved — or that was not on screen.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react'
-import { MemoryRouter } from 'react-router-dom'
+import { render, screen, waitFor, cleanup, fireEvent, act } from '@testing-library/react'
+import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
 
 const h = vi.hoisted(() => ({
   fetchUsageToday: vi.fn(),
@@ -35,6 +35,12 @@ vi.mock('../../../utils/appRegistryApi', () => ({ fetchAppStatusCounts: h.fetchA
 vi.mock('../../FeedbackModal', () => ({ default: () => null }))
 
 import Navbar from '../Navbar'
+import { WorkspaceExitProvider } from '../../workspace/UnsavedWorkGuard'
+
+/** Where a navigation actually landed. */
+function LocationProbe() {
+  return <span data-testid="where">{useLocation().pathname}</span>
+}
 
 // Deliberately NOT named "Admin": the display name is rendered in the avatar block, and a
 // `getByText('Admin')` on the nav entry would then match two nodes.
@@ -287,5 +293,115 @@ describe('the avatar menu opens and closes (#157 A)', () => {
     expect(menuIsOpen()).toBe(true)
     fireEvent.click(screen.getByTitle('Send feedback'))
     expect(menuIsOpen()).toBe(false)
+  })
+})
+
+/**
+ * U15 — THE HEADLINE. A failed sign-out used to call `showToast(...)` and then
+ * `navigate('/login')` on the very next line: the navigate unmounts ProjectsPage —
+ * unmounts the navbar — which OWNS the toast state, destroying the message in the same
+ * tick it was created. Nobody has ever seen it, on any device. The fix hands the warning
+ * forward as router state instead, so the screen the person actually LANDS ON renders it.
+ *
+ * `LoginScreenProbe` stands in for LoginPage here — it reads exactly the same
+ * `location.state.signoutWarning` LoginPage reads, so a passing test proves what reaches
+ * the destination screen, not merely what Navbar tried to render before leaving.
+ */
+function LoginScreenProbe() {
+  const location = useLocation()
+  return <div data-testid="login-screen">{location.state?.signoutWarning ?? ''}</div>
+}
+
+const renderNavbarWithLoginRoute = () =>
+  render(
+    <MemoryRouter initialEntries={['/dashboard']}>
+      <Routes>
+        <Route path="/dashboard" element={<Navbar />} />
+        <Route path="/login" element={<LoginScreenProbe />} />
+      </Routes>
+    </MemoryRouter>,
+  )
+
+const signOut = async () => {
+  await waitFor(() => expect(h.fetchUsageToday).toHaveBeenCalled())
+  const trigger = screen.getByText('Asha', { selector: 'p' }).closest('button')
+  fireEvent.click(trigger)
+  fireEvent.click(screen.getByRole('button', { name: /sign out/i }))
+}
+
+describe('the sign-out warning outlives the navigation (U15)', () => {
+  it('THE BUG: a failed sign-out leaves the warning readable on the screen the person lands on', async () => {
+    h.logout.mockResolvedValue(false)
+    renderNavbarWithLoginRoute()
+
+    await signOut()
+
+    // The navbar (and the toast state it used to own) is gone — this asserts the
+    // destination screen, not a message that flashed before the redirect.
+    const loginScreen = await screen.findByTestId('login-screen')
+    expect(loginScreen.textContent).toBe('Sign-out may be incomplete on this device.')
+    expect(screen.queryByText('Asha')).toBeNull()
+  })
+
+  it('carries no warning across on a clean sign-out', async () => {
+    h.logout.mockResolvedValue(true)
+    renderNavbarWithLoginRoute()
+
+    await signOut()
+
+    const loginScreen = await screen.findByTestId('login-screen')
+    expect(loginScreen.textContent).toBe('')
+  })
+})
+
+/**
+ * THE WORKSPACE'S IN-PLACE EXITS ROUTE THROUGH ITS GUARD (Plan F, U8).
+ *
+ * `beforeunload` cannot cover a nav link: a single-page navigation is not an unload, so leaving the
+ * workspace this way used to discard unsaved work in silence.
+ *
+ * Two halves, and the second is the one that keeps this from being a regression for every other
+ * page: inside a workspace the link consults the guard, and OUTSIDE one it navigates exactly as it
+ * always did. A guard that made the projects list ask before every click would be worse than the
+ * bug it fixed.
+ */
+describe('Navbar — the workspace exit guard', () => {
+  it('★ routes a nav link through the guard when one is provided', () => {
+    const exits = []
+    render(
+      <MemoryRouter initialEntries={['/projects/p1']}>
+        <WorkspaceExitProvider value={(go) => exits.push(go)}>
+          <Routes>
+            <Route path="*" element={<><Navbar /><LocationProbe /></>} />
+          </Routes>
+        </WorkspaceExitProvider>
+      </MemoryRouter>,
+    )
+
+    fireEvent.click(screen.getByRole('link', { name: /^projects$/i }))
+
+    // Handed to the guard, and NOT performed: the guard decides whether it happens.
+    expect(exits).toHaveLength(1)
+    expect(screen.getByTestId('where').textContent).toBe('/projects/p1')
+
+    // …and running it is what actually navigates, so nothing is lost when the guard says yes.
+    act(() => exits[0]())
+    expect(screen.getByTestId('where').textContent).toBe('/projects')
+  })
+
+  it('★ navigates straight through on a page with no workspace', () => {
+    // Every other page in the portal renders this navbar. Without the pass-through default, this
+    // unit would put a guard in front of navigation everywhere.
+    render(
+      <MemoryRouter initialEntries={['/dashboard']}>
+        <Routes>
+          <Route path="*" element={<><Navbar /><LocationProbe /></>} />
+        </Routes>
+      </MemoryRouter>,
+    )
+
+    fireEvent.click(screen.getByRole('link', { name: /^projects$/i }))
+
+    expect(screen.getByTestId('where').textContent).toBe('/projects')
   })
 })

@@ -1,4 +1,4 @@
-// Client-side guardrails on a build/refine request, enforced by ProjectBuilder at submit time.
+// Client-side guardrails on a build/refine request, enforced by the composer at submit time.
 // The load-bearing rule (below): a request naming passenger PII / financial / medical data is
 // flagged for IT Security review before go-live. (This used to mirror the old client-side
 // builder's file-storage prompt guidance, retired with the open-sandbox pivot; the gate stands.)

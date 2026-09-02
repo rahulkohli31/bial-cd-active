@@ -316,7 +316,19 @@ describe('an in-flight turn belongs to ONE chat (G2)', () => {
     await waitForGateOpen()
     type('a question')
     fireEvent.keyDown(composer(), { key: 'Enter' })
-    await waitFor(() => expect(h.startTurn).toHaveBeenCalledWith('chat-A', expect.anything()))
+    // FOUR ARGS NOW, ALWAYS (R-18, U13): `startTurn(id, message, deps, create)` is the ONE call
+    // the send path makes, and both messages here are the FIRST in an empty transcript
+    // (`messages: []`), so `create` rides along on every one of them as a real (non-`undefined`)
+    // positional argument. `toHaveBeenCalledWith` compares argument COUNT as well as content, so
+    // pinning only the first two args — as the old two-call protocol's assertion did — fails
+    // against every real call now, not just a differently-shaped one. What this test is actually
+    // about (chat A's turn reaches the server, chat B's does too, and they are not conflated) does
+    // not need the message or create shape spelled out again here — `expect.anything()` for the
+    // rest says "some call happened for this chat" without re-pinning R-18's payload a second time
+    // in a suite that is not about it.
+    await waitFor(() =>
+      expect(h.startTurn).toHaveBeenCalledWith('chat-A', expect.anything(), expect.anything(), expect.anything()),
+    )
 
     // The SAME instance moves to a sibling chat (flat routing — only the chatId prop changes).
     h.getBuild.mockResolvedValue({ id: 'chat-B', kind: 'build', messages: [] })
@@ -332,7 +344,11 @@ describe('an in-flight turn belongs to ONE chat (G2)', () => {
     h.startTurn.mockClear()
     type('a different question')
     fireEvent.keyDown(composer(), { key: 'Enter' })
-    await waitFor(() => expect(h.startTurn).toHaveBeenCalledWith('chat-B', expect.anything()))
+    // Same four-arg shape as chat A's assertion above — chat B's transcript is empty too, so its
+    // first message also carries a `create` block.
+    await waitFor(() =>
+      expect(h.startTurn).toHaveBeenCalledWith('chat-B', expect.anything(), expect.anything(), expect.anything()),
+    )
   })
 })
 
@@ -393,15 +409,22 @@ describe('a typed draft survives (G3)', () => {
   })
 
   it('a FAILED send keeps it — the toast says try again, so the text has to still be there', async () => {
-    h.getBuild.mockResolvedValue(null) // seq 0 → the create branch, which is the one that can fail
-    h.createBuild.mockRejectedValue(new Error('network down'))
+    // R-18/U13: there is no separate create call left to fail. The row's parentage rides the
+    // turn's OWN request now, so a refused first message takes `startTurn`'s catch — the same
+    // path every later message's refusal takes — and it is what this test rejects.
+    h.getBuild.mockResolvedValue(null) // seq 0 → the FIRST message, which carries `create`
+    h.startTurn.mockRejectedValue(new Error('network down'))
     const { deps: d } = deps()
     renderAt('build-X', d)
     await waitForGateOpen()
     type('please do not eat this')
     fireEvent.keyDown(composer(), { key: 'Enter' })
 
-    expect(await screen.findByText(/could not start this thread/i)).toBeTruthy()
+    // "Could not start this thread" was the retired create call's OWN failure sentence. A
+    // generic (non-`TurnStartError`) rejection from `startTurn` falls to the fallback
+    // `fireRelayTurn` catch already uses for every other refused send — see "a startTurn refusal
+    // rolls back BOTH bubbles…" above, which pins the same copy for the same reason.
+    expect(await screen.findByText(/could not be sent/i)).toBeTruthy()
     expect(composer().value).toBe('please do not eat this')
   })
 })
@@ -455,10 +478,16 @@ describe('a finished build offers no canned follow-ups (2026-07-30)', () => {
     h.startTurn.mockClear()
     type('add a dark mode toggle')
     fireEvent.keyDown(composer(), { key: 'Enter' })
+    // FOUR ARGS ALWAYS (R-18, U13) — see the G2 suite above for the full reasoning. This send is
+    // not this chat's first message (the reattached build turn already occupies seq 0), so `create`
+    // is `undefined` rather than a parentage object here — but `undefined` is still passed as a
+    // real 4th positional argument, so `toHaveBeenCalledWith` still needs a slot for it.
     await waitFor(() =>
       expect(h.startTurn).toHaveBeenCalledWith(
         NEW_BUILD_CHAT,
         expect.objectContaining({ text: 'add a dark mode toggle' }),
+        expect.anything(),
+        undefined,
       ),
     )
   })

@@ -5,8 +5,22 @@ import UsersLimitsPanel from '../components/admin/UsersLimitsPanel'
 import GlobalLimitsPanel from '../components/admin/GlobalLimitsPanel'
 import FeedbackPanel from '../components/admin/FeedbackPanel'
 import AppRegistryPanel from '../components/admin/AppRegistryPanel'
-import { Info, Lock } from 'lucide-react'
+import { Info, Lock, AlertCircle } from 'lucide-react'
 import { getStoredUser } from '../utils/auth'
+
+/**
+ * U15 — the channel every tab shares to report back to the admin. `AppRegistryPanel`'s
+ * `act()` sends both a submission's approval confirmation AND its raw failure text down
+ * this ONE callback: before this type existed, both rendered as the same white/blue-info
+ * card, so an administrator could not tell — without reading the words — whether the
+ * action they just took had worked. `'ok'` is the default so the other panels (which only
+ * ever call `onToast` with a confirmation today) need no call-site change.
+ */
+type ToastSeverity = 'ok' | 'problem'
+interface ToastState {
+  text: string
+  severity: ToastSeverity
+}
 
 const TABS = [
   { id: 'apps', label: 'App Registry' },
@@ -29,13 +43,19 @@ export default function AdminPage() {
   const user = getStoredUser()
 
   const [activeTab, setActiveTab] = useState(TABS[0].id)
-  const [toast, setToast] = useState<string | null>(null)
+  const [toast, setToast] = useState<ToastState | null>(null)
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  const showToast = (msg: string) => {
-    setToast(msg)
+  // Replaces the whole { text, severity } pair in one `setState`, never the two halves
+  // separately — the fix for two messages landing in quick succession: there is no tick
+  // where the SECOND message's text is on screen under the FIRST one's styling, because
+  // there is no intermediate state where they could disagree. A confirmation may fade on
+  // its own; a failure waits for the next message (or the admin) to clear it — starting a
+  // dismiss timer for one is exactly the mistake this unit exists to undo.
+  const showToast = (text: string, severity: ToastSeverity = 'ok') => {
+    setToast({ text, severity })
     if (toastTimer.current) clearTimeout(toastTimer.current)
-    toastTimer.current = setTimeout(() => setToast(null), 3000)
+    toastTimer.current = severity === 'ok' ? setTimeout(() => setToast(null), 3000) : null
   }
 
   if (!user?.isAdmin) {
@@ -100,9 +120,22 @@ export default function AdminPage() {
       </div>
 
       {toast && (
-        <div className="fixed bottom-6 right-6 z-50 bg-white border border-bial-border rounded-xl shadow-xl px-4 py-3 text-sm text-tertiary font-medium flex items-center gap-2">
-          <Info size={14} className="text-primary flex-shrink-0" />
-          {toast}
+        <div
+          role="alert"
+          data-testid="admin-toast"
+          data-severity={toast.severity}
+          className={`fixed bottom-6 right-6 z-50 border rounded-xl shadow-xl px-4 py-3 text-sm font-medium flex items-center gap-2 ${
+            toast.severity === 'problem'
+              ? 'bg-red-50 border-danger/30 text-danger'
+              : 'bg-white border-bial-border text-tertiary'
+          }`}
+        >
+          {toast.severity === 'problem' ? (
+            <AlertCircle size={14} className="text-danger flex-shrink-0" />
+          ) : (
+            <Info size={14} className="text-primary flex-shrink-0" />
+          )}
+          {toast.text}
         </div>
       )}
     </div>

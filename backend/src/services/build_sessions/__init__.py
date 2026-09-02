@@ -45,6 +45,9 @@ from src.services.build_sessions.manager import PreviewState as PreviewState
 from src.services.build_sessions.manager import (
     SandboxReclaimBlockedError as SandboxReclaimBlockedError,
 )
+from src.services.build_sessions.manager import (
+    SandboxUnreachableError as SandboxUnreachableError,
+)
 from src.services.build_sessions.manager import SaveOutcome as SaveOutcome
 from src.services.build_sessions.manager import SaveState as SaveState
 from src.services.build_sessions.manager import SessionManager as SessionManager

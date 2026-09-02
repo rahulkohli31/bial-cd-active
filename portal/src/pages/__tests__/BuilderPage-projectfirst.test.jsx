@@ -66,7 +66,7 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
 }))
 
 import ConversationSurface from '../../components/chat/ConversationSurface'
-import { ApiError } from '../../utils/apiError'
+import { TurnStartError } from '../../utils/turnStreamApi'
 
 function makeDeps() {
   const fake = new FakeEventSource('x')
@@ -111,13 +111,16 @@ beforeEach(() => {
 afterEach(() => cleanup())
 
 describe('BuilderPage — the seed turn is filed under a project', () => {
-  it('sends header.projectId + title on the create branch, then the confirmed brief starts the build', async () => {
+  it('sends the create block (projectId + title) on the turn\'s own FIRST call, then the confirmed brief starts the build (R-18/U13, was "the create branch")', async () => {
+    // R-18: there is no separate `createBuild` round trip left to carry `header.projectId` /
+    // `title` — they ride the turn's OWN `POST .../turns` as its `create` block instead, so the
+    // server can check the workspace BEFORE creating the row (see `fireRelayTurn`'s R-18 comment).
     renderHandoff()
-    await waitFor(() => expect(h.createBuild).toHaveBeenCalled())
-    const [id, header] = h.createBuild.mock.calls[0]
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalled())
+    const [id, , , create] = h.startTurn.mock.calls[0]
     expect(id).toBe('build-X')
-    expect(header.projectId).toBe('p1')
-    expect(header.title).toBeTruthy()
+    expect(create.projectId).toBe('p1')
+    expect(create.title).toBeTruthy()
 
     // The handed-off prompt is an interview turn, so nothing builds until the card is confirmed —
     // and what builds is the model's REFINED brief, not the raw handoff text.
@@ -126,28 +129,36 @@ describe('BuilderPage — the seed turn is filed under a project', () => {
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledWith('build-X', PLAN_CARD_ID, expect.any(String)))
   })
 
-  it('persists the user turn BEFORE the relay reads it, and so before any build', async () => {
-    // The append upserts the conversation header; the relay's server side looks that row up to
-    // fold in the project description + the interview protocol. Send first and the FIRST turn of a
-    // thread silently loses its context — and the brief it briefs on would be built blind.
+  it('persists the user turn (row + message, in ONE call) before any build (R-18/U13, was "before the relay reads it")', async () => {
+    // The two-call ordering this used to prove — append, THEN the relay reads what it wrote — is
+    // gone with the append: the row's creation and the turn's own POST are the SAME call now, so
+    // there is nothing left to order the turn against except the LATER confirmed-brief call.
     renderHandoff()
     await waitFor(() => expect(h.startTurn).toHaveBeenCalled())
     await confirmBrief()
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
 
-    expect(h.createBuild.mock.invocationCallOrder[0]).toBeLessThan(h.startTurn.mock.invocationCallOrder[0])
     expect(h.startTurn.mock.invocationCallOrder[0]).toBeLessThan(h.buildFromPlan.mock.invocationCallOrder[0])
   })
 })
 
-describe('BuilderPage — an append failure aborts the turn', () => {
-  it('never reaches a build the server has no row for (network error)', async () => {
-    h.createBuild.mockRejectedValue(new Error('network down'))
+describe('BuilderPage — a refused first-message turn aborts cleanly (was "an append failure aborts the turn")', () => {
+  // R-18/U13 RETIRES THE SEPARATE APPEND THIS DESCRIBE BLOCK WAS NAMED FOR. There is no longer a
+  // `createBuild` call whose failure can leave `startTurn` unreached — the row's creation and the
+  // turn's own POST are the SAME call, so a refusal that used to stop the append before the relay
+  // was ever asked now IS a refused `startTurn`. Every test below rejects `h.startTurn` instead of
+  // `h.createBuild`, and drops the old "startTurn was never called" assertion — it now WAS called,
+  // and it is the one that failed.
+  it('never reaches a build the server refused to create a row for (network error)', async () => {
+    h.startTurn.mockRejectedValue(new Error('network down'))
     renderHandoff()
-    expect(await screen.findByText(/Could not start this thread/i)).toBeTruthy()
+    // "Could not start this thread" was the retired create call's OWN sentence. A generic
+    // (non-`TurnStartError`) rejection now falls to `fireRelayTurn`'s shared fallback copy —
+    // the same one every other refused send in this file's sibling suites shows.
+    expect(await screen.findByText(/could not be sent/i)).toBeTruthy()
     await act(async () => { await Promise.resolve() })
-    // The turn aborts at the append: no relay reply, hence no card, hence no build.
-    expect(h.startTurn).not.toHaveBeenCalled()
+    expect(h.startTurn).toHaveBeenCalledTimes(1)
+    // No relay reply ever arrives, hence no card, hence no build.
     expect(screen.queryByTestId('build-brief-card')).toBeNull()
     expect(h.buildFromPlan).not.toHaveBeenCalled()
   })
@@ -157,6 +168,10 @@ describe('BuilderPage — an append failure aborts the turn', () => {
     // handed off a prompt + a spreadsheet from the project page, the upload failed, and a build
     // ran that never saw the file. Silently ignoring an attachment is the exact bug R3 deletes,
     // so the seed must abort exactly like the send path does.
+    //
+    // UNCHANGED BY R-18: the upload happens BEFORE `startTurn` is ever reached (`buildUserParts`
+    // throws inside `fireRelayTurn` ahead of the turn call entirely), so this scenario never
+    // touched the create/append protocol either before or after the collapse.
     h.buildUserParts.mockRejectedValue(new Error('Attachment storage is full.'))
     renderHandoff()
 
@@ -164,7 +179,6 @@ describe('BuilderPage — an append failure aborts the turn', () => {
     await act(async () => { await Promise.resolve() })
     expect(h.startTurn).not.toHaveBeenCalled()
     expect(h.buildFromPlan).not.toHaveBeenCalled()
-    expect(h.createBuild).not.toHaveBeenCalled()
   })
 
   it('a seed abort does not wedge the composer — the next send still reaches a build (R3)', async () => {
@@ -180,19 +194,28 @@ describe('BuilderPage — an append failure aborts the turn', () => {
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledWith('build-X', PLAN_CARD_ID, expect.any(String)))
   })
 
-  it('leaves for /projects when the append 404s (project deleted)', async () => {
-    h.createBuild.mockRejectedValue(new ApiError('Project not found.', 404))
+  it('leaves for /projects when the turn 404s (project deleted)', async () => {
+    // A REAL BUG THIS SUITE'S OLD SHAPE WAS MASKING: `startTurn` throws `TurnStartError` for
+    // every non-ok response, never `ApiError` — so `isConversationGone` (written for the retired
+    // `createBuild`'s `ApiError`) silently never matched a `startTurn` refusal, and a deleted
+    // project's 404 stranded the citizen on a chat that would refuse every future send the same
+    // way instead of sending them back to `/projects`. Fixed in `chatErrors.ts`'s
+    // `isConversationGone`, which now recognises `TurnStartError` too — this test asserts the
+    // navigation it silently stopped performing.
+    h.startTurn.mockRejectedValue(new TurnStartError(404, 'Project not found.'))
     renderHandoff()
     expect(await screen.findByTestId('projects-index')).toBeTruthy()
-    expect(h.startTurn).not.toHaveBeenCalled()
     expect(h.buildFromPlan).not.toHaveBeenCalled()
   })
 
   it("shows the server's own 400 message rather than blaming the connection", async () => {
-    h.createBuild.mockRejectedValue(new ApiError('header.projectId is required', 400))
+    // A raw `ApiError` would not reproduce this any more — the real `startTurn` throws
+    // `TurnStartError` for every non-ok response, and only a `TurnStartError` reaches
+    // `err.message` verbatim in `fireRelayTurn`'s catch (a plain `Error`/`ApiError` falls to the
+    // generic "could not be sent" copy instead).
+    h.startTurn.mockRejectedValue(new TurnStartError(400, 'header.projectId is required'))
     renderHandoff()
     expect(await screen.findByText('header.projectId is required')).toBeTruthy()
-    expect(h.startTurn).not.toHaveBeenCalled()
     expect(h.buildFromPlan).not.toHaveBeenCalled()
   })
 })
@@ -219,8 +242,12 @@ describe('BuilderPage — a refine turn', () => {
     await sendAndConfirm('make it blue')
 
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
-    // U7: a subsequent turn on an existing thread creates nothing — the row already exists.
-    expect(h.createBuild).not.toHaveBeenCalled()
+    // U7/R-18: a subsequent turn on an existing thread creates nothing — the row already exists,
+    // so `create` (the turn call's 4th argument) is omitted rather than passed. There is no
+    // longer a separate `createBuild` call to assert absent; the ONE call this send makes is
+    // `startTurn`, and this is the shape it takes when the thread is not empty.
+    const [, , , create] = h.startTurn.mock.calls[0]
+    expect(create).toBeUndefined()
     expect(h.buildFromPlan).toHaveBeenCalledWith('build-X', PLAN_CARD_ID, expect.any(String))
   })
 })
@@ -370,9 +397,11 @@ describe('BuilderPage — the StrictMode load strand (U7)', () => {
     await waitFor(() => expect(h.startTurn).toHaveBeenCalled())
     await act(async () => { await Promise.resolve() })
     // A remounted effect must not re-send the handed-off prompt: a doubled seed bills the user for
-    // two relay turns and leaves the thread arguing with itself over two briefs.
+    // two relay turns and leaves the thread arguing with itself over two briefs. R-18/U13 folded
+    // "one create for the one seeded first turn" into this same call — `startTurn` firing once
+    // IS the row being created once, so there is no second mock left to assert alongside it.
     expect(h.startTurn).toHaveBeenCalledTimes(1)
-    expect(h.createBuild).toHaveBeenCalledTimes(1) // one create for the one seeded first turn
+    expect(h.startTurn.mock.calls[0][3]).toMatchObject({ projectId: 'p1' })
   })
 })
 
