@@ -748,12 +748,15 @@ def _assert_anthropic_pairing(messages: list[ModelMessage]) -> None:
             }
         elif isinstance(message, ModelRequest):
             for part in message.parts:
-                rides_as_tool_result = isinstance(part, ToolReturnPart) or (
+                # Written inline rather than through a `rides_as_tool_result` flag so the
+                # isinstance narrowing survives to the assert: both arms carry `tool_call_id`,
+                # the wider part union does not, and a bare `RetryPromptPart` (no tool name) is
+                # a user message rather than a tool answer.
+                if isinstance(part, ToolReturnPart) or (
                     isinstance(part, RetryPromptPart) and part.tool_name is not None
-                )
-                if rides_as_tool_result:
-                    assert part.tool_call_id in seen_calls, (  # type: ignore[union-attr]
-                        f"orphan tool answer {part.tool_call_id!r} would 400 on the wire"  # type: ignore[union-attr]
+                ):
+                    assert part.tool_call_id in seen_calls, (
+                        f"orphan tool answer {part.tool_call_id!r} would 400 on the wire"
                     )
 
 
