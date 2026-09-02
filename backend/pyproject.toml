@@ -4,25 +4,25 @@ version = "0.1.0"
 description = "BIAL Citizen Developer Platform — FastAPI control-plane"
 requires-python = ">=3.14"
 dependencies = [
-    "aiohttp>=3.14.1",
-    "alembic>=1.18.5",
+    "aiohttp>=3.14.3",
+    "alembic>=1.19.1",
     "asyncpg>=0.31.0",
-    "authlib>=1.7.2",
+    "authlib>=1.8.0",
     "azure-identity>=1.25.3",
     "azure-mgmt-appcontainers>=5.0.0",
-    "azure-storage-blob>=12.30.0",
-    "cryptography>=49.0.0",
-    "greenlet>=3.5.3",
+    "azure-storage-blob>=12.30.1",
+    "cryptography>=50.0.1",
+    "greenlet>=3.5.5",
     "httpx>=0.28.1",
     "itsdangerous>=2.2.0",
-    "joserfc>=1.7.2",
+    "joserfc>=1.7.5",
     "openpyxl>=3.1.5",
-    "pydantic>=2.13.4",
-    "pydantic-settings>=2.14.2",
+    "pydantic>=2.13.5",
+    "pydantic-settings>=2.15.0",
     "python-docx>=1.2.0",
-    "sqlalchemy>=2.0.51",
+    "sqlalchemy>=2.0.52",
     "structlog>=26.1.0",
-    "taskiq>=0.12.4",
+    "taskiq>=0.12.6",
 ]
 
 [dependency-groups]
@@ -35,21 +35,21 @@ dependencies = [
 # ADR-0011 flipped Deferred -> Accepted on 2026-08-11 when sandbox reclamation (ADR-0029)
 # met its written flip condition; this comment used to say "no `worker` group this phase".
 api = [
-    "fastapi[standard]>=0.138.2",
-    "mammoth>=1.12.0",
+    "fastapi[standard]>=0.141.1",
+    "mammoth>=1.12.1",
     "markdownify>=1.2.3",
     "openpyxl>=3.1.5",
-    "pydantic-ai-slim[anthropic]>=2.5.0",
-    "redis>=8.0.1",
+    "pydantic-ai-slim[anthropic]>=2.37.0",
+    "redis>=8.1.0",
 ]
 dev = [
-    "fakeredis[lua]>=2.36.2",
-    "mypy>=2.1.0",
+    "fakeredis[lua]>=2.37.1",
+    "mypy>=2.3.1",
     "pyright>=1.1.411",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
-    "ruff>=0.15.20",
-    "ty>=0.0.55",
+    "ruff>=0.16.5",
+    "ty>=0.0.77",
 ]
 worker = [
     # NOT pinned to `redis>=7,<8`, deliberately. An earlier plan draft called for that, to dodge
