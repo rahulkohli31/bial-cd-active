@@ -187,10 +187,11 @@ describe('the working status — that the agent is thinking, never what about', 
   })
 
   it('carries no reasoning text into the DOM, because the part has nowhere to hold any', () => {
-    // The structural half of the guarantee. There is no field on `ReasoningPart` for text, and
-    // the converter hands the library an EMPTY reasoning part — so this is not "the renderer
-    // chooses not to draw it", it is "there is nothing to draw". The status line is the entire
-    // rendered content of the message.
+    // The structural half of the guarantee. There is no field on `ReasoningPart` for reasoning
+    // text, so the converter has none to pass on — what it hands the library is the platform's
+    // own status sentence, because a literally empty reasoning part is dropped. This is not
+    // "the renderer chooses not to draw it", it is "there is nothing to draw": the status line
+    // is the entire rendered content of the message.
     const { container } = mount([{ id: 'a1', role: 'assistant', parts: [{ type: 'reasoning' }], seq: 1 }], true)
 
     const message = container.querySelector('[data-testid="assistant-message"]')

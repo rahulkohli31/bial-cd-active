@@ -74,13 +74,11 @@ const TextPart: ThreadComponents['TextPart'] = ({ text, isUser }) => (
  * including a plain question. This one is driven by a real signal: the model is actually
  * reasoning, and it disappears the instant it starts writing or calling something.
  *
- * IT DOES APPEAR ON A TURN THAT RUNS TOOLS, and an earlier version of this comment said the
- * opposite — that `groupPartByType` files `reasoning` and `tool-call` under one chain-of-thought
- * key, so the activity group would cover it. The grouping is HIERARCHICAL: the two share a
- * `group-chainOfThought` parent and get separate `group-reasoning` / `group-tool` children, so
- * both render. That is the intended behaviour — a build shows the status before its first step —
- * but it was worth stating correctly, because the sentence read as a guarantee that this never
- * fires beside an activity group.
+ * IT DOES APPEAR ON A TURN THAT RUNS TOOLS. The grouping is HIERARCHICAL: `reasoning` and
+ * `tool-call` share a `group-chainOfThought` parent but get separate `group-reasoning` /
+ * `group-tool` children, so both render. That is intended — a build shows the status before its
+ * first step — and it is stated here because the shared parent key reads like a guarantee that
+ * this never fires beside an activity group.
  */
 const ReasoningGroup: ThreadComponents['ReasoningGroup'] = () => (
   <p data-testid="working-status" className="my-1 text-xs text-neutral">

@@ -18,6 +18,7 @@ import { fmt, createUserColumns } from './columns'
 import type { MergedUser } from './columns'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '../ui/table'
 import { Select, SelectValue, SelectTrigger, SelectContent, SelectItem } from '../ui/select'
+import { SYSTEM_PROMPT_RESERVE } from '../../utils/contextLimits'
 
 // The model's real context window — a per-conversation hard limit can be lowered below this
 // but never raised past it. The clamp is the SERVER's (`services/usage/limits.effective_context`),
@@ -31,7 +32,11 @@ import { Select, SelectValue, SelectTrigger, SelectContent, SelectItem } from '.
 // from), and the browser's own warning at the soft threshold is the friendly guard.
 const MODEL_CONTEXT_WINDOW = 200_000
 // The lowest per-conversation max that still leaves a usable chat, mirroring the server's
-// `CONTEXT_HARD_FLOOR` (twice its 8,000-token system-prompt reserve).
+// `CONTEXT_HARD_FLOOR`.
+//
+// DERIVED FROM THE RESERVE, exactly as the server derives it, rather than written out as a
+// number — `contextLimits.SYSTEM_PROMPT_RESERVE` is already the twin of the server's, so the
+// floor cannot drift from it on one side only.
 //
 // A NUMBER THE FORM HAS TO KNOW, not a duplicated rule. The server refuses anything below it
 // with a message naming it, so the two can never disagree about the OUTCOME; what this copy
@@ -39,7 +44,7 @@ const MODEL_CONTEXT_WINDOW = 200_000
 // context gate refuses every chat that person opens — including a brand-new empty one — and
 // the sentence they read tells them to start a new chat, which is the one thing that also
 // fails.
-const CONTEXT_HARD_FLOOR = 16_000
+const CONTEXT_HARD_FLOOR = SYSTEM_PROMPT_RESERVE * 2
 // The wire page size (how many rows one fetchUsers call asks for — capped at the
 // server's MAX_PAGE_SIZE=100) is deliberately larger than the table's on-screen page
 // size, so bulk-loading the roster takes 1/4 the round-trips it would at 25/request.

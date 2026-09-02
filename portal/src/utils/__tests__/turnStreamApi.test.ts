@@ -21,7 +21,8 @@ import {
 import * as turnStreamApi from '../turnStreamApi'
 
 const SNAPSHOT =
-  '{"type":"snapshot","seq":3,"turnId":"t1","turnStatus":"running","items":[],"textSoFar":"hi ","steps":[]}'
+  '{"type":"snapshot","seq":3,"turnId":"t1","turnStatus":"running","items":[],' +
+  '"parts":[{"type":"text","text":"hi "}],"working":false}'
 const DELTA = '{"type":"text_delta","seq":4,"text":"there"}'
 const ENDED = '{"type":"turn_ended","seq":5,"turnId":"t1","status":"completed"}'
 
@@ -171,7 +172,7 @@ describe('the compile frame (R17/R18) — an absent signal is never good news', 
     // framework error screen for the whole gap. The snapshot is what closes it.
     const [frame] = parseOne(
       '{"type":"snapshot","seq":3,"turnId":"t1","turnStatus":"running","items":[],' +
-        '"textSoFar":"","steps":[],"compileState":"failed"}',
+        '"parts":[],"working":false,"compileState":"failed"}',
     )
     expect(frame).toMatchObject({ type: 'snapshot', compileState: 'failed' })
   })
@@ -181,7 +182,7 @@ describe('the compile frame (R17/R18) — an absent signal is never good news', 
     // uncover a pane on the strength of a field the server never sent.
     const [frame] = parseOne(
       '{"type":"snapshot","seq":3,"turnId":"t1","turnStatus":"running","items":[],' +
-        '"textSoFar":"","steps":[]}',
+        '"parts":[],"working":false}',
     )
     expect(frame).toMatchObject({ type: 'snapshot', compileState: null })
   })

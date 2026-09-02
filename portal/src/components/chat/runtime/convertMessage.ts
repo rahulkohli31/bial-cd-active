@@ -100,7 +100,7 @@ const TOOL_NAME = 'activity'
  * the correct sentence on screen rather than a placeholder — fail-safe rather than a marker
  * nobody would recognise.
  */
-export const REASONING_STATUS_TEXT = 'Working on your app'
+const REASONING_STATUS_TEXT = 'Working on your app'
 
 /** The one place a step's wire state becomes a rendered state. */
 function activityState(state: 'ok' | 'failed' | 'pending'): ActivityState {
