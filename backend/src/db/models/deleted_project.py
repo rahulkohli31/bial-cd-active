@@ -28,7 +28,9 @@ deletion actually wants and could never reconstruct afterwards.
 WHO WRITES IT AND WHO READS IT. The remark is written by whoever deletes — usually the
 project's OWNER, not an administrator — and read by administrators. §13.2 requires the
 dialog to say so, because a person writing a private-feeling note deserves to know it is not
-private.
+private. The dialog names them too, but it does not ASK: `deleted_by_name` is stamped from
+the session next to `deleted_by`, so the readable label and the durable key are the same
+person by construction rather than by trust — see those columns.
 """
 
 from __future__ import annotations
@@ -50,6 +52,11 @@ MAX_DELETE_REMARK_WORDS = 50
 # A character ceiling as a paste backstop only. 50 words of ordinary English is far under
 # this; a user should never meet it, and the word rule is the one they are told about.
 MAX_DELETE_REMARK_CHARS = 2000
+# Wide enough for either source the server stamps `deleted_by_name` from, so the value never
+# needs truncating on the way in: `users.display_name` is 256 and `users.email` is 320. A
+# truncation here would quietly corrupt the one field an administrator reads to identify a
+# person, so the column is sized to make it impossible rather than handled.
+DELETED_BY_NAME_WIDTH = 320
 
 
 class DeletedProject(Base):
@@ -68,9 +75,23 @@ class DeletedProject(Base):
     project_name: Mapped[str] = mapped_column(sa.String(120), nullable=False)
     owner_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False, index=True)
     owner_email: Mapped[str] = mapped_column(sa.String(320), nullable=False)
-    # Usually the same person as the owner — a citizen deleting their own project — but
-    # stored separately because it does not have to be.
+    # WHO DELETED IT, authoritatively. Taken from the authenticated session, never from the
+    # request body, and this is the column to trust: see `deleted_by_name` below for the one
+    # that cannot be. Usually the same person as the owner — a citizen deleting their own
+    # project — but stored separately because it does not have to be.
     deleted_by: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    # `deleted_by` IN WORDS. Stamped by the server from the authenticated session —
+    # `display_name`, or the email when Entra gave us no display name — and NEVER read from
+    # the request body, which is the whole point: a name the client supplies can disagree
+    # with the account that acted, and this field exists to be read by an administrator
+    # deciding who deleted something. It cannot disagree, because nothing outside this
+    # process can set it.
+    #
+    # It is stored rather than joined for the same reason as `owner_email`: `users` rows
+    # outlive projects, but a tombstone that needs a second lookup to name a person is one
+    # an administrator will read wrong at a glance. `deleted_by` stays the durable key —
+    # this is the label on it, correct as of the moment of deletion.
+    deleted_by_name: Mapped[str] = mapped_column(sa.String(DELETED_BY_NAME_WIDTH), nullable=False)
     deleted_at: Mapped[datetime.datetime] = mapped_column(
         sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
     )

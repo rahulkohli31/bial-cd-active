@@ -36,7 +36,13 @@ why. (#158)
 
 - **Deleting a project now asks why**, in five to fifty words, instead of asking you to retype
   the project's name. Retyping a name proves you can read it, not that you meant it. The reason
-  is kept so an administrator can see why a project went, and the dialog says so.
+  is required before the Delete button will do anything, and it is kept with the deletion so an
+  administrator can see why a project went. The dialog says so, because a note that feels
+  private is not.
+- **A deletion is recorded against the account that made it**, and the dialog names that account
+  before you confirm. It is not something you type: a name a person can write in is a name that
+  can say somebody else, and this is the field an administrator reads to find out who deleted
+  something.
 - **Project titles are capped at about six to eight words** on both creating and renaming. The
   old limit was 120 characters — roughly twenty words — which reads as no limit at all to
   someone naming a tool. The counter beside the field shows where you are, and names already

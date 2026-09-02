@@ -12,6 +12,13 @@
  *   2. It asks WHY, in 5-50 words, and the confirm button stays disabled until that
  *      reason is inside the bounds (#158 §13.1/§13.2).
  *
+ *      IT NAMES WHO, BUT DOES NOT ASK. The deletion is recorded against an account, and the
+ *      dialog says which one — but the server stamps that from the session and ignores
+ *      anything sent for it. The field briefly WAS a required input, and that was wrong: a
+ *      name this dialog could set is a name that can disagree with the account that acted,
+ *      and it is the field an administrator reads to answer precisely that question. Shown,
+ *      never collected.
+ *
  *      THE TYPE-THE-NAME GATE IS GONE. Retyping a name proves you can read, not that you
  *      meant it — and it taught people to copy-paste past the warning they were meant to be
  *      reading. The reason is a better gate for the same purpose AND it is still useful a
@@ -31,6 +38,7 @@ import { useEffect, useState } from 'react'
 import { AlertTriangle, Loader2 } from 'lucide-react'
 import { CONVERSATION_LIST_CAP, listProjectConversations } from '../../utils/conversationApi'
 import type { Project } from '../../utils/projectApi'
+import { getStoredUser } from '../../utils/auth'
 import { Textarea } from '../ui/textarea'
 import {
   countWords,
@@ -108,6 +116,16 @@ export default function ProjectDeleteDialog({
   // flight, which is a different concern from whether the reason is valid.
   const canDelete = remarkValid && !busy
 
+  // WHO THIS WILL BE RECORDED AGAINST, shown rather than asked. The server stamps the name
+  // from the session and ignores anything the client sends, so this is a readback of what
+  // WILL be stored, not an input that decides it — which is why it cannot be edited.
+  //
+  // `null` when the profile has not been cached (it is fetched at sign-in, so this is the
+  // rare cold path). The row is still stamped correctly either way, so the fallback says
+  // the true thing without naming anybody it cannot name.
+  const me = getStoredUser()
+  const signedAs = me === null ? null : me.display_name || me.email
+
   const confirm = async (): Promise<void> => {
     if (!canDelete) return
     setBusy(true)
@@ -133,6 +151,16 @@ export default function ProjectDeleteDialog({
 
         <p className="text-sm font-semibold text-tertiary mt-4">
           Are you sure you want to delete this project?
+        </p>
+
+        {/* NAMED, NOT ASKED. Telling someone which account a permanent deletion is about to
+            be recorded against is worth a line; asking them to type it is not, because a
+            typed name can name the wrong person and this is the field an administrator
+            reads to find out who deleted something. */}
+        <p className="text-[11px] text-neutral mt-3">
+          {signedAs === null
+            ? 'This deletion is recorded against your account.'
+            : `Recorded against ${signedAs}.`}
         </p>
 
         <label className="block mt-3">

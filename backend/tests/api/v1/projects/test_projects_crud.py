@@ -25,6 +25,7 @@ from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.extract.office import PPTX_MEDIA_TYPE
 from src.services.projects import delete_project_cascade
 from src.services.storage import AppContainerStore, recovery_key, snapshot_key
+from tests.api.v1.projects.conftest import DELETE_BODY
 from tests.factories import (
     AppRegistryFactory,
     ConversationFactory,
@@ -206,7 +207,7 @@ async def test_get_patch_delete_cross_user_404(client, db_session) -> None:
             "DELETE",
             f"/v1/projects/{victim.id}",
             headers=headers,
-            json={"remark": "No longer needed by the ground operations team"},
+            json=DELETE_BODY,
         )
     ).status_code == 404
     # The victim row is untouched.
@@ -386,7 +387,7 @@ async def test_delete_cascades_children_and_sweeps_blobs(client, db_session, fak
         "DELETE",
         f"/v1/projects/{project.id}",
         headers=headers,
-        json={"remark": "No longer needed by the ground operations team"},
+        json=DELETE_BODY,
     )
     assert resp.status_code == 200
     assert resp.json() == {"ok": True}
@@ -455,7 +456,7 @@ async def test_delete_sweeps_the_apps_blob_container(
         "DELETE",
         f"/v1/projects/{project.id}",
         headers=headers,
-        json={"remark": "No longer needed by the ground operations team"},
+        json=DELETE_BODY,
     )
     assert resp.status_code == 200
     # The app's per-app Blob container was swept post-commit (wholesale, by app id).
@@ -477,7 +478,7 @@ async def test_delete_survives_a_container_sweep_failure(
         "DELETE",
         f"/v1/projects/{project.id}",
         headers=headers,
-        json={"remark": "No longer needed by the ground operations team"},
+        json=DELETE_BODY,
     )
     assert resp.status_code == 200
     assert await db_session.get(Project, project.id) is None  # the delete still committed
@@ -496,7 +497,7 @@ async def test_delete_succeeds_with_storage_disabled(client, db_session, fake_st
         "DELETE",
         f"/v1/projects/{project.id}",
         headers=headers,
-        json={"remark": "No longer needed by the ground operations team"},
+        json=DELETE_BODY,
     )
     assert resp.status_code == 200
     assert await db_session.get(Project, project.id) is None
@@ -740,7 +741,7 @@ async def test_delete_sweeps_a_bundle_written_between_the_gather_and_the_commit(
         "DELETE",
         f"/v1/projects/{project.id}",
         headers=headers,
-        json={"remark": "No longer needed by the ground operations team"},
+        json=DELETE_BODY,
     )
 
     assert resp.status_code == 200
@@ -766,7 +767,7 @@ async def test_delete_sweeps_a_bundle_written_before_the_delete_starts(
         "DELETE",
         f"/v1/projects/{project.id}",
         headers=headers,
-        json={"remark": "No longer needed by the ground operations team"},
+        json=DELETE_BODY,
     )
 
     assert resp.status_code == 200
@@ -796,7 +797,7 @@ async def test_delete_fails_and_keeps_the_project_when_the_pre_commit_gather_rai
             "DELETE",
             f"/v1/projects/{project.id}",
             headers=headers,
-            json={"remark": "No longer needed by the ground operations team"},
+            json=DELETE_BODY,
         )
     await savepoint.rollback()
 
@@ -827,7 +828,7 @@ async def test_delete_returns_200_and_logs_when_the_post_commit_sweep_fails(
             "DELETE",
             f"/v1/projects/{project.id}",
             headers=headers,
-            json={"remark": "No longer needed by the ground operations team"},
+            json=DELETE_BODY,
         )
 
     assert resp.status_code == 200
@@ -905,7 +906,7 @@ async def test_delete_returns_200_and_logs_when_the_re_walk_list_raises(
             "DELETE",
             f"/v1/projects/{project.id}",
             headers=headers,
-            json={"remark": "No longer needed by the ground operations team"},
+            json=DELETE_BODY,
         )
 
     assert resp.status_code == 200
@@ -935,7 +936,7 @@ async def test_the_re_walk_pages_past_the_first_page(app, client, db_session) ->
         "DELETE",
         f"/v1/projects/{project.id}",
         headers=headers,
-        json={"remark": "No longer needed by the ground operations team"},
+        json=DELETE_BODY,
     )
 
     assert resp.status_code == 200
@@ -967,7 +968,7 @@ async def test_the_re_walk_never_reaches_another_users_app(app, client, db_sessi
         "DELETE",
         f"/v1/projects/{project_a.id}",
         headers=headers_a,
-        json={"remark": "No longer needed by the ground operations team"},
+        json=DELETE_BODY,
     )
 
     assert resp.status_code == 200
@@ -997,7 +998,7 @@ async def test_a_bundle_written_after_the_re_walk_survives_the_delete(
         "DELETE",
         f"/v1/projects/{project.id}",
         headers=headers,
-        json={"remark": "No longer needed by the ground operations team"},
+        json=DELETE_BODY,
     )
 
     assert resp.status_code == 200
@@ -1077,7 +1078,7 @@ async def test_delete_is_refused_while_this_projects_app_is_building(
         "DELETE",
         f"/v1/projects/{project.id}",
         headers=headers,
-        json={"remark": "No longer needed by the ground operations team"},
+        json=DELETE_BODY,
     )
 
     assert resp.status_code == 409
@@ -1105,7 +1106,7 @@ async def test_delete_proceeds_when_no_build_session_is_live(
         "DELETE",
         f"/v1/projects/{project.id}",
         headers=headers,
-        json={"remark": "No longer needed by the ground operations team"},
+        json=DELETE_BODY,
     )
 
     assert resp.status_code == 200
@@ -1133,7 +1134,7 @@ async def test_a_live_session_in_another_project_does_not_block_this_delete(
         "DELETE",
         f"/v1/projects/{project_b.id}",
         headers=headers,
-        json={"remark": "No longer needed by the ground operations team"},
+        json=DELETE_BODY,
     )
 
     assert resp.status_code == 200
@@ -1166,7 +1167,7 @@ async def test_delete_is_503_when_redis_errors_during_the_guard(
         "DELETE",
         f"/v1/projects/{project.id}",
         headers=headers,
-        json={"remark": "No longer needed by the ground operations team"},
+        json=DELETE_BODY,
     )
 
     assert resp.status_code == 503
@@ -1196,7 +1197,7 @@ async def test_delete_is_503_when_the_registry_read_errors_during_the_guard(
         "DELETE",
         f"/v1/projects/{project.id}",
         headers=headers,
-        json={"remark": "No longer needed by the ground operations team"},
+        json=DELETE_BODY,
     )
 
     assert resp.status_code == 503
@@ -1218,7 +1219,7 @@ async def test_delete_proceeds_when_redis_is_not_configured(app, client, db_sess
         "DELETE",
         f"/v1/projects/{project.id}",
         headers=headers,
-        json={"remark": "No longer needed by the ground operations team"},
+        json=DELETE_BODY,
     )
 
     assert resp.status_code == 200
@@ -1240,7 +1241,7 @@ async def test_delete_fails_closed_when_the_lock_names_no_app(
         "DELETE",
         f"/v1/projects/{project.id}",
         headers=headers,
-        json={"remark": "No longer needed by the ground operations team"},
+        json=DELETE_BODY,
     )
 
     assert resp.status_code == 409
@@ -1265,7 +1266,7 @@ async def test_delete_fails_closed_when_the_registry_carries_no_app_name(
         "DELETE",
         f"/v1/projects/{project.id}",
         headers=headers,
-        json={"remark": "No longer needed by the ground operations team"},
+        json=DELETE_BODY,
     )
 
     assert resp.status_code == 409
@@ -1290,7 +1291,7 @@ async def test_delete_of_an_app_less_project_is_never_blocked_by_a_live_build(
         "DELETE",
         f"/v1/projects/{empty.id}",
         headers=headers,
-        json={"remark": "No longer needed by the ground operations team"},
+        json=DELETE_BODY,
     )
 
     assert resp.status_code == 200
@@ -1341,7 +1342,7 @@ async def test_a_relaunched_preview_does_not_block_the_delete_and_is_not_torn_do
         "DELETE",
         f"/v1/projects/{project.id}",
         headers=headers,
-        json={"remark": "No longer needed by the ground operations team"},
+        json=DELETE_BODY,
     )
 
     # The delete PROCEEDS — the guard never fires, because there is no lock to see.

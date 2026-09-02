@@ -40,6 +40,14 @@ def upgrade() -> None:
         sa.Column("owner_id", PGUUID(as_uuid=True), nullable=False),
         sa.Column("owner_email", sa.String(320), nullable=False),
         sa.Column("deleted_by", PGUUID(as_uuid=True), nullable=False),
+        # `deleted_by` in words, stamped from the session — never from the request body.
+        # 320 so neither source (`users.display_name` at 256, `users.email` at 320) can
+        # ever need truncating. See the model's docstring.
+        #
+        # NOT NULL with no server_default, which is only free because this column ships in
+        # the CREATE rather than in a later ALTER: the table is created empty in the same
+        # statement, so there is nothing to backfill.
+        sa.Column("deleted_by_name", sa.String(320), nullable=False),
         sa.Column(
             "deleted_at",
             sa.DateTime(timezone=True),

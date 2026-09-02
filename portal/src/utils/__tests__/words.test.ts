@@ -55,3 +55,22 @@ describe('the shared limits', () => {
     expect(MAX_DELETE_REASON_WORDS).toBe(50)
   })
 })
+
+describe('the whitespace set matches Python exactly', () => {
+  // The six code points `\s` gets wrong, found by sweeping all 1,114,112 of them rather
+  // than guessing. Python's `str.isspace()` includes the separators U+001C-U+001F and
+  // U+0085; `\s` does not. `\s` matches U+FEFF; Python does not. Nobody types these, but a
+  // title pasted from a spreadsheet, a mainframe export or a BOM'd file carries them — and
+  // a counter that disagrees with the validator is the one thing this module exists to
+  // prevent.
+  it.each([
+    ['a b', 2, 'file separator splits, as in Python'],
+    ['ab', 2, 'group separator'],
+    ['ab', 2, 'record separator'],
+    ['ab', 2, 'unit separator'],
+    ['ab', 2, 'NEL'],
+    ['﻿word', 1, 'a BOM is NOT a separator — it joins the word Python sees'],
+  ])('%j counts as %i (%s)', (input, expected) => {
+    expect(countWords(input)).toBe(expected)
+  })
+})

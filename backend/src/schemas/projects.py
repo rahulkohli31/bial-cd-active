@@ -122,6 +122,12 @@ class ProjectDeleteRequest(CamelModel):
     none of it comes back. #158 §13.1 replaced the type-the-name gate with a plain
     confirmation plus a stated reason: retyping a name proves you can read, not that you
     meant it, and the reason is the part that is still useful a month later.
+
+    THE REASON IS THE ONLY THING THE CLIENT GETS TO SAY. The deletion also records WHO, but
+    that is stamped by the route from the authenticated session, not carried here. It was
+    briefly a body field and that was wrong: a name the client supplies can name somebody
+    who did not act, and the field exists precisely so an administrator can tell who did.
+    An extra `deletedByName` in the body is ignored, as Pydantic ignores any unknown key.
     """
 
     remark: str

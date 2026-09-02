@@ -1,7 +1,8 @@
 /**
- * ProjectDeleteDialog — the two guarantees a destructive confirm owes the user:
- *   1. The confirm button will not arm until the typed text matches the project
- *      name EXACTLY — a trailing space or wrong case is not a match.
+ * ProjectDeleteDialog — the guarantees a destructive confirm owes the user:
+ *   1. The confirm button will not arm until the reason is a valid 5-50 words,
+ *      and the dialog NAMES the account the deletion will be recorded against
+ *      without asking anyone to type it.
  *   2. It names the cascade with a real chat count, and it never flashes
  *      "all 0 chats" while that count is still in flight — the numberless copy
  *      stands in until the count resolves.
@@ -12,7 +13,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, act, cleanup } from '@testing-library/react'
 
-const h = vi.hoisted(() => ({ listProjectConversations: vi.fn() }))
+const h = vi.hoisted(() => ({ listProjectConversations: vi.fn(), getStoredUser: vi.fn() }))
+vi.mock('../../../utils/auth', () => ({ getStoredUser: h.getStoredUser }))
 vi.mock('../../../utils/conversationApi', () => ({
   listProjectConversations: h.listProjectConversations,
   // The real server cap. The dialog compares the count against it, so a mock that omits it
@@ -37,6 +39,7 @@ const project: Project = {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  h.getStoredUser.mockReturnValue({ email: 'asha@bial.example', display_name: 'Asha Rao' })
 })
 afterEach(() => cleanup())
 
@@ -73,6 +76,37 @@ describe('ProjectDeleteDialog — confirm gating', () => {
     // The reason travels to the caller: the page forwards it to the API, which refuses
     // independently if it is out of bounds.
     expect(onConfirm).toHaveBeenCalledWith('no longer needed by ground ops')
+  })
+
+  it('NAMES the account without asking for it, and cannot be edited', async () => {
+    // The field was briefly a required text input. A name this dialog can set is a name
+    // that can disagree with the account that acted, and that is the one question the
+    // stored name exists to answer — so it is shown, never collected.
+    h.listProjectConversations.mockResolvedValue([])
+    render(<ProjectDeleteDialog project={project} onClose={() => {}} onConfirm={vi.fn()} />)
+
+    expect(screen.getByText(/recorded against asha rao/i)).toBeTruthy()
+    expect(screen.queryByLabelText(/your name/i)).toBeNull()
+    // Liveness: the reason IS still an input, so the absence above means something.
+    expect(screen.getByLabelText(/why are you deleting/i)).toBeTruthy()
+  })
+
+  it('falls back to the email when Entra gave no display name', async () => {
+    h.getStoredUser.mockReturnValue({ email: 'asha@bial.example', display_name: null })
+    h.listProjectConversations.mockResolvedValue([])
+    render(<ProjectDeleteDialog project={project} onClose={() => {}} onConfirm={vi.fn()} />)
+
+    expect(screen.getByText(/recorded against asha@bial\.example/i)).toBeTruthy()
+  })
+
+  it('still says the deletion is recorded when the profile is not cached', async () => {
+    // The cold path. It must not name nobody, and it must not invent a name — the server
+    // stamps the row correctly either way, so the copy says the true thing without one.
+    h.getStoredUser.mockReturnValue(null)
+    h.listProjectConversations.mockResolvedValue([])
+    render(<ProjectDeleteDialog project={project} onClose={() => {}} onConfirm={vi.fn()} />)
+
+    expect(screen.getByText(/recorded against your account/i)).toBeTruthy()
   })
 
   it('no longer asks for the project name at all', async () => {

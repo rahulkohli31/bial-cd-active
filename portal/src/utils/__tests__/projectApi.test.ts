@@ -148,6 +148,16 @@ describe('deleteProject', () => {
     })
     expect(result).toEqual({ ok: true })
   })
+
+  it('sends the reason and NOTHING about who is deleting', async () => {
+    // Who deleted it is stamped server-side from the session. It was briefly a body field,
+    // and a client that can set that name can record a deletion under somebody else's —
+    // the exact question the stored name exists to answer. `toEqual` is the assertion that
+    // catches a reintroduction: an extra key here fails.
+    const fetchImpl = fetchReturning(200, { ok: true })
+    await deleteProject('p1', 'no longer needed by ground ops', deps(fetchImpl))
+    expect(Object.keys(JSON.parse(String(fetchImpl.mock.calls[0][1]?.body)))).toEqual(['remark'])
+  })
 })
 
 describe('generateDescription', () => {

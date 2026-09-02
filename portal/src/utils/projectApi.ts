@@ -272,9 +272,14 @@ export async function patchProject(id: string, patch: ProjectPatch, deps: AuthFe
   return toProject(await res.json())
 }
 
-/** Delete a project; the server cascades its chats, app, and blobs. */
 /**
- * Delete a project, with the reason the server now requires (#158 §13.2).
+ * Delete a project, with the reason the server requires (#158 §13.2). The server cascades
+ * its chats, app, database and blobs; none of it comes back.
+ *
+ * THE REASON IS ALL THE CLIENT SENDS. The deletion also records WHO deleted it, but that is
+ * stamped server-side from the session — deliberately not a field here, because a name this
+ * code could set is a name that can disagree with the account that acted, and an
+ * administrator reads that field to answer exactly that question.
  *
  * A BODY ON A DELETE is unusual — RFC 9110 gives it no defined semantics, and some clients
  * decline to make it easy (httpx omits `json=` from its `.delete()`). It is used here

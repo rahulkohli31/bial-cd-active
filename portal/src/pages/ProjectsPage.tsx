@@ -115,6 +115,7 @@ export default function ProjectsPage(): React.JSX.Element {
   const [error, setError] = useState<Error | null>(null)
   const [counts, setCounts] = useState<ProjectCounts | null>(null)
   const [reloadNonce, setReloadNonce] = useState(0)
+  const [deleteInFlight, setDeleteInFlight] = useState(false)
 
   // Out-of-order guard: a slow page that lands after a newer one must not overwrite it.
   const requestId = useRef(0)
@@ -188,15 +189,23 @@ export default function ProjectsPage(): React.JSX.Element {
 
   const handleDelete = async (project: Project, remark: string): Promise<void> => {
     setDeleting(null)
+    setDeleteInFlight(true)
     setItems((rows) => rows.filter((p) => p.id !== project.id))
     try {
       await deleteProject(project.id, remark)
       setReloadNonce((n) => n + 1) // totals and the counts strip both move
     } catch (caught) {
-      // 404 = already gone (another tab). That IS the desired end state.
-      if (caught instanceof ApiError && caught.status === 404) return
+      // 404 = already gone (another tab). That IS the desired end state, so no toast — but
+      // the row still left the list, so `total` and the counts strip have to move with it.
+      // Returning early here left "Showing 1–7 of 8" on screen.
+      if (caught instanceof ApiError && caught.status === 404) {
+        setReloadNonce((n) => n + 1)
+        return
+      }
       setReloadNonce((n) => n + 1) // put the row back
       setToast(caught instanceof Error ? caught.message : 'Could not delete the project.')
+    } finally {
+      setDeleteInFlight(false)
     }
   }
 
@@ -204,9 +213,24 @@ export default function ProjectsPage(): React.JSX.Element {
   const settled = appliedQuery !== null
   const showSkeleton = isEmpty && (loading || !settled)
   const showFirstPageError = error !== null && isEmpty
-  const showFirstRun = settled && !loading && error === null && isEmpty && appliedQuery === ''
+  // `deleting` covers the round trip: the optimistic removal can empty `items` while the
+  // request is still in flight, and "Nothing here yet" is a claim about the ACCOUNT, not
+  // about this page. Deleting your last row on page 2 must not tell you that you have no
+  // projects for the length of a database drop.
+  const showFirstRun =
+    settled && !loading && !deleteInFlight && error === null && isEmpty && appliedQuery === ''
   const showNoMatches = settled && !loading && error === null && isEmpty && !!appliedQuery
   const showRows = !isEmpty
+  // A SLIDING WINDOW, not the first five. `Math.min(totalPages, 5)` rendered pages 1-5
+  // whatever page you were on, so from page 6 nothing was marked active and the only way
+  // deeper was clicking Next repeatedly — with the page you were reading not shown at all.
+  const pageWindow = useMemo(() => {
+    const span = Math.min(5, Math.max(totalPages, 1))
+    // Centre on the current page, then clamp so the window never runs past either end.
+    const first = Math.min(Math.max(page - Math.floor(span / 2), 1), Math.max(totalPages - span + 1, 1))
+    return Array.from({ length: span }, (_, i) => first + i)
+  }, [page, totalPages])
+
   const firstOnPage = useMemo(() => (page - 1) * pageSize + 1, [page, pageSize])
   const lastOnPage = useMemo(() => firstOnPage + items.length - 1, [firstOnPage, items.length])
 
@@ -463,7 +487,7 @@ export default function ProjectsPage(): React.JSX.Element {
                         className={page <= 1 ? 'pointer-events-none opacity-40' : undefined}
                       />
                     </PaginationItem>
-                    {Array.from({ length: Math.min(totalPages, 5) }, (_, i) => i + 1).map((n) => (
+                    {pageWindow.map((n) => (
                       <PaginationItem key={n}>
                         <PaginationLink isActive={n === page} onClick={() => setPage(n)}>
                           {n}

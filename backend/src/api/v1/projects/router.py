@@ -466,6 +466,13 @@ async def delete_project(
             owner_id=project.user_id,
             owner_email=user.email,
             deleted_by=user.id,
+            # BOTH from the session, never the body. `deleted_by` is the durable key and
+            # this is its readable label, so they must name the same person by construction;
+            # a client-supplied name could not be trusted by the administrator who reads it.
+            # `display_name` is nullable — Entra does not always give one — and the email
+            # identifies the account just as well, so it stands in rather than leaving the
+            # one human-readable field on the row blank.
+            deleted_by_name=user.display_name or user.email,
             remark=body.remark,
             chats_deleted=chats_deleted,
             had_app=app_id is not None,

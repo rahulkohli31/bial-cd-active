@@ -39,6 +39,7 @@ from src.services.appdb.engine import get_maintenance_engine
 from src.services.appdb.provision import control_plane_dsn, ensure_project_database
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.storage import AppContainerStore
+from tests.api.v1.projects.conftest import DELETE_BODY
 from tests.factories import AppRegistryFactory, ProjectFactory, UserFactory
 from tests.services.appdb.helpers import scalar_on
 
@@ -108,7 +109,7 @@ async def test_delete_drops_the_database_the_role_and_the_container(
         "DELETE",
         f"/v1/projects/{project.id}",
         headers=headers,
-        json={"remark": "No longer needed by the ground operations team"},
+        json=DELETE_BODY,
     )
 
     assert resp.status_code == 200
@@ -153,7 +154,7 @@ async def test_an_app_less_project_still_has_its_database_dropped(
         "DELETE",
         f"/v1/projects/{project.id}",
         headers=headers,
-        json={"remark": "No longer needed by the ground operations team"},
+        json=DELETE_BODY,
     )
 
     assert resp.status_code == 200
@@ -212,7 +213,7 @@ async def test_a_live_preview_connection_does_not_survive_the_delete(
                 "DELETE",
                 f"/v1/projects/{project.id}",
                 headers=headers,
-                json={"remark": "No longer needed by the ground operations team"},
+                json=DELETE_BODY,
             )
             assert resp.status_code == 200
     except DBAPIError:
@@ -257,7 +258,7 @@ async def test_a_live_build_still_refuses_the_delete_and_leaves_the_database_alo
         "DELETE",
         f"/v1/projects/{project.id}",
         headers=headers,
-        json={"remark": "No longer needed by the ground operations team"},
+        json=DELETE_BODY,
     )
 
     assert resp.status_code == 409
@@ -294,7 +295,7 @@ async def test_a_failed_drop_logs_an_orphan_and_still_returns_success(
             "DELETE",
             f"/v1/projects/{project.id}",
             headers=headers,
-            json={"remark": "No longer needed by the ground operations team"},
+            json=DELETE_BODY,
         )
 
     assert resp.status_code == 200
@@ -330,7 +331,7 @@ async def test_a_salt_that_cannot_reach_the_cluster_still_returns_success(
             "DELETE",
             f"/v1/projects/{project.id}",
             headers=headers,
-            json={"remark": "No longer needed by the ground operations team"},
+            json=DELETE_BODY,
         )
 
     assert resp.status_code == 200
@@ -355,7 +356,7 @@ async def test_a_project_without_a_database_deletes_exactly_as_before(
         "DELETE",
         f"/v1/projects/{project.id}",
         headers=headers,
-        json={"remark": "No longer needed by the ground operations team"},
+        json=DELETE_BODY,
     )
 
     assert resp.status_code == 200

@@ -329,9 +329,9 @@ describe('create and delete', () => {
     await screen.findByText('Alpha')
 
     fireEvent.click(screen.getByLabelText('Delete Alpha'))
-    // The dialog now gates on a 5-50 word reason (#158 §13.1), which the page forwards to
-    // the API. Its own bounds are asserted in ProjectDeleteDialog.test.tsx; here it just
-    // has to be valid so the delete runs.
+    // The dialog gates on a 5-50 word reason (#158 §13.1), which the page forwards to the
+    // API. Its own bounds are asserted in ProjectDeleteDialog.test.tsx; here it just has to
+    // be valid so the delete runs.
     fireEvent.change(await screen.findByLabelText(/why are you deleting/i), {
       target: { value: 'no longer needed by ground ops' },
     })
@@ -383,5 +383,68 @@ describe('create and delete', () => {
     // appear in the gap.
     expect(screen.queryByTestId('projects-empty')).toBeNull()
     expect(await screen.findByText('Alpha', undefined, { timeout: 3000 })).toBeTruthy()
+  })
+
+  it('the page window SLIDES, so a deep page is reachable and marked active', async () => {
+    // Was `Math.min(totalPages, 5)` — pages 1-5 whatever page you were on, so from page 6
+    // nothing read as active and the only way deeper was clicking Next repeatedly.
+    //
+    // Driven through real navigation, because the window is computed from the component's
+    // OWN page state: putting `page: 8` in the mocked response proves nothing, since the
+    // response does not move the state that drives the request.
+    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Alpha')], { total: 80, totalPages: 10 }))
+    renderPage()
+    await screen.findByText('Alpha')
+
+    // Page 1: the window is clamped to the start, so 6 is not offered yet.
+    expect(screen.getByRole('button', { name: '1' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: '6' })).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: '5' }))
+
+    // Centred on 5 now: 3..7. The page you are reading is offered and 1 has slid off.
+    await waitFor(() => expect(screen.getByRole('button', { name: '7' })).toBeTruthy())
+    expect(screen.queryByRole('button', { name: '1' })).toBeNull()
+  })
+
+  it('deleting the last row on a page does not flash "Nothing here yet"', async () => {
+    // The optimistic removal empties `items` while the request is in flight, and that
+    // request drops a database. "Nothing here yet" is a claim about the ACCOUNT, so
+    // showing it to someone with 40 projects for the length of a round trip is a lie.
+    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Alpha')], { total: 40, totalPages: 5 }))
+    let release: () => void = () => {}
+    h.deleteProject.mockReturnValue(new Promise<void>((r) => (release = () => r())))
+    renderPage()
+    await screen.findByText('Alpha')
+
+    fireEvent.click(screen.getByLabelText('Delete Alpha'))
+    fireEvent.change(await screen.findByLabelText(/why are you deleting/i), {
+      target: { value: 'no longer needed by ground ops' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /delete project/i }))
+
+    await waitFor(() => expect(screen.queryByText('Alpha')).toBeNull()) // optimistic removal
+    expect(screen.queryByTestId('projects-empty')).toBeNull() // ...but not the first-run screen
+
+    release()
+  })
+
+  it('a 404 delete still refreshes the total, which the row left stale', async () => {
+    // Already gone elsewhere is the desired end state, so no toast — but the row did leave
+    // the list, and returning early left "Showing 1–7 of 8" on screen.
+    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Alpha')], { total: 8, totalPages: 1 }))
+    h.deleteProject.mockRejectedValue(new ApiError('gone', 404))
+    renderPage()
+    await screen.findByText('Alpha')
+    h.listProjects.mockClear()
+
+    fireEvent.click(screen.getByLabelText('Delete Alpha'))
+    fireEvent.change(await screen.findByLabelText(/why are you deleting/i), {
+      target: { value: 'no longer needed by ground ops' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /delete project/i }))
+
+    await waitFor(() => expect(h.listProjects).toHaveBeenCalled()) // totals refetched
+    expect(screen.queryByRole('alert')).toBeNull() // and still no scary toast
   })
 })

@@ -1,4 +1,9 @@
-"""The reason a deletion has to give, and the tombstone that keeps it (#158 §13.2, §13.3).
+"""What a deletion has to say for itself, and the tombstone that keeps it (#158 §13).
+
+The body of `DELETE /v1/projects/{id}` carries exactly ONE field, the reason, 5 to 50 words.
+The deletion also records WHO, but the route stamps that from the session rather than
+accepting it — so the tests for it are not validation tests at all, they are tests that the
+client CANNOT influence it. Both live here because they are one request.
 
 Two things are being pinned, and they are separate claims:
 
@@ -43,10 +48,13 @@ async def _project(db, user_id, name: str = "Visitor Log"):
     return project
 
 
+async def _delete_body(client, project_id, headers, body: dict[str, str]):
+    """The raw request, for the cases that are ABOUT the body's shape."""
+    return await client.request("DELETE", f"{_PROJECTS}/{project_id}", headers=headers, json=body)
+
+
 async def _delete(client, project_id, headers, remark: str):
-    return await client.request(
-        "DELETE", f"{_PROJECTS}/{project_id}", headers=headers, json={"remark": remark}
-    )
+    return await _delete_body(client, project_id, headers, {"remark": remark})
 
 
 # --- the rule ------------------------------------------------------------------
@@ -148,6 +156,7 @@ async def test_the_tombstone_outlives_the_project(client, db_session) -> None:
     assert row.owner_id == user.id
     assert row.owner_email == user.email
     assert row.deleted_by == user.id
+    assert row.deleted_by_name == (user.display_name or user.email)
     assert row.remark == remark
     assert row.deleted_at is not None
 
@@ -195,3 +204,79 @@ async def test_the_tombstone_records_what_went_with_it(client, db_session) -> No
     assert row.chats_deleted == 0
     assert row.had_app is False
     assert row.had_database is False
+
+
+# --- who the row says did it ----------------------------------------------------
+
+
+async def test_the_deleter_is_stamped_from_the_session(client, db_session) -> None:
+    """The readable name on the tombstone is the ACCOUNT's, not anything sent."""
+    headers, user = await _auth(db_session)
+    user.display_name = "Asha Rao"
+    await db_session.commit()
+    project = await _project(db_session, user.id)
+
+    assert (await _delete(client, project.id, headers, _words(6))).status_code == 200
+
+    row = (
+        await db_session.execute(
+            sa.select(DeletedProject).where(DeletedProject.project_id == project.id)
+        )
+    ).scalar_one()
+    assert row.deleted_by_name == "Asha Rao"
+    assert row.deleted_by == user.id
+
+
+async def test_the_body_cannot_choose_who_deleted_it(client, db_session) -> None:
+    """THE TEST THIS FIELD EXISTS FOR.
+
+    `deletedByName` was briefly a required body field, and a browser session signed in as
+    one person could record a deletion under another person's name — which is exactly the
+    question an administrator reads this row to answer. The route now stamps it from the
+    session and Pydantic drops the unknown key, so sending one changes nothing.
+
+    If someone ever reintroduces the field, this fails.
+    """
+    headers, user = await _auth(db_session)
+    user.display_name = "Asha Rao"
+    await db_session.commit()
+    project = await _project(db_session, user.id)
+
+    resp = await _delete_body(
+        client,
+        project.id,
+        headers,
+        {"remark": _words(6), "deletedByName": "Someone Else Entirely"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    row = (
+        await db_session.execute(
+            sa.select(DeletedProject).where(DeletedProject.project_id == project.id)
+        )
+    ).scalar_one()
+    assert row.deleted_by_name == "Asha Rao"  # the session, not the body
+    assert row.deleted_by == user.id
+
+
+async def test_the_email_stands_in_when_entra_gave_no_display_name(client, db_session) -> None:
+    """`display_name` is nullable and really is null for some accounts.
+
+    The alternative to a fallback is a NOT NULL violation on the insert — a delete that
+    500s for people whose Entra profile happens to lack a display name — or a blank in the
+    one human-readable field on the row. The email identifies the account just as well.
+    """
+    headers, user = await _auth(db_session)
+    user.display_name = None
+    await db_session.commit()
+    project = await _project(db_session, user.id)
+
+    assert (await _delete(client, project.id, headers, _words(6))).status_code == 200
+
+    row = (
+        await db_session.execute(
+            sa.select(DeletedProject).where(DeletedProject.project_id == project.id)
+        )
+    ).scalar_one()
+    assert row.deleted_by_name == user.email
+    assert row.deleted_by_name  # not blank, which is the failure this guards
