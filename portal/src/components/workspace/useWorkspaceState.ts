@@ -39,7 +39,7 @@
  *    claimed, which is a server capability nobody has planned.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { fetchPreviewState, fetchSaveState } from '../../utils/buildSessionApi'
+import { fetchPreviewState, fetchSaveState, samePreviewState, sameSaveState } from '../../utils/buildSessionApi'
 import type { PreviewState, SaveState } from '../../utils/buildSessionApi'
 import {
   PREVIEW_PROBE_MS,
@@ -145,7 +145,15 @@ export function useWorkspaceState({
         // screen, and it must not wipe a settled answer somebody is already reading either. It is
         // recorded only when nothing has been decided yet — because "we could not check" is a real
         // thing to say when it is the only thing we know.
-        setPreview((prev) => (next.state === 'unknown' && prev ? prev : next))
+        // HOLDING THE OLD REFERENCE WHEN NOTHING CHANGED is not an optimisation detail here: this
+        // poll runs every 45 seconds on every project screen, and the reading is identical on
+        // almost all of them. A fresh object each tick republishes the workspace report, which
+        // wakes the shell, and re-renders the rail's whole conversation list — for an answer
+        // nobody's screen can tell apart from the one already up.
+        setPreview((prev) => {
+          if (next.state === 'unknown' && prev) return prev
+          return samePreviewState(prev, next) ? prev : next
+        })
 
         if (next.state === 'alive') {
           // THE ONLY CONTAINER CALL THIS HOOK MAKES, and it is gated on a live container for the
@@ -154,7 +162,7 @@ export function useWorkspaceState({
           // treats that as "could not tell" rather than as "clean".
           const state = await fetchSaveState(projectId).catch(() => null)
           if (!live || generation !== latest || projectRef.current !== projectId) return
-          setSave(state)
+          setSave((prev) => (sameSaveState(prev, state) ? prev : state))
         } else {
           // Not alive, so nothing to compare and nothing that could still be true. Holding a save
           // state from a container that has since stopped would arm the unsaved-work guard against

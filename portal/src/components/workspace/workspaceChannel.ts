@@ -45,8 +45,13 @@
  * re-renders once per character exactly as `LivePreview` did when the page rendered it directly.
  * What the split protects is the thing that matters: the address is the VALUE-compared cell and
  * the frame's identity input, so no amount of typing can move what is framed. Do not "fix" the
- * re-render with a shallow comparator — the handlers are unstable, so it would buy nothing without
- * memoising them too, and that is a behaviour change this refactor is not making.
+ * PANE's re-render with a shallow comparator — its view carries toolbar ReactNodes rebuilt every
+ * render, so a comparator would buy nothing without memoising those too, and that is a behaviour
+ * change this refactor is not making.
+ *
+ * THAT WARNING IS ABOUT THE PANE, AND ONLY THE PANE. `address`, `rail` and `workspace` are all
+ * value-compared, because each carries plain data (plus, for `workspace`, handlers that are
+ * provably interchangeable — see `sameReport`, which states the rule that keeps them so).
  *
  * The context carries the CHANNEL HANDLE, which is created once and never replaced. That handle is
  * stable for the life of the shell, so the context itself never re-renders anybody.
@@ -59,6 +64,7 @@ import type { PreviewAddress } from '../../utils/previewAddress'
 import type { CompileState } from '../../utils/compileState'
 import type { PreviewLifeState, ReclaimBlocked } from '../../utils/buildSessionApi'
 import type { RelaunchError } from '../../utils/buildSessionTypes'
+import { sameWorkspaceState } from './workspaceState'
 import type { StartOutcome, WorkspaceState } from './workspaceState'
 
 type Listener = () => void
@@ -324,6 +330,33 @@ export interface WorkspaceChannel {
   workspace: Cell<WorkspaceReport | null>
 }
 
+/**
+ * Two reports that would render identically — SO THE HANDLERS ARE DELIBERATELY NOT COMPARED, and
+ * that is the whole of the risk in this function.
+ *
+ * WHY IT HAS TO EXIST. This cell's subscriber is `WorkspaceShell` itself, so a publish re-renders
+ * the shell, the navbar and both columns. Its two publishers both hand it a FRESH OBJECT on every
+ * render — one an inline literal, the other a `useMemo` keyed on a value that is itself rebuilt
+ * each call — so under `Object.is` every keystroke in a composer and every streamed frame woke the
+ * entire page chrome. This is the same treatment `sameAddress` and `sameRail` already get, applied
+ * to the cell with the widest blast radius of the three.
+ *
+ * WHAT MAKES SKIPPING THE HANDLERS SAFE, AND THE RULE A FUTURE EDITOR MUST KEEP. Holding the older
+ * closures is only sound while they are interchangeable with the newer ones. Every handler at both
+ * call sites is either a `useState` setter, a `useCallback([])`, or an arrow that touches nothing
+ * but a ref, a functional `setState`, and `projectId` — which IS compared. None of them reads a
+ * render-scoped value, so an older copy does exactly what a newer one would.
+ *
+ * PUBLISH A HANDLER THAT CLOSES OVER RENDER STATE AND THIS GOES WRONG SILENTLY: the pane would go
+ * on calling a closure from an earlier render for as long as the state and project held still.
+ * Such a handler must read that value through a ref, or this comparator must grow to compare it.
+ * The narrower fix — memoising both publishers' objects — was not taken because it leaves the
+ * default `Object.is` in place, so the next publisher added is one unmemoised literal away from
+ * restoring the whole cost.
+ */
+const sameReport = (a: WorkspaceReport | null, b: WorkspaceReport | null): boolean =>
+  a === b || (a !== null && b !== null && a.projectId === b.projectId && sameWorkspaceState(a.state, b.state))
+
 export function createWorkspaceChannel(): WorkspaceChannel {
   return {
     address: createCell<WorkspaceAddress>(NO_ADDRESS, sameAddress),
@@ -333,7 +366,7 @@ export function createWorkspaceChannel(): WorkspaceChannel {
     reclaim: createCell<ReclaimRequest | null>(null),
     saveDirty: createCell<boolean | null>(null),
     rail: createCell<RailSlot>(NO_RAIL, sameRail),
-    workspace: createCell<WorkspaceReport | null>(null),
+    workspace: createCell<WorkspaceReport | null>(null, sameReport),
   }
 }
 
