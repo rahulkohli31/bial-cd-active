@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import (  # noqa: E402
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.orm.session import JoinTransactionMode  # noqa: E402
 from sqlalchemy.pool import NullPool  # noqa: E402
 
 from src.config import settings  # noqa: E402
@@ -104,7 +105,7 @@ def _salt_every_provisioned_app_database():
 
 
 @pytest.fixture
-async def db_session(test_engine):
+async def db_session(test_engine, request):
     # Each test runs inside a transaction that is rolled back afterwards, so tests
     # never see each other's writes.
     #
@@ -112,14 +113,25 @@ async def db_session(test_engine):
     # testable at all. Without it the session joins the outer transaction directly, so a route
     # that rolls back — the concurrent-insert collision arms in `turns.py` and `transition.py`
     # are the two — unwinds the whole test transaction and everything the fixtures set up goes
-    # with it. The arm was therefore unreachable by the unit suite, and both of them shipped
-    # with no coverage for exactly the branch that only runs when something has gone wrong.
-    # With a savepoint the route's rollback unwinds only its own work and the test survives.
+    # with it. The arm is otherwise unreachable by the unit suite, which is how both of them
+    # shipped with no coverage for exactly the branch that only runs when something broke.
+    #
+    # OPT-IN, PER TEST, AND THAT IS THE POINT. Making it the shape of EVERY test looks free and
+    # is not: a savepoint-joined session provisions its connection lazily, so any test whose
+    # DETACHED task touches the session while the test itself is mid-statement stops being a
+    # benign interleave and becomes `InvalidRequestError: this session is provisioning a new
+    # connection`. Eight deploy tests went red that way — tests about save-and-publish, which
+    # have no opinion about transaction shape and should not have to. Two tests need the
+    # savepoint; they ask for it with `@pytest.mark.route_rollback`, and the other ~3,700 keep
+    # the shape they were written against.
+    join_mode: JoinTransactionMode = (
+        "create_savepoint"
+        if request.node.get_closest_marker("route_rollback") is not None
+        else "conditional_savepoint"  # SQLAlchemy's own default: the shape every other test had
+    )
     async with test_engine.connect() as conn:
         transaction = await conn.begin()
-        session = AsyncSession(
-            bind=conn, expire_on_commit=False, join_transaction_mode="create_savepoint"
-        )
+        session = AsyncSession(bind=conn, expire_on_commit=False, join_transaction_mode=join_mode)
         yield session
         await session.close()
         await transaction.rollback()
