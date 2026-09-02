@@ -10,6 +10,7 @@ import {
   asReclaimBlocked,
   releaseProject,
   fetchPreviewState,
+  handOverWorkspace,
 } from '../buildSessionApi'
 import { ApiError } from '../apiError'
 
@@ -423,6 +424,65 @@ describe('asReclaimBlocked — a project that is still being built', () => {
  * had to stop swallowing, and `occupyingProjectId` is the only thing the "another project
  * holds your workspace" remedy has to navigate with.
  */
+describe('handOverWorkspace — the stop → save → release ordering (#83)', () => {
+  /** Records the path of every call in order, and answers each of the three routes plausibly. */
+  function recordingFetch() {
+    const seen: string[] = []
+    const fetchImpl = vi.fn<FetchImpl>(async (url: string) => {
+      seen.push(new URL(url, 'http://x').pathname)
+      if (url.endsWith('/save')) return res(200, { appId: 'a-1', headSha: 'deadbeef' })
+      if (url.endsWith('/release')) return res(200, { released: true })
+      return res(200, { stopped: true })
+    })
+    return { seen, fetchImpl }
+  }
+
+  it('stops FIRST, then saves, then releases — save and release both refuse while a session is live', async () => {
+    const { seen, fetchImpl } = recordingFetch()
+    await handOverWorkspace('p-1', true, { fetchImpl })
+    expect(seen).toEqual([
+      '/api/build-sessions/projects/p-1/stop-active-build',
+      '/api/build-sessions/projects/p-1/save',
+      '/api/build-sessions/projects/p-1/release',
+    ])
+  })
+
+  it('SKIPS the save on Leave without saving, and still stops and releases', async () => {
+    const { seen, fetchImpl } = recordingFetch()
+    await handOverWorkspace('p-1', false, { fetchImpl })
+    expect(seen).toEqual([
+      '/api/build-sessions/projects/p-1/stop-active-build',
+      '/api/build-sessions/projects/p-1/release',
+    ])
+  })
+
+  it('does NOT release when the save fails — that is the data loss the whole flow exists to prevent', async () => {
+    const seen: string[] = []
+    const fetchImpl = vi.fn<FetchImpl>(async (url: string) => {
+      seen.push(new URL(url, 'http://x').pathname)
+      if (url.endsWith('/save')) return res(500, { error: { message: 'disk full' } })
+      return res(200, { stopped: true })
+    })
+    await expect(handOverWorkspace('p-1', true, { fetchImpl })).rejects.toBeInstanceOf(ApiError)
+    expect(seen.some((p) => p.endsWith('/release'))).toBe(false)
+  })
+
+  it('carries a reclaim refusal out to the caller rather than swallowing it', async () => {
+    // The dialog is the only thing mounted that can report a failed hand-over.
+    const fetchImpl = jsonFetch(409, {
+      error: {
+        message: '“Lost & Found” is still open and has unsaved changes.',
+        code: 'sandbox_reclaim_blocked',
+        projectId: 'p-a',
+        projectName: 'Lost & Found',
+        dirty: true,
+      },
+    })
+    const err = await handOverWorkspace('p-1', false, { fetchImpl }).catch((e: unknown) => e)
+    expect(asReclaimBlocked(err)?.projectName).toBe('Lost & Found')
+  })
+})
+
 describe('fetchPreviewState — the wire mirror (C3 §8.3)', () => {
   const previewFetch = (body: unknown) =>
     ({ fetchImpl: async () => res(200, body) })
