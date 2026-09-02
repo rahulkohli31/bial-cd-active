@@ -1840,38 +1840,16 @@ class SessionManager:
         # brand-new project and then starting a second one now raises a dialog about the first —
         # a pristine container nobody would miss. R94 is explicit that this difference goes. It is
         # one click, on a dialog whose clean arm claims no unsaved work and offers no Save button.
-        if state.dirty is False:
-            raise SandboxReclaimBlockedError(
-                project_id=occupying.project_id,
-                project_name=occupying.project_name,
-                app_id=occupying.app_id,
-                dirty=False,
-            )
-        if await self._nothing_to_lose(sandbox_client, handle, state):
-            # `dirty=False`, NOT `state.dirty`, AND THIS IS THE SHARPEST LINE IN THE UNIT.
-            #
-            # Passing `state.dirty` through here would silently reintroduce a bug this guard
-            # already fixed. `dirty` answers the SAVE BUTTON's question — "is there anything Save
-            # would write?" — and for a never-built project the answer is deliberately YES
-            # (`_save_state_of` maps "no commit, nothing saved" to dirty so the button appears on
-            # exactly the projects that most need it). This arm is answering a different question
-            # and fires BECAUSE there is nothing to lose, so it has to say so. Otherwise a person
-            # is told their pristine, untouched golden template "has unsaved changes" — the precise
-            # wording whose live-observed consequence the comment below calls "a straight
-            # downgrade".
-            raise SandboxReclaimBlockedError(
-                project_id=occupying.project_id,
-                project_name=occupying.project_name,
-                app_id=occupying.app_id,
-                dirty=False,
-            )
-        # NOTHING TO LOSE — the case that made this guard worse than the bug.
+        # NOTHING TO LOSE — the case that made this guard worse than the bug, and the reason
+        # BOTH arms below report `dirty=False` rather than passing `state.dirty` through.
         #
         # `dirty` answers the SAVE BUTTON's question ("is there anything Save would write?"),
         # and for a never-built project the answer is deliberately yes: `_save_state_of` maps
         # "no commit, nothing saved" to dirty so the button appears on exactly the projects
         # that most need it. This guard is asking a different question — "would reclaiming
-        # this DESTROY something?" — and there the same state means the opposite.
+        # this DESTROY something?" — and there the same state means the opposite. An arm that
+        # fires BECAUSE there is nothing to lose has to say so; forwarding `state.dirty` would
+        # silently reintroduce the bug the guard already fixed.
         #
         # A Plan or Ask turn attaches the container (`_pin_workspace` does, for every mode)
         # and writes nothing. So a user who typed one question into a brand-new project held
@@ -1883,6 +1861,16 @@ class SessionManager:
         # — see its docstring for why "no commit in the container" is not one of them: the
         # sandbox client seeds a baseline commit at birth, so a pristine container has exactly
         # one and a no-commits check is dead code. Together they are proof, not inference.
+        #
+        # The `or` SHORT-CIRCUITS deliberately: a known-clean tree is already proof, so there is
+        # nothing for the four-condition probe to add and it is not worth a round trip.
+        if state.dirty is False or await self._nothing_to_lose(sandbox_client, handle, state):
+            raise SandboxReclaimBlockedError(
+                project_id=occupying.project_id,
+                project_name=occupying.project_name,
+                app_id=occupying.app_id,
+                dirty=False,
+            )
 
         raise SandboxReclaimBlockedError(
             project_id=occupying.project_id,

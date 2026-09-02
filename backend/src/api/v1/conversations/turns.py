@@ -177,14 +177,6 @@ async def _conversation_or_none(
     return row
 
 
-def _project_of(staged: NewConversation | None) -> uuid.UUID:
-    """The staged parentage's project. A narrowing helper: by the time this is called the caller
-    has established that one of the two arms exists, and this is what tells the type checker."""
-    if staged is None:  # unreachable — guarded by the caller
-        raise AppApiError(404, "Conversation not found.")
-    return staged.project_id
-
-
 async def _app_id_for_project(
     db: AsyncSession, user_id: uuid.UUID, project_id: uuid.UUID
 ) -> uuid.UUID | None:
@@ -318,23 +310,27 @@ async def start_turn(
     # deliberately NOT a commit. This copies it rather than inventing a second ordering.
     staged = body.create
     existing = await _conversation_or_none(db, user.id, conversation_id)
-    if existing is None and staged is None:
+    conversation: Conversation | None
+    project_id: uuid.UUID
+    if existing is not None:
+        # A `create` block on a conversation that already exists is a retry or a second tab. The
+        # existing row wins; the block is ignored rather than refused, which keeps the idempotency
+        # the separate create route used to provide. Clearing `staged` is what makes that true —
+        # it is the sole guard on the row-creating branch far below.
+        staged = None
+        conversation, project_id = existing, existing.project_id
+    elif staged is not None:
+        conversation, project_id = None, staged.project_id
+        # OWNERSHIP FIRST, and before anything else reads this project. A 404 here is the same
+        # non-leaking answer the resolver gives, so a project under another owner is
+        # indistinguishable from one that does not exist. Only this arm needs it: an existing
+        # conversation was already read under this user's scope.
+        await owned_project_or_404(db, user.id, project_id)
+    else:
         # Unchanged for every turn after the first: conversations are created with their first
         # message, so an unknown id with no parentage to build one from is a client bug — and a
         # cross-user id is indistinguishable from it, which is one non-leaking 404 (ADR-0004).
         raise AppApiError(404, "Conversation not found.")
-    if existing is not None:
-        # A `create` block on a conversation that already exists is a retry or a second tab. The
-        # existing row wins; the block is ignored rather than refused, which keeps the idempotency
-        # the separate create route used to provide.
-        staged = None
-    conversation = existing
-    project_id = existing.project_id if existing is not None else _project_of(staged)
-    # OWNERSHIP FIRST, and before anything else reads this project. A 404 here is the same
-    # non-leaking answer the resolver gives, so a project under another owner is indistinguishable
-    # from one that does not exist.
-    if existing is None:
-        await owned_project_or_404(db, user.id, project_id)
 
     # Daily-token gate BEFORE anything persists — a capped user's message is refused
     # whole, never half-recorded. The error carries its own byte-stable body (limit/used/
