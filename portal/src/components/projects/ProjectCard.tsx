@@ -13,6 +13,7 @@ import { Trash2 } from 'lucide-react'
 import type { Project } from '../../utils/projectApi'
 import { statusFor, TONE_CLASS } from '../../utils/appStatusLabel'
 import { relativeTime } from '../../utils/relativeTime'
+import { Card } from '../ui/card'
 
 /**
  * The status pill, in the SHARED vocabulary (#158 §10).
@@ -52,7 +53,10 @@ export default function ProjectCard({ project, onOpen, onDelete }: ProjectCardPr
   // descendant of another interactive element. Native buttons carry keyboard activation for free
   // (Enter/Space), so the old onKeyDown handler is gone too.
   return (
-    <div className="group relative flex flex-col gap-3 bg-white border border-bial-border rounded-2xl px-5 py-4 hover:border-primary/40 hover:shadow-sm transition font-manrope">
+    // shadcn `Card` is the tile, per §12 — the surface (border, radius, background) comes
+    // from the primitive so a grid tile here and a card anywhere else cannot drift apart.
+    // The layout and hover behaviour stay local, because they belong to THIS tile.
+    <Card className="group relative flex flex-col gap-3 rounded-2xl px-5 py-4 hover:border-primary/40 hover:shadow-sm transition font-manrope">
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-center gap-2.5 min-w-0">
           <h3 className="min-w-0 flex-1">
@@ -98,6 +102,6 @@ export default function ProjectCard({ project, onOpen, onDelete }: ProjectCardPr
           {relativeTime(project.updatedAt)}
         </span>
       </div>
-    </div>
+    </Card>
   )
 }
