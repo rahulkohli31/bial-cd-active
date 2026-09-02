@@ -7,6 +7,9 @@ from typing import Any
 
 import pytest
 from pydantic_ai import Agent, RunContext
+from pydantic_ai._agent_graph import AgentNode
+from pydantic_ai.result import FinalResult
+from pydantic_graph import End
 
 from src.services.sandbox import (
     ExecResult,
@@ -179,8 +182,12 @@ async def test_scripted_model_drives_per_turn_usage_verbatim() -> None:
     per_step: list[tuple[int, int]] = []
     deps: list[str] = []
     async with agent.iter("build", deps=deps, model=model) as run:
-        node = run.next_node
-        while not Agent.is_end_node(node):
+        # Annotated and walked with `isinstance`, for the reason `harness.py` writes out at
+        # length: `Agent.is_end_node` binds its `TypeIs` type-var to `Unknown` on the bare class,
+        # so the NEGATIVE branch it is used for here does not narrow and `run.next(node)` reads
+        # as possibly-End.
+        node: AgentNode[list[str], str] | End[FinalResult[str]] = run.next_node
+        while not isinstance(node, End):
             node = await run.next(node)
             if Agent.is_call_tools_node(node):
                 usage = node.model_response.usage

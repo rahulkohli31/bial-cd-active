@@ -44,6 +44,7 @@ api = [
 ]
 dev = [
     "fakeredis[lua]>=2.37.1",
+    "httpx2>=2.12.0",
     "mypy>=2.3.1",
     "pyright>=1.1.411",
     "pytest>=9.1.1",
@@ -142,5 +143,11 @@ markers = [
     # slots per table, ever). Deselected from the default lane so routine runs don't eat the
     # budget; run them explicitly before shipping a migration: `uv run pytest -m destructive_migration`.
     "destructive_migration: opt-in; alembic up/down round-trips that permanently consume pg_attribute slots on the shared test DB",
+    # Not a lane — a transaction SHAPE. `db_session` joins the fixtures' transaction with a
+    # SAVEPOINT for a marked test, so a route's own `db.rollback()` unwinds only its work
+    # instead of the whole test. Only the tests that drive such a route wear it: a
+    # savepoint-joined session provisions its connection lazily, which turns a detached task's
+    # concurrent use of that session into an error rather than a benign interleave.
+    "route_rollback: the test drives a route that calls db.rollback(); join the fixture transaction by savepoint",
 ]
 addopts = "-m 'not integration and not destructive_migration' --strict-markers"
