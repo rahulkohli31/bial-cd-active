@@ -36,6 +36,7 @@
  * where the conversation surface already puts its own chat-panel toggle, and it points back here
  * through `aria-controls`.
  */
+import { useEffect, useState } from 'react'
 import { ArrowLeft, Check, MoreVertical, Pencil, X } from 'lucide-react'
 import { Badge } from '../ui/badge'
 import PublishStatusChip from '../PublishStatusChip'
@@ -43,17 +44,13 @@ import ProjectDescriptionEditor from '../projects/ProjectDescriptionEditor'
 import RailComposer from './RailComposer'
 import { chatKindFor } from '../../utils/chatKind'
 import { relativeTime } from '../../utils/chatHistory'
+import { shortSha } from '../../utils/shortSha'
+import type { ChatSummary } from '../../utils/conversationApi'
+import { patchProject } from '../../utils/projectApi'
+import { ApiError } from '../../utils/apiError'
 import type { Project } from '../../utils/projectApi'
 import type { SaveState } from '../../utils/buildSessionApi'
 import type { WorkspaceState } from './workspaceState'
-
-/** The chat-row shape the rail renders; narrowed at the API boundary by its owner. */
-export interface ChatSummary {
-  id: string
-  kind: string
-  title: string
-  updatedAt: string
-}
 
 export interface WorkspaceRailProps {
   project: Project
@@ -67,22 +64,6 @@ export interface WorkspaceRailProps {
   onBack: () => void
   onOpenChat: (chatId: string) => void
   onDeleteChat: (chatId: string) => void
-  // ── the inline rename, owned above so a failed patch keeps its message ──
-  editingName: boolean
-  nameDraft: string
-  nameError: string | null
-  onStartRename: () => void
-  onNameDraftChange: (value: string) => void
-  onSubmitRename: () => void
-  onCancelRename: () => void
-  // ── the ⋮ menu, owned above because a document-level listener closes it ──
-  menuOpenId: string | null
-  onToggleMenu: (chatId: string | null) => void
-}
-
-/** The short saved commit, or nothing. Seven characters is the git convention and it is enough. */
-function shortSha(sha: string | null): string | null {
-  return sha ? sha.slice(0, 7) : null
 }
 
 export default function WorkspaceRail({
@@ -95,16 +76,62 @@ export default function WorkspaceRail({
   onBack,
   onOpenChat,
   onDeleteChat,
-  editingName,
-  nameDraft,
-  nameError,
-  onStartRename,
-  onNameDraftChange,
-  onSubmitRename,
-  onCancelRename,
-  menuOpenId,
-  onToggleMenu,
 }: WorkspaceRailProps) {
+  // OWNED HERE, BECAUSE THIS IS THE ONLY COMPONENT THAT RENDERS THEM. Both were lifted to
+  // `ProjectPage` and threaded down through `ProjectWorkspace`, which cost nine props across two
+  // interfaces to reach one renderer — and neither is state anybody above can act on: a half-typed
+  // name and an open ⋮ menu mean nothing to a route.
+  const [editingName, setEditingName] = useState(false)
+  const [nameDraft, setNameDraft] = useState('')
+  const [nameError, setNameError] = useState<string | null>(null)
+  const [menuOpenId, setMenuOpenId] = useState<string | null>(null)
+
+  // Close the row action menu on Escape or an outside click while it is open.
+  useEffect(() => {
+    if (!menuOpenId) return undefined
+    const onDown = () => setMenuOpenId(null)
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setMenuOpenId(null)
+    }
+    document.addEventListener('mousedown', onDown)
+    document.addEventListener('keydown', onEsc)
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      document.removeEventListener('keydown', onEsc)
+    }
+  }, [menuOpenId])
+
+  const onStartRename = () => {
+    setNameDraft(project.name)
+    setNameError(null)
+    setEditingName(true)
+  }
+  const onCancelRename = () => setEditingName(false)
+
+  const onSubmitRename = () => {
+    const trimmed = nameDraft.trim()
+    // Blocked client-side BEFORE any request: the server 400s on name:null and 422s on "". A
+    // whitespace-only name never reaches the wire.
+    if (trimmed === '') {
+      setNameError('Name cannot be empty.')
+      return
+    }
+    if (trimmed === project.name) {
+      setEditingName(false)
+      return
+    }
+    void (async () => {
+      try {
+        const updated = await patchProject(project.id, { name: trimmed })
+        onProjectUpdate(updated)
+        setEditingName(false)
+        setNameError(null)
+      } catch (err) {
+        setNameError(err instanceof ApiError ? err.message : 'Could not rename. Try again.')
+      }
+    })()
+  }
+
   return (
     // ITS OWN SCROLLER. The shell is a full-height frame that does not scroll, and this is a flex
     // child of it — without `overflow-y-auto` a project with twenty conversations clips its list
@@ -129,7 +156,7 @@ export default function WorkspaceRail({
                 aria-label="Project name"
                 value={nameDraft}
                 autoFocus
-                onChange={(e) => onNameDraftChange(e.target.value)}
+                onChange={(e) => setNameDraft(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') onSubmitRename()
                   if (e.key === 'Escape') onCancelRename()
@@ -199,7 +226,7 @@ export default function WorkspaceRail({
                     ? 'Everything is saved.'
                     : 'We could not check for unsaved changes.'}
               </p>
-              {shortSha(save.savedHead) && (
+              {save.savedHead !== null && (
                 <p className="text-[11px] text-neutral mt-1 tabular-nums">
                   Last saved version <span className="font-mono">{shortSha(save.savedHead)}</span>
                 </p>
@@ -278,7 +305,7 @@ export default function WorkspaceRail({
                       <button
                         type="button"
                         onMouseDown={(e) => e.stopPropagation()}
-                        onClick={() => onToggleMenu(menuOpen ? null : chat.id)}
+                        onClick={() => setMenuOpenId(menuOpen ? null : chat.id)}
                         aria-label={`Actions for ${chat.title || 'conversation'}`}
                         className="p-1 rounded-lg text-neutral hover:text-primary hover:bg-surface-muted transition"
                       >
@@ -292,7 +319,7 @@ export default function WorkspaceRail({
                           <button
                             type="button"
                             onClick={() => {
-                              onToggleMenu(null)
+                              setMenuOpenId(null)
                               onOpenChat(chat.id)
                             }}
                             className="w-full text-left px-3 py-2 text-sm text-tertiary hover:bg-bial-bg transition"
@@ -301,7 +328,10 @@ export default function WorkspaceRail({
                           </button>
                           <button
                             type="button"
-                            onClick={() => onDeleteChat(chat.id)}
+                            onClick={() => {
+                              setMenuOpenId(null)
+                              onDeleteChat(chat.id)
+                            }}
                             className="w-full text-left px-3 py-2 text-sm text-danger hover:bg-red-50 transition"
                           >
                             Delete

@@ -45,7 +45,7 @@
  */
 import { useCallback, useMemo, useState } from 'react'
 import WorkspaceRail from './WorkspaceRail'
-import type { ChatSummary } from './WorkspaceRail'
+import type { ChatSummary } from '../../utils/conversationApi'
 import { useWorkspaceState } from './useWorkspaceState'
 import type { StartOutcome } from './workspaceState'
 import {
@@ -59,7 +59,7 @@ import {
 } from './workspaceChannel'
 import type { ReclaimRequest } from './workspaceChannel'
 import { resolvePreviewAddress } from '../../utils/previewAddress'
-import { releaseProject, saveProject, stopActiveBuild } from '../../utils/buildSessionApi'
+import { handOverWorkspace } from '../../utils/buildSessionApi'
 import type { ReclaimBlocked } from '../../utils/buildSessionApi'
 import type { Project } from '../../utils/projectApi'
 
@@ -71,15 +71,6 @@ export interface ProjectWorkspaceProps {
   onBack: () => void
   onOpenChat: (chatId: string) => void
   onDeleteChat: (chatId: string) => void
-  editingName: boolean
-  nameDraft: string
-  nameError: string | null
-  onStartRename: () => void
-  onNameDraftChange: (value: string) => void
-  onSubmitRename: () => void
-  onCancelRename: () => void
-  menuOpenId: string | null
-  onToggleMenu: (chatId: string | null) => void
 }
 
 export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
@@ -135,13 +126,10 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
       // The project this surface IS — the one being started, which is what the dialog leads with.
       startingProjectName: project.name,
       resolve: async (save: boolean) => {
-        // STOP, THEN SAVE, THEN RELEASE, THEN RETRY — the existing ordering, which is load-bearing:
-        // save and release both refuse while a live session owns the container, so the stop is what
-        // unblocks them. The retry is AWAITED BEFORE the dialog is dismissed, so a switch that
-        // fails can still be reported instead of vanishing with the dialog.
-        await stopActiveBuild(reclaim.blocked.projectId)
-        if (save) await saveProject(reclaim.blocked.projectId)
-        await releaseProject(reclaim.blocked.projectId)
+        // Stop, then save, then release — the ordering invariant lives in `handOverWorkspace`.
+        // The retry is AWAITED BEFORE the dialog is dismissed, so a switch that fails can still
+        // be reported instead of vanishing with the dialog.
+        await handOverWorkspace(reclaim.blocked.projectId, save)
         await reclaim.retry()
         setReclaim(null)
       },

@@ -43,9 +43,9 @@ import { useCallback, useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { ArrowLeft } from 'lucide-react'
 import ProjectWorkspace from '../components/workspace/ProjectWorkspace'
-import type { ChatSummary } from '../components/workspace/WorkspaceRail'
+import type { ChatSummary } from '../utils/conversationApi'
 import { useWorkspaceProject } from '../components/workspace/workspaceChannel'
-import { getProject, patchProject } from '../utils/projectApi'
+import { getProject } from '../utils/projectApi'
 import type { Project } from '../utils/projectApi'
 import { ApiError, isRecord } from '../utils/apiError'
 import { listProjectConversations, deleteConversation } from '../utils/conversationApi'
@@ -82,11 +82,6 @@ export default function ProjectPage() {
 
   const [chats, setChats] = useState<ChatSummary[]>([])
   const [chatsError, setChatsError] = useState<string | null>(null)
-  const [menuOpenId, setMenuOpenId] = useState<string | null>(null)
-
-  const [editingName, setEditingName] = useState(false)
-  const [nameDraft, setNameDraft] = useState('')
-  const [nameError, setNameError] = useState<string | null>(null)
 
   const goToProjects = useCallback(() => navigate('/projects', { replace: true }), [navigate])
   const openChat = useCallback((chatId: string) => navigate(`/chat/${chatId}`), [navigate])
@@ -146,60 +141,8 @@ export default function ProjectPage() {
     void refreshChats()
   }, [refreshChats])
 
-  // Close the row action menu on Escape or an outside click while it is open.
-  useEffect(() => {
-    if (!menuOpenId) return undefined
-    const onDown = () => setMenuOpenId(null)
-    const onEsc = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setMenuOpenId(null)
-    }
-    document.addEventListener('mousedown', onDown)
-    document.addEventListener('keydown', onEsc)
-    return () => {
-      document.removeEventListener('mousedown', onDown)
-      document.removeEventListener('keydown', onEsc)
-    }
-  }, [menuOpenId])
-
-  const startRename = useCallback(() => {
-    setProject((current) => {
-      if (current) {
-        setNameDraft(current.name)
-        setNameError(null)
-        setEditingName(true)
-      }
-      return current
-    })
-  }, [])
-
-  const submitRename = useCallback((): void => {
-    if (!project) return
-    const trimmed = nameDraft.trim()
-    // Blocked client-side BEFORE any request: the server 400s on name:null and 422s on "". A
-    // whitespace-only name never reaches the wire.
-    if (trimmed === '') {
-      setNameError('Name cannot be empty.')
-      return
-    }
-    if (trimmed === project.name) {
-      setEditingName(false)
-      return
-    }
-    void (async () => {
-      try {
-        const updated = await patchProject(project.id, { name: trimmed })
-        setProject(updated)
-        setEditingName(false)
-        setNameError(null)
-      } catch (err) {
-        setNameError(err instanceof ApiError ? err.message : 'Could not rename. Try again.')
-      }
-    })()
-  }, [project, nameDraft])
-
   const handleDeleteChat = useCallback(
     (id: string): void => {
-      setMenuOpenId(null)
       setChats((prev) => prev.filter((c) => c.id !== id)) // optimistic
       void (async () => {
         try {
@@ -251,15 +194,6 @@ export default function ProjectPage() {
       onBack={goToProjects}
       onOpenChat={openChat}
       onDeleteChat={handleDeleteChat}
-      editingName={editingName}
-      nameDraft={nameDraft}
-      nameError={nameError}
-      onStartRename={startRename}
-      onNameDraftChange={setNameDraft}
-      onSubmitRename={submitRename}
-      onCancelRename={() => setEditingName(false)}
-      menuOpenId={menuOpenId}
-      onToggleMenu={setMenuOpenId}
     />
   )
 }

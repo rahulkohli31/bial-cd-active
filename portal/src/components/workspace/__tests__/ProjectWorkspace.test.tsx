@@ -108,15 +108,6 @@ function Surface({ project = PROJECT }: { project?: Project }) {
       onBack={noop}
       onOpenChat={noop}
       onDeleteChat={noop}
-      editingName={false}
-      nameDraft=""
-      nameError={null}
-      onStartRename={noop}
-      onNameDraftChange={noop}
-      onSubmitRename={noop}
-      onCancelRename={noop}
-      menuOpenId={null}
-      onToggleMenu={noop}
     />
   )
 }
