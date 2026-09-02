@@ -166,6 +166,49 @@ The agent's whole voice, and the workspace the canvas draws.
 
 ## [1.7.0-beta.5] - 2026-09-02
 
+The project list becomes the landing screen: three numbers, two views, and a delete that asks
+why. (#158)
+
+### Added
+
+- **`/projects` is where you land after signing in.** Three numbers sit above your projects —
+  how many are live, how many you have made in total, and how many are moving through review —
+  and then the projects themselves.
+- **Two ways to look at them: a list (the default) and a grid**, with a switch beside the
+  search box. The list has a column header; the grid has small, medium and large cards. Your
+  choice is remembered, so the next visit opens the way you left it.
+- **Page numbers and a rows-per-page picker**, in both views, with `Showing 1–8 of 12` so you
+  can see where you are in the whole set rather than only what is on screen.
+- **A status on every project**, in the same words the project page uses: *Nothing built yet*,
+  *Draft*, *In review*, *Changes requested*, *Approved*, *Switched off*, and *Live* when the app
+  is actually deployed and reachable. *Approved* and *Live* are deliberately different: an
+  administrator saying yes is not the same as the app running.
+- **A description too long for its row shows in full on hover**, and one that already fits shows
+  nothing — no tooltip on text you can already read.
+
+### Changed
+
+- **Deleting a project now asks why**, in five to fifty words, instead of asking you to retype
+  the project's name. Retyping a name proves you can read it, not that you meant it. The reason
+  is kept so an administrator can see why a project went, and the dialog says so.
+- **Project titles are capped at about six to eight words** on both creating and renaming. The
+  old limit was 120 characters — roughly twenty words — which reads as no limit at all to
+  someone naming a tool. The counter beside the field shows where you are, and names already
+  saved keep working.
+- **Refusals from the server are written for people.** Renaming a project too long used to
+  answer *"Value error, name must be at most 120 characters"*; that machine prefix no longer
+  reaches the screen, on any form in the product.
+- **The dialogs soften the page behind them** instead of blacking it out, so you can still see
+  where the panel came from.
+- **The welcome page is gone.** It existed to put a button in front of your projects, and the
+  project list now carries the summary it was showing. Old links to it still work.
+- **The repeated icon on every project is removed.** It was identical on all of them and
+  identified nothing.
+
+### Fixed
+
+- The BIAL logo sat a few pixels high in the header and could be squeezed at narrow widths; it
+  now renders identically on every screen.
 The project screen becomes the app.
 
 ### Added

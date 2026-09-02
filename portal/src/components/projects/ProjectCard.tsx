@@ -12,6 +12,7 @@
 import { Trash2 } from 'lucide-react'
 import type { Project } from '../../utils/projectApi'
 import { statusFor, TONE_CLASS } from '../../utils/appStatusLabel'
+import { relativeTime } from '../../utils/relativeTime'
 
 /**
  * The status pill, in the SHARED vocabulary (#158 §10).
@@ -86,8 +87,16 @@ export default function ProjectCard({ project, onOpen, onDelete }: ProjectCardPr
         <p className="text-xs text-neutral/70 italic">No description yet</p>
       )}
 
-      <div className="mt-auto pt-1">
+      {/* Status and the timestamp on one line, as the grid board draws it — and the SAME
+          timestamp the list row shows, so the two views cannot describe a project
+          differently. `updatedAt` tracks details, not activity, which is why the list
+          column is labelled "Details updated"; there is no room for that label here, so
+          the card shows the value and the list carries the honest heading. */}
+      <div className="mt-auto pt-1 flex items-center justify-between gap-2">
         <AppStatusBadge project={project} />
+        <span className="text-[11px] text-neutral whitespace-nowrap">
+          {relativeTime(project.updatedAt)}
+        </span>
       </div>
     </div>
   )

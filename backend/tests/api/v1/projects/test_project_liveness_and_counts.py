@@ -218,7 +218,9 @@ async def test_in_production_agrees_with_the_rows_beneath_it(client, db_session)
 
     assert counts["inProduction"] == sum(1 for is_live in rows.values() if is_live)
     assert counts["inProduction"] == 2  # Live One + Republished
-    assert counts["totalApplications"] == 4  # every app; "Nothing Built" has none
+    # PROJECTS, including the one with nothing built in it — a project IS an application
+    # in the product's language, and it exists before anything is built.
+    assert counts["totalApplications"] == 5
     # `approved` is counted as in-pipeline ONLY because it is not live; counting it in both
     # would make the three numbers sum to more than the citizen has.
     assert counts["inPipeline"] == 1

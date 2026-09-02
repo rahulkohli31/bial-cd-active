@@ -83,6 +83,14 @@ const DENSITY_COLS: Record<Density, string> = {
   L: 'grid-cols-1 sm:grid-cols-2',
 }
 
+// shadcn's toggle marks its ON state with `bg-accent`, and this theme maps `--accent` to
+// the brand ORANGE (#F5A623) — a solid orange pill in a teal interface. The component is
+// right; its default theme mapping is not for this design, and no unit test can see which
+// colour a class resolves to. Overridden at the call site rather than in `ui/toggle.tsx`,
+// so the vendored component stays upstream-shaped for whoever uses it next.
+const ACTIVE =
+  ' data-[state=on]:bg-primary/10 data-[state=on]:text-primary data-[state=on]:ring-1 data-[state=on]:ring-primary/30'
+
 const PAGE_SIZES = [8, 16, 24, 48] as const
 
 export default function ProjectsPage(): React.JSX.Element {
@@ -260,7 +268,12 @@ export default function ProjectsPage(): React.JSX.Element {
                 aria-label="Card size"
               >
                 {(['S', 'M', 'L'] as const).map((d) => (
-                  <ToggleGroupItem key={d} value={d} aria-label={`${d} cards`} className="px-2.5">
+                  <ToggleGroupItem
+                    key={d}
+                    value={d}
+                    aria-label={`${d} cards`}
+                    className={`px-2.5${ACTIVE}`}
+                  >
                     {d}
                   </ToggleGroupItem>
                 ))}
@@ -273,10 +286,10 @@ export default function ProjectsPage(): React.JSX.Element {
               onValueChange={(v) => v && chooseView(v as View)}
               aria-label="View"
             >
-              <ToggleGroupItem value="list" aria-label="List view">
+              <ToggleGroupItem value="list" aria-label="List view" className={ACTIVE.trim()}>
                 <ListIcon size={15} />
               </ToggleGroupItem>
-              <ToggleGroupItem value="grid" aria-label="Grid view">
+              <ToggleGroupItem value="grid" aria-label="Grid view" className={ACTIVE.trim()}>
                 <LayoutGrid size={15} />
               </ToggleGroupItem>
             </ToggleGroup>

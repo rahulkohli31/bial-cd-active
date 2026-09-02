@@ -289,9 +289,12 @@ async def project_counts(user: CurrentUser, db: DbSession) -> ProjectCountsRespo
     """
     live = live_app_ids().subquery()
 
-    total = (
-        sa.select(sa.func.count()).select_from(AppRegistry).where(AppRegistry.user_id == user.id)
-    )
+    # PROJECTS, not `app_registry` rows. The product calls a project an application — the
+    # page is headed "Your apps" and its subtitle reads "each project is one tool" — and a
+    # project exists before anything is built inside it. Counting app rows put "Total
+    # applications 0" above a list showing 18 projects, which reads as broken rather than as
+    # a subtle distinction, and the mockup shows the two numbers agreeing for that reason.
+    total = sa.select(sa.func.count()).select_from(Project).where(Project.user_id == user.id)
     in_production = (
         sa.select(sa.func.count())
         .select_from(AppRegistry)
