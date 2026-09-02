@@ -1966,19 +1966,10 @@ class TurnEngine:
             # Deliberately NO `usage=`: this run's spend is folded per step below, and
             # passing the turn accumulator as well would bill every token twice.
         ) as run:
-            # ANNOTATED, AND WALKED WITH `isinstance` RATHER THAN `Agent.is_end_node`.
-            #
-            # The library offers that classmethod and its docstring recommends it over isinstance
-            # "to preserve the generic parameters while narrowing". That is true of the POSITIVE
-            # branch and is not what this loop needs: it needs the NEGATIVE one, and the guard is
-            # a `TypeIs[End[FinalResult[S]]]` whose `S` is inferable only from the argument. Call
-            # it on the bare class and `ty` binds `S` to `Unknown`, so `End[FinalResult[str]]`
-            # survives the negation and every `run.next(node)` below it reads as possibly-End.
-            #
-            # Annotating the variable is what makes plain `isinstance` exact instead: the union
-            # is written down, so the negative branch is precisely the node type, and all four
-            # checkers agree. The annotation is also the honest documentation — this loop walks
-            # a graph, and what it walks was previously inferred and invisible.
+            # ANNOTATED, AND WALKED WITH `isinstance` RATHER THAN `Agent.is_end_node` — the
+            # classmethod's `TypeIs` binds its type-var to `Unknown` on the bare class, so the
+            # NEGATIVE branch this loop needs does not narrow. `orchestrator/harness.py` writes
+            # the reasoning out in full at the one other place the graph is walked this way.
             node: AgentNode[ChatDeps, str] | End[FinalResult[str]] = run.next_node
             cut_short = False
             pending_answers: ModelRequest | None = None
@@ -2765,12 +2756,7 @@ class TurnEngine:
             state="pending",
             hidden=False,
         )
-        self._retire_acknowledgement(state)
         self._open_step(state, tool_call_id, item)
-        self._emit(
-            state,
-            lambda seq: StepFrame(seq=seq, tool_call_id=tool_call_id, phase="started", item=item),
-        )
 
     def _emit_plan_options(self, state: _TurnState, tool_call_id: str) -> None:
         item = PlanOptionsItem(
@@ -2915,17 +2901,7 @@ class TurnEngine:
                     state.finished_pieces.clear()
                 return
             item = self._step_item(state, event.part.tool_name, event.part.args_as_json_str())
-            # REPLACED, not accumulated beside: the first real step retires the ack — from the
-            # snapshot a later subscriber reads AND from the feed an earlier one is already
-            # watching, which is the half that was missing.
-            self._retire_acknowledgement(state)
             self._open_step(state, event.part.tool_call_id, item)
-            self._emit(
-                state,
-                lambda seq: StepFrame(
-                    seq=seq, tool_call_id=event.part.tool_call_id, phase="started", item=item
-                ),
-            )
             self._start_long_operation(state, event.part.tool_call_id, hidden=item.hidden)
         elif isinstance(event, FunctionToolResultEvent):
             # BEFORE the resolved frame, so the status line is gone from the row the instant
@@ -3080,17 +3056,37 @@ class TurnEngine:
         self._emit(state, lambda seq: WorkingFrame(seq=seq, working=working))
 
     def _open_step(self, state: _TurnState, tool_call_id: str, item: StepItem) -> None:
-        """Record a step and, the first time it is seen, its POSITION in the turn.
+        """Record a step, its POSITION in the turn, and announce it on the wire.
 
         A step arrives twice — started, then finished — and the second must replace the first
         in place rather than move it: a step that jumped to the end when it resolved would
         reorder the turn under a citizen who is watching it. So the map is written every
-        time and the ref is appended only once."""
+        time and the ref is appended only once.
+
+        RETIRING THE ACK IS PART OF TAKING A POSITION, which is why it lives here rather than
+        at each caller. The ack is REPLACED, not accumulated beside — in the snapshot a later
+        subscriber reads AND in the feed an earlier one is already watching, which is the half
+        that was missing — so a caller that forgot the line would leave a row that never
+        resolves under a group that never seals. `_push_text`, the other sink that takes a
+        position in the turn, enforces the same rule the same way.
+
+        THE STARTED FRAME GOES OUT FROM HERE TOO, for the same reason: recording a step and
+        announcing it are one act, and both callers were spelling out the identical three
+        statements. `_emit` is synchronous, so the order a caller used to write by hand —
+        retraction, then the working flag if it changed, then the step — is the order this
+        produces. The turn's other `phase="started"` emitters (the acknowledgement itself, the
+        verify step, the long-operation narrator's re-emit) deliberately do not come through
+        here: none of them takes a position in `parts`."""
+        self._retire_acknowledgement(state)
         # A step means the model has stopped thinking and started doing.
         self._set_working(state, False)
         if tool_call_id not in state.steps:
             state.parts.append(_StepRef(tool_call_id))
         state.steps[tool_call_id] = item
+        self._emit(
+            state,
+            lambda seq: StepFrame(seq=seq, tool_call_id=tool_call_id, phase="started", item=item),
+        )
 
     def _push_text(self, state: _TurnState, text: str, *, new_block: bool = True) -> None:
         """Prose to the citizen: onto the turn's ordered parts AND onto the wire, at once.

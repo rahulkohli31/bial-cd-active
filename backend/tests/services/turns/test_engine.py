@@ -1216,10 +1216,10 @@ def _ack_frames(state: _TurnState) -> list[StepFrame]:
 async def test_the_first_real_step_retracts_the_acknowledgement(
     _fresh_engine, db_session, session_factory
 ) -> None:
-    """Mutation check: delete the `_retire_acknowledgement` call from `_on_event`'s
-    `FunctionToolCallEvent` arm and the retraction frame disappears while every other
-    assertion here stays green — the ack survives to the terminal instead, which is the
-    open-group defect wearing a later timestamp."""
+    """Mutation check: delete the `_retire_acknowledgement` call from `_open_step` and the
+    retraction frame disappears while every other assertion here stays green — the ack
+    survives to the terminal instead, which is the open-group defect wearing a later
+    timestamp."""
 
     async def _stream(messages: list[ModelMessage], info: AgentInfo):
         if len(messages) == 1:

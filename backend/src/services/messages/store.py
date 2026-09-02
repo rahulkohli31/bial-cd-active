@@ -66,15 +66,10 @@ _log = structlog.get_logger()
 # attachment-ref externalization). Readers of a row with a HIGHER version than they know
 # must refuse rather than guess.
 #
-# 1 -> 2 WITH REVISION 0035, AND THAT BUMP IS A CORRECTNESS REQUIREMENT, NOT HOUSEKEEPING.
-# The payload shape did not change; what changed is what the row's own `kind` stamp MEANS.
-# 0035 rewrites every historical row to `build`, and the projection's narration drop reads
-# that stamp — so without a way to tell a rewritten row from a natively-written one, prose
-# that renders today would silently stop rendering on reload for every migrated transcript
-# (a Plan turn that read files and then wrote prose in one response is the ordinary shape,
-# not an edge case). `services/messages/projection.py` therefore gates the drop on
-# `schema_version >= SCHEMA_VERSION`: a fact about WHEN a row was written, never a per-row
-# exemption keyed on the migrated stamp.
+# The payload shape never differed between 1 and 2: the bump was spent on revision 0035's
+# narration-drop gate, and that gate went out with the drop, so nothing reads the version for
+# RENDERING any more. It stays at 2 because rows on disk carry the 2 — walking it back would
+# make the refusal above fire on payloads this server wrote itself.
 SCHEMA_VERSION: Final = 2
 
 # The attachment reference marker's discriminator value. The serialized `BinaryContent` uses

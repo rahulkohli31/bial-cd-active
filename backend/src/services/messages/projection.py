@@ -129,10 +129,12 @@ class AssistantTextItem(CamelModel):
 
 
 class StepItem(CamelModel):
-    """One friendly agent step. `hidden` steps (reads) render only inside an expanded view;
-    `state` is derived from the stored return: ok / failed (a retry-refusal came back) /
-    pending (no return recorded — in flight, or lost to a crash; the surrounding banner or
-    in-progress anchor says which)."""
+    """One friendly agent step. `hidden` marks PLUMBING and nothing else now — a write to a
+    configuration file, a housekeeping shell command — never a read (a read is what the agent
+    looked at to get here, and it is drawn), and never a step that failed (a hidden failure
+    makes the group's count name a row nobody can find). `state` is derived from the stored
+    return: ok / failed (a retry-refusal came back) / pending (no return recorded — in flight,
+    or lost to a crash; the surrounding banner or in-progress anchor says which)."""
 
     type: Literal["step"] = "step"
     seq: int
@@ -379,7 +381,8 @@ def classify_command(argv: list[str]) -> tuple[str, bool]:
     """Public entry to the run_command classifier — the LIVE emitter (`orchestrator/tools.py`)
     shares this exact logic with the reload projection. The shared contract is the friendly BASE
     label + the `hidden` flag + the step state: neither feed ever shows raw shell/argv, both hide
-    the same read-only/housekeeping steps, and a given command classifies identically on both. The
+    the same housekeeping steps — a read is VISIBLE on both now, and a step that failed is hidden
+    on neither — and a given command classifies identically on both. The
     ONE intentional live-only affordance is a short human SUFFIX the live emitter appends to a
     blocked/failed step (`… — blocked to protect your data`, `… — couldn't finish`); on reload the
     same reason rides the step's Details expander instead (the state, failed, matches either way).
