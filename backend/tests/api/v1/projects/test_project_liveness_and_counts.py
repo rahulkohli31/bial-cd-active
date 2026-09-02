@@ -240,3 +240,38 @@ async def test_counts_is_not_shadowed_by_the_project_id_route(client, db_session
 
     assert resp.status_code == 200, resp.text
     assert set(resp.json()) == {"inProduction", "totalApplications", "inPipeline"}
+
+
+async def test_a_disabled_app_is_not_live_even_with_a_standing_deployment(
+    client, db_session
+) -> None:
+    """THE KILL SWITCH MUST WIN OVER THE DEPLOYMENT ROW.
+
+    `disable` transitions the status and SEVERS the app's database — it does not stamp
+    `unpublished_at` on the deployment. So an app that was serving keeps a newest-succeeded
+    row with a URL and no takedown, and a purely deployment-side liveness predicate calls it
+    live: the row renders the green Live badge, `Switched off` becomes unreachable because
+    `statusFor` checks serving first, and "In production" counts an app an administrator
+    has already killed.
+
+    Liveness is "published AND not withdrawn", and a disable IS a withdrawal — it just
+    records it on the registry rather than on the deployment.
+    """
+    headers, user = await _auth(db_session)
+    _, app = await _project_with_app(db_session, user.id, name="Killed", status=AppStatus.DISABLED)
+    await _deploy(db_session, app, user.id)  # succeeded, has a URL, never unpublished
+
+    assert (await _rows(client, headers))["Killed"] is False
+    assert (await client.get(_COUNTS, headers=headers)).json()["inProduction"] == 0
+
+
+async def test_a_rejected_app_is_not_live_either(client, db_session) -> None:
+    """Same shape, the other lever. `reject` writes `status` and `rejection_standing`
+    together; neither touches the deployment row."""
+    headers, user = await _auth(db_session)
+    _, app = await _project_with_app(
+        db_session, user.id, name="Refused", status=AppStatus.REJECTED
+    )
+    await _deploy(db_session, app, user.id)
+
+    assert (await _rows(client, headers))["Refused"] is False

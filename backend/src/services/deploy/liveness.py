@@ -31,8 +31,9 @@ COLLAPSE, never a flat filter, and it takes two of them:
     the newest row carry a stamp" but "did a takedown land after the thing we are about to
     call live".
 
-An app is live when a `last_success` row exists and no takedown landed at or after it.
-Because ids are UUIDv7 and creation-ordered, "after" is a straight `<` comparison.
+An app is live when a `last_success` row exists, no takedown landed at or after it, AND the
+registry does not record a withdrawal of its own. Because ids are UUIDv7 and
+creation-ordered, "after" is a straight `<` comparison.
 
 THE ORDERING INVARIANT THIS RESTS ON lives nowhere near here and breaks silently: `uuid`
 ordering equals creation order only because every row is minted by CPython's in-process
@@ -53,6 +54,7 @@ from typing import Any
 
 import sqlalchemy as sa
 
+from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.deployment import Deployment, DeploymentStatus
 
 
@@ -97,10 +99,26 @@ def live_app_ids() -> sa.Select[Any]:
         .select_from(last_success)
         # OUTER: an app that has never been unpublished has no row here and is still live.
         .outerjoin(last_unpublished, last_unpublished.c.app_id == last_success.c.app_id)
+        # INNER, and load-bearing: A WITHDRAWAL IS NOT ALWAYS RECORDED ON THE DEPLOYMENT.
+        # `unpublish` stamps the deployment row, but `disable` and `reject` write only the
+        # REGISTRY — `disable` transitions the status and severs the app's database without
+        # touching `unpublished_at` at all. A purely deployment-side predicate therefore
+        # calls a kill-switched app live: it still has a newest-succeeded row with a URL and
+        # no takedown stamp. The row would render the green Live badge (serving is checked
+        # first, so `Switched off` is unreachable), and "In production" would count an app
+        # an administrator had already killed.
+        #
+        # So liveness reads BOTH sides of the same question. These are the predicates the
+        # marketplace applies for the same reason, `rejection_standing` included: `status`
+        # is mutable lifecycle state, and a reject -> publish -> withdraw round trip lands
+        # back at DRAFT while the standing rejection survives.
+        .join(AppRegistry, AppRegistry.id == last_success.c.app_id)
         .where(
             sa.or_(
                 last_unpublished.c.id.is_(None),
                 last_unpublished.c.id < last_success.c.id,
-            )
+            ),
+            AppRegistry.status.notin_((AppStatus.DISABLED, AppStatus.REJECTED)),
+            AppRegistry.rejection_standing.is_(False),
         )
     )
