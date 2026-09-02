@@ -20,6 +20,19 @@ import type { ChatMessage } from './messageTypes'
  * The header used to carry a second field beside it, a per-thread setting the citizen could move
  * mid-conversation; there is no such field on the wire any more, and nothing here should look for
  * one. A chat that needs to do the other thing is a different chat. */
+/**
+ * The chat-row shape a project's rail renders — a deliberate narrowing of `ConversationHeader`,
+ * not a second spelling of it. It lives HERE, beside the rows it is narrowed from, because its
+ * owner is the API boundary that parses them: defining it on the component that renders it made
+ * the page importing its own parsed shape back out of a leaf.
+ */
+export interface ChatSummary {
+  id: string
+  kind: string
+  title: string
+  updatedAt: string
+}
+
 export interface ConversationHeader {
   id: string
   kind: string

@@ -147,6 +147,28 @@ export interface WorkspaceState {
   readonly action: WorkspaceAction | null
 }
 
+/**
+ * Two states that say the same thing to a reader. Every member is a primitive or a small union of
+ * them, so this is exact — and it is what lets a poll that keeps returning the same answer stop
+ * waking the surfaces rendering it.
+ */
+export const sameWorkspaceState = (a: WorkspaceState, b: WorkspaceState): boolean =>
+  a === b ||
+  (a.name === b.name &&
+    a.headline === b.headline &&
+    a.detail === b.detail &&
+    sameAction(a.action, b.action))
+
+const sameAction = (a: WorkspaceAction | null, b: WorkspaceAction | null): boolean =>
+  a === b ||
+  (a !== null &&
+    b !== null &&
+    a.kind === b.kind &&
+    a.label === b.label &&
+    // Only `go-to-project` carries one, and comparing it on the arms that do not is `undefined`
+    // against `undefined` — true, which is the right answer for them.
+    (a as { projectId?: string }).projectId === (b as { projectId?: string }).projectId)
+
 // ─── the inputs ───────────────────────────────────────────────────────────────────────────────
 
 export interface WorkspaceInputs {

@@ -326,6 +326,18 @@ export interface SaveState {
   savedHead: string | null
 }
 
+/** Two readings that say the same thing. Every field is a primitive, so this is exact rather
+ *  than an approximation — and it exists so a poll that keeps reporting the same answer stops
+ *  handing consumers a new object to re-render for. */
+export const sameSaveState = (a: SaveState | null, b: SaveState | null): boolean =>
+  a === b ||
+  (a !== null &&
+    b !== null &&
+    a.appId === b.appId &&
+    a.dirty === b.dirty &&
+    a.containerHead === b.containerHead &&
+    a.savedHead === b.savedHead)
+
 /** Push the project's current tree to durable storage. THE USER'S CLICK — nothing else writes
  *  the bundle. A 409 means the workspace is no longer running, and is surfaced, never
  *  swallowed: a Save that reports success having stored nothing is the worst outcome here. */
@@ -381,6 +393,36 @@ export async function stopActiveBuild(
     deps,
   )
   return isRecord(body) && body.stopped === true
+}
+
+/** Hand the workspace over: STOP, then optionally SAVE, then RELEASE — the whole of what the
+ *  #83 refusal dialog's buttons do to the server, in the one order that works.
+ *
+ *  THE ORDER IS THE DESIGN, and it lives here rather than in each caller because it is an
+ *  invariant of these three endpoints, not of any one surface. Save and release BOTH refuse
+ *  while an agent is writing, so a sequence that saved first would simply fail — and a save
+ *  that slipped past that guard would bundle a tree caught mid-edit as the version Relaunch
+ *  later restores. Stopping settles the turn (terminal frame, billing, `finish_turn_sandbox`)
+ *  and only then is there a coherent tree to save.
+ *
+ *  THE STOP IS UNCONDITIONAL, not gated on `ReclaimBlocked.building`. `building` describes what
+ *  to SAY, not what to do: it is true only for a Write turn, because that is the one whose
+ *  interruption costs the user something. But an Ask or Plan turn holds the container just as
+ *  firmly — every mode pins it — and `release` refuses for either, so gating the stop on it left
+ *  the other modes in the dead end this flow exists to remove: a dialog whose buttons the server
+ *  declines. Stopping when nothing is running is free and says so (`{stopped: false}`).
+ *
+ *  REJECTS RATHER THAN SWALLOWS. A failed save must not be followed by a release — that is
+ *  precisely the data loss the dialog exists to prevent — so the rejection travels back to the
+ *  caller, which is the only thing still mounted that can report it. */
+export async function handOverWorkspace(
+  projectId: string,
+  save: boolean,
+  deps: AuthFetchDeps = {},
+): Promise<void> {
+  await stopActiveBuild(projectId, deps)
+  if (save) await saveProject(projectId, deps)
+  await releaseProject(projectId, deps)
 }
 
 /** The project standing in the way, read off a `sandbox_reclaim_blocked` 409. */
@@ -471,6 +513,19 @@ export interface PreviewState {
    *  every 45 seconds). This is why `hasSavedBuild` reads it with `??` and not `||`. */
   restorable: boolean | null
 }
+
+/** Two readings that say the same thing — see `sameSaveState`. `alive` is omitted deliberately:
+ *  its own docblock above pins it to `state === 'alive'`, so comparing it could only ever agree
+ *  with the comparison of `state` that is already here. */
+export const samePreviewState = (a: PreviewState | null, b: PreviewState | null): boolean =>
+  a === b ||
+  (a !== null &&
+    b !== null &&
+    a.state === b.state &&
+    a.previewUrl === b.previewUrl &&
+    a.occupyingProjectName === b.occupyingProjectName &&
+    a.occupyingProjectId === b.occupyingProjectId &&
+    a.restorable === b.restorable)
 
 function asPreviewLifeState(value: unknown, alive: boolean): PreviewLifeState {
   // An unrecognised (or absent) state falls back to what `alive` can prove and NO further:
