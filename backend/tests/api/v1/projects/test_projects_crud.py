@@ -201,7 +201,14 @@ async def test_get_patch_delete_cross_user_404(client, db_session) -> None:
     assert (
         await client.patch(f"/v1/projects/{victim.id}", headers=headers, json={"name": "hax"})
     ).status_code == 404
-    assert (await client.delete(f"/v1/projects/{victim.id}", headers=headers)).status_code == 404
+    assert (
+        await client.request(
+            "DELETE",
+            f"/v1/projects/{victim.id}",
+            headers=headers,
+            json={"remark": "No longer needed by the ground operations team"},
+        )
+    ).status_code == 404
     # The victim row is untouched.
     still = await db_session.get(Project, victim.id)
     assert still is not None and still.name == "Secret"
@@ -375,7 +382,12 @@ async def test_delete_cascades_children_and_sweeps_blobs(client, db_session, fak
     )
     await db_session.commit()
 
-    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    resp = await client.request(
+        "DELETE",
+        f"/v1/projects/{project.id}",
+        headers=headers,
+        json={"remark": "No longer needed by the ground operations team"},
+    )
     assert resp.status_code == 200
     assert resp.json() == {"ok": True}
 
@@ -439,7 +451,12 @@ async def test_delete_sweeps_the_apps_blob_container(
     app_row = await AppRegistryFactory.create(db_session, user_id=user.id, project_id=project.id)
     await db_session.commit()
 
-    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    resp = await client.request(
+        "DELETE",
+        f"/v1/projects/{project.id}",
+        headers=headers,
+        json={"remark": "No longer needed by the ground operations team"},
+    )
     assert resp.status_code == 200
     # The app's per-app Blob container was swept post-commit (wholesale, by app id).
     assert store.deleted == [app_row.id]
@@ -456,7 +473,12 @@ async def test_delete_survives_a_container_sweep_failure(
     await AppRegistryFactory.create(db_session, user_id=user.id, project_id=project.id)
     await db_session.commit()
 
-    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    resp = await client.request(
+        "DELETE",
+        f"/v1/projects/{project.id}",
+        headers=headers,
+        json={"remark": "No longer needed by the ground operations team"},
+    )
     assert resp.status_code == 200
     assert await db_session.get(Project, project.id) is None  # the delete still committed
 
@@ -470,7 +492,12 @@ async def test_delete_succeeds_with_storage_disabled(client, db_session, fake_st
     await AppRegistryFactory.create(db_session, user_id=user.id, project_id=project.id)
     await db_session.commit()
 
-    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    resp = await client.request(
+        "DELETE",
+        f"/v1/projects/{project.id}",
+        headers=headers,
+        json={"remark": "No longer needed by the ground operations team"},
+    )
     assert resp.status_code == 200
     assert await db_session.get(Project, project.id) is None
 
@@ -709,7 +736,12 @@ async def test_delete_sweeps_a_bundle_written_between_the_gather_and_the_commit(
     store = _MidDeleteWriteStorage(inject_after_list_call=1, objects={late: b"# v2 git bundle"})
     _override_storage(app, store)
 
-    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    resp = await client.request(
+        "DELETE",
+        f"/v1/projects/{project.id}",
+        headers=headers,
+        json={"remark": "No longer needed by the ground operations team"},
+    )
 
     assert resp.status_code == 200
     assert store.list_calls == 2  # the pre-commit gather AND the post-commit re-walk
@@ -730,7 +762,12 @@ async def test_delete_sweeps_a_bundle_written_before_the_delete_starts(
     store.objects[snapshot_key(app_row.id)] = b"bundle"
     _override_storage(app, store)
 
-    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    resp = await client.request(
+        "DELETE",
+        f"/v1/projects/{project.id}",
+        headers=headers,
+        json={"remark": "No longer needed by the ground operations team"},
+    )
 
     assert resp.status_code == 200
     assert _under(store, app_row.id) == []
@@ -755,7 +792,12 @@ async def test_delete_fails_and_keeps_the_project_when_the_pre_commit_gather_rai
 
     savepoint = await db_session.begin_nested()
     with pytest.raises(StorageError):
-        await client.delete(f"/v1/projects/{project.id}", headers=headers)
+        await client.request(
+            "DELETE",
+            f"/v1/projects/{project.id}",
+            headers=headers,
+            json={"remark": "No longer needed by the ground operations team"},
+        )
     await savepoint.rollback()
 
     assert await db_session.scalar(select(Project).where(Project.id == project.id)) is not None
@@ -781,7 +823,12 @@ async def test_delete_returns_200_and_logs_when_the_post_commit_sweep_fails(
     _override_storage(app, store)
 
     with capture_logs() as logs:
-        resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+        resp = await client.request(
+            "DELETE",
+            f"/v1/projects/{project.id}",
+            headers=headers,
+            json={"remark": "No longer needed by the ground operations team"},
+        )
 
     assert resp.status_code == 200
     assert await db_session.get(Project, project.id) is None
@@ -854,7 +901,12 @@ async def test_delete_returns_200_and_logs_when_the_re_walk_list_raises(
     _override_storage(app, store)
 
     with capture_logs() as logs:
-        resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+        resp = await client.request(
+            "DELETE",
+            f"/v1/projects/{project.id}",
+            headers=headers,
+            json={"remark": "No longer needed by the ground operations team"},
+        )
 
     assert resp.status_code == 200
     assert await db_session.get(Project, project.id) is None
@@ -879,7 +931,12 @@ async def test_the_re_walk_pages_past_the_first_page(app, client, db_session) ->
     store = _MidDeleteWriteStorage(inject_after_list_call=1, objects=late)
     _override_storage(app, store)
 
-    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    resp = await client.request(
+        "DELETE",
+        f"/v1/projects/{project.id}",
+        headers=headers,
+        json={"remark": "No longer needed by the ground operations team"},
+    )
 
     assert resp.status_code == 200
     assert _under(store, app_row.id) == []
@@ -906,7 +963,12 @@ async def test_the_re_walk_never_reaches_another_users_app(app, client, db_sessi
     store.objects[key_b] = b"# v2 git bundle"
     _override_storage(app, store)
 
-    resp = await client.delete(f"/v1/projects/{project_a.id}", headers=headers_a)
+    resp = await client.request(
+        "DELETE",
+        f"/v1/projects/{project_a.id}",
+        headers=headers_a,
+        json={"remark": "No longer needed by the ground operations team"},
+    )
 
     assert resp.status_code == 200
     assert key_a not in store.objects
@@ -931,7 +993,12 @@ async def test_a_bundle_written_after_the_re_walk_survives_the_delete(
     )
     _override_storage(app, store)
 
-    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    resp = await client.request(
+        "DELETE",
+        f"/v1/projects/{project.id}",
+        headers=headers,
+        json={"remark": "No longer needed by the ground operations team"},
+    )
 
     assert resp.status_code == 200
     assert store.list_calls == 2  # the re-walk DID run — the write simply landed after it
@@ -1006,7 +1073,12 @@ async def test_delete_is_refused_while_this_projects_app_is_building(
     _override_storage(app, store)
     await _live_session_for(fake_redis, user.id, app_row.id)
 
-    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    resp = await client.request(
+        "DELETE",
+        f"/v1/projects/{project.id}",
+        headers=headers,
+        json={"remark": "No longer needed by the ground operations team"},
+    )
 
     assert resp.status_code == 409
     assert "build session" in resp.json()["error"]["message"]
@@ -1029,7 +1101,12 @@ async def test_delete_proceeds_when_no_build_session_is_live(
     store.objects[snapshot_key(app_row.id)] = b"# v2 git bundle"
     _override_storage(app, store)
 
-    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    resp = await client.request(
+        "DELETE",
+        f"/v1/projects/{project.id}",
+        headers=headers,
+        json={"remark": "No longer needed by the ground operations team"},
+    )
 
     assert resp.status_code == 200
     assert await db_session.get(Project, project.id) is None
@@ -1052,7 +1129,12 @@ async def test_a_live_session_in_another_project_does_not_block_this_delete(
     # Project A is building; project B is the one being deleted.
     await _live_session_for(fake_redis, user.id, app_a.id)
 
-    resp = await client.delete(f"/v1/projects/{project_b.id}", headers=headers)
+    resp = await client.request(
+        "DELETE",
+        f"/v1/projects/{project_b.id}",
+        headers=headers,
+        json={"remark": "No longer needed by the ground operations team"},
+    )
 
     assert resp.status_code == 200
     assert await db_session.get(Project, project_b.id) is None
@@ -1080,7 +1162,12 @@ async def test_delete_is_503_when_redis_errors_during_the_guard(
     store.objects[snapshot_key(app_row.id)] = b"# v2 git bundle"
     _override_storage(app, store)
 
-    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    resp = await client.request(
+        "DELETE",
+        f"/v1/projects/{project.id}",
+        headers=headers,
+        json={"remark": "No longer needed by the ground operations team"},
+    )
 
     assert resp.status_code == 503
     assert resp.json()["error"]["message"] == BUILD_COORDINATION_UNAVAILABLE_MSG
@@ -1105,7 +1192,12 @@ async def test_delete_is_503_when_the_registry_read_errors_during_the_guard(
     _override_storage(app, FakeStorage())
     await fake_redis.set(_lock(user.id), "holder-token")
 
-    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    resp = await client.request(
+        "DELETE",
+        f"/v1/projects/{project.id}",
+        headers=headers,
+        json={"remark": "No longer needed by the ground operations team"},
+    )
 
     assert resp.status_code == 503
     assert resp.json()["error"]["message"] == BUILD_COORDINATION_UNAVAILABLE_MSG
@@ -1122,7 +1214,12 @@ async def test_delete_proceeds_when_redis_is_not_configured(app, client, db_sess
     store.objects[snapshot_key(app_row.id)] = b"# v2 git bundle"
     _override_storage(app, store)
 
-    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    resp = await client.request(
+        "DELETE",
+        f"/v1/projects/{project.id}",
+        headers=headers,
+        json={"remark": "No longer needed by the ground operations team"},
+    )
 
     assert resp.status_code == 200
     assert await db_session.get(Project, project.id) is None
@@ -1139,7 +1236,12 @@ async def test_delete_fails_closed_when_the_lock_names_no_app(
     _override_storage(app, FakeStorage())
     await fake_redis.set(_lock(user.id), "holder-token")  # lock held, NO registry hash
 
-    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    resp = await client.request(
+        "DELETE",
+        f"/v1/projects/{project.id}",
+        headers=headers,
+        json={"remark": "No longer needed by the ground operations team"},
+    )
 
     assert resp.status_code == 409
     assert await db_session.get(Project, project.id) is not None
@@ -1159,7 +1261,12 @@ async def test_delete_fails_closed_when_the_registry_carries_no_app_name(
     await fake_redis.set(_lock(user.id), "holder-token")
     await fake_redis.hset(registry_key(user.id), REGISTRY_FIELD_STATE, "ready")
 
-    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    resp = await client.request(
+        "DELETE",
+        f"/v1/projects/{project.id}",
+        headers=headers,
+        json={"remark": "No longer needed by the ground operations team"},
+    )
 
     assert resp.status_code == 409
     assert await db_session.get(Project, project.id) is not None
@@ -1179,7 +1286,12 @@ async def test_delete_of_an_app_less_project_is_never_blocked_by_a_live_build(
     _override_storage(app, FakeStorage())
     await _live_session_for(fake_redis, user.id, building.id)
 
-    resp = await client.delete(f"/v1/projects/{empty.id}", headers=headers)
+    resp = await client.request(
+        "DELETE",
+        f"/v1/projects/{empty.id}",
+        headers=headers,
+        json={"remark": "No longer needed by the ground operations team"},
+    )
 
     assert resp.status_code == 200
     assert await db_session.get(Project, empty.id) is None
@@ -1225,7 +1337,12 @@ async def test_a_relaunched_preview_does_not_block_the_delete_and_is_not_torn_do
     )
     assert not await fake_redis.exists(_lock(user.id))
 
-    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    resp = await client.request(
+        "DELETE",
+        f"/v1/projects/{project.id}",
+        headers=headers,
+        json={"remark": "No longer needed by the ground operations team"},
+    )
 
     # The delete PROCEEDS — the guard never fires, because there is no lock to see.
     assert resp.status_code == 200

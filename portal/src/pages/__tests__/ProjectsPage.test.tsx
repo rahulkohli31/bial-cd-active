@@ -3,7 +3,8 @@
  *
  * #158 replaced the card grid with two views, numbered pagination and a summary strip, so
  * this file was rewritten rather than patched. What it used to assert — a "Load more"
- * button, "Create your first project", the card grid as the ONLY layout — describes a page
+ * button, the first-run CTA that named creating a project, the card grid as the ONLY
+ * layout — describes a page
  * that no longer exists, and §16.3 names that describe block as dead code to remove rather
  * than leave failing beside the new work.
  *
@@ -328,16 +329,12 @@ describe('create and delete', () => {
     await screen.findByText('Alpha')
 
     fireEvent.click(screen.getByLabelText('Delete Alpha'))
-    // The dialog still carries the type-the-name gate #158 §13.1 replaces with a plain
-    // confirmation plus a required reason. Satisfying it here keeps THIS test about the
-    // page's 404 handling; the gate's own removal lands with the dialog rewrite and brings
-    // its own assertions.
-    // The confirm input, not the page's search box — the current dialog is a plain div
-    // with no `role="dialog"` to scope by.
-    const confirm = (await screen.findAllByRole('textbox')).find(
-      (el) => el.getAttribute('aria-label') !== 'Search projects',
-    )
-    fireEvent.change(confirm!, { target: { value: 'Alpha' } })
+    // The dialog now gates on a 5-50 word reason (#158 §13.1), which the page forwards to
+    // the API. Its own bounds are asserted in ProjectDeleteDialog.test.tsx; here it just
+    // has to be valid so the delete runs.
+    fireEvent.change(await screen.findByLabelText(/why are you deleting/i), {
+      target: { value: 'no longer needed by ground ops' },
+    })
     fireEvent.click(screen.getByRole('button', { name: /delete project/i }))
 
     await waitFor(() => expect(h.deleteProject).toHaveBeenCalled())

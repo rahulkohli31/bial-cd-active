@@ -1,53 +1,55 @@
 /**
- * Dashboard (U4): one front door.
+ * The welcome page is gone — this file is its INERTNESS GUARD (#158 §7 / §16.1).
  *
- * The App Builder card is gone — the dashboard offers a single Projects card, with the
- * greeting and the Pilot (POC) disclaimer preserved. Navbar is stubbed; auth is mocked so
- * the greeting has a name.
+ * `pages/Dashboard.tsx` was a screen whose whole purpose was a button to `/projects`. Once
+ * the project list carries the three summary numbers, that hop has nothing left to do, so
+ * the page was deleted and `/dashboard` became a redirect.
+ *
+ * §16.1 is explicit that this suite should NOT simply be deleted: a removal is only real
+ * when nothing can quietly bring it back. So instead of testing a component that no longer
+ * exists, this asserts the module is absent and that nothing imports it. Re-adding the page
+ * fails here, and has to be argued for rather than landed beside the new landing screen.
+ *
+ * IT CHECKS THE FILESYSTEM, not a dynamic import: Vite resolves imports at transform time,
+ * so `import('../Dashboard')` inside a test is a build error rather than a rejected promise
+ * — the suite would fail to load instead of reporting. Same reason
+ * `jsx-deploy-retirement.test.ts` walks the tree.
+ *
+ * The route-level half — `/dashboard` renders the project list and no welcome page — lives
+ * in `App.test.jsx`, where the route table is.
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
-import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
-import Dashboard from '../Dashboard'
+import { describe, it, expect } from 'vitest'
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
-vi.mock('../../utils/auth', () => ({ getStoredUser: () => ({ display_name: 'Anant' }) }))
+const PAGES = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
+const SRC = path.dirname(PAGES)
 
-function LocationProbe() {
-  const loc = useLocation()
-  return <div data-testid="location">{loc.pathname}</div>
+function walk(dir) {
+  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const full = path.join(dir, entry.name)
+    if (entry.isDirectory()) return entry.name === 'node_modules' ? [] : walk(full)
+    return /\.(ts|tsx|js|jsx)$/.test(entry.name) ? [full] : []
+  })
 }
 
-function renderDashboard() {
-  return render(
-    <MemoryRouter initialEntries={['/dashboard']}>
-      <Routes>
-        <Route path="/dashboard" element={<Dashboard />} />
-        <Route path="*" element={<LocationProbe />} />
-      </Routes>
-    </MemoryRouter>,
-  )
-}
-
-beforeEach(() => vi.clearAllMocks())
-afterEach(() => cleanup())
-
-describe('Dashboard — single front door', () => {
-  it('keeps the greeting + Pilot (POC) notice and offers exactly one Projects card', () => {
-    renderDashboard()
-    expect(screen.getByRole('heading', { name: /Hello, Anant/i })).toBeTruthy()
-    expect(screen.getByText('Pilot (POC)')).toBeTruthy()
-    expect(screen.getByRole('heading', { name: 'Projects' })).toBeTruthy()
+describe('the welcome page stays deleted', () => {
+  it('has no module file', () => {
+    for (const ext of ['tsx', 'ts', 'jsx', 'js']) {
+      expect(fs.existsSync(path.join(PAGES, `Dashboard.${ext}`))).toBe(false)
+    }
   })
 
-  it('has no App Builder door anywhere', () => {
-    renderDashboard()
-    expect(screen.queryByText(/App Builder/i)).toBeNull()
-  })
+  it('is imported by nothing', () => {
+    // The stale `vi.mock('./pages/Dashboard')` in App.test.jsx is exactly the kind of
+    // leftover this catches: a mock of a path that no longer exists passes locally and
+    // fails oddly later.
+    const offenders = walk(SRC)
+      .filter((file) => !file.endsWith(path.join('__tests__', 'Dashboard.test.jsx')))
+      .filter((file) => /pages\/Dashboard|pages\\Dashboard/.test(fs.readFileSync(file, 'utf8')))
+      .map((file) => path.relative(SRC, file))
 
-  it('opens /projects from the Projects card', async () => {
-    renderDashboard()
-    fireEvent.click(screen.getByRole('heading', { name: 'Projects' }))
-    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('/projects'))
+    expect(offenders).toEqual([])
   })
 })

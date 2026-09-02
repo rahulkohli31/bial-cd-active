@@ -273,8 +273,25 @@ export async function patchProject(id: string, patch: ProjectPatch, deps: AuthFe
 }
 
 /** Delete a project; the server cascades its chats, app, and blobs. */
-export async function deleteProject(id: string, deps: AuthFetchDeps = {}): Promise<DeleteResult> {
-  const res = await authFetch(`/api/projects/${encodeURIComponent(id)}`, { method: 'DELETE' }, deps)
+/**
+ * Delete a project, with the reason the server now requires (#158 §13.2).
+ *
+ * A BODY ON A DELETE is unusual — RFC 9110 gives it no defined semantics, and some clients
+ * decline to make it easy (httpx omits `json=` from its `.delete()`). It is used here
+ * because a 50-word reason does not belong in a query string, and because the alternative,
+ * a `POST /{id}/delete`, is a bigger contract change than adding a field to the route that
+ * already exists. `fetch` sends it, and nginx and the container ingress both forward it.
+ */
+export async function deleteProject(
+  id: string,
+  remark: string,
+  deps: AuthFetchDeps = {},
+): Promise<DeleteResult> {
+  const res = await authFetch(
+    `/api/projects/${encodeURIComponent(id)}`,
+    { method: 'DELETE', headers: JSON_HEADERS, body: JSON.stringify({ remark }) },
+    deps,
+  )
   if (!res.ok) throw await readApiError(res, 'Failed to delete project')
   const data: unknown = await res.json().catch(() => null)
   return { ok: isRecord(data) && data.ok === true }

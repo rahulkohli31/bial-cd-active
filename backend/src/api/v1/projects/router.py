@@ -35,6 +35,8 @@ from src.api.v1.pagination import (
 )
 from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry, AppStatus
+from src.db.models.conversation import Conversation
+from src.db.models.deleted_project import DeletedProject
 from src.db.models.project import Project
 from src.schemas import (
     AUTH_401,
@@ -43,6 +45,7 @@ from src.schemas import (
     OkResponse,
     ProjectCountsResponse,
     ProjectCreate,
+    ProjectDeleteRequest,
     ProjectListResponse,
     ProjectPatch,
     ProjectResponse,
@@ -388,12 +391,22 @@ _BUILD_LIVE_DELETE_MSG = (
 )
 async def delete_project(
     project_id: uuid.UUID,
+    body: ProjectDeleteRequest,
     user: CurrentUser,
     db: DbSession,
     storage: StorageDep,
     container_store: ContainerStoreDep,
 ) -> OkResponse:
-    """Cascade-delete the project and every child it owns. Rows are deleted inside the
+    """Cascade-delete the project and every child it owns.
+
+    IT TAKES A BODY, which is unusual for DELETE and worth naming. #158 §13.2 requires the
+    person deleting to state WHY, in 5-50 words, and a 50-word reason does not belong in a
+    query string. RFC 9110 says content on a DELETE has no defined semantics, and httpx
+    declines to offer `json=` on `.delete()` for that reason — tests use `.request("DELETE",
+    ...)`. nginx and the container ingress both forward the body, and the portal is the only
+    client, so this is safe here; it is recorded rather than assumed. The alternative, a
+    `POST /{id}/delete` matching `disable`/`unpublish`, is a bigger contract change than
+    adding a required field to the route that already exists. Rows are deleted inside the
     transaction and committed; object-store blobs AND each app's per-app Blob container are swept
     only AFTER commit, best-effort, so a rolled-back delete never destroys a blob/container a
     restored row still points at (KD-3). The two sweeps hit two different stores (KTD-7).
@@ -414,6 +427,21 @@ async def delete_project(
     already gone, so a failed drop is a logged orphan for the reconciler, never a 500 on a
     delete that in fact succeeded."""
     project = await owned_project_or_404(db, user.id, project_id)
+    # THE TOMBSTONE, written before the cascade removes what it describes (#158 §13.3).
+    # Inside the caller's transaction, so a rolled-back delete leaves no record of a
+    # deletion that did not happen — and a committed one always has its reason.
+    #
+    # Values, not foreign keys: the project row is gone a few lines below, so anything this
+    # references by id would be unreadable. The counts are captured HERE because they cannot
+    # be reconstructed once the children are deleted.
+    chats_deleted = int(
+        await db.scalar(
+            sa.select(sa.func.count())
+            .select_from(Conversation)
+            .where(Conversation.project_id == project.id)
+        )
+        or 0
+    )
     # R9: refuse while this project's app is being built. Owner-scoped discovery (ADR-0004);
     # a project with no app row can have no build session, so the guard is skipped rather
     # than fired — an app-less project must not inherit another project's live build.
@@ -426,6 +454,21 @@ async def delete_project(
     # cascades its `project_databases` row away, so post-commit there is nothing left to
     # read them from — the same reason `app_container_ids` are plain UUIDs (KD-8).
     handles = await teardown_handles(db, project.id)
+    # Captured before the cascade, for the same reason as the chat count: `handles` is read
+    # from a row the cascade deletes.
+    db.add(
+        DeletedProject(
+            project_id=project.id,
+            project_name=project.name,
+            owner_id=project.user_id,
+            owner_email=user.email,
+            deleted_by=user.id,
+            remark=body.remark,
+            chats_deleted=chats_deleted,
+            had_app=app_id is not None,
+            had_database=handles is not None,
+        )
+    )
     cleanup = await delete_project_cascade(db, project, storage, user_id=user.id)
     await append_audit(
         db,

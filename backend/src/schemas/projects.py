@@ -14,6 +14,11 @@ from datetime import datetime
 from pydantic import field_validator
 
 from src.core.words import count_words
+from src.db.models.deleted_project import (
+    MAX_DELETE_REMARK_CHARS,
+    MAX_DELETE_REMARK_WORDS,
+    MIN_DELETE_REMARK_WORDS,
+)
 from src.db.models.project import (
     MAX_PROJECT_DESCRIPTION,
     MAX_PROJECT_NAME,
@@ -80,6 +85,48 @@ class ProjectPatch(CamelModel):
         return None if value is None else _clean_name(value)
 
     _v_description = field_validator("description")(_clean_description)
+
+
+def _clean_delete_remark(value: str) -> str:
+    """Why this project is being deleted — 5 to 50 WORDS (#158 §13.2).
+
+    The same shared rule as the title cap: `count_words` here,
+    `portal/src/utils/words.ts` in the browser, both pinned against the same inputs. The
+    client keeps the person inside the limit and the server enforces it independently —
+    which is the shape §13.2 asks for, and the opposite of the rename path it cites as the
+    thing not to repeat.
+
+    A lower bound is unusual and deliberate. The remark exists so an administrator reading
+    a deletion months later learns something; "no" and "done" satisfy a required field
+    without satisfying that, and a field that can be dismissed in one word is a field that
+    will be.
+    """
+    value = value.strip()
+    if not value:
+        raise ValueError("Say why you are deleting this project.")
+    # The paste backstop, which a person should never meet.
+    if len(value) > MAX_DELETE_REMARK_CHARS:
+        raise ValueError("That reason is too long. Keep it under 50 words.")
+    words = count_words(value)
+    if words < MIN_DELETE_REMARK_WORDS:
+        raise ValueError("Give a little more detail — at least 5 words.")
+    if words > MAX_DELETE_REMARK_WORDS:
+        raise ValueError("Keep the reason under 50 words.")
+    return value
+
+
+class ProjectDeleteRequest(CamelModel):
+    """The body `DELETE /v1/projects/{id}` now requires.
+
+    Deleting a project destroys its app, its database, its files and all of its chats, and
+    none of it comes back. #158 §13.1 replaced the type-the-name gate with a plain
+    confirmation plus a stated reason: retyping a name proves you can read, not that you
+    meant it, and the reason is the part that is still useful a month later.
+    """
+
+    remark: str
+
+    _v_remark = field_validator("remark")(_clean_delete_remark)
 
 
 class ProjectResponse(CamelModel):

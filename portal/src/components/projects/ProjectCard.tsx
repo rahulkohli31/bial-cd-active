@@ -9,19 +9,30 @@
  * `onOpen` / `onDelete`, so this component is trivial to render in a test with no
  * router.
  */
-import { Trash2, Boxes } from 'lucide-react'
-import type { AppStatus, Project } from '../../utils/projectApi'
+import { Trash2 } from 'lucide-react'
+import type { Project } from '../../utils/projectApi'
+import { statusFor, TONE_CLASS } from '../../utils/appStatusLabel'
 
-const HAS_APP_BADGE = { label: 'App', cls: 'bg-primary/10 text-primary' }
-const NO_APP_BADGE = { label: 'No app yet', cls: 'bg-bial-bg text-neutral' }
-
-export function AppStatusBadge({ appStatus }: { appStatus: AppStatus | null }): React.JSX.Element {
-  // `appStatus` still types the exact lifecycle union, but the card only cares whether an
-  // app exists — any non-null status reads as a plain "App".
-  const badge = appStatus === null ? NO_APP_BADGE : HAS_APP_BADGE
+/**
+ * The status pill, in the SHARED vocabulary (#158 §10).
+ *
+ * It used to read "App" or "No app yet" — a binary, on the reasoning that lifecycle belonged
+ * to the admin registry. The publishing work moved that lifecycle onto the citizen's own
+ * surfaces, so the card now says the same words the project page's chip does, via
+ * `appStatusLabel`. The list row reads the identical helper: two views of one list must not
+ * describe the same project differently.
+ */
+export function AppStatusBadge({
+  project,
+}: {
+  project: Pick<Project, 'appStatus' | 'isServing'>
+}): React.JSX.Element {
+  const status = statusFor(project)
   return (
-    <span className={`text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full ${badge.cls}`}>
-      {badge.label}
+    <span
+      className={`text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full whitespace-nowrap ${TONE_CLASS[status.tone]}`}
+    >
+      {status.label}
     </span>
   )
 }
@@ -43,9 +54,6 @@ export default function ProjectCard({ project, onOpen, onDelete }: ProjectCardPr
     <div className="group relative flex flex-col gap-3 bg-white border border-bial-border rounded-2xl px-5 py-4 hover:border-primary/40 hover:shadow-sm transition font-manrope">
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-center gap-2.5 min-w-0">
-          <div className="w-9 h-9 rounded-xl bg-primary/10 flex items-center justify-center flex-shrink-0">
-            <Boxes size={16} className="text-primary" />
-          </div>
           <h3 className="min-w-0 flex-1">
             <button
               type="button"
@@ -79,7 +87,7 @@ export default function ProjectCard({ project, onOpen, onDelete }: ProjectCardPr
       )}
 
       <div className="mt-auto pt-1">
-        <AppStatusBadge appStatus={project.appStatus} />
+        <AppStatusBadge project={project} />
       </div>
     </div>
   )

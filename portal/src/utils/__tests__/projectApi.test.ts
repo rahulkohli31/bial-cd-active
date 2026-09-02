@@ -134,10 +134,18 @@ describe('patchProject', () => {
 })
 
 describe('deleteProject', () => {
-  it('DELETEs and returns {ok:true}', async () => {
+  it('DELETEs, carries the reason in the body, and returns {ok:true}', async () => {
     const fetchImpl = fetchReturning(200, { ok: true })
-    const result = await deleteProject('p1', deps(fetchImpl))
-    expect(fetchImpl.mock.calls[0][1]?.method).toBe('DELETE')
+
+    const result = await deleteProject('p1', 'Superseded by the new gate pass tool', deps(fetchImpl))
+
+    const init = fetchImpl.mock.calls[0][1]
+    expect(init?.method).toBe('DELETE')
+    // The server requires it (#158 §13.2) and refuses independently of the dialog, so the
+    // client sending it is not optional — a DELETE with no body is a 422.
+    expect(JSON.parse(String(init?.body))).toEqual({
+      remark: 'Superseded by the new gate pass tool',
+    })
     expect(result).toEqual({ ok: true })
   })
 })

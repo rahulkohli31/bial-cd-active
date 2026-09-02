@@ -178,11 +178,11 @@ export default function ProjectsPage(): React.JSX.Element {
     navigate(`/projects/${project.id}`)
   }
 
-  const handleDelete = async (project: Project): Promise<void> => {
+  const handleDelete = async (project: Project, remark: string): Promise<void> => {
     setDeleting(null)
     setItems((rows) => rows.filter((p) => p.id !== project.id))
     try {
-      await deleteProject(project.id)
+      await deleteProject(project.id, remark)
       setReloadNonce((n) => n + 1) // totals and the counts strip both move
     } catch (caught) {
       // 404 = already gone (another tab). That IS the desired end state.
@@ -477,7 +477,7 @@ export default function ProjectsPage(): React.JSX.Element {
         <ProjectDeleteDialog
           project={deleting}
           onClose={() => setDeleting(null)}
-          onConfirm={() => handleDelete(deleting)}
+          onConfirm={(remark) => handleDelete(deleting, remark)}
         />
       )}
 

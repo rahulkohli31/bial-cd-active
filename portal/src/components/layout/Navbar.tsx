@@ -180,12 +180,16 @@ export default function Navbar() {
                 `beforeunload` cannot cover these: a single-page navigation is not an unload, so
                 leaving the workspace by a nav link used to discard unsaved work in silence. Outside
                 a workspace `useWorkspaceExit` hands back a function that simply goes, which is why
-                every other page's navigation is untouched by this. */}
+                every other page's navigation is untouched by this.
+
+                THE DESTINATION IS `/projects`, not `/dashboard`: that address is a redirect now
+                (#158 §7), and the most-clicked element in the product should not pay an extra hop
+                through it. The guard is unchanged — only where it lets you go. */}
             <NavLink
-              to="/dashboard"
+              to="/projects"
               onClick={(e) => {
                 e.preventDefault()
-                exit(() => navigate('/dashboard'))
+                exit(() => navigate('/projects'))
               }}
               className="flex items-center whitespace-nowrap"
             >

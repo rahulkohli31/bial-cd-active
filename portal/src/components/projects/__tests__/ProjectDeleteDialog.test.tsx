@@ -41,30 +41,57 @@ beforeEach(() => {
 afterEach(() => cleanup())
 
 describe('ProjectDeleteDialog — confirm gating', () => {
-  it('arms confirm only when the typed name matches exactly (trailing space / wrong case do not count)', async () => {
+  it('arms confirm on a VALID REASON, not on retyping the name (#158 §13.1)', async () => {
+    // FLIPPED, not deleted (§16.2). This used to assert the confirm button stayed disabled
+    // until the project's name was retyped exactly — trailing space and wrong case both
+    // refused. That gate is gone: retyping a name proves you can read, not that you meant
+    // it, and it taught people to copy-paste straight past the warning. The reason is the
+    // new gate, and unlike the name it is still worth something a month later.
     h.listProjectConversations.mockResolvedValue([{}, {}])
     const onConfirm = vi.fn()
     render(<ProjectDeleteDialog project={project} onClose={() => {}} onConfirm={onConfirm} />)
 
-    // Flush the count effect so the resolving promise does not fire an un-acted update.
     expect(await screen.findByText(/all 2 chats/i)).toBeTruthy()
 
     const confirmBtn = screen.getByRole('button', { name: /delete project/i })
-    const input = screen.getByLabelText(/type the project name/i)
+    const reason = screen.getByLabelText(/why are you deleting/i)
 
-    expect(confirmBtn.hasAttribute('disabled')).toBe(true) // nothing typed yet
+    expect(confirmBtn.hasAttribute('disabled')).toBe(true) // nothing written yet
 
-    fireEvent.change(input, { target: { value: 'VIP Movement ' } }) // trailing space
+    fireEvent.change(reason, { target: { value: 'not needed' } }) // 2 words
     expect(confirmBtn.hasAttribute('disabled')).toBe(true)
 
-    fireEvent.change(input, { target: { value: 'vip movement' } }) // wrong case
-    expect(confirmBtn.hasAttribute('disabled')).toBe(true)
-
-    fireEvent.change(input, { target: { value: 'VIP Movement' } }) // exact
+    fireEvent.change(reason, { target: { value: 'no longer needed by ground ops' } }) // 6
     expect(confirmBtn.hasAttribute('disabled')).toBe(false)
 
+    // Past the upper bound it disarms again — both ends are enforced, not just the lower.
+    fireEvent.change(reason, { target: { value: 'word '.repeat(51) } })
+    expect(confirmBtn.hasAttribute('disabled')).toBe(true)
+
+    fireEvent.change(reason, { target: { value: 'no longer needed by ground ops' } })
     fireEvent.click(confirmBtn)
-    expect(onConfirm).toHaveBeenCalledTimes(1)
+    // The reason travels to the caller: the page forwards it to the API, which refuses
+    // independently if it is out of bounds.
+    expect(onConfirm).toHaveBeenCalledWith('no longer needed by ground ops')
+  })
+
+  it('no longer asks for the project name at all', async () => {
+    // The inertness half: the old input is gone, not merely bypassed.
+    h.listProjectConversations.mockResolvedValue([])
+    render(<ProjectDeleteDialog project={project} onClose={() => {}} onConfirm={vi.fn()} />)
+
+    expect(screen.queryByLabelText(/type the project name/i)).toBeNull()
+    // Liveness, so the absence above means something.
+    expect(screen.getByLabelText(/why are you deleting/i)).toBeTruthy()
+    expect(screen.getByText(/are you sure you want to delete this project/i)).toBeTruthy()
+  })
+
+  it('says an administrator can read the reason', async () => {
+    // Someone writing what feels like a private note deserves to know who sees it (§13.2).
+    h.listProjectConversations.mockResolvedValue([])
+    render(<ProjectDeleteDialog project={project} onClose={() => {}} onConfirm={vi.fn()} />)
+
+    expect(screen.getByText(/an administrator can see this/i)).toBeTruthy()
   })
 })
 

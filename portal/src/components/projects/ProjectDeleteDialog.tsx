@@ -9,9 +9,19 @@
  *      in flight, or if the count call fails, it falls back to copy that still names
  *      the cascade WITHOUT a number ("all of its chats") — it must never flash
  *      "all 0 chats" from a count that simply has not resolved yet.
- *   2. It makes the click deliberate: the confirm button stays disabled until the
- *      user types the project's name back exactly (a trailing space or wrong case
- *      does not count).
+ *   2. It asks WHY, in 5-50 words, and the confirm button stays disabled until that
+ *      reason is inside the bounds (#158 §13.1/§13.2).
+ *
+ *      THE TYPE-THE-NAME GATE IS GONE. Retyping a name proves you can read, not that you
+ *      meant it — and it taught people to copy-paste past the warning they were meant to be
+ *      reading. The reason is a better gate for the same purpose AND it is still useful a
+ *      month later: it is kept on a `deleted_projects` tombstone an administrator can read.
+ *      The helper text says so, because someone writing a private-feeling note deserves to
+ *      know who sees it.
+ *
+ *      The count is validated HERE and again on the server, with the same splitting rule
+ *      (`utils/words.ts` <-> `src/core/words.py`). The client keeps the person inside the
+ *      limit; the server refuses independently.
  *
  * The dialog does not delete anything itself — the page owns the optimistic removal
  * and the 404-vs-500 reconciliation — it only collects an informed confirmation and
@@ -21,6 +31,15 @@ import { useEffect, useState } from 'react'
 import { AlertTriangle, Loader2 } from 'lucide-react'
 import { CONVERSATION_LIST_CAP, listProjectConversations } from '../../utils/conversationApi'
 import type { Project } from '../../utils/projectApi'
+import { Textarea } from '../ui/textarea'
+import {
+  countWords,
+  MAX_DELETE_REASON_WORDS,
+  MIN_DELETE_REASON_WORDS,
+} from '../../utils/words'
+
+/** A paste backstop only — 50 words of ordinary English is far under this. */
+const MAX_DELETE_REASON_CHARS = 2000
 
 /**
  * `null` count = not resolved yet (loading, or the count call failed) → name the cascade with
@@ -53,7 +72,8 @@ function cascadeCopy(chatCount: number | null): string {
 export interface ProjectDeleteDialogProps {
   project: Project
   onClose: () => void
-  onConfirm: () => void | Promise<void>
+  /** Receives the reason, which the page forwards to the API. */
+  onConfirm: (remark: string) => void | Promise<void>
 }
 
 export default function ProjectDeleteDialog({
@@ -62,7 +82,7 @@ export default function ProjectDeleteDialog({
   onConfirm,
 }: ProjectDeleteDialogProps): React.JSX.Element {
   const [chatCount, setChatCount] = useState<number | null>(null)
-  const [typed, setTyped] = useState('')
+  const [remark, setRemark] = useState('')
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
@@ -82,17 +102,25 @@ export default function ProjectDeleteDialog({
     }
   }, [project.id])
 
-  const confirmArmed = typed === project.name && !busy
+  const words = countWords(remark)
+  const remarkValid = words >= MIN_DELETE_REASON_WORDS && words <= MAX_DELETE_REASON_WORDS
+  // `busy` STAYS in the guard: the button must still disable while the request is in
+  // flight, which is a different concern from whether the reason is valid.
+  const canDelete = remarkValid && !busy
 
   const confirm = async (): Promise<void> => {
-    if (!confirmArmed) return
+    if (!canDelete) return
     setBusy(true)
-    await onConfirm()
+    await onConfirm(remark)
   }
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 font-manrope">
-      <div className="absolute inset-0 bg-black/40" onClick={busy ? undefined : onClose} />
+      {/* The softened overlay (#158 §9) — same values as the create dialog. */}
+      <div
+        className="absolute inset-0 bg-slate-900/15 backdrop-blur-[3px] [-webkit-backdrop-filter:blur(3px)]"
+        onClick={busy ? undefined : onClose}
+      />
       <div className="relative bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
         <div className="flex items-center gap-2.5">
           <div className="w-9 h-9 rounded-xl bg-red-50 flex items-center justify-center flex-shrink-0">
@@ -103,23 +131,44 @@ export default function ProjectDeleteDialog({
 
         <p className="text-sm text-neutral mt-3 leading-relaxed">{cascadeCopy(chatCount)}</p>
 
-        <label className="block mt-4">
+        <p className="text-sm font-semibold text-tertiary mt-4">
+          Are you sure you want to delete this project?
+        </p>
+
+        <label className="block mt-3">
           <span className="text-xs font-semibold text-tertiary">
-            Type <span className="font-bold text-danger">{project.name}</span> to confirm
+            Why are you deleting this project?
           </span>
-          <input
+          <Textarea
             autoFocus
-            value={typed}
-            onChange={(e) => setTyped(e.target.value)}
-            aria-label="Type the project name to confirm deletion"
-            className="mt-1.5 w-full border border-bial-border rounded-xl px-3 py-2.5 text-sm text-tertiary focus:outline-none focus:ring-2 focus:ring-danger/30 focus:border-danger"
+            value={remark}
+            onChange={(e) => setRemark(e.target.value)}
+            rows={3}
+            maxLength={MAX_DELETE_REASON_CHARS}
+            aria-label="Why are you deleting this project?"
+            className="mt-1.5 resize-y"
           />
+          <div className="flex items-baseline justify-between mt-1">
+            {/* Says who reads it. The remark is written by whoever deletes — usually the
+                owner — and read by administrators, so it is not a private note. */}
+            <span className="text-[11px] text-neutral">
+              Between {MIN_DELETE_REASON_WORDS} and {MAX_DELETE_REASON_WORDS} words. An
+              administrator can see this.
+            </span>
+            <span
+              className={`text-[11px] tabular-nums ${
+                remark.length > 0 && !remarkValid ? 'text-danger font-semibold' : 'text-neutral'
+              }`}
+            >
+              {words}/{MAX_DELETE_REASON_WORDS} words
+            </span>
+          </div>
         </label>
 
         <div className="flex gap-3 mt-5">
           <button
             type="button"
-            disabled={!confirmArmed}
+            disabled={!canDelete}
             onClick={() => void confirm()}
             className="flex-1 flex items-center justify-center gap-2 bg-red-600 hover:bg-red-700 text-white font-semibold py-2.5 rounded-xl transition text-sm disabled:opacity-50 disabled:cursor-not-allowed"
           >
