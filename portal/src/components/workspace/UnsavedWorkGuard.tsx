@@ -151,11 +151,21 @@ interface DialogProps {
 }
 
 /**
- * COMPOSES THE VENDORED `dialog` PRIMITIVE rather than hand-rolling a modal.
+ * HAND-ROLLED, MATCHING `ReclaimWorkspaceDialog` — and the docblock says so because it used to
+ * claim the opposite.
  *
- * This is the guard that most has to be reliable under a keyboard, so it should not be the one
- * built without a focus trap, Escape handling, scroll lock or `aria-modal`. `ReclaimWorkspaceDialog`
- * stays the pattern for the COPY and for the busy-window focus park — not for the primitive.
+ * What is actually here: `aria-modal` + `aria-labelledby`, Escape and overlay-click to stay (both
+ * inert while a save is in flight, so nobody dismisses the dialog out from under their own write),
+ * and initial focus parked on Stay. What is NOT here: a focus trap or a scroll lock, so Tab can
+ * still walk out of the dialog into the page behind it.
+ *
+ * THAT GAP IS WORTH CLOSING and this is the guard it matters most on — it is the last thing
+ * between somebody and their unsaved work, so it is the one that most has to be reliable under a
+ * keyboard. `components/ui/dialog.tsx` (Radix) is the upgrade path and brings the trap and the
+ * lock for free; `AttachmentPreview.tsx` is the worked example. Left as its own change because
+ * swapping the primitive moves real behaviour, which is not what the commit introducing this note
+ * was doing. `ReclaimWorkspaceDialog` stays the pattern for the COPY and the busy-window focus
+ * park either way.
  */
 function UnsavedWorkDialog({
   certain,

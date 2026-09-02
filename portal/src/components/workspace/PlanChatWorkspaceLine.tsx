@@ -31,6 +31,7 @@
  */
 import StartAppControl from './StartAppControl'
 import { useWorkspaceReport } from './workspaceChannel'
+import type { WorkspaceStateName } from './workspaceState'
 
 /**
  * The states R97 requires a Plan chat to speak for, and only those. Scoped deliberately: asserting
@@ -38,7 +39,12 @@ import { useWorkspaceReport } from './workspaceChannel'
  * which R11's framing may well want different — a Plan chat has no business inviting somebody to
  * press a start control it does not render.
  */
-const SPOKEN_HERE = new Set(['starting', 'held-by-another-project', 'held-unattributed', 'could-not-read'])
+const SPOKEN_HERE: ReadonlySet<WorkspaceStateName> = new Set<WorkspaceStateName>([
+  'starting',
+  'held-by-another-project',
+  'held-unattributed',
+  'could-not-read',
+])
 
 export default function PlanChatWorkspaceLine() {
   const report = useWorkspaceReport()
