@@ -73,6 +73,11 @@ The project screen becomes the app.
   container — multiplying how often the fleet is built up — while the pass that would reclaim
   orphaned ones stays on its own deferred track (C10 §7), not shipped with this change.
 - There is no feature flag. The primary project screen changes for everyone at once.
+- A consolidation pass over this wave, with nothing to see on screen: the stop-then-save-then-release
+  hand-over now has one home rather than two copies that had to agree, the short commit shown beside
+  a saved version has one spelling again, and the project screen stops re-drawing its whole
+  conversation list every forty-five seconds for a reading that had not changed. Typing in a chat no
+  longer re-renders the page frame around it.
 
 ## [1.7.0-beta.4] - 2026-09-01
 
