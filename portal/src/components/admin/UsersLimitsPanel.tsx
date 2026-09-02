@@ -30,6 +30,16 @@ import { Select, SelectValue, SelectTrigger, SelectContent, SelectItem } from '.
 // past the per-conversation max (`enforce_context_limit`, a 413 the citizen reads a sentence
 // from), and the browser's own warning at the soft threshold is the friendly guard.
 const MODEL_CONTEXT_WINDOW = 200_000
+// The lowest per-conversation max that still leaves a usable chat, mirroring the server's
+// `CONTEXT_HARD_FLOOR` (twice its 8,000-token system-prompt reserve).
+//
+// A NUMBER THE FORM HAS TO KNOW, not a duplicated rule. The server refuses anything below it
+// with a message naming it, so the two can never disagree about the OUTCOME; what this copy
+// buys is that an administrator is told before they submit rather than after. Below this the
+// context gate refuses every chat that person opens — including a brand-new empty one — and
+// the sentence they read tells them to start a new chat, which is the one thing that also
+// fails.
+const CONTEXT_HARD_FLOOR = 16_000
 // The wire page size (how many rows one fetchUsers call asks for — capped at the
 // server's MAX_PAGE_SIZE=100) is deliberately larger than the table's on-screen page
 // size, so bulk-loading the roster takes 1/4 the round-trips it would at 25/request.
@@ -143,6 +153,10 @@ function EditModal({ user, defaults, onClose, onSaved, onToast }: EditModalProps
       setErr(`Per-conversation max can't exceed ${fmt(MODEL_CONTEXT_WINDOW)} (the model's context window).`)
       return
     }
+    if (hardNum < CONTEXT_HARD_FLOOR) {
+      setErr(`Per-conversation max can't be below ${fmt(CONTEXT_HARD_FLOOR)} — under that, every chat this person opens is refused before they have typed anything.`)
+      return
+    }
     if (softNum >= hardNum) {
       setErr('Per-conversation warn must be less than the max.')
       return
@@ -199,7 +213,7 @@ function EditModal({ user, defaults, onClose, onSaved, onToast }: EditModalProps
           <LimitField
             name="hard"
             label="Per-conversation max"
-            hint={`Hard stop for a single chat: past this the server refuses the next message and tells the user to start a new chat. Max ${fmt(MODEL_CONTEXT_WINDOW)} (model window).`}
+            hint={`Hard stop for a single chat: past this the server refuses the next message and tells the user to start a new chat. Between ${fmt(CONTEXT_HARD_FLOOR)} and ${fmt(MODEL_CONTEXT_WINDOW)} (model window).`}
             field={hard}
             setField={setHard}
             defaultValue={defaults.contextHardLimit}

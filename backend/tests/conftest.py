@@ -107,9 +107,19 @@ def _salt_every_provisioned_app_database():
 async def db_session(test_engine):
     # Each test runs inside a transaction that is rolled back afterwards, so tests
     # never see each other's writes.
+    #
+    # `join_transaction_mode="create_savepoint"` is what makes a ROUTE's own `db.rollback()`
+    # testable at all. Without it the session joins the outer transaction directly, so a route
+    # that rolls back — the concurrent-insert collision arms in `turns.py` and `transition.py`
+    # are the two — unwinds the whole test transaction and everything the fixtures set up goes
+    # with it. The arm was therefore unreachable by the unit suite, and both of them shipped
+    # with no coverage for exactly the branch that only runs when something has gone wrong.
+    # With a savepoint the route's rollback unwinds only its own work and the test survives.
     async with test_engine.connect() as conn:
         transaction = await conn.begin()
-        session = AsyncSession(bind=conn, expire_on_commit=False)
+        session = AsyncSession(
+            bind=conn, expire_on_commit=False, join_transaction_mode="create_savepoint"
+        )
         yield session
         await session.close()
         await transaction.rollback()

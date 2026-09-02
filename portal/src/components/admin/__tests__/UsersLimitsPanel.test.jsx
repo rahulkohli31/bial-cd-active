@@ -751,7 +751,11 @@ describe('UsersLimitsPanel — the per-conversation hints describe what actually
     // acts on the NEXT MESSAGE, and what the user is told.
     expect(hint.textContent).toMatch(/server refuses/i)
     expect(hint.textContent).toMatch(/start a new chat/i)
-    expect(hint.textContent).toMatch(/Max 200,000 \(model window\)/)
+    // BOTH ENDS OF THE RANGE. The hint used to name only the ceiling, because only the ceiling
+    // was enforced — a max below the system-prompt reserve was accepted and then refused every
+    // chat that person opened, including a brand-new empty one, with a message telling them to
+    // start a new chat. The floor is now the first thing an administrator reads.
+    expect(hint.textContent).toMatch(/Between 16,000 and 200,000 \(model window\)/)
 
     // 180,000 rather than something smaller: the modal refuses a max at or below the warn
     // threshold, and the default warn is 150,000. That refusal is its own existing behaviour;
@@ -766,6 +770,32 @@ describe('UsersLimitsPanel — the per-conversation hints describe what actually
         contextHardLimit: 180000,
       }),
     )
+  })
+
+  it('a max below the floor is refused before it is submitted, and the floor is named', async () => {
+    // THE FORM STOPS IT, and the server stops it too — this is the half that means an
+    // administrator is told BEFORE they save rather than after. Below the floor the context
+    // gate refuses every chat that person opens, because it charges the system-prompt reserve
+    // before it has counted a word, and the sentence they read tells them to start a new chat.
+    //
+    // Mutation check: delete the `hardNum < CONTEXT_HARD_FLOOR` arm from `submit` and this goes
+    // red on the second assertion — the panel would call the API instead of refusing.
+    await openEditor()
+    fireEvent.click(screen.getByTestId('usedefault-hard'))
+    fireEvent.change(screen.getByTestId('limit-hard'), { target: { value: '8000' } })
+    fireEvent.click(screen.getByTestId('usedefault-soft'))
+    fireEvent.change(screen.getByTestId('limit-soft'), { target: { value: '4000' } })
+    fireEvent.click(screen.getByTestId('save-limits'))
+
+    expect(await screen.findByText(/can't be below 16,000/i)).toBeTruthy()
+    expect(h.updateUserLimits).not.toHaveBeenCalled()
+
+    // …and the floor itself is a value an administrator may genuinely want, so the refusal is a
+    // floor rather than a wall. Without this pairing the test would pass just as well against a
+    // panel that refused every value.
+    fireEvent.change(screen.getByTestId('limit-hard'), { target: { value: '16000' } })
+    fireEvent.click(screen.getByTestId('save-limits'))
+    await waitFor(() => expect(h.updateUserLimits).toHaveBeenCalled())
   })
 
   it('the propagation note no longer lumps the two per-conversation limits together', async () => {
