@@ -408,9 +408,6 @@ export default function LivePreview({
   turnRunning = false,
   workspaceLost = false,
   occupyingProjectName = null,
-  // The save model (KTD-5e). `saveDirty` is TRI-STATE: true = unsaved work, false = saved,
-  // null = UNKNOWN (no live workspace, or the server could not compare). Unknown must not
-  // render as saved — that tells the user their work is safe when nothing checked.
   device = 'Desktop',
   reloadNonce: externalReloadNonce = 0,
   onRevealed,
