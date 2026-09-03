@@ -10,8 +10,10 @@
  * entirely" forbids. Worse, this surface's toggle rendered into `LivePreview`'s toolbar, and
  * `LivePreview` only mounts when there is something to frame — so on a Plan chat, a project with
  * nothing built, or an app that had gone to sleep, the toggle did not exist at all, and a panel
- * collapsed while an app was running lost its way back the moment the container stopped. See
- * `AppPane.tsx`'s docblock for the fuller account; its collapse control is the survivor.
+ * collapsed while an app was running lost its way back the moment the container stopped. The
+ * survivor is `WorkspaceToolbar`'s: plan 002's U2 moved the control one step further out again,
+ * from the pane to the row above both columns, so it has one home whether the rail is collapsed,
+ * the pane is gone, or both. See `AppPane.tsx`'s docblock for the fuller account.
  *
  * THE SLOT ITSELF IS GONE, so no test here asserts it is empty. An earlier draft of this file
  * asserted `queryByRole('button', {name: /hide chat panel/i})` is null and it passed — but it
@@ -34,6 +36,8 @@
  * not unmounted, and never a one-way door" suite — and each guard below says so rather than
  * silently going quiet about where that coverage went.
  */
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, render, cleanup, fireEvent } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
@@ -92,13 +96,36 @@ async function renderReady(kind = 'build') {
 }
 
 describe('BuilderPage — the retired #42 chat-panel collapse (now the shell rail\'s, R13)', () => {
+  it('★ the scenarios it hands its retired properties to are really there, under those names', () => {
+    // EVERY GUARD IN THIS SUITE IS A POINTER. Each one says "this property still holds, and it is
+    // proven over there" — which is only worth anything while "over there" exists. Two of these
+    // citations had already rotted into a title no file has ever carried ("★ lives in the PANE…"),
+    // so a reader following them found nothing and had no way to tell a moved test from a deleted
+    // one. Nothing else in either suite would ever have noticed.
+    //
+    // Resolved from the vitest root (`portal/`) rather than from `import.meta.url`, which under
+    // vite is not a `file:` URL — the same reason `AppPane.test.tsx` reads the stylesheet that way.
+    const shellSuite = readFileSync(
+      resolve(process.cwd(), 'src/components/workspace/__tests__/ProjectWorkspace.test.tsx'),
+      'utf8',
+    )
+    for (const title of [
+      '★ lives in the TOOLBAR ROW, so it is still reachable once the rail is hidden',
+      'keeps the rail MOUNTED while collapsed, so nothing inside it is discarded',
+    ]) {
+      expect(shellSuite, title).toContain(title)
+    }
+  })
+
   it('publishes no hide/show chat-panel toggle into the pane\'s toolbar — the rail\'s ONE collapse is drawn by AppPane now', async () => {
     await renderReady()
 
     // The surface mounts and runs, and there is no slot on `PaneView` for it to push a toggle
     // into: U2 deleted `toolbarLeading`/`toolbarTrailing`, and `UnacceptedPaneProps` fails the
-    // build if the shape grows a field back. The collapse control that survived is `AppPane`'s,
-    // pinned in `ProjectWorkspace.test.tsx` ("★ lives in the PANE…").
+    // build if the shape grows a field back. The collapse control that survived is the
+    // shell's, drawn once in the toolbar row above both columns and pinned in
+    // `ProjectWorkspace.test.tsx` ("★ lives in the TOOLBAR ROW, so it is still reachable once
+    // the rail is hidden").
     expect(composer()).toBeTruthy()
   })
 
@@ -139,13 +166,14 @@ describe('BuilderPage — the retired #42 chat-panel collapse (now the shell rai
     expect(screen.getByTestId('thread-viewport').scrollTop).toBe(40)
   })
 
-  it('publishes no toggle of its own to keep reachable — "stays reachable while collapsed" is entirely AppPane\'s property now (ProjectWorkspace.test.tsx, "★ lives in the PANE...")', async () => {
+  it('publishes no toggle of its own to keep reachable — "stays reachable while collapsed" is entirely the shell\'s property now (ProjectWorkspace.test.tsx, "★ lives in the TOOLBAR ROW…")', async () => {
     await renderReady()
 
     // LIVENESS: the surface rendered its ordinary chrome. There is nothing here to ask "does it
     // stay reachable while hidden" about — this surface retired the whole toggle rather than
     // relocating it, so the question the old test asked has no subject left on THIS component.
-    // The control that must answer it lives in `AppPane` and is pinned there.
+    // The control that must answer it is drawn in the workspace's toolbar row, and is pinned in
+    // `ProjectWorkspace.test.tsx` under "★ lives in the TOOLBAR ROW…".
     expect(screen.getByTestId('chat-panel')).toBeTruthy()
   })
 })
