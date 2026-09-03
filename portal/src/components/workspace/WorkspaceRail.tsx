@@ -38,7 +38,6 @@
  */
 import { useEffect, useState } from 'react'
 import { ArrowLeft, Check, MoreVertical, Pencil, X } from 'lucide-react'
-import { Badge } from '../ui/badge'
 import PublishStatusChip from '../PublishStatusChip'
 import ProjectDescriptionEditor from '../projects/ProjectDescriptionEditor'
 import RailComposer from './RailComposer'
@@ -278,9 +277,6 @@ export default function WorkspaceRail({
                     key={chat.id}
                     className="group relative flex items-center gap-3 bg-white border border-bial-border rounded-xl px-4 py-3 hover:border-primary/40 hover:shadow-sm transition"
                   >
-                    <div className={`w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0 ${kind.tint}`}>
-                      <kind.Icon size={15} className={kind.iconTint} />
-                    </div>
                     <h3 className="min-w-0 flex-1">
                       <button
                         type="button"
@@ -290,14 +286,16 @@ export default function WorkspaceRail({
                         <span className="block truncate">{chat.title || 'Untitled'}</span>
                       </button>
                     </h3>
-                    <Badge variant="outline" className="flex-shrink-0 border-bial-border bg-white">
+                    <span
+                      className={`inline-flex flex-shrink-0 items-center rounded-full px-2.5 py-1 text-[10px] font-bold uppercase tracking-wide ${kind.pill}`}
+                    >
                       {/* The word is shown; the completion is read but not seen, so the screen
                           says "Build" and the element's text says "Build chat". An `aria-label`
                           on a role-less span is not reliably exposed — it would satisfy a test
                           and help nobody — so the name is built from text. */}
                       {kind.word}
                       {kind.completion && <span className="sr-only">{kind.completion}</span>}
-                    </Badge>
+                    </span>
                     <span className="text-[11px] text-neutral flex-shrink-0 tabular-nums">
                       {relativeTime(chat.updatedAt)}
                     </span>

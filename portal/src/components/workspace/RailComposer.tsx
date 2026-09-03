@@ -129,7 +129,11 @@ export default function RailComposer({ projectId }: RailComposerProps) {
               const look = chatKindFor(candidate)
               return (
                 <ToggleGroupItem key={candidate} value={candidate} aria-label={look.word}>
-                  <look.Icon size={13} className={kind === candidate ? look.iconTint : undefined} />
+                  {/* NO COLOUR OF ITS OWN. The board strokes the segment icon with the same
+                      colour as the segment's label (#1A2B34 when selected, #6B7280 when not),
+                      which `currentColor` gives for free. Tinting it separately is what put a
+                      gold wrench on an orange ground at roughly 1.2:1. */}
+                  <look.Icon size={13} />
                   {look.word}
                 </ToggleGroupItem>
               )
@@ -171,7 +175,7 @@ export default function RailComposer({ projectId }: RailComposerProps) {
               type="button"
               onClick={startChat}
               disabled={!prompt.trim()}
-              className="ml-auto flex items-center gap-2 bg-secondary hover:bg-secondary-600 disabled:opacity-40 text-white font-bold text-sm px-5 py-2 rounded-xl transition shadow-sm shadow-secondary/30 flex-shrink-0"
+              className="ml-auto flex items-center gap-2 bg-primary hover:bg-primary-600 disabled:opacity-40 text-white font-bold text-sm px-5 py-2 rounded-xl transition shadow-sm shadow-primary/30 flex-shrink-0"
             >
               Start Chat <Sparkles size={13} />
             </button>

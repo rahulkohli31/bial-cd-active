@@ -59,16 +59,27 @@ describe('chatKindFor', () => {
     expect(chatKindFor('build').word).toBe('Launch')
   })
 
-  it('keeps the icon and the tint local, unaffected by whatever the bootstrap says', () => {
-    // R-8: icon/tint are NOT part of the catalogue's shape and must not move even though the
+  it('keeps the icon and the pill local, unaffected by whatever the bootstrap says', () => {
+    // R-8: icon/pill are NOT part of the catalogue's shape and must not move even though the
     // words now do. Same kind, two catalogues, one look.
     withCatalogue(MOCK_CATALOGUE)
     const first = chatKindFor('plan')
     withCatalogue([{ value: 'plan', name: 'Different Every Time', description: '…' }])
     const second = chatKindFor('plan')
     expect(second.Icon).toBe(first.Icon)
-    expect(second.tint).toBe(first.tint)
-    expect(second.iconTint).toBe(first.iconTint)
+    expect(second.pill).toBe(first.pill)
+  })
+
+  it('paints each kind the pill colours the canvas draws, and neither as an action', () => {
+    // The boards give the kind a LABEL pill — BUILD #8C5D1E on #FFF4E0, PLAN #0A5C5F on
+    // #E0F5F6 — which is the one role the gold family legitimately keeps. What must never come
+    // back is `bg-secondary`/`text-secondary`: the gold DEFAULT, which paints an action.
+    withCatalogue(MOCK_CATALOGUE)
+    expect(chatKindFor('build').pill).toBe('bg-accent-light text-secondary-800')
+    expect(chatKindFor('plan').pill).toBe('bg-primary-50 text-primary-dark')
+    for (const kind of ['build', 'plan', 'assistant']) {
+      expect(chatKindFor(kind).pill).not.toMatch(/(?:bg|text)-secondary(?![-\w])/)
+    }
   })
 
   it('falls back for the third value the field can hold today, and for one it cannot yet', () => {

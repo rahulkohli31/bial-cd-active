@@ -101,6 +101,83 @@ describe('the usage meter is visible on a narrow screen (N4)', () => {
   })
 })
 
+describe('the navbar the boards draw (plan 002, U1)', () => {
+  it('the meter is amber well below any 80% threshold, because the board draws it amber at 54%', async () => {
+    // The board's own worked example is `537,102 / 1,000,000 tokens` over a 54%-wide `--amb`
+    // fill. The code turned the bar amber only past 80%, so at the board's own figures it
+    // painted teal. Mutation-check: restore `pct >= 80 ? 'bg-accent' : 'bg-primary'` and the
+    // 24.7% reading below goes teal and this goes red.
+    h.fetchUsageToday.mockResolvedValue({ used: 12_345, limit: 50_000, remaining: 37_655 })
+    renderNavbar()
+    const meter = await screen.findByTestId('usage-meter')
+    expect(meter.querySelector('.bg-accent')).not.toBeNull()
+    expect(meter.querySelector('.bg-primary')).toBeNull()
+  })
+
+  it('keeps danger for a budget that is actually spent', async () => {
+    h.fetchUsageToday.mockResolvedValue({ used: 50_000, limit: 50_000, remaining: 0 })
+    renderNavbar()
+    const meter = await screen.findByTestId('usage-meter')
+    expect(meter.querySelector('.bg-danger')).not.toBeNull()
+    expect(meter.querySelector('.bg-accent')).toBeNull()
+  })
+
+  it('draws the meter as an outlined pill with a visible unspent remainder', async () => {
+    // The board: `border:1px solid var(--bd);border-radius:999px` and NO background, over a
+    // 3px `--bd` track. It was a #F8F9FA chip with a `bg-white` track, which made the unspent
+    // part of the budget invisible against the white header behind it.
+    renderNavbar()
+    const meter = await screen.findByTestId('usage-meter')
+    expect(meter.className).toMatch(/border-bial-border/)
+    expect(meter.className).not.toMatch(/bg-surface-muted/)
+    expect(meter.querySelector('.bg-bial-border')).not.toBeNull()
+  })
+
+  it('renders the wordmark in the brand teal at the board\'s size and weight', async () => {
+    renderNavbar()
+    const wordmark = await screen.findByText('BIAL Citizen Developer')
+    expect(wordmark.className).toMatch(/text-primary(?![-\w])/)
+    expect(wordmark.className).toMatch(/text-\[15px\]/)
+    expect(wordmark.className).toMatch(/font-extrabold/)
+    // What it must NOT be: the 18px/700 #00818A it shipped as — a teal that is not the brand
+    // teal and that no board draws.
+    expect(wordmark.getAttribute('style')).toBeNull()
+  })
+
+  it('gives the active nav item weight and ink, and no rule and no brand colour', async () => {
+    // The board draws the active item `color:#1A2B34;font-weight:600` at its siblings' size,
+    // against `color:#6B7280;font-weight:500`. The code added teal, bold AND a 2px underline.
+    render(
+      <MemoryRouter initialEntries={['/projects']}>
+        <Navbar />
+      </MemoryRouter>,
+    )
+    const active = await screen.findByRole('link', { name: 'Projects' })
+    expect(active.className).toMatch(/text-primary-900/)
+    expect(active.className).not.toMatch(/border-b-2/)
+    expect(active.className).not.toMatch(/text-primary(?![-\w])/)
+
+    const inactive = screen.getByRole('link', { name: 'Help' })
+    expect(inactive.className).toMatch(/text-neutral/)
+    // Same size on both — the board changes weight, never scale.
+    expect(active.className).toMatch(/text-sm/)
+    expect(inactive.className).toMatch(/text-sm/)
+  })
+
+  it('keeps every navbar feature the boards predate', async () => {
+    // The origin is explicit: do not delete a shipped feature because an older board omits it.
+    // Only the styling the boards DO specify is corrected.
+    h.getStoredUser.mockReturnValue(ADMIN)
+    h.fetchAppStatusCounts.mockResolvedValue(counts(3))
+    renderNavbar()
+    expect(await screen.findByRole('link', { name: 'Marketplace' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Feedback' })).toBeTruthy()
+    expect(await screen.findByText('3 apps waiting for review')).toBeTruthy()
+    fireEvent.click(screen.getByText('Priya'))
+    expect(screen.getByRole('button', { name: 'Sign out' })).toBeTruthy()
+  })
+})
+
 describe('the meter settles without a reload (N4)', () => {
   it('subscribes to the usage-changed signal and refetches when it fires', async () => {
     renderNavbar()

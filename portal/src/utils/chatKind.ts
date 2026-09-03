@@ -14,9 +14,9 @@
  * U16/R73 RE-POINTED THE WORDING AT THE SERVER. `word` and `description` no longer live as
  * literals in this file — they come from `chat_kinds` on the once-cached `GET /auth/me` bootstrap
  * (`utils/auth.ts`'s `UserProfile.chat_kinds`, mirroring `backend/src/services/agent/toolsets.py`'s
- * `CHAT_KIND_CATALOGUE`), the same catalogue the toolset registry sits beside. Only `Icon`, `tint`
- * and `iconTint` — and the screen-reader-only `completion` suffix, which is UI grammar rather than
- * a description of what a kind IS — stay LOCAL: the server has no notion of a Lucide icon or a
+ * `CHAT_KIND_CATALOGUE`), the same catalogue the toolset registry sits beside. Only `Icon` and
+ * `pill` — and the screen-reader-only `completion` suffix, which is UI grammar rather than a
+ * description of what a kind IS — stay LOCAL: the server has no notion of a Lucide icon or a
  * Tailwind class, and re-pointing those too would just move the "what does this look like"
  * decision somewhere it does not belong.
  *
@@ -58,10 +58,16 @@ export interface ChatKindPresentation {
    * it from here instead of writing their own when they arrive (R73). */
   description: string
   Icon: LucideIcon
-  /** The icon plate's background tint. LOCAL — the server has no opinion on Tailwind classes. */
-  tint: string
-  /** The icon's own colour. LOCAL, same reason. */
-  iconTint: string
+  /**
+   * The kind PILL's own colours — a text/ground pair, applied to the caps pill the canvas draws
+   * beside a chat's title. LOCAL: the server has no opinion on Tailwind classes.
+   *
+   * The pair is the board's, not a choice made here: BUILD is #8C5D1E on #FFF4E0 and PLAN is
+   * #0A5C5F on #E0F5F6, both of which this build already owns as tokens. The pill is a LABEL and
+   * never an action, which is why gold is allowed to appear in it while nothing gold may fill a
+   * button.
+   */
+  pill: string
 }
 
 /**
@@ -72,19 +78,17 @@ export interface ChatKindPresentation {
  * that could quietly drift apart.
  */
 const CHAT_KIND_LOOKS: Readonly<
-  Partial<Record<string, Pick<ChatKindPresentation, 'completion' | 'Icon' | 'tint' | 'iconTint'>>>
+  Partial<Record<string, Pick<ChatKindPresentation, 'completion' | 'Icon' | 'pill'>>>
 > = {
   build: {
     completion: ' chat',
     Icon: Wrench,
-    tint: 'bg-secondary/10',
-    iconTint: 'text-secondary',
+    pill: 'bg-accent-light text-secondary-800',
   },
   plan: {
     completion: ' chat',
     Icon: MessageSquare,
-    tint: 'bg-primary/10',
-    iconTint: 'text-primary',
+    pill: 'bg-primary-50 text-primary-dark',
   },
 }
 
@@ -98,8 +102,7 @@ export const UNKNOWN_CHAT_KIND: ChatKindPresentation = {
   completion: '',
   description: '',
   Icon: MessageSquare,
-  tint: 'bg-neutral/10',
-  iconTint: 'text-neutral',
+  pill: 'bg-status-grey-bg text-status-grey-fg',
 }
 
 /**
@@ -130,7 +133,6 @@ export function chatKindFor(kind: string): ChatKindPresentation {
     completion: look.completion,
     description: entry.description,
     Icon: look.Icon,
-    tint: look.tint,
-    iconTint: look.iconTint,
+    pill: look.pill,
   }
 }

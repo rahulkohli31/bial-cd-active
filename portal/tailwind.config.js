@@ -90,6 +90,45 @@ export default {
         success: '#22C55E',
         warning: '#EAB308',
         danger: '#EF4444',
+        /**
+         * THE UX CANVAS'S OWN PALETTE — the roles the brand ramp has no name for. Every value
+         * below is a hex read off `docs/ux-canvas/boards/*.dc.html`; nothing here is invented,
+         * and nothing here is a second name for a colour the brand ramp already owns (the
+         * canvas's ink #1A2B34 is `primary-900`, its hairline #E2E8F0 is `bial-border`, its
+         * muted text #6B7280 is `neutral`, its teal #0D7377 is `primary`).
+         *
+         * They live as tokens rather than as `bg-[#B45309]` literals because the status panel
+         * and the chip beside a chat title have to agree state by state, and nine hard-coded
+         * pairs in two files is exactly how they would stop agreeing.
+         */
+        canvas: {
+          label: '#9CA3AF',        // the small-caps section and row labels
+          placeholder: '#9AA5B1',  // composer placeholder text
+          sha: '#B4BCC6',          // the muted short build id beside a date
+          tile: '#F1F5F9',         // an activity tool tile's ground
+          group: '#FCFDFD',        // an activity group's ground
+          rule: '#D8E0E8',         // the app card's border, a shade darker than a hairline
+          track: '#F7F9FB',        // the resize handle's track
+          grip: '#DCE3EA',         // the resize handle's grip border
+        },
+        /**
+         * The nine status states of `StatusCardStates`, as text / ground / dot triples. Six
+         * colour families cover the nine states because three pairs of states share a look and
+         * differ only in their words.
+         */
+        status: {
+          'faint-fg': '#6B7280', 'faint-bg': '#F1F4F8', 'faint-dot': '#B4BCC6',  // nothing built yet
+          'grey-fg': '#4B5563', 'grey-bg': '#F1F4F8', 'grey-dot': '#94A3B8',     // draft
+          'amber-fg': '#B45309', 'amber-bg': '#FEF3C7', 'amber-dot': '#D97706',  // in review; and the drifted date
+          'red-fg': '#B91C1C', 'red-bg': '#FEE2E2', 'red-dot': '#DC2626',        // changes requested; didn't start
+          'green-fg': '#15803D', 'green-bg': '#DCFCE7', 'green-dot': '#16A34A',  // starting up; live
+          'off-fg': '#4B5563', 'off-bg': '#E5E7EB', 'off-dot': '#9CA3AF',        // switched off
+        },
+      },
+      boxShadow: {
+        /** The canvas's selected-segment elevation — the whole of how the Plan/Build control
+         *  signals its choice, since the board gives that control no hue at all. */
+        segment: '0 1px 2px rgba(16,24,40,.08)',
       },
       fontFamily: {
         manrope: ['Manrope', 'sans-serif'],

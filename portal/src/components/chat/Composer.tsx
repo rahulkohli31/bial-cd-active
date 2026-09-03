@@ -397,8 +397,8 @@ const Composer: FC<ComposerProps> = ({
           aria-label={unavailableReason ? `Send message — ${unavailableReason}` : 'Send message'}
           title={unavailableReason ?? undefined}
           data-testid="composer-send"
-          className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-xl bg-secondary text-white transition ${
-            sendUnavailable ? 'cursor-default opacity-40' : 'hover:bg-secondary-600'
+          className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-xl bg-primary text-white transition ${
+            sendUnavailable ? 'cursor-default opacity-40' : 'hover:bg-primary-600'
           }`}
         >
           <Send size={13} />

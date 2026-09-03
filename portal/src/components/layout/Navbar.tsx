@@ -185,8 +185,12 @@ export default function Navbar() {
                     exit(() => navigate(to))
                   }}
                   className={({ isActive }) =>
-                    `text-sm font-medium transition pb-0.5 inline-flex items-center gap-1.5 ${
-                      isActive ? 'text-primary font-bold border-b-2 border-primary' : 'text-neutral hover:text-primary'
+                    // THE BOARD DISTINGUISHES THE ACTIVE ITEM BY WEIGHT AND INK, NOTHING ELSE.
+                    // No underline, no teal, no size change: `color:#1A2B34;font-weight:600`
+                    // against siblings at `color:#6B7280;font-weight:500`. The teal rule this
+                    // replaced put brand colour on a nav item on every screen the client sees.
+                    `text-sm transition inline-flex items-center gap-1.5 ${
+                      isActive ? 'text-primary-900 font-semibold' : 'text-neutral font-medium hover:text-primary-900'
                     }`
                   }
                 >
@@ -201,14 +205,17 @@ export default function Navbar() {
 
           {/* Right cluster */}
           <div className="flex items-center gap-1">
-            {/* Daily token usage — prominent status chip bound to the live
-                /api/usage/today source. Three-state colour: healthy (primary) →
-                nearing the limit (accent/amber) → exhausted (danger). */}
+            {/* Daily token usage — the board's outlined pill bound to the live
+                /api/usage/today source. Two-state colour: amber while there is budget,
+                danger once it is spent. */}
             {usage && (() => {
               const pct = usage.limit ? Math.min(100, (usage.used / usage.limit) * 100) : 0
               const exhausted = usage.remaining <= 0
-              const nearing = !exhausted && pct >= 80
-              const barColor = exhausted ? 'bg-danger' : nearing ? 'bg-accent' : 'bg-primary'
+              // NO "NEARING" THRESHOLD. It used to turn the bar amber only past 80%, which the
+              // board contradicts directly: its worked example draws 537,102 / 1,000,000 — 54% —
+              // with an amber fill. Amber IS the meter, and danger is kept for a budget that is
+              // actually spent. This is one of exactly two places the canvas uses `accent`.
+              const barColor = exhausted ? 'bg-danger' : 'bg-accent'
               return (
                 // N4: NEVER `hidden md:flex`. F7 removed the in-rail meter on the grounds that
                 // "the header already shows real usage" — but the header hid it below 768px, so
@@ -216,20 +223,25 @@ export default function Navbar() {
                 // small screens instead of vanishing: the count drops to a compact
                 // used-of-limit and the bar narrows, so a citizen on a phone can still see
                 // their budget running out.
+                // THE BOARD'S PILL: a 1px hairline outline with NO fill, so it sits on the
+                // white header rather than on a grey chip of its own, and a 3px track in the
+                // hairline colour so the UNSPENT part of the budget is visible. It was a
+                // #F8F9FA chip with a 6px white track, which made the remainder invisible
+                // against the header behind it.
                 <div
-                  className="flex flex-col justify-center gap-1 bg-surface-muted border border-bial-border rounded-full px-2 md:px-3 py-1.5 mr-1 select-none"
+                  className="flex flex-col justify-center gap-1 border border-bial-border rounded-full px-2 md:px-3.5 py-1.5 mr-1 select-none"
                   title="Daily AI tokens used today · resets at midnight IST"
                   data-testid="usage-meter"
                 >
-                  <span className={`text-[10px] md:text-xs font-semibold leading-none whitespace-nowrap ${exhausted ? 'text-danger' : 'text-tertiary'}`}>
+                  <span className={`text-[10px] md:text-[11px] font-semibold leading-none whitespace-nowrap ${exhausted ? 'text-danger' : 'text-primary-900'}`}>
                     <span className="md:hidden">
                       {compactTokens(usage.used)} / {compactTokens(usage.limit)}
                     </span>
                     <span className="hidden md:inline">
-                      {usage.used.toLocaleString('en-US')} / {usage.limit.toLocaleString('en-US')} tokens
+                      {usage.used.toLocaleString('en-US')} / {usage.limit.toLocaleString('en-US')} tokens today
                     </span>
                   </span>
-                  <div className="h-1.5 w-14 md:w-28 rounded-full bg-white overflow-hidden">
+                  <div className="h-[3px] w-14 md:w-28 rounded-full bg-bial-border overflow-hidden">
                     <div
                       className={`h-full rounded-full transition-all ${barColor}`}
                       style={{ width: `${pct}%` }}
