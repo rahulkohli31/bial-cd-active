@@ -127,12 +127,24 @@ export default {
           grip: '#DCE3EA',         // the resize handle's grip border
           savedirty: '#F5FCFC',    // the pale teal ground behind an unsaved Save control
           sendoff: '#D6DDE4',      // the send control with nothing to send — a ground, not an opacity
+          tilelive: '#E0F5F6',     // a tool tile whose step is running (= primary-50)
+          tileedge: '#B3E6E9',     // …and its border (= primary-100)
         },
         /**
          * The nine status states of `StatusCardStates`, as text / ground / dot triples. Six
          * colour families cover the nine states because three pairs of states share a look and
          * differ only in their words.
          */
+        /**
+         * A GROUP WHOSE WORK FAILED, from `ActivityAnatomy` panel 4. Its own family rather than
+         * the `status.red` pair: those are pill colours at pill weights, and this is a container
+         * that has to sit quietly in a transcript while still being unmistakable.
+         */
+        problem: {
+          edge: '#F4C7C7',
+          ground: '#FEF7F7',
+          ink: '#B4483F',
+        },
         status: {
           'faint-fg': '#6B7280', 'faint-bg': '#F1F4F8', 'faint-dot': '#B4BCC6',  // nothing built yet
           'grey-fg': '#4B5563', 'grey-bg': '#F1F4F8', 'grey-dot': '#94A3B8',     // draft

@@ -15,27 +15,53 @@
  *
  * ══ WHY THIS IS NOT THE REGISTRY'S `tool-group` ══
  *
- * The plan's file list names a hand-port of `tool-group.aui.tsx`. It was fetched and read, and
- * porting it would have shipped nothing: its `defaultVariants` is `outline` (`rounded-lg border
- * py-3` — the bordered card this work exists to delete), and the variant we would pass, `ghost`, is
- * LITERALLY THE EMPTY STRING. Every visible property below — the overlapping state glyphs, the
- * count, the chevron, the row list — is authored here against the design canvas's `BuildChat` and
- * `ActivityAnatomy` boards, which draw the group with no border, no background and no card. So the
- * v4→v3 rewrite would have been applied to a component whose entire styling we discard: the same
- * "expensive way to ship nothing" the plan gives as the reason not to port `tool-fallback`.
+ * The registry's `tool-group.aui.tsx` was fetched and read, and porting it would have shipped
+ * nothing usable: the variant we would pass, `ghost`, is LITERALLY THE EMPTY STRING, and its
+ * `outline` default is a `rounded-lg border py-3` card whose proportions are not the board's. Every
+ * visible property below is authored here against `ActivityAnatomy`, which is a whole artboard
+ * about exactly this component.
  *
  * What the port would genuinely have brought is kept: `useScrollLock`, so expanding does not throw
  * the reader somewhere else, is imported from the library directly.
  *
- * ══ SEALED MEANS COLLAPSED ══
+ * ══ IT HAS A CONTAINER NOW, AND THAT IS THE BOARD'S (plan 002, U8) ══
  *
- * Settled with the client on 2026-09-01: a sealed group collapses to a count, INCLUDING the last
- * group of a turn. Vercel's AI Elements auto-open completed tools and we deliberately do not — the
- * reading line stays prose, and the receipt is one press away. R34's fail-open is the only
- * exception, and it fires only once the group is terminal: expanding mid-turn moves what the reader
- * is reading.
+ * An earlier pass read `BuildChat` as drawing the group with no border and no background, and said
+ * so at length here. `ActivityAnatomy` is the artboard that actually specifies it, and it draws a
+ * bordered chip: `border:1px solid #E2E8F0; background:#FCFDFD; border-radius:10px`, opening into
+ * a bordered panel with a header rule. A group with no chrome at all was bare text sitting in the
+ * transcript with nothing to say it was a receipt rather than a sentence.
+ *
+ * ══ ALWAYS COLLAPSED — INCLUDING WHILE IT RUNS (owner ruling, 2026-09-02) ══
+ *
+ * This AMENDS the board in place. `ActivityAnatomy` panel 2 draws a live group open, with a label
+ * naming the current step inside it; the owner does not want the working detail on screen. So a
+ * running group is ONE COLLAPSED ROW — icons accumulating in it as steps complete — with a single
+ * quiet line beneath it naming what is happening right now. Nothing expands on its own.
+ *
+ * PRESSING IT IS A GLANCE, NOT A NEW RESTING STATE. Opening shows the rows; pressing again closes
+ * them; and a group opened WHILE RUNNING returns to collapsed by itself when it seals, because the
+ * turn it belonged to is over and the peek was about watching it. A group that was ALREADY sealed
+ * when the reader opened it stays open until they close it — there is no later event to hang a
+ * self-close on, and snapping shut under someone reading a finished receipt would be hostile
+ * rather than tidy. Both halves are deliberate; the second is the honest limit of the first.
+ *
+ * R34's FAIL-OPEN IS THE ONE THING THAT OPENS ITSELF, and it fires only once the group is
+ * terminal: expanding mid-turn moves what the reader is reading. Nothing is hidden when something
+ * went wrong.
  */
-import { ChevronDown, ChevronRight } from 'lucide-react'
+import {
+  ChevronDown,
+  ChevronRight,
+  Circle,
+  Eye,
+  Flag,
+  Hammer,
+  Package,
+  Plus,
+  ShieldCheck,
+  type LucideIcon,
+} from 'lucide-react'
 import {
   createContext,
   useContext,
@@ -122,17 +148,48 @@ function pluralSteps(n: number): string {
 }
 
 /**
- * The sealed and live labels, in the canvas's register.
+ * WHAT THE ROW SAYS, running or sealed — and since plan 002's U8 it is a COUNT either way.
  *
- * A running group names what is happening now; a sealed one is a count. No headline, no elapsed
- * timer, no "step 3 of 9" — the screen reads as an app being built, not an agent being watched.
+ * It used to name the running step here, which is what `ActivityAnatomy` panel 2 draws. The owner's
+ * ruling of 2026-09-02 moves that sentence OUT of the row and onto one quiet line beneath the
+ * collapsed group, so the row is the receipt and the line is the commentary. The count is what
+ * belongs on a receipt.
+ *
+ * No headline, no elapsed timer, no "step 3 of 9" — the screen reads as an app being built, not an
+ * agent being watched. The suffixes are sealed-only: a count of problems while the run is still
+ * going describes something that may yet be recovered from.
  */
 export function groupLabel(facts: GroupFacts, interrupted: boolean): string {
-  if (facts.running) return facts.currentLabel
+  if (facts.running) return pluralSteps(facts.count)
   if (interrupted) return `${pluralSteps(facts.count)} · stopped before it finished`
   if (facts.failures === 1) return `${pluralSteps(facts.count)} · one problem`
   if (facts.failures > 1) return `${pluralSteps(facts.count)} · ${facts.failures} problems`
   return pluralSteps(facts.count)
+}
+
+/**
+ * ONE ICON PER KIND OF STEP, rather than one tick for everything — `ActivityAnatomy`'s own rule.
+ *
+ * DERIVED FROM THE LABEL, WHICH IS AN HONEST LIMIT WORTH STATING. The wire carries `{label, state}`
+ * and no kind, so there is no field to switch on: a real `kind` would have to be added by the
+ * server's step classifier, which is where the platform's own vocabulary already lives, and that
+ * is a backend change this unit does not carry. The labels ARE that vocabulary though — a small
+ * closed set the classifier emits — so matching on their verb is reading the same decision one
+ * layer later rather than inventing a second one.
+ *
+ * THE FALLBACK IS THE POINT OF THE SHAPE. An unrecognised label gets the neutral dot, never a
+ * guessed icon: a wrong icon is a claim about what the agent did, and this component's whole
+ * discipline is that it never makes one.
+ */
+export function stepIconFor(label: string): LucideIcon {
+  const words = label.toLowerCase()
+  if (words.startsWith('reading') || words.startsWith('checking') || words.startsWith('looking')) return Eye
+  if (words.startsWith('adding') || words.startsWith('putting') || words.startsWith('creating')) return Plus
+  if (words.startsWith('setting up') || words.startsWith('installing')) return Package
+  if (words.startsWith('making sure') || words.startsWith('verifying')) return ShieldCheck
+  if (words.startsWith('wrapping up') || words.startsWith('finishing')) return Flag
+  if (words.startsWith('building') || words.startsWith('working')) return Hammer
+  return Circle
 }
 
 const ActivityGroup: FC<PropsWithChildren<{ group: ThreadGroupPart }>> = ({ group, children }) => {
@@ -167,6 +224,27 @@ const ActivityGroup: FC<PropsWithChildren<{ group: ThreadGroupPart }>> = ({ grou
   const failOpen = !facts.running && facts.failures > 0
   const open = readerOpen ?? failOpen
 
+  /**
+   * A GLANCE INSIDE A RUNNING GROUP IS TEMPORARY (owner ruling, 2026-09-02).
+   *
+   * Opening one while it runs is about watching it, so when it seals the peek is over and the
+   * group returns to its resting state — collapsed. Cleared to `null` rather than to `false`, so
+   * a group that also FAILED still opens itself: the reader has stopped deciding, which is exactly
+   * what `null` means here.
+   *
+   * ONLY FOR A GROUP THE READER OPENED WHILE IT WAS RUNNING. One that was already sealed when they
+   * opened it has no later event to hang a self-close on, and snapping shut under someone reading
+   * a finished receipt would be hostile rather than tidy. That is the honest limit of this rule
+   * and it is deliberate.
+   */
+  const openedWhileRunning = useRef(false)
+  if (facts.running && readerOpen === true) openedWhileRunning.current = true
+  useEffect(() => {
+    if (facts.running || !openedWhileRunning.current) return
+    openedWhileRunning.current = false
+    setReaderOpen(null)
+  }, [facts.running])
+
   // Expanding must not throw the reader somewhere else. The library's own lock is what the
   // registry's component uses and it is exported, so it comes across without the port.
   //
@@ -199,46 +277,101 @@ const ActivityGroup: FC<PropsWithChildren<{ group: ThreadGroupPart }>> = ({ grou
     announceSealed(label)
   }, [facts.running, facts.count, label, announceSealed])
 
-  return (
-    <div data-testid="activity-group" data-state={open ? 'open' : 'closed'} className="my-2">
-      <button
-        type="button"
-        onClick={() => {
-          // BEFORE the state change, so the lock is in place for the height change it causes.
-          lockScroll()
-          setReaderOpen(!open)
-        }}
-        aria-expanded={open}
-        data-testid="activity-group-trigger"
-        // NO border and NO background — see the docblock. This is a line of text with glyphs, not
-        // a card, and a `border` class appearing here is a review comment.
-        className="inline-flex max-w-full items-center gap-2 rounded-md py-0.5 text-left transition hover:opacity-80"
-      >
-        {/* R31's second clause: one state glyph per contained part, arrival order, oldest on the
-            left, growing IN PLACE. Overlapped with a ring so a long run stays compact — the
-            canvas's treatment. */}
-        <span className="flex flex-shrink-0 items-center" data-testid="activity-glyphs">
-          {group.indices.map((partIndex, i) => {
-            const args = toolCallArgs(parts[partIndex])
-            return (
-              <span
-                key={partIndex}
-                className="flex h-[18px] w-[18px] items-center justify-center rounded-md bg-surface-muted ring-2 ring-white"
-                style={i === 0 ? undefined : { marginLeft: '-6px' }}
-              >
-                <GlyphOnly state={rowState(args?.state)} />
-              </span>
-            )
-          })}
-        </span>
-        <span className="min-w-0 truncate text-xs font-semibold text-neutral">{label}</span>
-        <Chevron size={13} aria-hidden="true" className="flex-shrink-0 text-neutral/70" />
-      </button>
+  // THE FAILURE TINT, from `ActivityAnatomy` panel 4 — its own container colours rather than the
+  // status pills', because this sits quietly in a transcript and still has to be unmistakable.
+  // It follows the same predicate as the fail-open: terminal, and with something to report.
+  const problem = failOpen
 
-      {open && (
-        <div ref={contentRef} data-testid="activity-group-rows" className="mt-2 flex flex-col gap-2 ps-0.5">
-          {children}
-        </div>
+  return (
+    // `my-3` IS THE BOARD'S SPACING between a paragraph and the group that follows it. It was
+    // `my-2`, which read as the group belonging to the next sentence rather than to the one above.
+    <div data-testid="activity-group" data-state={open ? 'open' : 'closed'} className="my-3">
+      <div
+        data-testid="activity-group-container"
+        data-problem={problem || undefined}
+        // A BORDERED CHIP, which is what `ActivityAnatomy` actually draws — see the docblock for
+        // the earlier reading that said otherwise. `w-fit` so the container hugs its contents
+        // when collapsed and is not a full-width bar across the transcript.
+        className={`w-fit max-w-full overflow-hidden rounded-[10px] border ${
+          problem ? 'border-problem-edge' : 'border-bial-border'
+        }`}
+      >
+        <button
+          type="button"
+          onClick={() => {
+            // BEFORE the state change, so the lock is in place for the height change it causes.
+            lockScroll()
+            setReaderOpen(!open)
+          }}
+          aria-expanded={open}
+          data-testid="activity-group-trigger"
+          className={`flex w-full items-center gap-2.5 py-1.5 pe-3 ps-2 text-left transition ${
+            problem ? 'bg-problem-ground' : 'bg-canvas-group'
+          } ${open ? `border-b ${problem ? 'border-problem-edge' : 'border-bial-border'}` : ''}`}
+        >
+          {/* ONE TILE PER CONTAINED STEP, arrival order, oldest on the left, growing IN PLACE.
+              Overlapped with a white ring so a long run stays compact — the board's treatment, and
+              what keeps the row's HEIGHT constant as icons accumulate so the transcript never
+              jumps. */}
+          <span className="flex flex-shrink-0 items-center" data-testid="activity-glyphs">
+            {group.indices.map((partIndex, i) => {
+              const args = toolCallArgs(parts[partIndex])
+              const state = rowState(args?.state)
+              const live = state === 'started' || state === 'pending'
+              const StepIcon = stepIconFor(args?.label ?? '')
+              return (
+                <span
+                  key={partIndex}
+                  className={`flex h-[22px] w-[22px] items-center justify-center rounded-[7px] border ring-2 ring-white ${
+                    live ? 'border-canvas-tileedge bg-canvas-tilelive' : 'border-bial-border bg-canvas-tile'
+                  }`}
+                  style={i === 0 ? undefined : { marginLeft: '-7px' }}
+                >
+                  {/* A FAILED STEP KEEPS ITS STATE GLYPH. The kind icon says what the agent was
+                      doing; a cross says it did not work, and that outranks the kind — conveyed by
+                      SHAPE and not by colour alone (WCAG 1.4.1), which is the row atom's own rule. */}
+                  {state === 'failed' ? (
+                    <GlyphOnly state={state} />
+                  ) : live ? (
+                    <GlyphOnly state={state} />
+                  ) : (
+                    <StepIcon size={12} aria-hidden="true" className="text-neutral" />
+                  )}
+                </span>
+              )
+            })}
+          </span>
+          <span
+            className={`min-w-0 truncate text-xs font-semibold ${problem ? 'text-problem-ink' : 'text-neutral'}`}
+          >
+            {label}
+          </span>
+          <Chevron
+            size={13}
+            aria-hidden="true"
+            className={`flex-shrink-0 ${problem ? 'text-problem-ink' : 'text-neutral/70'}`}
+          />
+        </button>
+
+        {open && (
+          <div
+            ref={contentRef}
+            data-testid="activity-group-rows"
+            className="flex flex-col gap-2 bg-white px-3 py-2.5"
+          >
+            {children}
+          </div>
+        )}
+      </div>
+
+      {/* ONE QUIET LINE, BENEATH THE COLLAPSED ROW, naming what is happening right now (owner
+          ruling, 2026-09-02). The board puts this sentence INSIDE an open group; the owner does
+          not want the working detail on screen, so the group stays shut and the sentence moves
+          here. Running only: a sealed group's steps are in the receipt, one press away. */}
+      {facts.running && (
+        <p data-testid="activity-group-now" className="mt-1.5 ps-1 text-[11px] text-neutral">
+          {facts.currentLabel}
+        </p>
       )}
     </div>
   )
