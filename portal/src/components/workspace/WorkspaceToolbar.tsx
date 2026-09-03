@@ -166,7 +166,17 @@ export default function WorkspaceToolbar({
         </h1>
       )}
 
-      {heading.projectId && (
+      {/* ONE PLACE SAYS THE STATE AT A TIME, and which place it is depends on whether the rail is
+          showing it. `BuildChat`, `PlanChat` and every other chat board draws the chip beside the
+          title, because a chat has no APP STATUS section. `Collapsed` draws it there too, for the
+          same reason — the section it lives in has just gone off screen. `PreviewOff`, `Main`,
+          `NewProject` and `NothingBuilt` draw the identity cluster as back-chevron + title and
+          NOTHING else, because the rail is right there carrying the pill.
+
+          Ungated, the project screen stated the same word twice inside 300px — a `Draft` chip in
+          the row and a `Draft` pill in the rail — which is the classic way two renderings of one
+          fact start to disagree. */}
+      {heading.projectId && (isChat || collapsed) && (
         <span className="ms-2.5 flex-shrink-0">
           <PublishStatusChip projectId={heading.projectId} />
         </span>

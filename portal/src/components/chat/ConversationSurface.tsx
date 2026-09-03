@@ -2946,10 +2946,12 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
           </div>
         )}
 
-        {/* R97 — A PLAN CHAT SAYS EVERYTHING THE PANE WOULD HAVE SAID. Above the composer, from the
-            same computed workspace value the pane renders, so there is one author for every
-            workspace sentence in the product and "no pane" cannot mean "says nothing". */}
-        {isPlanChat && <PlanChatWorkspaceLine />}
+        {/* R97 — A PLAN CHAT SAYS EVERYTHING THE PANE WOULD HAVE SAID, from the same computed
+            workspace value the pane renders, so there is one author for every workspace sentence
+            in the product and "no pane" cannot mean "says nothing". It goes to the composer's
+            footer slot rather than being drawn here: `PlanChat` and `PlanReady` both put it BELOW
+            the box, and above it the standing sentence sat between the transcript and the control
+            the citizen was reaching for. */}
 
         <Composer
           conversationId={buildId ?? null}
@@ -2961,6 +2963,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
           isRunning={isRunning}
           gate={gate}
           contextWarning={contextWarning}
+          footerNote={isPlanChat ? <PlanChatWorkspaceLine /> : undefined}
           // R55 — BOTH ways a build can be live here. `isRunning` is a turn this tab is streaming;
           // `buildActiveHere` is a LEGACY build session adopted on a reload, which sets no
           // streaming flag at all. Gating on the turn alone left a reloaded mid-build tab with a

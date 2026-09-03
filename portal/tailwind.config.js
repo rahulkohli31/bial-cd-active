@@ -158,6 +158,9 @@ export default {
         /** The canvas's selected-segment elevation — the whole of how the Plan/Build control
          *  signals its choice, since the board gives that control no hue at all. */
         segment: '0 1px 2px rgba(16,24,40,.08)',
+        /** The app card's lift off the `#F0F4F8` pane ground — `PreviewOff`, `NothingBuilt` and
+         *  `PreviewStarting` all give the empty pane the same white card the running app gets. */
+        'app-card': '0 4px 16px rgba(16,24,40,.07), 0 1px 3px rgba(16,24,40,.05)',
       },
       fontFamily: {
         manrope: ['Manrope', 'sans-serif'],

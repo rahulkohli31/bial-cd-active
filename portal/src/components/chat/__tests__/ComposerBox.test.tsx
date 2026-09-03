@@ -79,6 +79,54 @@ describe('the board\'s shape: one box, both controls inside it', () => {
     draw()
     expect(box().getAttribute('placeholder')).toBe('Describe the change you need…')
   })
+
+  it('★ carries the two controls TOGETHER at the right edge', () => {
+    // Every board that draws a composer puts `margin-left:auto` on the paperclip and lets Send
+    // follow it on the row's gap, so the pair sits in the box's bottom-right corner. With the auto
+    // margin on Send instead they were pushed to opposite ends: measured 308px apart on the project
+    // rail at 1440 and 932px apart at 1024, which is one control at each end of the screen.
+    draw()
+    const classes = (el: HTMLElement) => el.className.split(/\s+/)
+    expect(classes(screen.getByTestId('composer-attach'))).toContain('ms-auto')
+    expect(classes(send())).not.toContain('ms-auto')
+  })
+})
+
+describe('★ the pale send circle means LOCKED, not "you have not typed yet"', () => {
+  // The canvas paints the send circle #D6DDE4 (`bg-canvas-sendoff`) in exactly two boards —
+  // PlanReady and PlanRevised — and in both the composer is locked by a pending offer, with the
+  // greyed circle beside "Choose one of the two above". Fourteen other boards draw an EMPTY
+  // composer, placeholder showing, with the circle teal. Keying the treatment off "is there text"
+  // therefore put the locked look on the resting state of every screen in the product — and white
+  // on #D6DDE4 is about 1.4:1, a contrast failure the boards do not have.
+
+  it('is teal over an empty box', () => {
+    draw()
+    expect(send().className).toMatch(/bg-primary/)
+    expect(send().className).not.toMatch(/bg-canvas-sendoff/)
+  })
+
+  it('stays teal once there is something to send', () => {
+    draw()
+    type('add a checkout column')
+    expect(send().className).toMatch(/bg-primary/)
+  })
+
+  it('★ goes pale when something genuinely forbids sending', () => {
+    draw({ unavailableReason: 'The assistant is still working.' })
+    expect(send().className).toMatch(/bg-canvas-sendoff/)
+    expect(send().className).not.toMatch(/bg-primary/)
+  })
+
+  it('★ still refuses an empty send, which is what `aria-disabled` is for', () => {
+    // The look changed; the enforcement did not. Without this the fix above would read as
+    // "the empty composer now sends", which is the opposite of what it does.
+    const onSubmit = vi.fn()
+    draw({ onSubmit })
+    expect(send().getAttribute('aria-disabled')).toBe('true')
+    fireEvent.click(send())
+    expect(onSubmit).not.toHaveBeenCalled()
+  })
 })
 
 describe('★ the box clears ONLY once the server has accepted', () => {

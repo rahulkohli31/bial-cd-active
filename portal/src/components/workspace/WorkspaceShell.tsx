@@ -131,7 +131,12 @@ function railWidthClass(collapsed: boolean, paneVisible: boolean): string {
   // string. Above the threshold a zero height is equally correct: the element is already zero-width
   // and hidden, so nothing is left for a height to stretch.
   if (collapsed) return `w-0 h-0 flex-shrink-0 border-r-0 overflow-hidden ${HIDDEN_BUT_MOUNTED}`
-  if (!paneVisible) return 'flex-1'
+  // WHEN THE RAIL IS THE WHOLE WINDOW IT IS THE PAGE, AND THE PAGE IS WHITE. `#F0F4F8` is the
+  // ground the boards paint BEHIND THE APP; with no app beside it there is nothing for that grey to
+  // be behind, and `PlanChat` draws its root and its chat region both `#FFFFFF` with the 760px
+  // column centred on one unbroken white surface. Without this the centred column read as a white
+  // card floating between two 336px grey margins — a card the board does not draw.
+  if (!paneVisible) return 'flex-1 bg-white'
   // Stacked below the threshold (`flex-1`, sharing the column), the citizen's own width above it.
   return 'flex-1 wide:flex-none wide:w-[var(--rail-w)]'
 }

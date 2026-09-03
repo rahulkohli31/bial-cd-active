@@ -34,7 +34,7 @@
  * render on a project whose workspace is stopped, which is precisely where `save-state` — which
  * attaches to a container first — has nothing to say.
  */
-import { useMemo, useState } from 'react'
+import { useMemo, useState, type ReactNode } from 'react'
 import { ExternalLink } from 'lucide-react'
 import DataClassificationModal from '../DataClassificationModal'
 import { usePublishState } from '../../hooks/usePublishState'
@@ -50,6 +50,28 @@ import type { ProvenanceRow } from '../../utils/publishPresentation'
 
 export interface AppStatusPanelProps {
   projectId: string
+  /**
+   * The section's own small-caps label, drawn by this component so the state pill can share its row.
+   *
+   * A NODE RATHER THAN A STRING, and it comes from the rail rather than being written here: the
+   * rail owns the treatment every one of its section labels shares, and a second definition of it
+   * here is how two of the three end up a half-point apart. What this component owns is the ROW —
+   * `PreviewOff`, `NothingBuilt` and `Main` all draw the label and the pill on one 25px band with
+   * the pill carried right. The pill was a `float-right` in the block BELOW the heading, and a
+   * float cannot rise onto a preceding block's line, so it dropped to its own row and left a stray
+   * band of empty rail in every state.
+   */
+  label: ReactNode
+}
+
+/** The section's head: the label, and whatever the state wants carried to its right. */
+function SectionHead({ label, children }: { label: ReactNode; children?: ReactNode }) {
+  return (
+    <div className="mb-2.5 flex min-h-[25px] items-center gap-2.5">
+      {label}
+      {children}
+    </div>
+  )
 }
 
 /**
@@ -97,7 +119,7 @@ function Row({ row }: { row: ProvenanceRow }) {
   )
 }
 
-export default function AppStatusPanel({ projectId }: AppStatusPanelProps) {
+export default function AppStatusPanel({ projectId, label }: AppStatusPanelProps) {
   const { deployment, approval, loadError, refresh, onConfirm, saveAndPublish, unsaved, saving, withdraw, withdrawing } =
     usePublishState(projectId)
   const [showModal, setShowModal] = useState(false)
@@ -116,6 +138,7 @@ export default function AppStatusPanel({ projectId }: AppStatusPanelProps) {
   if (loadError !== null) {
     return (
       <div data-testid="app-status-panel" data-publish-state="unavailable">
+        <SectionHead label={label} />
         <p className="text-[11.5px] leading-relaxed text-neutral">{loadError}</p>
         <button
           type="button"
@@ -133,6 +156,7 @@ export default function AppStatusPanel({ projectId }: AppStatusPanelProps) {
   if (presentation === null || look === null || state === null) {
     return (
       <div data-testid="app-status-panel" data-publish-state="pending">
+        <SectionHead label={label} />
         <p className="text-[11.5px] text-neutral">Checking…</p>
       </div>
     )
@@ -140,23 +164,25 @@ export default function AppStatusPanel({ projectId }: AppStatusPanelProps) {
 
   return (
     <div data-testid="app-status-panel" data-publish-state={state}>
-      <span
-        data-testid="status-pill"
-        className={`float-right ml-2 inline-flex items-center gap-[7px] rounded-full px-[10px] py-1 text-[11px] font-bold whitespace-nowrap ${look.pill}`}
-      >
-        <span className={`h-1.5 w-1.5 flex-shrink-0 rounded-full ${look.dot}`} aria-hidden />
-        {presentation.label}
-      </span>
+      <SectionHead label={label}>
+        <span
+          data-testid="status-pill"
+          className={`ms-auto inline-flex items-center gap-[7px] rounded-full px-[10px] py-1 text-[11px] font-bold whitespace-nowrap ${look.pill}`}
+        >
+          <span className={`h-1.5 w-1.5 flex-shrink-0 rounded-full ${look.dot}`} aria-hidden />
+          {presentation.label}
+        </span>
+      </SectionHead>
 
       {rows.length > 0 && (
-        <div className="mt-2.5 clear-both pt-1">
+        <div className="pt-1">
           {rows.map((row) => (
             <Row key={row.key} row={row} />
           ))}
         </div>
       )}
 
-      <p className="mt-2.5 clear-both text-[11.5px] leading-relaxed text-neutral">{presentation.sentence}</p>
+      <p className="mt-2.5 text-[11.5px] leading-relaxed text-neutral">{presentation.sentence}</p>
 
       {/* WHERE NOTHING CAN BE DONE THERE IS NO BUTTON, rather than one that fails when pressed —
           the board says so in as many words. `take_it_back` is the one action that is not a

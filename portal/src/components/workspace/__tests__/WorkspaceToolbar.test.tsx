@@ -154,13 +154,16 @@ beforeEach(() => vi.clearAllMocks())
 afterEach(() => cleanup())
 
 describe('what the row names on each address', () => {
-  it('the project screen: back, the project name, and the status chip', () => {
+  it('the project screen: back and the project name, and NOT a second copy of the state', () => {
     render(<Workspace />)
 
     expect(screen.getByRole('button', { name: 'Back to projects' })).toBeTruthy()
     expect(title().textContent).toBe('Visitor Log — Airport Office')
     expect(title().tagName).toBe('H1')
-    expect(screen.getByTestId('publish-chip-stub').getAttribute('data-project')).toBe('pA')
+    // `PreviewOff`, `Main`, `NewProject` and `NothingBuilt` all draw this cluster as chevron +
+    // title and nothing else: the rail's APP STATUS section is right there carrying the pill, and
+    // a chip beside the title stated the same word twice inside 300px.
+    expect(screen.queryByTestId('publish-chip-stub')).toBeNull()
     // The chat half is absent, and that is what a heading with no kind means.
     expect(screen.queryByTestId('toolbar-chat-kind')).toBeNull()
   })
@@ -430,23 +433,34 @@ describe('the Save control', () => {
   })
 })
 
-describe('the status chip', () => {
-  it('names the project, and is not gated on whether anything is built', () => {
-    // "Nothing built yet" is a state the chip NAMES, so a citizen learns it from the same place
-    // they learn everything else about their app rather than from an absence.
-    render(<Workspace />)
+describe('the status chip — where the state is said, and where it would be said twice', () => {
+  // THE RULE THE BOARDS DRAW, and it is about duplication rather than about the chip. Every state
+  // the chip names is also named by the rail's APP STATUS section. So the chip appears exactly
+  // where that section is NOT: on a chat, which has no rail section at all, and over a collapsed
+  // rail, where the section has just gone off screen. On the open project screen it is a second
+  // rendering of one fact standing 300px from the first — which is how two renderings begin to
+  // disagree, and it is the one thing this row is supposed to prevent.
+
+  it('★ names the project on a chat, where nothing else says the state', () => {
+    render(<Workspace entry="/chat/c1" />)
     expect(screen.getByTestId('publish-chip-stub').getAttribute('data-project')).toBe('pA')
   })
 
-  it('is drawn ONCE, on both addresses — one mount, not two that could word a state differently', () => {
+  it('★ comes back when the rail that was carrying it is hidden', () => {
     render(<Workspace />)
-    expect(screen.getAllByTestId('publish-chip-stub')).toHaveLength(1)
-    fireEvent.click(screen.getByText('to chat'))
+    expect(screen.queryByTestId('publish-chip-stub')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Hide details' }))
+    expect(screen.getByTestId('publish-chip-stub').getAttribute('data-project')).toBe('pA')
+  })
+
+  it('is drawn ONCE where it is drawn at all — one mount, not two that could word a state differently', () => {
+    render(<Workspace entry="/chat/c1" />)
     expect(screen.getAllByTestId('publish-chip-stub')).toHaveLength(1)
   })
 
   it('renders nothing where there is no project to name', () => {
-    render(<Workspace project={{ heading: { ...PROJECT_HEADING, projectId: null } }} />)
+    render(<Workspace entry="/chat/c1" chat={{ heading: { ...CHAT_HEADING, projectId: null } }} />)
     expect(screen.queryByTestId('publish-chip-stub')).toBeNull()
   })
 })

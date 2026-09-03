@@ -155,9 +155,23 @@ export default function AppPane({ device, reloadNonce }: AppPaneProps) {
         // source, the sandbox token list — is unchanged and stays there. The device WIDTH is the
         // shell's now, because the control that picks it is in the row, and it is passed through
         // rather than held: two owners of one width is how the card and the switcher disagree.
+        //
+        // IT DRAWS ITS OWN CARD — `LivePreview` frames the iframe in a padded `#e8edf2` box with a
+        // rounded, shadowed white surround — which is why the card below is on the EMPTY arm only.
+        // A second card around the first would be two borders and two shadows on one app.
         <AppPaneHost device={device} reloadNonce={reloadNonce} />
       ) : (
-        <NoFrame report={report} />
+        // THE EMPTY PANE IS A NAMED REGION WITH A CARD IN IT, which is what `PreviewOff`,
+        // `NothingBuilt` and `PreviewStarting` draw — and only those three. The label is the tell:
+        // it appears on exactly the boards where the pane holds no app, because a blank half of the
+        // screen needs to say what it is for, and a running application says that itself. Drawn
+        // here rather than at the section, so it comes and goes with the emptiness it explains.
+        <div className="flex min-h-0 flex-1 flex-col px-4 pb-4 pt-3.5">
+          <p className="mb-2.5 text-[11.5px] font-bold tracking-[0.6px] text-neutral">YOUR APP</p>
+          <div className="flex min-h-0 flex-1 overflow-hidden rounded-xl border border-canvas-rule bg-white shadow-app-card">
+            <NoFrame report={report} />
+          </div>
+        </div>
       )}
     </section>
   )

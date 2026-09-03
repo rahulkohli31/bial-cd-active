@@ -100,11 +100,14 @@ export default function WorkspaceRail({ project, save, onProjectUpdate }: Worksp
           Same computed value, so the two surfaces cannot say different things. U4 gives this
           section its provenance rows, its colour-coded states and its own action button. */}
       <section data-testid="rail-app-status" className="px-[18px] py-[15px]">
-        <SectionLabel>APP STATUS</SectionLabel>
         {/* WHERE THE APP STANDS — publishing, approval and the citizen's own last save, from the
             one server-computed state. `AppStatusPanel` and the toolbar row's chip put that state
-            through the same presentation map, so the two can never say different things. */}
-        <AppStatusPanel projectId={project.id} />
+            through the same presentation map, so the two can never say different things.
+
+            THE LABEL GOES DOWN INTO THE PANEL rather than being drawn above it, because the boards
+            put it and the state pill on ONE row. The treatment is still this file's — the panel
+            receives the rendered label, it does not write one. */}
+        <AppStatusPanel projectId={project.id} label={<SectionLabel>APP STATUS</SectionLabel>} />
         {/* WHETHER THE CONTAINER HAS WORK THE BUNDLE DOES NOT — a DIFFERENT question from the
             panel's, and it is worth being clear about why both are here. The panel's saved row
             says which version the citizen last SAVED, from object-store metadata, on a project

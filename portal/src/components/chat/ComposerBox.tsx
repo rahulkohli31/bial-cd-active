@@ -101,6 +101,23 @@ export default function ComposerBox({
   const stagedCount = useAuiState((s) => s.composer.attachments.length)
   const hasContent = useAuiState((s) => s.composer.text.trim().length > 0) || stagedCount > 0
   const sendUnavailable = unavailableReason !== null || !hasContent || sending
+  /**
+   * WHAT THE CONTROL LOOKS LIKE IS A DIFFERENT QUESTION FROM WHETHER IT WILL SEND, and collapsing
+   * the two was a departure from fourteen boards.
+   *
+   * The canvas paints the send circle `#D6DDE4` in exactly two places — `PlanReady` and
+   * `PlanRevised` — and in both the composer is LOCKED by a pending offer, with the greyed circle
+   * sitting beside "Choose one of the two above". Every other board that draws a composer, empty
+   * placeholder and all, draws it teal. So the pale ground means "you may not send", not "you have
+   * not typed anything yet" — and an empty box is the resting state of every screen in the product,
+   * which is how the resting state came to wear the locked treatment.
+   *
+   * It was also a contrast failure the boards do not have: white on `#D6DDE4` is about 1.4:1.
+   *
+   * `sendUnavailable` is untouched and still governs `aria-disabled`, the accessible name and the
+   * refusal in `doSend` — pressing an empty composer still sends nothing.
+   */
+  const sendLocked = unavailableReason !== null || sending
 
   const doSend = useCallback(async () => {
     // THE ENFORCEMENT, and the whole of it. `aria-disabled` says so; it does not do so. Pressing
@@ -212,12 +229,18 @@ export default function ComposerBox({
 
           <div className="flex items-center gap-2.5">
             {/* THE ATTACHMENT CONTROL IS INSIDE THE BOX, which is the board's whole point about
-                this row. It never goes unavailable: staging a file is composing, not sending. */}
+                this row. It never goes unavailable: staging a file is composing, not sending.
+
+                `ms-auto` IS ON THE PAPERCLIP, not on Send, and the two then ride together at the
+                right edge on the row's own `gap-2.5`. Every board that draws a composer carries
+                `margin-left:auto` on the paperclip; with the auto margin on Send instead, the two
+                controls were pushed to opposite ends of the box — 308px apart on the project rail
+                at 1440, and 932px apart at 1024, which is one at each end of the screen. */}
             <ComposerPrimitive.AddAttachment
               data-testid="composer-attach"
               aria-label="Attach a file"
               title="Attach images, PDFs or text files (CSV, TXT), or drop them anywhere in the composer"
-              className="inline-flex text-neutral transition hover:text-primary"
+              className="ms-auto inline-flex text-neutral transition hover:text-primary"
             >
               <Paperclip size={16} />
             </ComposerPrimitive.AddAttachment>
@@ -230,11 +253,12 @@ export default function ComposerBox({
               aria-label={unavailableReason ? `Send message — ${unavailableReason}` : 'Send message'}
               title={unavailableReason ?? undefined}
               data-testid="composer-send"
-              // THE BOARD'S SEND: a 30px teal circle, not a 36px gold square. Its unavailable
-              // treatment is the board's too — a pale ground rather than an opacity, so it still
-              // reads as a control rather than as a ghost.
-              className={`ms-auto inline-flex h-[30px] w-[30px] flex-shrink-0 items-center justify-center rounded-full transition ${
-                sendUnavailable ? 'cursor-default bg-canvas-sendoff text-white' : 'bg-primary text-white hover:bg-primary-600'
+              // THE BOARD'S SEND: a 30px teal circle, not a 36px gold square. Its LOCKED treatment
+              // is the board's too — a pale ground rather than an opacity, so it still reads as a
+              // control rather than as a ghost — and it is reserved for being locked. See
+              // `sendLocked`: an empty box is not a lock, it is Tuesday.
+              className={`inline-flex h-[30px] w-[30px] flex-shrink-0 items-center justify-center rounded-full transition ${
+                sendLocked ? 'cursor-default bg-canvas-sendoff text-white' : 'bg-primary text-white hover:bg-primary-600'
               }`}
             >
               <Send size={14} />

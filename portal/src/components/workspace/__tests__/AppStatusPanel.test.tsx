@@ -76,13 +76,31 @@ const hook = (over: Partial<UsePublishState> = {}): UsePublishState =>
   }) as UsePublishState
 
 const wire = (over: Partial<UsePublishState>) => h.usePublishState.mockReturnValue(hook(over))
-const mount = () => render(<AppStatusPanel projectId="p1" />)
+// The rail hands the section's label down so the pill can share its row; here it is a plain node,
+// because what this suite is about is the panel's states, not the rail's type scale.
+const mount = () => render(<AppStatusPanel projectId="p1" label={<h2>APP STATUS</h2>} />)
 const panel = () => screen.getByTestId('app-status-panel')
 
 beforeEach(() => vi.clearAllMocks())
 afterEach(cleanup)
 
 describe('the state pill', () => {
+  it('★ shares the section label\'s row, carried to its right', () => {
+    // `PreviewOff`, `NothingBuilt` and `Main` draw the label and the pill on one band. The pill was
+    // a `float-right` in the block BELOW the heading — and a float cannot rise onto a preceding
+    // block's line, so it dropped to a row of its own and left a stray strip of empty rail under
+    // "APP STATUS" in every single state.
+    wire({ deployment: view('draft') })
+    mount()
+    const pill = screen.getByTestId('status-pill')
+    const head = pill.parentElement as HTMLElement
+
+    expect(head.textContent).toContain('APP STATUS')
+    expect(head.className).toMatch(/(^|\s)flex(\s|$)/)
+    expect(pill.className.split(/\s+/)).toContain('ms-auto')
+    expect(pill.className.split(/\s+/)).not.toContain('float-right')
+  })
+
   it('carries the state\'s own colour and a leading dot, exactly as the chip does', () => {
     wire({ deployment: view('in_review'), approval: approval({ status: 'pending' }) })
     mount()

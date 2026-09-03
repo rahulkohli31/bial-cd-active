@@ -64,7 +64,14 @@ export default function PlanChatWorkspaceLine() {
     // MOUNTED ALWAYS, even before the first read lands. A region that appears together with its
     // first sentence arrives without warning under whatever the person was reading; one that is
     // always in the document simply gains a line.
-    <div data-testid="plan-chat-workspace-line" className="px-4 pb-2 text-xs leading-relaxed text-neutral">
+    // THE BOARD'S TREATMENT, and it is a caption rather than a paragraph: 11px `#9AA5B1`, centred
+    // under the box with 8px of air. `PlanChat` and `PlanReady` both draw it in that slot; it read
+    // as a left-aligned 12px sentence ABOVE the composer, which puts a standing disclaimer between
+    // the transcript and the box the citizen is typing in.
+    <div
+      data-testid="plan-chat-workspace-line"
+      className="mt-2 px-4 text-center text-[11px] leading-relaxed text-canvas-placeholder"
+    >
       <p>
         {/* THE BOARD'S SENTENCE, VERBATIM — see the docblock for why both of its halves are true. */}
         Planning is a conversation. Your app is not open here and nothing you say changes it.

@@ -41,7 +41,7 @@
  * R60 — CROSS-CHAT LEAKAGE is guarded by the send path stamping the conversation at press time
  *   and the surface comparing it on completion.
  */
-import { useCallback, useEffect, useMemo, type FC } from 'react'
+import { useCallback, useEffect, useMemo, type FC, type ReactNode } from 'react'
 import { useAui, useAuiState } from '@assistant-ui/react'
 
 import { capState, MAX_COMPOSER_CHARS } from '../../utils/composerCap'
@@ -102,6 +102,13 @@ export interface ComposerProps {
    * server's refusal, which arrives as an ordinary turn error.
    */
   contextWarning?: string | null | undefined
+  /**
+   * A standing caption under the box — the plan chat's line about its app, and nothing transient.
+   *
+   * A SLOT RATHER THAN A FLAG, because the sentence and the states it may speak for belong to the
+   * surface that knows the chat's kind; the composer only knows where the board draws it.
+   */
+  footerNote?: ReactNode
   /** Urgent sentences go to the assertive slot the surface owns. */
   onUrgent: (message: string) => void
 }
@@ -115,6 +122,7 @@ const Composer: FC<ComposerProps> = ({
   stop,
   offer,
   contextWarning,
+  footerNote,
   onUrgent,
 }) => {
   const aui = useAui()
@@ -177,7 +185,11 @@ const Composer: FC<ComposerProps> = ({
   )
 
   return (
-    <div className="flex flex-col gap-1.5 border-t border-bial-border bg-bial-surface px-3 py-2.5">
+    // NO RULE ABOVE THE BOX. Every board that draws a composer — BuildChat, PlanChat, PlainAnswer,
+    // NewBuildChat, NewPlanChat and the rest — runs the transcript's white straight down into the
+    // composer's own bordered box, with nothing between them. The full-width hairline read as a
+    // second edge stacked on the box's, and on a plan chat it cut the one centred column in two.
+    <div className="flex flex-col gap-1.5 bg-bial-surface px-3 py-2.5">
       {/* R55 — stop's permanent home, ABOVE the box rather than inside it: it acts on the turn,
           not on the message being composed, and a control inside the box would read as part of
           sending one. */}
@@ -221,6 +233,12 @@ const Composer: FC<ComposerProps> = ({
                 {contextWarning}
               </p>
             )}
+
+            {/* THE STANDING NOTE, LAST AND BELOW THE BOX (plan 002, U6). The plan chat's line
+                about the app is the board's use of this slot: a caption under the composer, not a
+                banner above it. It comes after the transient notes because those answer the press
+                the citizen just made, and this one has been true the whole time. */}
+            {footerNote}
 
             {/* R43 — silent until it is useful, and then exact. See `composerCap.ts` for why the
                 number is code points rather than String.length. */}
