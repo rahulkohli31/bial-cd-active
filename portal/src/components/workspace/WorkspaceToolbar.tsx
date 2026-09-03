@@ -25,9 +25,9 @@
  * that cell is republished on every keystroke in the composer and is cleared to nothing when its
  * publisher unmounts. Either one alone would disqualify it.
  *
- * The save control reads its VALUES from `save` and its ACTION from `saveAction`, at press time —
+ * The save control reads its VALUES from `save` and its ACTION from `actions`, at press time —
  * so a handler whose identity changes on every render of the conversation surface costs this row
- * nothing, and a stale closure is not reachable. See `useSaveAction`.
+ * nothing, and a stale closure is not reachable. See `useWorkspaceActions`.
  *
  * ═══ WHAT IS DELIBERATELY NOT HERE ═══
  *
@@ -330,7 +330,7 @@ function SaveControl({ save, readActions }: { save: SaveSlot; readActions: () =>
         </span>
       )}
       {canSave ? (
-        // THE ACTION IS READ AT PRESS TIME, never held across a render — see `useSaveAction`. A
+        // THE ACTION IS READ AT PRESS TIME, never held across a render — see `useWorkspaceActions`. A
         // `null` read means the publisher unmounted between this render and the click, which is a
         // press with nothing to do rather than a crash.
         <button

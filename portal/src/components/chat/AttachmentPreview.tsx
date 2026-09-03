@@ -36,6 +36,7 @@
 import { useEffect, useState, type FC } from 'react'
 
 import { TEXT_MEDIA_TYPES } from '../../utils/attachmentInput'
+import { decodeBase64Text } from '../../utils/attachmentStore'
 
 import {
   Dialog,
@@ -87,17 +88,14 @@ function framableSrc(target: PreviewTarget): string | null {
   return target.attachmentId ? `/api/attachments/${encodeURIComponent(target.attachmentId)}` : null
 }
 
-/** The base64 payload out of a staged file's data URL, or `null` for anything else. */
+/** The decoded text of a staged file's data URL, or `null` for anything else. */
 function stagedText(target: PreviewTarget): string | null {
   const url = target.dataUrl
   if (!url || !url.startsWith('data:')) return null
   const comma = url.indexOf(',')
   if (comma < 0) return null
   try {
-    // `atob` then a UTF-8 decode: the payload is bytes, and a CSV with a name in it is not ASCII.
-    const binary = atob(url.slice(comma + 1))
-    const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0))
-    return new TextDecoder().decode(bytes)
+    return decodeBase64Text(url.slice(comma + 1))
   } catch {
     return null
   }

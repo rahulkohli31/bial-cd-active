@@ -352,12 +352,11 @@ const ActivityGroup: FC<PropsWithChildren<{ group: ThreadGroupPart }>> = ({ grou
                   }`}
                   style={i === 0 ? undefined : { marginLeft: '-7px' }}
                 >
-                  {/* A FAILED STEP KEEPS ITS STATE GLYPH. The kind icon says what the agent was
-                      doing; a cross says it did not work, and that outranks the kind — conveyed by
-                      SHAPE and not by colour alone (WCAG 1.4.1), which is the row atom's own rule. */}
-                  {state === 'failed' ? (
-                    <GlyphOnly state={state} />
-                  ) : live ? (
+                  {/* A FAILED OR RUNNING STEP KEEPS ITS STATE GLYPH. The kind icon says what the
+                      agent was doing; a cross says it did not work and a spinner says it still is,
+                      and either outranks the kind — conveyed by SHAPE and not by colour alone
+                      (WCAG 1.4.1), which is the row atom's own rule. */}
+                  {state === 'failed' || live ? (
                     <GlyphOnly state={state} />
                   ) : (
                     <StepIcon size={12} aria-hidden="true" className="text-neutral" />

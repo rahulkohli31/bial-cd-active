@@ -50,7 +50,7 @@
  * nothing. The empty, stopped and gone states are therefore drawn HERE, from the workspace state,
  * rather than left to whatever the framed origin happens to return.
  */
-import { useCallback } from 'react'
+import { memo, useCallback } from 'react'
 import AppPaneHost from './AppPaneHost'
 import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
 import StartAppControl from './StartAppControl'
@@ -80,7 +80,7 @@ export interface AppPaneProps {
   reloadNonce: number
 }
 
-export default function AppPane({ device, reloadNonce }: AppPaneProps) {
+function AppPane({ device, reloadNonce }: AppPaneProps) {
   const address = useWorkspaceAddress()
   const report = useWorkspaceReport()
   // THE COLUMN ITSELF ANSWERS TO THE VISIBILITY, NOT ONLY THE FRAME INSIDE IT (plan 002, U6).
@@ -215,3 +215,13 @@ function NoFrame({ report }: { report: ReturnType<typeof useWorkspaceReport> }) 
     </div>
   )
 }
+
+/**
+ * MEMOISED BECAUSE THE RAIL DRAG RE-RENDERS THE SHELL ON EVERY POINTER MOVE. `RailResizeHandle`
+ * reports each move into the shell's own width state, and this column is its sibling — so without
+ * this the whole pane subtree re-renders at pointer frequency for the length of a drag, for a
+ * width that is not its own. Both props are primitives, so the default shallow compare is exactly
+ * right; nothing else this component reads comes through props, and context and cell subscriptions
+ * reach it regardless of memo.
+ */
+export default memo(AppPane)
