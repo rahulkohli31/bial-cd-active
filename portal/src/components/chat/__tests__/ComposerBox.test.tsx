@@ -215,6 +215,51 @@ describe('★ the box clears ONLY once the server has accepted', () => {
     expect(onSubmit.mock.calls[0]?.[0]?.text).toBe('first message')
   })
 
+  it('★ keeps a file ATTACHED while the send was in flight — the other half of the same rule', async () => {
+    // THE SIBLING OF THE TEST ABOVE, and the one whose absence let the attachment half of the fix
+    // ship unpinned: `kept` / `clearAttachments()` / re-add could be reverted to a bare
+    // `clearAttachments()` and every other test here would stay green.
+    let release = () => {}
+    const gate = new Promise<void>((r) => { release = r })
+    const onSubmit = vi.fn().mockReturnValue(gate)
+    draw({ onSubmit })
+
+    type('here is the first file')
+    drop(new File(['id,name'], 'sent.csv', { type: 'text/csv' }))
+    await waitFor(() => expect(screen.getByTestId('composer-chips').textContent).toContain('sent.csv'))
+
+    fireEvent.click(send())
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+
+    // The citizen stages a SECOND file while the first send is still out.
+    drop(new File(['a,b'], 'staged-during.csv', { type: 'text/csv' }))
+    await waitFor(() =>
+      expect(screen.getByTestId('composer-chips').textContent).toContain('staged-during.csv'))
+
+    release()
+
+    // The one that was sent goes. The one that was not stays.
+    await waitFor(() =>
+      expect(screen.getByTestId('composer-chips').textContent).not.toContain('sent.csv'))
+    expect(screen.getByTestId('composer-chips').textContent).toContain('staged-during.csv')
+  })
+
+  it('★ does not claim the message failed when only the tidying up did', async () => {
+    // The send SUCCEEDED. Whatever goes wrong while clearing afterwards, the citizen must not be
+    // told their message did not send — it did, and telling them otherwise invites a duplicate.
+    const onSubmit = vi.fn().mockResolvedValue(undefined)
+    const onUrgent = vi.fn()
+    draw({ onSubmit, onUrgent })
+    type('this one lands')
+    fireEvent.click(send())
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    // Whether or not the tidy-up throws in this environment, the failure sentence is reserved for
+    // sends that actually failed.
+    const said = onUrgent.mock.calls.map((c) => String(c[0])).join(' ')
+    expect(said).not.toMatch(/did not send/i)
+  })
+
   it('★ still empties the box when nothing was added during the send', async () => {
     // The ordinary case must not regress into "never clears".
     const onSubmit = vi.fn().mockResolvedValue(undefined)

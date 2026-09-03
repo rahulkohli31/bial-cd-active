@@ -137,15 +137,24 @@ export default function ComposerBox({
     const sentText = state.text
     const sentIds = new Set(state.attachments.map((a) => a.id))
 
+    // WHETHER THE SERVER TOOK IT, for the catch below. The clearing has to stay INSIDE this `try`
+    // so that `sending` is only released once the box has actually been reconciled — release it
+    // first and a fast second press re-enters with the sent text still in the box and sends it
+    // twice. But that means a slip while CLEARING lands in the same catch as a failed send, and
+    // those are not the same event and must not read the same.
+    let accepted = false
+
     setSending(true)
     try {
       await onSubmit({ text: sentText, attachments, conversationId })
+      accepted = true
       // CLEARED ONLY ON SUCCESS, AND ONLY WHAT WAS SENT. Nothing is optimistically emptied, so a
       // failed send leaves everything exactly where it was and there is no restore path to race
       // with; and anything added since the press survives, because it was never sent.
       const after = aui.composer.getState()
-      if (after.text === sentText) await aui.composer.setText('')
-      else if (after.text.startsWith(sentText)) await aui.composer.setText(after.text.slice(sentText.length))
+      // ONE BRANCH, NOT TWO. `startsWith` is true when the two are equal and the slice is then
+      // empty, so an `after.text === sentText` arm ahead of this would be the same statement twice.
+      if (after.text.startsWith(sentText)) await aui.composer.setText(after.text.slice(sentText.length))
       // Anything else is an edit we cannot reconcile — the citizen rewrote the box while the
       // request was out. Leaving their words alone is the only safe answer; a stale copy of a
       // sent line is a nuisance, a deleted paragraph is the bug.
@@ -155,10 +164,26 @@ export default function ComposerBox({
       // back. Re-adding runs it through the adapter's validation a second time, which is harmless:
       // it passed once already, and the alternative is either deleting a file the citizen chose or
       // sending it twice.
+      //
+      // `a.file` IS ASSERTED, NOT TESTED. The library types `file` optional because a
+      // `CompleteAttachment` — produced only by the adapter's own `send()`, which this app never
+      // calls — may lack it. Everything reaching here is a `PendingAttachment` and carries its
+      // file. A bare `if (a.file)` would drop one SILENTLY on the day that stops being true, which
+      // is the exact loss the rest of this function exists to prevent.
       const kept = after.attachments.filter((a) => !sentIds.has(a.id))
       await aui.composer.clearAttachments()
-      for (const a of kept) if (a.file) await aui.composer.addAttachment(a.file)
+      for (const a of kept) {
+        if (!a.file) throw new Error(`Staged attachment ${a.id} has no file to restore after a send.`)
+        await aui.composer.addAttachment(a.file)
+      }
     } catch (err) {
+      // THE SEND WORKED AND THE TIDYING DID NOT. Saying "that message did not send" here would be
+      // false twice over: it sent, and the files were cleared a few lines above. `addAttachment`
+      // can genuinely throw — the adapter raises `AttachmentRefusal` on a failed verdict.
+      if (accepted) {
+        onUrgent('Your message was sent. The composer could not be tidied up afterwards — reload if it looks wrong.')
+        return
+      }
       // The swallowed press: nothing sent, nothing said, nothing cleared.
       if (err instanceof SendRefusal && err.silent) return
       // THE REFUSAL'S OWN WORDS, but only when they were written to be read. Anything else keeps
