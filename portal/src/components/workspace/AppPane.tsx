@@ -51,6 +51,7 @@
  * rather than left to whatever the framed origin happens to return.
  */
 import { memo, useCallback } from 'react'
+import { Box, Locate, Play, type LucideIcon } from 'lucide-react'
 import AppPaneHost from './AppPaneHost'
 import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
 import StartAppControl from './StartAppControl'
@@ -72,6 +73,38 @@ const NOTHING_IS_SERVING: ReadonlySet<WorkspaceStateName> = new Set<WorkspaceSta
   // is what the map's `starting` arm says.
   'starting',
 ])
+
+/**
+ * THE MARK ABOVE THE HEADLINE, ON THE THREE STATES WHOSE BOARDS DRAW ONE.
+ *
+ * `NothingBuilt`, `PreviewOff` and `PreviewStarting` are the boards for an empty pane, and every
+ * one of them puts a 30px #9AA5B1 glyph directly above its headline: a ticked circle, a play
+ * triangle and a box. Without it the pane is a headline and a sentence floating in a white card,
+ * and a blank half-screen with no mark on it reads as a page that failed to load rather than as a
+ * deliberate state.
+ *
+ * IT IS A LOOKUP HERE AND NOT A FIELD ON `WorkspaceState`, deliberately. The state map is a pure
+ * module answering "what is true and what may be pressed"; a Lucide component is a rendering
+ * decision, and `chatKind.ts` already draws that line the same way — the words are the catalogue's,
+ * the icon and the pill are local. What the map still owns is every sentence on this pane.
+ *
+ * `null` IS AN ANSWER, not a gap: no board draws a mark for the hand-over states, the read
+ * failures or the three start outcomes, and inventing seven glyphs the canvas has never shown
+ * would be this file making the design decision. Exhaustive over `WorkspaceStateName` so a new
+ * state cannot be added without someone deciding here.
+ */
+const STATE_GLYPH: Readonly<Record<WorkspaceStateName, LucideIcon | null>> = {
+  'never-built': Locate, // NothingBuilt — the ticked circle, the same mark the rail's Plan picker has
+  'not-running': Play, // PreviewOff — "Your app is saved", and the press that brings it back
+  starting: Box, // PreviewStarting — "Setting up somewhere for it to run"
+  running: null, // The frame is up; this pane draws no card at all.
+  'held-by-another-project': null,
+  'held-unattributed': null,
+  'could-not-read': null,
+  'not-painted': null,
+  'timed-out': null,
+  'start-failed': null,
+}
 
 export interface AppPaneProps {
   /** The width the app is framed at. Shell-owned, because its control is in the toolbar row. */
@@ -192,6 +225,9 @@ function NoFrame({ report }: { report: ReturnType<typeof useWorkspaceReport> }) 
   if (!report) return null
 
   const { state } = report
+  // See `STATE_GLYPH`: the three boards that draw an empty pane draw a mark above the headline,
+  // and the states no board covers draw none rather than borrowing one.
+  const Glyph = STATE_GLYPH[state.name]
   return (
     <div
       data-testid="app-pane-empty"
@@ -203,7 +239,18 @@ function NoFrame({ report }: { report: ReturnType<typeof useWorkspaceReport> }) 
       data-workspace-state={state.name}
       className="flex flex-1 items-center justify-center p-8"
     >
-      <div className="max-w-sm text-center">
+      <div className="flex max-w-sm flex-col items-center text-center">
+        {/* 30px, 1.6 stroke, #9AA5B1 — the board's own numbers, 14px above the headline.
+            Decorative: the headline beneath it says the same thing in words. */}
+        {Glyph && (
+          <Glyph
+            data-testid="app-pane-glyph"
+            size={30}
+            strokeWidth={1.6}
+            aria-hidden="true"
+            className="mb-3.5 flex-shrink-0 text-canvas-placeholder"
+          />
+        )}
         <p className="text-base font-bold text-tertiary">{state.headline}</p>
         {state.detail && <p className="mt-2 text-sm text-neutral leading-relaxed">{state.detail}</p>}
         {state.action && (

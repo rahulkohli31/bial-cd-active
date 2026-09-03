@@ -205,6 +205,40 @@ describe('one author for every pane sentence', () => {
     expect(empty.textContent).toContain('It stays running while you work, so you only do this once.')
   })
 
+  it('★ draws the board\'s mark above the headline on the three states that have one', () => {
+    // `NothingBuilt`, `PreviewOff` and `PreviewStarting` each put a 30px #9AA5B1 glyph directly
+    // above the headline, and it is the only thing that makes a blank half-screen read as a
+    // deliberate state rather than as a page that failed to load. The card and the "YOUR APP"
+    // label landed; its contents were still headline + sentence + button.
+    const withGlyph: [string, PreviewState][] = [
+      ['never-built', reading({ state: 'never_built', restorable: false })],
+      ['not-running', reading({ state: 'asleep', restorable: true })],
+      ['starting', reading({ state: 'starting' })],
+    ]
+
+    for (const [name, preview] of withGlyph) {
+      const { unmount } = renderPane((c) => c.workspace.set(reportFor(preview)))
+      const glyph = screen.getByTestId('app-pane-glyph')
+      expect(screen.getByTestId('app-pane-empty').getAttribute('data-workspace-state'), name).toBe(name)
+      expect(glyph.getAttribute('width')).toBe('30')
+      // Decorative: the headline underneath already says it in words.
+      expect(glyph.getAttribute('aria-hidden')).toBe('true')
+      unmount()
+    }
+  })
+
+  it('★ and draws none for a state no board has a mark for', () => {
+    // Seven of the ten states are hand-overs, read failures and start outcomes that the canvas has
+    // never drawn. Borrowing one of the three marks for them would be this file inventing the
+    // design; saying nothing is the honest answer, and the sentence still carries the state.
+    renderPane((c) => c.workspace.set(reportFor(reading({ state: 'unknown' }))))
+
+    expect(screen.queryByTestId('app-pane-glyph')).toBeNull()
+    // LIVENESS: the card is there and speaking, so this is a deliberate absence rather than a
+    // pane that rendered nothing.
+    expect(screen.getByTestId('app-pane-empty').textContent?.length).toBeGreaterThan(10)
+  })
+
   it('never says what the app is NOT (R-16)', () => {
     for (const preview of [
       reading({ state: 'asleep', restorable: true }),
