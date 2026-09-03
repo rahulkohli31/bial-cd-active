@@ -65,7 +65,7 @@ from src.services.turns.plan_options import (
 )
 from tests.factories import ConversationFactory, UserFactory
 from tests.fakes import FakeSandboxClient
-from tests.transcript import rendered_text
+from tests.transcript import live_shape, reload_shape, rendered_text
 
 _CTX = PromptContext(user_name="Ada", project_name="Visitors", project_description=None)
 
@@ -269,6 +269,69 @@ async def test_the_plan_argument_is_the_happy_path_live_and_on_reload(
     options = [i for i in items if isinstance(i, PlanOptionsItem)]
     assert [t.text for t in text_items] == [_PLAN_TEXT]
     assert len(options) == 1 and options[0].state == "pending"
+
+
+async def test_the_writing_up_status_leaves_the_screen_when_the_plan_arrives(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    """★ A WATCHING TAB AND A RELOADED ONE READ THE SAME THING, on the turn that has a status
+    line to withdraw.
+
+    "Writing up the plan…" is announced the moment the tool's block opens, because the plan
+    rides the argument and thousands of tokens stream before the call resolves. It has no
+    durable counterpart — a reloaded transcript shows the plan and the offer and never the
+    moment before them — so the status has to LEAVE the feed when the call lands. Dropping it
+    from the turn's own memory only settles what a LATE subscriber gets; a tab that was already
+    connected received the started frame, and unless the withdrawal reaches the wire too it
+    keeps a spinning row labelled "Writing up the plan…" above the finished plan for the rest
+    of the session, and only a reload clears it.
+
+    Compared as SHAPES rather than as two separate absence checks: an assertion that the live
+    feed holds no visible step passes just as well if the whole turn produced nothing, and the
+    plan text on both sides is the liveness half that says it did not.
+
+    Mutation check: put `state.drop_step(...)` back in place of `_retract_step(...)` in the
+    engine's offer arm and the live shape grows a `step:present_plan_options` the reloaded one
+    does not have."""
+
+    async def _stream(messages, info: AgentInfo):
+        # The provider's own two-part shape: the tool NAME with an empty argument first, which
+        # is what opens the status, then the plan.
+        yield DeltaToolCalls(
+            {0: DeltaToolCall(name="present_plan_options", json_args="", tool_call_id="opt-1")}
+        )
+        yield DeltaToolCalls(
+            {0: DeltaToolCall(json_args=json.dumps({"plan": _PLAN_TEXT}), tool_call_id="opt-1")}
+        )
+
+    user, conv = await _plan_conversation(db_session)
+    state = await _run_turn(
+        _fresh_engine,
+        db_session,
+        session_factory,
+        FunctionModel(stream_function=_stream),
+        user,
+        conv,
+    )
+    assert state.status == "completed"
+
+    rows = await load_rows(
+        db_session, user_id=user.id, conversation_id=conv.id, include_hidden=True
+    )
+    assert live_shape(state) == [f"text:{_PLAN_TEXT}"] == reload_shape(project_rows(list(rows)))
+
+    # The withdrawal is a FRAME, not just an absence from the snapshot: the connected tab is
+    # told, on the same call id, and the item it is told with is hidden.
+    withdrawals = [
+        f
+        for f in state.ring
+        if f.type == "step" and f.tool_call_id == "opt-1" and f.phase == "finished"
+    ]
+    assert len(withdrawals) == 1 and withdrawals[0].item.hidden is True
+
+    # And the card the status was making way for is still there — the retraction takes the
+    # status off the screen and nothing else with it.
+    assert [f.item.tool_call_id for f in state.ring if f.type == "plan_options"] == ["opt-1"]
 
 
 async def test_an_offer_survives_unrelated_turns_and_still_names_its_own_plan(

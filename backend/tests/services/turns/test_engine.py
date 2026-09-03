@@ -389,9 +389,13 @@ async def test_the_offer_tools_part_start_event_emits_a_started_step_the_card_th
     step_frames = [f for f in ring if f.type == "step" and f.tool_call_id == "opt-1"]
     plan_frames = [f for f in ring if f.type == "plan_options" and f.item.tool_call_id == "opt-1"]
 
-    # Exactly one started step, never a 'finished' counterpart — the offer DEFERS rather than
-    # resolving through the ordinary step lifecycle, so nothing ever closes it out that way.
-    assert [f.phase for f in step_frames] == ["started"]
+    # Started, then WITHDRAWN. The offer defers — the citizen's click is the result — so the
+    # status never resolves through the ordinary step lifecycle; it is retracted instead, and
+    # the retraction has to reach the wire. A tab that was already connected when the status
+    # went out learns of the withdrawal from this second frame and from nothing else: the
+    # snapshot assertions below only speak for a client that subscribes afterwards.
+    assert [f.phase for f in step_frames] == ["started", "finished"]
+    assert step_frames[1].item.hidden is True
     assert step_frames[0].item.label == WRITING_UP_THE_PLAN_LABEL
     # The frame that opens the block carries no plan text — and now cannot: a step has no
     # field a plan could ride in (U14). Asserted on the plan's own words rather than on the

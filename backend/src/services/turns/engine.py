@@ -2857,7 +2857,7 @@ class TurnEngine:
                     # result), so there is no 'finished' counterpart to wait for. It REPLACES
                     # the status on the same tool_call_id rather than stacking beside it.
                     self._emit_plan_options(state, event.part.tool_call_id)
-                state.drop_step(event.part.tool_call_id)
+                self._retract_step(state, event.part.tool_call_id)
                 return
             if event.part.tool_name == TELL_THE_USER_TOOL:
                 # THE WORDS, AND NOT A STEP. Rendered here at the CALL event rather than at
@@ -3046,6 +3046,35 @@ class TurnEngine:
             state,
             lambda seq: StepFrame(
                 seq=seq, tool_call_id=ACK_TOOL_CALL_ID, phase="finished", item=retired
+            ),
+        )
+
+    def _retract_step(self, state: _TurnState, tool_call_id: str) -> None:
+        """Withdraw a step from the snapshot AND from the feed a tab is already watching.
+
+        `drop_step` alone is only half of a withdrawal, and it is the half a LATE subscriber
+        sees: the catch-up snapshot is built from `state.steps`, so removing the entry is
+        enough for a client that had not subscribed yet. A client that was already connected
+        received the started frame and has no way to learn the step is over — it sits in that
+        turn's activity group as a step that never resolves, which is a group that never
+        seals. That is the acknowledgement's defect exactly, and this is the same answer:
+        re-emit the same id `finished` and hidden, which replaces the row in place and takes
+        it off the screen on a path both emitters already filter.
+
+        NOT USED BY THE EVICTION at the steps cap: an evicted step is a REAL step that ran and
+        whose row is authoritative — trimming the snapshot to bound memory must not tell a
+        watching tab that the work never happened."""
+        item = state.steps.get(tool_call_id)
+        state.drop_step(tool_call_id)
+        if item is None:
+            return
+        self._emit(
+            state,
+            lambda seq: StepFrame(
+                seq=seq,
+                tool_call_id=tool_call_id,
+                phase="finished",
+                item=item.model_copy(update={"hidden": True}),
             ),
         )
 

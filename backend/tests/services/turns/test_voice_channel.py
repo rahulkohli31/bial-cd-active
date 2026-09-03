@@ -30,7 +30,6 @@ import ast
 import json
 import pathlib
 import uuid
-from collections.abc import Sequence
 from typing import Final
 
 import pytest
@@ -52,13 +51,11 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RunUsage
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.v1.conversations.schemas import StepFrame, TextDeltaFrame
 from src.db.models.conversation import ChatKind
 from src.db.models.message import Message, MessageEntryKind
 from src.services.agent.conversation_tools import tell_the_user
 from src.services.messages.projection import (
     AssistantTextItem,
-    DisplayItem,
     StepItem,
     project_rows,
     update_from_args,
@@ -66,7 +63,7 @@ from src.services.messages.projection import (
 from src.services.messages.store import append_batch
 from src.services.turns.engine import TurnEngine, _TurnState
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
-from tests.transcript import rendered_text
+from tests.transcript import live_shape, reload_shape, rendered_text
 
 _APP_WORDS = "Adding the status picker next to your search box now."
 
@@ -123,33 +120,6 @@ def _called(tool: str, args: str, call_id: str) -> FunctionToolCallEvent:
     return FunctionToolCallEvent(
         part=ToolCallPart(tool_name=tool, args=args, tool_call_id=call_id)
     )
-
-
-def _live_shape(state: _TurnState) -> list[str]:
-    """The live feed reduced to what a reader would see happen, in order.
-
-    Text and steps only: this is the sequence a reload has to reproduce, and comparing shapes
-    rather than raw frames keeps the two comparable across the frame types only one side has
-    (workspace, compile, preview, and the working status that reasoning now raises)."""
-    shape: list[str] = []
-    for frame in state.ring:
-        if isinstance(frame, TextDeltaFrame):
-            text = frame.text.strip()
-            if text:
-                shape.append(f"text:{text}")
-        elif isinstance(frame, StepFrame) and frame.phase == "started":
-            shape.append(f"step:{frame.item.tool}")
-    return shape
-
-
-def _reload_shape(items: Sequence[DisplayItem]) -> list[str]:
-    shape: list[str] = []
-    for item in items:
-        if isinstance(item, AssistantTextItem):
-            shape.append(f"text:{item.text.strip()}")
-        elif isinstance(item, StepItem):
-            shape.append(f"step:{item.tool}")
-    return shape
 
 
 async def _thread(db: AsyncSession, email: str, kind: ChatKind):
@@ -265,7 +235,7 @@ def test_speaking_is_not_a_step_and_never_shows_its_wire_name(kind: ChatKind) ->
 
     engine._on_event(state, _spoke(_APP_WORDS))
 
-    assert _live_shape(state) == [f"text:{_APP_WORDS}"]
+    assert live_shape(state) == [f"text:{_APP_WORDS}"]
     assert state.steps == {}
     assert "tell_the_user" not in rendered_text(state)
 
@@ -361,7 +331,7 @@ async def test_live_order_and_reload_order_are_the_same_order(
         entry_kind=MessageEntryKind.TURN,
         kind=kind,
     )
-    reloaded = _reload_shape(project_rows(await _rows(db_session, user, conversation)))
+    reloaded = reload_shape(project_rows(await _rows(db_session, user, conversation)))
 
     expected = [
         "step:read_file",
@@ -369,7 +339,7 @@ async def test_live_order_and_reload_order_are_the_same_order(
         "step:read_file",
         f"text:{second}",
     ]
-    assert _live_shape(state) == expected
+    assert live_shape(state) == expected
     assert reloaded == expected
 
 
@@ -499,8 +469,8 @@ async def test_prose_and_a_spoken_line_in_one_response_both_land_in_the_order_wr
     items = project_rows(await _rows(db_session, user, conversation))
 
     expected = [f"text:{narration}", f"text:{_APP_WORDS}", "step:read_file"]
-    assert _live_shape(state) == expected
-    assert _reload_shape(items) == expected
+    assert live_shape(state) == expected
+    assert reload_shape(items) == expected
     assert state.text_blocks() == [narration, _APP_WORDS]
 
 
@@ -596,7 +566,7 @@ async def test_a_note_the_model_quotes_back_reaches_the_citizen_like_any_other_p
     )
     items = project_rows(await _rows(db_session, user, conversation))
 
-    assert _reload_shape(items) == [f"text:{quoted}", "step:read_file"]
+    assert reload_shape(items) == [f"text:{quoted}", "step:read_file"]
 
 
 async def test_the_live_emitter_shows_the_same_quoted_note_in_the_same_place() -> None:
@@ -617,7 +587,7 @@ async def test_the_live_emitter_shows_the_same_quoted_note_in_the_same_place() -
     engine._on_event(state, _called("read_file", '{"path": "app/page.tsx"}', "r1"))
     await engine._drain_long_operations(state)
 
-    assert _live_shape(state) == [f"text:{quoted}", "step:read_file"]
+    assert live_shape(state) == [f"text:{quoted}", "step:read_file"]
     assert state.text_blocks() == [quoted]
 
 
