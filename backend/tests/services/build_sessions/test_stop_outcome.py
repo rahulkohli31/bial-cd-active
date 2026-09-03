@@ -41,6 +41,7 @@ from structlog.testing import capture_logs
 
 from src.config import settings
 from src.db.models.user import User
+from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions.manager import (
     BuildSessionConflictError,
     SessionManager,
@@ -387,14 +388,31 @@ async def test_a_dropped_connection_mid_stop_loses_no_work_and_takes_no_containe
 
 
 async def test_two_racing_transfers_for_one_citizen_end_with_one_container(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Two tabs, one workspace, one stop.
 
     The hazard is the scope split: whoever asks is no longer whoever watches, so two asks could
     easily become two stops — a second `task.cancel()` landing inside a cleanup already under way,
     which is how a terminal frame gets eaten, and two teardowns of one container. One record per
-    project is what prevents it, and both callers are told the same true thing."""
+    project is what prevents it, and both callers are told the same true thing.
+
+    ★ THE RACE HAS TO BE MADE REAL, AND THE COUNT HAS TO BE OF TASKS. Two tabs are two requests,
+    and the only suspension point in the ask is the app-id read — but both asks here share one
+    connection, whose driver serialises them, so a bare `gather` runs the second ask only after
+    the first has finished and no interleave ever happens. `_existing_app_id` is therefore made
+    to yield first, which puts both asks past the ask's one await with neither having claimed the
+    project. And what is counted is `_stop_the_held_session` ENTRIES: `len(_stop_records)` counts
+    KEYS, and both tabs write the same key, so it reads `1` whether one stop was started or two
+    with the second silently replacing the first.
+
+    What makes one the answer is that nothing suspends between reading the record and writing it
+    — the check, the create and the store are one uninterrupted step — so the second tab cannot
+    resume in the gap. That is the property this test exists to hold, and the mutation that
+    breaks it is putting any await between them."""
     user, project_a = await _mk(db_session, "stop7@rvaiglobal.com")
     manager = SessionManager()
     client = _bundles_to(FakeSandboxClient(), "6" * 40)
@@ -405,13 +423,30 @@ async def test_two_racing_transfers_for_one_citizen_end_with_one_container(
     )
     await brain.stepped.wait()
 
+    real_app_id = manager_module._existing_app_id
+
+    async def _yields_before_answering(db, user_id, project_id):
+        await asyncio.sleep(0)  # both tabs are now inside the ask, neither has claimed it
+        return await real_app_id(db, user_id, project_id)
+
+    monkeypatch.setattr(manager_module, "_existing_app_id", _yields_before_answering)
+
+    stops_started: list[uuid.UUID] = []
+    real_stop = manager._stop_the_held_session
+
+    async def _counting_stop(user_id, app_id, **kwargs):
+        stops_started.append(app_id)
+        return await real_stop(user_id, app_id, **kwargs)
+
+    monkeypatch.setattr(manager, "_stop_the_held_session", _counting_stop)
+
     both = await asyncio.gather(
         manager.request_stop_of_active_work(db_session, user, project_a, sandbox_client=client),
         manager.request_stop_of_active_work(db_session, user, project_a, sandbox_client=client),
     )
 
     assert list(both) == [StopOutcome.STILL_RUNNING, StopOutcome.STILL_RUNNING]
-    assert len(manager._stop_records) == 1  # one stop, not one per tab
+    assert len(manager._stop_records) == 1  # one KEY…
     record = manager._stop_records[(user.id, project_a)]
 
     # A THIRD ask, sequentially, JOINS the same stop rather than starting another — the identity
@@ -426,8 +461,15 @@ async def test_two_racing_transfers_for_one_citizen_end_with_one_container(
     )
     assert manager._stop_records[(user.id, project_a)].task is record.task
 
+    # THE BARRIER FIRST, THEN THE COUNT — the rule this whole file runs on. A second stop task
+    # would be parked inside the same unwind, and asking about it before letting the brain go
+    # would leave this test hanging on its own failure instead of reporting it.
     brain.let_go.set()
     assert await asyncio.wait_for(record.task, timeout=10) is StopOutcome.STOPPED
+
+    # …and ONE STOP was ever started behind that one key. The second tab joined the first rather
+    # than firing a second cancel into a cleanup already under way.
+    assert stops_started == [record.app_id]
 
     # ONE container destroyed, and only the one that was provisioned.
     assert len(client.provisioned) == 1
