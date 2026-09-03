@@ -210,16 +210,15 @@ export default function ProjectDeleteDialog({
             className="mt-1.5 resize-y"
           />
           <div className="flex items-baseline justify-between mt-1">
-            {/* SAYS ONLY WHAT IS TRUE TODAY. This read "An administrator can see this",
-                and nothing reads `deleted_projects` — there is no route, no schema and no
-                screen. Every deletion collects a mandatory 5-50 word justification, so a
-                promise about who reads it is a promise to a user, not an internal TODO. The
-                read surface is tracked in #176; when it lands, the stronger sentence becomes
-                true again and this reverts. Until then the copy says what the platform
-                actually does, which is keep the reason with the record. */}
+            {/* SAYS WHO READS IT, and it is true again as of #176. This sentence was
+                softened to "Kept with the deletion record." for exactly as long as nothing
+                could retrieve one — a promise about who reads a person's words is a promise
+                to that person, not an internal TODO. The admin console's Deletions tab is
+                that reader now, so the stronger claim is restored. §13.2 asks for it:
+                someone writing what feels like a private note deserves to know it is not. */}
             <span className="text-[11px] text-neutral">
-              Between {MIN_DELETE_REASON_WORDS} and {MAX_DELETE_REASON_WORDS} words. Kept with
-              the deletion record.
+              Between {MIN_DELETE_REASON_WORDS} and {MAX_DELETE_REASON_WORDS} words. An
+              administrator can see this.
             </span>
             <span
               className={`text-[11px] tabular-nums ${

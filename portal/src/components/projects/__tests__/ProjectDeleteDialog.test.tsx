@@ -120,16 +120,17 @@ describe('ProjectDeleteDialog — confirm gating', () => {
     expect(screen.getByText(/are you sure you want to delete this project/i)).toBeTruthy()
   })
 
-  it('says what happens to the reason, and does not overpromise who reads it', async () => {
-    // It used to say "An administrator can see this." Nothing reads `deleted_projects` — no
-    // route, no schema, no screen — so that was a promise to a user rather than an internal
-    // TODO. The copy now states what the platform actually does; the read surface is tracked
-    // separately, and this test is what stops the old claim coming back before it lands.
+  it('says an administrator can read the reason — true again since #176', async () => {
+    // THIS ASSERTION WAS INVERTED FOR ONE RELEASE, on purpose. While nothing read
+    // `deleted_projects` the copy was softened to "Kept with the deletion record.", and this
+    // test asserted the stronger sentence was ABSENT — a tripwire stopping the claim
+    // returning before the screen did. The admin console's Deletions tab is that screen, so
+    // the promise is true and the assertion flips back. §13.2: someone writing what feels
+    // like a private note deserves to know it is not.
     h.listProjectConversations.mockResolvedValue([])
     render(<ProjectDeleteDialog project={project} onClose={() => {}} onConfirm={vi.fn()} />)
 
-    expect(screen.getByText(/kept with the deletion record/i)).toBeTruthy()
-    expect(screen.queryByText(/an administrator can see this/i)).toBeNull()
+    expect(screen.getByText(/an administrator can see this/i)).toBeTruthy()
   })
 
   it('arms at EXACTLY the bounds, and disarms one word outside either', async () => {

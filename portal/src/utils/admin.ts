@@ -250,3 +250,62 @@ export async function resetUserUsage(userId: string, deps: AuthFetchDeps = {}): 
   const body: unknown = await res.json()
   return body as { userId: string; usageToday: number }
 }
+
+
+// --- deleted projects (#176) ----------------------------------------------------
+
+/** One deletion, as the admin console reads it.
+ *
+ *  `deletedBy` and `deletedByName` are NOT interchangeable. The first is the account that
+ *  acted; the second is a readable label for it. Both are stamped server-side from the
+ *  session — the name was briefly client-supplied, which let a browser signed in as one
+ *  person file a deletion under another person's name — so they cannot disagree, but only
+ *  `deletedBy` is an identity. */
+export interface DeletedProjectRow {
+  id: string
+  projectId: string
+  projectName: string
+  ownerId: string
+  ownerEmail: string
+  deletedBy: string
+  deletedByName: string
+  deletedAt: string
+  remark: string
+  chatsDeleted: number
+  hadApp: boolean
+  hadDatabase: boolean
+}
+
+export interface DeletedProjectsPage {
+  deletions: DeletedProjectRow[]
+  nextCursor: string | null
+  hasMore: boolean
+}
+
+/**
+ * GET a keyset page of deletions, newest first, optionally filtered by `q` (project name,
+ * owner email, who deleted it, or the reason itself).
+ *
+ * KEYSET, unlike `/api/projects`, and the difference is deliberate rather than an
+ * inconsistency: that list needs a `total` for `Showing 1-8 of 12`, and this one does not.
+ * The table is append-only with a time-sortable key, so the cursor is just the last row's id.
+ */
+export async function fetchDeletedProjects(
+  { cursor, limit, q, signal }: { cursor?: string | null; limit?: number; q?: string; signal?: AbortSignal } = {},
+  deps: AuthFetchDeps = {},
+): Promise<DeletedProjectsPage> {
+  const params = new URLSearchParams()
+  if (cursor) params.set('cursor', cursor)
+  if (limit != null) params.set('limit', String(limit))
+  if (q) params.set('q', q)
+  const query = params.toString()
+  const res = await authFetch(`/api/admin/deleted-projects${query ? `?${query}` : ''}`, { signal }, deps)
+  if (!res.ok) throw await readApiError(res, 'Failed to load deletions')
+  const body: unknown = await res.json()
+  const data = body as Partial<DeletedProjectsPage>
+  return {
+    deletions: data.deletions || [],
+    nextCursor: data.nextCursor ?? null,
+    hasMore: data.hasMore ?? false,
+  }
+}

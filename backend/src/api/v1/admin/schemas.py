@@ -666,3 +666,56 @@ class HarnessCountersResponse(CamelModel):
 
     counters: list[HarnessCounterRow]
     since: datetime
+
+
+# --- deleted projects (`/admin/deleted-projects`) -------------------------------
+
+
+class DeletedProjectOut(CamelModel):
+    """One deletion, as an administrator reads it (#176).
+
+    Every field is a VALUE copied at the moment of deletion, not a join: the project row, its
+    app, its database and its chats are all gone by the time this row is written, so there is
+    nothing left to join to. That is why the tombstone stores rather than references.
+
+    `deletedBy` AND `deletedByName` ARE NOT THE SAME KIND OF FACT, and this screen is exactly
+    where the difference matters. `deletedBy` is the account that acted, taken from the
+    authenticated session and never from a request body. `deletedByName` is the readable label
+    for it — also stamped server-side, from `display_name` or the email when Entra gave us
+    none — so the two cannot disagree. It was briefly a client-supplied field, which meant a
+    browser signed in as one person could file a deletion under somebody else's name; that is
+    the question this row exists to answer, so it is now unspoofable by construction.
+
+    The three counts are what went with the project. They cannot be reconstructed once the
+    children are deleted, which is why they are captured at deletion time rather than derived.
+    """
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    project_name: str
+    owner_id: uuid.UUID
+    owner_email: str
+    deleted_by: uuid.UUID
+    deleted_by_name: str
+    deleted_at: datetime
+    remark: str
+    chats_deleted: int
+    had_app: bool
+    had_database: bool
+
+
+class DeletedProjectsResponse(CamelModel):
+    """A keyset page of deletions, newest first.
+
+    KEYSET, NOT THE OFFSET ENVELOPE the projects list uses — and the distinction is not
+    arbitrary. `/v1/projects` deviated to offset because §2 specifies `Showing 1-8 of 12` and
+    `Page 1 of 2`, neither of which is expressible without a `total`. Nothing here asks for
+    one, and the two reasons `pagination.py` prefers keyset both hold: the table is
+    APPEND-ONLY (no row is ever updated or deleted, so a page walk cannot skew) and the walk
+    is over a UUIDv7 primary key, so `ORDER BY id DESC` already IS newest-first and the cursor
+    is just the last row's id.
+    """
+
+    deletions: list[DeletedProjectOut]
+    next_cursor: str | None
+    has_more: bool

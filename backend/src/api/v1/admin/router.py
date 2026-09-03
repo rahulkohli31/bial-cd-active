@@ -59,6 +59,8 @@ from src.api.v1.admin.schemas import (
     DatabaseCredentialResponse,
     DatabaseReconcileCounts,
     DatabaseReconcileResponse,
+    DeletedProjectOut,
+    DeletedProjectsResponse,
     DeployCredentialResponse,
     DeployReconcileResponse,
     FeedbackItem,
@@ -105,6 +107,7 @@ from src.db.models.app_registry import (
 )
 from src.db.models.attachment import Attachment
 from src.db.models.audit import AuditLog
+from src.db.models.deleted_project import DeletedProject
 from src.db.models.feedback import Feedback
 from src.db.models.harness_counter import HarnessCount
 from src.db.models.project import Project
@@ -2324,4 +2327,104 @@ async def harness_counters(
             for name, total, occurrences, last_seen in rows
         ],
         since=since,
+    )
+
+
+@users_router.get(
+    "/deleted-projects",
+    responses=error_responses(
+        (422, ErrorEnvelope, "Invalid pagination cursor or over-long q"), *_ADMIN_AUTH
+    ),
+)
+async def list_deleted_projects(
+    admin: CurrentSuperadmin,
+    db: DbSession,
+    cursor: CursorQuery = None,
+    limit: LimitQuery = DEFAULT_PAGE_SIZE,
+    q: SearchQuery = None,
+) -> DeletedProjectsResponse:
+    """Deletions, newest first — the reader `deleted_projects` did not have (#176).
+
+    WITHOUT THIS THE TABLE IS WRITE-ONLY, and that is a promise broken rather than a feature
+    missing. #158 §13.2 makes a 5-50 word reason MANDATORY before a project can be deleted:
+    the confirm button will not arm without one. Collecting a justification from every citizen
+    that nobody can then retrieve is the shape `build_sessions/router.py` already names as a
+    defect — "no reader, no retention, no runbook" — and it must not be reproduced here.
+
+    KEYSET, and the contrast with `/v1/projects` is deliberate rather than inconsistent. That
+    list deviated to OFFSET because §2 specifies `Showing 1-8 of 12` and `Page 1 of 2`, neither
+    expressible without a `total`. Nothing on this screen asks for one, and both of
+    `pagination.py`'s reasons hold here where they did not there: the table is APPEND-ONLY, so
+    no row can move under a page walk, and its primary key is UUIDv7, so `ORDER BY id DESC` IS
+    newest-first and the cursor is simply the last row's id.
+
+    CROSS-OWNER, like every other route on this router. `list_apps` and `list_users` both read
+    across owners, and the question this surface answers — what has been deleted, and why — is
+    not answerable from one person's rows.
+
+    THE READ IS AUDITED, which is unusual and intended. Most reads are not, but a few are:
+    `db:reveal` and `harness:parked:list` are both audited reads, on the same reasoning —
+    seeing something privileged is itself an act worth recording. Reading the reason a citizen
+    gave for destroying their own work belongs in that category.
+    """
+    after = parse_cursor(cursor)
+    search = clean_search(q)
+    limit = clean_limit(limit)
+
+    query = sa.select(DeletedProject)
+    if search is not None:
+        # `autoescape` is not optional: without it a `%` or `_` in the query becomes a
+        # wildcard and the "search" silently matches far more than the admin typed.
+        query = query.where(
+            sa.or_(
+                DeletedProject.project_name.icontains(search, autoescape=True),
+                DeletedProject.owner_email.icontains(search, autoescape=True),
+                DeletedProject.deleted_by_name.icontains(search, autoescape=True),
+                DeletedProject.remark.icontains(search, autoescape=True),
+            )
+        )
+    if after is not None:
+        query = query.where(DeletedProject.id < after)
+
+    rows = (
+        (await db.execute(query.order_by(DeletedProject.id.desc()).limit(limit + 1)))
+        .scalars()
+        .all()
+    )
+    page, next_cursor, has_more = split_keyset(rows, limit, key=lambda row: row.id)
+
+    # A READ THAT WRITES, so it commits on its own — nothing else in this request will.
+    #
+    # The detail records the QUERY, never the rows. Logging what was returned would grow the
+    # audit table a second copy of the table it is auditing, and would put the citizen's own
+    # words in two places instead of one.
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="admin:deletions:list",
+        resource_type="deleted_project",
+        detail={"q": search, "count": len(page)},
+    )
+    await db.commit()
+
+    return DeletedProjectsResponse(
+        deletions=[
+            DeletedProjectOut(
+                id=row.id,
+                project_id=row.project_id,
+                project_name=row.project_name,
+                owner_id=row.owner_id,
+                owner_email=row.owner_email,
+                deleted_by=row.deleted_by,
+                deleted_by_name=row.deleted_by_name,
+                deleted_at=row.deleted_at,
+                remark=row.remark,
+                chats_deleted=row.chats_deleted,
+                had_app=row.had_app,
+                had_database=row.had_database,
+            )
+            for row in page
+        ],
+        next_cursor=next_cursor,
+        has_more=has_more,
     )

@@ -10,6 +10,25 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 > `1.7.0` section is added above them and tagged `v1.7.0`; the betas stay as the record of how it
 > got there. A version number marks a build, not a merge.
 
+## [1.7.0-beta.8] - 2026-09-03
+
+Administrators can read why a project was deleted. (#176)
+
+### Added
+
+- **A Deletions tab in the admin console.** Deleting a project has required a written reason
+  since the previous release — five to fifty words, and the Delete button stays dead without
+  one — but nothing could retrieve what people wrote. Every deletion now appears here, newest
+  first: the project, who deleted it, when, what went with it, and the reason in their own
+  words. Searchable by any of those, including the reason itself.
+
+### Changed
+
+- **The delete dialog says an administrator can see the reason again.** It was softened to
+  "Kept with the deletion record." for exactly as long as that was the honest thing to say.
+  Someone writing what feels like a private note deserves to know it is not, and now that
+  there is somewhere to read it, the dialog says so.
+
 ## [1.7.0-beta.7] - 2026-09-03
 
 The project list becomes the landing screen: three numbers, two views, and a delete that asks
