@@ -19,6 +19,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
 import type { Project } from '../../../utils/projectApi'
+import { ApiError } from '../../../utils/apiError'
 
 const api = vi.hoisted(() => ({
   relaunchPreview: vi.fn(),
@@ -76,7 +77,7 @@ function Where() {
   return <span data-testid="where">{loc.pathname + loc.search}</span>
 }
 
-function Workspace() {
+function Workspace({ project = PROJECT }: { project?: Project } = {}) {
   return (
     <MemoryRouter initialEntries={['/projects/pB']}>
       <Where />
@@ -84,7 +85,7 @@ function Workspace() {
         <Route element={<WorkspaceShell />}>
           <Route
             path="/projects/:projectId"
-            element={<ProjectWorkspace project={PROJECT} onProjectUpdate={() => {}} />}
+            element={<ProjectWorkspace project={project} onProjectUpdate={() => {}} />}
           />
           <Route path="/chat/:chatId" element={<div data-testid="chat-opened" />} />
         </Route>
@@ -170,6 +171,72 @@ describe('the question arrives BEFORE anything moves', () => {
 
     await screen.findByRole('dialog')
     expect(screen.queryByTestId('reclaim-agent-working')).toBeNull()
+  })
+})
+
+describe('a project with nothing built yet — the first message anybody sends', () => {
+  /** What the server answers when there is no saved build to bring back: the snapshot gate, 404,
+   *  and deliberately no blank-template arm. */
+  const nothingToRelaunch = () =>
+    new ApiError('No saved build to relaunch. Build the app first.', 404)
+
+  const NEVER_BUILT: Project = { ...PROJECT, appId: null, hasRelaunchableSnapshot: false }
+
+  beforeEach(() => {
+    api.fetchPreviewState.mockResolvedValue({
+      state: 'asleep', alive: false, previewUrl: null, occupyingProjectName: null,
+      occupyingProjectId: null, restorable: false,
+    })
+  })
+
+  it('★ opens the chat anyway — nothing to bring back is not a failed send', async () => {
+    // THE ONBOARDING PATH, AND THE ONE THIS PREFLIGHT BROKE. A citizen creates a project,
+    // describes their app in the rail and presses Send. There is no snapshot, so asking for the
+    // workspace answers 404 — and treating that as a failure left them reading "That message did
+    // not send" with no chat, on every attempt. The container this project needs is provisioned
+    // by the turn itself, once the chat is open.
+    api.relaunchPreview.mockRejectedValue(nothingToRelaunch())
+    render(<Workspace project={NEVER_BUILT} />)
+    type('an app to log visitors at the gate')
+
+    fireEvent.click(send())
+
+    await waitFor(() => expect(screen.getByTestId('chat-opened')).toBeTruthy())
+    expect(where()).toMatch(/^\/chat\/[0-9a-f-]+\?projectId=pB&kind=build$/)
+    // …and nothing told them their message was lost. Paired with the assertion above, so an
+    // absent alert cannot pass by the screen having failed to render at all.
+    expect(screen.queryAllByRole('alert')).toHaveLength(0)
+  })
+
+  it('★ still asks the one-workspace question first, even with nothing built', async () => {
+    // Issue #161's own reproduction is a submit in a project that has never been built, so the
+    // 404 mapping must not become a way past the gate: the server refuses a held workspace ABOVE
+    // its snapshot gate, and that refusal still stops the address changing.
+    api.relaunchPreview.mockRejectedValue(heldBy())
+    render(<Workspace project={NEVER_BUILT} />)
+    type('an app to log visitors at the gate')
+
+    fireEvent.click(send())
+
+    expect(await screen.findByRole('dialog')).toBeTruthy()
+    expect(where()).toBe('/projects/pB')
+    expect(screen.queryByTestId('chat-opened')).toBeNull()
+  })
+
+  it('a genuine failure to start is still reported, and opens nothing', async () => {
+    // The mapping is narrow on purpose: a 503 is "we could not do it", not "there was nothing to
+    // do", and it must not open a chat onto a workspace that never came up.
+    api.relaunchPreview.mockRejectedValue(
+      new ApiError('The sandbox or build coordination is temporarily unavailable', 503),
+    )
+    render(<Workspace project={NEVER_BUILT} />)
+    type('an app to log visitors at the gate')
+
+    fireEvent.click(send())
+
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/did not send/i))
+    expect(screen.queryByTestId('chat-opened')).toBeNull()
+    expect(where()).toBe('/projects/pB')
   })
 })
 
