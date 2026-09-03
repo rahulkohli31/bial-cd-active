@@ -13,9 +13,10 @@
  * that a state with nothing to do gets no button rather than a dead one.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/react'
 import type { ApprovalState, DeploymentView, PublishState } from '../../../utils/deployApi'
 import type { UsePublishState } from '../../../hooks/usePublishState'
+import { WorkspaceChannelProvider, createWorkspaceChannel } from '../workspaceChannel'
 
 const h = vi.hoisted(() => ({ usePublishState: vi.fn() }))
 vi.mock('../../../hooks/usePublishState', () => ({ usePublishState: h.usePublishState }))
@@ -338,5 +339,31 @@ describe('the unsaved-work question', () => {
     expect(screen.getByTestId('status-unsaved').textContent).toMatch(/not saved yet/i)
     fireEvent.click(screen.getByTestId('status-save-and-publish'))
     await waitFor(() => expect(saveAndPublish).toHaveBeenCalledTimes(1))
+  })
+
+  it('★ retires the question when the details are hidden, rather than leaving it pending unseen', () => {
+    // Hide details keeps this panel MOUNTED and merely invisible, and the question is per-mount
+    // state the chip's own hook instance knows nothing about — so the question and its live
+    // button sat behind a rail nobody could see while the chip beside the project name offered
+    // "Send for review" as though nothing were outstanding.
+    const dismissUnsaved = vi.fn()
+    const channel = createWorkspaceChannel()
+    wire({
+      deployment: view('draft'),
+      unsaved: 'Your workspace has changes that are not saved yet.',
+      dismissUnsaved,
+    })
+    render(
+      <WorkspaceChannelProvider value={channel}>
+        <AppStatusPanel projectId="p1" label={<h2>APP STATUS</h2>} />
+      </WorkspaceChannelProvider>,
+    )
+
+    // Open, the question stands and nothing is retired.
+    expect(screen.getByTestId('status-unsaved')).toBeTruthy()
+    expect(dismissUnsaved).not.toHaveBeenCalled()
+
+    act(() => channel.rail.set({ mode: 'details', stacked: false, collapsed: true }))
+    expect(dismissUnsaved).toHaveBeenCalledTimes(1)
   })
 })
