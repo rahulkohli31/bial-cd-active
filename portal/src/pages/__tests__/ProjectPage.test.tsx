@@ -24,8 +24,11 @@
  *
  * ═══ WHAT THIS SUITE CAN AND CANNOT SEE ═══
  *
- * It renders the page WITHOUT the workspace shell, so there is no pane host and no iframe in the
- * tree at all. That is deliberate: the pane's own behaviour — its identity across a navigation, the
+ * It renders the page WITHOUT the workspace shell, so there is no pane host, no iframe and — since
+ * plan 002's U2 — no TOOLBAR ROW in the tree at all. The project's name, its status chip, its back
+ * control and its rename control are all drawn by the shell above the Outlet now, which is why the
+ * load barrier in every test below is the rail's own status section rather than the project's
+ * heading. Those four things are covered by `WorkspaceToolbar.test.tsx`, where they live. That is deliberate: the pane's own behaviour — its identity across a navigation, the
  * stacked crossing, the framed URL — belongs to `ProjectWorkspace.test.tsx`, which renders through
  * the real shell, because a test that mounts this page alone cannot see any of it. What THIS file
  * owns is the page: its data, its beacon, its rail's contents, and the affordances that must and
@@ -177,7 +180,7 @@ describe('ProjectPage — the composer is unconditional', () => {
     h.getProject.mockResolvedValue(makeProject({ appId: null, appStatus: null }))
     renderProjectPage()
 
-    expect(await screen.findByRole('heading', { name: 'VIP Movement' })).toBeTruthy()
+    expect(await screen.findByTestId('rail-app-status')).toBeTruthy()
     // The composer is present whether or not the project has an app — the exact regression that
     // caused the reverted app-first fold. (F6: no idea-starter cards inside a dedicated project.)
     expect(screen.getByPlaceholderText(/Describe the app you want built/i)).toBeTruthy()
@@ -195,7 +198,7 @@ describe('ProjectPage — the composer is unconditional', () => {
     ])
     renderProjectPage()
 
-    await screen.findByRole('heading', { name: 'VIP Movement' })
+    await screen.findByTestId('rail-app-status')
     // NOT collapsed under an app card — this is the reverted regression the fold must avoid.
     expect(screen.getByPlaceholderText(/Describe the app you want built/i)).toBeTruthy()
     // INERTNESS GUARDS, kept through the inversion rather than deleted with it. What Phase-1
@@ -216,7 +219,7 @@ describe('ProjectPage — the app arrives behind one deliberate press (R3, AE1, 
     h.fetchPreviewState.mockResolvedValue(preview({ state: 'asleep', restorable: true }))
     renderProjectPage()
 
-    await screen.findByRole('heading', { name: 'VIP Movement' })
+    await screen.findByTestId('rail-app-status')
     // R-16's exact sentence, and no negation of it anywhere on the screen.
     await waitFor(() => expect(screen.getAllByText('Your app is saved.').length).toBeGreaterThan(0))
     expect(document.body.textContent).not.toMatch(/not running/i)
@@ -228,7 +231,7 @@ describe('ProjectPage — the app arrives behind one deliberate press (R3, AE1, 
     h.fetchPreviewState.mockResolvedValue(preview({ state: 'never_built', restorable: false }))
     renderProjectPage()
 
-    await screen.findByRole('heading', { name: 'VIP Movement' })
+    await screen.findByTestId('rail-app-status')
     await waitFor(() => expect(h.fetchPreviewState).toHaveBeenCalled())
     expect(screen.queryByRole('button', { name: /launch application/i })).toBeNull()
   })
@@ -242,7 +245,7 @@ describe('ProjectPage — the app arrives behind one deliberate press (R3, AE1, 
     h.fetchPreviewState.mockResolvedValue(preview({ state: 'asleep', restorable: true }))
     renderProjectPage()
 
-    await screen.findByRole('heading', { name: 'VIP Movement' })
+    await screen.findByTestId('rail-app-status')
     await waitFor(() => expect(h.fetchPreviewState).toHaveBeenCalledWith('p1'))
     expect(h.relaunchPreview).not.toHaveBeenCalled()
   })
@@ -254,7 +257,7 @@ describe('ProjectPage — the app arrives behind one deliberate press (R3, AE1, 
     h.fetchPreviewState.mockResolvedValue(preview({ state: 'asleep', restorable: true }))
     renderProjectPage()
 
-    await screen.findByRole('heading', { name: 'VIP Movement' })
+    await screen.findByTestId('rail-app-status')
     await waitFor(() => expect(h.fetchPreviewState).toHaveBeenCalled())
     expect(h.fetchSaveState).not.toHaveBeenCalled()
     expect(screen.queryByTestId('rail-save-state')).toBeNull()
@@ -266,7 +269,7 @@ describe('ProjectPage — the app arrives behind one deliberate press (R3, AE1, 
     h.fetchSaveState.mockResolvedValue({ appId: 'a1', dirty: true, containerHead: 'deadbeefcafe', savedHead: 'abc1234def' })
     renderProjectPage()
 
-    await screen.findByRole('heading', { name: 'VIP Movement' })
+    await screen.findByTestId('rail-app-status')
     const saved = await screen.findByTestId('rail-save-state')
     expect(saved.textContent).toMatch(/not saved yet/i)
     // The short commit, not the full sha.
@@ -289,7 +292,7 @@ describe('ProjectPage — the app arrives behind one deliberate press (R3, AE1, 
     h.getProject.mockResolvedValue(makeProject({ appId: 'app-123', appStatus: 'approved' }))
     renderProjectPage()
 
-    await screen.findByRole('heading', { name: 'VIP Movement' })
+    await screen.findByTestId('rail-app-status')
     expect(screen.queryByRole('link', { name: /open app/i })).toBeNull()
     expect(screen.queryByRole('button', { name: /continue building/i })).toBeNull()
   })
@@ -300,7 +303,7 @@ describe('ProjectPage — the description rail (R3, U7 pop-up editor)', () => {
     h.getProject.mockResolvedValue(makeProject())
     renderProjectPage()
 
-    await screen.findByRole('heading', { name: 'VIP Movement' })
+    await screen.findByTestId('rail-app-status')
     const rail = screen.getByTestId('description-rail')
     expect(within(rail).getByRole('button', { name: /edit/i })).toBeTruthy()
     expect(within(rail).queryByRole('button', { name: /attach|upload/i })).toBeNull()
@@ -312,7 +315,7 @@ describe('ProjectPage — the description rail (R3, U7 pop-up editor)', () => {
     h.getProject.mockResolvedValue(makeProject())
     renderProjectPage()
 
-    await screen.findByRole('heading', { name: 'VIP Movement' })
+    await screen.findByTestId('rail-app-status')
     const rail = screen.getByTestId('description-rail')
     fireEvent.click(within(rail).getByRole('button', { name: /edit/i }))
 
@@ -323,57 +326,22 @@ describe('ProjectPage — the description rail (R3, U7 pop-up editor)', () => {
   })
 })
 
-describe('ProjectPage — publishing is one chip beside the name (R37)', () => {
-  it('puts the chip beside the project name and nothing about publishing in the rail', async () => {
+/* THE CHIP IS NOT ON THIS PAGE ANY MORE (plan 002, U2), so its three scenarios moved with it to
+   `WorkspaceToolbar.test.tsx`: that it names the project, that a project with nothing built still
+   gets one rather than an absence, and that it neither moves nor remounts. What SURVIVES here is
+   the half this page can still answer for — that the rail says nothing about publishing — because
+   the rail is what this file renders. */
+describe('ProjectPage — publishing is not in the rail (R37)', () => {
+  it('keeps every word about publishing out of the description section', async () => {
     h.getProject.mockResolvedValue(makeProject({ appId: 'a1' }))
     renderProjectPage()
 
-    await screen.findByRole('heading', { name: 'VIP Movement' })
-    expect(screen.getByTestId('publish-chip-stub').getAttribute('data-project')).toBe('p1')
-
-    // Scoped to the rail's own test id, so the absence is about the rail rather than
-    // about the whole page — the chip itself is a publish affordance and it is elsewhere.
+    await screen.findByTestId('rail-app-status')
     const rail = screen.getByTestId('description-rail')
     expect(within(rail).queryByTestId('publish-chip-stub')).toBeNull()
     expect(within(rail).getByRole('button', { name: /edit/i })).toBeTruthy()
     expect(rail.textContent).not.toMatch(/publish/i)
     expect(rail.textContent).not.toMatch(/review/i)
-  })
-
-  it('shows the chip for a project with nothing built, rather than showing nothing', async () => {
-    // "Nothing built yet" is a state the chip NAMES. A citizen should learn it from the
-    // same place they learn everything else about their app, not from an absence — which
-    // is why the mount is not gated on `appId` the way the two retired cards were.
-    // Mutation receipt: put `project.appId &&` back in front of the chip and this goes red.
-    h.getProject.mockResolvedValue(makeProject({ appId: null }))
-    renderProjectPage()
-
-    await screen.findByRole('heading', { name: 'VIP Movement' })
-    expect(screen.getByTestId('publish-chip-stub')).toBeTruthy()
-  })
-
-  it('does not move the chip, or unmount it, when an inline rename starts', async () => {
-    // Both header branches are the same `flex items-center gap-2` row with the chip as the
-    // second child, so the rename swap does not shift it. `getByTestId` throws on a
-    // duplicate, which is what rules out the other failure — a second mount in the rename
-    // branch rather than a moved one.
-    h.getProject.mockResolvedValue(makeProject({ appId: 'a1' }))
-    renderProjectPage()
-
-    await screen.findByRole('heading', { name: 'VIP Movement' })
-    const before = screen.getByTestId('publish-chip-stub')
-    const nameBefore = before.previousElementSibling?.tagName
-
-    fireEvent.click(screen.getByRole('button', { name: /rename project/i }))
-
-    const after = screen.getByTestId('publish-chip-stub')
-    expect(after).toBeTruthy()
-    expect(screen.getByRole('textbox', { name: /project name/i })).toBeTruthy()
-    // Still the second child of the row, with the name element before it and the action
-    // buttons after it — in both branches.
-    expect(nameBefore).toBe('H1')
-    expect(after.previousElementSibling?.tagName).toBe('INPUT')
-    expect(after.nextElementSibling?.tagName).toBe('BUTTON')
   })
 })
 
@@ -389,7 +357,7 @@ describe('ProjectPage — an outlet child that owns its own scroller (Plan A, U3
   it('declares its own scroller and brings no page frame of its own', async () => {
     h.getProject.mockResolvedValue(makeProject())
     const { container } = renderProjectPage()
-    await screen.findByRole('heading', { name: 'VIP Movement' })
+    await screen.findByTestId('rail-app-status')
 
     const main = container.querySelector('main') as HTMLElement
     expect(main).toBeTruthy()
@@ -411,7 +379,7 @@ describe('ProjectPage — an outlet child that owns its own scroller (Plan A, U3
     // fails on the first navigation to a chat.
     h.getProject.mockResolvedValue(makeProject())
     const { container } = renderProjectPage()
-    await screen.findByRole('heading', { name: 'VIP Movement' })
+    await screen.findByTestId('rail-app-status')
 
     // No grid template, and no second iframe host — the pane is the SHELL's sibling of the Outlet.
     expect(container.innerHTML).not.toMatch(/grid-cols-/)
@@ -552,29 +520,18 @@ describe('ProjectPage — conversations as a plain recents list (U3)', () => {
     h.listProjectConversations.mockResolvedValue([])
     renderProjectPage()
 
-    await screen.findByRole('heading', { name: 'VIP Movement' })
+    await screen.findByTestId('rail-app-status')
     expect(screen.getByText('No conversations yet — start a build or plan above.')).toBeTruthy()
   })
 })
 
 describe('ProjectPage — identity + guard rails carried over', () => {
-  it('blocks renaming to "" and to "   " before any request fires', async () => {
-    h.getProject.mockResolvedValue(makeProject({ name: 'VIP Movement' }))
-    renderProjectPage()
-
-    fireEvent.click(await screen.findByRole('button', { name: /rename project/i }))
-    const input = screen.getByRole('textbox', { name: /project name/i })
-
-    fireEvent.change(input, { target: { value: '' } })
-    fireEvent.click(screen.getByRole('button', { name: /save name/i }))
-    expect(h.patchProject).not.toHaveBeenCalled()
-
-    fireEvent.change(input, { target: { value: '   ' } })
-    fireEvent.click(screen.getByRole('button', { name: /save name/i }))
-    expect(h.patchProject).not.toHaveBeenCalled()
-
-    expect(screen.getByRole('alert').textContent).toMatch(/cannot be empty/i)
-  })
+  /* THE RENAME GUARDS MOVED WITH THE CONTROL (plan 002, U2). The pencil is in the shell's
+     toolbar row and the editor is a dialog `ProjectWorkspace` owns, so a render of this page
+     alone can no longer reach either. Both halves are pinned where they now live:
+     `ProjectRenameDialog.test.tsx` keeps the empty-and-whitespace guard, and
+     `WorkspaceToolbar.test.tsx` keeps the press that opens it. Named here rather than deleted
+     silently, because "the tests went with the markup" is how a guard disappears. */
 
   it('redirects to /projects when the project 404s (deleted elsewhere)', async () => {
     h.getProject.mockRejectedValue(new ApiError('Project not found.', 404))
@@ -610,7 +567,7 @@ describe('ProjectPage — the project-open mark (U4; R104, R105)', () => {
     h.getProject.mockResolvedValue(makeProject({ id: 'p-strict', appId: 'a1' }))
     renderTwiceOver('p-strict')
 
-    await screen.findByRole('heading', { name: 'VIP Movement' })
+    await screen.findByTestId('rail-app-status')
     await waitFor(() => expect(beacons()).toEqual([{ name: 'project_opened' }]))
   })
 
@@ -623,12 +580,12 @@ describe('ProjectPage — the project-open mark (U4; R104, R105)', () => {
     // Mutation check: remove the once-per-project-id guard and this goes red.
     h.getProject.mockResolvedValue(makeProject({ id: 'p-return', appId: 'a1' }))
     renderProjectPage('p-return')
-    await screen.findByRole('heading', { name: 'VIP Movement' })
+    await screen.findByTestId('rail-app-status')
     await waitFor(() => expect(beacons()).toEqual([{ name: 'project_opened' }]))
 
     cleanup()
     renderProjectPage('p-return')
-    await screen.findByRole('heading', { name: 'VIP Movement' })
+    await screen.findByTestId('rail-app-status')
 
     expect(beacons()).toEqual([{ name: 'project_opened' }])
   })
@@ -640,7 +597,7 @@ describe('ProjectPage — the project-open mark (U4; R104, R105)', () => {
     h.getProject.mockResolvedValue(makeProject({ id: 'p-noapp', appId: null }))
     renderProjectPage('p-noapp')
 
-    await screen.findByRole('heading', { name: 'VIP Movement' })
+    await screen.findByTestId('rail-app-status')
     await waitFor(() => expect(beacons()).toEqual([{ name: 'project_opened' }]))
 
     const { markAppVisible } = await import('../../utils/observe')

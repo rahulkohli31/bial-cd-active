@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo, type FC } from 'react'
 import { useNavigate, useLocation, useParams } from 'react-router-dom'
-import PublishStatusChip from '../PublishStatusChip'
 import Announcer, { useActivityAnnouncement } from './Announcer'
 import ChatThread from './ChatThread'
 import Composer, { SendRefusal, type ComposerSubmission } from './Composer'
@@ -8,7 +7,6 @@ import type { BuildHandoff } from './OfferStrip'
 import ScrollToLatest from './ScrollToLatest'
 import SessionBanners from './SessionBanners'
 import TurnBanner from './TurnBanner'
-import ProjectBreadcrumb from '../projects/ProjectBreadcrumb'
 import { listProjectConversations } from '../../utils/conversationApi'
 import type { ConversationHeader } from '../../utils/conversationApi'
 import { ApiError } from '../../utils/apiError'
@@ -22,6 +20,7 @@ import {
   usePublishAddress,
   usePublishPaneView,
   usePublishReclaim,
+  usePublishSave,
   usePublishSaveState,
   usePublishWorkspaceReport,
   useWorkspaceProject,
@@ -171,6 +170,18 @@ export interface ConversationSurfaceProps {
   chatId?: string
   projectId?: string | null
   projectName?: string | null
+  /**
+   * THE TITLE THIS SURFACE DERIVES, HANDED BACK UP (plan 002, U2).
+   *
+   * A chat's title is derived here, from its first message, at the moment the row is created — and
+   * the route that publishes the toolbar row's heading learns it from a GET that already ran and
+   * 404'd. Without this the row would say "New build chat" until a reload, while the board draws
+   * the real title the instant the first message is sent.
+   *
+   * A CALLBACK RATHER THAN A SECOND PUBLISHER, so the heading keeps one author. This surface
+   * informs; the route decides.
+   */
+  onTitleDerived?: (title: string) => void
   /** Which kind of conversation this is. Read for ONE thing: whether the app pane is seen. */
   kind?: ChatKind
   projectHasSavedBuild?: boolean | null
@@ -375,7 +386,7 @@ function putStep(sink: TurnSink, toolCallId: string, step: StepItem): void {
   else sink.parts[at] = { kind: 'step', toolCallId, step }
 }
 
-export default function ConversationSurface({ chatId: chatIdProp, kind = 'build', projectId = null, projectName = null, projectHasSavedBuild = null, buildSessionDeps }: ConversationSurfaceProps = {}) {
+export default function ConversationSurface({ chatId: chatIdProp, kind = 'build', projectId = null, projectName = null, projectHasSavedBuild = null, onTitleDerived, buildSessionDeps }: ConversationSurfaceProps = {}) {
   // R11/R12 — THE ONE THING THE KIND DECIDES ON THIS SURFACE. A Plan chat shows no app pane; a
   // Build chat shows it. `build` is the default because fifteen existing suites mount this surface
   // with no kind at all and every one of them is about the build surface — defaulting to `plan`
@@ -793,6 +804,13 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // about the unsaved work. The TRI-STATE is carried, never collapsed — `null` means "could not
   // check", and the shell arms on a definite `true` alone.
   usePublishSaveState(saveDirty)
+  // THE SAVE CONTROL ITSELF LIVES IN THE TOOLBAR ROW NOW (plan 002, U2), so its three values and
+  // its action go up the channel rather than into the pane's view. Two cells rather than one, and
+  // the split is deliberate: the values are compared and drive a render, the action is read at
+  // press time and drives none. `usePublishSaveState` above is unchanged and still separate — it
+  // is the tri-state the shell's unload warning arms on, and it is KEPT across an unmount, while
+  // these two are cleared with their publisher.
+  usePublishSave({ dirty: saveDirty, saving, error: saveError }, { save: handleSave, rename: null })
 
   // A genuine unmount must cancel the in-flight turn-stream reader — a chat switch already
   // aborts it before resubscribing, but nothing did on unmount, leaking the reader (and its
@@ -1425,16 +1443,22 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     // The server now creates the row inside the turn's own transaction, AFTER every side-effect-free
     // refusal and with a flush rather than a commit — so a refusal rolls it back. The whole change
     // on this side is that one round trip is gone and its arguments moved onto the next one.
+    const derivedTitle = userSeq === 0 && projectId ? deriveTitle(partsToText(parts)) : null
     const parentage =
       userSeq === 0 && projectId
         ? {
             projectId,
             kind,
-            title: deriveTitle(partsToText(parts)),
+            title: derivedTitle ?? '',
             // `context` is whatever this surface was seeded with; it travels unchanged.
             context: contextRef.current,
           }
         : undefined
+    // OPTIMISTIC, AND DELIBERATELY SO. The row is created inside the turn's own transaction and a
+    // refusal rolls it back, so this can name a chat that never came to exist. That is the right
+    // trade for a heading: the board draws the title the moment the message is sent, and a chat
+    // whose creation was refused is one the citizen is being told about in the same breath.
+    if (derivedTitle) onTitleDerived?.(derivedTitle)
     dropTransientQuery(activeId)
     refreshBuilds()
 
@@ -2615,27 +2639,12 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       : null,
   )
   usePublishPaneView({
-    /* Publish, right where the build just finished. Only once the route resolved a project — a
-       chat with no project behind it has nothing to publish.
-       THE SAME COMPONENT the project page mounts beside the name, not a second control that
-       could word the same state differently. This page and that one are sibling routes under
-       one Outlet, so the two mount sites are never live at once — the chip owns its own read
-       either way, which is what makes a second site correct rather than merely tolerated.
-       Its popover is portalled, and here that is load-bearing rather than inherited: four
-       nested `overflow-hidden` ancestors sit between this toolbar and the document, so
-       anything anchored here without a portal disappears rather than overflows. Plan F
-       retires this mount when it merges the two screens. */
-    toolbarTrailing: projectId ? <PublishStatusChip projectId={projectId} /> : null,
-    // NO LEADING CONTROL ANY MORE. This used to be the chat-panel toggle — a SECOND collapse for
-    // the column `WorkspaceShell` already collapses (`usePublishRail` / `railWidthClass`), with a
-    // control drawn by `AppPane` because that is the part of the pane that always renders, even
-    // when this surface's own `LivePreview` mount does not exist yet (a Plan chat, a project with
-    // nothing built) or has gone away (a stopped app). Two independent booleans hiding the same
-    // rail is exactly what R13's "ONE control that collapses it entirely" forbids, and the second
-    // one was unreachable in precisely the states where a way back mattered most. See
-    // `ProjectWorkspace.test.tsx`'s "the collapse control" suite for where that property is pinned
-    // now, and `AppPane.tsx`'s own docblock for the fuller account of why its home moved there.
-    toolbarLeading: null,
+    /* NO TOOLBAR SLOTS TO FILL ANY MORE (plan 002, U2). This published the publish chip into a
+       row `LivePreview` drew inside the pane, with a note saying "Plan F retires this mount when
+       it merges the two screens". It is retired here instead, and by a different move than that
+       note expected: the chip is not re-homed on another surface, it is drawn by the shell's own
+       toolbar row beside the chat title, from the same computed state, so there is one mount for
+       both screens rather than two that happen never to be live at once. */
     iterating: showSession && session.iterating,
     onRelaunch: handleRelaunch,
     relaunching: sessionProjectMatches && session.relaunching,
@@ -2644,10 +2653,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     restoredFromFailedBuild: relaunchedUrl != null && session.relaunchedFromFailedBuild,
     completedLive,
     hasSavedBuild,
-    saveDirty,
-    onSave: handleSave,
-    saving,
-    saveError,
     previewState: previewState?.state ?? null,
     occupyingProjectName: previewState?.occupyingProjectName ?? null,
     reconnecting: (turnNarrativeIsThisChat && turnPreview.state === 'reconnecting') || (showSession && session.reconnecting),
@@ -2810,11 +2815,11 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
         data-testid="chat-panel"
         className="flex flex-col bg-white border-r border-bial-border flex-shrink-0 overflow-hidden w-72 xl:w-80"
       >
-        {/* Back-navigation and the project name, and nothing else (F7/F10). Past conversations
-            live on the project page the breadcrumb links to. */}
-        <div className="p-4 border-b border-bial-border">
-          <ProjectBreadcrumb projectId={projectId} projectName={projectName} />
-        </div>
+        {/* THE BORDERED HEADER IS SURRENDERED TO THE TOOLBAR ROW (plan 002, U2). It held one
+            breadcrumb link back to the project and nothing else — the only thing in the product
+            that named where a chat belonged, and it named neither the chat nor its kind. The row
+            above both columns draws all three now: project, kind pill, chat title. `projectName`
+            is still a prop because the reclaim dialog names the project being started with it. */}
 
         {/* ONE SCROLL CONTAINER, and it is the thread's own viewport — not this wrapper, which
             only gives the thread a box to fill. `min-h-0` is what lets it shrink inside the column

@@ -58,13 +58,11 @@ const APP_URL = 'https://app-a.example.azurecontainerapps.io/'
 const OTHER_APP_URL = 'https://app-b.example.azurecontainerapps.io/'
 
 const EMPTY_PANE: PaneView = {
-  toolbarLeading: null, toolbarTrailing: null,
   iterating: false, reconnecting: false,
   relaunching: false, relaunchError: null, lastBuildFailed: false,
   restoredFromFailedBuild: false, completedLive: false, hasSavedBuild: null,
   previewState: null, occupyingProjectName: null, turnRunning: false,
   compileState: null, workspaceLost: false,
-  saveDirty: null, saving: false, saveError: null,
 }
 
 /** A conversation surface: declares its project, publishes an address, asks to be seen. */

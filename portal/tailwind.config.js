@@ -110,6 +110,7 @@ export default {
           rule: '#D8E0E8',         // the app card's border, a shade darker than a hairline
           track: '#F7F9FB',        // the resize handle's track
           grip: '#DCE3EA',         // the resize handle's grip border
+          savedirty: '#F5FCFC',    // the pale teal ground behind an unsaved Save control
         },
         /**
          * The nine status states of `StatusCardStates`, as text / ground / dot triples. Six

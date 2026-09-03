@@ -44,7 +44,7 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { ArrowLeft } from 'lucide-react'
 import ProjectWorkspace from '../components/workspace/ProjectWorkspace'
 import type { ChatSummary } from '../utils/conversationApi'
-import { useWorkspaceProject } from '../components/workspace/workspaceChannel'
+import { usePublishHeading, useWorkspaceProject } from '../components/workspace/workspaceChannel'
 import { getProject } from '../utils/projectApi'
 import type { Project } from '../utils/projectApi'
 import { ApiError, isRecord } from '../utils/apiError'
@@ -82,6 +82,18 @@ export default function ProjectPage() {
 
   const [chats, setChats] = useState<ChatSummary[]>([])
   const [chatsError, setChatsError] = useState<string | null>(null)
+
+  // WHAT THE TOOLBAR ROW NAMES, PUBLISHED FROM THE ROUTE (plan 002, U2) — above the early returns
+  // below, for the same reason the project declaration is above them. The loading and load-error
+  // branches are still this project's screen, and the row draws its back control and holds its own
+  // height on both, rather than appearing once the fetch lands. `chatTitle`/`chatKind` are `null`
+  // here and that IS the signal: a heading with no kind is a project screen.
+  usePublishHeading({
+    projectId: projectId ?? null,
+    projectName: project?.name ?? null,
+    chatTitle: null,
+    chatKind: null,
+  })
 
   const goToProjects = useCallback(() => navigate('/projects', { replace: true }), [navigate])
   const openChat = useCallback((chatId: string) => navigate(`/chat/${chatId}`), [navigate])
@@ -191,7 +203,6 @@ export default function ProjectPage() {
       chats={chats}
       chatsError={chatsError}
       onProjectUpdate={setProject}
-      onBack={goToProjects}
       onOpenChat={openChat}
       onDeleteChat={handleDeleteChat}
     />

@@ -77,13 +77,11 @@ const preview = (over: Record<string, unknown> = {}) => ({
 })
 
 const EMPTY_PANE: PaneView = {
-  toolbarLeading: null, toolbarTrailing: null,
   iterating: false, reconnecting: false,
   relaunching: false, relaunchError: null, lastBuildFailed: false,
   restoredFromFailedBuild: false, completedLive: true, hasSavedBuild: null,
   previewState: null, occupyingProjectName: null, turnRunning: false,
   compileState: null, workspaceLost: false,
-  saveDirty: null, saving: false, saveError: null,
 }
 
 /** A build chat, publishing its own address — the OTHER publisher on this channel. */
@@ -105,7 +103,6 @@ function Surface({ project = PROJECT }: { project?: Project }) {
       chats={[]}
       chatsError={null}
       onProjectUpdate={noop}
-      onBack={noop}
       onOpenChat={noop}
       onDeleteChat={noop}
     />
@@ -308,18 +305,24 @@ describe('AE37 — the stacked crossing is a class, not a remount', () => {
 })
 
 describe('the collapse control — hidden, not unmounted, and never a one-way door', () => {
-  it('★ lives in the PANE, so it is still reachable once the rail is hidden', async () => {
+  it('★ lives in the TOOLBAR ROW, so it is still reachable once the rail is hidden', async () => {
     // The failure this is written against: a toggle inside the rail. A collapsed rail is `w-0` and
     // `invisible` — out of the tab order and out of the accessibility tree — so the control that
     // would restore it would be unreachable, and nothing short of a reload could undo the press.
+    //
+    // It was in the PANE for exactly that reason, and plan 002's U2 moved it one step further out,
+    // to the row above both columns. The reachability property is unchanged and still asserted; the
+    // row is simply the one surface that survives a collapse AND the pane going away, so the
+    // control has one home in every state rather than appearing and disappearing with the frame.
     api.fetchPreviewState.mockResolvedValue(
       preview({ state: 'alive', alive: true, previewUrl: APP_URL, restorable: true }),
     )
     render(<Workspace />)
     await waitFor(() => expect(frame()).toBeTruthy())
 
-    const toggle = screen.getByRole('button', { name: /hide project details/i })
-    expect(paneRegion()?.contains(toggle)).toBe(true)
+    const toggle = screen.getByRole('button', { name: /hide details/i })
+    expect(screen.getByTestId('workspace-toolbar').contains(toggle)).toBe(true)
+    expect(paneRegion()?.contains(toggle)).toBe(false)
     expect(rail().contains(toggle)).toBe(false)
 
     fireEvent.click(toggle)
@@ -328,7 +331,7 @@ describe('the collapse control — hidden, not unmounted, and never a one-way do
     expect(rail().className).toMatch(/(^|\s)w-0(\s|$)/)
     expect(rail().className).toMatch(/invisible/)
     // Still there, still pressable, now offering the other direction.
-    const back = screen.getByRole('button', { name: /show project details/i })
+    const back = screen.getByRole('button', { name: /show details/i })
     expect(back.getAttribute('aria-expanded')).toBe('false')
     expect(back.getAttribute('aria-controls')).toBe(rail().id)
 
@@ -340,7 +343,7 @@ describe('the collapse control — hidden, not unmounted, and never a one-way do
     render(<Workspace />)
     await waitFor(() => expect(screen.getByTestId('description-editor')).toBeTruthy())
 
-    fireEvent.click(screen.getByRole('button', { name: /hide project details/i }))
+    fireEvent.click(screen.getByRole('button', { name: /hide details/i }))
 
     // The subtree is still in the document — a draft and a scroll position survive the cycle.
     expect(screen.getByTestId('description-editor')).toBeTruthy()
@@ -353,16 +356,17 @@ describe('the collapse control — hidden, not unmounted, and never a one-way do
     // chat-panel toggle. That toolbar is rendered by `LivePreview`, which only mounts once there is
     // something to frame, so a project with nothing built had NO toggle at all; and a rail
     // collapsed while an app was running would have lost its way back the moment the container
-    // stopped. Its home has to be the part of the pane that always renders.
+    // stopped. Its home has to be a surface that always renders — the pane's own outer shell then,
+    // the toolbar row now.
     api.fetchPreviewState.mockResolvedValue(preview({ state: 'never_built', restorable: false }))
     render(<Workspace project={{ ...PROJECT, appId: null, hasRelaunchableSnapshot: false }} />)
     await waitFor(() => expect(api.fetchPreviewState).toHaveBeenCalled())
     expect(frame()).toBeNull()
 
-    fireEvent.click(screen.getByRole('button', { name: /hide project details/i }))
+    fireEvent.click(screen.getByRole('button', { name: /hide details/i }))
     expect(rail().className).toMatch(/(^|\s)w-0(\s|$)/)
     // …and back again, with no frame in the story at any point.
-    fireEvent.click(screen.getByRole('button', { name: /show project details/i }))
+    fireEvent.click(screen.getByRole('button', { name: /show details/i }))
     expect(rail().className).not.toMatch(/(^|\s)w-0(\s|$)/)
   })
 
@@ -374,7 +378,7 @@ describe('the collapse control — hidden, not unmounted, and never a one-way do
     await waitFor(() => expect(frame()).toBeTruthy())
     const original = frame()
 
-    fireEvent.click(screen.getByRole('button', { name: /hide project details/i }))
+    fireEvent.click(screen.getByRole('button', { name: /hide details/i }))
 
     expect(frame()).toBe(original)
   })

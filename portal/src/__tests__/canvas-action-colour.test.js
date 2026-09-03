@@ -69,6 +69,8 @@ const GOLD_ALLOWED = {
 const ORANGE_ALLOWED = {
   // The header token meter's fill. The board's own worked example draws it amber at 54%.
   'components/layout/Navbar.tsx': ['bg-accent'],
+  // The 6px unsaved dot on the Save control — the canvas's other, and last, use of the accent.
+  'components/workspace/WorkspaceToolbar.tsx': ['bg-accent'],
 }
 
 function offenders(pattern, allowed) {

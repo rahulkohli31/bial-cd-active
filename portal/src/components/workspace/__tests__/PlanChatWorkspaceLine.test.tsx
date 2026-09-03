@@ -109,7 +109,7 @@ describe('★ AE48 — the same value, the same sentence, on both surfaces (R97)
       const spokenHere = screen.getByTestId('plan-chat-workspace-state').textContent ?? ''
       unmount()
 
-      renderIn(<AppPane collapsed={false} onToggleCollapsed={() => {}} />, (c) =>
+      renderIn(<AppPane device="Desktop" reloadNonce={0} />, (c) =>
         c.workspace.set(report),
       )
       const spokenThere = screen.getByTestId('app-pane-empty').textContent ?? ''

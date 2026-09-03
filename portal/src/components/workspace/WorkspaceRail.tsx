@@ -37,16 +37,13 @@
  * through `aria-controls`.
  */
 import { useEffect, useState } from 'react'
-import { ArrowLeft, Check, MoreVertical, Pencil, X } from 'lucide-react'
-import PublishStatusChip from '../PublishStatusChip'
+import { MoreVertical } from 'lucide-react'
 import ProjectDescriptionEditor from '../projects/ProjectDescriptionEditor'
 import RailComposer from './RailComposer'
 import { chatKindFor } from '../../utils/chatKind'
 import { relativeTime } from '../../utils/chatHistory'
 import { shortSha } from '../../utils/shortSha'
 import type { ChatSummary } from '../../utils/conversationApi'
-import { patchProject } from '../../utils/projectApi'
-import { ApiError } from '../../utils/apiError'
 import type { Project } from '../../utils/projectApi'
 import type { SaveState } from '../../utils/buildSessionApi'
 import type { WorkspaceState } from './workspaceState'
@@ -60,7 +57,6 @@ export interface WorkspaceRailProps {
   chats: ChatSummary[]
   chatsError: string | null
   onProjectUpdate: (project: Project) => void
-  onBack: () => void
   onOpenChat: (chatId: string) => void
   onDeleteChat: (chatId: string) => void
 }
@@ -72,7 +68,6 @@ export default function WorkspaceRail({
   chats,
   chatsError,
   onProjectUpdate,
-  onBack,
   onOpenChat,
   onDeleteChat,
 }: WorkspaceRailProps) {
@@ -80,9 +75,6 @@ export default function WorkspaceRail({
   // `ProjectPage` and threaded down through `ProjectWorkspace`, which cost nine props across two
   // interfaces to reach one renderer — and neither is state anybody above can act on: a half-typed
   // name and an open ⋮ menu mean nothing to a route.
-  const [editingName, setEditingName] = useState(false)
-  const [nameDraft, setNameDraft] = useState('')
-  const [nameError, setNameError] = useState<string | null>(null)
   const [menuOpenId, setMenuOpenId] = useState<string | null>(null)
 
   // Close the row action menu on Escape or an outside click while it is open.
@@ -100,37 +92,6 @@ export default function WorkspaceRail({
     }
   }, [menuOpenId])
 
-  const onStartRename = () => {
-    setNameDraft(project.name)
-    setNameError(null)
-    setEditingName(true)
-  }
-  const onCancelRename = () => setEditingName(false)
-
-  const onSubmitRename = () => {
-    const trimmed = nameDraft.trim()
-    // Blocked client-side BEFORE any request: the server 400s on name:null and 422s on "". A
-    // whitespace-only name never reaches the wire.
-    if (trimmed === '') {
-      setNameError('Name cannot be empty.')
-      return
-    }
-    if (trimmed === project.name) {
-      setEditingName(false)
-      return
-    }
-    void (async () => {
-      try {
-        const updated = await patchProject(project.id, { name: trimmed })
-        onProjectUpdate(updated)
-        setEditingName(false)
-        setNameError(null)
-      } catch (err) {
-        setNameError(err instanceof ApiError ? err.message : 'Could not rename. Try again.')
-      }
-    })()
-  }
-
   return (
     // ITS OWN SCROLLER. The shell is a full-height frame that does not scroll, and this is a flex
     // child of it — without `overflow-y-auto` a project with twenty conversations clips its list
@@ -138,72 +99,15 @@ export default function WorkspaceRail({
     // it the child's min-content height wins and the overflow never has anywhere to happen.
     <main className="flex-1 min-h-0 overflow-y-auto">
       <div className="w-full px-5 py-6 space-y-5">
-        <button
-          type="button"
-          onClick={onBack}
-          className="flex items-center gap-1 text-sm text-neutral hover:text-primary transition"
-        >
-          <ArrowLeft size={15} /> Back to projects
-        </button>
+        {/* THE HEADER IS SURRENDERED TO THE TOOLBAR ROW (plan 002, U2). Back, the project name,
+            the status chip and the rename control all lived here, inside a 400px column — which is
+            why the name truncated at the rail's width and vanished entirely when the rail was
+            collapsed, the opposite of what the collapse board draws. They are drawn once by the
+            shell now, above both columns, so they survive a collapse by construction.
 
-        {/* THE HEADER. Both branches are the same `flex items-center gap-2` row with the chip as
-            the second child, so starting a rename does not move it and does not remount it. */}
-        <div>
-          {editingName ? (
-            <div className="flex items-center gap-2">
-              <input
-                aria-label="Project name"
-                value={nameDraft}
-                autoFocus
-                onChange={(e) => setNameDraft(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') onSubmitRename()
-                  if (e.key === 'Escape') onCancelRename()
-                }}
-                className="flex-1 min-w-0 text-xl font-extrabold text-tertiary bg-white border border-bial-border rounded-lg px-2 py-1 focus:outline-none focus:ring-2 focus:ring-primary/30"
-              />
-              <PublishStatusChip projectId={project.id} />
-              <button
-                type="button"
-                aria-label="Save name"
-                onClick={onSubmitRename}
-                className="p-2 rounded-lg text-primary hover:bg-primary/5 transition"
-              >
-                <Check size={18} />
-              </button>
-              <button
-                type="button"
-                aria-label="Cancel rename"
-                onClick={onCancelRename}
-                className="p-2 rounded-lg text-neutral hover:bg-surface-muted transition"
-              >
-                <X size={18} />
-              </button>
-            </div>
-          ) : (
-            <div className="flex items-center gap-2">
-              <h1 className="min-w-0 truncate text-xl font-extrabold text-tertiary">{project.name}</h1>
-              {/* R37's "beside the project name", literally, and NOT gated on `project.appId`: a
-                  project with nothing built learns that from the same place it learns everything
-                  else about its app, rather than from an absence. A live component carried
-                  forward from the page this rail replaces — not a slot left for future work. */}
-              <PublishStatusChip projectId={project.id} />
-              <button
-                type="button"
-                aria-label="Rename project"
-                onClick={onStartRename}
-                className="p-1.5 rounded-lg text-neutral hover:text-primary hover:bg-surface-muted transition"
-              >
-                <Pencil size={15} />
-              </button>
-            </div>
-          )}
-          {nameError && (
-            <p className="text-xs font-medium text-danger mt-1" role="alert">
-              {nameError}
-            </p>
-          )}
-        </div>
+            `onBack` is still a prop and still `ProjectPage`'s: the row's own back control routes
+            through the shell's unsaved-work guard, and this one is what the load-error branch of
+            that page uses. */}
 
         <RailComposer projectId={project.id} />
 

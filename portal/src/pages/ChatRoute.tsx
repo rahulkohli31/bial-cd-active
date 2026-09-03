@@ -33,6 +33,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Navigate, useLocation, useParams, useSearchParams } from 'react-router-dom'
 import ConversationSlot from '../components/workspace/ConversationSlot'
+import { usePublishHeading } from '../components/workspace/workspaceChannel'
 import { getConversation } from '../utils/conversationApi'
 import { getProject } from '../utils/projectApi'
 import { markChatOpened } from '../utils/observe'
@@ -52,7 +53,7 @@ function kindFromServer(raw: unknown): ChatKind {
 /** `chatId` is carried so a render can tell whether a resolution still describes the routed chat. */
 type Resolution =
   | { status: 'loading' }
-  | { status: 'ready'; chatId: string; kind: ChatKind; projectId: string | null }
+  | { status: 'ready'; chatId: string; kind: ChatKind; projectId: string | null; title: string | null }
   | { status: 'gone' }
 
 export default function ChatRoute() {
@@ -94,7 +95,11 @@ export default function ChatRoute() {
     // its state, aborted on unmount. Only a cold open shows the spinner.
     setResolution((prev) => (prev.status === 'ready' ? prev : { status: 'loading' }))
 
-    const ready = (kind: ChatKind, projectId: string | null): void => {
+    // THE TITLE IS ALREADY STORED AND ALREADY RETURNED — it was simply never read back (plan 002,
+    // U2, ASM5). It is set when the row is created, derived from the chat's first message, so a
+    // freshly minted chat legitimately has none until that message lands. `null` is that case and
+    // the row names the kind instead; it is never an error and never a spinner.
+    const ready = (kind: ChatKind, projectId: string | null, title: string | null = null): void => {
       // R105's numerator, marked at THE one seam every arm passes through — freshly-minted,
       // server-resolved, query fallback and load failure alike — rather than on the three
       // handlers that navigate here. Those live in two components that other work is mid-rewrite
@@ -104,7 +109,7 @@ export default function ChatRoute() {
       // included — which is precisely the case `markChatOpened` refuses, because a project this
       // load never opened has no denominator to be the numerator of.
       markChatOpened(projectId)
-      setResolution({ status: 'ready', chatId, kind, projectId })
+      setResolution({ status: 'ready', chatId, kind, projectId, title })
     }
 
     void (async () => {
@@ -126,6 +131,7 @@ export default function ChatRoute() {
           ready(
             kindFromServer(conversation.kind),
             typeof conversation.projectId === 'string' ? conversation.projectId : queryProjectId,
+            conversation.title || null,
           )
           return
         }
@@ -156,6 +162,22 @@ export default function ChatRoute() {
   // provision call to find out. A 404 here means the project was deleted out from under
   // an open chat — show the transcript anyway, unnamed. Never redirect on this.
   const projectId = resolution.status === 'ready' ? resolution.projectId : null
+
+  // WHAT THE TOOLBAR ROW NAMES (plan 002, U2). Published from the ROUTE rather than from the
+  // surface below it, because this component is mounted for the whole life of the address —
+  // including the loading branch, where neither the conversation nor the project has resolved and
+  // the row still has to render at full height with a working back control.
+  //
+  // THE KIND IS WHAT MAKES IT A CHAT HEADING, not the title: a chat this session just minted has
+  // no row and so no title, and the row must still draw it as a chat rather than falling back to
+  // the project screen's shape for the seconds before the first message lands.
+  usePublishHeading({
+    projectId,
+    projectName: project !== null && project.id === projectId ? project.name : null,
+    chatTitle: resolution.status === 'ready' ? resolution.title : null,
+    chatKind: resolution.status === 'ready' ? resolution.kind : null,
+  })
+
   useEffect(() => {
     if (!projectId) return undefined
     let alive = true
@@ -208,6 +230,11 @@ export default function ChatRoute() {
   // is; nothing branches on it.
   return (
     <ConversationSlot
+      // THE ROW'S TITLE, LEARNED FROM THE SURFACE THAT DERIVES IT. `resolution` is this route's
+      // own state, so the heading published above still has exactly one author.
+      onTitleDerived={(title) =>
+        setResolution((held) => (held.status === 'ready' && !held.title ? { ...held, title } : held))
+      }
       conversation={{
         chatId: resolution.chatId,
         kind: resolution.kind,

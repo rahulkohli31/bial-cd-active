@@ -64,7 +64,7 @@ function renderPane(prime: (channel: WorkspaceChannel) => void) {
         <button type="button">a rail control</button>
       </div>
       <WorkspaceChannelProvider value={channel}>
-        <AppPane collapsed={false} onToggleCollapsed={() => {}} />
+        <AppPane device="Desktop" reloadNonce={0} />
       </WorkspaceChannelProvider>
     </MemoryRouter>,
   )
@@ -75,13 +75,11 @@ const region = () => screen.getByTestId('app-pane-region')
 
 /** What a mounted surface publishes for the pane's chrome — every field at its resting value. */
 const PANE_VIEW = {
-  toolbarLeading: null, toolbarTrailing: null,
   iterating: false, reconnecting: false,
   relaunching: false, relaunchError: null, lastBuildFailed: false,
   restoredFromFailedBuild: false, completedLive: true, hasSavedBuild: null,
   previewState: null, occupyingProjectName: null, turnRunning: false,
   compileState: null, workspaceLost: false,
-  saveDirty: null, saving: false, saveError: null,
 }
 
 afterEach(() => cleanup())

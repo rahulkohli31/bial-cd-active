@@ -42,11 +42,13 @@
  * below then declares its OWN scroller, because sticky positioning and overflow both resolve
  * against the nearest scroll container and that container has moved.
  */
-import { Outlet, useLocation } from 'react-router-dom'
-import { useEffect, useLayoutEffect, useState } from 'react'
+import { Outlet, useLocation, useNavigate } from 'react-router-dom'
+import { useCallback, useEffect, useLayoutEffect, useState } from 'react'
 import Navbar from '../layout/Navbar'
 import ReclaimWorkspaceDialog from '../projects/ReclaimWorkspaceDialog'
 import AppPane from './AppPane'
+import WorkspaceToolbar from './WorkspaceToolbar'
+import type { DeviceName } from './WorkspaceToolbar'
 import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
 import { WorkspaceExitProvider, useUnsavedWorkGuard } from './UnsavedWorkGuard'
 import {
@@ -54,6 +56,7 @@ import {
   createWorkspaceChannel,
   useRailSlot,
   useWorkspaceChannel,
+  useWorkspaceHeading,
   useWorkspacePaneVisible,
   useWorkspaceReclaim,
   useWorkspaceReport,
@@ -215,6 +218,15 @@ function ShellFrame() {
   const mode = railModeFor(useLocation().pathname)
   const [collapsed, setCollapsed] = useState(false)
   usePublishRail(mode, collapsed)
+  // THE DEVICE WIDTH AND THE RELOAD NONCE ARE THE SHELL'S NOW (plan 002, U2) — both were private
+  // state inside `LivePreview`, chosen there because their controls lived in that component's own
+  // toolbar. Their controls are in the row above the grid, so the state comes up here with them,
+  // and the pane receives both as props down a chain of shell-owned siblings. Holding them here
+  // also means the chosen width survives a route change from the project screen to a chat, which
+  // it could not while it lived inside a component the pane host re-mounts around.
+  const [device, setDevice] = useState<DeviceName>('Desktop')
+  const [reloadNonce, setReloadNonce] = useState(0)
+  const heading = useWorkspaceHeading()
   // WHICH COLUMN GROWS, and it is not a cosmetic choice. The two columns are the conversation and
   // the app, and the conversation is the SIZED one whenever the app is on screen: the builder
   // surface's chat panel sets its own 288px and the pane takes everything left over, which is
@@ -250,12 +262,33 @@ function ShellFrame() {
     if (!paneVisible) setCollapsed(false)
   }, [paneVisible])
 
+  // THE BACK CONTROL IS DERIVED FROM THE ADDRESS, and it goes through the same guard every other
+  // navigation in the workspace goes through. Two of the three exits a citizen actually uses — the
+  // navbar and this one — used to leave unsaved work behind in silence; the navbar was routed
+  // through the guard first, and this is the other one.
+  const navigate = useNavigate()
+  const back = useCallback(() => {
+    const to = heading.chatKind !== null && heading.projectId ? `/projects/${heading.projectId}` : '/projects'
+    guard(() => navigate(to))
+  }, [guard, navigate, heading.chatKind, heading.projectId])
+
   return (
     <WorkspaceExitProvider value={guard}>
     <div className="h-screen flex flex-col font-manrope bg-bial-bg overflow-hidden">
       <ReclaimSlot />
       {unsavedWorkDialog}
       <Navbar />
+      {/* ONE TOOLBAR ROW, DRAWN ONCE, ABOVE THE GRID — so it survives a collapse of the rail it
+          used to live inside, and so it is a single element across a project↔chat move rather
+          than three headers that appear and disappear. */}
+      <WorkspaceToolbar
+        collapsed={collapsed}
+        onToggleCollapsed={() => setCollapsed((was) => !was)}
+        device={device}
+        onDevice={setDevice}
+        onReload={() => setReloadNonce((n) => n + 1)}
+        onBack={back}
+      />
       {/* THE TWO-COLUMN GRID, BUILT ONCE, ABOVE THE OUTLET. Plan F supplies the rail's contents
           and the threshold that flips `stacked`; it does not build a second two-column frame
           inside the project surface. This is also the container whose class changes at that
@@ -287,7 +320,7 @@ function ShellFrame() {
             `AppPane` (Plan F, U4) wraps the host with the region label, the skip control and the
             sentence for when there is nothing to frame; the iframe and its identity stay in the
             host, because a second mount of it is the remount AE4 and AE37 exist to forbid. */}
-        <AppPane collapsed={collapsed} onToggleCollapsed={() => setCollapsed((was) => !was)} />
+        <AppPane device={device} reloadNonce={reloadNonce} />
       </div>
     </div>
     </WorkspaceExitProvider>

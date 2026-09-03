@@ -467,7 +467,11 @@ describe('LivePreview — what Plan F removed, and what it deliberately did not'
     expect(source).toMatch(/e\.source/)          // the inbound-message gate, on origin AND source
     expect(source).toMatch(/sandbox=/)           // the sandbox token list
     expect(source).toMatch(/const frameKey =/)   // the frame's identity
-    expect(source).toMatch(/const DEVICES/)      // the device widths
+    // The device WIDTHS are still read here; the TABLE moved up to the toolbar row with the
+    // control that picks them (plan 002, U2), so this asserts the import rather than the literal —
+    // two copies of it is the drift this guard exists to prevent, not one copy in a new file.
+    expect(source).toMatch(/import \{ DEVICES, type DeviceName \} from '\.\/workspace\/WorkspaceToolbar'/)
+    expect(source).toMatch(/DEVICES\[device\]\.width/)
     expect(source).toMatch(/setCovered/)         // the cover that holds on an unknown
   })
 })

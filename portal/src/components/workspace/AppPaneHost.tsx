@@ -51,9 +51,16 @@
 import { useRef } from 'react'
 import LivePreview from '../LivePreview'
 import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
+import type { DeviceName } from './WorkspaceToolbar'
 import { useWorkspaceAddress, useWorkspacePane, useWorkspacePaneVisible } from './workspaceChannel'
 
-export default function AppPaneHost() {
+export interface AppPaneHostProps {
+  /** Shell-owned, passed straight through — see `AppPane`. */
+  device: DeviceName
+  reloadNonce: number
+}
+
+export default function AppPaneHost({ device, reloadNonce }: AppPaneHostProps) {
   const address = useWorkspaceAddress()
   const pane = useWorkspacePane()
   const visible = useWorkspacePaneVisible()
@@ -134,6 +141,8 @@ export default function AppPaneHost() {
         // component defaults when the publisher is gone. See the hold above for what each breaks.
         iterating={pane ? pane.iterating : lastIterating.current}
         completedLive={pane ? pane.completedLive : lastCompletedLive.current}
+        device={device}
+        reloadNonce={reloadNonce}
       />
     </div>
   )

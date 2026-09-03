@@ -63,7 +63,6 @@ function renderRail(over: { workspace?: WorkspaceState; save?: SaveState | null 
         chats={[]}
         chatsError={null}
         onProjectUpdate={noop}
-        onBack={noop}
         onOpenChat={noop}
         onDeleteChat={noop}
       />
@@ -162,15 +161,23 @@ describe('the save half, which exists only while the app is running', () => {
 })
 
 describe('the publishing chip and the recents survive the rewrite', () => {
-  it('mounts the chip beside the project name, ungated on whether anything is built', () => {
-    // A live component carried forward from the page this rail replaces — not a slot left empty.
-    // "Nothing built yet" is a state the chip NAMES, so a citizen learns it from the same place
-    // they learn everything else rather than from an absence.
+  it('draws no chip and no project name of its own — both are the toolbar row\'s', () => {
+    // THE RAIL SURRENDERED ITS HEADER (plan 002, U2). Back, the project name, the status chip and
+    // the rename control lived here, inside a 400px column, which is why the name truncated at the
+    // rail's width and vanished entirely on a collapse — the opposite of what the collapse board
+    // draws. They are drawn once by the shell now, above both columns.
+    //
+    // ASSERTED AS AN ABSENCE PAIRED WITH A LIVENESS CHECK, because a `toBeNull()` on its own passes
+    // just as happily when the component threw and rendered nothing at all.
     renderRail()
 
-    const chip = screen.getByTestId('publish-chip-stub')
-    expect(chip.getAttribute('data-project')).toBe('p1')
-    expect(chip.previousElementSibling?.tagName).toBe('H1')
+    expect(screen.queryByTestId('publish-chip-stub')).toBeNull()
+    expect(screen.queryByRole('heading', { name: 'VIP Movement' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /rename project/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /back to projects/i })).toBeNull()
+    // …and the rail itself is alive and rendering its own sections.
+    expect(screen.getByTestId('rail-app-status')).toBeTruthy()
+    expect(screen.getByTestId('description-rail')).toBeTruthy()
   })
 
   it('keeps the recents section, with its empty-state copy', () => {

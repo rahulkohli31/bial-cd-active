@@ -45,6 +45,7 @@
  */
 import { useCallback, useMemo, useState } from 'react'
 import WorkspaceRail from './WorkspaceRail'
+import ProjectRenameDialog from '../projects/ProjectRenameDialog'
 import type { ChatSummary } from '../../utils/conversationApi'
 import { useWorkspaceState } from './useWorkspaceState'
 import type { StartOutcome } from './workspaceState'
@@ -53,6 +54,7 @@ import {
   usePublishAddress,
   usePublishPaneView,
   usePublishReclaim,
+  usePublishSave,
   usePublishSaveState,
   usePublishWorkspaceReport,
   useWorkspaceProject,
@@ -68,7 +70,6 @@ export interface ProjectWorkspaceProps {
   chats: ChatSummary[]
   chatsError: string | null
   onProjectUpdate: (project: Project) => void
-  onBack: () => void
   onOpenChat: (chatId: string) => void
   onDeleteChat: (chatId: string) => void
 }
@@ -81,6 +82,11 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   // just pressed a button to bring up, which reads as the press having done nothing.
   const [startedPreviewUrl, setStartedPreviewUrl] = useState<string | null>(null)
   const [reclaim, setReclaim] = useState<{ blocked: ReclaimBlocked; retry: () => Promise<void> } | null>(null)
+  // THE RENAME'S STATE IS HERE BECAUSE ITS DATA IS. The control is in the shell's toolbar row,
+  // which sits above the Outlet and has no project object; this surface has both the project and
+  // the update callback, so the row publishes a press upward and the editing happens down here.
+  const [renaming, setRenaming] = useState(false)
+  const startRename = useCallback(() => setRenaming(true), [])
 
   const workspace = useWorkspaceState({
     projectId: project.id,
@@ -157,13 +163,6 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
 
   const paneView = useMemo(
     () => ({
-      // NO TOOLBAR CHROME FROM HERE. The rail's collapse control is the shell's — it is drawn by
-      // `AppPane` itself, which is the part of the pane that renders whether or not there is
-      // anything to frame. Publishing it into `LivePreview`'s toolbar left a project with nothing
-      // built without a toggle at all.
-      toolbarLeading: null,
-      // The publishing chip is the rail's, beside the project name (R37). Nothing here.
-      toolbarTrailing: null,
       // NO TURN RUNS ON THIS SURFACE. Every one of these describes a build in flight, and there is
       // none: this screen starts no turn and owns no session. `completedLive` is the one to look
       // at twice — it is the "this container is alive under an idle lease" pardon that lets a frame
@@ -184,14 +183,8 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
       // (R3 — the screen must not cause a container call).
       compileState: null,
       workspaceLost: false,
-      // The save model. `dirty` is TRI-STATE and stays tri-state — `null` is UNKNOWN, never clean.
-      // No `onSave`: saving is the user's click from a surface that has one, and this plan adds no
-      // second writer of the bundle.
-      saveDirty: workspace.save?.dirty ?? null,
-      saving: false,
-      saveError: null,
     }),
-    [workspace.preview, workspace.save, project.hasRelaunchableSnapshot],
+    [workspace.preview, project.hasRelaunchableSnapshot],
   )
 
   useWorkspaceProject(project.id)
@@ -199,6 +192,17 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   usePublishPaneView(paneView)
   usePublishWorkspaceReport(report)
   usePublishSaveState(workspace.save?.dirty ?? null)
+  // THE SAVE CONTROL'S VALUES, FOR THE TOOLBAR ROW, AND STILL NO ACTION FROM HERE.
+  //
+  // `rename` IS an action this surface owns: the row draws the project's name, and the control
+  // that edits it used to sit in the rail header the boards replace. `save` is deliberately still
+  // `null` — this plan's U11 gives the project screen a writer of the bundle, and until it does,
+  // publishing a handler would put a pressable Save on a screen with nothing behind it. The row
+  // reads `canSave` from this and draws a status rather than a button.
+  usePublishSave(
+    { dirty: workspace.save?.dirty ?? null, saving: false, error: null },
+    { save: null, rename: startRename },
+  )
   usePublishReclaim(request)
   // TWO COLUMNS ARE THE REST STATE of the project screen — not something contingent on a build
   // having run. A project with nothing built shows the empty-state sentence IN the pane, not a
@@ -206,5 +210,16 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   // than an absence a citizen has to interpret.
   useAppPaneVisible(true)
 
-  return <WorkspaceRail {...props} workspace={workspace.state} save={workspace.save} />
+  return (
+    <>
+      <WorkspaceRail {...props} workspace={workspace.state} save={workspace.save} />
+      {renaming && (
+        <ProjectRenameDialog
+          project={project}
+          onProjectUpdate={props.onProjectUpdate}
+          onClose={() => setRenaming(false)}
+        />
+      )}
+    </>
+  )
 }

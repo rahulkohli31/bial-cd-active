@@ -1,10 +1,11 @@
 /**
  * U8 (F7 + F10) — the trimmed chat header.
  *
- * The header is now back-navigation (ProjectBreadcrumb) + the project name and NOTHING else: the
- * redundant in-rail usage meter (F7), the AI branding block, its avatar, and the "Recent" builds
- * dropdown (F10) are gone. Past conversations are reached through the project page the breadcrumb
- * links to — ProjectPage already lists every conversation, so nothing is orphaned.
+ * The header is gone from this surface entirely (plan 002, U2): the redundant in-rail usage meter
+ * (F7), the AI branding block, its avatar and the "Recent" builds dropdown (F10) went first, and
+ * the breadcrumb that was left went to the shell's toolbar row, which draws the project, the chat's
+ * kind and the chat's title above both columns. What this file still pins is the ABSENCE of the
+ * four removed things, which is unaffected by where the surviving header lives.
  *
  * THE LOAD-BEARING CORRECTION (the review's catch): only the strictly dropdown-scoped state was
  * removed. `builds`/`refreshBuilds` were KEPT — `buildBlockedMessage` reads `builds` to name the
@@ -111,15 +112,16 @@ beforeEach(() => {
 })
 afterEach(() => cleanup())
 
-describe('U8 — the chat header is back-navigation + project name only', () => {
-  it('renders the back link + project name and none of the removed chrome', async () => {
+describe('U8 — the chat surface draws no header of its own', () => {
+  it('renders none of the removed chrome, and no header either', async () => {
     const { container } = renderBuilder()
     // Settle the async adopt (getBuild → welcome message) before asserting on the header.
     await screen.findByPlaceholderText(/describe what you need/i)
 
-    // KEPT: the breadcrumb back link, labelled with the project name.
-    const back = screen.getByRole('link', { name: /VIP Movement/i })
-    expect(back.getAttribute('href')).toBe('/projects/p1')
+    // GONE (plan 002, U2): the breadcrumb that was the last thing left in this header. The
+    // project, the chat's kind and the chat's title are drawn by the shell's toolbar row above
+    // both columns — see `WorkspaceToolbar.test.tsx`.
+    expect(screen.queryByRole('link', { name: /VIP Movement/i })).toBeNull()
 
     // GONE (F10): the AI branding block + its avatar. "powered by Anthropic" was branding-only
     // (the welcome bubble never says it); the online-status dot was the avatar's distinguishing mark.
@@ -135,13 +137,9 @@ describe('U8 — the chat header is back-navigation + project name only', () => 
     expect(container.querySelector('.usage-meter')).toBeNull()
   })
 
-  it('the back link routes to /projects/{projectId} — the past-conversation surface', async () => {
-    renderBuilder()
-    await screen.findByPlaceholderText(/describe what you need/i)
-
-    fireEvent.click(screen.getByRole('link', { name: /VIP Movement/i }))
-    expect((await screen.findByTestId('project-page')).textContent).toContain('p1')
-  })
+  /* WHERE THE BACK CONTROL GOES is the toolbar row's, and it is asserted there — including the
+     half this test could never see, that it routes through the workspace's unsaved-work guard
+     rather than navigating straight out. */
 })
 
 describe('U8 regression guard — builds/refreshBuilds survive the dropdown removal', () => {

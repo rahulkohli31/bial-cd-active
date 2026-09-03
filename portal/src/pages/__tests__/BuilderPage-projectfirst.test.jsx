@@ -220,11 +220,17 @@ describe('BuilderPage — a refused first-message turn aborts cleanly (was "an a
   })
 })
 
-describe('BuilderPage — the project breadcrumb', () => {
-  it('links back to the project, the only way out of a flat chat URL', async () => {
+describe('BuilderPage — the way out of a flat chat URL', () => {
+  it('the surface itself draws no back link — the toolbar row does', async () => {
+    // Plan 002's U2 moved it: the row above both columns carries the project, the chat's kind and
+    // the chat's title, so the surface no longer draws a header at all. Where the back control
+    // goes, and that it routes through the unsaved-work guard, is `WorkspaceToolbar.test.tsx`'s.
+    //
+    // Paired with a liveness check, because "the link is gone" also passes when the surface
+    // rendered nothing at all.
     renderHandoff()
-    const link = await screen.findByRole('link', { name: /VIP Movement/i })
-    expect(link.getAttribute('href')).toBe('/projects/p1')
+    await screen.findByPlaceholderText(/describe what you need/i)
+    expect(screen.queryByRole('link', { name: /VIP Movement/i })).toBeNull()
   })
 })
 
