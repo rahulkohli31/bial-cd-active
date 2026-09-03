@@ -399,16 +399,28 @@ describe('LivePreview — relaunch a torn-down preview (#43)', () => {
     expect(after).not.toBe(before)
   })
 
-  it('offers a manual Reload that remounts the frame', () => {
+  it('remounts the frame when the shell asks it to reload', () => {
     // "What I see is out of date" is a judgement only the person looking can make — a dev-server
-    // restart, an HMR socket that died quietly. Without this the only recourse was reloading the
-    // whole portal.
-    const view = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" />)
+    // restart, an HMR socket that died quietly. The CONTROL is in the toolbar row now (plan 002,
+    // U2); what this pins is the half this component owns, that a change in the signal produces a
+    // genuinely new frame rather than a re-render of the same one.
+    const view = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" reloadNonce={0} />)
     const before = view.container.querySelector('iframe')
 
-    fireEvent.click(screen.getByRole('button', { name: /reload/i }))
+    view.rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" reloadNonce={1} />)
 
     expect(view.container.querySelector('iframe')).not.toBe(before)
+  })
+
+  it('does NOT remount the frame when the reload signal holds still', () => {
+    // The other half, and the one a single-direction test cannot see: a re-render for any other
+    // reason must leave the citizen's app exactly where it was.
+    const view = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" reloadNonce={3} />)
+    const before = view.container.querySelector('iframe')
+
+    view.rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" reloadNonce={3} turnRunning />)
+
+    expect(view.container.querySelector('iframe')).toBe(before)
   })
 
   it('frames the restored preview once relaunch resolves (a fresh ready URL)', () => {
@@ -920,56 +932,13 @@ describe('LivePreview — the reconnecting state is BOUNDED after a completed bu
 // means UNKNOWN — no live workspace, or a bundle the server could not compare. Rendering
 // unknown as "Saved" tells the user their work is safe when nothing actually checked.
 
-describe('LivePreview — the Save control (KTD-5e)', () => {
-  it('offers a highlighted Save when there is unsaved work', () => {
-    setup({ saveDirty: true, onSave: vi.fn() })
-    const save = screen.getByTestId('save-project')
-    expect(save.textContent).toContain('Save')
-    expect(save.disabled).toBe(false)
-    // Highlighted ONLY when there is something to save — a permanently-primary Save button
-    // trains the user to ignore it, which is the state the dirty check exists to escape.
-    expect(save.className).toMatch(/bg-primary/)
-  })
-
-  it('calls onSave once per click', () => {
-    const onSave = vi.fn()
-    setup({ saveDirty: true, onSave })
-    fireEvent.click(screen.getByTestId('save-project'))
-    expect(onSave).toHaveBeenCalledTimes(1)
-  })
-
-  it('goes quiet and un-clickable once everything is saved', () => {
-    setup({ saveDirty: false, onSave: vi.fn() })
-    const save = screen.getByTestId('save-project')
-    expect(save.textContent).toContain('Saved')
-    expect(save.disabled).toBe(true)
-    expect(save.className).not.toMatch(/bg-primary/)
-    expect(screen.getByText(/all changes saved/i)).toBeTruthy()
-  })
-
-  it('UNKNOWN hides the control rather than claiming the work is saved', () => {
-    // THE POINT. `null` is not `false`. A button reading "Saved" here would be a claim nobody
-    // verified, and the user would act on it.
-    setup({ saveDirty: null, onSave: vi.fn() })
-    expect(screen.queryByTestId('save-project')).toBeNull()
-  })
-
-  it('shows a save failure as an alert instead of letting it look successful', () => {
-    setup({
-      saveDirty: true,
-      onSave: vi.fn(),
-      saveError: 'Your workspace is no longer running, so there is nothing to save.',
-    })
-    expect(screen.getByRole('alert').textContent).toMatch(/no longer running/i)
-  })
-
-  it('reports progress while saving, and refuses a second click', () => {
-    setup({ saveDirty: true, onSave: vi.fn(), saving: true })
-    const save = screen.getByTestId('save-project')
-    expect(save.textContent).toContain('Saving')
-    expect(save.disabled).toBe(true)
-  })
-})
+/* THE SAVE CONTROL LEFT THIS COMPONENT (plan 002, U2). It lived in the toolbar row this pane
+   drew inside itself, which meant it only existed once something was framed — so a project with
+   nothing built had no Save at all. It is in the shell's row now, reading the channel's own save
+   cell, and every one of the six scenarios that were here is in `WorkspaceToolbar.test.tsx`,
+   including the one that matters most: `null` is UNKNOWN and hides the control rather than
+   claiming the work is saved. Named rather than deleted quietly, because a guard that vanishes
+   with its markup is how the claim stops being checked. */
 
 describe('LivePreview — the preview only claims a build that exists (R5)', () => {
   // The exact screen n7-terminal-branch-20260730.png captured: a fresh, never-built project
@@ -1088,64 +1057,47 @@ describe('LivePreview — the preview only claims a build that exists (R5)', () 
   })
 })
 
-describe('LivePreview — device viewport toggle (#42)', () => {
-  // The iframe itself is plain `w-full` (see LivePreview.jsx's DEVICES comment): it always
-  // matches the card's width exactly, with no competing inline value of its own. So the
-  // device pixel width lives on the WRAPPER's inline style, and that's what
-  // these tests assert — they pin that the inline style got SET, not that the framed
-  // document actually reflows against it (jsdom has no layout engine, so a real reflow claim
-  // can only be proven in a browser — see the real-sandbox Playwright spec for that half).
-  // Queried by data-testid rather than `iframe.parentElement`, so an element inserted between
-  // the card and the iframe later can't silently retarget these assertions at the wrong node.
+describe('LivePreview — the device width it is told to frame at (#42)', () => {
+  // THE SWITCHER IS NOT IN THIS COMPONENT ANY MORE (plan 002, U2). It is in the shell's toolbar
+  // row, above both columns, so the three `aria-pressed` scenarios that used to live here are in
+  // `WorkspaceToolbar.test.tsx` — where the control is. What stays here is the half this
+  // component still owns: that the width it is TOLD reaches the card's inline style.
+  //
+  // The iframe itself is plain `w-full`: it always matches the card's width exactly, with no
+  // competing inline value of its own. So the device pixel width lives on the WRAPPER's inline
+  // style, and that is what these assert — that the inline style got SET, not that the framed
+  // document reflows against it (jsdom has no layout engine; the real-sandbox Playwright spec
+  // owns that half). Queried by data-testid rather than `iframe.parentElement`, so an element
+  // inserted between the card and the iframe cannot silently retarget these at the wrong node.
   function deviceCard(container) {
     return container.querySelector('[data-testid="device-card"]')
   }
 
-  it('defaults to Desktop: full width, pressed', () => {
+  it('defaults to full width when nobody says otherwise', () => {
     const { container } = setup()
     expect(deviceCard(container).style.width).toBe('100%')
-    expect(screen.getByRole('button', { name: /desktop/i }).getAttribute('aria-pressed')).toBe('true')
   })
 
-  it('Tablet sets the wrapper\'s inline width to 834px (iPad Pro 11" preset) and marks only Tablet pressed', () => {
-    const { container } = setup()
-    fireEvent.click(screen.getByRole('button', { name: /tablet/i }))
-    expect(deviceCard(container).style.width).toBe('834px')
-    expect(screen.getByRole('button', { name: /tablet/i }).getAttribute('aria-pressed')).toBe('true')
-    expect(screen.getByRole('button', { name: /desktop/i }).getAttribute('aria-pressed')).toBe('false')
-    expect(screen.getByRole('button', { name: /mobile/i }).getAttribute('aria-pressed')).toBe('false')
-  })
-
-  it('Mobile sets the wrapper\'s inline width to 390px (iPhone class) and marks only Mobile pressed', () => {
-    const { container } = setup()
-    fireEvent.click(screen.getByRole('button', { name: /mobile/i }))
-    expect(deviceCard(container).style.width).toBe('390px')
-    expect(screen.getByRole('button', { name: /mobile/i }).getAttribute('aria-pressed')).toBe('true')
-    expect(screen.getByRole('button', { name: /desktop/i }).getAttribute('aria-pressed')).toBe('false')
-    expect(screen.getByRole('button', { name: /tablet/i }).getAttribute('aria-pressed')).toBe('false')
-  })
-
-  it('switching back to Desktop restores full width', () => {
-    const { container } = setup()
-    fireEvent.click(screen.getByRole('button', { name: /mobile/i }))
-    fireEvent.click(screen.getByRole('button', { name: /desktop/i }))
-    expect(deviceCard(container).style.width).toBe('100%')
+  it('frames at 834px for Tablet (iPad Pro 11" preset) and 390px for Mobile (iPhone class)', () => {
+    expect(deviceCard(setup({ device: 'Tablet' }).container).style.width).toBe('834px')
+    cleanup()
+    expect(deviceCard(setup({ device: 'Mobile' }).container).style.width).toBe('390px')
   })
 
   it('no per-mode height is imposed on the wrapper — no fixed device aspect ratio', () => {
-    const { container } = setup()
-    for (const label of ['Desktop', 'Tablet', 'Mobile']) {
-      fireEvent.click(screen.getByRole('button', { name: new RegExp(label, 'i') }))
+    for (const device of ['Desktop', 'Tablet', 'Mobile']) {
+      const { container } = setup({ device })
       expect(deviceCard(container).style.height).toBe('')
+      cleanup()
     }
   })
 
   it('the card keeps relative + overflow-hidden in every mode — anchors/clips the C8 overlays', () => {
-    const { container } = setup()
-    for (const label of ['Desktop', 'Tablet', 'Mobile']) {
-      fireEvent.click(screen.getByRole('button', { name: new RegExp(label, 'i') }))
+    for (const device of ['Desktop', 'Tablet', 'Mobile']) {
+      const { container } = setup({ device })
       expect(deviceCard(container).className).toMatch(/relative/)
       expect(deviceCard(container).className).toMatch(/overflow-hidden/)
+      cleanup()
     }
   })
 })

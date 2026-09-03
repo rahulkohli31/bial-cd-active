@@ -458,10 +458,10 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
 
     // SENDING is what waits — not typing (KTD-1/KTD-2). The text box and attach stay live so the
     // citizen can compose their next message while they watch, and the note says why send is off.
-    const textarea = screen.getByPlaceholderText(/describe what you need/i)
+    const textarea = screen.getByPlaceholderText(/ask for another change/i)
     expect(textarea.disabled).toBe(false)
     expect(screen.getByTitle(/Attach images/i).disabled).toBe(false)
-    expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/send unlocks when it’s done/i)
+    expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/send unlocks when it is done/i)
 
     // …and the gate is ENFORCED, not merely rendered: `aria-disabled` is affordance only and the
     // textarea is not disabled at all, so Enter must be refused by `handleSend` itself.
@@ -474,7 +474,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     // round-trip (`buildStarting`), pinned separately in `BuilderPage-composer.test.jsx`.
     fireEvent.change(textarea, { target: { value: 'make it dark mode' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
-    expect(await screen.findByText(/send unlocks when it’s done/i)).toBeTruthy()
+    expect(await screen.findByText(/send unlocks when it is done/i)).toBeTruthy()
     expect(h.startTurn).not.toHaveBeenCalled()
     expect(h.stop).not.toHaveBeenCalled()
     expect(h.buildFromPlan).not.toHaveBeenCalled()
@@ -502,7 +502,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     await turn.frame(T_BUILD_END())
     await turn.end()
     await waitFor(() => expect(screen.queryByTestId('composer-gate-note')).toBeNull())
-    expect(screen.getByPlaceholderText(/describe what you need/i).disabled).toBe(false)
+    expect(screen.getByPlaceholderText(/ask for another change/i).disabled).toBe(false)
     expect(screen.getByTitle(/Attach images/i).disabled).toBe(false)
 
     h.buildFromPlan.mockClear()
@@ -543,7 +543,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     await turn.end()
 
     await waitFor(() => expect(screen.queryByTestId('composer-gate-note')).toBeNull())
-    expect(screen.getByPlaceholderText(/describe what you need/i).disabled).toBe(false)
+    expect(screen.getByPlaceholderText(/ask for another change/i).disabled).toBe(false)
     expect(screen.queryByRole('button', { name: /^Mode:/ })).toBeNull()
   })
 
@@ -595,7 +595,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     renderBuilder({ deps: sessionDeps })
 
     await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('live-7'))
-    const textarea = await screen.findByPlaceholderText(/describe what you need/i)
+    const textarea = await screen.findByPlaceholderText(/ask for another change/i)
     await waitFor(() => expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/send unlocks/i))
     // Typing and attaching stay live over the live build; only SEND waits.
     expect(textarea.disabled).toBe(false)
@@ -634,7 +634,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     await send('a visitor app')
     fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
 
-    const textarea = screen.getByPlaceholderText(/describe what you need/i)
+    const textarea = screen.getByPlaceholderText(/ask for another change/i)
     await waitFor(() => expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/send unlocks/i))
 
     h.startTurn.mockClear()
@@ -676,7 +676,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
         <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId="chat-A" projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} /> />)}</Routes>
       </MemoryRouter>,
     )
-    await screen.findByPlaceholderText(/describe what you need/i)
+    await screen.findByPlaceholderText(/ask for another change/i)
     await send('build A')
     fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
     await waitFor(() =>
@@ -700,7 +700,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
-    const sibling = await screen.findByPlaceholderText(/describe what you need/i)
+    const sibling = await screen.findByPlaceholderText(/ask for another change/i)
     await waitFor(() => expect(screen.queryByTestId('composer-gate-note')).toBeNull())
     expect(sibling.disabled).toBe(false)
 
@@ -740,7 +740,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
       </MemoryRouter>,
     )
     // Build + frame a preview in project A.
-    const ta = await screen.findByPlaceholderText(/describe what you need/i)
+    const ta = await screen.findByPlaceholderText(/ask for another change/i)
     fireEvent.change(ta, { target: { value: 'build A' } })
     fireEvent.keyDown(ta, { key: 'Enter' })
     fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
@@ -774,7 +774,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
 
     // Confirm a brief in project B → refused WITHOUT stopping or restarting A's build.
     h.buildFromPlan.mockRejectedValue(new Error('You already have a build running in another project.'))
-    const tb = await screen.findByPlaceholderText(/describe what you need/i)
+    const tb = await screen.findByPlaceholderText(/ask for another change/i)
     fireEvent.change(tb, { target: { value: 'build B' } })
     fireEvent.keyDown(tb, { key: 'Enter' })
     fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
@@ -877,7 +877,7 @@ describe('BuilderPage — the "come back later" relaunch entry point (#43)', () 
     h.getBuild.mockResolvedValue(null)
     const { deps: sessionDeps } = deps()
     const { container } = renderBuilder({ deps: sessionDeps })
-    await screen.findByPlaceholderText(/describe what you need/i)
+    await screen.findByPlaceholderText(/ask for another change/i)
     // A PROJECT WITH NOTHING BUILT NOW HAS ITS OWN SENTENCE, and it is an invitation rather than a
     // report of an absence — the pane's empty state, from the one computed workspace value. The
     // earlier "we could not check on your app" was this file's poll failing on an unmocked fetch,
@@ -907,7 +907,7 @@ describe('a failed mode switch says what actually failed (N12) — RETIRED, now 
     renderBuilder({ deps: sessionDeps })
 
     // LIVENESS FIRST: an absent pill also describes a component that threw and rendered nothing.
-    await screen.findByPlaceholderText(/describe what you need/i)
+    await screen.findByPlaceholderText(/ask for another change/i)
     expect(screen.queryByRole('button', { name: /^Mode: /i })).toBeNull()
     fireEvent.keyDown(document, { code: 'KeyP', altKey: true })
     expect(screen.queryByRole('menuitemradio')).toBeNull()
@@ -984,7 +984,7 @@ describe('a read turn reads the live container without becoming a build (2026-07
     await send('What is the heading text on the page right now? One line.')
 
     await waitFor(() =>
-      expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/send unlocks when it’s done/i),
+      expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/send unlocks when it is done/i),
     )
     // …and it is stoppable for all of it, which the wait's own headline never made it.
     expect(screen.getByTestId('stop-turn')).toBeTruthy()
@@ -998,7 +998,7 @@ describe('a read turn reads the live container without becoming a build (2026-07
     await turn.frame(T_WORKSPACE('ready', 2))
     // The container coming up changes nothing a citizen reads in the conversation: the reply is
     // still coming, and that is still the only thing the chat says about it.
-    expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/send unlocks when it’s done/i)
+    expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/send unlocks when it is done/i)
     expect(chat.queryByText(/Setting up your sandbox/i)).toBeNull()
   })
 

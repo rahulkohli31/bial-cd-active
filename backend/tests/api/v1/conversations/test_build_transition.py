@@ -834,7 +834,11 @@ async def test_unsaved_work_in_another_project_refuses_the_handoff_with_its_own_
 
     async def _blocked(*a: object, **k: object) -> None:
         raise SandboxReclaimBlockedError(
-            project_id=uuid.uuid4(), project_name="Visitor Log", app_id=uuid.uuid4(), dirty=True
+            project_id=uuid.uuid4(),
+            project_name="Visitor Log",
+            app_id=uuid.uuid4(),
+            dirty=True,
+            agent_working=True,
         )
 
     minted = uuid.uuid4()
@@ -851,6 +855,10 @@ async def test_unsaved_work_in_another_project_refuses_the_handoff_with_its_own_
     error = resp.json()["error"]
     assert error["code"] == "sandbox_reclaim_blocked"  # NOT the generic try-again-shortly
     assert error["projectName"] == "Visitor Log"  # it names what is in the way
+    # The SECOND of the three entry points into the hand-over dialog, carrying the same facts as
+    # the send route — the point of routing all three through one responder is that "correct on
+    # the one that was tested" cannot happen here.
+    assert error["agentWorking"] is True
     assert await _chats_with_id(db_session, minted) == 0  # and nothing was created
 
 

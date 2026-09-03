@@ -60,6 +60,8 @@ export interface MountedConversation {
 
 interface Props {
   conversation: MountedConversation
+  /** Passed through to the surface — see `ConversationSurfaceProps.onTitleDerived`. */
+  onTitleDerived?: (title: string) => void
   /**
    * Hide the conversation without discarding it. No caller in this plan sets it — the builder
    * surface's own chat-panel collapse hides a panel, not the whole conversation, and Plan F's rail
@@ -69,7 +71,7 @@ interface Props {
   hidden?: boolean
 }
 
-export default function ConversationSlot({ conversation, hidden = false }: Props) {
+export default function ConversationSlot({ conversation, hidden = false, onTitleDerived }: Props) {
   // `kind` IS destructured now, and the reason is narrow enough to write down (Plan F, U6).
   //
   // The branch this file retired picked a whole PAGE per kind — a different root layout, a
@@ -99,7 +101,12 @@ export default function ConversationSlot({ conversation, hidden = false }: Props
           surface declares the app pane VISIBLE (R11/R12), and the line that stands in for it. That
           is presentation — the pane's absence is not what stops a Plan chat changing the app; the
           toolset is. */}
-      <ConversationSurface {...shared} kind={kind} projectHasSavedBuild={projectHasSavedBuild} />
+      <ConversationSurface
+        {...shared}
+        kind={kind}
+        projectHasSavedBuild={projectHasSavedBuild}
+        onTitleDerived={onTitleDerived}
+      />
     </div>
   )
 }

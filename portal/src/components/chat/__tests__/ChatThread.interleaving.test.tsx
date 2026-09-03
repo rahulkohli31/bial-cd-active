@@ -25,6 +25,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, cleanup } from '@testing-library/react'
 
 import ChatThread from '../ChatThread'
+import ChatRuntimeProvider from '../runtime/ChatRuntimeProvider'
 import type { ChatMessage, MessagePart } from '../../../utils/messageTypes'
 import type { StepItem } from '../../../utils/turnStreamApi'
 
@@ -42,12 +43,14 @@ const step = (seq: number, label: string): StepItem => ({
 function mount(messages: ChatMessage[], isRunning = false) {
   return render(
     <div style={{ height: 600 }}>
-      <ChatThread
+      <ChatRuntimeProvider
         messages={messages}
         isRunning={isRunning}
         onNew={vi.fn().mockResolvedValue(undefined)}
         onCancel={vi.fn().mockResolvedValue(undefined)}
-      />
+      >
+        <ChatThread />
+      </ChatRuntimeProvider>
     </div>,
   )
 }

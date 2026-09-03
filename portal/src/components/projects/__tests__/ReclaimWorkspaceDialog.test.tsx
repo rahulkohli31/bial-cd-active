@@ -8,7 +8,7 @@ const BLOCKED = {
   projectId: 'p-a',
   projectName: 'Lost & Found',
   dirty: true as boolean | null,
-  building: false,
+  building: false, agentWorking: false,
 }
 /** The refusal a project whose agent is mid-write produces: `building`, and `dirty` null
  *  because the server deliberately did not probe a tree being written to. */

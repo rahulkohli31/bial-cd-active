@@ -77,21 +77,24 @@ const preview = (over: Record<string, unknown> = {}) => ({
 })
 
 const EMPTY_PANE: PaneView = {
-  toolbarLeading: null, toolbarTrailing: null,
   iterating: false, reconnecting: false,
   relaunching: false, relaunchError: null, lastBuildFailed: false,
   restoredFromFailedBuild: false, completedLive: true, hasSavedBuild: null,
   previewState: null, occupyingProjectName: null, turnRunning: false,
   compileState: null, workspaceLost: false,
-  saveDirty: null, saving: false, saveError: null,
 }
 
-/** A build chat, publishing its own address — the OTHER publisher on this channel. */
-function ChatSurface({ projectId = 'pA' }: { projectId?: string }) {
+/**
+ * A chat, publishing its own address — the OTHER publisher on this channel.
+ *
+ * `pane` is the one thing the two KINDS differ on here (plan 002, U6): a build chat asks for the
+ * app to be seen, a plan chat does not. Everything else about a conversation is the same on both.
+ */
+function ChatSurface({ projectId = 'pA', pane = true }: { projectId?: string; pane?: boolean }) {
   useWorkspaceProject(projectId)
   usePublishAddress({ url: APP_URL, status: 'ready' }, projectId)
   usePublishPaneView(EMPTY_PANE)
-  useAppPaneVisible(true)
+  useAppPaneVisible(pane)
   return <div data-testid="chat-surface" />
 }
 
@@ -102,12 +105,7 @@ function Surface({ project = PROJECT }: { project?: Project }) {
   return (
     <ProjectWorkspace
       project={project}
-      chats={[]}
-      chatsError={null}
       onProjectUpdate={noop}
-      onBack={noop}
-      onOpenChat={noop}
-      onDeleteChat={noop}
     />
   )
 }
@@ -123,6 +121,7 @@ function Workspace({ entry = '/projects/pA', project = PROJECT }: { entry?: stri
             element={
               <>
                 <Link to="/chat/c1">to chat</Link>
+                <Link to="/plan/c2">to plan chat</Link>
                 <Surface project={project} />
               </>
             }
@@ -133,6 +132,15 @@ function Workspace({ entry = '/projects/pA', project = PROJECT }: { entry?: stri
               <>
                 <Link to="/projects/pA">to project</Link>
                 <ChatSurface />
+              </>
+            }
+          />
+          <Route
+            path="/plan/:chatId"
+            element={
+              <>
+                <Link to="/projects/pA">to project</Link>
+                <ChatSurface pane={false} />
               </>
             }
           />
@@ -187,6 +195,11 @@ describe('R3 — loading a project address frames the running app, with no chat 
     // interpret. There is no frame, because there is nothing to frame; there is a sentence.
     expect(paneRegion()).toBeTruthy()
     expect(screen.getByTestId('app-pane-empty').textContent).toMatch(/describe what you want to build/i)
+    // ★ ONE AUTHOR FOR THE WORKSPACE SENTENCE (plan 002, U4). It was rendered twice — by the
+    // pane and by the rail's status card — and the rail's APP STATUS section is the publish
+    // panel the boards draw now. `getAllByText` would tolerate a second renderer; counting is
+    // what forbids one.
+    expect(screen.queryAllByText(/describe what you want to build/i)).toHaveLength(1)
     expect(frame()).toBeNull()
     expect(frameWrapper()).toBeNull()
   })
@@ -295,31 +308,37 @@ describe('AE37 — the stacked crossing is a class, not a remount', () => {
     await waitFor(() => expect(frame()).toBeTruthy())
 
     expect(grid().className).toMatch(/flex-col/)
-    expect(grid().className).toMatch(/lg:flex-row/)
+    expect(grid().className).toMatch(/wide:flex-row/)
   })
 
-  it('gives the project rail the narrower of the two settled widths', async () => {
+  it('gives the project rail the narrower of the two OPENING widths', async () => {
     render(<Workspace />)
     await waitFor(() => expect(screen.getByTestId('description-editor')).toBeTruthy())
 
-    expect(rail().className).toMatch(/lg:w-\[400px\]/)
+    expect(rail().style.getPropertyValue('--rail-w')).toBe('400px')
     expect(rail().getAttribute('data-rail-mode')).toBe('details')
   })
 })
 
 describe('the collapse control — hidden, not unmounted, and never a one-way door', () => {
-  it('★ lives in the PANE, so it is still reachable once the rail is hidden', async () => {
+  it('★ lives in the TOOLBAR ROW, so it is still reachable once the rail is hidden', async () => {
     // The failure this is written against: a toggle inside the rail. A collapsed rail is `w-0` and
     // `invisible` — out of the tab order and out of the accessibility tree — so the control that
     // would restore it would be unreachable, and nothing short of a reload could undo the press.
+    //
+    // It was in the PANE for exactly that reason, and plan 002's U2 moved it one step further out,
+    // to the row above both columns. The reachability property is unchanged and still asserted; the
+    // row is simply the one surface that survives a collapse AND the pane going away, so the
+    // control has one home in every state rather than appearing and disappearing with the frame.
     api.fetchPreviewState.mockResolvedValue(
       preview({ state: 'alive', alive: true, previewUrl: APP_URL, restorable: true }),
     )
     render(<Workspace />)
     await waitFor(() => expect(frame()).toBeTruthy())
 
-    const toggle = screen.getByRole('button', { name: /hide project details/i })
-    expect(paneRegion()?.contains(toggle)).toBe(true)
+    const toggle = screen.getByRole('button', { name: /hide details/i })
+    expect(screen.getByTestId('workspace-toolbar').contains(toggle)).toBe(true)
+    expect(paneRegion()?.contains(toggle)).toBe(false)
     expect(rail().contains(toggle)).toBe(false)
 
     fireEvent.click(toggle)
@@ -328,7 +347,7 @@ describe('the collapse control — hidden, not unmounted, and never a one-way do
     expect(rail().className).toMatch(/(^|\s)w-0(\s|$)/)
     expect(rail().className).toMatch(/invisible/)
     // Still there, still pressable, now offering the other direction.
-    const back = screen.getByRole('button', { name: /show project details/i })
+    const back = screen.getByRole('button', { name: /show details/i })
     expect(back.getAttribute('aria-expanded')).toBe('false')
     expect(back.getAttribute('aria-controls')).toBe(rail().id)
 
@@ -340,7 +359,7 @@ describe('the collapse control — hidden, not unmounted, and never a one-way do
     render(<Workspace />)
     await waitFor(() => expect(screen.getByTestId('description-editor')).toBeTruthy())
 
-    fireEvent.click(screen.getByRole('button', { name: /hide project details/i }))
+    fireEvent.click(screen.getByRole('button', { name: /hide details/i }))
 
     // The subtree is still in the document — a draft and a scroll position survive the cycle.
     expect(screen.getByTestId('description-editor')).toBeTruthy()
@@ -353,16 +372,17 @@ describe('the collapse control — hidden, not unmounted, and never a one-way do
     // chat-panel toggle. That toolbar is rendered by `LivePreview`, which only mounts once there is
     // something to frame, so a project with nothing built had NO toggle at all; and a rail
     // collapsed while an app was running would have lost its way back the moment the container
-    // stopped. Its home has to be the part of the pane that always renders.
+    // stopped. Its home has to be a surface that always renders — the pane's own outer shell then,
+    // the toolbar row now.
     api.fetchPreviewState.mockResolvedValue(preview({ state: 'never_built', restorable: false }))
     render(<Workspace project={{ ...PROJECT, appId: null, hasRelaunchableSnapshot: false }} />)
     await waitFor(() => expect(api.fetchPreviewState).toHaveBeenCalled())
     expect(frame()).toBeNull()
 
-    fireEvent.click(screen.getByRole('button', { name: /hide project details/i }))
+    fireEvent.click(screen.getByRole('button', { name: /hide details/i }))
     expect(rail().className).toMatch(/(^|\s)w-0(\s|$)/)
     // …and back again, with no frame in the story at any point.
-    fireEvent.click(screen.getByRole('button', { name: /show project details/i }))
+    fireEvent.click(screen.getByRole('button', { name: /show details/i }))
     expect(rail().className).not.toMatch(/(^|\s)w-0(\s|$)/)
   })
 
@@ -374,7 +394,7 @@ describe('the collapse control — hidden, not unmounted, and never a one-way do
     await waitFor(() => expect(frame()).toBeTruthy())
     const original = frame()
 
-    fireEvent.click(screen.getByRole('button', { name: /hide project details/i }))
+    fireEvent.click(screen.getByRole('button', { name: /hide details/i }))
 
     expect(frame()).toBe(original)
   })
@@ -397,5 +417,49 @@ describe('the channel is left as the next surface needs to find it', () => {
     // The chat surface publishes its own pane, so the frame survives on the address, not the pane.
     expect(frame()).toBe(original)
     expect(screen.getByTestId('chat-surface')).toBeTruthy()
+  })
+})
+
+/**
+ * WHAT THE SHELL DOES FOR A CHAT THAT WANTS NO PANE (plan 002, U6).
+ *
+ * The SURFACE half — that the panel fills the rail, that a plan chat centres its column, that the
+ * board's footer line appears on one kind and not the other — is `BuilderPage-panel.test.tsx`'s,
+ * where the real conversation surface renders. What is only visible HERE, through the real shell,
+ * is the relationship between the two columns: who gets the width, and whether the frame survives.
+ */
+describe('a chat that declares no pane', () => {
+  it('★ takes the whole rail, and the frame stays mounted rather than being torn down', async () => {
+    // The hide treatment, never an unmount — the same node throughout, which is what makes the
+    // board's "nothing about the app is stopped or reloaded — it is only taken off the screen" a
+    // structural fact rather than a hope.
+    api.fetchPreviewState.mockResolvedValue(
+      preview({ state: 'alive', alive: true, previewUrl: APP_URL, restorable: true }),
+    )
+    render(<Workspace />)
+    await waitFor(() => expect(frame()).toBeTruthy())
+    const original = frame()
+
+    fireEvent.click(screen.getByText('to plan chat'))
+
+    expect(rail().className).toMatch(/flex-1/)
+    expect(rail().className).not.toMatch(/lg:w-\[520px\]/)
+    expect(frameWrapper()).toBeTruthy()
+    expect(frame()).toBe(original)
+    expect(frameWrapper()?.className).toMatch(/invisible/)
+  })
+
+  it('★ and the app does not reload on the way back either', async () => {
+    api.fetchPreviewState.mockResolvedValue(
+      preview({ state: 'alive', alive: true, previewUrl: APP_URL, restorable: true }),
+    )
+    render(<Workspace />)
+    await waitFor(() => expect(frame()).toBeTruthy())
+    const original = frame()
+
+    fireEvent.click(screen.getByText('to plan chat'))
+    fireEvent.click(screen.getByText('to project'))
+
+    expect(frame()).toBe(original)
   })
 })

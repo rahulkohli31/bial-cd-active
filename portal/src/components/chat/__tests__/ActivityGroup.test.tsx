@@ -11,7 +11,8 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, cleanup, fireEvent, within } from '@testing-library/react'
 
 import ChatThread from '../ChatThread'
-import { groupLabel } from '../ActivityGroup'
+import ChatRuntimeProvider from '../runtime/ChatRuntimeProvider'
+import { groupLabel, stepIconFor } from '../ActivityGroup'
 import type { ChatMessage, MessagePart } from '../../../utils/messageTypes'
 import type { StepItem } from '../../../utils/turnStreamApi'
 
@@ -24,17 +25,24 @@ const stepPart = (seq: number, label: string, state: StepItem['state'] = 'ok'): 
 
 const textPart = (text: string): MessagePart => ({ type: 'text', text })
 
-function mount(parts: MessagePart[], opts: { isRunning?: boolean; interrupted?: boolean } = {}) {
+/** The tree under test, so a scenario can RE-RENDER it with different parts — which is the only
+ *  way to observe a group SEALING, and therefore the only way to test the peek closing itself. */
+function tree(parts: MessagePart[], opts: { isRunning?: boolean; interrupted?: boolean } = {}) {
   const message: ChatMessage = { id: 'a1', role: 'assistant', parts, seq: 1 }
-  return render(
-    <ChatThread
+  return (
+    <ChatRuntimeProvider
       messages={[message]}
       isRunning={opts.isRunning ?? false}
       onNew={vi.fn().mockResolvedValue(undefined)}
       onCancel={vi.fn().mockResolvedValue(undefined)}
-      interruptedMessageIds={opts.interrupted ? new Set(['a1']) : undefined}
-    />,
+    >
+      <ChatThread interruptedMessageIds={opts.interrupted ? new Set(['a1']) : undefined} />
+    </ChatRuntimeProvider>
   )
+}
+
+function mount(parts: MessagePart[], opts: { isRunning?: boolean; interrupted?: boolean } = {}) {
+  return render(tree(parts, opts))
 }
 
 const groups = () => screen.queryAllByTestId('activity-group')
@@ -116,12 +124,61 @@ describe('a sealed group collapses to a count, and opens where it sits', () => {
     expect(rows.querySelectorAll('.overflow-y-auto, .overflow-y-scroll')).toHaveLength(0)
   })
 
-  it('the group root carries no border class — ghost, never the registry outline card', () => {
+  it('★ is a bordered chip on the board\'s own ground, not bare text in the transcript', () => {
+    // AN EARLIER PASS READ `BuildChat` AS DRAWING NO CHROME AT ALL and said so at length in the
+    // component. `ActivityAnatomy` is the artboard that specifies this component, and it draws
+    // `border:1px solid #E2E8F0; background:#FCFDFD; border-radius:10px`. Without it the group was
+    // a line of text with nothing to say it was a receipt rather than a sentence.
     mount([stepPart(1, 'Reading your visitor screen'), textPart('Done.')])
 
-    const root = groups()[0]!
-    expect(root.className).not.toMatch(/\bborder\b/)
-    expect(trigger().className).not.toMatch(/\bborder\b/)
+    const container = screen.getByTestId('activity-group-container')
+    expect(container.className).toMatch(/border-bial-border/)
+    expect(container.className).toMatch(/rounded-\[10px\]/)
+    expect(trigger().className).toMatch(/bg-canvas-group/)
+    // It hugs its contents rather than spanning the transcript.
+    expect(container.className).toMatch(/w-fit/)
+  })
+
+  it('★ gives a problem group its own tint, and only once it is terminal', () => {
+    // `ActivityAnatomy` panel 4: "nothing is hidden when something went wrong". The container, its
+    // header and its label all change; the fail-open and the tint follow the SAME predicate, so a
+    // group cannot be red and shut, or open and neutral.
+    mount([
+      stepPart(1, 'Working on your app', 'ok'),
+      stepPart(2, 'Working on your app', 'failed'),
+      textPart('Not green yet — continuing.'),
+    ])
+    const container = screen.getByTestId('activity-group-container')
+    expect(container.getAttribute('data-problem')).toBe('true')
+    expect(container.className).toMatch(/border-problem-edge/)
+    expect(trigger().className).toMatch(/bg-problem-ground/)
+    expect(trigger().getAttribute('aria-expanded')).toBe('true')
+
+    cleanup()
+    // MID-TURN IT IS NEITHER TINTED NOR OPEN — expanding then would move what the reader is
+    // reading, and a failure that is still being recovered from is not yet a problem to report.
+    mount([stepPart(1, 'Working on your app', 'failed'), stepPart(2, 'Working on your app', 'pending')])
+    expect(screen.getByTestId('activity-group-container').getAttribute('data-problem')).toBeNull()
+    expect(trigger().getAttribute('aria-expanded')).toBe('false')
+  })
+
+  it('★ draws an icon per KIND of step, and keeps the state glyph for one that failed', () => {
+    // `ActivityAnatomy`: one icon per kind, not one tick for everything. The kind is derived from
+    // the label because the wire carries no kind — see `stepIconFor` for why that is an honest
+    // limit rather than a shortcut. A FAILED step keeps its cross: what went wrong outranks what
+    // was being attempted, and shape rather than colour carries it.
+    mount([
+      stepPart(1, 'Reading your visitor screen', 'ok'),
+      stepPart(2, 'Adding the Out column', 'ok'),
+      stepPart(3, 'Working on your app', 'failed'),
+      textPart('Done.'),
+    ])
+    const tiles = screen.getByTestId('activity-glyphs').children
+    // Three tiles, and the first two carry DIFFERENT icons — one tick for everything is exactly
+    // what this replaces. Compared by their rendered markup, since both are inline SVGs.
+    expect(tiles).toHaveLength(3)
+    expect(tiles[0]!.innerHTML).not.toBe(tiles[1]!.innerHTML)
+    expect(tiles[2]!.textContent).toMatch(/failed/i)
   })
 })
 
@@ -159,16 +216,44 @@ describe('R34 — a group that hit a problem opens by itself, but never mid-turn
 })
 
 describe('R31 — a live group names what is happening NOW and grows in place', () => {
-  it('labels the running step rather than a count, and shows one glyph per call', () => {
+  it('★ stays COLLAPSED while it runs, with the current step on one quiet line beneath it', () => {
+    // THE OWNER'S RULING OF 2026-09-02, which amends `ActivityAnatomy` panel 2 in place. The board
+    // draws a live group OPEN with the current step named inside it; the owner does not want the
+    // working detail on screen. So the row is a count with icons accumulating in it, and the
+    // sentence moves to a line underneath. Mutation receipt: return `facts.currentLabel` from
+    // `groupLabel`'s running arm again and the first two assertions go red together.
     mount([
       stepPart(1, 'Reading your restaurants screen', 'ok'),
       stepPart(2, 'Checking what a status can be', 'ok'),
       stepPart(3, 'Making sure everything fits together', 'pending'),
     ])
 
-    expect(trigger().textContent).toContain('Making sure everything fits together')
-    expect(trigger().textContent).not.toMatch(/\d+ steps/)
+    expect(trigger().getAttribute('aria-expanded')).toBe('false')
+    expect(trigger().textContent).toContain('3 steps')
+    expect(trigger().textContent).not.toContain('Making sure everything fits together')
+    expect(screen.getByTestId('activity-group-now').textContent).toBe('Making sure everything fits together')
+    // Icons accumulate in the row itself — one per call, oldest on the left.
     expect(screen.getByTestId('activity-glyphs').childElementCount).toBe(3)
+  })
+
+  it('★ a sealed group has no quiet line — its steps are in the receipt, one press away', () => {
+    mount([stepPart(1, 'Reading your restaurants screen', 'ok'), textPart('Done.')])
+    expect(screen.queryByTestId('activity-group-now')).toBeNull()
+    // LIVENESS: the group rendered, it simply has nothing happening right now.
+    expect(trigger().textContent).toContain('1 step')
+  })
+
+  it('★ a glance inside a RUNNING group closes itself when the group seals', () => {
+    // "A glance inside is temporary, not a new resting state" (owner ruling, 2026-09-02). Cleared
+    // to "the reader has not decided" rather than to closed, so a group that also FAILED still
+    // opens itself afterwards.
+    const view = mount([stepPart(1, 'Reading your restaurants screen', 'pending')])
+    fireEvent.click(trigger())
+    expect(trigger().getAttribute('aria-expanded')).toBe('true')
+
+    view.rerender(tree([stepPart(1, 'Reading your restaurants screen', 'ok')]))
+
+    expect(trigger().getAttribute('aria-expanded')).toBe('false')
   })
 
   it('AE16: a Plan-kind message with four read steps produces the same shape as a Build one', () => {
@@ -233,8 +318,12 @@ describe('groupLabel — the wording, unit-tested away from the DOM', () => {
     expect(groupLabel(facts({ count: 4, failures: 3 }), false)).toBe('4 steps · 3 problems')
   })
 
-  it('names the running step while running, whatever the failures', () => {
-    expect(groupLabel(facts({ running: true, failures: 2 }), false)).toBe('Working on your app')
+  it('is a COUNT while running too, whatever the failures — the current step is not the row\'s', () => {
+    // A COUNT OF PROBLEMS WHILE THE RUN IS STILL GOING describes something that may yet be
+    // recovered from, which is why the suffixes are sealed-only. Mutation receipt: return
+    // `facts.currentLabel` from the running arm again and this goes red.
+    expect(groupLabel(facts({ running: true, failures: 2 }), false)).toBe('9 steps')
+    expect(groupLabel(facts({ running: true, failures: 2 }), false)).not.toContain('problem')
   })
 
   it('interruption outranks a failure count, because it explains the count', () => {
@@ -258,14 +347,17 @@ describe('a group reports what it amounted to, once, as it seals', () => {
     onGroupSealed: (summary: string) => void,
     opts: { isRunning?: boolean; interrupted?: boolean } = {},
   ) => (
-    <ChatThread
+    <ChatRuntimeProvider
       messages={[{ id: 'a1', role: 'assistant', parts, seq: 1 }]}
       isRunning={opts.isRunning ?? false}
       onNew={vi.fn().mockResolvedValue(undefined)}
       onCancel={vi.fn().mockResolvedValue(undefined)}
-      interruptedMessageIds={opts.interrupted ? new Set(['a1']) : undefined}
-      onGroupSealed={onGroupSealed}
-    />
+    >
+      <ChatThread
+        interruptedMessageIds={opts.interrupted ? new Set(['a1']) : undefined}
+        onGroupSealed={onGroupSealed}
+      />
+    </ChatRuntimeProvider>
   )
 
   /**
@@ -333,5 +425,64 @@ describe('a group reports what it amounted to, once, as it seals', () => {
     rerender(withReporter(done, onGroupSealed))
     rerender(withReporter(done, onGroupSealed))
     expect(onGroupSealed).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('★ the icon map speaks the server\'s vocabulary, not a guess at it', () => {
+  // `ActivityAnatomy` never draws an empty tile: every glyph on it names a kind of call. The first
+  // cut of `stepIconFor` matched verbs the projection does not emit — `reading`, `adding`,
+  // `putting`, `creating`, `installing`, `finishing` — and had no branch for the ones it does, so a
+  // quarter of the tiles in a real 61-message transcript drew the featureless fallback circle.
+  //
+  // THESE ARE THE SERVER'S ACTUAL WORDS, copied from `backend/src/services/messages/projection.py`.
+  // If a label there is reworded, this list is what goes red.
+  const EMITTED: [string, string][] = [
+    ["Looking at your app's main page", 'read'],
+    ["Looked through the app's files", 'read'],
+    ["Inspected the app's files", 'read'],
+    ['Read app/page.tsx', 'read'],
+    ['Building your app', 'build'],
+    ['Working on your app', 'build'],
+    ['Updating app/page.tsx', 'edit'],
+    ['Edited `app/page.tsx`.', 'edit'],
+    ['Setting up the tools your app needs', 'prepare'],
+    ["Getting your app's data ready", 'prepare'],
+    ['Making sure everything fits together', 'check'],
+    ['Verifying the build…', 'check'],
+    ['Wrapping up the build', 'finish'],
+    ['Tidying things up', 'finish'],
+    ["Organized the app's files", 'finish'],
+  ]
+
+  for (const [label, kind] of EMITTED) {
+    it(`gives "${label}" a named icon (${kind}), not the fallback dot`, () => {
+      expect(stepIconFor(label).displayName).not.toBe('Circle')
+    })
+  }
+
+  it('★ groups the vocabulary rather than giving every label its own glyph', () => {
+    // A DIFFERENT assertion from the one above, and the reason both are here: "not the fallback"
+    // passes on a map that returns a different icon for every string, which is not what the board
+    // draws — its glyphs name KINDS. So the reads must agree with each other and differ from the
+    // writes.
+    const iconOf = (label: string) => stepIconFor(label).displayName
+    expect(iconOf("Looked through the app's files")).toBe(iconOf('Looking at your app'))
+    expect(iconOf("Inspected the app's files")).toBe(iconOf('Looking at your app'))
+    expect(iconOf('Building your app')).not.toBe(iconOf('Looking at your app'))
+    expect(iconOf('Making sure everything fits together')).not.toBe(iconOf('Building your app'))
+  })
+
+  it('★ sees through the "Still …" prefix a slow step is wrapped in', () => {
+    // The projection fronts a long-running step's OWN words rather than replacing them, so the raw
+    // string starts with "Still" — and the steps a citizen stares at longest were exactly the ones
+    // being sent to the neutral dot.
+    expect(stepIconFor('Still setting up the tools your app needs').displayName)
+      .toBe(stepIconFor('Setting up the tools your app needs').displayName)
+  })
+
+  it('keeps the fallback for a call the SERVER could not name either', () => {
+    // `Used {tool_name}` is the projection admitting it has no words for this one. Guessing an icon
+    // here would be a claim about what the agent did that nothing on the wire supports.
+    expect(stepIconFor('Used fetch_output_slice').displayName).toBe('Circle')
   })
 })

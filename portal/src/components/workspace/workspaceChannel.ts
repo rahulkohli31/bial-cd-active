@@ -12,12 +12,13 @@
  * ═══ WHAT TRAVELS ON IT, AND NOTHING ELSE ═══
  *
  *  1. the resolved preview address and its status      (`utils/previewAddress.ts`)
- *  2. the pane's view — visibility, toolbar slots, and the pane's own pass-through props
+ *  2. the pane's view — visibility and the pane's own pass-through props
  *  3. the reclaim dialog's open state
  *  4. the tri-state save state
  *  5. the app-revealed callback (R104's stop-clock)
  *  6. the rail mode, its collapse, and an opaque per-mode bag that outlives a chat
  *  7. what to SAY about the workspace — one computed value, and the handlers for its one action
+ *  8. what the toolbar row NAMES, and the save control's values and its action (plan 002, U2)
  *
  * TWO RULES MAKE IT SAFE, and they are the whole contract:
  *
@@ -45,9 +46,9 @@
  * re-renders once per character exactly as `LivePreview` did when the page rendered it directly.
  * What the split protects is the thing that matters: the address is the VALUE-compared cell and
  * the frame's identity input, so no amount of typing can move what is framed. Do not "fix" the
- * PANE's re-render with a shallow comparator — its view carries toolbar ReactNodes rebuilt every
- * render, so a comparator would buy nothing without memoising those too, and that is a behaviour
- * change this refactor is not making.
+ * PANE's re-render with a shallow comparator — its view is rebuilt by identity every render, with
+ * fresh handler closures on it, so a comparator would buy nothing without memoising those too, and
+ * that is a behaviour change this refactor is not making.
  *
  * THAT WARNING IS ABOUT THE PANE, AND ONLY THE PANE. `address`, `rail` and `workspace` are all
  * value-compared, because each carries plain data (plus, for `workspace`, handlers that are
@@ -56,13 +57,13 @@
  * The context carries the CHANNEL HANDLE, which is created once and never replaced. That handle is
  * stable for the life of the shell, so the context itself never re-renders anybody.
  */
-import { createContext, useContext, useLayoutEffect, useRef, useSyncExternalStore, type ComponentProps, type ReactNode } from 'react'
+import { createContext, useContext, useLayoutEffect, useRef, useSyncExternalStore, type ComponentProps } from 'react'
 // TYPE-ONLY, so this stays a leaf at runtime: the import is erased and the channel keeps no
 // dependency on the component it describes.
 import type LivePreview from '../LivePreview'
 import type { PreviewAddress } from '../../utils/previewAddress'
 import type { CompileState } from '../../utils/compileState'
-import type { PreviewLifeState, ReclaimBlocked } from '../../utils/buildSessionApi'
+import type { HandoverStep, PreviewLifeState, ReclaimBlocked } from '../../utils/buildSessionApi'
 import type { RelaunchError } from '../../utils/buildSessionTypes'
 import { sameWorkspaceState } from './workspaceState'
 import type { StartOutcome, WorkspaceState } from './workspaceState'
@@ -107,7 +108,7 @@ const sameAddress = (a: WorkspaceAddress, b: WorkspaceAddress) =>
  * stable across renders that did not change it.
  */
 const sameRail = (a: RailSlot, b: RailSlot) =>
-  a.mode === b.mode && a.stacked === b.stacked && a.collapsed === b.collapsed && a.state === b.state
+  a.mode === b.mode && a.stacked === b.stacked && a.collapsed === b.collapsed
 
 /**
  * What the mounted surface asks the pane to SHOW — its visibility declaration, its toolbar slots,
@@ -121,8 +122,17 @@ const sameRail = (a: RailSlot, b: RailSlot) =>
  * describes.
  */
 export interface PaneView {
-  toolbarLeading: ReactNode
-  toolbarTrailing: ReactNode
+  /* NO TOOLBAR SLOTS ANY MORE (plan 002, U2). `toolbarLeading` and `toolbarTrailing` existed so a
+     surface could push chrome into the row `LivePreview` drew inside the pane. That row is gone —
+     the boards draw one toolbar for the whole workspace, above both columns — so the slots have no
+     row to fill and are removed rather than left pointing at nothing. Their two occupants (the
+     publish chip and, before it, a chat-panel toggle) are drawn by the row itself.
+
+     THE SAVE MODEL LEFT WITH THEM, for the same reason: Save is in the row now, reading the
+     channel's own `save` cell. Keeping a second copy here would give one control two publishers
+     that could disagree — and the pane spread would silently drop it, since JSX spread attributes
+     are exempt from excess-property checking. `UnacceptedPaneProps` below is what caught exactly
+     that when this field list was first trimmed. */
   /** Chat-scoped: this conversation's own turn. */
   iterating: boolean
   reconnecting: boolean
@@ -140,11 +150,6 @@ export interface PaneView {
   /** App-scoped: about the project's ONE app, deliberately NOT narrowed to the open chat. */
   compileState: CompileState | null
   workspaceLost: boolean
-  /** The save model (KTD-5e). `saveDirty` is TRI-STATE — `null` is UNKNOWN, never clean. */
-  saveDirty: boolean | null
-  saving: boolean
-  saveError: string | null
-  onSave?: () => void
   /** The framed app's own error reporter, scoped to the framed URL by its caller. */
   onFrameMessage?: (data: unknown) => void
   /**
@@ -194,15 +199,26 @@ export interface ReclaimRequest {
   /** `true` saves the other project before releasing it; `false` releases without saving. */
   resolve: (save: boolean) => Promise<void>
   cancel: () => void
+  /**
+   * WHICH STEP THE HAND-OVER HAS REACHED (plan 002, U9), or `null` before one starts.
+   *
+   * It travels with the request rather than being derived by the dialog, because the SEQUENCE is
+   * the publisher's: stop the other project, wait for that to genuinely finish, save, release,
+   * start this one, and only then open the chat. Those take real time — a stop alone waits on a
+   * finish path that contains a recovery autosave — and a dialog left spinning through them is
+   * indistinguishable from one that has hung.
+   */
+  step: HandoverStep | null
 }
 
 /**
- * The rail's slot, provided now and filled by Plan F.
+ * The rail's slot — WHICH RAIL IS SHOWING, and how the shell is laying it out.
  *
- * Plan F needs the rail mode and an opaque per-mode bag to outlive a chat (R9, R63), and has
- * already rejected a `?rail=` query param on the strength of shell-held state. Providing the slot
- * here costs one cell and saves F from amending a shipped component. This plan renders no rail and
- * reads no mode.
+ * It was provided ahead of the rail itself, against a `?rail=` query param that would have made a
+ * rail mode a shareable link. The rail has since landed: `WorkspaceShell` derives the mode from
+ * the address and publishes it here, and `WorkspaceRail` reads it. The "opaque per-mode bag" that
+ * was reserved alongside it was never filled by anything and has been removed rather than left
+ * standing as a field every writer has to remember to carry.
  */
 export interface RailSlot {
   /**
@@ -215,8 +231,6 @@ export interface RailSlot {
    * different feature from the one R9 asks for.
    */
   mode: string | null
-  /** Opaque to the shell; the Outlet child owns the contents. */
-  state: Record<string, unknown>
   /**
    * Below R13's threshold the two columns stack instead of sitting side by side. Plan F owns the
    * threshold that flips this; THIS PLAN OWNS THE CONTAINER whose class it changes, which is what
@@ -245,6 +259,92 @@ export interface RailSlot {
 }
 
 /**
+ * WHAT THE TOOLBAR ROW NAMES — the heading half (plan 002, U2).
+ *
+ * ═══ WHY THIS IS ITS OWN CELL, WHICH THE PLAN ASKED TO HAVE RECORDED ═══
+ *
+ * The row could have read the `pane` cell, which already carries chrome. It must not, for two
+ * reasons that are both about the wrong lifetime rather than about tidiness:
+ *
+ *  1. THE PANE CELL IS REPUBLISHED ON EVERY KEYSTROKE. Its publisher is the conversation surface,
+ *     which re-renders per character typed in the composer, and the cell holds React elements that
+ *     cannot be value-compared. The row would re-render with the composer.
+ *  2. THE PANE CELL IS CLEARED TO NOTHING ON UNMOUNT. The row has to name the project on a screen
+ *     where no conversation is mounted at all.
+ *
+ * ═══ AND WHY THE ROUTES PUBLISH IT, NOT THE SURFACES ═══
+ *
+ * `ProjectPage` and `ChatRoute` are mounted for the whole life of an address INCLUDING their
+ * loading and load-error branches; the surfaces below them are not. A cold open of `/chat/{id}`
+ * spends its first frames with no conversation and no project resolved, and the row still has to
+ * render its back control and hold its own height rather than appearing once the fetches land.
+ * That is the "renders without a flash of empty space or a layout shift" property, and it is a
+ * consequence of WHERE this is published rather than of anything the row does.
+ */
+export interface WorkspaceHeading {
+  projectId: string | null
+  /** `null` until the project's own fetch lands — a cold open of a chat address, or a project
+   *  whose row was deleted out from under it. The row renders a stable fallback, never a gap. */
+  projectName: string | null
+  /** Set only on a chat address. `null` on the project screen, and `null` for a freshly minted
+   *  chat whose row does not exist yet — its title is derived from the first message it sends. */
+  chatTitle: string | null
+  /** The stored wire value (`plan` / `build`), presented through `utils/chatKind.ts`. */
+  chatKind: string | null
+}
+
+export const NO_HEADING: WorkspaceHeading = {
+  projectId: null,
+  projectName: null,
+  chatTitle: null,
+  chatKind: null,
+}
+
+/**
+ * THE SAVE HALF OF THE ROW — its VALUES only. The action lives in `actions`, and the split is
+ * the point.
+ *
+ * A handler on a value-compared cell is the hazard `sameReport` had to write a paragraph of rules
+ * around: skip it in the comparator and a stale closure survives, compare it and every render of
+ * the publisher wakes the subscriber. The row needs neither. It needs the latest handler AT THE
+ * MOMENT OF A PRESS, which is not a render-time need at all — so the handler goes in its own cell
+ * that nothing subscribes to and the row reads imperatively inside its `onClick`.
+ */
+export interface SaveSlot {
+  /** TRI-STATE. `true` definitely dirty, `false` definitely clean, `null` "could not tell". */
+  dirty: boolean | null
+  saving: boolean
+  error: string | null
+  /**
+   * WHETHER AN ACTION IS PUBLISHED AT ALL — derived from `actions` by `usePublishSave`, never
+   * passed separately, so the two cannot disagree.
+   *
+   * The row needs this at RENDER time and the action itself only at press time, which is why one
+   * is a compared value here and the other is a cell nothing subscribes to. Without it the row
+   * cannot tell a pressable control from a status, and today's project screen — whose surface
+   * deliberately publishes no `onSave` — would draw a button that does nothing.
+   */
+  canSave: boolean
+}
+
+export const NO_SAVE: SaveSlot = { dirty: null, saving: false, error: null, canSave: false }
+
+/**
+ * THE ROW'S HANDLERS, held apart from every compared value on purpose.
+ *
+ * Both are things a citizen PRESSES, so neither is needed at render time — which is what lets them
+ * live in a cell nothing subscribes to. `rename` is here because the rail's header, which used to
+ * own it, is replaced by the board's three sections; the capability had to move rather than be
+ * dropped, and the row is where its name now lives.
+ */
+export interface WorkspaceActions {
+  save: (() => void) | null
+  rename: (() => void) | null
+}
+
+export const NO_ACTIONS: WorkspaceActions = { save: null, rename: null }
+
+/**
  * The address, plus the ONE thing that can invalidate it after its publisher is gone.
  *
  * An address OUTLIVES the surface that published it — that is the whole mechanism, and it is why
@@ -259,7 +359,16 @@ export interface WorkspaceAddress extends PreviewAddress {
 
 export const NO_ADDRESS: WorkspaceAddress = { url: null, status: null, projectId: null }
 
-export const NO_RAIL: RailSlot = { mode: null, state: {}, stacked: false, collapsed: false }
+export const NO_RAIL: RailSlot = { mode: null, stacked: false, collapsed: false }
+
+const sameHeading = (a: WorkspaceHeading, b: WorkspaceHeading) =>
+  a.projectId === b.projectId &&
+  a.projectName === b.projectName &&
+  a.chatTitle === b.chatTitle &&
+  a.chatKind === b.chatKind
+
+const sameSave = (a: SaveSlot, b: SaveSlot) =>
+  a.dirty === b.dirty && a.saving === b.saving && a.error === b.error && a.canSave === b.canSave
 
 /**
  * WHAT THE PANE NEEDS IN ORDER TO SAY WHAT THE WORKSPACE IS DOING (Plan F, U2/U3/U4).
@@ -326,6 +435,17 @@ export interface WorkspaceChannel {
   /** `null` means NOBODY HAS REPORTED, which is the same "could not tell" as a failed check. */
   saveDirty: Cell<boolean | null>
   rail: Cell<RailSlot>
+  /** What the toolbar row NAMES. Published by the routes — see `WorkspaceHeading`. */
+  heading: Cell<WorkspaceHeading>
+  /** The save control's values. Its ACTION is the next cell, deliberately. */
+  save: Cell<SaveSlot>
+  /**
+   * THE ROW'S ACTIONS, AND NOTHING SUBSCRIBES TO THEM. Republished on every render of whichever
+   * surface owns them, compared by identity, and read imperatively by the row at press time. That
+   * is what makes a changing handler free: it wakes nobody, and it can never be stale, because the
+   * read happens after the press rather than during a render.
+   */
+  actions: Cell<WorkspaceActions>
   /** What to SAY about the workspace, and the handlers for the one thing that may be pressed. */
   workspace: Cell<WorkspaceReport | null>
 }
@@ -366,6 +486,9 @@ export function createWorkspaceChannel(): WorkspaceChannel {
     reclaim: createCell<ReclaimRequest | null>(null),
     saveDirty: createCell<boolean | null>(null),
     rail: createCell<RailSlot>(NO_RAIL, sameRail),
+    heading: createCell<WorkspaceHeading>(NO_HEADING, sameHeading),
+    save: createCell<SaveSlot>(NO_SAVE, sameSave),
+    actions: createCell<WorkspaceActions>(NO_ACTIONS),
     workspace: createCell<WorkspaceReport | null>(null, sameReport),
   }
 }
@@ -442,6 +565,28 @@ export function useWorkspaceReport(): WorkspaceReport | null {
   return useCell(useWorkspaceChannel()?.workspace, null)
 }
 
+/** What the toolbar row names. Every field is independently nullable — see `WorkspaceHeading`. */
+export function useWorkspaceHeading(): WorkspaceHeading {
+  return useCell(useWorkspaceChannel()?.heading, NO_HEADING)
+}
+
+/** The save control's VALUES. Its action is read at press time — see `useWorkspaceActions`. */
+export function useWorkspaceSave(): SaveSlot {
+  return useCell(useWorkspaceChannel()?.save, NO_SAVE)
+}
+
+/**
+ * A READER, NOT A VALUE — and that is the whole design of this pair.
+ *
+ * The returned function reads the currently published handlers when it is CALLED, which is after a
+ * press. So the row never re-renders because a handler's identity changed, and it can never hold a
+ * closure from an earlier render: there is no render in between the read and the call.
+ */
+export function useWorkspaceActions(): () => WorkspaceActions {
+  const channel = useWorkspaceChannel()
+  return () => channel?.actions.get() ?? NO_ACTIONS
+}
+
 // ─── Publishing: what a mounted surface says upward ────────────────────────────────────────────
 //
 // WHETHER A PAYLOAD IS CLEARED WHEN ITS PUBLISHER UNMOUNTS IS A PER-PAYLOAD DECISION, and each
@@ -497,6 +642,36 @@ function usePublish<T>(cell: Cell<T> | undefined, value: T, onUnmount?: T, absta
 /** Declare which project the workspace is showing. `null` while a route is still resolving one. */
 export function useWorkspaceProject(projectId: string | null): void {
   usePublish(useWorkspaceChannel()?.project, projectId)
+}
+
+/**
+ * Name the workspace for the toolbar row. PUBLISHED BY THE ROUTE, not by the surface below it —
+ * see `WorkspaceHeading` for why that is what stops a cold open rendering an empty row.
+ *
+ * CLEARED ON UNMOUNT, unlike `project` and `saveDirty`. A heading describes an ADDRESS, and the two
+ * routes that publish one swap in the same commit — the departing route's cleanup and the arriving
+ * route's publish are both layout effects of that commit — so there is no frame in which the row is
+ * blank. Keeping it instead would leave a chat's title standing over the project screen for as long
+ * as `ProjectPage` spent loading, which is the one case this cell exists to get right.
+ */
+export function usePublishHeading(heading: WorkspaceHeading): void {
+  usePublish(useWorkspaceChannel()?.heading, heading, NO_HEADING)
+}
+
+/**
+ * Publish the save control's values, and its action.
+ *
+ * BOTH ARE CLEARED ON UNMOUNT, and for the same reason the reclaim request is: the action closes
+ * over the publisher's own session, and a Save button left standing after that publisher died is a
+ * button that does nothing. The tri-state on the SEPARATE `saveDirty` cell is the one that is KEPT,
+ * because the unsaved work is in the container rather than in the component and the unload warning
+ * has to stay armed across a navigation.
+ */
+export function usePublishSave(save: Omit<SaveSlot, 'canSave'>, actions: WorkspaceActions): void {
+  // A FRESH OBJECT EVERY RENDER IS FREE HERE — the cell is value-compared, so an unchanged save
+  // state wakes nobody however many times it is republished.
+  usePublish(useWorkspaceChannel()?.save, { ...save, canSave: actions.save !== null }, NO_SAVE)
+  usePublish(useWorkspaceChannel()?.actions, actions, NO_ACTIONS)
 }
 
 /**
@@ -574,21 +749,6 @@ export function usePublishSaveState(dirty: boolean | null): void {
   usePublish(useWorkspaceChannel()?.saveDirty, dirty)
 }
 
-/**
- * Publish the rail's slot — its mode, its collapse and its opaque per-mode bag (Plan F, U1).
- *
- * CLEARED ON UNMOUNT, and the reason is the opposite of the address's. An address survives its
- * publisher because the app it names is still running and R8 forbids destroying it on a
- * navigation. A rail slot describes chrome that has just been unmounted: leaving `collapsed: true`
- * standing after the surface that collapsed it is gone would hand the NEXT surface a rail already
- * hidden, with the control that would restore it published by a component that no longer exists.
- *
- * ONE WRITER AT A TIME, by construction rather than by convention: the shell mounts exactly one
- * Outlet child, and only that child publishes here.
- */
-export function usePublishRailSlot(slot: RailSlot): void {
-  usePublish(useWorkspaceChannel()?.rail, slot, NO_RAIL)
-}
 
 /**
  * Publish what to say about the workspace. CLEARED ON UNMOUNT, like the pane view and for the same

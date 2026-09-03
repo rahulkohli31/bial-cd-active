@@ -136,7 +136,11 @@ export default function LoginPage() {
         </div>
 
         <div className="relative z-10 space-y-5">
-          <span className="inline-block bg-secondary text-white text-xs font-worksans font-semibold tracking-widest uppercase px-3 py-1 rounded-full">
+          {/* A LABEL, not an action — which is the only role the gold family keeps. It is the darker
+              `secondary-800` (#8C5D1E, the same gold the BUILD pill uses) rather than the DEFAULT:
+              white on #D9A036 is 2.34:1, below AA for text this size. No board covers the login
+              panel, so nothing else here changes. */}
+          <span className="inline-block bg-secondary-800 text-white text-xs font-worksans font-semibold tracking-widest uppercase px-3 py-1 rounded-full">
             Staff Internal Portal
           </span>
           <h1 className="text-5xl font-extrabold text-white leading-tight">

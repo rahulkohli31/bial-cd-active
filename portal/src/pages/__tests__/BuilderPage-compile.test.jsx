@@ -100,7 +100,7 @@ function renderThread(chatId = 'thread-1') {
   )
 }
 
-const composer = () => screen.getByPlaceholderText(/describe what you need/i)
+const composer = () => screen.getByPlaceholderText(/ask for another change/i)
 
 async function send(text = 'a visitor app') {
   await waitForGateOpen()

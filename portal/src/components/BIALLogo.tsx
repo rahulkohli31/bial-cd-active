@@ -16,9 +16,13 @@ export default function BIALLogo({ dark = false }: BIALLogoProps) {
           className="h-8 w-auto"
         />
       </span>
+      {/* THE BOARD'S WORDMARK: 15px, weight 800, brand teal #0D7377, -0.2px tracking. It was
+          18px/700 in #00818A — a teal that is not the brand teal and that no board draws. The
+          `dark` arm keeps white, for the login panel the boards do not cover. */}
       <span
-        className="font-manrope text-lg leading-tight"
-        style={{ fontWeight: 700, color: dark ? '#FFFFFF' : '#00818A' }}
+        className={`font-manrope text-[15px] font-extrabold leading-tight tracking-[-0.2px] ${
+          dark ? 'text-white' : 'text-primary'
+        }`}
       >
         BIAL Citizen Developer
       </span>

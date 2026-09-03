@@ -59,6 +59,7 @@ from src.services.build_sessions.manager import (
     NoLiveSandboxError,
     SandboxReclaimBlockedError,
     SessionManager,
+    StopOutcome,
     app_name_for,
 )
 from src.services.redis import registry_key
@@ -932,7 +933,12 @@ async def test_stop_active_work_settles_the_build_so_the_switch_can_proceed(
     Asserts the ordering invariant end to end: while the build runs, save and release both
     refuse; after `stop_active_work` returns, the slot is free and the release goes through.
     That `_active_by_user` is empty ON RETURN is the whole contract — a stop that returned
-    before the turn unwound would hand the caller a container still owned by a running task."""
+    before the turn unwound would hand the caller a container still owned by a running task.
+
+    UPDATED FOR THE THREE STATES: this used to assert `stopped is True`, which the code returned
+    unconditionally — so the assertion held whether or not the turn had actually unwound, and
+    the two lines below it were carrying the whole test. `STOPPED` is now derived from exactly
+    what they check, so the three agree by construction rather than by luck."""
     user, project_a = await _mk(db_session, "w23@rvaiglobal.com")
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "1" * 40)
@@ -950,7 +956,7 @@ async def test_stop_active_work_settles_the_build_so_the_switch_can_proceed(
     # `gate.wait()`, which is the shape a real agent mid-write takes.
     stopped = await manager.stop_active_work(db_session, user, project_a, sandbox_client=client)
 
-    assert stopped is True
+    assert stopped is StopOutcome.STOPPED
     # THE CONTRACT: settled by the time it returned, not "asked to settle".
     assert manager.active_session_for(user.id) is None
     assert user.id not in manager._active_by_user
@@ -959,9 +965,14 @@ async def test_stop_active_work_settles_the_build_so_the_switch_can_proceed(
 async def test_stopping_a_project_that_is_not_building_is_a_quiet_success(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    """False, not an error. The caller's goal is "settled", and it already is — a 409 here
-    would make the dialog's own first step fail on the common path where the build finished
-    while the user was reading."""
+    """`NOTHING_WAS_RUNNING`, not an error. The caller's goal is "settled", and it already is —
+    a 409 here would make the dialog's own first step fail on the common path where the build
+    finished while the user was reading.
+
+    ITS OWN STATE, not the absence of a stop. The boolean this replaces spelt this case `False`
+    and a *timeout* `True`, so the one answer that must never be proceeded on shared a face with
+    the one that always may. Named separately, both proceed-able answers stay proceed-able and
+    the third can be refused on its own."""
     user, project_a = await _mk(db_session, "w24@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
@@ -973,7 +984,7 @@ async def test_stopping_a_project_that_is_not_building_is_a_quiet_success(
 
     assert (
         await manager.stop_active_work(db_session, user, project_a, sandbox_client=client)
-    ) is False
+    ) is StopOutcome.NOTHING_WAS_RUNNING
 
 
 async def test_stop_active_work_will_not_stop_a_different_project(
@@ -998,7 +1009,7 @@ async def test_stop_active_work_will_not_stop_a_different_project(
         stopped = await manager.stop_active_work(
             db_session, user, project_b, sandbox_client=client
         )
-        assert stopped is False
+        assert stopped is StopOutcome.NOTHING_WAS_RUNNING
         assert manager.active_session_for(user.id) is not None  # A is still building
     finally:
         brain.gate.set()
@@ -1098,6 +1109,12 @@ async def test_a_read_only_turn_on_an_empty_project_refuses_as_clean_not_as_buil
     # NOT the building arm, and not the unsaved-work arm. A question is not work.
     assert refusal.value.building is False
     assert refusal.value.dirty is False
+    # ...AND YET THE AGENT IS WORKING, which is a different sentence on the same dialog. This
+    # pair is the whole reason the hand-over's fact rides beside `building` instead of widening
+    # it: a plan turn is mid-thought (so the citizen is told before they choose) while the
+    # container behind it is pristine (so the clean-container escape hatch still ran and there
+    # is no Save button). Fold the two into one flag and one of these two lines becomes a lie.
+    assert refusal.value.agent_working is True
 
 
 async def test_a_write_turn_still_reports_building(
@@ -1120,6 +1137,7 @@ async def test_a_write_turn_still_reports_building(
         await manager.reclaim_preflight(db_session, user, project_b, sandbox_client=client)
     assert caught.value.building is True
     assert caught.value.dirty is None  # unprobed, because the tree IS moving
+    assert caught.value.agent_working is True  # the wide fact agrees here; it is wider, not other
 
     # ...and Save refuses for the same reason.
     with pytest.raises(BuildSessionConflictError):
@@ -1132,7 +1150,18 @@ async def test_stopping_still_covers_a_read_only_turn(
     """`stop_active_work` keeps the BROAD predicate on purpose. An Ask turn holds the
     container just as firmly as a build and `release` refuses for either, so the client calls
     stop unconditionally — narrowing this one too would put read-only modes back in the dead
-    end the whole flow exists to remove."""
+    end the whole flow exists to remove.
+
+    IT NOW REPORTS `STILL_RUNNING`, AND THAT IS THE FIX RATHER THAN A REGRESSION. The old
+    boolean answered `True` here whatever happened, which a caller reads as "the slot is yours".
+    It never was: this fixture pins the container the way a read-only turn does, and nothing
+    owns the engine turn the pin exists for, so the pin outlives the stop. `release` refuses on
+    precisely the predicate that is still true — asserted below — so "still running" is an
+    accurate prediction of the very next step, where "stopped" was a promise it would break.
+
+    WHAT THIS STILL PINS is the one thing it was written for: the broad predicate selects a
+    read-only turn. A `stop_active_work` narrowed to `may_write` would answer
+    `NOTHING_WAS_RUNNING`, and that is the assertion that goes red."""
     user, project_id = await _mk(db_session, "w30@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
@@ -1143,7 +1172,12 @@ async def test_stopping_still_covers_a_read_only_turn(
     assert manager.active_session_for(user.id) is not None
 
     stopped = await manager.stop_active_work(db_session, user, project_id, sandbox_client=client)
-    assert stopped is True
+    # The BROAD predicate: a narrowed one would have seen nothing here at all.
+    assert stopped is not StopOutcome.NOTHING_WAS_RUNNING
+    assert stopped is StopOutcome.STILL_RUNNING
+    # ...and the refusal that verdict predicts is real, which is what makes it the honest one.
+    with pytest.raises(BuildSessionConflictError):
+        await manager.release_project_sandbox(db_session, user, project_id, sandbox_client=client)
 
 
 async def test_a_failed_provision_leaks_neither_lock_nor_slot(

@@ -411,6 +411,16 @@ async def start_turn(
         # the same 503 every other coordination route gives, not a 500. An UNCONFIGURED Redis
         # skips the block and proceeds, which is right: with no coordination subsystem there is
         # no registry, no slot, and nothing a reclaim could destroy.
+        #
+        # AND IT IS ALSO THE HAND-OVER'S PREFLIGHT, which is why the body it returns carries
+        # more than the status. The browser asks the one-workspace question BY SENDING — every
+        # refusal above this line is side-effect-free, so a send that is refused leaves no chat,
+        # no turn row and no spent card — and draws its dialog from what comes back:
+        # `projectName` for which project holds the workspace, and `agentWorking` for whether
+        # that project's agent is mid-thought, of ANY kind (`building` stays narrow, and only
+        # marks a turn that can write — see `SandboxReclaimBlockedError`). Neither fact is
+        # obtainable from the cheap state poll: its documented budget forbids the container
+        # round trip the unsaved-work half needs.
         with build_coordination_or_503():
             try:
                 await manager.reclaim_preflight(db, user, project_id, sandbox_client=sandbox)

@@ -45,7 +45,7 @@
  */
 import { useCallback, useMemo, useState } from 'react'
 import WorkspaceRail from './WorkspaceRail'
-import type { ChatSummary } from '../../utils/conversationApi'
+import ProjectRenameDialog from '../projects/ProjectRenameDialog'
 import { useWorkspaceState } from './useWorkspaceState'
 import type { StartOutcome } from './workspaceState'
 import {
@@ -53,24 +53,20 @@ import {
   usePublishAddress,
   usePublishPaneView,
   usePublishReclaim,
+  usePublishSave,
   usePublishSaveState,
   usePublishWorkspaceReport,
   useWorkspaceProject,
 } from './workspaceChannel'
 import type { ReclaimRequest } from './workspaceChannel'
 import { resolvePreviewAddress } from '../../utils/previewAddress'
-import { handOverWorkspace } from '../../utils/buildSessionApi'
-import type { ReclaimBlocked } from '../../utils/buildSessionApi'
+import { handOverWorkspace, saveProject } from '../../utils/buildSessionApi'
+import type { HandoverStep, ReclaimBlocked } from '../../utils/buildSessionApi'
 import type { Project } from '../../utils/projectApi'
 
 export interface ProjectWorkspaceProps {
   project: Project
-  chats: ChatSummary[]
-  chatsError: string | null
   onProjectUpdate: (project: Project) => void
-  onBack: () => void
-  onOpenChat: (chatId: string) => void
-  onDeleteChat: (chatId: string) => void
 }
 
 export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
@@ -81,6 +77,14 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   // just pressed a button to bring up, which reads as the press having done nothing.
   const [startedPreviewUrl, setStartedPreviewUrl] = useState<string | null>(null)
   const [reclaim, setReclaim] = useState<{ blocked: ReclaimBlocked; retry: () => Promise<void> } | null>(null)
+  // THE RENAME'S STATE IS HERE BECAUSE ITS DATA IS. The control is in the shell's toolbar row,
+  // which sits above the Outlet and has no project object; this surface has both the project and
+  // the update callback, so the row publishes a press upward and the editing happens down here.
+  // WHAT THE HAND-OVER IS DOING RIGHT NOW, published to the dialog so it narrates instead of
+  // spinning. Held here because this surface performs the sequence.
+  const [step, setStep] = useState<HandoverStep | null>(null)
+  const [renaming, setRenaming] = useState(false)
+  const startRename = useCallback(() => setRenaming(true), [])
 
   const workspace = useWorkspaceState({
     projectId: project.id,
@@ -125,17 +129,32 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
       blocked: reclaim.blocked,
       // The project this surface IS — the one being started, which is what the dialog leads with.
       startingProjectName: project.name,
+      step,
       resolve: async (save: boolean) => {
-        // Stop, then save, then release — the ordering invariant lives in `handOverWorkspace`.
-        // The retry is AWAITED BEFORE the dialog is dismissed, so a switch that fails can still
-        // be reported instead of vanishing with the dialog.
-        await handOverWorkspace(reclaim.blocked.projectId, save)
-        await reclaim.retry()
-        setReclaim(null)
+        try {
+          // Stop, then WAIT FOR THE STOP TO GENUINELY FINISH, then save, then release — the
+          // ordering invariant lives in `handOverWorkspace`, and so does the refusal to proceed
+          // on a stop that only timed out.
+          await handOverWorkspace(reclaim.blocked.projectId, save, {}, setStep)
+          // The retry is AWAITED BEFORE the dialog is dismissed, so a switch that fails can still
+          // be reported instead of vanishing with the dialog. It is the whole of what was refused:
+          // starting this project's app, and — from the rail — opening the chat with the message
+          // the citizen typed, which has been held in the composer throughout.
+          setStep('starting')
+          await reclaim.retry()
+          setReclaim(null)
+        } finally {
+          setStep(null)
+        }
       },
-      cancel: () => setReclaim(null),
+      cancel: () => {
+        // CANCELLING CHANGES NOTHING ANYWHERE. Nothing has been stopped, nothing released, and the
+        // typed message and its staged files are still in the composer that never sent them.
+        setReclaim(null)
+        setStep(null)
+      },
     }
-  }, [reclaim, project.name])
+  }, [reclaim, project.name, step])
 
   const report = useMemo(
     () => ({
@@ -157,13 +176,6 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
 
   const paneView = useMemo(
     () => ({
-      // NO TOOLBAR CHROME FROM HERE. The rail's collapse control is the shell's — it is drawn by
-      // `AppPane` itself, which is the part of the pane that renders whether or not there is
-      // anything to frame. Publishing it into `LivePreview`'s toolbar left a project with nothing
-      // built without a toggle at all.
-      toolbarLeading: null,
-      // The publishing chip is the rail's, beside the project name (R37). Nothing here.
-      toolbarTrailing: null,
       // NO TURN RUNS ON THIS SURFACE. Every one of these describes a build in flight, and there is
       // none: this screen starts no turn and owns no session. `completedLive` is the one to look
       // at twice — it is the "this container is alive under an idle lease" pardon that lets a frame
@@ -184,21 +196,53 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
       // (R3 — the screen must not cause a container call).
       compileState: null,
       workspaceLost: false,
-      // The save model. `dirty` is TRI-STATE and stays tri-state — `null` is UNKNOWN, never clean.
-      // No `onSave`: saving is the user's click from a surface that has one, and this plan adds no
-      // second writer of the bundle.
-      saveDirty: workspace.save?.dirty ?? null,
-      saving: false,
-      saveError: null,
     }),
-    [workspace.preview, workspace.save, project.hasRelaunchableSnapshot],
+    [workspace.preview, project.hasRelaunchableSnapshot],
   )
 
   useWorkspaceProject(project.id)
   usePublishAddress(address, project.id)
   usePublishPaneView(paneView)
   usePublishWorkspaceReport(report)
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
+
+  /**
+   * PUSH THE WORKSPACE TO DURABLE STORAGE, from the project screen.
+   *
+   * The same call the conversation surface makes, and deliberately not shared with it: only ONE
+   * of the two is ever mounted for a given address, so there is no contest, and a hook whose whole
+   * body is three `useState`s and one request would be an abstraction over nothing.
+   *
+   * SURFACED, NEVER SWALLOWED. A save that silently fails leaves the citizen believing their work
+   * is stored, which is the one outcome worse than not offering the control at all. The server's
+   * own copy names the way out, so it is passed through rather than reworded.
+   */
+  const save = useCallback(async () => {
+    if (saving) return
+    setSaving(true)
+    setSaveError(null)
+    try {
+      await saveProject(project.id)
+      workspace.refresh()
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Could not save your work. Try again.')
+    } finally {
+      setSaving(false)
+    }
+  }, [project.id, saving, workspace])
+
   usePublishSaveState(workspace.save?.dirty ?? null)
+  // SAVE IS REACHABLE FROM THE PROJECT SCREEN (plan 002, U11), and it was not.
+  //
+  // The only writer of the bundle lived on the conversation surface, so a citizen who had built
+  // something, gone back to the project screen and then closed the tab lost it — with the rail
+  // telling them, correctly, that they had unsaved changes and offering nothing to do about it.
+  // The toolbar row is where the control lives; this is the producer behind it.
+  usePublishSave(
+    { dirty: workspace.save?.dirty ?? null, saving, error: saveError },
+    { save: workspace.save ? save : null, rename: startRename },
+  )
   usePublishReclaim(request)
   // TWO COLUMNS ARE THE REST STATE of the project screen — not something contingent on a build
   // having run. A project with nothing built shows the empty-state sentence IN the pane, not a
@@ -206,5 +250,16 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   // than an absence a citizen has to interpret.
   useAppPaneVisible(true)
 
-  return <WorkspaceRail {...props} workspace={workspace.state} save={workspace.save} />
+  return (
+    <>
+      <WorkspaceRail {...props} save={workspace.save} />
+      {renaming && (
+        <ProjectRenameDialog
+          project={project}
+          onProjectUpdate={props.onProjectUpdate}
+          onClose={() => setRenaming(false)}
+        />
+      )}
+    </>
+  )
 }

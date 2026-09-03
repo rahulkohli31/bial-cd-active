@@ -323,12 +323,36 @@ _OUTCOME_WRITE_TIMEOUT_SECONDS: float = 10.0
 # enough that failing is quicker than hanging.
 _RECOVERY_SNAPSHOT_TIMEOUT_SECONDS: float = 60.0
 
-# How long "stop the build so I can switch projects" waits for the turn to actually unwind
-# Bounds a REQUEST the user is sitting in front of, so it cannot be generous: a cancelled
-# turn's `finally` has a terminal frame, a billing write and `finish_turn_sandbox` to get
-# through, which is fast unless the container is wedged. Expiring is not a failure the user
-# needs explained — the release that follows refuses on its own, and they retry.
-_STOP_ACTIVE_WORK_TIMEOUT_SECONDS: float = 30.0
+# How long "stop the work so I can switch projects" waits for the turn to actually unwind.
+#
+# DERIVED FROM THE PATH IT WAITS ON, not chosen. The old 30 s was picked to bound a REQUEST the
+# citizen was sitting in front of — and it was BELOW the unwind's own bounds, so an ordinary,
+# healthy turn could outlast it and be reported as "still running" for doing exactly what it is
+# supposed to do. Two numbers on the very path this waits for:
+#
+#   * `_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS` (60 s) — `finish_turn_sandbox`'s recovery autosave,
+#     which a Write turn's `finally` runs before the slot is freed. This is the long pole, and
+#     it alone is twice the budget that used to bound the wait for it.
+#   * `_OUTCOME_WRITE_TIMEOUT_SECONDS` (10 s) — `_record_outcome`, the one DB step a BUILD
+#     session's `_do_finalize` runs on the same unwind.
+#
+# One budget serves both branches of `stop_active_work`, so it is their SUM rather than either
+# one: whichever branch a stop lands on, the wait sits above that branch's own bounded work
+# instead of expiring inside it. Written as the sum so it tracks either bound if it moves.
+#
+# NOTHING HOLDS A REQUEST OPEN FOR THIS. Since the stop became an ask plus a status read
+# (`request_stop_of_active_work` / `stop_state_of_active_work`), this bounds a detached task,
+# not a connection — which is what makes a budget above a minute affordable at all.
+_STOP_ACTIVE_WORK_TIMEOUT_SECONDS: float = (
+    _RECOVERY_SNAPSHOT_TIMEOUT_SECONDS + _OUTCOME_WRITE_TIMEOUT_SECONDS
+)
+
+# How long a settled stop record is kept so a status read can still tell "stopped" from "nothing
+# was running". The same window ended sessions keep, and for the same reason: a client that lost
+# its connection mid-stop comes back and asks again. Pruning past it can only ever turn one
+# proceed-able answer (stopped) into the other (nothing was running) — never a false "stopped",
+# and never a false permission.
+_STOP_RECORD_RETENTION_SECONDS: float = _ENDED_RETENTION_SECONDS
 
 _ATTACHED_READY_BUDGET_SECONDS: float = 15.0
 _COLD_READY_BUDGET_SECONDS: float = 120.0
@@ -441,6 +465,67 @@ class RecoveryNews(enum.StrEnum):
     UNVERIFIED = "unverified"
 
 
+class StopOutcome(enum.StrEnum):
+    """What a stop actually achieved — THREE NAMED STATES, never a boolean.
+
+    A boolean could not say this, and the one that used to be here said the wrong thing twice
+    over: `True` was hardcoded on both branches of `stop_active_work` and again in the turn
+    engine's own stop, while all three docstrings promised that a timeout would be reported as
+    "still running". So the one answer a caller must never act on — a stop that has not finished
+    — arrived wearing the same face as a stop that had.
+
+    The other half of why a boolean cannot work: `False` already meant "nothing was running",
+    which is a SUCCESS the caller proceeds on. Fold a timeout into it and a citizen's container
+    is taken out from under a task still writing to it; keep them apart and the two proceed-able
+    answers stay proceed-able while the third stops everything.
+
+    Read from the source of truth — whether a session still holds the app — and NEVER inferred
+    from elapsed time. A container that is merely slow has destroyed unsaved work in this repo
+    before, precisely because a timeout was read as a verdict.
+
+    * `STOPPED` — proceed. Something was running and it has finished unwinding: the slot is
+      free, so the save and the release that follow will not refuse.
+    * `NOTHING_WAS_RUNNING` — proceed. There was nothing to stop, which is the state the caller
+      wanted and the common one (work usually finishes while the citizen reads the dialog).
+    * `STILL_RUNNING` — do NOT proceed. Either the wait expired or something holds the app
+      anyway. It is not a failure to explain: read the state again in a moment.
+    """
+
+    STOPPED = "stopped"
+    NOTHING_WAS_RUNNING = "nothing_was_running"
+    STILL_RUNNING = "still_running"
+
+
+@dataclass(frozen=True)
+class _StopRecord:
+    """One stop that was asked for: the app it is stopping and the detached task doing it.
+
+    THE TASK REFERENCE IS LOAD-BEARING, not bookkeeping. Nothing else holds it, and a task the
+    loop can garbage-collect is a stop that silently never happens — the same reason
+    `SessionManager._tasks` exists for `run_build`.
+
+    `requested_at` is used for ONE thing: pruning a settled record. It is never consulted to
+    decide whether the stop finished, which is read from the session map instead."""
+
+    app_id: uuid.UUID
+    task: asyncio.Task[StopOutcome]
+    requested_at: datetime
+
+
+def _log_a_stop_that_failed(task: asyncio.Task[StopOutcome]) -> None:
+    """A detached stop that raised, said out loud.
+
+    The status read does not depend on this — it reads the session map, so a crashed stop still
+    reports honestly as "still running" while the session is held. But a stop that breaks is an
+    operator's problem the moment it repeats, and an un-retrieved task exception surfaces only
+    as a warning at collection time, attached to nothing anyone is looking at."""
+    if task.cancelled():
+        return
+    failure = task.exception()
+    if failure is not None:
+        _log.error("stop of active work failed", exc_info=failure)
+
+
 class WorkspaceUnreadableError(Exception):
     """The integrity gate could not reach the container to ask whether it still holds the app.
 
@@ -506,6 +591,20 @@ class SandboxReclaimBlockedError(Exception):
 
     So the client gets a third choice — stop and save, stop and discard, or leave it running —
     and `release` stays the only thing that destroys a container.
+
+    `agent_working=True` is a SEPARATE FACT FROM `building`, and adding it as its own field
+    rather than widening `building` is the whole point. `building` is deliberately narrow: it
+    is `_writing_session_holds`, so it marks only turns whose toolset can write. The broad
+    predicate was tried there and it is what put a hammer icon and two Stop buttons in front of
+    a citizen who had only asked a question, and short-circuited `_nothing_to_lose` — the escape
+    hatch that lets a pristine container be reclaimed without a dialog about nothing.
+
+    The hand-over needs the broad answer anyway, for a different sentence: the dialog has to say
+    whether the other project's agent is mid-thought before the citizen chooses, and a Plan or
+    an Ask turn is mid-thought exactly as a build is. `_live_session_holds` is that predicate —
+    the same one `stop_active_work` uses, because it is also the one `release_project_sandbox`
+    refuses on. Carried beside `building`, never folded into it: `building` decides WHICH dialog,
+    `agent_working` decides what the dialog says is happening right now.
     """
 
     def __init__(
@@ -516,6 +615,7 @@ class SandboxReclaimBlockedError(Exception):
         app_id: uuid.UUID,
         dirty: bool | None,
         building: bool = False,
+        agent_working: bool = False,
     ) -> None:
         super().__init__("another project is holding the sandbox")
         self.project_id = project_id
@@ -523,6 +623,7 @@ class SandboxReclaimBlockedError(Exception):
         self.app_id = app_id
         self.dirty = dirty
         self.building = building
+        self.agent_working = agent_working
 
 
 @dataclass(frozen=True)
@@ -1003,6 +1104,11 @@ class SessionManager:
         # window where a concurrent same-user start would reconcile-away the first start's
         # in-flight lock (held but registry not yet written) and double-allocate a sandbox.
         self._start_locks: dict[uuid.UUID, asyncio.Lock] = {}
+        # The stops that have been ASKED FOR, per (user, project) — a strong ref to each
+        # detached stop task, and the memory that lets the status read tell "stopped" from
+        # "nothing was running" once the work is gone. Pruned lazily; see
+        # `_prune_settled_stop_records`.
+        self._stop_records: dict[tuple[uuid.UUID, uuid.UUID], _StopRecord] = {}
 
     def _start_lock_for(self, user_id: uuid.UUID) -> asyncio.Lock:
         lock = self._start_locks.get(user_id)
@@ -1788,11 +1894,24 @@ class SessionManager:
         # buttons `release_project_sandbox` refuses while a live session owns the container, so
         # the user gets a choice and then an error whichever they pick. Observed live.
         #
+        # THE BROAD ANSWER, READ ONCE AND CARRIED TO EVERY REFUSAL BELOW. It is a separate fact
+        # from `building`, not a replacement for it (see `SandboxReclaimBlockedError`): the
+        # hand-over dialog has to tell the citizen whether the other project's agent is
+        # mid-thought before they choose, and a Plan or Ask turn is mid-thought exactly as a
+        # build is. `_live_session_holds` is also what `release_project_sandbox` refuses on, so
+        # this is a prediction of the next step rather than a guess about it.
+        #
+        # READ HERE, ABOVE the `building` arm, so every exit below carries it — including the
+        # two that fire BECAUSE there is nothing to lose. A pristine container held by a plan
+        # turn still has an agent working in it, and the dialog that offers to take it says so.
+        agent_working = self._live_session_holds(user.id, occupying.app_id)
         # `_writing_session_holds`, NOT `_live_session_holds`, and the difference is a bug this
         # arm shipped with. Every mode pins the container, so the broader predicate is true
         # throughout an ordinary Ask or Plan turn — which put a hammer icon and two Stop buttons
         # in front of a user who had asked a question, and short-circuited `_nothing_to_lose`
         # below, the escape hatch written for exactly that case ("a question is not work").
+        # THE NARROW PREDICATE STAYS NARROW: `agent_working` above exists so nothing ever needs
+        # to widen this one to answer the hand-over's question.
         if self._writing_session_holds(user.id, occupying.app_id):
             raise SandboxReclaimBlockedError(
                 project_id=occupying.project_id,
@@ -1800,6 +1919,7 @@ class SessionManager:
                 app_id=occupying.app_id,
                 dirty=None,  # deliberately unprobed: see above
                 building=True,
+                agent_working=agent_working,
             )
         try:
             handle = await self._attach_for_read(user.id, occupying.app_id, sandbox_client)
@@ -1813,6 +1933,7 @@ class SessionManager:
                 project_name=occupying.project_name,
                 app_id=occupying.app_id,
                 dirty=None,
+                agent_working=agent_working,
             ) from exc
         except NoLiveSandboxError:
             # The plain parent: the registry is certain nothing of this app's is live.
@@ -1870,6 +1991,7 @@ class SessionManager:
                 project_name=occupying.project_name,
                 app_id=occupying.app_id,
                 dirty=False,
+                agent_working=agent_working,
             )
 
         raise SandboxReclaimBlockedError(
@@ -1877,6 +1999,7 @@ class SessionManager:
             project_name=occupying.project_name,
             app_id=occupying.app_id,
             dirty=state.dirty,
+            agent_working=agent_working,
         )
 
     async def stop_active_work(
@@ -1887,37 +2010,66 @@ class SessionManager:
         *,
         sandbox_client: SandboxClient,
         timeout_s: float = _STOP_ACTIVE_WORK_TIMEOUT_SECONDS,
-    ) -> bool:
-        """Stop whatever is running in this project and wait for it to settle. Returns True if
-        something was actually stopped — the first step of "stop and switch".
+    ) -> StopOutcome:
+        """Stop whatever is running in this project, wait for it to settle, and REPORT WHAT
+        ACTUALLY HAPPENED — the first step of "stop and switch".
 
         THE FIRST STEP of the three the dialog performs, and the only one that is new: stop →
         save → release. The other two already existed and both refuse while a session is live,
         so this is what unblocks them — and the refusals stay in place as the backstop, which
         is what makes the ordering an invariant rather than a convention a client must honour.
 
-        TWO KINDS OF LIVE, one door. `_start_locked` registers a build session carrying a
-        `run_build` task and the whole terminal-commit machinery; `ensure_sandbox` registers a
-        Write turn's workspace with no task at all, because the work is running in the turn
-        engine instead. From the container's point of view an agent is writing either way, so
-        the caller should not have to know which — the branch is here.
+        THREE STATES, NOT A BOOLEAN, and this is where the boolean was a lie: both branches
+        below used to `return True` unconditionally, so a wait that expired reported the same
+        success as a turn that had genuinely unwound. See `StopOutcome`.
 
-        NOT idempotent-by-omission: returning False means nothing was running, which is a
-        success the caller can proceed on. A timeout is NOT reported as success — the session
-        stays live, the release that follows refuses, and the user is told to try again. Better
-        a retry than a container torn out from under a task that never unwound.
+        THE ANSWER IS READ, NOT ASSUMED. Whichever branch runs, the verdict comes from one
+        final look at whether a session still holds this app — the same map
+        `release_project_sandbox` refuses on — so "stopped" is a positive observation that the
+        slot is free rather than a claim about how long we waited.
 
         Scoped to the project on purpose. The slot is per-user so at most one thing is live,
         but stopping is destructive to work-in-progress and the caller asked about a specific
         project; stopping a different one because it happened to hold the slot would be the
-        silent-action failure this whole issue is about."""
+        silent-action failure this whole issue is about.
+
+        AWAITS THE WHOLE STOP, so it is not what a request should call: the router asks through
+        `request_stop_of_active_work` and reads the result back with `stop_state_of_active_work`
+        instead. This stays the one place the stop is actually performed, and the detached task
+        that ask starts is a call to it."""
         app_id = await _existing_app_id(db, user.id, project_id)
-        if app_id is None or not self._live_session_holds(user.id, app_id):
-            return False
-        session_id = self._active_by_user.get(user.id)
+        if app_id is None:
+            return StopOutcome.NOTHING_WAS_RUNNING
+        return await self._stop_the_held_session(
+            user.id, app_id, sandbox_client=sandbox_client, timeout_s=timeout_s
+        )
+
+    async def _stop_the_held_session(
+        self,
+        user_id: uuid.UUID,
+        app_id: uuid.UUID,
+        *,
+        sandbox_client: SandboxClient,
+        timeout_s: float,
+    ) -> StopOutcome:
+        """The stop itself, with NO DB SESSION — which is what lets it run detached.
+
+        The caller resolves the app row (a user-scoped read) and hands the id over; everything
+        below is the in-process session map, the sandbox client singleton and Redis. So the task
+        `request_stop_of_active_work` starts cannot outlive a request's `get_db` and read from a
+        closed connection.
+
+        TWO KINDS OF LIVE, one door. `_start_locked` registers a build session carrying a
+        `run_build` task and the whole terminal-commit machinery; `ensure_sandbox` registers a
+        Write turn's workspace with no task at all, because the work is running in the turn
+        engine instead. From the container's point of view an agent is working either way, so
+        the caller should not have to know which — the branch is here."""
+        if not self._live_session_holds(user_id, app_id):
+            return StopOutcome.NOTHING_WAS_RUNNING
+        session_id = self._active_by_user.get(user_id)
         session = self._sessions.get(session_id) if session_id is not None else None
         if session is None:
-            return False
+            return StopOutcome.NOTHING_WAS_RUNNING
         if session.task is not None:
             # A BUILD session. `stop` runs the graceful end sequence and awaits the shielded
             # finalize, so when it returns the terminal is committed and the slot is free.
@@ -1925,24 +2077,127 @@ class SessionManager:
             # BOUNDED HERE, because `stop` takes no timeout of its own: `_end` awaits the
             # cancelled task and `_await_end_sequence` awaits `finalize_task` unbounded, and a
             # finalize does real work (a snapshot bundle over the supervisor) that a wedged
-            # container can stall indefinitely. Without this the documented `timeout_s` applied
-            # to only one of the two branches, and a user sat in a request that might never
-            # return. `shield` so expiring does not cancel the end sequence — it is mid-teardown
-            # and killing it there is how containers get orphaned; we stop WAITING, we do not
-            # stop the stop. The caller treats a timeout as "still running", which is true.
+            # container can stall indefinitely. `shield` so expiring does not cancel the end
+            # sequence — it is mid-teardown and killing it there is how containers get
+            # orphaned; we stop WAITING, we do not stop the stop.
             with suppress(TimeoutError):
                 await asyncio.wait_for(
                     asyncio.shield(asyncio.ensure_future(self.stop(session, sandbox_client))),
                     timeout=timeout_s,
                 )
-            return True
-        # A WRITE TURN's workspace. The work is the engine's; the manager session is only
-        # holding the container for it. Imported lazily — `turns.engine` imports this module,
-        # so a module-level import is a cycle (the same reason `live_build.py` documents).
-        from src.services.turns.engine import get_turn_engine
+        else:
+            # A WRITE TURN's workspace. The work is the engine's; the manager session is only
+            # holding the container for it. Imported lazily — `turns.engine` imports this
+            # module, so a module-level import is a cycle (the reason `live_build.py`
+            # documents). Its own answer is deliberately not the verdict: the engine can only
+            # speak for its turn, while the fact that decides whether the container may be
+            # taken is whether the MANAGER still has the slot, which the read below asks.
+            from src.services.turns.engine import get_turn_engine
 
-        await get_turn_engine().stop_user_turn_and_wait(user.id, timeout_s=timeout_s)
-        return True
+            await get_turn_engine().stop_user_turn_and_wait(user_id, timeout_s=timeout_s)
+        # THE ONE READ THAT SETTLES IT, for both branches. A session still holding the app means
+        # the release that follows would refuse, so "still running" is not a hedge here — it is
+        # an accurate prediction of the next step. Nothing about elapsed time enters this.
+        if self._live_session_holds(user_id, app_id):
+            return StopOutcome.STILL_RUNNING
+        return StopOutcome.STOPPED
+
+    async def request_stop_of_active_work(
+        self,
+        db: AsyncSession,
+        user: User,
+        project_id: uuid.UUID,
+        *,
+        sandbox_client: SandboxClient,
+        timeout_s: float = _STOP_ACTIVE_WORK_TIMEOUT_SECONDS,
+    ) -> StopOutcome:
+        """ASK for the stop and return. Never waits for it.
+
+        The hand-over used to hold one request open for the whole stop, which made the budget a
+        hostage to whatever request timeout sits in front of the service — a number owned by the
+        client's network and recorded nowhere in this repo. Splitting the ask from the answer
+        removes that dependency entirely: this returns as soon as the stop is under way, and
+        `stop_state_of_active_work` reports how it went, however long it takes.
+
+        Answers `STILL_RUNNING` when a stop is now in flight — the honest state at that instant,
+        and the one the browser polls on. `NOTHING_WAS_RUNNING` when there was nothing to stop
+        and none has been asked for before; `STOPPED` when an earlier ask has already settled,
+        so a second press is answered with its own answer rather than starting a second stop.
+
+        ONE STOP PER PROJECT, which is what makes two tabs racing a transfer safe: the second
+        ask finds the first still in flight and joins it rather than cancelling a second time
+        into a task already unwinding. Two racing transfers therefore end with one container."""
+        app_id = await _existing_app_id(db, user.id, project_id)
+        self._prune_settled_stop_records()
+        key = (user.id, project_id)
+        in_flight = self._stop_records.get(key)
+        if in_flight is not None and not in_flight.task.done():
+            return StopOutcome.STILL_RUNNING
+        if app_id is None or not self._live_session_holds(user.id, app_id):
+            # Nothing to stop. Whether that reads as "stopped" or "nothing was running" depends
+            # on whether we were ever asked before — the same question the status read answers,
+            # asked the same way, so an ask and a read never disagree.
+            if in_flight is not None:
+                return StopOutcome.STOPPED
+            return StopOutcome.NOTHING_WAS_RUNNING
+        task = asyncio.create_task(
+            self._stop_the_held_session(
+                user.id, app_id, sandbox_client=sandbox_client, timeout_s=timeout_s
+            )
+        )
+        # A stop that raises must not vanish into an un-retrieved task exception at GC time. The
+        # status read still answers correctly either way — it reads the session map, not this
+        # task — but an operator needs to know the stop itself broke.
+        task.add_done_callback(_log_a_stop_that_failed)
+        self._stop_records[key] = _StopRecord(
+            app_id=app_id, task=task, requested_at=datetime.now(UTC)
+        )
+        return StopOutcome.STILL_RUNNING
+
+    async def stop_state_of_active_work(
+        self, db: AsyncSession, user: User, project_id: uuid.UUID
+    ) -> StopOutcome:
+        """THE STATUS READ: what the stop has actually achieved, right now.
+
+        Read from the source of truth, never inferred from elapsed time. This repo has already
+        destroyed a citizen's unsaved work by treating slow as gone, and the shape of that bug
+        was exactly this decision made on a clock. So the first question is the only one that
+        can license taking the container — does a session still hold this app? — and it is
+        asked of the same map `release_project_sandbox` refuses on.
+
+        CHEAP AND SAFE TO POLL. Two user-scoped DB reads at most (the app row), an in-process
+        dict lookup, and nothing else: no Redis, no attach, no container call. The browser polls
+        this while it narrates, and a poll that touched the container would manufacture exactly
+        the activity signal R14 forbids.
+
+        `STOPPED` requires BOTH that nothing holds the app AND that a stop was asked for. Absent
+        the second, the honest answer is `NOTHING_WAS_RUNNING` — a caller that never asked for a
+        stop has not had one, and saying otherwise would let a client believe it had performed a
+        hand-over it never started."""
+        app_id = await _existing_app_id(db, user.id, project_id)
+        if app_id is not None and self._live_session_holds(user.id, app_id):
+            # STILL UNWINDING — or something else took the slot in the meantime. Either way the
+            # container is not free, and however long this goes on the answer stays this one.
+            return StopOutcome.STILL_RUNNING
+        self._prune_settled_stop_records()
+        if (user.id, project_id) in self._stop_records:
+            return StopOutcome.STOPPED
+        return StopOutcome.NOTHING_WAS_RUNNING
+
+    def _prune_settled_stop_records(self) -> None:
+        """Drop settled stop records past their retention window, lazily.
+
+        The record is what keeps "stopped" distinguishable from "nothing was running" after the
+        fact, so it has to outlive the stop — long enough for a client that lost its connection
+        to come back and ask again. It must not outlive the process's memory, hence a window
+        rather than forever, and it is only ever dropped once its task is DONE: a stop still in
+        flight is never forgotten, however long it takes."""
+        if not self._stop_records:
+            return
+        cutoff = datetime.now(UTC) - timedelta(seconds=_STOP_RECORD_RETENTION_SECONDS)
+        for key, record in list(self._stop_records.items()):
+            if record.task.done() and record.requested_at < cutoff:
+                del self._stop_records[key]
 
     async def project_preview_state(
         self, db: AsyncSession, user: User, project_id: uuid.UUID

@@ -12,6 +12,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup } from '@testing-library/react'
 
+import { ComposerHarness } from './_composerHarness'
 import Composer, { type ComposerProps } from '../Composer'
 
 const WARNING =
@@ -30,7 +31,7 @@ function draw(over: Partial<ComposerProps> = {}) {
     onUrgent: vi.fn(),
     ...over,
   }
-  return { props, ...render(<Composer {...props} />) }
+  return { props, ...render(<ComposerHarness><Composer {...props} /></ComposerHarness>) }
 }
 
 describe('the getting-long warning', () => {
@@ -81,7 +82,7 @@ describe('the getting-long warning', () => {
     const input = screen.getByTestId('composer-input') as HTMLTextAreaElement
     fireEvent.change(input, { target: { value: 'half a thought' } })
 
-    rerender(<Composer {...props} contextWarning={WARNING} />)
+    rerender(<ComposerHarness><Composer {...props} contextWarning={WARNING} /></ComposerHarness>)
 
     expect((screen.getByTestId('composer-input') as HTMLTextAreaElement).value).toBe(
       'half a thought',

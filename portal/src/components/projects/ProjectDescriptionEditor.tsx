@@ -206,12 +206,18 @@ export default function ProjectDescriptionEditor({
   return (
     <section className="font-manrope">
       <div className="flex items-center justify-between mb-2">
-        <h2 className="text-sm font-bold text-tertiary">Description</h2>
+        {/* THE RAIL'S OWN SECTION-LABEL TREATMENT (plan 002, U3). `PreviewOff`, `Main` and
+            `NothingBuilt` draw `DESCRIPTION` in exactly the micro-label form `START A CHAT` and
+            `APP STATUS` use — 10.5px, 700, .7px tracking, `#9CA3AF` — with a grey Edit beside it.
+            It shipped as 14px sentence-case bold with a teal Edit, which read as a heading of a
+            different rank from the two sections above it and put the canvas's only primary-action
+            colour on a control that opens a text box. */}
+        <h2 className="text-[10.5px] font-bold uppercase tracking-[.7px] text-canvas-label">Description</h2>
         <button
           type="button"
           ref={editButtonRef}
           onClick={openEditor}
-          className="flex items-center gap-1.5 text-xs font-semibold text-primary hover:text-primary-dark transition"
+          className="flex items-center gap-1.5 text-xs font-semibold text-neutral transition hover:text-primary"
         >
           <Pencil size={13} />
           Edit

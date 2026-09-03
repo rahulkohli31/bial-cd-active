@@ -350,10 +350,42 @@ class DeploymentResponse(CamelModel):
     # explicitly, the same fail-first posture `Settings` takes on a required field —
     # forgetting it should be a type error, not a value that quietly means nothing.
     publish_state: PublishState
+    # THE CITIZEN'S OWN LAST SAVE (U4), which `publish_state` until now only ever consumed
+    # and threw away. The rail draws a "YOUR LATEST <date> <short id>" row, and both halves
+    # of it come from the ONE metadata HEAD `latest_deployment` already takes — no second
+    # call, and no container: a project whose workspace is stopped still answers, which is
+    # the entire reason this rides here rather than on `save-state` (that read attaches to a
+    # container first, so it is null in exactly the reclaimed case the row exists for).
+    #
+    # HONESTLY NULLABLE, AND THE TWO HALVES ARE INDEPENDENT. `saved_head` is NULL when the
+    # bundle predates the metadata stamp, when the store would not answer, or when nothing
+    # has ever been saved — the same "no claim" `head_sha_from_metadata` documents, which a
+    # client renders as "cannot tell" and NEVER as a version. `saved_at` is the store's own
+    # last-modified on that same object, so a stamp-less bundle can still say WHEN while
+    # declining to say WHICH. Neither is ever invented: there is no placeholder that would
+    # make a missing save look present (`.claude/rules/fail-first.md`).
+    #
+    # NO COUNT RIDES BESIDE THEM, and none can (ASM6/Decision 2): `snapshot_key` is
+    # overwrite-latest with one bundle per app and there is no version-history table, so
+    # "4 newer saves" has no source anywhere in this process. The chip says newer work
+    # exists; it does not count it. A count waits for save history.
+    #
+    # No defaults, for the reason `publish_state` above has none: three construction sites,
+    # all in `latest_deployment`, and one that forgot would silently wire "nothing saved"
+    # onto a project that has saved — which is the exact defect the nullability exists to
+    # avoid, arriving through the back door.
+    saved_head: str | None
+    saved_at: datetime | None
 
     @classmethod
     def of(
-        cls, row: Deployment, *, approval: ApprovalState | None = None, publish_state: PublishState
+        cls,
+        row: Deployment,
+        *,
+        approval: ApprovalState | None = None,
+        publish_state: PublishState,
+        saved_head: str | None,
+        saved_at: datetime | None,
     ) -> DeploymentResponse:
         # `image_digest`, `acr_run_id` and `revision_name` are deliberately NOT surfaced:
         # they are operator facts with no meaning to a citizen, and the digest in particular
@@ -377,4 +409,6 @@ class DeploymentResponse(CamelModel):
             unpublished_at=row.unpublished_at,
             approval=approval,
             publish_state=publish_state,
+            saved_head=saved_head,
+            saved_at=saved_at,
         )

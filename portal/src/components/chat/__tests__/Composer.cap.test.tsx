@@ -12,6 +12,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup } from '@testing-library/react'
 
+import { ComposerHarness } from './_composerHarness'
 import Composer, { type ComposerProps } from '../Composer'
 import { COUNTER_VISIBLE_WITHIN, MAX_COMPOSER_CHARS } from '../../../utils/composerCap'
 
@@ -28,7 +29,7 @@ function draw(over: Partial<ComposerProps> = {}) {
     onUrgent: vi.fn(),
     ...over,
   }
-  return render(<Composer {...props} />)
+  return render(<ComposerHarness><Composer {...props} /></ComposerHarness>)
 }
 
 const box = () => screen.getByTestId('composer-input') as HTMLTextAreaElement

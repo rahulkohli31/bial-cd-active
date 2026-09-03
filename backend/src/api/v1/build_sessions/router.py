@@ -70,6 +70,7 @@ from src.services.build_sessions import (
     SandboxUnreachableError,
     SessionManager,
     SnapshotUnavailableError,
+    StopOutcome,
     app_name_for,
     sweep_all,
 )
@@ -640,15 +641,19 @@ class PreviewStateResponse(CamelModel):
 
 
 class StopActiveBuildResponse(CamelModel):
-    """`stopped` says whether there was actually something running to stop. False is a success:
-    the project is settled, which is the state the caller needed before saving or releasing.
+    """THREE NAMED STATES, never a boolean — the shared shape of the ask and the status read.
 
-    Says nothing about whether the stop SUCCEEDED in freeing the slot, because it cannot — the
-    wait is bounded, and a wedged container can outlast it. The next step's refusal is the
-    authority on that, which is why the save and release guards stay in place rather than
-    trusting this call to have done its job."""
+    The field it replaces was a `stopped: bool` whose `false` meant "nothing was running", which
+    a caller proceeds on. Both the service and the turn engine hardcoded `true` on every path,
+    so a stop that had not finished arrived wearing the same face as one that had — and the next
+    thing the client does is take the container. See `StopOutcome` for what each state licenses:
+    `stopped` and `nothingWasRunning` are both permission to continue, `stillRunning` is not.
 
-    stopped: bool
+    The SAME shape from both routes on purpose. The ask reports the state at the instant the stop
+    began; the status read reports it now. A client that had to decode two shapes would be one
+    refactor away from reading one of them with the other's rules."""
+
+    state: StopOutcome
 
 
 class ReleaseResponse(CamelModel):
@@ -746,7 +751,7 @@ async def stop_active_build(
     manager: SessionManagerDep,
     sandbox: OptionalSandbox,
 ) -> StopActiveBuildResponse:
-    """Stop what the agent is doing in this project, and wait for it to settle.
+    """ASK for the work in this project to stop. Returns as soon as the stop is under way.
 
     THE FIRST OF THREE, and the only new one: stop → save → release. It exists because the
     other two both refuse while a session is live, which used to make the reclaim dialog a dead
@@ -760,8 +765,15 @@ async def stop_active_build(
     each keeps its own refusal, so the ORDER is enforced by the guards rather than by a client
     remembering to call them in sequence.
 
-    `stopped: false` means nothing was running — a success the caller proceeds on, not a miss.
-    Deliberately no 409: asking a settled project to stop is already the state you wanted.
+    NOTHING IS HELD OPEN FOR THE LENGTH OF A STOP. This route used to await the whole thing,
+    which put the stop's budget under whatever request timeout the gateway in front of the
+    service enforces — a number owned by the client's network and written down nowhere here.
+    Now the wait lives in a detached task and `GET .../stop-state` reports how it went, so that
+    number stops constraining the design and a stop may honestly take as long as it takes.
+
+    `stillRunning` means the stop is in flight, which is what the caller polls on;
+    `nothingWasRunning` means there was nothing to stop, a success the caller proceeds on, not a
+    miss. Deliberately no 409: asking a settled project to stop is already the state you wanted.
 
     NO `build_coordination_or_503` SEAM, unlike `release` and `save` beside it, and the
     asymmetry is deliberate rather than an omission. Those two ask REDIS what is live — the
@@ -776,8 +788,42 @@ async def stop_active_build(
     if sandbox is None:
         raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG)
     await owned_project_or_404(db, user.id, project_id)
-    stopped = await manager.stop_active_work(db, user, project_id, sandbox_client=sandbox)
-    return StopActiveBuildResponse(stopped=stopped)
+    state = await manager.request_stop_of_active_work(db, user, project_id, sandbox_client=sandbox)
+    return StopActiveBuildResponse(state=state)
+
+
+@router.get(
+    "/projects/{project_id}/stop-state",
+    response_model=StopActiveBuildResponse,
+    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Project not found")),
+)
+async def stop_state(
+    project_id: uuid.UUID,
+    user: CurrentUser,
+    db: DbSession,
+    manager: SessionManagerDep,
+) -> StopActiveBuildResponse:
+    """HAS IT STOPPED YET? The other half of the ask above, and the only authority on the answer.
+
+    Read from the source of truth — whether a session still holds this project's app — and never
+    inferred from how long the caller has been waiting. That distinction is not academic here: a
+    container declared dead when it was merely slow has already destroyed a citizen's unsaved
+    work in this repo, and the shape of that bug was a timeout read as a verdict.
+
+    The browser polls this while it narrates the hand-over and proceeds only on `stopped` or
+    `nothingWasRunning`. A dropped connection costs nothing — the stop is a detached task, so
+    asking again picks the answer up where it was left: no work lost, no container taken.
+
+    NO CSRF, and a GET, because it changes nothing. NO `build_coordination_or_503` either, for
+    the same reason the ask has none — the question lives in this process's session map, not in
+    Redis, and a live build during a Redis outage is exactly when the answer is still needed.
+
+    Cheap enough to poll: two user-scoped DB reads and a dict lookup. No attach, no container
+    call, no registry round trip — a status poll that touched the container would manufacture
+    the very activity signal R14 forbids, on the workspace we are asking permission to take."""
+    await owned_project_or_404(db, user.id, project_id)
+    state = await manager.stop_state_of_active_work(db, user, project_id)
+    return StopActiveBuildResponse(state=state)
 
 
 @router.post(

@@ -206,7 +206,7 @@ export function primeTurn(h, frames = planReply()) {
 }
 
 /** The thread composer. */
-export const composer = () => screen.getByPlaceholderText(/describe what you need/i)
+export const composer = () => screen.getByPlaceholderText(/ask for another change/i)
 
 /**
  * Wait out the composer gate's OPENING state (G1).

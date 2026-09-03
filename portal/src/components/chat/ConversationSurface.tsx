@@ -1,14 +1,14 @@
 import { useState, useEffect, useRef, useCallback, useMemo, type FC } from 'react'
 import { useNavigate, useLocation, useParams } from 'react-router-dom'
-import PublishStatusChip from '../PublishStatusChip'
 import Announcer, { useActivityAnnouncement } from './Announcer'
 import ChatThread from './ChatThread'
-import Composer, { SendRefusal, type ComposerSubmission } from './Composer'
+import ChatRuntimeProvider from './runtime/ChatRuntimeProvider'
+import Composer, { type ComposerSubmission } from './Composer'
+import { SendRefusal } from './sendRefusal'
 import type { BuildHandoff } from './OfferStrip'
 import ScrollToLatest from './ScrollToLatest'
 import SessionBanners from './SessionBanners'
 import TurnBanner from './TurnBanner'
-import ProjectBreadcrumb from '../projects/ProjectBreadcrumb'
 import { listProjectConversations } from '../../utils/conversationApi'
 import type { ConversationHeader } from '../../utils/conversationApi'
 import { ApiError } from '../../utils/apiError'
@@ -17,11 +17,13 @@ import { isConversationGone } from '../../utils/chatErrors'
 
 import { resolvePreviewAddress } from '../../utils/previewAddress'
 import { PREVIEW_PROBE_MS, SETTLED_GONE, resolveWorkspaceState } from '../workspace/workspaceState'
+import type { StartOutcome } from '../workspace/workspaceState'
 import {
   useAppPaneVisible,
   usePublishAddress,
   usePublishPaneView,
   usePublishReclaim,
+  usePublishSave,
   usePublishSaveState,
   usePublishWorkspaceReport,
   useWorkspaceProject,
@@ -47,7 +49,7 @@ import { contextState } from '../../utils/contextLimits'
 import { atLimitSendState, narrativeEnvelopes, turnPhase } from '../../utils/turnNarrative'
 import type { TurnNarrative } from '../../utils/turnNarrative'
 import { fetchSaveState, saveProject, handOverWorkspace, asReclaimBlocked, fetchPreviewState, fetchCompileState, checkWorkspace } from '../../utils/buildSessionApi'
-import type { ReclaimBlocked, PreviewState } from '../../utils/buildSessionApi'
+import type { HandoverStep, ReclaimBlocked, PreviewState } from '../../utils/buildSessionApi'
 import { resolvePlanOptions } from '../../utils/turnStreamApi'
 import { wireMessageFromParts, buildUserParts, partsToText, countAttachments, releaseUploadedAttachments } from '../../utils/attachmentStore'
 import { validateConversationAttachmentCap } from '../../utils/attachmentInput'
@@ -171,6 +173,18 @@ export interface ConversationSurfaceProps {
   chatId?: string
   projectId?: string | null
   projectName?: string | null
+  /**
+   * THE TITLE THIS SURFACE DERIVES, HANDED BACK UP (plan 002, U2).
+   *
+   * A chat's title is derived here, from its first message, at the moment the row is created — and
+   * the route that publishes the toolbar row's heading learns it from a GET that already ran and
+   * 404'd. Without this the row would say "New build chat" until a reload, while the board draws
+   * the real title the instant the first message is sent.
+   *
+   * A CALLBACK RATHER THAN A SECOND PUBLISHER, so the heading keeps one author. This surface
+   * informs; the route decides.
+   */
+  onTitleDerived?: (title: string) => void
   /** Which kind of conversation this is. Read for ONE thing: whether the app pane is seen. */
   kind?: ChatKind
   projectHasSavedBuild?: boolean | null
@@ -375,7 +389,7 @@ function putStep(sink: TurnSink, toolCallId: string, step: StepItem): void {
   else sink.parts[at] = { kind: 'step', toolCallId, step }
 }
 
-export default function ConversationSurface({ chatId: chatIdProp, kind = 'build', projectId = null, projectName = null, projectHasSavedBuild = null, buildSessionDeps }: ConversationSurfaceProps = {}) {
+export default function ConversationSurface({ chatId: chatIdProp, kind = 'build', projectId = null, projectName = null, projectHasSavedBuild = null, onTitleDerived, buildSessionDeps }: ConversationSurfaceProps = {}) {
   // R11/R12 — THE ONE THING THE KIND DECIDES ON THIS SURFACE. A Plan chat shows no app pane; a
   // Build chat shows it. `build` is the default because fifteen existing suites mount this surface
   // with no kind at all and every one of them is about the build surface — defaulting to `plan`
@@ -793,6 +807,13 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // about the unsaved work. The TRI-STATE is carried, never collapsed — `null` means "could not
   // check", and the shell arms on a definite `true` alone.
   usePublishSaveState(saveDirty)
+  // THE SAVE CONTROL ITSELF LIVES IN THE TOOLBAR ROW NOW (plan 002, U2), so its three values and
+  // its action go up the channel rather than into the pane's view. Two cells rather than one, and
+  // the split is deliberate: the values are compared and drive a render, the action is read at
+  // press time and drives none. `usePublishSaveState` above is unchanged and still separate — it
+  // is the tri-state the shell's unload warning arms on, and it is KEPT across an unmount, while
+  // these two are cleared with their publisher.
+  usePublishSave({ dirty: saveDirty, saving, error: saveError }, { save: handleSave, rename: null })
 
   // A genuine unmount must cancel the in-flight turn-stream reader — a chat switch already
   // aborts it before resubscribing, but nothing did on unmount, leaking the reader (and its
@@ -1425,16 +1446,22 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     // The server now creates the row inside the turn's own transaction, AFTER every side-effect-free
     // refusal and with a flush rather than a commit — so a refusal rolls it back. The whole change
     // on this side is that one round trip is gone and its arguments moved onto the next one.
+    const derivedTitle = userSeq === 0 && projectId ? deriveTitle(partsToText(parts)) : null
     const parentage =
       userSeq === 0 && projectId
         ? {
             projectId,
             kind,
-            title: deriveTitle(partsToText(parts)),
+            title: derivedTitle ?? '',
             // `context` is whatever this surface was seeded with; it travels unchanged.
             context: contextRef.current,
           }
         : undefined
+    // OPTIMISTIC, AND DELIBERATELY SO. The row is created inside the turn's own transaction and a
+    // refusal rolls it back, so this can name a chat that never came to exist. That is the right
+    // trade for a heading: the board draws the title the moment the message is sent, and a chat
+    // whose creation was refused is one the citizen is being told about in the same breath.
+    if (derivedTitle) onTitleDerived?.(derivedTitle)
     dropTransientQuery(activeId)
     refreshBuilds()
 
@@ -2450,6 +2477,12 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // Held together because they are useless apart: the banner names the project, and the retry
   // is the whole reason the refusal is survivable rather than just informative. Cleared as one.
   const [reclaim, setReclaim] = useState<{ blocked: ReclaimBlocked; retry: () => Promise<void> } | null>(null)
+  // What the hand-over is doing right now, so the dialog narrates instead of spinning through a
+  // sequence that genuinely takes tens of seconds (plan 002, U9).
+  const [handoverStep, setHandoverStep] = useState<HandoverStep | null>(null)
+  // HOW THE LAST START ENDED, or `null` when none has been attempted or the last one reached the
+  // app. Fed to the same pure map the project screen uses — see the report below.
+  const [startOutcome, setStartOutcome] = useState<StartOutcome | null>(null)
 
   // The refusal is the SAME on both paths a user can take into the one workspace — a Write
   // message and the Relaunch button — so the mapping lives once here. Returns true when it
@@ -2481,8 +2514,12 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   const resolveReclaim = async (save: boolean) => {
     if (!reclaim) return
     const { blocked, retry } = reclaim
-    // Stop, then save, then release — the ordering invariant lives in `handOverWorkspace`.
-    await handOverWorkspace(blocked.projectId, save)
+    try {
+    // Stop, then WAIT FOR THE STOP TO GENUINELY FINISH, then save, then release — the ordering
+    // invariant lives in `handOverWorkspace`, and so does the refusal to proceed on a stop that
+    // only timed out. The narration is the dialog's; this is what feeds it.
+    await handOverWorkspace(blocked.projectId, save, {}, setHandoverStep)
+    setHandoverStep('starting')
     // The retry is awaited BEFORE the dialog is dismissed (#83 review, finding 8). Clearing
     // first unmounts the only surface that can say "that didn't work", so a retry that failed
     // — another tab took the slot, the network blipped — looked exactly like one that worked:
@@ -2490,6 +2527,9 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     // only after it settles, and let a rejection travel back to `run()`.
     await retry()
     setReclaim(null)
+    } finally {
+      setHandoverStep(null)
+    }
   }
 
   // The dialog itself is mounted by the shell, so a refusal has somewhere to appear that is not
@@ -2502,6 +2542,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
         reclaim
           ? {
               blocked: reclaim.blocked,
+              step: handoverStep,
               // Issue #161's framing half: the dialog leads with the app being STARTED, and this
               // surface is that app. `null` while the route is still resolving the project name —
               // the dialog then falls back to the plain phrasing rather than quoting an empty
@@ -2512,9 +2553,13 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
             }
           : null,
       // `resolveReclaim` is redefined every render and is not worth memoising on its own — it
-      // reads `reclaim` directly. Keyed on the refusal itself, which is what the dialog renders.
+      // reads `reclaim` directly. Keyed on the refusal itself, which is what the dialog renders —
+      // AND ON THE STEP, without which the narration freezes: `handoverStep` is read on the line
+      // above, so leaving it out pinned the dialog to whatever the step was when the refusal
+      // arrived, and R9's "every transition narrates itself" silently held only on the project
+      // screen. `ProjectWorkspace` lists it; this surface did not.
       // eslint-disable-next-line react-hooks/exhaustive-deps
-      [reclaim, projectName],
+      [reclaim, projectName, handoverStep],
     ),
   )
 
@@ -2568,16 +2613,22 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // sentence a citizen reads when this chat's pane has nothing to frame has exactly one author in
   // the product — the same one the project screen's pane and a Plan chat's line read from.
   //
-  // NO START OUTCOME HERE. This surface has its own relaunch path with its own error handling
-  // (`session.relaunchError`, rendered by the pane's own arms), and threading a second outcome
-  // through would give one state two authors again. `onStartOutcome` therefore only refreshes.
+  // ★ A FAILED START IN A CHAT SAYS WHY (plan 002, U11), and it did not.
+  //
+  // `startOutcome` was hardcoded to `null` here on the grounds that this surface has its own
+  // relaunch path with its own error handling. That path is the SESSION's relaunch, which is a
+  // different control: a press on the PANE's start or retry — the one a citizen reaches when
+  // their app is asleep in a build chat — reported nothing at all. The spinner stopped, the same
+  // sentence came back, and pressing again did the same thing. This surface holds the outcome now,
+  // exactly as the project surface's hook does, and hands it to the same pure map so the wording
+  // still has one author.
   usePublishWorkspaceReport(
     projectId
       ? {
           state: resolveWorkspaceState({
             preview: previewState,
             projectHasSavedBuild,
-            startOutcome: null,
+            startOutcome,
             startInFlight: startPending,
           }),
           projectId,
@@ -2603,7 +2654,12 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
           // and nothing else — so an in-flight press is local state here, exactly as it is in the
           // hook the project surface uses.
           onStartPending: setStartPending,
-          onStartOutcome: () => setPreviewProbeEpoch((n) => n + 1),
+          onStartOutcome: (outcome) => {
+            setStartOutcome(outcome)
+            // A start that REACHED the app clears the outcome and asks again immediately, so the
+            // pane arrives at the running app on the press rather than on the next poll tick.
+            if (outcome === null) setPreviewProbeEpoch((n) => n + 1)
+          },
           onRefresh: () => setPreviewProbeEpoch((n) => n + 1),
           // The SAME single-slot capture the composer and the relaunch button use — first refusal
           // wins, so the dialog cannot change under the person reading it. Set directly rather
@@ -2615,27 +2671,12 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       : null,
   )
   usePublishPaneView({
-    /* Publish, right where the build just finished. Only once the route resolved a project — a
-       chat with no project behind it has nothing to publish.
-       THE SAME COMPONENT the project page mounts beside the name, not a second control that
-       could word the same state differently. This page and that one are sibling routes under
-       one Outlet, so the two mount sites are never live at once — the chip owns its own read
-       either way, which is what makes a second site correct rather than merely tolerated.
-       Its popover is portalled, and here that is load-bearing rather than inherited: four
-       nested `overflow-hidden` ancestors sit between this toolbar and the document, so
-       anything anchored here without a portal disappears rather than overflows. Plan F
-       retires this mount when it merges the two screens. */
-    toolbarTrailing: projectId ? <PublishStatusChip projectId={projectId} /> : null,
-    // NO LEADING CONTROL ANY MORE. This used to be the chat-panel toggle — a SECOND collapse for
-    // the column `WorkspaceShell` already collapses (`usePublishRail` / `railWidthClass`), with a
-    // control drawn by `AppPane` because that is the part of the pane that always renders, even
-    // when this surface's own `LivePreview` mount does not exist yet (a Plan chat, a project with
-    // nothing built) or has gone away (a stopped app). Two independent booleans hiding the same
-    // rail is exactly what R13's "ONE control that collapses it entirely" forbids, and the second
-    // one was unreachable in precisely the states where a way back mattered most. See
-    // `ProjectWorkspace.test.tsx`'s "the collapse control" suite for where that property is pinned
-    // now, and `AppPane.tsx`'s own docblock for the fuller account of why its home moved there.
-    toolbarLeading: null,
+    /* NO TOOLBAR SLOTS TO FILL ANY MORE (plan 002, U2). This published the publish chip into a
+       row `LivePreview` drew inside the pane, with a note saying "Plan F retires this mount when
+       it merges the two screens". It is retired here instead, and by a different move than that
+       note expected: the chip is not re-homed on another surface, it is drawn by the shell's own
+       toolbar row beside the chat title, from the same computed state, so there is one mount for
+       both screens rather than two that happen never to be live at once. */
     iterating: showSession && session.iterating,
     onRelaunch: handleRelaunch,
     relaunching: sessionProjectMatches && session.relaunching,
@@ -2644,10 +2685,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     restoredFromFailedBuild: relaunchedUrl != null && session.relaunchedFromFailedBuild,
     completedLive,
     hasSavedBuild,
-    saveDirty,
-    onSave: handleSave,
-    saving,
-    saveError,
     previewState: previewState?.state ?? null,
     occupyingProjectName: previewState?.occupyingProjectName ?? null,
     reconnecting: (turnNarrativeIsThisChat && turnPreview.state === 'reconnecting') || (showSession && session.reconnecting),
@@ -2804,17 +2841,50 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
           `HIDDEN_BUT_MOUNTED`) behind its own `chatCollapsed` state — the whole mechanism R13
           retired (see the state's removal note above). The rail this surface fills is collapsed
           by `WorkspaceShell` instead, as a class on the `workspace-outlet` element one level up;
-          from here that is invisible; this panel always renders at its own width. */}
+          from here that is invisible.
+
+          AND NO FIXED WIDTH EITHER (plan 002, U6). It was `w-72 xl:w-80` — a second, narrower
+          column INSIDE the rail the shell had already sized, which left a dead band of ground
+          between the transcript and the app pane. The panel fills the rail now, and the rail's
+          width is the one the citizen can drag.
+
+          A PLAN CHAT IS THE OTHER HALF OF THE SAME RULE. It declares no pane, so the shell gives
+          it the whole window — and a transcript run edge to edge across 1440px is unreadable. So
+          it centres itself in one column at a comfortable measure, which is exactly what the
+          board draws. A build chat does not: it sits beside the app it is changing, and the two
+          are meant to read as one screen. */}
+      {/* ONE RUNTIME, AROUND EVERYTHING THAT READS IT (plan 002, U5). It used to be built inside
+          `ChatThread`, whose provider therefore wrapped only the transcript — fine while the
+          composer was entirely hand-rolled and read nothing from it, and wrong the moment the
+          composer became the library's, because every composer primitive resolves against
+          `useAui()`. Hoisted rather than duplicated: two runtimes would give this screen two
+          composer states, and the one the citizen typed into would not be the one the transcript
+          belonged to. */}
+      <ChatRuntimeProvider
+        messages={transcript}
+        isRunning={isRunning}
+        onNew={handleAppend}
+        onCancel={handleCancel}
+      >
       <div
         id="chat-panel"
         data-testid="chat-panel"
-        className="flex flex-col bg-white border-r border-bial-border flex-shrink-0 overflow-hidden w-72 xl:w-80"
+        data-chat-kind={kind}
+        className={`flex min-w-0 flex-1 flex-col overflow-hidden bg-white ${
+          isPlanChat
+            ? // ONE CENTRED COLUMN. `mx-auto` on a `max-w` inside the full-width rail, rather
+              // than a narrower rail — the rail's width is the citizen's to drag, and pinning it
+              // for one chat kind would take that away and reintroduce the measured breakpoint
+              // the shell exists without.
+              'mx-auto w-full max-w-3xl'
+            : 'border-r border-bial-border'
+        }`}
       >
-        {/* Back-navigation and the project name, and nothing else (F7/F10). Past conversations
-            live on the project page the breadcrumb links to. */}
-        <div className="p-4 border-b border-bial-border">
-          <ProjectBreadcrumb projectId={projectId} projectName={projectName} />
-        </div>
+        {/* THE BORDERED HEADER IS SURRENDERED TO THE TOOLBAR ROW (plan 002, U2). It held one
+            breadcrumb link back to the project and nothing else — the only thing in the product
+            that named where a chat belonged, and it named neither the chat nor its kind. The row
+            above both columns draws all three now: project, kind pill, chat title. `projectName`
+            is still a prop because the reclaim dialog names the project being started with it. */}
 
         {/* ONE SCROLL CONTAINER, and it is the thread's own viewport — not this wrapper, which
             only gives the thread a box to fill. `min-h-0` is what lets it shrink inside the column
@@ -2822,10 +2892,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
         <div className="flex-1 min-h-0">
           <ChatThread
             onGroupSealed={setSealedSummary}
-            messages={transcript}
-            isRunning={isRunning}
-            onNew={handleAppend}
-            onCancel={handleCancel}
             interruptedMessageIds={interruptedIds}
             footer={ViewportFooter}
           />
@@ -2885,18 +2951,24 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
           </div>
         )}
 
-        {/* R97 — A PLAN CHAT SAYS EVERYTHING THE PANE WOULD HAVE SAID. Above the composer, from the
-            same computed workspace value the pane renders, so there is one author for every
-            workspace sentence in the product and "no pane" cannot mean "says nothing". */}
-        {isPlanChat && <PlanChatWorkspaceLine />}
+        {/* R97 — A PLAN CHAT SAYS EVERYTHING THE PANE WOULD HAVE SAID, from the same computed
+            workspace value the pane renders, so there is one author for every workspace sentence
+            in the product and "no pane" cannot mean "says nothing". It goes to the composer's
+            footer slot rather than being drawn here: `PlanChat` and `PlanReady` both put it BELOW
+            the box, and above it the standing sentence sat between the transcript and the control
+            the citizen was reaching for. */}
 
         <Composer
           conversationId={buildId ?? null}
-          placeholder="Describe what you need, or ask for a change…"
+          // THE BOARD WRITES A DIFFERENT ONE PER KIND, and it is a hint rather than a mode: a
+          // build chat asks for a change to the app, a plan chat asks for a change to the plan.
+          // One sentence for both said neither.
+          placeholder={kind === 'plan' ? 'Tell me what to change…' : 'Ask for another change…'}
           onSubmit={handleSubmit}
           isRunning={isRunning}
           gate={gate}
           contextWarning={contextWarning}
+          footerNote={isPlanChat ? <PlanChatWorkspaceLine /> : undefined}
           // R55 — BOTH ways a build can be live here. `isRunning` is a turn this tab is streaming;
           // `buildActiveHere` is a LEGACY build session adopted on a reload, which sets no
           // streaming flag at all. Gating on the turn alone left a reloaded mid-build tab with a
@@ -2927,6 +2999,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
           onUrgent={setUrgent}
         />
       </div>
+      </ChatRuntimeProvider>
     </div>
   )
 }

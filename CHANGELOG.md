@@ -12,7 +12,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.7.0-beta.6] - 2026-09-02
 
-The agent's whole voice.
+The agent's whole voice, and the workspace the canvas draws.
 
 ### Added
 
@@ -23,6 +23,15 @@ The agent's whole voice.
   you watched it happen in.
 - **The agent can think for as long as a question needs, and the thinking costs you nothing.**
   Reasoning tokens no longer count against your daily allowance.
+- **The project rail says what is live, what an administrator approved, and what you last saved,
+  without you opening anything.** All three used to sit behind a small grey chip you had to click,
+  one row at a time. They are drawn straight on the rail now, dated, under a status pill that is
+  actually coloured by the state it names rather than the one grey every state used to share. When
+  the running app is behind work you have already saved, that date prints in amber to say so.
+- **The boundary between your chat and your app can be moved.** It used to open at one of two
+  fixed widths with no way to change it. A handle between the two columns drags from 360 to 640
+  pixels, arrow keys nudge it, Home and End jump to either end, and the width you settle on is
+  still there next time you open the project.
 
 ### Changed
 
@@ -35,6 +44,43 @@ The agent's whole voice.
 - **The agent writes at the length the answer needs.** The rules that capped how much it could say,
   forced every plan into the same five parts, and prescribed how it had to sign off are gone. What
   stays is who it is writing for.
+- **The project screen and both chat screens share one toolbar now, instead of three headers that
+  disagreed.** The rail's own header cut the project name off and vanished entirely once the panel
+  was collapsed; the chat header named neither the chat nor whether it was Build or Plan; and the
+  app drew a third header that only appeared once something had been built, so a new project had
+  no device switcher and no Save at all. It is one row now, always present. A chat's row reads
+  project name, then Build or Plan, then the chat's own title. The device width you pick survives
+  moving between a project and a chat instead of resetting, renaming happens in a small dialog
+  rather than by turning the page heading into a text box, and the running app can be opened in
+  its own tab.
+- **Teal is the colour of every action, and gold has stopped painting buttons.** Send, Launch, Try
+  again — all of them filled gold before, which is not what the design draws, and an unused gold
+  button style has been deleted so it cannot come back. Outline buttons highlight neutrally on
+  hover instead of turning solid orange, the selected half of the Plan/Build switch is a white
+  pill rather than a saturated block, and the login page's "Staff Internal Portal" badge — white
+  on gold at about 2.3:1, under the accessible minimum — is legible now.
+- **The rail is one flat white panel, and it no longer lists your past conversations.** It used to
+  be four bordered cards floating on a grey-blue column, one of them a list of every chat on the
+  project with a menu to reopen or delete each. It is a single panel divided by hairlines into
+  Start a chat, App status and Description. Leaving a chat means starting a new one; there is no
+  route back to an old one and no way to delete one anywhere in the product. Nothing is removed
+  from the server — the chats, their plans and their files all stay.
+- **Each kind of chat is laid out for what it is.** A build chat used to sit in a narrow fixed
+  strip with a band of grey between it and your app; it fills the panel now, and the panel is what
+  you resize. A plan chat has no app beside it, so stretching it across the whole window made it
+  unreadable; it centres in one column, and moving between a plan chat and a build chat slides the
+  app panel away rather than making it blink out (skipped if your system asks for reduced motion).
+- **The box you start a chat in and the box you type into are the same control.** They were built
+  separately and had drifted — a wide gold Start Chat button beside a separate Upload File pill on
+  one screen, a gold square beside the input on the other. Both are one bordered box now with
+  attach and send inside it at the right, a file can be dropped anywhere in it rather than onto a
+  pill, and the hint text speaks to the screen you are actually on.
+- **A build's steps are drawn as a list of tiles rather than a line of identical ticks.** Reading a
+  file, adding something, installing a package, checking work — each has its own icon in a
+  bordered panel now. The list stays collapsed while the build runs, showing a count with the
+  current step named underneath instead of opening itself; a group you opened for a look closes
+  again when the turn ends, while one you open after it finished stays open. A group where
+  something failed is tinted red and opens on its own.
 
 ### Fixed
 
@@ -53,6 +99,49 @@ The agent's whole voice.
 - **"Working on your app" stays where the agent actually is.** It was pinned to the top of the
   reply, so a build that thought again between steps pushed everything you had already read down
   the screen until it stopped.
+- **Sending a message to a project while another one is running now asks first, instead of
+  opening your chat and asking afterwards.** The browser used to navigate immediately — address
+  changed, chat opened, message sent — and the question about the other project arrived after the
+  fact, interrupting a build two minutes in or bouncing you back where you came from. It asks
+  before anything moves: a dialog names both projects in plain words while your typed message and
+  your files stay where you left them. Cancelling changes nothing anywhere. Agreeing stops the
+  other project, saves it if you asked, waits for it to genuinely finish rather than trusting a
+  clock, and only then opens your chat with your message. Each step says what it is doing while it
+  happens, and it tells you when the other project's assistant is still writing, even if nothing
+  there is unsaved.
+- **Every way out of a workspace now asks about unsaved work, including the back arrow and signing
+  out.** The back arrow left silently. Signing out skipped the check altogether, which made the
+  one exit most people use at the end of the day the one that could throw away an afternoon. Both
+  go through the same warning as everything else, and it now names the project whose work is at
+  risk.
+- **Typing while a message is sending is no longer thrown away.** The box stays open for more
+  typing during a send on purpose — waiting on the server is no reason to stop writing — but it
+  was emptied unconditionally when that send completed, so anything written, or any file added,
+  during the wait disappeared the moment the original message went through. It clears only what it
+  actually sent.
+- **"Hide details" no longer wipes the screen on a narrow window.** Below the width where the
+  panel and the app stack instead of sitting side by side, the control whose whole job is to give
+  the app the screen did the opposite: the collapsed panel kept its full height, squeezing the app
+  to nothing and pushing it almost two screens down. Collapsing clears the height with the width.
+- **Save works from the project screen, not only from inside a chat**, which is where you are when
+  you open a project, watch its app start, and change something. A failed launch now tells you why
+  it failed instead of refreshing the reason away and leaving a stopped spinner.
+- **An attached file says what happened to it.** One too large, or of a kind the platform does not
+  take, was sometimes dropped without a word, so you would think the agent could see a file it
+  never got; a refusal is always spoken now. A file attached but not yet sent had no address the
+  site's security rules would show, so its preview was an empty box — text files show their
+  contents, and anything else says plainly that it opens once sent.
+- **The plan-ready offer explains itself, and the smaller places the screens disagreed with the
+  design are fixed.** "Build this plan" and "Keep planning" were two bare buttons with nothing
+  saying that Build opens a new chat and leaves this one untouched. Alongside that: the send
+  control was painted the grey reserved for a locked composer whenever the box was empty, at about
+  1.4:1 contrast; the paperclip sat at the far left of the box, up to a screen's width from Send;
+  a quarter of the build-step icons were blank circles because the icon map was matched to words
+  the app never sends; the plan chat floated as a card on grey instead of running edge to edge and
+  took half its screen for an app pane it does not have; the empty app pane had no frame or label;
+  a duplicate "Draft" chip sat beside the project title; the status pill dropped onto its own line
+  below its heading; "Take it back" was painted as a primary action; and your own messages were
+  grey fills rather than white with a hairline.
 
 ### Notes
 
@@ -63,6 +152,17 @@ The agent's whole voice.
   left red or hanging are green, the test fixture that made a route's own rollback observable is
   scoped to the two tests that need it rather than reshaping all 3,700, and a handful of comments
   and docstrings that described mechanisms this wave deleted now describe what is there.
+- A guard test fails the build if a brand colour is used outside its role. The test environment
+  cannot read rendered colour, so it reads class names — enough to catch gold painting a surface
+  the design does not call for.
+- Three defects found while reviewing this wave rather than by using it: the hand-over dialog's
+  narration froze on chat screens, so it said "closing the other app" for the whole sequence; a
+  stalled network read could hold that dialog open past its own two-minute limit with no way out
+  but a reload; and the polled deployment-status route could abandon a database query mid-flight if
+  the object store failed. A cleanup pass removed dead code and comments naming things that never
+  existed, and added the tests several of these fixes were missing.
+- Twelve differences from the design boards remain, each recorded with its reason — several need a
+  product decision rather than more work.
 
 ## [1.7.0-beta.5] - 2026-09-02
 

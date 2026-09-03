@@ -18,7 +18,7 @@
  *   edit, reload, refetchThread   ← onEdit / onReload / onRefetchThread
  *   cancel                        ← onCancel                          ← WE PASS THIS
  *   speech, dictation, voice,
- *   attachments, feedback         ← adapters.*
+ *   attachments, feedback         ← adapters.*      ← WE PASS `attachments` (plan 002, U5)
  *   queue                         ← queue
  *   unstable_copy                 ← unstable_capabilities.copy (default true)
  *
@@ -36,8 +36,11 @@
  *
  * R51a names three things the library forms a view about — whether a turn is running, whether a
  * message can be sent, whether an attachment is allowed. `isRunning` is answered HERE, by passing
- * it as a first-class field. Attachments are answered by registering no adapter. `canSend` is
- * answered by NOT USING THE LIBRARY'S SEND BUTTON AT ALL.
+ * it as a first-class field. Attachments are answered by an adapter that IS ours, so the library
+ * decides only whether a chip may be drawn. `canSend` is answered by NOT USING THE LIBRARY'S SEND
+ * BUTTON AT ALL — and, since U5, by not using its send PATH either: `composer.send()` empties the
+ * text before it awaits anything and restores it only when the attachment tasks throw, which is
+ * the message-destroying defect of 2026-09-01 in the library's own code.
  *
  * That last one is not stylistic. `createActionButton` renders `<button disabled={props.disabled ||
  * !callback}>`, and `useComposerSend` returns no callback while `isRunning && !capabilities.queue`
@@ -51,6 +54,7 @@ import {
   useExternalStoreRuntime,
   type AppendMessage,
   type AssistantRuntime,
+  type AttachmentAdapter,
 } from '@assistant-ui/react'
 
 import type { ChatMessage } from '../../../utils/messageTypes'
@@ -59,19 +63,28 @@ import { assertUniqueIds, convertMessage } from './convertMessage'
 /**
  * THE CAPABILITY LIST, written down (R51a).
  *
- * Fourteen keys, matching `RuntimeCapabilities` exactly. Two are `true`. A test compares
- * `runtime.thread.getState().capabilities` against this with `toEqual` — exact equality, never
- * `toMatchObject`, because `toMatchObject` passes when a capability we never listed wakes up,
- * which is the entire failure this guard exists to catch.
+ * Fourteen keys, matching `RuntimeCapabilities` exactly. THREE are `true` since plan 002's U5. A
+ * test compares `runtime.thread.getState().capabilities` against this with `toEqual` — exact
+ * equality, never `toMatchObject`, because `toMatchObject` passes when a capability we never
+ * listed wakes up, which is the entire failure this guard exists to catch.
  */
 export const EXPECTED_CAPABILITIES = {
-  // ── the two we want ──
+  // ── the three we want ──
   /** R55. Registered by passing `onCancel`; dropping it deletes the stop path. */
   cancel: true,
   /** Explicit though it is the default, so a change of default is visible in a diff. */
   unstable_copy: true,
+  /**
+   * ON SINCE PLAN 002's U5, and it had to be. The library's add-attachment control, its chip
+   * list and its dropzone are ALL gated on this capability — with it off they render nothing, so
+   * there is no way to adopt the library's box and keep it off. The adapter behind it wraps THIS
+   * project's own pipeline: the library renders a chip, it does not decide which content is
+   * re-sent, which binaries are inlined, the cache-breakpoint ceiling, or how fences are escaped.
+   * See `attachmentAdapter.ts`, which also records why the library's `send` is not on our path.
+   */
+  attachments: true,
 
-  // ── the twelve that stay off, by passing nothing ──
+  // ── the eleven that stay off, by passing nothing ──
   switchToBranch: false,
   switchBranchDuringRun: false,
   edit: false,
@@ -81,7 +94,6 @@ export const EXPECTED_CAPABILITIES = {
   speech: false,
   dictation: false,
   voice: false,
-  attachments: false,
   feedback: false,
   queue: false,
 } as const
@@ -104,6 +116,8 @@ export interface ChatRuntimeOptions {
   onNew: (message: AppendMessage) => Promise<void>
   /** R55's relocated stop. Passing it is what registers `cancel`. */
   onCancel: () => Promise<void>
+  /** The attachment adapter over this project's own pipeline. Passing it registers `attachments`. */
+  attachments: AttachmentAdapter
 }
 
 export function useChatRuntime({
@@ -111,6 +125,7 @@ export function useChatRuntime({
   isRunning,
   onNew,
   onCancel,
+  attachments,
 }: ChatRuntimeOptions): AssistantRuntime {
   // Fail loudly on a duplicate id BEFORE the runtime sees the array. Its own behaviour is to keep
   // the last occurrence and `console.warn`, which costs a whole turn and reports it nowhere
@@ -129,6 +144,7 @@ export function useChatRuntime({
     onCancel,
     convertMessage,
     unstable_capabilities: { copy: true },
+    adapters: { attachments },
 
     // ── DELIBERATELY ABSENT, and each absence is a capability ──
     //
@@ -139,10 +155,11 @@ export function useChatRuntime({
     // onRefetchThread — `refetchThread`.
     // queue           — `queue`. Its absence is ALSO why the library's Send is unusable; see the
     //                   docblock. Adding it would make that button work and would be the wrong fix.
-    // adapters        — `speech`, `dictation`, `voice`, `attachments`, `feedback`. Attachments in
-    //                   particular stay ours: the library renders a chip, it does not decide which
-    //                   content is re-sent, which binaries are inlined, the cache-breakpoint
-    //                   ceiling, or how fences are escaped (R51).
+    // adapters        — `speech`, `dictation`, `voice` and `feedback` stay absent. `attachments`
+    //                   is now PASSED, and the reason it is safe to pass is that the adapter is
+    //                   ours: the library renders a chip, it does not decide which content is
+    //                   re-sent, which binaries are inlined, the cache-breakpoint ceiling, or how
+    //                   fences are escaped (R51).
     // isSendDisabled  — see the docblock. It gates a code path nothing here executes.
     // unstable_enableToolInvocations — would run tool callbacks TWICE on top of our own step
     //                   dispatch. Its default is already `false`; naming it here is documentation,

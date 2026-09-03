@@ -7,7 +7,6 @@ import {
   createConversation,
   messagesFromProjection,
   patchConversation,
-  deleteConversation,
   createConversationStore,
   deriveTitle,
 } from '../conversationApi'
@@ -261,13 +260,20 @@ describe('createConversation / patchConversation / deleteConversation', () => {
     const fetchImpl = vi.fn(async () => ({ ok: false, status: 409, json: async () => ({ error: { message: 'id already in use' } }) }))
     await expect(createConversation('c1', { projectId: 'p1', kind: 'plan' }, deps(fetchImpl))).rejects.toThrow('id already in use')
   })
-  it('patchConversation PATCHes the body; deleteConversation DELETEs (404 tolerated)', async () => {
+  it('patchConversation PATCHes the body', async () => {
     const patchFetch = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) }))
     await patchConversation('c1', { title: 'new' }, deps(patchFetch))
     expect(patchFetch.mock.calls[0][1].method).toBe('PATCH')
+  })
 
-    const delFetch = vi.fn(async () => ({ ok: false, status: 404, json: async () => ({}) }))
-    await expect(deleteConversation('c1', deps(delFetch))).resolves.toBe(true) // 404 is fine (already gone)
+  it('★ offers no delete at all — the module and the store both', async () => {
+    // `deleteConversation` had exactly one caller, the project rail's past-conversations list, and
+    // the ruling of 2026-09-02 deleted the list: nothing points back to a chat, so nothing offers
+    // to delete one. The SERVER route is untouched. Asserted rather than left silent so that
+    // re-adding a client has to be a decision someone makes on purpose.
+    const mod = await import('../conversationApi')
+    expect('deleteConversation' in mod).toBe(false)
+    expect('deleteConversation' in mod.createConversationStore('plan')).toBe(false)
   })
 })
 

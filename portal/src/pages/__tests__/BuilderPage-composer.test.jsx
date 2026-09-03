@@ -78,7 +78,7 @@ function renderAt(chatId, sessionDeps, projectId = 'p1') {
   )
 }
 
-const composer = () => screen.getByPlaceholderText(/describe what you need/i)
+const composer = () => screen.getByPlaceholderText(/ask for another change/i)
 const sendButton = () => composer().parentElement.querySelector('button:last-of-type')
 const type = (text) => fireEvent.change(composer(), { target: { value: text } })
 

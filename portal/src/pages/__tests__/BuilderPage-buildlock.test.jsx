@@ -112,7 +112,7 @@ function renderBuilder(chatId, projectId = 'p1') {
 /** A chat turn — the model answers with a brief, so a card appears. Starts nothing on its own. */
 async function sendFrom(container, text = 'make it blue') {
   await waitForGateOpen()
-  const textarea = within(container).getByPlaceholderText(/describe what you need/i)
+  const textarea = within(container).getByPlaceholderText(/ask for another change/i)
   fireEvent.change(textarea, { target: { value: text } })
   fireEvent.keyDown(textarea, { key: 'Enter' })
 }
@@ -217,7 +217,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     await within(a.container).findByTestId('stop-turn') // A's build is live → claim held on 'new-A'
 
     const b = renderBuilder('build-B')
-    await within(b.container).findByPlaceholderText(/describe what you need/i)
+    await within(b.container).findByPlaceholderText(/ask for another change/i)
     await flushChannel() // let B learn about A's claim over the channel
     await buildFrom(b.container, 'and add a table')
 
@@ -237,7 +237,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
 
     mintBuild('new-B', 'B build')
     const b = renderBuilder('build-B', 'p2')
-    await within(b.container).findByPlaceholderText(/describe what you need/i)
+    await within(b.container).findByPlaceholderText(/ask for another change/i)
     await flushChannel()
     await buildFrom(b.container, 'different project')
 
@@ -279,7 +279,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     await within(a.container).findByTestId('stop-turn')
 
     const b = renderBuilder('build-B')
-    await within(b.container).findByPlaceholderText(/describe what you need/i)
+    await within(b.container).findByPlaceholderText(/ask for another change/i)
     await flushChannel() // let B learn about A's re-acquired claim
     await buildFrom(b.container, 'me too')
 
@@ -301,7 +301,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     await within(a.container).findByTestId('stop-turn') // joined → A's build is live
 
     const b = renderBuilder('build-B')
-    await within(b.container).findByPlaceholderText(/describe what you need/i)
+    await within(b.container).findByPlaceholderText(/ask for another change/i)
     await flushChannel() // let B learn about A's claim
     await buildFrom(b.container, 'me too')
 
@@ -317,7 +317,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     await within(a.container).findByTestId('stop-turn')
 
     const b = renderBuilder('build-B')
-    await within(b.container).findByPlaceholderText(/describe what you need/i)
+    await within(b.container).findByPlaceholderText(/ask for another change/i)
     await flushChannel()
     await buildFrom(b.container, 'wait for me')
     await lastCard(b.container) // wait for the offer to be on screen before reading the refusal
@@ -374,7 +374,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
       expect(h.getBuild.mock.calls.filter(([id]) => id === 'build-A').length).toBeGreaterThan(before),
     )
     // And it is a working chat, not an empty shell: the composer is live again.
-    await within(a.container).findByPlaceholderText(/describe what you need/i)
+    await within(a.container).findByPlaceholderText(/ask for another change/i)
   })
 
   it('★ releases the claim when the chat it handed off to has nothing running', async () => {
@@ -405,7 +405,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
 
     mintBuild('new-B', 'Second build')
     const b = renderBuilder('build-B')
-    await within(b.container).findByPlaceholderText(/describe what you need/i)
+    await within(b.container).findByPlaceholderText(/ask for another change/i)
     await flushChannel()
     await buildFrom(b.container, 'and add a table')
 

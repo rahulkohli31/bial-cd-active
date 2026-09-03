@@ -3,12 +3,18 @@
  *
  * ═══ TWO DIFFERENT SENTENCES, AND CONFUSING THEM IS THE MISTAKE TO AVOID ═══
  *
- * THE STANDING LINE says what this chat is for. It is always there, and it must NOT say the app is
- * not running — the design canvas's `PlanChat` board carries the old model ("your app is not open
- * here", "the plan chat holds no sandbox of its own") and the origin document REVERSES it and wins:
- * a planning question reads the running app and starts it if it is stopped, so the app may well be
- * up and held by this very conversation. Under R-16 it does not say what the app is NOT at all; it
- * says what happens here.
+ * THE STANDING LINE says what this chat is for, and it is THE BOARD'S, VERBATIM (plan 002, U6).
+ *
+ * IT WAS REWRITTEN ONCE, AND THAT WAS A MISREADING. An earlier pass read the board's "your app is
+ * not open here" as a claim that the app is not RUNNING, which would be false — a planning question
+ * reads the live app and starts it if it is stopped, so the container may well be up and held by
+ * this very conversation. But the board is not talking about the container. It is talking about the
+ * SCREEN: a plan chat has no app pane, which is the whole of what "not open here" says, and the
+ * second clause is true for a different reason again — a plan chat's toolset carries no write, no
+ * schema change, no sandbox command and no finish tool, so the run genuinely cannot alter the app.
+ *
+ * Both halves are true, so the board's own words stand. Recorded at this length because the line
+ * has now been argued about twice, and the next reader should not have to have it a third time.
  *
  * THE WORKSPACE LINE is the same value the pane renders, as text. Same source, same wording,
  * different surface. That is what makes "no pane" structurally incapable of meaning "says nothing":
@@ -58,10 +64,17 @@ export default function PlanChatWorkspaceLine() {
     // MOUNTED ALWAYS, even before the first read lands. A region that appears together with its
     // first sentence arrives without warning under whatever the person was reading; one that is
     // always in the document simply gains a line.
-    <div data-testid="plan-chat-workspace-line" className="px-4 pb-2 text-xs leading-relaxed text-neutral">
+    // THE BOARD'S TREATMENT, and it is a caption rather than a paragraph: 11px `#9AA5B1`, centred
+    // under the box with 8px of air. `PlanChat` and `PlanReady` both draw it in that slot; it read
+    // as a left-aligned 12px sentence ABOVE the composer, which puts a standing disclaimer between
+    // the transcript and the box the citizen is typing in.
+    <div
+      data-testid="plan-chat-workspace-line"
+      className="mt-2 px-4 text-center text-[11px] leading-relaxed text-canvas-placeholder"
+    >
       <p>
-        {/* WHAT THIS CHAT DOES — never what the app is not. */}
-        Planning happens here. Your app stays exactly as it is until you choose to build.
+        {/* THE BOARD'S SENTENCE, VERBATIM — see the docblock for why both of its halves are true. */}
+        Planning is a conversation. Your app is not open here and nothing you say changes it.
       </p>
       {speak && state && (
         <div data-testid="plan-chat-workspace-state" className="mt-1.5 flex flex-wrap items-center gap-2">

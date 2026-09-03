@@ -90,7 +90,7 @@ function renderThread(chatId = 'thread-1') {
   return { ...view, fake }
 }
 
-const composer = () => screen.getByPlaceholderText(/describe what you need/i)
+const composer = () => screen.getByPlaceholderText(/ask for another change/i)
 async function send(text) {
   await waitForGateOpen()
   fireEvent.change(composer(), { target: { value: text } })

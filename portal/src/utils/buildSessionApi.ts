@@ -195,6 +195,25 @@ function existingSessionIdOf(body: unknown): string | null {
 }
 
 /**
+ * A plain GET with the same error handling. Separate from `postJson` rather than a flag on it,
+ * because a GET carries no CSRF header and no body — and a helper that took "is this a mutation"
+ * as an argument would be one edit away from sending one that did.
+ */
+async function getJson(
+  url: string,
+  fallback: string,
+  deps: AuthFetchDeps,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  const res = await authFetch(url, signal ? { signal } : {}, deps)
+  if (!res.ok) {
+    const errBody: unknown = await res.json().catch(() => null)
+    throw new ApiError(extractApiMessage(errBody, res.status, fallback), res.status, extractApiCode(errBody))
+  }
+  return res.json().catch(() => null)
+}
+
+/**
  * A mutating POST with CSRF. `body === undefined` sends no JSON body (`forceEnd` — the one
  * surviving lock op — takes none, C3 §3). A non-2xx becomes an `ApiError`, EXCEPT a
  * `409 build_session_already_active` which becomes the richer
@@ -372,27 +391,149 @@ export async function releaseProject(
   return isRecord(body) && body.released === true
 }
 
-/** Stop whatever the agent is doing in this project, and wait for it to settle.
+/**
+ * WHAT A STOP ACHIEVED — THREE NAMED STATES, never a boolean (plan 002, U9).
  *
- *  The FIRST of the three steps behind "stop and switch" — stop, then save, then release —
- *  and the reason the other two work at all: both refuse while a session is live, so a dialog
- *  that skipped this offered two buttons the server declined.
+ * The boolean this replaces said the wrong thing twice over: the server hardcoded success on both
+ * branches, while its own docstrings promised a timeout would read as "still running". So the one
+ * answer a caller must never act on — a stop that has NOT finished — arrived wearing the same face
+ * as one that had. And `false` already meant "nothing was running", which is a success the caller
+ * proceeds on, so a timeout folded into it would take a container out from under a task still
+ * writing to it.
  *
- *  `false` means nothing was running, which is a success to proceed on rather than a miss.
- *  A `true` is NOT a promise that the slot is free: the server's wait is bounded, so the
- *  authority on that is the next step's own refusal. Do not branch on it — just carry on and
- *  let save/release speak for themselves. */
-export async function stopActiveBuild(
+ *   `stopped`              proceed. Something was running and has finished unwinding.
+ *   `nothing_was_running`  proceed. There was nothing to stop.
+ *   `still_running`        DO NOT PROCEED. The wait expired, or something holds the app anyway.
+ */
+export type StopState = 'stopped' | 'nothing_was_running' | 'still_running'
+
+/** The two states a hand-over may act on. Named rather than inlined, because "which of these
+ *  means go" is the whole decision and it should have one place to be read. */
+export function stopSettled(state: StopState): boolean {
+  return state === 'stopped' || state === 'nothing_was_running'
+}
+
+function readStopState(body: unknown): StopState {
+  const state = isRecord(body) ? body.state : undefined
+  if (state === 'stopped' || state === 'nothing_was_running' || state === 'still_running') {
+    return state
+  }
+  // AN UNREADABLE ANSWER IS "STILL RUNNING", which is the only safe default: it refuses to
+  // proceed. Reading it as settled would let an unparseable body take somebody's container.
+  return 'still_running'
+}
+
+/**
+ * ASK for the stop. Returns immediately with the state at the instant the ask landed — usually
+ * `still_running`, because the unwind has barely begun.
+ *
+ * NOTHING HOLDS A REQUEST OPEN FOR THE LENGTH OF A STOP any more, and that is what removed a
+ * dependency nobody could satisfy: the old shape's budget had to sit under the request timeout of
+ * the gateway in front of the service, a number recorded nowhere in this repo and owned by the
+ * client's network.
+ */
+export async function stopActiveBuild(projectId: string, deps: AuthFetchDeps = {}): Promise<StopState> {
+  return readStopState(
+    await postJson(
+      `${BASE}/projects/${encodeURIComponent(projectId)}/stop-active-build`,
+      undefined,
+      'Could not stop the build in the other project',
+      deps,
+    ),
+  )
+}
+
+/** READ the real state, from the source of truth rather than from elapsed time. */
+export async function readStopStateOf(
   projectId: string,
   deps: AuthFetchDeps = {},
-): Promise<boolean> {
-  const body = await postJson(
-    `${BASE}/projects/${encodeURIComponent(projectId)}/stop-active-build`,
-    undefined,
-    'Could not stop the build in the other project',
-    deps,
+  signal?: AbortSignal,
+): Promise<StopState> {
+  return readStopState(
+    await getJson(
+      `${BASE}/projects/${encodeURIComponent(projectId)}/stop-state`,
+      'Could not check on the other project',
+      deps,
+      signal,
+    ),
   )
-  return isRecord(body) && body.stopped === true
+}
+
+/**
+ * HOW OFTEN TO ASK, AND FOR HOW LONG. Ordinary tuning, chosen with the code open, and neither
+ * number constrains anything: the read is cheap, nothing is held open, and the ceiling only
+ * decides when the dialog stops saying "closing…" and starts saying it could not.
+ *
+ * The ceiling is deliberately above the server's own stop budget, which is itself derived from
+ * the recovery autosave inside the finish path — so an ordinary healthy turn finishes well inside
+ * it, and reaching it means something is genuinely wrong rather than merely slow.
+ */
+const STOP_POLL_MS = 1200
+const STOP_CEILING_MS = 120_000
+/**
+ * HOW LONG ONE READ MAY HANG BEFORE IT IS ABANDONED — and why this is a REAL timer and not the
+ * injected clock's.
+ *
+ * The ceiling below is checked BETWEEN iterations, so it can only fire if each iteration actually
+ * returns. `authFetch` sets no timeout of its own: a connection that opens and then stalls never
+ * settles, the `while` never re-evaluates, and the two-minute ceiling silently becomes forever —
+ * with `ReclaimWorkspaceDialog` holding Escape and the overlay click disabled the whole time. So
+ * every read is abandoned on its own deadline and retried, which is the same treatment a dropped
+ * connection already gets: a read that gave up decided nothing.
+ *
+ * It uses `setTimeout` rather than `clock.sleep` deliberately. The injected clock exists so a test
+ * can reach the ceiling without waiting two minutes, and its `sleep` resolves immediately — racing
+ * a read against an instant sleep would abandon every read in every test. This bound is about a
+ * socket, not about pacing, so it belongs on the real timer either way.
+ */
+const STOP_READ_TIMEOUT_MS = 15_000
+
+/**
+ * Wait for a stop to genuinely finish, narrating while it does.
+ *
+ * IT POLLS THE STATE RATHER THAN WATCHING A CLOCK, which is the whole of the fix. A container
+ * declared dead when it was merely slow has destroyed unsaved work in this repo before, precisely
+ * because a timeout was read as a verdict.
+ *
+ * A DROPPED CONNECTION IS NOT A VERDICT EITHER. A failed read is retried until the ceiling rather
+ * than treated as "still running for ever" — the browser losing the network is not evidence about
+ * the other project's turn — and the caller can simply ask again afterwards, because the stop
+ * itself is running server-side and the state read is idempotent.
+ */
+export interface StopWaitClock {
+  now: () => number
+  sleep: (ms: number) => Promise<void>
+}
+
+/** The real one. Injectable, because a test that actually waited two minutes for the ceiling
+ *  would be a test nobody runs — and the ceiling's behaviour is exactly what must be proven. */
+export const REAL_CLOCK: StopWaitClock = {
+  now: () => Date.now(),
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+}
+
+export async function awaitStopSettled(
+  projectId: string,
+  deps: AuthFetchDeps = {},
+  clock: StopWaitClock = REAL_CLOCK,
+): Promise<StopState> {
+  const { now, sleep } = clock
+  const deadline = now() + STOP_CEILING_MS
+  let last: StopState = 'still_running'
+  while (now() < deadline) {
+    const abandon = new AbortController()
+    const bell = setTimeout(() => abandon.abort(), STOP_READ_TIMEOUT_MS)
+    try {
+      last = await readStopStateOf(projectId, deps, abandon.signal)
+      if (stopSettled(last)) return last
+    } catch {
+      // Retried below. See the docblock: a read that failed — or was abandoned — decided nothing.
+    } finally {
+      clearTimeout(bell)
+    }
+    await sleep(STOP_POLL_MS)
+  }
+  return last
 }
 
 /** Hand the workspace over: STOP, then optionally SAVE, then RELEASE — the whole of what the
@@ -410,7 +551,12 @@ export async function stopActiveBuild(
  *  interruption costs the user something. But an Ask or Plan turn holds the container just as
  *  firmly — every mode pins it — and `release` refuses for either, so gating the stop on it left
  *  the other modes in the dead end this flow exists to remove: a dialog whose buttons the server
- *  declines. Stopping when nothing is running is free and says so (`{stopped: false}`).
+ *  declines. Stopping when nothing is running is free and says so.
+ *
+ *  AND IT WAITS FOR THE STOP TO GENUINELY FINISH (plan 002, U9). The ask returns immediately now;
+ *  the state read is the authority, and this proceeds only on one of the two settled answers. A
+ *  stop that times out is reported as still running and the transfer DOES NOT PROCEED — which is
+ *  the difference between a clean stop and a timeout that this repo has shipped confused before.
  *
  *  REJECTS RATHER THAN SWALLOWS. A failed save must not be followed by a release — that is
  *  precisely the data loss the dialog exists to prevent — so the rejection travels back to the
@@ -419,11 +565,31 @@ export async function handOverWorkspace(
   projectId: string,
   save: boolean,
   deps: AuthFetchDeps = {},
+  narrate: (step: HandoverStep) => void = () => {},
+  clock: StopWaitClock = REAL_CLOCK,
 ): Promise<void> {
-  await stopActiveBuild(projectId, deps)
-  if (save) await saveProject(projectId, deps)
+  narrate('stopping')
+  const asked = await stopActiveBuild(projectId, deps)
+  const settled = stopSettled(asked) ? asked : await awaitStopSettled(projectId, deps, clock)
+  if (!stopSettled(settled)) {
+    // NOT AN ERROR OF OURS, AND NOT A REASON TO TAKE THE CONTAINER. Everything the citizen has is
+    // still where it was; what failed is the wait, and asking again is the remedy.
+    throw new ApiError(
+      'The other project has not finished what it was doing yet. Nothing has changed — try again in a moment.',
+      409,
+      'stop_did_not_settle',
+    )
+  }
+  if (save) {
+    narrate('saving')
+    await saveProject(projectId, deps)
+  }
+  narrate('releasing')
   await releaseProject(projectId, deps)
 }
+
+/** What a hand-over is doing right now, so the dialog can say it rather than spin. */
+export type HandoverStep = 'stopping' | 'saving' | 'releasing' | 'starting' | 'opening'
 
 /** The project standing in the way, read off a `sandbox_reclaim_blocked` 409. */
 export interface ReclaimBlocked {
@@ -442,6 +608,21 @@ export interface ReclaimBlocked {
    *  changes". And Save/Release both refuse until the build stops, which is why this variant
    *  runs `stopActiveBuild` first instead of offering them directly. */
   building: boolean
+  /**
+   * AN AGENT IS MID-TURN IN THERE, OF ANY KIND (plan 002, U9) — deliberately wider than
+   * `building`, and deliberately a SEPARATE field.
+   *
+   * `building` marks only turns whose toolset can WRITE, and the server records why: widening
+   * that one put a stop button and a hammer icon in front of someone who had only asked a
+   * question, and short-circuited the escape hatch that lets a pristine container be reclaimed
+   * without asking. This is the wide answer, for a different sentence — "their agent is still
+   * working, and transferring will stop it" — which the dialog has to be able to say over a
+   * workspace it has just reported as holding nothing to lose.
+   *
+   * Absent reads as false: an older backend that does not send it cannot have an agent to report,
+   * and defaulting the other way would tell every citizen their other project is busy.
+   */
+  agentWorking: boolean
 }
 
 /** Narrow a thrown error to the #83 refusal, or `null` for anything else.
@@ -468,6 +649,7 @@ export function asReclaimBlocked(err: unknown): ReclaimBlocked | null {
     // build to report, and defaulting the other way would show the stop dialog for a project
     // nobody is building.
     building: d.building === true,
+    agentWorking: d.agentWorking === true,
   }
 }
 

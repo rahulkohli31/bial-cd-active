@@ -51,9 +51,16 @@
 import { useRef } from 'react'
 import LivePreview from '../LivePreview'
 import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
+import type { DeviceName } from './WorkspaceToolbar'
 import { useWorkspaceAddress, useWorkspacePane, useWorkspacePaneVisible } from './workspaceChannel'
 
-export default function AppPaneHost() {
+export interface AppPaneHostProps {
+  /** Shell-owned, passed straight through — see `AppPane`. */
+  device: DeviceName
+  reloadNonce: number
+}
+
+export default function AppPaneHost({ device, reloadNonce }: AppPaneHostProps) {
   const address = useWorkspaceAddress()
   const pane = useWorkspacePane()
   const visible = useWorkspacePaneVisible()
@@ -103,9 +110,19 @@ export default function AppPaneHost() {
     <div
       data-testid="app-pane"
       aria-hidden={!visible}
+      // THE MOVEMENT THE BOARD DRAWS (plan 002, U6). `T2Sliding` is an artboard of this one
+      // transition, caught halfway, with an annotation that says exactly what it is: the app card
+      // sliding out to the right and fading as it goes, and "nothing about the app is stopped or
+      // reloaded — it is only taken off the screen".
+      //
+      // THE ANIMATION IS ON THE HIDE TREATMENT, NEVER ON THE MOUNT, and that distinction is the
+      // whole reason this is safe. The element is not conditionally rendered — it is the same node
+      // throughout, with a class change — so the frame inside it is untouched by the movement. An
+      // enter/exit animation that keyed on mounting would remount the iframe, which is the one
+      // thing this host exists to forbid.
       className={
         visible
-          ? 'flex-1 min-w-0 overflow-hidden'
+          ? 'flex-1 min-w-0 overflow-hidden animate-pane-return'
           : // Zero size AND out of reach. The width alone would only clip it; HIDDEN_BUT_MOUNTED is
             // what takes the framed app out of the tab order and out of the accessibility tree.
             `w-0 flex-shrink-0 overflow-hidden ${HIDDEN_BUT_MOUNTED}`
@@ -134,6 +151,8 @@ export default function AppPaneHost() {
         // component defaults when the publisher is gone. See the hold above for what each breaks.
         iterating={pane ? pane.iterating : lastIterating.current}
         completedLive={pane ? pane.completedLive : lastCompletedLive.current}
+        device={device}
+        reloadNonce={reloadNonce}
       />
     </div>
   )

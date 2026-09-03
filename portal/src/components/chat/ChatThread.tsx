@@ -22,23 +22,21 @@
  * re-pointed at this host and must pass BEFORE anything is deleted.
  */
 import { useMemo, type FC } from 'react'
-import { AssistantRuntimeProvider, type AppendMessage } from '@assistant-ui/react'
 
 import { Thread, type ThreadComponents } from '../assistant-ui/thread'
-import { useChatRuntime } from './runtime/useChatRuntime'
-import type { ChatMessage } from '../../utils/messageTypes'
 import MessageContent from './MessageContent'
 import AttachmentChips from '../AttachmentChips'
 import ActivityGroup, { InterruptedMessagesContext, GroupSealedContext } from './ActivityGroup'
 import ActivityRow from './ActivityRow'
 
 export interface ChatThreadProps {
-  /** The server-owned transcript. Live assembly and reload projection produce the same shape. */
-  messages: readonly ChatMessage[]
-  isRunning: boolean
-  onNew: (message: AppendMessage) => Promise<void>
-  /** R55's relocated stop, as the runtime sees it. Passing it is what registers `cancel`. */
-  onCancel: () => Promise<void>
+  /**
+   * THE RUNTIME IS NO LONGER BUILT HERE (plan 002, U5). It is the SURFACE's, and provided by the
+   * surface, because the composer needs to sit inside the same provider: the library's composer
+   * primitives all resolve against `useAui()`, and this component's own provider wrapped only the
+   * transcript. Nothing about the runtime changed — only where it is mounted, and it moved up
+   * rather than being duplicated, so there is still exactly one per conversation.
+   */
   /**
    * Messages whose turn ended on an interrupted terminal (R35c). Supplied by the surface because
    * it is a fact about the turn, not about any part.
@@ -88,17 +86,7 @@ const ReasoningGroup: ThreadComponents['ReasoningGroup'] = () => (
 
 const noAnnouncement = () => {}
 
-const ChatThread: FC<ChatThreadProps> = ({
-  messages,
-  isRunning,
-  onNew,
-  onCancel,
-  interruptedMessageIds,
-  footer,
-  onGroupSealed,
-}) => {
-  const runtime = useChatRuntime({ messages, isRunning, onNew, onCancel })
-
+const ChatThread: FC<ChatThreadProps> = ({ interruptedMessageIds, footer, onGroupSealed }) => {
   const components = useMemo<ThreadComponents>(
     () => ({
       TextPart,
@@ -121,13 +109,11 @@ const ChatThread: FC<ChatThreadProps> = ({
   const announceSealed = useMemo(() => onGroupSealed ?? noAnnouncement, [onGroupSealed])
 
   return (
-    <AssistantRuntimeProvider runtime={runtime}>
-      <InterruptedMessagesContext.Provider value={interrupted}>
-        <GroupSealedContext.Provider value={announceSealed}>
-          <Thread components={components} />
-        </GroupSealedContext.Provider>
-      </InterruptedMessagesContext.Provider>
-    </AssistantRuntimeProvider>
+    <InterruptedMessagesContext.Provider value={interrupted}>
+      <GroupSealedContext.Provider value={announceSealed}>
+        <Thread components={components} />
+      </GroupSealedContext.Provider>
+    </InterruptedMessagesContext.Provider>
   )
 }
 

@@ -62,19 +62,25 @@ const line = (preview: PreviewState) =>
 afterEach(() => cleanup())
 
 describe('AE5 — the standing line says what this chat DOES', () => {
-  it('never says the app is not running, or stopped', () => {
-    // The canvas's `PlanChat` board carries the old model ("your app is not open here", "the plan
-    // chat holds no sandbox of its own"). The origin document REVERSES it and wins: a planning
-    // question reads the running app and starts it if it is stopped, so the app may well be up and
-    // held by this very conversation. Under R-16 the line does not say what the app is NOT at all.
+  it('★ speaks the board\'s line verbatim, and still never says the app is not RUNNING', () => {
+    // THE LINE WAS REWRITTEN ONCE, ON A MISREADING (plan 002, U6). An earlier pass read the
+    // board's "your app is not open here" as a claim that the container is down — which would be
+    // false, since a planning question reads the live app and starts it if it is stopped. But the
+    // board is talking about the SCREEN: a plan chat has no app pane. And its second clause is
+    // true for a different reason again — a plan chat's toolset carries no write, no schema
+    // change, no sandbox command and no finish tool, so the run cannot alter the app.
+    //
+    // So the board's words stand, and what must STILL never appear is a claim about the
+    // container's state. Both halves are asserted here, because keeping only the first would let
+    // the misreading back in and keeping only the second would let the board's line be rewritten
+    // again.
     const { container } = line(reading({ state: 'asleep', restorable: true }))
     const text = container.textContent ?? ''
 
-    expect(text).toMatch(/planning happens here/i)
+    expect(text).toContain('Planning is a conversation. Your app is not open here and nothing you say changes it.')
     expect(text).not.toMatch(/not running/i)
     expect(text).not.toMatch(/\bstopped\b/i)
     expect(text).not.toMatch(/no sandbox/i)
-    expect(text).not.toMatch(/not open here/i)
   })
 
   it('is in the document before the first sentence arrives', () => {
@@ -109,7 +115,7 @@ describe('★ AE48 — the same value, the same sentence, on both surfaces (R97)
       const spokenHere = screen.getByTestId('plan-chat-workspace-state').textContent ?? ''
       unmount()
 
-      renderIn(<AppPane collapsed={false} onToggleCollapsed={() => {}} />, (c) =>
+      renderIn(<AppPane device="Desktop" reloadNonce={0} />, (c) =>
         c.workspace.set(report),
       )
       const spokenThere = screen.getByTestId('app-pane-empty').textContent ?? ''

@@ -66,11 +66,18 @@ beforeEach(() => {
 })
 afterEach(() => cleanup())
 
+/**
+ * THE DROP TARGET IS THE DROPZONE, NOT THE FORM (plan 002, U5). It was one hand-rolled wrapper
+ * carrying both roles; the library's dropzone wraps the box now and sets the same `data-dragging`
+ * attribute, so what changed is which element the handlers are on — the property these scenarios
+ * describe is unchanged, and still that a drop anywhere in the composer is claimed rather than
+ * falling through to the browser, which would navigate the tab away and discard everything.
+ */
 async function renderReady() {
   const { deps } = dragDeps()
   renderBuilder({ deps })
   await waitForGateOpen()
-  return screen.getByTestId('composer')
+  return screen.getByTestId('composer-dropzone')
 }
 
 describe('BuilderPage — composer drag-and-drop', () => {

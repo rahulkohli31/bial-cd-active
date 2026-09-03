@@ -10,7 +10,6 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, cleanup, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import WorkspaceRail from '../WorkspaceRail'
-import type { WorkspaceState } from '../workspaceState'
 import type { Project } from '../../../utils/projectApi'
 import type { SaveState } from '../../../utils/buildSessionApi'
 
@@ -44,28 +43,15 @@ const PROJECT: Project = {
   updatedAt: '2026-07-10T00:00:00Z',
 }
 
-const SAVED: WorkspaceState = {
-  name: 'not-running',
-  headline: 'Your app is saved.',
-  detail: 'It stays running while you work, so you only do this once.',
-  action: { kind: 'start', label: 'Launch Application' },
-}
-
 const noop = () => {}
 
-function renderRail(over: { workspace?: WorkspaceState; save?: SaveState | null } = {}) {
+function renderRail(over: { save?: SaveState | null } = {}) {
   return render(
     <MemoryRouter>
       <WorkspaceRail
         project={PROJECT}
-        workspace={over.workspace ?? SAVED}
         save={over.save ?? null}
-        chats={[]}
-        chatsError={null}
         onProjectUpdate={noop}
-        onBack={noop}
-        onOpenChat={noop}
-        onDeleteChat={noop}
       />
     </MemoryRouter>,
   )
@@ -77,19 +63,24 @@ describe("R6 — what the rail carries at rest", () => {
   it('carries the composer with its kind picker, the app status, and the description', () => {
     renderRail()
 
-    expect(screen.getByPlaceholderText(/Describe the app you want built/i)).toBeTruthy()
+    expect(screen.getByPlaceholderText(/Describe the change you need/i)).toBeTruthy()
     expect(screen.getByRole('radio', { name: 'Build' })).toBeTruthy()
     expect(screen.getByTestId('rail-app-status')).toBeTruthy()
     expect(screen.getByTestId('description-editor')).toBeTruthy()
   })
 
-  it('renders the workspace SENTENCE, from the one computed value', () => {
+  it('★ carries the PUBLISH status, and no longer the workspace sentence', () => {
+    // TWO DIFFERENT STATUSES (plan 002, U4). This section is about publishing — what is live,
+    // what was approved, what the citizen last saved. Whether the CONTAINER is up is a different
+    // question, and the boards give it to the pane, where a citizen is already looking for their
+    // app. The rail carried it too, which meant two renderers for one sentence.
     const status = screen.queryByTestId('rail-app-status')
     expect(status).toBeNull() // nothing rendered yet — guards against a stale query below
     renderRail()
 
     const block = screen.getByTestId('rail-app-status')
-    expect(within(block).getByText('Your app is saved.')).toBeTruthy()
+    expect(within(block).getByTestId('app-status-panel')).toBeTruthy()
+    expect(block.textContent).not.toMatch(/your app is saved/i)
   })
 
   it('★ carries NO start control — R3 says exactly one, and it is the pane\'s', () => {
@@ -142,44 +133,66 @@ describe('the save half, which exists only while the app is running', () => {
     expect(screen.getByTestId('rail-save-state').textContent).not.toMatch(/everything is saved/i)
   })
 
-  it('shows the SHORT saved commit, and no time', () => {
-    // No endpoint returns a saved-AT time, and a wrong time is worse than no time (R62's own
-    // principle). The commit ships; the time waits for a server field.
+  it('★ says only whether the container has moved on — the VERSION is the panel\'s row now', () => {
+    // The commit line here duplicated a fact the panel states properly: which version the
+    // citizen last saved, with its date, from object-store metadata and with no container in
+    // the request path. This block answers the question only a RUNNING container can — whether
+    // it holds work the saved bundle does not — and says nothing about versions.
     renderRail({ save: save({ savedHead: 'ccccccc1111111' }) })
 
     const block = screen.getByTestId('rail-save-state')
-    expect(block.textContent).toContain('ccccccc')
-    expect(block.textContent).not.toContain('ccccccc1111111')
-    expect(block.textContent).not.toMatch(/ago|:\d\d/)
-  })
-
-  it('omits the commit line entirely when nothing has been saved yet', () => {
-    renderRail({ save: save({ dirty: true, savedHead: null }) })
-
-    const block = screen.getByTestId('rail-app-status')
+    expect(block.textContent).toMatch(/everything is saved/i)
+    expect(block.textContent).not.toContain('ccccccc')
     expect(block.textContent).not.toMatch(/last saved version/i)
   })
 })
 
 describe('the publishing chip and the recents survive the rewrite', () => {
-  it('mounts the chip beside the project name, ungated on whether anything is built', () => {
-    // A live component carried forward from the page this rail replaces — not a slot left empty.
-    // "Nothing built yet" is a state the chip NAMES, so a citizen learns it from the same place
-    // they learn everything else rather than from an absence.
+  it('draws no chip and no project name of its own — both are the toolbar row\'s', () => {
+    // THE RAIL SURRENDERED ITS HEADER (plan 002, U2). Back, the project name, the status chip and
+    // the rename control lived here, inside a 400px column, which is why the name truncated at the
+    // rail's width and vanished entirely on a collapse — the opposite of what the collapse board
+    // draws. They are drawn once by the shell now, above both columns.
+    //
+    // ASSERTED AS AN ABSENCE PAIRED WITH A LIVENESS CHECK, because a `toBeNull()` on its own passes
+    // just as happily when the component threw and rendered nothing at all.
     renderRail()
 
-    const chip = screen.getByTestId('publish-chip-stub')
-    expect(chip.getAttribute('data-project')).toBe('p1')
-    expect(chip.previousElementSibling?.tagName).toBe('H1')
+    expect(screen.queryByTestId('publish-chip-stub')).toBeNull()
+    expect(screen.queryByRole('heading', { name: 'VIP Movement' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /rename project/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /back to projects/i })).toBeNull()
+    // …and the rail itself is alive and rendering its own sections.
+    expect(screen.getByTestId('rail-app-status')).toBeTruthy()
+    expect(screen.getByTestId('description-rail')).toBeTruthy()
   })
 
-  it('keeps the recents section, with its empty-state copy', () => {
-    // It carries the only project-scoped way to delete a conversation and the only route back to an
-    // EXISTING chat. Chat history was withheld before it was built, so removing this now would
-    // retire both silently.
-    renderRail()
+  it('★ renders exactly three sections, in the board\'s order, with no card borders between them', () => {
+    // THE SHAPE, AND THE FOURTH SECTION THAT IS NOT THERE. A grey rail with four floating white
+    // cards became a white rail with three sections and 1px rules — which is not decoration: it
+    // gives #E2E8F0 back its role as the divider and #F0F4F8 back its role as the ground behind
+    // the app. The fourth card was the recents list, deleted by the owner's ruling.
+    const { container } = renderRail()
 
-    expect(screen.getByTestId('conversations')).toBeTruthy()
-    expect(screen.getByText('No conversations yet — start a build or plan above.')).toBeTruthy()
+    expect(screen.queryByTestId('conversations')).toBeNull()
+    expect(screen.queryByText(/no conversations yet/i)).toBeNull()
+
+    const labels = Array.from(container.querySelectorAll('h2')).map((h) => h.textContent)
+    // The third section's heading is the description editor's own, which this suite stubs — so
+    // the two the RAIL draws are asserted here, in order, and the stub's presence stands for the
+    // third. `ProjectPage.test.tsx` renders the real editor and sees its heading.
+    expect(labels).toEqual(['START A CHAT', 'APP STATUS'])
+    expect(screen.getByTestId('description-editor')).toBeTruthy()
+
+    // No section carries a border, a radius or a fill of its own.
+    for (const testid of ['rail-app-status', 'description-rail']) {
+      const section = screen.getByTestId(testid)
+      expect(section.className).not.toMatch(/border-bial-border/)
+      expect(section.className).not.toMatch(/rounded-2xl/)
+      expect(section.className).not.toMatch(/bg-white/)
+    }
+    // …and the rail itself is the white surface, with hairlines between the sections.
+    expect(container.querySelector('main')?.className).toMatch(/bg-white/)
+    expect(container.querySelectorAll('div.h-px').length).toBe(2)
   })
 })

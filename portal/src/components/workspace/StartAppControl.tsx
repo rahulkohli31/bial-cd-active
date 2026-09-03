@@ -199,7 +199,7 @@ function Control({ label, pending, pendingLabel, icon, onPress }: ControlProps) 
       onClick={() => {
         if (!pending) onPress()
       }}
-      className={`inline-flex items-center gap-2 rounded-xl bg-secondary px-5 py-2.5 text-sm font-bold text-white shadow-sm shadow-secondary/30 transition hover:bg-secondary-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-secondary/40 ${
+      className={`inline-flex items-center gap-2 rounded-xl bg-primary px-5 py-2.5 text-sm font-bold text-white shadow-sm shadow-primary/30 transition hover:bg-primary-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 ${
         pending ? 'opacity-60' : ''
       }`}
     >

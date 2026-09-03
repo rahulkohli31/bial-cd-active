@@ -214,6 +214,26 @@ export interface DeploymentView {
    * its own value rather than an absent field.
    */
   publishState: PublishState
+  /**
+   * THE CITIZEN'S OWN LAST SAVE — which commit, and when (plan 002, U4).
+   *
+   * The server spends its ONE object-store metadata HEAD twice instead of once: the same read
+   * that computes `publishState`'s drift now also returns the head it compared and the store's
+   * last-modified on that bundle. No second call, and NO CONTAINER — which is the whole point,
+   * because the rail draws this row on a project whose workspace is stopped, and `save-state`
+   * attaches to a container before it can answer.
+   *
+   * THE TWO HALVES ARE INDEPENDENTLY NULL and neither is ever filled in from the other. A bundle
+   * written before the metadata stamp existed has a last-modified but no head, so it can say WHEN
+   * without saying WHICH — a renderer has to cover that mixed case, not only "both present" and
+   * "both absent". `null` on either axis is "no claim", and must never be spoken as a version.
+   *
+   * NO COUNT RIDES BESIDE THEM and none can: the snapshot key is overwrite-latest with one bundle
+   * per app and there is no version-history table, so "4 newer saves" has no source. The chip says
+   * newer work exists; it does not count it.
+   */
+  savedHead: string | null
+  savedAt: string | null
 }
 
 /**
@@ -402,6 +422,8 @@ function toDeploymentView(body: unknown): DeploymentView {
     unpublishedAt: optionalString(body.unpublishedAt),
     approval: toApprovalState(body.approval),
     publishState: toPublishState(body.publishState),
+    savedHead: optionalString(body.savedHead),
+    savedAt: optionalString(body.savedAt),
   }
 }
 

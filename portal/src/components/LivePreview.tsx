@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import type { ReactNode } from 'react'
-import { Monitor, Tablet, Smartphone, PowerOff, RotateCcw, WifiOff, Moon, Save, Loader2 } from 'lucide-react'
+import { Loader2, Moon, PowerOff, RotateCcw, WifiOff } from 'lucide-react'
 import type { RelaunchError, BuildSessionStatus } from '../utils/buildSessionTypes'
 import type { PreviewLifeState } from '../utils/buildSessionApi'
 import type { CompileState } from '../utils/compileState'
@@ -17,12 +17,11 @@ import type { CompileState } from '../utils/compileState'
 // to the pane (`h-full`, as today) with the iframe's own native scrollbar handling taller
 // content, matching the Lovable/v0 reference: a bounded-height card that scrolls
 // internally, never a fixed-aspect-ratio clip.
-const DEVICES = {
-  Desktop: { icon: Monitor, width: null as number | null },
-  Tablet: { icon: Tablet, width: 834 }, // iPad Pro 11" portrait width — Chrome DevTools preset
-  Mobile: { icon: Smartphone, width: 390 }, // iPhone 12/13/14-class width
-}
-type DeviceName = keyof typeof DEVICES
+// THE TABLE ITSELF MOVED UP WITH ITS CONTROL (plan 002, U2) — it is `WorkspaceToolbar`'s now,
+// because the switcher that picks a width lives in the shell's toolbar row. This component still
+// reads the widths, so it imports the one table rather than keeping a second copy that could
+// disagree about what "Tablet" means.
+import { DEVICES, type DeviceName } from './workspace/WorkspaceToolbar'
 
 // U5 — bound the wait for the framed document's own `load`. The reveal itself is gated on that
 // event and nothing else (see `loadedUrl` below); this cap exists only so a frame that NEVER
@@ -344,12 +343,17 @@ export interface LivePreviewProps {
   workspaceLost?: boolean
   // `slot_taken` only — the sibling project standing in the way, so the copy can name it.
   occupyingProjectName?: string | null
-  saveDirty?: boolean | null
-  onSave?: () => void
-  saving?: boolean
-  saveError?: string | null
-  toolbarLeading?: ReactNode
-  toolbarTrailing?: ReactNode
+  /**
+   * THE WIDTH THIS PANE FRAMES AT, AND ITS RELOAD SIGNAL — both owned by the shell (plan 002, U2).
+   *
+   * Both used to be this component's private `useState`, which was right while their controls
+   * lived in this component's own toolbar row. That row is gone: the boards draw ONE toolbar for
+   * the whole workspace, above the two columns, and the device switcher and the Reload control are
+   * in it. State follows its control, so these arrive as props. `reloadNonce` is combined with —
+   * never replaces — this component's own automatic remount signal below.
+   */
+  device?: DeviceName
+  reloadNonce?: number
   // Fired the moment this pane is actually SHOWING the app — the frame loaded and no cover is
   // over it — which is the honest stop-clock for "how long until the citizen saw their app".
   // Optional and fire-and-forget: this pane owes the caller nothing if the caller does not care,
@@ -407,23 +411,10 @@ export default function LivePreview({
   // The save model (KTD-5e). `saveDirty` is TRI-STATE: true = unsaved work, false = saved,
   // null = UNKNOWN (no live workspace, or the server could not compare). Unknown must not
   // render as saved — that tells the user their work is safe when nothing checked.
-  saveDirty = null,
-  onSave,
-  saving = false,
-  saveError = null,
-  // Rendered as the FIRST child of the toolbar's left group, ahead of the device-width
-  // buttons — the caller's own toggle/controls that need to live in-flow next to this
-  // toolbar rather than float over it (#87 — an absolutely-positioned caller button here
-  // used to overlap the device-width group in the same corner).
-  toolbarLeading = null,
-  // Rendered as the LAST child of the toolbar's right group, after Save. Publish lives here
-  // (via the caller, so this component stays unaware of deployment) because the moment a
-  // build finishes is the moment someone wants to put it out — making them navigate to the
-  // project page to find the button is asking them to leave the room to use the light switch.
-  toolbarTrailing = null,
+  device = 'Desktop',
+  reloadNonce: externalReloadNonce = 0,
   onRevealed,
 }: LivePreviewProps) {
-  const [viewport, setViewport] = useState<DeviceName>('Desktop')
 
   // The sandbox preview origin, held in a ref so the mount-once message listener always reads
   // the CURRENT origin without re-subscribing on every prop change.
@@ -547,13 +538,18 @@ export default function LivePreview({
   // honest moment: it means a turn that was running OVER a live preview just ended, which is the
   // repair case and nothing else. A timer would reload an idle pane; a status tick would reload
   // on every poll and leak the HMR socket the original key comment rightly protects.
-  const [reloadNonce, setReloadNonce] = useState(0)
+  const [autoReloadNonce, setAutoReloadNonce] = useState(0)
   const wasIterating = useRef(false)
   useEffect(() => {
-    if (wasIterating.current && !iterating && previewUrl) setReloadNonce((n) => n + 1)
+    if (wasIterating.current && !iterating && previewUrl) setAutoReloadNonce((n) => n + 1)
     wasIterating.current = iterating
   }, [iterating, previewUrl])
-  const frameKey = previewUrl ? `${previewUrl}#${reloadNonce}` : null
+  // TWO INDEPENDENT REASONS TO RE-REQUEST THE DOCUMENT, COMBINED RATHER THAN COLLAPSED. The one
+  // above is the platform's — a turn ended over a live preview, so the served bundle may be stale.
+  // The other is the citizen's, from the toolbar row's Reload control, for the staleness the
+  // platform cannot detect (a dev server restarted, an HMR socket that died quietly). Either one
+  // moving changes the key; neither can reset the other, which a single shared counter would.
+  const frameKey = previewUrl ? `${previewUrl}#${autoReloadNonce}.${externalReloadNonce}` : null
 
   const [covered, setCovered] = useState(false)
   // Which app the current verdict describes. A ref rather than state because it must not itself
@@ -805,82 +801,16 @@ export default function LivePreview({
 
   return (
     <div className="flex flex-col h-full">
-      {/* Toolbar */}
-      <div className="flex items-center justify-between px-4 py-2 border-b border-bial-border bg-white flex-shrink-0">
-        <div className="flex items-center gap-2">
-          {toolbarLeading}
-          <div role="group" aria-label="Preview device width" className="flex items-center gap-1 bg-bial-bg rounded-lg p-1">
-            {(Object.entries(DEVICES) as [DeviceName, (typeof DEVICES)[DeviceName]][]).map(([label, { icon: Icon }]) => (
-              <button
-                key={label}
-                type="button"
-                aria-pressed={viewport === label}
-                onClick={() => setViewport(label)}
-                className={`flex items-center gap-1.5 text-xs font-worksans font-medium px-3 py-1.5 rounded-md transition ${
-                  viewport === label
-                    ? 'bg-white text-primary shadow-sm border border-bial-border'
-                    : 'text-neutral hover:text-primary'
-                }`}
-              >
-                <Icon size={12} />{label}
-              </button>
-            ))}
-          </div>
-        </div>
+      {/* THE TOOLBAR ROW THIS COMPONENT USED TO DRAW IS GONE (plan 002, U2), and it is a removal
+          rather than a relocation of markup. The boards draw ONE row for the whole workspace,
+          under the navbar and above both columns, and this one sat INSIDE the pane — so it only
+          existed once something was framed, which is why a project with nothing built had no
+          device switcher, no Save and no way to open the app in a tab.
 
-        {/* RELOAD. The automatic remount above covers the case we can detect (a turn ending over
-            a live preview), but "what I see is out of date" is a judgement only the person
-            looking at it can make — a dev-server restart, an HMR socket that died quietly, a
-            route the agent touched without ending a turn. Without this the citizen's only
-            recourse was reloading the whole portal. Rendered only when something is framed. */}
-        {showFrame && (
-          <button
-            type="button"
-            onClick={() => setReloadNonce((n) => n + 1)}
-            title="Reload the preview"
-            className="flex items-center gap-1.5 text-xs font-worksans font-medium px-3 py-1.5 rounded-md text-neutral hover:text-primary transition"
-          >
-            <RotateCcw size={12} />
-            Reload
-          </button>
-        )}
-
-        {/* SAVE. The agent commits inside the container as it works; this is the only thing
-            that pushes the result to durable storage, and it happens because the user asked.
-            Rendered only when there is a workspace to save FROM (`saveDirty !== null`) — a
-            button that cannot do anything is worse than no button. */}
-        {onSave && saveDirty !== null && (
-          <div className="flex items-center gap-2">
-            {saveError && (
-              <span role="alert" className="text-[11px] text-danger max-w-[220px] text-right">
-                {saveError}
-              </span>
-            )}
-            {saveDirty === false && !saving && (
-              <span className="text-[11px] text-neutral/70">All changes saved</span>
-            )}
-            <button
-              type="button"
-              onClick={onSave}
-              disabled={saving || saveDirty === false}
-              data-testid="save-project"
-              // Highlighted ONLY when there is something to save. A permanently-primary Save
-              // button trains the user to ignore it, which is the state the dirty check exists
-              // to escape.
-              className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-worksans font-semibold transition disabled:opacity-50 ${
-                saveDirty
-                  ? 'bg-primary text-white hover:bg-primary-600'
-                  : 'border border-bial-border bg-white text-neutral'
-              }`}
-            >
-              {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
-              {saving ? 'Saving…' : saveDirty ? 'Save' : 'Saved'}
-            </button>
-          </div>
-        )}
-
-        {toolbarTrailing}
-      </div>
+          Where its four occupants went: the device group and the Reload control to the shell's
+          row (their state came with them and arrives here as props); Save to the same row, reading
+          the channel's save cell; and the publish chip to the row's left cluster beside the title,
+          where U4 rebuilds it. Nothing was dropped. */}
 
       {/* Main area */}
       <div className="flex-1 flex overflow-hidden relative">
@@ -1029,7 +959,7 @@ export default function LivePreview({
             // content width being exactly the device pixel width, with nothing to subtract.
             <div
               data-testid="device-card"
-              style={{ width: DEVICES[viewport].width ? `${DEVICES[viewport].width}px` : '100%' }}
+              style={{ width: DEVICES[device].width ? `${DEVICES[device].width}px` : '100%' }}
               // `width` is deliberately EXCLUDED from the transition (no `transition-all`, no
               // `transition-[width]`): animating layout width genuinely resizes the cross-origin
               // iframe on every intermediate frame of the sweep, firing a burst of real `resize`

@@ -220,11 +220,17 @@ describe('BuilderPage — a refused first-message turn aborts cleanly (was "an a
   })
 })
 
-describe('BuilderPage — the project breadcrumb', () => {
-  it('links back to the project, the only way out of a flat chat URL', async () => {
+describe('BuilderPage — the way out of a flat chat URL', () => {
+  it('the surface itself draws no back link — the toolbar row does', async () => {
+    // Plan 002's U2 moved it: the row above both columns carries the project, the chat's kind and
+    // the chat's title, so the surface no longer draws a header at all. Where the back control
+    // goes, and that it routes through the unsaved-work guard, is `WorkspaceToolbar.test.tsx`'s.
+    //
+    // Paired with a liveness check, because "the link is gone" also passes when the surface
+    // rendered nothing at all.
     renderHandoff()
-    const link = await screen.findByRole('link', { name: /VIP Movement/i })
-    expect(link.getAttribute('href')).toBe('/projects/p1')
+    await screen.findByPlaceholderText(/ask for another change/i)
+    expect(screen.queryByRole('link', { name: /VIP Movement/i })).toBeNull()
   })
 })
 
@@ -238,7 +244,7 @@ describe('BuilderPage — a refine turn', () => {
         </Routes>
       </MemoryRouter>,
     )
-    await screen.findByPlaceholderText(/describe what you need/i)
+    await screen.findByPlaceholderText(/ask for another change/i)
     await sendAndConfirm('make it blue')
 
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
@@ -278,7 +284,7 @@ describe('BuilderPage — the preview is handed R104\u2019s stop-clock (U4)', ()
     // Deliberately not asserting what the callback DOES: that decision lives in `observe.ts` and
     // is pinned there. What can only be checked here is that the wire exists.
     renderHandoff()
-    await screen.findByPlaceholderText(/describe what you need/i)
+    await screen.findByPlaceholderText(/ask for another change/i)
 
     expect(h.previewProps.length).toBeGreaterThan(0)
     for (const props of h.previewProps) {
@@ -296,7 +302,7 @@ describe('BuilderPage — the preview is handed R104\u2019s stop-clock (U4)', ()
     h.authFetch.mockClear()
 
     renderHandoff()
-    await screen.findByPlaceholderText(/describe what you need/i)
+    await screen.findByPlaceholderText(/ask for another change/i)
     const { onRevealed } = h.previewProps[h.previewProps.length - 1]
     onRevealed()
 
@@ -357,12 +363,12 @@ describe('BuilderPage — the composer is not shared across a chat navigation', 
         </Routes>
       </MemoryRouter>,
     )
-    const composer = await screen.findByPlaceholderText(/describe what you need/i)
+    const composer = await screen.findByPlaceholderText(/ask for another change/i)
     fireEvent.change(composer, { target: { value: 'a draft meant only for chat A' } })
     expect(composer.value).toBe('a draft meant only for chat A')
 
     fireEvent.click(screen.getByText('go to B'))
-    await waitFor(() => expect(screen.getByPlaceholderText(/describe what you need/i).value).toBe(''))
+    await waitFor(() => expect(screen.getByPlaceholderText(/ask for another change/i).value).toBe(''))
   })
 })
 
@@ -417,17 +423,17 @@ describe('BuilderPage — a send blocked by an in-flight reply explains itself',
         </Routes>
       </MemoryRouter>,
     )
-    await screen.findByPlaceholderText(/describe what you need/i)
+    await screen.findByPlaceholderText(/ask for another change/i)
     await send('first')
     await waitFor(() => expect(h.startTurn).toHaveBeenCalledTimes(1))
 
     await send('second')
 
-    expect(await screen.findByText(/send unlocks when it’s done/i)).toBeTruthy()
+    expect(await screen.findByText(/send unlocks when it is done/i)).toBeTruthy()
     expect(h.startTurn).toHaveBeenCalledTimes(1) // the blocked send never re-entered
     // The second message is still in the box — the user composed it while waiting, which is
     // exactly what the mode-free contract invites them to do (KTD-1).
-    expect(screen.getByPlaceholderText(/describe what you need/i).value).toBe('second')
+    expect(screen.getByPlaceholderText(/ask for another change/i).value).toBe('second')
   })
 })
 
@@ -495,7 +501,7 @@ describe('BuilderPage — the hand-off does not replay on reload (N1)', () => {
 
     const reloadSink = { current: null }
     renderAt(dropped, reloadSink)
-    await screen.findByPlaceholderText(/describe what you need/i)
+    await screen.findByPlaceholderText(/ask for another change/i)
     await act(async () => { await Promise.resolve() })
 
     expect(h.startTurn).not.toHaveBeenCalled()

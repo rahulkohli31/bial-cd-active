@@ -23,6 +23,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
 
+import { ComposerHarness } from './_composerHarness'
 import Composer, { type ComposerProps } from '../Composer'
 import { OFFER_GATE_NOTE } from '../OfferStrip'
 import { readDraft, writeDraft } from '../../../utils/composerDraft'
@@ -40,7 +41,7 @@ function draw(over: Partial<ComposerProps> = {}) {
     onUrgent: vi.fn(),
     ...over,
   }
-  return { props, ...render(<Composer {...props} />) }
+  return { props, ...render(<ComposerHarness><Composer {...props} /></ComposerHarness>) }
 }
 
 const box = () => screen.getByTestId('composer-input') as HTMLTextAreaElement
@@ -60,7 +61,7 @@ describe('a turn in flight: typing stays, sending waits (AE30)', () => {
     expect(box().value).toBe('while it thinks')
 
     expect(send().getAttribute('aria-disabled')).toBe('true')
-    expect(gateNote()?.textContent).toMatch(/send unlocks when it’s done/i)
+    expect(gateNote()?.textContent).toMatch(/send unlocks when it is done/i)
     // ONE line, not a stack of them.
     expect(screen.getAllByTestId('composer-gate-note')).toHaveLength(1)
     noRealDisabled(container)
@@ -133,14 +134,14 @@ describe('focus never drops', () => {
     send().focus()
     expect(document.activeElement).toBe(send())
 
-    rerender(<Composer {...props} isRunning />)
+    rerender(<ComposerHarness><Composer {...props} isRunning /></ComposerHarness>)
     expect(document.activeElement).toBe(send())
   })
 
   it('the textarea keeps focus too', () => {
     const { rerender, props } = draw()
     box().focus()
-    rerender(<Composer {...props} isRunning />)
+    rerender(<ComposerHarness><Composer {...props} isRunning /></ComposerHarness>)
     expect(document.activeElement).toBe(box())
   })
 })
@@ -148,10 +149,16 @@ describe('focus never drops', () => {
 describe('growth is bounded, then it scrolls', () => {
   it('grows with the text and stops at a ceiling', () => {
     // `react-textarea-autosize` measures with `scrollHeight`, which jsdom reports as 0 — so the
-    // pixel behaviour cannot be observed here. What CAN be pinned, and is what actually bounds
-    // the growth, is that a min and a max are declared and the max is finite.
+    // pixel behaviour cannot be observed here. What CAN be pinned is that the ceiling is declared
+    // and finite, and that reaching it drops nothing.
+    //
+    // THE CEILING MOVED WITH THE BOX (plan 002, U5). It was a `maxRows` prop on our own textarea;
+    // it is a `max-h` on the library's, because the library's input owns its own autosize. One
+    // line is the board's resting height — the box grows from a single line rather than opening
+    // two rows tall.
     draw()
-    expect(box().getAttribute('rows')).not.toBe('1') // it starts taller than one line
+    expect(box().getAttribute('rows')).toBe('1')
+    expect(box().className).toMatch(/max-h-\[\d+px\]/)
     type('one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen')
     expect(box().value.split('\n')).toHaveLength(13)
     // The box still exists and still holds every line — growth capped is not content dropped.
@@ -200,10 +207,10 @@ describe('the draft follows its own chat', () => {
     const { rerender, props } = draw()
     type('a draft for one')
 
-    rerender(<Composer {...props} conversationId="chat-2" />)
+    rerender(<ComposerHarness><Composer {...props} conversationId="chat-2" /></ComposerHarness>)
     expect(box().value).toBe('') // the sibling never saw it
 
-    rerender(<Composer {...props} conversationId="chat-1" />)
+    rerender(<ComposerHarness><Composer {...props} conversationId="chat-1" /></ComposerHarness>)
     expect(box().value).toBe('a draft for one')
   })
 
@@ -250,16 +257,21 @@ describe('attachments', () => {
   it('the drop target is the WHOLE composer, not just the row', () => {
     // A drop landing on the chips or the gate note would otherwise fall through to the browser's
     // default handler — which navigates the tab away and discards the draft AND the staged files.
+    //
+    // THE DROPZONE IS THE LIBRARY'S NOW (plan 002, U5) and it wraps the whole box, which is the
+    // same property said about a different element. It sets the same `data-dragging` attribute
+    // the hand-rolled one did, so what changed is the handle, not the behaviour.
     const { container } = draw()
-    const wrapper = screen.getByTestId('composer')
-    expect(wrapper.getAttribute('data-dragging')).toBeNull()
+    const zone = screen.getByTestId('composer-dropzone')
+    expect(zone.contains(screen.getByTestId('composer'))).toBe(true)
+    expect(zone.getAttribute('data-dragging')).toBeNull()
 
-    fireEvent.dragEnter(wrapper, { dataTransfer: { types: ['Files'] } })
-    fireEvent.dragOver(wrapper, { dataTransfer: { types: ['Files'] } })
-    expect(wrapper.getAttribute('data-dragging')).toBe('true')
+    fireEvent.dragEnter(zone, { dataTransfer: { types: ['Files'] } })
+    fireEvent.dragOver(zone, { dataTransfer: { types: ['Files'] } })
+    expect(zone.getAttribute('data-dragging')).toBe('true')
 
-    fireEvent.dragLeave(wrapper, { dataTransfer: { types: ['Files'] } })
-    expect(wrapper.getAttribute('data-dragging')).toBeNull()
+    fireEvent.dragLeave(zone, { dataTransfer: { types: ['Files'] } })
+    expect(zone.getAttribute('data-dragging')).toBeNull()
     noRealDisabled(container)
   })
 
@@ -279,13 +291,18 @@ describe('attachments', () => {
     //
     // They are DROPPED rather than restored on the way back: unlike the draft they live only in
     // memory as decoded bytes, so there is nothing to hydrate them from.
+    // STAGED BY DROP rather than through a hidden file input. The library's add-attachment control
+    // opens the OS picker, which jsdom cannot drive — and its dropzone reaches exactly the same
+    // `addAttachment`, so this exercises the real path rather than a seam invented for the test.
     const { rerender, props } = draw()
     const file = new File(['id,name\n1,Priya'], 'payroll.csv', { type: 'text/csv' })
-    fireEvent.change(screen.getByTestId('composer-file-input'), { target: { files: [file] } })
+    fireEvent.drop(screen.getByTestId('composer-dropzone'), {
+      dataTransfer: { types: ['Files'], files: [file] },
+    })
 
     await waitFor(() => expect(screen.getByTestId('composer-chips').textContent).toContain('payroll.csv'))
 
-    rerender(<Composer {...props} conversationId="chat-2" />)
+    rerender(<ComposerHarness><Composer {...props} conversationId="chat-2" /></ComposerHarness>)
     expect(screen.queryByTestId('composer-chips')).toBeNull()
     // LIVENESS — the composer is still mounted and usable in the sibling, so the chip's absence is
     // the switch clearing it rather than a component that failed to render.
@@ -301,7 +318,7 @@ describe('one composer, both kinds (R72)', () => {
     type('same in both')
     const first = box().value
 
-    rerender(<Composer {...props} placeholder="What are we planning?" />)
+    rerender(<ComposerHarness><Composer {...props} placeholder="What are we planning?" /></ComposerHarness>)
     expect(box().value).toBe(first)
     expect(box().getAttribute('placeholder')).toBe('What are we planning?')
     expect(send().getAttribute('aria-disabled')).toBe('false')
@@ -326,7 +343,7 @@ describe('the send-unavailable cascade, with more than one arm true', () => {
   const offer = { toolCallId: 'tc-1', conversationId: 'chat-1', spent: false, onBuild: vi.fn(), onKeepPlanning: vi.fn() }
   const gate = {
     blocked: true,
-    reason: 'Building your app — keep typing if you like; send unlocks when it’s done.',
+    reason: 'Building your app — keep typing if you like; send unlocks when it is done.',
   }
 
   it('the citizen’s own text beats everything else', () => {
@@ -338,7 +355,7 @@ describe('the send-unavailable cascade, with more than one arm true', () => {
   it('a reply arriving beats a build gate and a waiting offer', () => {
     draw({ isRunning: true, gate, offer })
     type('short enough')
-    expect(gateNote()?.textContent).toMatch(/send unlocks when it’s done/i)
+    expect(gateNote()?.textContent).toMatch(/send unlocks when it is done/i)
   })
 
   it('a build running beats a waiting offer', () => {

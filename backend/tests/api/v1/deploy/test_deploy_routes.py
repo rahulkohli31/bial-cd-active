@@ -41,7 +41,7 @@ from src.services.build_sessions.manager import SaveOutcome, SessionManager
 from src.services.classification import store as review_store
 from src.services.deploy.classification import CLASSIFICATION_KEYS
 from src.services.deploy.service import DeployNotPossibleError, StartedDeploy
-from src.services.storage import StorageError, snapshot_key
+from src.services.storage import StorageError, recovery_key, snapshot_key
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.factories import AppRegistryFactory, ProjectFactory, UserFactory
 from tests.fakes import FakeSandboxClient, FakeStorage, a_git_bundle
@@ -699,7 +699,7 @@ async def test_the_status_read_answers_without_a_deploy_pipeline(
     (`.claude/rules/testing.md`). This asserts the fixture-off baseline instead.
 
     U15: storage is UNBOUND here too (no `wire`, no `fake_storage`), which is exactly the
-    other posture this route must tolerate — `_saved_head_for_publish_state` reads `None`
+    other posture this route must tolerate — `_saved_version_for_publish_state` reads `None`
     from an unconfigured store the same way it reads one from a `StorageError`, so
     `publishState` still comes back rather than the route crashing on a `None` storage
     handle.
@@ -901,3 +901,214 @@ async def test_an_unstamped_bundle_also_reads_drift_unknown(wire, client, db_ses
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["publishState"] == "live_drift_unknown"
+
+
+# --- U4: the citizen's own last save, on the wire --------------------------------------
+#
+# The rail draws three provenance rows — LIVE NOW, APPROVED, YOUR LATEST — and until this
+# unit the third one had no source: `publish_state` consumed the saved head and threw it
+# away. These tests pin the two halves that now reach the browser (`savedHead`, `savedAt`)
+# and, more importantly, the three traps the unit sits between: the read must not wake a
+# container, it must not invent a head for an unstamped bundle, and it must read the
+# CITIZEN'S save key rather than the platform's autosave key.
+
+# The board's own instant, so the wire value and the row the boards draw
+# ("YOUR LATEST 25 Aug 2026, 14:20 f9e8d7c") are visibly the same fact.
+_SAVED_AT = datetime(2026, 8, 25, 14, 20, tzinfo=UTC)
+_SAVED_SHA = "f9" * 20
+_AUTOSAVED_SHA = "11" * 20
+
+
+class _NoContainersHere:
+    """A sandbox nobody may touch. Any attribute access at all is recorded AND raises, so
+    a container call in this request path fails as itself rather than as a mystery 500 —
+    `__getattr__` rather than an override list because a list of method names goes stale
+    the moment `SandboxClient` grows one, and the whole claim being tested is "NONE of
+    them"."""
+
+    def __init__(self) -> None:
+        self.reached_for: list[str] = []
+
+    def __getattr__(self, name: str) -> object:
+        self.reached_for.append(name)
+        raise AssertionError(f"the deployment status read reached into the container: {name}")
+
+
+async def test_the_published_approved_and_saved_rows_arrive_together(
+    wire, client, db_session
+) -> None:
+    """The rail's three provenance rows, from ONE response: what is live (the deployment's
+    own commit), when it was approved, and the citizen's latest save with its date and id.
+
+    Asserted together on purpose — the rows are drawn as a group, and a client that had to
+    make three calls to fill them would render them at three different moments.
+
+    Mutation receipt: drop `saved_head=`/`saved_at=` from `DeploymentResponse.of` and this
+    goes red on the saved row while the two above it stay green."""
+    user, app_row = await _owner_with_app(db_session, wire)
+    await _live_deployment(db_session, app_id=app_row.id, user_id=user.id)
+    app_row.status = AppStatus.APPROVED
+    app_row.approved_commit_sha = _HEAD_SHA
+    app_row.approved_at = datetime(2026, 8, 24, 9, 0, tzinfo=UTC)
+    app_row.approval_route = ApprovalRoute.SELF_PUBLISH
+    await db_session.commit()
+    key = snapshot_key(app_row.id)
+    wire.store.objects[key] = a_git_bundle(_SAVED_SHA)
+    wire.store.meta[key] = {"head_sha": _SAVED_SHA}
+    wire.store.mtimes[key] = _SAVED_AT
+
+    resp = await client.get(_STATUS.format(pid=app_row.project_id), headers=auth_headers(user))
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # LIVE NOW — the commit that actually went live, off the deployment row.
+    assert body["headSha"] == _HEAD_SHA
+    assert body["startedAt"] is not None
+    # APPROVED — the date first, the pin beside it (U12).
+    assert body["approval"]["approvedAt"] == "2026-08-24T09:00:00Z"
+    assert body["approval"]["approvedCommitSha"] == _HEAD_SHA
+    # YOUR LATEST — the new pair, and the reason the row can exist at all.
+    assert body["savedHead"] == _SAVED_SHA
+    assert body["savedAt"] == "2026-08-25T14:20:00Z"
+    # And the state that follows from the three: saved past what is live.
+    assert body["publishState"] == "live_newer_work"
+
+
+async def test_a_stopped_project_still_reports_its_saved_row_and_wakes_no_container(
+    app: FastAPI, client, db_session, monkeypatch
+) -> None:
+    """THE POINT OF THE FIELD. A citizen whose workspace was reclaimed still gets the
+    saved row, because both halves come from object-store metadata and nothing on this
+    route can reach a container.
+
+    NO `wire` FIXTURE. That fixture binds a `FakeSandboxClient` into both sandbox
+    dependencies, which is precisely the configuration under which "no container was
+    touched" is untestable — a call would simply be answered. Here the sandbox providers
+    are bound to a tripwire instead, and BOTH directions are asserted on the spy: the
+    provider was never even resolved (this route declares no sandbox dependency, so
+    FastAPI never calls it), and no attribute of the sandbox was ever reached for.
+
+    `save-state` is the read that CANNOT answer this — it attaches to a container before
+    it can say anything — which is why the row hangs off the deployment read instead."""
+    tripwire = _NoContainersHere()
+    resolved: list[str] = []
+
+    def _provide() -> object:
+        resolved.append("sandbox")
+        return tripwire
+
+    store = FakeStorage()
+    app.dependency_overrides[storage_or_none_dependency] = lambda: store
+    app.dependency_overrides[sandbox_dependency] = _provide
+    app.dependency_overrides[sandbox_or_none_dependency] = _provide
+
+    user = await UserFactory.create(db_session)
+    app_row = await AppRegistryFactory.create(db_session, user_id=user.id)
+    await db_session.commit()
+    key = snapshot_key(app_row.id)
+    store.objects[key] = a_git_bundle(_SAVED_SHA)
+    store.meta[key] = {"head_sha": _SAVED_SHA}
+    store.mtimes[key] = _SAVED_AT
+
+    resp = await client.get(_STATUS.format(pid=app_row.project_id), headers=auth_headers(user))
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["savedHead"] == _SAVED_SHA
+    assert body["savedAt"] == "2026-08-25T14:20:00Z"
+    assert resolved == [], "the status read asked for a sandbox client it must never need"
+    assert tripwire.reached_for == [], (
+        f"the status read touched the container: {tripwire.reached_for}"
+    )
+
+
+async def test_a_bundle_with_no_stamped_head_reports_null_rather_than_a_guess(
+    wire, client, db_session
+) -> None:
+    """A bundle written before the metadata stamp existed has NO claim about which commit
+    it holds, and the wire says so. The client renders "cannot tell" for the id; an
+    invented value (the deployment's head, the approved pin, an empty string) would make a
+    missing fact look like a present one, which is the whole of `.claude/rules/fail-first.md`.
+
+    THE TWO HALVES ARE INDEPENDENT, and that is asserted here rather than assumed: the
+    store still knows WHEN that bundle was written, so the date survives while the id does
+    not. Nulling both would throw away a fact nobody lost."""
+    user, app_row = await _owner_with_app(db_session, wire)
+    key = snapshot_key(app_row.id)
+    wire.store.objects[key] = a_git_bundle(_SAVED_SHA)
+    wire.store.meta[key] = {}  # a present blob carrying no `head_sha` stamp
+    wire.store.mtimes[key] = _SAVED_AT
+
+    resp = await client.get(_STATUS.format(pid=app_row.project_id), headers=auth_headers(user))
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["savedHead"] is None
+    assert body["savedAt"] == "2026-08-25T14:20:00Z"
+
+
+async def test_the_saved_row_reads_the_citizens_save_not_the_platforms_autosave(
+    wire, client, db_session
+) -> None:
+    """THE TRAP THIS UNIT SITS ONE FUNCTION CALL AWAY FROM. `manager.restore_presence`
+    PREFERS `recovery_key` — the platform's turn-boundary autosave — over the citizen's
+    `snapshot_key`, and `newest_restore_source` returns whichever of the two is newer.
+    Both are correct for resuming a workspace and both would be wrong here: the row says
+    "YOUR LATEST", so it must name the version the citizen chose to keep.
+
+    Seeded so the wrong read is unmistakable: the autosave is a DIFFERENT commit and a
+    NEWER object, so a helper that preferred it (or picked the newer of the two) would
+    return `_AUTOSAVED_SHA` and the later timestamp, and report work as saved that the
+    citizen never saved.
+
+    Mutation receipt: change `snapshot_key` to `recovery_key` in
+    `_saved_version_for_publish_state` and both assertions below go red."""
+    user, app_row = await _owner_with_app(db_session, wire)
+    saved = snapshot_key(app_row.id)
+    wire.store.objects[saved] = a_git_bundle(_SAVED_SHA)
+    wire.store.meta[saved] = {"head_sha": _SAVED_SHA}
+    wire.store.mtimes[saved] = _SAVED_AT
+    autosaved = recovery_key(app_row.id)
+    wire.store.objects[autosaved] = a_git_bundle(_AUTOSAVED_SHA)
+    wire.store.meta[autosaved] = {"head_sha": _AUTOSAVED_SHA}
+    wire.store.mtimes[autosaved] = datetime(2026, 8, 26, 11, 5, tzinfo=UTC)
+
+    resp = await client.get(_STATUS.format(pid=app_row.project_id), headers=auth_headers(user))
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["savedHead"] == _SAVED_SHA, "the autosave is not the citizen's save"
+    assert body["savedAt"] == "2026-08-25T14:20:00Z"
+
+
+async def test_another_citizen_never_learns_the_saved_head_or_when_it_was_saved(
+    wire, client, db_session
+) -> None:
+    """Owner scoping, asserted on the LEAK rather than only on the status code. The
+    ownership predicate is in the WHERE clause (ADR-0004), so a stranger gets a
+    non-leaking 404 — and this checks the two new values specifically, because a field
+    added to a response is exactly the kind of change that can widen what a wrong answer
+    would have said. Neither the commit id nor the save time may appear anywhere in the
+    body the stranger receives."""
+    owner, app_row = await _owner_with_app(db_session, wire)
+    key = snapshot_key(app_row.id)
+    wire.store.objects[key] = a_git_bundle(_SAVED_SHA)
+    wire.store.meta[key] = {"head_sha": _SAVED_SHA}
+    wire.store.mtimes[key] = _SAVED_AT
+    stranger = await UserFactory.create(db_session, email="nosy@rvaiglobal.com")
+
+    resp = await client.get(_STATUS.format(pid=app_row.project_id), headers=auth_headers(stranger))
+
+    assert resp.status_code == 404
+    assert _SAVED_SHA not in resp.text
+    assert "2026-08-25" not in resp.text
+    assert "savedHead" not in resp.text
+    assert "savedAt" not in resp.text
+
+    # And the owner, for the same project, does get both — otherwise the assertions above
+    # would pass just as well against a field that was never sent to anyone.
+    owner_resp = await client.get(
+        _STATUS.format(pid=app_row.project_id), headers=auth_headers(owner)
+    )
+    assert owner_resp.json()["savedHead"] == _SAVED_SHA
+    assert owner_resp.json()["savedAt"] == "2026-08-25T14:20:00Z"

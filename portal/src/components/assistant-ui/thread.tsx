@@ -299,7 +299,11 @@ const UserMessage: FC = () => {
       {UserAttachments && attachments && attachments.length > 0 ? (
         <UserAttachments attachments={attachments} />
       ) : null}
-      <div className="max-w-[85%] break-words rounded-xl bg-muted px-4 py-2 text-foreground empty:hidden">
+      {/* WHITE WITH A HAIRLINE, which is what every board draws for the citizen's own message —
+          `BuildChat`, `PlanChat`, `PlainAnswer`, `PlanReady`. The grey fill it shipped with was
+          the library default; on a white transcript it read as a second surface rather than as a
+          quoted line, and on the plan chat's edge-to-edge white it was the only grey on screen. */}
+      <div className="max-w-[85%] break-words rounded-xl border border-bial-border bg-white px-4 py-2 text-foreground empty:hidden">
         <MessagePrimitive.Parts components={{ Text: () => <UserText Component={TextPart} /> }} />
       </div>
     </MessagePrimitive.Root>

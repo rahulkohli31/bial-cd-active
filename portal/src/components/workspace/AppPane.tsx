@@ -50,11 +50,12 @@
  * nothing. The empty, stopped and gone states are therefore drawn HERE, from the workspace state,
  * rather than left to whatever the framed origin happens to return.
  */
-import { useCallback } from 'react'
-import { PanelLeftClose, PanelLeftOpen } from 'lucide-react'
+import { memo, useCallback } from 'react'
 import AppPaneHost from './AppPaneHost'
+import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
 import StartAppControl from './StartAppControl'
 import { WORKSPACE_RAIL_ID } from './WorkspaceShell'
+import type { DeviceName } from './WorkspaceToolbar'
 import { useWorkspaceAddress, useWorkspacePaneVisible, useWorkspaceReport } from './workspaceChannel'
 import type { WorkspaceStateName } from './workspaceState'
 
@@ -73,14 +74,27 @@ const NOTHING_IS_SERVING: ReadonlySet<WorkspaceStateName> = new Set<WorkspaceSta
 ])
 
 export interface AppPaneProps {
-  /** The rail's collapse, owned by the shell — see its `usePublishRail` note for why. */
-  collapsed: boolean
-  onToggleCollapsed: () => void
+  /** The width the app is framed at. Shell-owned, because its control is in the toolbar row. */
+  device: DeviceName
+  /** Bumped by the row's Reload control; the frame re-requests its document on a change. */
+  reloadNonce: number
 }
 
-export default function AppPane({ collapsed, onToggleCollapsed }: AppPaneProps) {
+function AppPane({ device, reloadNonce }: AppPaneProps) {
   const address = useWorkspaceAddress()
   const report = useWorkspaceReport()
+  // THE COLUMN ITSELF ANSWERS TO THE VISIBILITY, NOT ONLY THE FRAME INSIDE IT (plan 002, U6).
+  //
+  // `AppPaneHost` hides itself when no surface declares a pane — but the host is only reached when
+  // there is something to frame. A plan chat is the opposite case: nothing to frame AND no pane
+  // declared, so `frameIt` is false, `NoFrame` renders instead of the host, and this section's
+  // `flex-1` went on claiming half the window for a card offering to start an app the citizen did
+  // not ask for. That is exactly the layout `PlanChat` forbids and U6 promises: the board draws one
+  // centred column across the full width, and `ConversationSurface`'s `mx-auto max-w-3xl` cannot
+  // centre inside a rail that is only half the screen.
+  //
+  // ZERO IN BOTH DIRECTIONS, because this column sits in a flex row above the stacking threshold
+  // and a flex COLUMN below it — a width alone leaves a full-height band under a stacked rail.
   const visible = useWorkspacePaneVisible()
 
   /**
@@ -110,7 +124,14 @@ export default function AppPane({ collapsed, onToggleCollapsed }: AppPaneProps) 
     <section
       data-testid="app-pane-region"
       aria-label="Your app"
-      className="flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden"
+      aria-hidden={!visible}
+      className={
+        visible
+          ? 'flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden'
+          : // Hidden, never unmounted — the whole point of the sibling host is that leaving a
+            // build chat for a plan chat must not re-issue the frame's `src`.
+            `w-0 h-0 flex-shrink-0 overflow-hidden ${HIDDEN_BUT_MOUNTED}`
+      }
     >
       {/* VISIBLE ON FOCUS ONLY. It is the standard skip-link treatment: out of the way for a
           pointer, and the first thing a keyboard reaches on its way into the frame. */}
@@ -122,38 +143,35 @@ export default function AppPane({ collapsed, onToggleCollapsed }: AppPaneProps) 
         Skip past your app
       </button>
 
-      {/* THE RAIL'S COLLAPSE CONTROL, ON THE PANE SIDE — and it is drawn HERE rather than published
-          into the framed pane's toolbar, which is the version that failed. That toolbar is rendered
-          by `LivePreview`, which only mounts when there is something to frame; a project with
-          nothing built therefore had no toggle at all, and one collapsed from a running app would
-          have lost its way back the moment the container stopped. Its home has to be the part of
-          the pane that always renders, which is this component.
-
-          Rendered only while the pane is visible: a planning conversation has no pane, and
-          collapsing the rail there would leave an empty screen. */}
-      {visible && (
-        <div className="flex items-center px-3 pt-2">
-          <button
-            type="button"
-            onClick={onToggleCollapsed}
-            aria-expanded={!collapsed}
-            aria-controls={WORKSPACE_RAIL_ID}
-            aria-label={collapsed ? 'Show project details' : 'Hide project details'}
-            title={collapsed ? 'Show project details' : 'Hide project details'}
-            className="rounded-lg p-1.5 text-neutral transition hover:bg-bial-bg hover:text-primary"
-          >
-            {collapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
-          </button>
-        </div>
-      )}
+      {/* THE COLLAPSE CONTROL IS NOT HERE ANY MORE (plan 002, U2). It moved to the toolbar row,
+          which is drawn once above the two-column grid. Here it was already better than living
+          inside the rail it hides — a collapsed rail is invisible and untabbable, so a toggle in
+          it is a one-way door — but it still appeared and disappeared with the pane. In the row it
+          has one home in every state, beside the title that now also survives a collapse. */}
 
       {frameIt ? (
         // THE FRAME IS THE HOST'S. Everything from the frame inward — the cover that holds on an
         // unknown, the `load`-gated reveal, the frame key, the inbound-message gate on origin AND
-        // source, the sandbox token list, the device widths — is unchanged and stays there.
-        <AppPaneHost />
+        // source, the sandbox token list — is unchanged and stays there. The device WIDTH is the
+        // shell's now, because the control that picks it is in the row, and it is passed through
+        // rather than held: two owners of one width is how the card and the switcher disagree.
+        //
+        // IT DRAWS ITS OWN CARD — `LivePreview` frames the iframe in a padded `#e8edf2` box with a
+        // rounded, shadowed white surround — which is why the card below is on the EMPTY arm only.
+        // A second card around the first would be two borders and two shadows on one app.
+        <AppPaneHost device={device} reloadNonce={reloadNonce} />
       ) : (
-        <NoFrame report={report} />
+        // THE EMPTY PANE IS A NAMED REGION WITH A CARD IN IT, which is what `PreviewOff`,
+        // `NothingBuilt` and `PreviewStarting` draw — and only those three. The label is the tell:
+        // it appears on exactly the boards where the pane holds no app, because a blank half of the
+        // screen needs to say what it is for, and a running application says that itself. Drawn
+        // here rather than at the section, so it comes and goes with the emptiness it explains.
+        <div className="flex min-h-0 flex-1 flex-col px-4 pb-4 pt-3.5">
+          <p className="mb-2.5 text-[11.5px] font-bold tracking-[0.6px] text-neutral">YOUR APP</p>
+          <div className="flex min-h-0 flex-1 overflow-hidden rounded-xl border border-canvas-rule bg-white shadow-app-card">
+            <NoFrame report={report} />
+          </div>
+        </div>
       )}
     </section>
   )
@@ -197,3 +215,13 @@ function NoFrame({ report }: { report: ReturnType<typeof useWorkspaceReport> }) 
     </div>
   )
 }
+
+/**
+ * MEMOISED BECAUSE THE RAIL DRAG RE-RENDERS THE SHELL ON EVERY POINTER MOVE. `RailResizeHandle`
+ * reports each move into the shell's own width state, and this column is its sibling — so without
+ * this the whole pane subtree re-renders at pointer frequency for the length of a drag, for a
+ * width that is not its own. Both props are primitives, so the default shallow compare is exactly
+ * right; nothing else this component reads comes through props, and context and cell subscriptions
+ * reach it regardless of memo.
+ */
+export default memo(AppPane)

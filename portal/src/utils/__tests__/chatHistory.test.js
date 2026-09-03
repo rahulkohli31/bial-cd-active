@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import * as chatHistory from '../chatHistory'
-import { relativeTime, deriveTitle, newConversation } from '../chatHistory'
+import { deriveTitle, newConversation } from '../chatHistory'
 
 // U27: `buildPromptFromHistory` wrapped a planning transcript into the prompt for the old
 // client-driven single-file build. The open-sandbox orchestrator builds from the conversation
@@ -37,10 +37,17 @@ describe('deriveTitle', () => {
   })
 })
 
-describe('relativeTime', () => {
-  it('formats recent timestamps', () => {
-    expect(relativeTime(new Date().toISOString())).toBe('just now')
-    expect(relativeTime(new Date(Date.now() - 5 * 60000).toISOString())).toBe('5m ago')
-    expect(relativeTime(new Date(Date.now() - 3 * 3600000).toISOString())).toBe('3h ago')
+/* `relativeTime` IS GONE (plan 002, U3) and this block goes with it, deliberately rather than by
+   breakage. It dated the rows of the project rail's past-conversations list; the ruling of
+   2026-09-02 deleted the list, so there is no row left to date. Its absence is asserted below
+   rather than merely left unstated, so a future re-export has to be a decision. */
+describe('what this module no longer offers', () => {
+  it('exports no relativeTime, and no delete', async () => {
+    const mod = await import('../chatHistory')
+    expect('relativeTime' in mod).toBe(false)
+    expect('deleteConversation' in mod).toBe(false)
+    // Liveness: the module still loads and still exports what it is for.
+    expect(typeof mod.newConversation).toBe('function')
+    expect(typeof mod.deriveTitle).toBe('function')
   })
 })
