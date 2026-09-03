@@ -427,6 +427,11 @@ describe('R8 live clause — a reload MID-TURN re-attaches to the running reply'
       activeTurn: { turnId: 't-live', lastSeq: 3 },
       messages: [
         { id: 'srv_1_u_0', role: 'user', seq: 1, parts: [{ type: 'text', text: 'add a page' }] },
+        // ★ THE EQUAL CASE, and the only row in this fixture that exercises it. The boundary IS
+        // the user row's seq, so every other stored row of the turn sits STRICTLY above it and
+        // `>` and `>=` cannot be told apart by them. A stored agent row sharing that seq is the
+        // one row the difference decides, and it belongs to the turn just as much as the rest.
+        { id: 'srv_1_a_0', role: 'assistant', seq: 1, parts: [{ type: 'text', text: 'Reading the page first.' }] },
         { id: 'srv_2_a_0', role: 'assistant', seq: 2, parts: [{ type: 'text', text: 'Let me look at the page.' }] },
       ],
     })
@@ -437,7 +442,10 @@ describe('R8 live clause — a reload MID-TURN re-attaches to the running reply'
           seq: 3,
           turnId: 't-live',
           turnStatus: 'running',
-          parts: [{ type: 'text', text: 'Let me look at the page.' }],
+          parts: [
+            { type: 'text', text: 'Reading the page first.' },
+            { type: 'text', text: 'Let me look at the page.' },
+          ],
           working: false,
           items: [],
         },
@@ -455,6 +463,11 @@ describe('R8 live clause — a reload MID-TURN re-attaches to the running reply'
     // Once, not twice — and `getAllByText` rather than `getByText` so the assertion is about the
     // COUNT: `getByText` throws on multiple matches, which reads as a broken query.
     expect(screen.getAllByText(/Let me look at the page\./)).toHaveLength(1)
+    // ★ INCLUDING THE ROW AT EXACTLY THE BOUNDARY. The re-telling carries this sentence too, so
+    // the stored copy sitting AT the boundary seq is a second copy like any other — and a
+    // boundary drawn as `>` rather than `>=` would leave it on screen beside its own re-telling.
+    // Nothing else in this fixture can fail that way.
+    expect(screen.getAllByText(/Reading the page first\./)).toHaveLength(1)
     // ★ AND THE CITIZEN'S OWN MESSAGE SURVIVED IT. The stored user row is `srv_` plus one text
     // part, sitting at exactly the seq the boundary is drawn from, so the suppression deleted it
     // — the reply arrived with nothing above it saying what had been asked. Nothing re-tells a
