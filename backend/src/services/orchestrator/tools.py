@@ -695,10 +695,21 @@ async def _step(
 ) -> None:
     """The legacy C7 build feed. `emitter is None` on the chat-turn path, where the ENGINE emits a
     StepFrame per tool call from the run's own FunctionToolCall/Result events using the same
-    `classify_tool_call` label — emitting both would render every step twice."""
+    `classify_tool_call` label — emitting both would render every step twice.
+
+    NOTHING IS HIDDEN WHEN SOMETHING WENT WRONG, the same rule the turn engine's `_resolve_step`
+    and the reload projection both apply, and `classify_command`'s docstring states for this
+    emitter by name. A housekeeping command is plumbing while it works and the whole story the
+    moment it does not, and a group's problem count has to name a row the citizen can find.
+    Enforced HERE rather than at each call site: the classifier's `hidden` and the step's state
+    are decided in different places, and a caller that has to remember to combine them is a
+    caller that will eventually forget on the failing arm — which is the arm nobody looks at
+    until it matters."""
     if session.emitter is None:
         return
-    await session.emitter.step(name=name, label=label, state=state, hidden=hidden)
+    await session.emitter.step(
+        name=name, label=label, state=state, hidden=hidden and state != "failed"
+    )
 
 
 def _require_writable(path: str) -> None:
