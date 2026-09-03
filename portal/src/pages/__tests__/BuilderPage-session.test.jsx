@@ -72,7 +72,6 @@ vi.mock('../../utils/conversationApi', async (importOriginal) => ({
   ...(await importOriginal()),
   listProjectConversations: h.listProjectConversations,
 }))
-vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
 // THE WORKSPACE READ, and it is the difference between two very different sentences on the pane.
 //
 // This file mocked nothing here, so the poll's real fetch failed and the map answered honestly:

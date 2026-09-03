@@ -44,7 +44,6 @@ vi.mock('../../utils/conversationApi', async (importOriginal) => ({
   ...(await importOriginal()),
   listProjectConversations: h.listProjectConversations,
 }))
-vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
 // `switchMode` is GONE from this list (U1/U19): the route it posted to no longer exists, and a

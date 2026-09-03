@@ -46,7 +46,6 @@ vi.mock('../../utils/conversationApi', () => ({
   listProjectConversations: h.listProjectConversations,
   uuidv7: (...a) => h.uuidv7(...a),
 }))
-vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../components/LivePreview', () => ({ default: () => null }))
 vi.mock('../../components/AttachmentChips', () => ({ default: () => null }))
