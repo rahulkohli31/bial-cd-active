@@ -136,8 +136,8 @@ export function validateAttachmentFiles(
   return { ok: true }
 }
 
-/** The pending-composer shape (`usePendingAttachments.js`) — transient base64
- * held client-side until the message sends. */
+/** The pending-composer shape (`chat/runtime/attachmentAdapter.ts` makes them) —
+ * transient base64 held client-side until the message sends. */
 export interface PendingAttachment {
   id: string
   name: string

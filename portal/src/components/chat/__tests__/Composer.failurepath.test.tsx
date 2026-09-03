@@ -17,8 +17,9 @@
  * race with, and the tests below are shaped as "the failure changed nothing" rather than as "the
  * restore put the right things back". That difference is the fix.
  *
- * R57's clamp is still tested — in `hooks/__tests__/usePendingAttachments.test.ts`, because the
- * function is still exported and reachable even though this composer never calls it.
+ * R57's clamp lives in the attachment adapter now and is tested where it runs — in
+ * `ComposerBox.test.tsx`, against a drop and a multi-file gesture. The hook that used to carry it
+ * had no caller left once this composer became the library's box, and went with it.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
