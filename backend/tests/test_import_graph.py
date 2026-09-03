@@ -204,8 +204,13 @@ def test_the_app_still_builds_with_its_full_route_surface() -> None:
     # 17 since U28 retired `lock/acquire` / `lock/renew` / `lock/release` / `heartbeat` (21 - 4):
     # nothing called them — the portal's keep-alive loop that was their only caller was itself
     # deleted back in U13. `lock/force-end` is the one lock op still reachable from the UI.
-    assert len(build_session_paths) == 17, (
-        f"the C3 build-session route surface changed: expected 17 paths, found "
+    # 18 since plan 002 U9 added `projects/{project_id}/stop-state`: the drain's ask
+    # (`stop-active-build`) now RETURNS IMMEDIATELY and a detached task does the waiting, so the
+    # outcome needs a reader. Holding a request open for the length of a stop was a dependency
+    # nobody could satisfy — the budget had to sit under the request timeout of a gateway owned by
+    # the client's network — and the outcome it was hiding is three states, not a boolean.
+    assert len(build_session_paths) == 18, (
+        f"the C3 build-session route surface changed: expected 18 paths, found "
         f"{len(build_session_paths)}. If a route was deliberately added or removed, amend C3 "
         f"and update this number in the same change.\n{sorted(build_session_paths)}"
     )
