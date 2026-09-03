@@ -195,18 +195,17 @@ function existingSessionIdOf(body: unknown): string | null {
 }
 
 /**
- * A mutating POST with CSRF. `body === undefined` sends no JSON body (`forceEnd` — the one
- * surviving lock op — takes none, C3 §3). A non-2xx becomes an `ApiError`, EXCEPT a
- * `409 build_session_already_active` which becomes the richer
- * `BuildSessionAlreadyActiveError` carrying the existing session id.
- */
-/**
  * A plain GET with the same error handling. Separate from `postJson` rather than a flag on it,
  * because a GET carries no CSRF header and no body — and a helper that took "is this a mutation"
  * as an argument would be one edit away from sending one that did.
  */
-async function getJson(url: string, fallback: string, deps: AuthFetchDeps): Promise<unknown> {
-  const res = await authFetch(url, {}, deps)
+async function getJson(
+  url: string,
+  fallback: string,
+  deps: AuthFetchDeps,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  const res = await authFetch(url, signal ? { signal } : {}, deps)
   if (!res.ok) {
     const errBody: unknown = await res.json().catch(() => null)
     throw new ApiError(extractApiMessage(errBody, res.status, fallback), res.status, extractApiCode(errBody))
@@ -214,6 +213,12 @@ async function getJson(url: string, fallback: string, deps: AuthFetchDeps): Prom
   return res.json().catch(() => null)
 }
 
+/**
+ * A mutating POST with CSRF. `body === undefined` sends no JSON body (`forceEnd` — the one
+ * surviving lock op — takes none, C3 §3). A non-2xx becomes an `ApiError`, EXCEPT a
+ * `409 build_session_already_active` which becomes the richer
+ * `BuildSessionAlreadyActiveError` carrying the existing session id.
+ */
 async function postJson(url: string, body: unknown, fallback: string, deps: AuthFetchDeps): Promise<unknown> {
   const hasBody = body !== undefined
   const res = await authFetch(
@@ -439,12 +444,17 @@ export async function stopActiveBuild(projectId: string, deps: AuthFetchDeps = {
 }
 
 /** READ the real state, from the source of truth rather than from elapsed time. */
-export async function readStopStateOf(projectId: string, deps: AuthFetchDeps = {}): Promise<StopState> {
+export async function readStopStateOf(
+  projectId: string,
+  deps: AuthFetchDeps = {},
+  signal?: AbortSignal,
+): Promise<StopState> {
   return readStopState(
     await getJson(
       `${BASE}/projects/${encodeURIComponent(projectId)}/stop-state`,
       'Could not check on the other project',
       deps,
+      signal,
     ),
   )
 }
@@ -460,6 +470,23 @@ export async function readStopStateOf(projectId: string, deps: AuthFetchDeps = {
  */
 const STOP_POLL_MS = 1200
 const STOP_CEILING_MS = 120_000
+/**
+ * HOW LONG ONE READ MAY HANG BEFORE IT IS ABANDONED — and why this is a REAL timer and not the
+ * injected clock's.
+ *
+ * The ceiling below is checked BETWEEN iterations, so it can only fire if each iteration actually
+ * returns. `authFetch` sets no timeout of its own: a connection that opens and then stalls never
+ * settles, the `while` never re-evaluates, and the two-minute ceiling silently becomes forever —
+ * with `ReclaimWorkspaceDialog` holding Escape and the overlay click disabled the whole time. So
+ * every read is abandoned on its own deadline and retried, which is the same treatment a dropped
+ * connection already gets: a read that gave up decided nothing.
+ *
+ * It uses `setTimeout` rather than `clock.sleep` deliberately. The injected clock exists so a test
+ * can reach the ceiling without waiting two minutes, and its `sleep` resolves immediately — racing
+ * a read against an instant sleep would abandon every read in every test. This bound is about a
+ * socket, not about pacing, so it belongs on the real timer either way.
+ */
+const STOP_READ_TIMEOUT_MS = 15_000
 
 /**
  * Wait for a stop to genuinely finish, narrating while it does.
@@ -494,11 +521,15 @@ export async function awaitStopSettled(
   const deadline = now() + STOP_CEILING_MS
   let last: StopState = 'still_running'
   while (now() < deadline) {
+    const abandon = new AbortController()
+    const bell = setTimeout(() => abandon.abort(), STOP_READ_TIMEOUT_MS)
     try {
-      last = await readStopStateOf(projectId, deps)
+      last = await readStopStateOf(projectId, deps, abandon.signal)
       if (stopSettled(last)) return last
     } catch {
-      // Retried below. See the docblock: a read that failed decided nothing.
+      // Retried below. See the docblock: a read that failed — or was abandoned — decided nothing.
+    } finally {
+      clearTimeout(bell)
     }
     await sleep(STOP_POLL_MS)
   }

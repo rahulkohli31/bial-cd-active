@@ -478,7 +478,7 @@ describe('AppPaneHost — a layout change does not remount the frame (AE37)', ()
         <>
           <button
             type="button"
-            onClick={() => { setStacked(!stacked); channel?.rail.set({ mode: null, state: {}, stacked: !stacked, collapsed: false }) }}
+            onClick={() => { setStacked(!stacked); channel?.rail.set({ mode: null, stacked: !stacked, collapsed: false }) }}
           >
             flip
           </button>

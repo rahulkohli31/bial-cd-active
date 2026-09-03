@@ -23,6 +23,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
 import { ComposerHarness } from './_composerHarness'
 import ComposerBox from '../ComposerBox'
+import { SendRefusal } from '../sendRefusal'
 import type { ComposerSubmission } from '../ComposerBox'
 
 afterEach(cleanup)
@@ -163,9 +164,7 @@ describe('★ the box clears ONLY once the server has accepted', () => {
   })
 
   it('says the refusal in the words it was given, and only when they were meant to be read', async () => {
-    const refusal = Object.assign(new Error('You already have a build running in this chat.'), {
-      name: 'SendRefusal',
-    })
+    const refusal = new SendRefusal('You already have a build running in this chat.')
     const onUrgent = vi.fn()
     draw({ onSubmit: vi.fn().mockRejectedValue(refusal), onUrgent })
     type('again')
@@ -183,13 +182,46 @@ describe('★ the box clears ONLY once the server has accepted', () => {
   })
 
   it('a silent refusal says nothing and clears nothing', async () => {
-    const refusal = Object.assign(new Error('swallowed'), { name: 'SendRefusal', silent: true })
+    const refusal = new SendRefusal('swallowed', { silent: true })
     const onUrgent = vi.fn()
     draw({ onSubmit: vi.fn().mockRejectedValue(refusal), onUrgent })
     type('held')
     fireEvent.click(send())
     await waitFor(() => expect(box().value).toBe('held'))
     expect(onUrgent).not.toHaveBeenCalled()
+  })
+
+  it('★ keeps what was typed WHILE the send was in flight — it clears only what it sent', async () => {
+    // THE AFFORDANCE IS THE HAZARD. The box stays typable while a send is out (by design), so an
+    // unconditional clear on success deletes whatever arrived in the meantime. This is the same
+    // loss the file's docblock says it exists to prevent, reached through the happy path instead
+    // of the failure path.
+    let release = () => {}
+    const gate = new Promise<void>((r) => { release = r })
+    const onSubmit = vi.fn().mockReturnValue(gate)
+    draw({ onSubmit })
+
+    type('first message')
+    fireEvent.click(send())
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+
+    // The citizen keeps typing while the request is out.
+    type('first message and a second thought')
+    release()
+
+    // Only the sent words go. The rest is still there to send.
+    await waitFor(() => expect(box().value).toBe(' and a second thought'))
+    // The sent text was the snapshot, not what the box held when the promise settled.
+    expect(onSubmit.mock.calls[0]?.[0]?.text).toBe('first message')
+  })
+
+  it('★ still empties the box when nothing was added during the send', async () => {
+    // The ordinary case must not regress into "never clears".
+    const onSubmit = vi.fn().mockResolvedValue(undefined)
+    draw({ onSubmit })
+    type('just this')
+    fireEvent.click(send())
+    await waitFor(() => expect(box().value).toBe(''))
   })
 
   it('a double press sends once', async () => {

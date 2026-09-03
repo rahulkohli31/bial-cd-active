@@ -108,7 +108,7 @@ const sameAddress = (a: WorkspaceAddress, b: WorkspaceAddress) =>
  * stable across renders that did not change it.
  */
 const sameRail = (a: RailSlot, b: RailSlot) =>
-  a.mode === b.mode && a.stacked === b.stacked && a.collapsed === b.collapsed && a.state === b.state
+  a.mode === b.mode && a.stacked === b.stacked && a.collapsed === b.collapsed
 
 /**
  * What the mounted surface asks the pane to SHOW — its visibility declaration, its toolbar slots,
@@ -212,12 +212,13 @@ export interface ReclaimRequest {
 }
 
 /**
- * The rail's slot, provided now and filled by Plan F.
+ * The rail's slot — WHICH RAIL IS SHOWING, and how the shell is laying it out.
  *
- * Plan F needs the rail mode and an opaque per-mode bag to outlive a chat (R9, R63), and has
- * already rejected a `?rail=` query param on the strength of shell-held state. Providing the slot
- * here costs one cell and saves F from amending a shipped component. This plan renders no rail and
- * reads no mode.
+ * It was provided ahead of the rail itself, against a `?rail=` query param that would have made a
+ * rail mode a shareable link. The rail has since landed: `WorkspaceShell` derives the mode from
+ * the address and publishes it here, and `WorkspaceRail` reads it. The "opaque per-mode bag" that
+ * was reserved alongside it was never filled by anything and has been removed rather than left
+ * standing as a field every writer has to remember to carry.
  */
 export interface RailSlot {
   /**
@@ -230,8 +231,6 @@ export interface RailSlot {
    * different feature from the one R9 asks for.
    */
   mode: string | null
-  /** Opaque to the shell; the Outlet child owns the contents. */
-  state: Record<string, unknown>
   /**
    * Below R13's threshold the two columns stack instead of sitting side by side. Plan F owns the
    * threshold that flips this; THIS PLAN OWNS THE CONTAINER whose class it changes, which is what
@@ -302,7 +301,7 @@ export const NO_HEADING: WorkspaceHeading = {
 }
 
 /**
- * THE SAVE HALF OF THE ROW — its VALUES only. The action lives in `saveAction`, and the split is
+ * THE SAVE HALF OF THE ROW — its VALUES only. The action lives in `actions`, and the split is
  * the point.
  *
  * A handler on a value-compared cell is the hazard `sameReport` had to write a paragraph of rules
@@ -317,7 +316,7 @@ export interface SaveSlot {
   saving: boolean
   error: string | null
   /**
-   * WHETHER AN ACTION IS PUBLISHED AT ALL — derived from `saveAction` by `usePublishSave`, never
+   * WHETHER AN ACTION IS PUBLISHED AT ALL — derived from `actions` by `usePublishSave`, never
    * passed separately, so the two cannot disagree.
    *
    * The row needs this at RENDER time and the action itself only at press time, which is why one
@@ -360,7 +359,7 @@ export interface WorkspaceAddress extends PreviewAddress {
 
 export const NO_ADDRESS: WorkspaceAddress = { url: null, status: null, projectId: null }
 
-export const NO_RAIL: RailSlot = { mode: null, state: {}, stacked: false, collapsed: false }
+export const NO_RAIL: RailSlot = { mode: null, stacked: false, collapsed: false }
 
 const sameHeading = (a: WorkspaceHeading, b: WorkspaceHeading) =>
   a.projectId === b.projectId &&
@@ -571,7 +570,7 @@ export function useWorkspaceHeading(): WorkspaceHeading {
   return useCell(useWorkspaceChannel()?.heading, NO_HEADING)
 }
 
-/** The save control's VALUES. Its action is read at press time — see `useSaveAction`. */
+/** The save control's VALUES. Its action is read at press time — see `useWorkspaceActions`. */
 export function useWorkspaceSave(): SaveSlot {
   return useCell(useWorkspaceChannel()?.save, NO_SAVE)
 }
@@ -750,21 +749,6 @@ export function usePublishSaveState(dirty: boolean | null): void {
   usePublish(useWorkspaceChannel()?.saveDirty, dirty)
 }
 
-/**
- * Publish the rail's slot — its mode, its collapse and its opaque per-mode bag (Plan F, U1).
- *
- * CLEARED ON UNMOUNT, and the reason is the opposite of the address's. An address survives its
- * publisher because the app it names is still running and R8 forbids destroying it on a
- * navigation. A rail slot describes chrome that has just been unmounted: leaving `collapsed: true`
- * standing after the surface that collapsed it is gone would hand the NEXT surface a rail already
- * hidden, with the control that would restore it published by a component that no longer exists.
- *
- * ONE WRITER AT A TIME, by construction rather than by convention: the shell mounts exactly one
- * Outlet child, and only that child publishes here.
- */
-export function usePublishRailSlot(slot: RailSlot): void {
-  usePublish(useWorkspaceChannel()?.rail, slot, NO_RAIL)
-}
 
 /**
  * Publish what to say about the workspace. CLEARED ON UNMOUNT, like the pane view and for the same

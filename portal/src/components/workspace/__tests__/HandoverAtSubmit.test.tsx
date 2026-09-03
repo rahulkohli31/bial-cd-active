@@ -181,7 +181,11 @@ describe('cancelling', () => {
     fireEvent.click(send())
     await screen.findByRole('dialog')
 
-    fireEvent.keyDown(screen.getByRole('dialog').querySelector('[tabindex="-1"]')!, { key: 'Escape' })
+    // The keydown goes to the SAME element Radix listens on — its focusable content wrapper, not
+    // the role node — so this asserts the element exists rather than asserting it away with `!`.
+    const content = screen.getByRole('dialog').querySelector('[tabindex="-1"]')
+    expect(content).not.toBeNull()
+    fireEvent.keyDown(content as Element, { key: 'Escape' })
 
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
     expect((composer() as HTMLTextAreaElement).value).toBe('add an out-time column')

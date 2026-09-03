@@ -42,7 +42,7 @@ import { chatKindFor } from '../../utils/chatKind'
 import { asReclaimBlocked, relaunchPreview } from '../../utils/buildSessionApi'
 import { useWorkspaceReport } from './workspaceChannel'
 import ComposerBox, { type ComposerSubmission } from '../chat/ComposerBox'
-import { SendRefusal } from '../chat/Composer'
+import { SendRefusal } from '../chat/sendRefusal'
 import { convertMessage } from '../chat/runtime/convertMessage'
 import type { ChatMessage } from '../../utils/messageTypes'
 import {

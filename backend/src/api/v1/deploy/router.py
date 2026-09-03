@@ -50,6 +50,7 @@ the 503 paths on the storage and sandbox routes were once broken.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -1015,8 +1016,28 @@ async def latest_deployment(
         )
 
     approval = ApprovalState.of(app_row)
-    row = await deployment_for_app(db, app_id=app_row.id)
-    saved = await _saved_version_for_publish_state(storage, app_row.id)
+    # A Postgres round-trip and an object-store metadata HEAD, neither of which needs the
+    # other's answer. Both surfaces POLL this route, so serialising them would make every tick
+    # cost the SUM of a database query and a network call to the store instead of the larger of
+    # the two. Only the first coroutine touches `db`, so the session is never used concurrently.
+    #
+    # `return_exceptions=True` IS LOAD-BEARING, not defensive noise. A bare `gather` propagates
+    # the first exception the moment it is raised and leaves its sibling RUNNING — so a storage
+    # error that escapes `_saved_version_for_publish_state` (it catches `StorageError`, and the
+    # Azure client can raise from outside that) would return control to `get_db`, which rolls the
+    # session back while the SELECT above is still on it. Collecting both answers means each
+    # coroutine always finishes before anything unwinds; the failure is then re-raised unchanged,
+    # so the route's error surface is exactly what it was when these two ran in sequence.
+    row_or_error, saved_or_error = await asyncio.gather(
+        deployment_for_app(db, app_id=app_row.id),
+        _saved_version_for_publish_state(storage, app_row.id),
+        return_exceptions=True,
+    )
+    if isinstance(row_or_error, BaseException):
+        raise row_or_error
+    if isinstance(saved_or_error, BaseException):
+        raise saved_or_error
+    row, saved = row_or_error, saved_or_error
     publish_state = compute_publish_state(app_row, row, saved.head)
     if row is None:
         return DeploymentResponse(

@@ -88,12 +88,23 @@ function renderShell(child: ReactNode) {
 // The two chat PAGES are gone (Plan D U17) and one surface replaces them, so the list follows the
 // tree rather than being left naming files that no longer exist — a guard whose inventory has
 // rotted reads the same as a guard that passes.
+// The surfaces this plan ADDED are on the list too. The guard is a SOURCE scan, not a render
+// assertion — it reaches branches no test mounts — so a surface left off it is not covered by
+// "the tests pass". Leaving the new toolbar, rail, pane and handle off would have defeated the
+// guard for precisely the components the rebuild introduced.
 const IN_SHELL_SURFACES = [
   'pages/ChatRoute.tsx',
   'components/chat/ConversationSurface.tsx',
   'pages/ProjectPage.tsx',
   'components/workspace/ConversationSlot.tsx',
   'components/workspace/AppPaneHost.tsx',
+  'components/workspace/AppPane.tsx',
+  'components/workspace/WorkspaceToolbar.tsx',
+  'components/workspace/WorkspaceRail.tsx',
+  'components/workspace/RailComposer.tsx',
+  'components/workspace/RailResizeHandle.tsx',
+  'components/workspace/PlanChatWorkspaceLine.tsx',
+  'components/workspace/StartAppControl.tsx',
 ] as const
 
 const grid = () => screen.getByTestId('workspace-grid')
@@ -173,7 +184,7 @@ describe('WorkspaceShell — the grid is the shell\'s own', () => {
         type="button"
         onClick={() => {
           setStacked(!stacked)
-          channel?.rail.set({ mode: null, state: {}, stacked: !stacked, collapsed: false })
+          channel?.rail.set({ mode: null, stacked: !stacked, collapsed: false })
         }}
       >
         flip

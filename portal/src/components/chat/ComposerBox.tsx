@@ -51,6 +51,7 @@ import { useRefusalSink } from './runtime/stagedAttachments'
 import { unsupportedFormatMessage } from '../../utils/attachmentInput'
 import type { PendingAttachment } from '../../utils/attachmentInput'
 import AttachmentPreview, { type PreviewTarget } from './AttachmentPreview'
+import { SendRefusal } from './sendRefusal'
 
 /** What one send carries. The box assembles it; the surface performs it. */
 export interface ComposerSubmission {
@@ -127,21 +128,44 @@ export default function ComposerBox({
     const attachments = payloadsOf(state.attachments)
     if (state.text.trim().length === 0 && attachments.length === 0) return
 
+    // WHAT THIS PRESS IS SENDING, snapshotted — and the reason the clear below is not a `reset()`.
+    // The box stays typable and the paperclip stays live for the whole in-flight window, on
+    // purpose: waiting on the server is not a reason to stop composing. That makes an
+    // unconditional clear a DELETE of whatever the citizen added while the request was out —
+    // exactly the loss this file's docblock says it exists to prevent, arriving through the
+    // affordance rather than through the failure path.
+    const sentText = state.text
+    const sentIds = new Set(state.attachments.map((a) => a.id))
+
     setSending(true)
     try {
-      await onSubmit({ text: state.text, attachments, conversationId })
-      // CLEARED ONLY ON SUCCESS. Nothing is optimistically emptied, so a failed send leaves the
-      // text and the files exactly where they were and there is no restore path to race with.
-      await aui.composer.setText('')
+      await onSubmit({ text: sentText, attachments, conversationId })
+      // CLEARED ONLY ON SUCCESS, AND ONLY WHAT WAS SENT. Nothing is optimistically emptied, so a
+      // failed send leaves everything exactly where it was and there is no restore path to race
+      // with; and anything added since the press survives, because it was never sent.
+      const after = aui.composer.getState()
+      if (after.text === sentText) await aui.composer.setText('')
+      else if (after.text.startsWith(sentText)) await aui.composer.setText(after.text.slice(sentText.length))
+      // Anything else is an edit we cannot reconcile — the citizen rewrote the box while the
+      // request was out. Leaving their words alone is the only safe answer; a stale copy of a
+      // sent line is a nuisance, a deleted paragraph is the bug.
+
+      // THE FILES, SAME RULE. `clearAttachments()` is all-or-nothing and the composer exposes no
+      // per-file removal, so anything staged during the send is cleared with the rest and then put
+      // back. Re-adding runs it through the adapter's validation a second time, which is harmless:
+      // it passed once already, and the alternative is either deleting a file the citizen chose or
+      // sending it twice.
+      const kept = after.attachments.filter((a) => !sentIds.has(a.id))
       await aui.composer.clearAttachments()
+      for (const a of kept) if (a.file) await aui.composer.addAttachment(a.file)
     } catch (err) {
       // The swallowed press: nothing sent, nothing said, nothing cleared.
-      if (err instanceof Error && err.name === 'SendRefusal' && (err as { silent?: boolean }).silent) return
+      if (err instanceof SendRefusal && err.silent) return
       // THE REFUSAL'S OWN WORDS, but only when they were written to be read. Anything else keeps
       // the generic sentence: an aborted send is already in the surface's own banner in the
       // server's words, and a bug's message is not for this audience.
       onUrgent(
-        err instanceof Error && err.name === 'SendRefusal'
+        err instanceof SendRefusal
           ? err.message
           : 'That message did not send. Everything you typed is still here — try again.',
       )

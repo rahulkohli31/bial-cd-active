@@ -43,7 +43,7 @@
  * against the nearest scroll container and that container has moved.
  */
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
-import { useCallback, useEffect, useLayoutEffect, useState, type CSSProperties } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useState, type CSSProperties } from 'react'
 import Navbar from '../layout/Navbar'
 import ReclaimWorkspaceDialog from '../projects/ReclaimWorkspaceDialog'
 import AppPane from './AppPane'
@@ -366,7 +366,7 @@ function ShellFrame() {
           style={{ '--rail-w': `${collapsed ? 0 : railWidth}px` } as CSSProperties}
           className={`min-w-0 min-h-0 flex flex-col overflow-hidden ${railWidthClass(collapsed, paneVisible)}`}
         >
-          <Outlet />
+          <RailOutlet />
         </div>
         {/* THE HANDLE, BETWEEN THE TWO COLUMNS. Rendered only when there are two: a collapsed rail
             has no boundary to move, and a surface that declares no pane — every plan chat — is the
@@ -392,6 +392,24 @@ function ShellFrame() {
     </WorkspaceExitProvider>
   )
 }
+
+/**
+ * THE RAIL'S ROUTE CONTENT, MEMOISED — the other half of `AppPane`'s fix.
+ *
+ * `RailResizeHandle` reports every pointer move into the shell's width state, and BOTH columns of
+ * the grid are siblings of that state. `AppPane` was given `React.memo` for exactly this; the
+ * outlet column is the same distance from the same cause and renders the far heavier subtree —
+ * `ChatRoute` → `ConversationSlot` → `ConversationSurface`, with the transcript, the composer and
+ * the assistant-ui runtime under it. Without this, a drag re-invokes all of it at pointer
+ * frequency for a width that belongs to the wrapper, not to the route.
+ *
+ * It takes NO props, so the memo can never go stale: routing changes reach `Outlet` through
+ * context, which memo does not block. The wrapper div's `--rail-w` still updates every move —
+ * that is a cheap style write, and it is what actually moves the boundary.
+ */
+const RailOutlet = memo(function RailOutlet() {
+  return <Outlet />
+})
 
 export default function WorkspaceShell() {
   // Created once and never replaced, so the context value is stable for the life of the shell and

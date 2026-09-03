@@ -55,7 +55,6 @@ const h = vi.hoisted(() => ({
   patchProject: vi.fn(),
   generateDescription: vi.fn(),
   listProjectConversations: vi.fn(),
-  deleteConversation: vi.fn(),
   fetchPreviewState: vi.fn(),
   fetchSaveState: vi.fn(),
   relaunchPreview: vi.fn(),
@@ -76,7 +75,6 @@ vi.mock('../../utils/projectApi', () => ({
 }))
 vi.mock('../../utils/conversationApi.js', () => ({
   listProjectConversations: h.listProjectConversations,
-  deleteConversation: h.deleteConversation,
 }))
 // The publish chip owns its own read and its own suite; stubbed to a marker so these tests
 // stay about the page while still being able to assert WHERE it is mounted. The stub is
@@ -441,7 +439,6 @@ describe('ProjectPage — nothing points back to a past chat', () => {
     expect(screen.queryByText('Scope the fields')).toBeNull()
     expect(screen.queryByText('Build the screen')).toBeNull()
     expect(screen.queryByRole('button', { name: /^delete$/i })).toBeNull()
-    expect(h.deleteConversation).not.toHaveBeenCalled()
     expect(screen.getByTestId('description-rail')).toBeTruthy()
   })
 

@@ -3,7 +3,8 @@ import { useNavigate, useLocation, useParams } from 'react-router-dom'
 import Announcer, { useActivityAnnouncement } from './Announcer'
 import ChatThread from './ChatThread'
 import ChatRuntimeProvider from './runtime/ChatRuntimeProvider'
-import Composer, { SendRefusal, type ComposerSubmission } from './Composer'
+import Composer, { type ComposerSubmission } from './Composer'
+import { SendRefusal } from './sendRefusal'
 import type { BuildHandoff } from './OfferStrip'
 import ScrollToLatest from './ScrollToLatest'
 import SessionBanners from './SessionBanners'
@@ -2552,9 +2553,13 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
             }
           : null,
       // `resolveReclaim` is redefined every render and is not worth memoising on its own — it
-      // reads `reclaim` directly. Keyed on the refusal itself, which is what the dialog renders.
+      // reads `reclaim` directly. Keyed on the refusal itself, which is what the dialog renders —
+      // AND ON THE STEP, without which the narration freezes: `handoverStep` is read on the line
+      // above, so leaving it out pinned the dialog to whatever the step was when the refusal
+      // arrived, and R9's "every transition narrates itself" silently held only on the project
+      // screen. `ProjectWorkspace` lists it; this surface did not.
       // eslint-disable-next-line react-hooks/exhaustive-deps
-      [reclaim, projectName],
+      [reclaim, projectName, handoverStep],
     ),
   )
 
