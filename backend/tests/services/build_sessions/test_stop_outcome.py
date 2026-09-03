@@ -446,7 +446,9 @@ async def test_two_racing_transfers_for_one_citizen_end_with_one_container(
         # write, which is exactly why both tabs being here is a real race and not a staged one.
         if len(parked) < 2:
             parked.append(1)
-            await at_the_check.wait()
+            # BOUNDED, so a change that lets either ask return before it reaches the barrier
+            # FAILS this test instead of hanging the suite on a wait nothing can release.
+            await asyncio.wait_for(at_the_check.wait(), timeout=10)
         return app_id
 
     monkeypatch.setattr(manager_module, "_existing_app_id", _holds_both_tabs_at_the_check)
