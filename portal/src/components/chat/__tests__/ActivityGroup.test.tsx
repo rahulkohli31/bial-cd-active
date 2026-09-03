@@ -236,6 +236,49 @@ describe('R31 — a live group names what is happening NOW and grows in place', 
     expect(screen.getByTestId('activity-glyphs').childElementCount).toBe(3)
   })
 
+  it('★ keeps its height as icons fill it, so the transcript never jumps', () => {
+    // U8's last scenario. jsdom lays nothing out, so what is asserted is the MECHANISM that keeps
+    // the row exactly one line tall while steps accumulate into it: a strip that never shrinks,
+    // tiles of a FIXED 22px square rather than content-sized ones, and each tile after the first
+    // pulled back over its neighbour so a long run stays compact instead of wrapping onto a second
+    // line. A wrapping tile, or a dropped negative margin, would grow the group's height on every
+    // completed step and shuffle the transcript under someone reading it.
+    //
+    // Mutation receipt: drop `flex-shrink-0` from the strip, or the `marginLeft` from the tiles,
+    // or make the tile size anything but the fixed square, and one of these goes red.
+    const view = mount([stepPart(1, 'Reading your restaurants screen', 'pending')], {
+      isRunning: true,
+    })
+    const strip = () => screen.getByTestId('activity-glyphs')
+    const tiles = () => Array.from(strip().children) as HTMLElement[]
+
+    expect(strip().className).toMatch(/flex-shrink-0/)
+    expect(tiles()).toHaveLength(1)
+    expect(tiles()[0]!.className).toMatch(/h-\[22px\]/)
+    expect(tiles()[0]!.className).toMatch(/w-\[22px\]/)
+    expect(tiles()[0]!.style.marginLeft).toBe('')
+
+    // Four more steps land in the same group — the row gains tiles, not height.
+    view.rerender(
+      tree(
+        Array.from({ length: 5 }, (_, i) =>
+          stepPart(i + 1, `Step ${i + 1}`, i === 4 ? 'pending' : 'ok'),
+        ),
+        { isRunning: true },
+      ),
+    )
+
+    expect(tiles()).toHaveLength(5)
+    expect(strip().className).toMatch(/flex-shrink-0/)
+    for (const [i, tile] of tiles().entries()) {
+      expect(tile.className).toMatch(/h-\[22px\]/)
+      expect(tile.className).toMatch(/w-\[22px\]/)
+      // Overlapped rather than laid end to end: every tile but the first is pulled back over the
+      // one before it, which is what stops five icons from needing a second line.
+      expect(tile.style.marginLeft).toBe(i === 0 ? '' : '-7px')
+    }
+  })
+
   it('★ a sealed group has no quiet line — its steps are in the receipt, one press away', () => {
     mount([stepPart(1, 'Reading your restaurants screen', 'ok'), textPart('Done.')])
     expect(screen.queryByTestId('activity-group-now')).toBeNull()
