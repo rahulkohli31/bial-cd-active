@@ -52,10 +52,11 @@
  */
 import { useCallback } from 'react'
 import AppPaneHost from './AppPaneHost'
+import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
 import StartAppControl from './StartAppControl'
 import { WORKSPACE_RAIL_ID } from './WorkspaceShell'
 import type { DeviceName } from './WorkspaceToolbar'
-import { useWorkspaceAddress, useWorkspaceReport } from './workspaceChannel'
+import { useWorkspaceAddress, useWorkspacePaneVisible, useWorkspaceReport } from './workspaceChannel'
 import type { WorkspaceStateName } from './workspaceState'
 
 /** See `frameIt` below. Kept beside the component so the veto's members are readable at a glance. */
@@ -82,6 +83,19 @@ export interface AppPaneProps {
 export default function AppPane({ device, reloadNonce }: AppPaneProps) {
   const address = useWorkspaceAddress()
   const report = useWorkspaceReport()
+  // THE COLUMN ITSELF ANSWERS TO THE VISIBILITY, NOT ONLY THE FRAME INSIDE IT (plan 002, U6).
+  //
+  // `AppPaneHost` hides itself when no surface declares a pane — but the host is only reached when
+  // there is something to frame. A plan chat is the opposite case: nothing to frame AND no pane
+  // declared, so `frameIt` is false, `NoFrame` renders instead of the host, and this section's
+  // `flex-1` went on claiming half the window for a card offering to start an app the citizen did
+  // not ask for. That is exactly the layout `PlanChat` forbids and U6 promises: the board draws one
+  // centred column across the full width, and `ConversationSurface`'s `mx-auto max-w-3xl` cannot
+  // centre inside a rail that is only half the screen.
+  //
+  // ZERO IN BOTH DIRECTIONS, because this column sits in a flex row above the stacking threshold
+  // and a flex COLUMN below it — a width alone leaves a full-height band under a stacked rail.
+  const visible = useWorkspacePaneVisible()
 
   /**
    * MOVE FOCUS BACK TO THE RAIL, and do it by focusing the region rather than hunting for its
@@ -110,7 +124,14 @@ export default function AppPane({ device, reloadNonce }: AppPaneProps) {
     <section
       data-testid="app-pane-region"
       aria-label="Your app"
-      className="flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden"
+      aria-hidden={!visible}
+      className={
+        visible
+          ? 'flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden'
+          : // Hidden, never unmounted — the whole point of the sibling host is that leaving a
+            // build chat for a plan chat must not re-issue the frame's `src`.
+            `w-0 h-0 flex-shrink-0 overflow-hidden ${HIDDEN_BUT_MOUNTED}`
+      }
     >
       {/* VISIBLE ON FOCUS ONLY. It is the standard skip-link treatment: out of the way for a
           pointer, and the first thing a keyboard reaches on its way into the frame. */}

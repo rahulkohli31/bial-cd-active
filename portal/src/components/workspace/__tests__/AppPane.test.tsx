@@ -52,9 +52,17 @@ function reportFor(preview: PreviewState | null, startOutcome: StartOutcome | nu
   }
 }
 
-/** The pane under a channel primed exactly as a mounted surface would have left it. */
-function renderPane(prime: (channel: WorkspaceChannel) => void) {
+/**
+ * The pane under a channel primed exactly as a mounted surface would have left it.
+ *
+ * THE VISIBILITY IS PRIMED TOO, and it has to be: a mounted surface declares it (the project screen
+ * unconditionally, a chat for every kind but `plan`), and the channel's resting value is `false`.
+ * Leaving it at rest here would test the pane in a state no surface on screen ever puts it in —
+ * every state below is one a citizen is LOOKING at.
+ */
+function renderPane(prime: (channel: WorkspaceChannel) => void, paneVisible = true) {
   const channel = createWorkspaceChannel()
+  channel.visible.set(paneVisible)
   prime(channel)
   const result = render(
     <MemoryRouter>
@@ -289,5 +297,73 @@ describe('the seam is the address AND the state, not the URL alone', () => {
     })
 
     expect(container.querySelector('iframe')).toBeTruthy()
+  })
+})
+
+describe('the column a plan chat does not get (plan 002, U6)', () => {
+  // THE DEFECT THIS BLOCK IS WRITTEN AGAINST, found in a browser and not by any suite: `AppPane`
+  // read the report and the address but never the VISIBILITY, so its `flex-1` section claimed half
+  // the window on a plan chat — filled with the "Your app is saved / Launch Application" card,
+  // offering to start an app the citizen had not asked about. `AppPaneHost` hides itself correctly,
+  // but a plan chat never reaches it: with nothing to frame, `NoFrame` renders instead.
+  //
+  // The knock-on was the visible half of the bug. `ConversationSurface` centres a plan chat with
+  // `mx-auto max-w-3xl`, which does nothing inside a rail that is only half the screen — so the
+  // board's one centred column rendered as a left-aligned half-width one.
+
+  // WHOLE CLASSES, NOT SUBSTRINGS. `min-w-0` contains `w-0`, so a `toContain` here passes on the
+  // very layout this block exists to forbid.
+  const paneClasses = (container: HTMLElement) =>
+    (container.querySelector('[data-testid="app-pane-region"]')?.className ?? '').split(/\s+/)
+
+  it('★ takes no width when no surface asks for the pane', () => {
+    const { container } = renderPane((c) => {
+      c.workspace.set(reportFor(reading()))
+    }, false)
+
+    expect(paneClasses(container)).toContain('w-0')
+    expect(paneClasses(container)).not.toContain('flex-1')
+  })
+
+  it('★ zeroes its HEIGHT too, for the stacked layout below the threshold', () => {
+    // Above the threshold this column sits in a flex row, where a zero width is enough. Below it
+    // the same element is a child of a flex COLUMN, and a width of zero leaves a full-height band
+    // of nothing under the rail — the stacked layout's version of the same bug.
+    const { container } = renderPane((c) => {
+      c.workspace.set(reportFor(reading()))
+    }, false)
+
+    expect(paneClasses(container)).toContain('h-0')
+  })
+
+  it('★ leaves the accessibility tree, so nothing in it is reachable by keyboard', () => {
+    // `visibility:hidden` is the mechanism and jsdom loads no stylesheet, so the `aria-hidden`
+    // beside it is what this assertion can see — and it is the half that a screen reader obeys.
+    // Without it the skip control and any start button stay announced on a screen that draws none.
+    renderPane((c) => c.workspace.set(reportFor(reading())), false)
+
+    expect(screen.getByTestId('app-pane-region').getAttribute('aria-hidden')).toBe('true')
+    expect(screen.queryByRole('button', { name: /skip past your app/i })).toBeNull()
+  })
+
+  it('is HIDDEN, never unmounted — a running app survives the move to a plan chat', () => {
+    // The reason the pane is a sibling of the outlet at all. Unmounting re-issues the frame's
+    // `src` on the way back, which is a full reload of somebody's application.
+    const { container } = renderPane((c) => {
+      c.workspace.set(reportFor(reading({ state: 'alive', alive: true })))
+      c.address.set({ url: 'https://app.example/', status: 'ready', projectId: 'p1' })
+      c.project.set('p1')
+      c.pane.set(PANE_VIEW)
+    }, false)
+
+    expect(container.querySelector('iframe')).toBeTruthy()
+    expect(screen.getByTestId('app-pane-region').className).toContain('invisible')
+  })
+
+  it('takes the width back the moment a surface asks for it', () => {
+    const { container } = renderPane((c) => c.workspace.set(reportFor(reading())), true)
+
+    expect(paneClasses(container)).toContain('flex-1')
+    expect(paneClasses(container)).not.toContain('w-0')
   })
 })
