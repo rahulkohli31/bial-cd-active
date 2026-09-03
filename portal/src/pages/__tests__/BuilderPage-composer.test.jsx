@@ -78,7 +78,11 @@ function renderAt(chatId, sessionDeps, projectId = 'p1') {
   )
 }
 
-const composer = () => screen.getByPlaceholderText(/ask for another change/i)
+/** BY ITS HANDLE, NOT BY ITS HINT. The placeholder is not stable copy: while a plan offer waits
+ *  for an answer the box wears the board's locked treatment and the reason takes the placeholder's
+ *  place, so a lookup by hint stops finding the composer exactly when a test follows a build
+ *  through to an offer. */
+const composer = () => screen.getByTestId('composer-input')
 const sendButton = () => composer().parentElement.querySelector('button:last-of-type')
 const type = (text) => fireEvent.change(composer(), { target: { value: text } })
 
