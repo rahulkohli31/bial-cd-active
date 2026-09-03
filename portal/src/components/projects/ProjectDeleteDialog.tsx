@@ -21,10 +21,17 @@
  *
  *      THE TYPE-THE-NAME GATE IS GONE. Retyping a name proves you can read, not that you
  *      meant it — and it taught people to copy-paste past the warning they were meant to be
- *      reading. The reason is a better gate for the same purpose AND it is still useful a
- *      month later: it is kept on a `deleted_projects` tombstone an administrator can read.
- *      The helper text says so, because someone writing a private-feeling note deserves to
- *      know who sees it.
+ *      reading. The reason is a better gate for the same purpose AND it is meant to still be
+ *      useful a month later: it is kept on a `deleted_projects` tombstone. NOTHING READS THAT
+ *      TABLE YET as of this PR — the admin read surface is tracked separately (#176) — so
+ *      the helper text says only what is true today (kept with the record) rather than
+ *      promising a reader that does not exist. Round-4 review caught this docblock saying
+ *      the stronger thing a paragraph away from the copy that had already been walked back;
+ *      say the same true thing in both places.
+ *
+ *      Once #176 lands, this reverts to the stronger claim — someone writing a
+ *      private-feeling note deserves to know an administrator sees it — in both the
+ *      helper text and here.
  *
  *      The count is validated HERE and again on the server, with the same splitting rule
  *      (`utils/words.ts` <-> `src/core/words.py`). The client keeps the person inside the

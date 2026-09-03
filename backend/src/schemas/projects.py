@@ -106,7 +106,14 @@ def _clean_delete_remark(value: str) -> str:
         raise ValueError("Say why you are deleting this project.")
     # The paste backstop, which a person should never meet.
     if len(value) > MAX_DELETE_REMARK_CHARS:
-        raise ValueError("That reason is too long. Keep it under 50 words.")
+        # The character cap fires on something a WORD cap cannot express: a 40-word paste of
+        # long words, URLs or a non-English script can clear 2000 characters while genuinely
+        # under 50 words, and telling that person to get under a bound they are already under
+        # is not actionable. Matches `_clean_name`'s own character-cap message for the same
+        # reason.
+        raise ValueError(
+            f"That reason is too long. Keep it under {MAX_DELETE_REMARK_CHARS} characters."
+        )
     words = count_words(value)
     if words < MIN_DELETE_REMARK_WORDS:
         raise ValueError("Give a little more detail — at least 5 words.")
@@ -153,7 +160,12 @@ class ProjectResponse(CamelModel):
     # never disagree.
     #
     # `False` for a project with no app at all — there is nothing that could be live.
-    is_serving: bool = False
+    # NO DEFAULT. `_to_response` was made keyword-only and required specifically to stop a
+    # call site silently omitting this (round-3 fix for round-1 finding 1: three of five
+    # endpoints answered a live app as not serving because this WAS `= False`). A default
+    # one layer down would let a future direct `ProjectResponse(...)` construction
+    # reintroduce exactly that bug; every call site already passes it via `_to_response`.
+    is_serving: bool
     # N7 — whether this project has a bundle a Relaunch could actually restore.
     # THREE-STATE ON PURPOSE: `true` = there is one, `false` = confirmed there is not,
     # `null` = the object store could not be reached, so the platform declines to claim

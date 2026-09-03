@@ -32,6 +32,7 @@ from sqlalchemy.pool import NullPool
 from src.config import settings
 from src.db.models.app_registry import AppRegistry
 from src.db.models.audit import AuditLog
+from src.db.models.deleted_project import DeletedProject
 from src.db.models.project import Project
 from src.db.models.project_database import ProjectDatabase
 from src.services.appdb import teardown as appdb_teardown
@@ -136,6 +137,18 @@ async def test_delete_drops_the_database_the_role_and_the_container(
         "roleName": record.role_name,
         "appId": str(app_row.id),
     }
+
+    # THE ONLY TEST THAT EVER PROVISIONS A REAL DATABASE THROUGH THE DELETE PATH, so it is
+    # the only one that can prove `had_database` is ever actually `True`. Every OTHER
+    # tombstone test builds its project via the bare factory, where `teardown_handles()`
+    # always returns `None` — a mutant hard-coding `had_database=False` on the
+    # `DeletedProject(...)` construction passed every one of them.
+    tombstone = await db_session.scalar(
+        sa.select(DeletedProject).where(DeletedProject.project_id == project.id)
+    )
+    assert tombstone is not None
+    assert tombstone.had_database is True
+    assert tombstone.had_app is True
 
 
 async def test_an_app_less_project_still_has_its_database_dropped(

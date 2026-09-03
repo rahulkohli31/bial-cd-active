@@ -129,6 +129,12 @@ export default function ProjectsPage(): React.JSX.Element {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<Error | null>(null)
   const [counts, setCounts] = useState<ProjectCounts | null>(null)
+  // TRUE ONLY WHEN THE FIRST LOAD FAILED WITH NOTHING TO FALL BACK ON (round-4 finding 12).
+  // A REFRESH failure (there IS a last-known-good `counts`) stays silent by design — the
+  // comment below explains why — but that same silence, applied to a FIRST load, left the
+  // three tiles skeleton-pulsing forever over a working list: no error, no retry, and
+  // nothing but a delete (or the page list's own Retry) ever bumps `reloadNonce` again.
+  const [countsFailedCold, setCountsFailedCold] = useState(false)
   const [reloadNonce, setReloadNonce] = useState(0)
   // DELETES IN FLIGHT, BY ID — not a boolean. Two overlapping deletes shared one flag, so the
   // faster one's `finally` cleared it while the slower was still running: precisely the
@@ -138,6 +144,12 @@ export default function ProjectsPage(): React.JSX.Element {
 
   // Out-of-order guard: a slow page that lands after a newer one must not overwrite it.
   const requestId = useRef(0)
+  // WHERE FOCUS GOES WHEN A DELETE CONFIRMATION CLOSES. Its own trigger — the row's Delete
+  // button — is gone by then: the optimistic removal takes the row out immediately, well
+  // before the request settles, so Radix's default restore-to-trigger finds a detached node
+  // and silently no-ops (round-4 finding 2). `tabIndex={-1}` on the heading below makes it a
+  // programmatic focus target without adding it to the tab order.
+  const headingRef = useRef<HTMLHeadingElement>(null)
 
   // The search is debounced, but `page` resets IMMEDIATELY on a keystroke — a cursor into
   // page 3 of the previous query is meaningless against a new one.
@@ -178,19 +190,37 @@ export default function ProjectsPage(): React.JSX.Element {
   // projection and joins it does not need.
   useEffect(() => {
     let alive = true
+    // Captured BEFORE the request, not read inside `.catch()`: this is "did we have
+    // something to show before THIS attempt started", which is exactly the refresh-vs-first-
+    // load distinction the two branches below need. Reading `counts` inside the callback
+    // would still answer that correctly here (nothing else sets `counts` between this line
+    // and the request settling), but capturing it up front says so without relying on that.
+    const hadValueAlready = counts !== null
     listProjectCounts()
-      .then((c) => alive && setCounts(c))
+      .then((c) => {
+        if (!alive) return
+        setCounts(c)
+        setCountsFailedCold(false)
+      })
       // A REFRESH FAILURE KEEPS THE LAST KNOWN-GOOD NUMBERS. Clearing to `null` sent the
       // tiles back to their skeleton, so a page showing real rows underneath grew three
       // empty boxes above them — which reads as the page breaking rather than as one
       // request failing. The skeleton means "not asked yet", and after a successful load
       // that is no longer true. Slightly stale beats visibly broken.
+      //
+      // A FIRST-LOAD FAILURE IS DIFFERENT: there is no last-known-good number to fall back
+      // on, so silence here meant the skeleton pulsed forever with no error and no retry.
       .catch(() => {
-        /* keep `counts` as it stands */
+        if (!alive) return
+        if (!hadValueAlready) setCountsFailedCold(true)
       })
     return () => {
       alive = false
     }
+    // `counts` is read once, at the top of the effect body, to characterise THIS attempt as
+    // first-load-vs-refresh. Adding it as a dep would re-run the fetch every time the
+    // response above changes it, which is not a real trigger for asking again.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reloadNonce])
 
   // Paged past the end — a delete elsewhere can shrink the list under a reader. Step back
@@ -216,7 +246,6 @@ export default function ProjectsPage(): React.JSX.Element {
   }
 
   const handleDelete = async (project: Project, remark: string): Promise<void> => {
-    setDeleting(null)
     setDeletingIds((ids) => new Set(ids).add(project.id))
     setItems((rows) => rows.filter((p) => p.id !== project.id))
     try {
@@ -238,6 +267,22 @@ export default function ProjectsPage(): React.JSX.Element {
         next.delete(project.id)
         return next
       })
+      // CLOSING THE DIALOG IS DEFERRED TO HERE, not the top of this function (round-4
+      // finding 9). It used to close synchronously before the request even started —
+      // batched into the SAME commit as the optimistic row removal — so the dialog's own
+      // `busy` state (the spinner, Cancel disabling) was set and then immediately unmounted
+      // in the same render, never actually observable. The backend does real work before
+      // answering (force-drop the database, sweep blobs, tear down the container), so this
+      // is not decorative: a citizen genuinely waits, across every outcome here — success,
+      // 404, or a real failure — which is why this sits in `finally` rather than in only
+      // one branch.
+      setDeleting(null)
+      // FOCUS EXPLICITLY, rather than let Radix try. The row (and its Delete button, the
+      // trigger Radix captured at open time) left the DOM the moment the optimistic removal
+      // ran, above — long before this `finally` runs — so `onCloseAutoFocus`'s default
+      // restore would find a detached node and silently do nothing (round-4 finding 2). The
+      // heading is the nearest stable, always-mounted landmark.
+      headingRef.current?.focus()
     }
   }
 
@@ -249,8 +294,23 @@ export default function ProjectsPage(): React.JSX.Element {
   // request is still in flight, and "Nothing here yet" is a claim about the ACCOUNT, not
   // about this page. Deleting your last row on page 2 must not tell you that you have no
   // projects for the length of a database drop.
+  //
+  // `total === 0` CLOSES THE WINDOW `deleteInFlight` DOES NOT (round-4 finding 13). When the
+  // delete settles, `setReloadNonce` and the `finally`'s `deletingIds` clear land in ONE
+  // commit — and the refetch that `reloadNonce` triggers is an EFFECT, which runs after
+  // that commit paints. So there is a real rendered frame where `items` is empty (optimistic
+  // removal), `deletingIds` is empty (just cleared), and `loading` is still false (the
+  // refetch has not started): every guard above passes and an account with 40 projects is
+  // told it has none. `total` is the server's own last answer, untouched by the local
+  // filtering, so it still reads 40 in exactly that frame and discriminates the case.
   const showFirstRun =
-    settled && !loading && !deleteInFlight && error === null && isEmpty && appliedQuery === ''
+    settled &&
+    !loading &&
+    !deleteInFlight &&
+    error === null &&
+    isEmpty &&
+    total === 0 &&
+    appliedQuery === ''
   // Gated on the same flag as the first run, and for the same reason: deleting the last
   // matching row must not claim the search found nothing for the length of the round trip.
   const showNoMatches =
@@ -281,12 +341,24 @@ export default function ProjectsPage(): React.JSX.Element {
       <Navbar />
 
       <main className="flex-1 max-w-6xl mx-auto w-full px-6 py-8">
-        <h1 className="text-2xl font-extrabold text-tertiary">Your apps</h1>
+        <h1 ref={headingRef} tabIndex={-1} className="text-2xl font-extrabold text-tertiary outline-none">Your apps</h1>
         <p className="text-sm text-neutral mt-1">
           Each project is one tool — its app, its description, and its chats.
         </p>
 
         {/* Three numbers. Nothing else — no charts (§1). */}
+        {countsFailedCold ? (
+          <div className="flex items-center justify-between gap-3 bg-white border border-danger/30 rounded-2xl px-5 py-4 mt-5 mb-6">
+            <p className="text-xs text-danger">Couldn’t load your counts.</p>
+            <button
+              type="button"
+              onClick={() => setReloadNonce((n) => n + 1)}
+              className="text-xs font-semibold text-primary hover:underline"
+            >
+              Retry
+            </button>
+          </div>
+        ) : (
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-5 mb-6">
           {[
             { label: 'In production', value: counts?.inProduction, hint: 'apps live for BIAL staff right now' },
@@ -306,6 +378,7 @@ export default function ProjectsPage(): React.JSX.Element {
             </div>
           ))}
         </div>
+        )}
 
         {/* ONE controls row: search, density (grid only), view, New project (§3). The
             New project button lives HERE and nowhere else — it used to sit in the page
@@ -481,10 +554,24 @@ export default function ProjectsPage(): React.JSX.Element {
             )}
 
             {/* A later page failing keeps the rows above. Say it underneath them — a control
-                that quietly does nothing reads as a frozen button (§11). */}
+                that quietly does nothing reads as a frozen button (§11).
+                
+                ROUND-4 FINDING 11: this used to BE that frozen button — static text, no
+                control at all. Clicking the same page number again is a React no-op (the
+                state value is unchanged, so the fetch effect's deps do not change and
+                nothing re-runs); `reloadNonce` is the one thing in this effect's deps that
+                is guaranteed to change on every bump, regardless of which page failed, so
+                it is what a real retry has to touch. */}
             {error !== null && (
               <p role="alert" className="text-xs text-danger text-center mt-4">
-                Couldn’t load more projects.
+                Couldn’t load more projects.{' '}
+                <button
+                  type="button"
+                  onClick={() => setReloadNonce((n) => n + 1)}
+                  className="font-semibold text-primary hover:underline"
+                >
+                  Retry
+                </button>
               </p>
             )}
 
@@ -523,7 +610,7 @@ export default function ProjectsPage(): React.JSX.Element {
                 {/* WRAPS rather than overflowing. The number list reached `right: 534px` on a
                     390px screen with only two pages, which put a horizontal scrollbar on the
                     landing page and got worse with six. */}
-                <Pagination className="mx-0 w-auto">
+                <Pagination className="mx-0 w-auto" aria-label="Projects pagination">
                   <PaginationContent className="flex-wrap justify-end">
                     {/* §2 spells the control set literally — « ‹ 1 2 › » — and the board draws
                         four icon buttons around the numbers. Jump-to-first/last were missing;

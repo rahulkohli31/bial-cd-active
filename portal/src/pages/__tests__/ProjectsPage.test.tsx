@@ -307,6 +307,63 @@ describe('the states', () => {
     expect(screen.getByText('Alpha')).toBeTruthy() // still there
     expect(screen.queryByTestId('projects-error')).toBeNull() // not the full-width state
   })
+
+  it('a later page failure can actually be RETRIED', async () => {
+    // Round-4 finding 11: the message underneath the rows was static text with no control.
+    // Clicking the same page number again is a React no-op — the state value is unchanged,
+    // so the fetch effect's deps do not change and nothing re-runs — which left the failure
+    // unrecoverable without a reload. `reloadNonce` is the dep that always changes.
+    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Alpha')], { total: 12, totalPages: 2 }))
+    renderPage()
+    await screen.findByText('Alpha')
+
+    h.listProjects.mockRejectedValue(new Error('boom'))
+    fireEvent.click(screen.getByRole('button', { name: '2' }))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/Couldn’t load more/))
+
+    // The recovery the old version had no way to reach.
+    h.listProjects.mockResolvedValue(page([mkProject('p2', 'Beta')], { total: 12, totalPages: 2, page: 2 }))
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }))
+
+    expect(await screen.findByText('Beta')).toBeTruthy()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('a FIRST-LOAD counts failure offers a retry instead of pulsing forever', async () => {
+    // Round-4 finding 12: the catch was made a total no-op, which is right for a REFRESH
+    // (keep the last known-good numbers) and wrong for a first load — `counts` stayed null,
+    // all three tiles skeleton-pulsed over a working list, and nothing but a delete could
+    // ever bump `reloadNonce` to ask again.
+    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Alpha')], { total: 8, totalPages: 1 }))
+    h.listProjectCounts.mockRejectedValueOnce(new Error('counts boom'))
+    renderPage()
+    await screen.findByText('Alpha') // the list itself is fine
+
+    const retry = await screen.findByRole('button', { name: /retry/i })
+    expect(screen.getByText(/Couldn’t load your counts/)).toBeTruthy()
+
+    h.listProjectCounts.mockResolvedValue(COUNTS)
+    fireEvent.click(retry)
+
+    expect(await screen.findByText(String(COUNTS.totalApplications))).toBeTruthy()
+    expect(screen.queryByText(/Couldn’t load your counts/)).toBeNull()
+  })
+
+  it('a REFRESH counts failure stays silent and keeps the numbers', async () => {
+    // The other half, and the reason the first-load case needed its own state rather than
+    // just un-silencing the catch: once there ARE numbers, a failed refresh must not replace
+    // them with an error — slightly stale beats visibly broken.
+    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Alpha')], { total: 8, totalPages: 1 }))
+    renderPage()
+    await screen.findByText(String(COUNTS.totalApplications))
+
+    h.listProjectCounts.mockRejectedValue(new Error('later boom'))
+    fireEvent.click(screen.getByLabelText('Grid view')) // any re-render; counts refetch on nonce
+    await waitFor(() => expect(screen.queryByLabelText('M cards')).toBeTruthy())
+
+    expect(screen.getByText(String(COUNTS.totalApplications))).toBeTruthy()
+    expect(screen.queryByText(/Couldn’t load your counts/)).toBeNull()
+  })
 })
 
 // --- create and delete ---------------------------------------------------------
@@ -390,20 +447,28 @@ describe('create and delete', () => {
     // nothing read as active and the only way deeper was clicking Next repeatedly.
     //
     // Driven through real navigation, because the window is computed from the component's
-    // OWN page state: putting `page: 8` in the mocked response proves nothing, since the
-    // response does not move the state that drives the request.
-    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Alpha')], { total: 80, totalPages: 10 }))
+    // OWN page state — but the mocked RESPONSE has to answer with the page that was actually
+    // requested too (round-4 finding 10). The original version of this test used one static
+    // `mockResolvedValue` that always said `page: 1` regardless of what was asked for, so
+    // `appliedPage` never moved past 1 no matter which button was clicked — the window slid
+    // (computed from local `page` state) but NO button was ever `aria-current`, and mutating
+    // `isActive={n === appliedPage}` to `isActive={false}` passed the whole suite.
+    h.listProjects
+      .mockResolvedValueOnce(page([mkProject('p1', 'Alpha')], { total: 80, totalPages: 10, page: 1 }))
+      .mockResolvedValueOnce(page([mkProject('p1', 'Alpha')], { total: 80, totalPages: 10, page: 5 }))
     renderPage()
     await screen.findByText('Alpha')
 
-    // Page 1: the window is clamped to the start, so 6 is not offered yet.
-    expect(screen.getByRole('button', { name: '1' })).toBeTruthy()
+    // Page 1: the window is clamped to the start, so 6 is not offered yet, and 1 IS current.
+    expect(screen.getByRole('button', { name: '1' }).getAttribute('aria-current')).toBe('page')
     expect(screen.queryByRole('button', { name: '6' })).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: '5' }))
 
-    // Centred on 5 now: 3..7. The page you are reading is offered and 1 has slid off.
+    // Centred on 5 now: 3..7. The page you are reading is offered, marked current, and 1
+    // has slid off.
     await waitFor(() => expect(screen.getByRole('button', { name: '7' })).toBeTruthy())
+    expect(screen.getByRole('button', { name: '5' }).getAttribute('aria-current')).toBe('page')
     expect(screen.queryByRole('button', { name: '1' })).toBeNull()
   })
 
@@ -431,17 +496,26 @@ describe('create and delete', () => {
     // The other half of the clamp. A window that always centred would ask for pages 9-13 of
     // 10 here; a window that never slid would strand you as it did before the fix. Neither
     // is caught by the mid-list case above.
-    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Alpha')], { total: 80, totalPages: 10 }))
+    //
+    // The response has to echo the page actually requested (round-4 finding 10) — a static
+    // mock always answering `page: 1` left `appliedPage` at 1 while the window rendered
+    // 6-10, so nothing was ever `aria-current` and this test's own title ("marked active")
+    // was not being checked at all.
+    h.listProjects
+      .mockResolvedValueOnce(page([mkProject('p1', 'Alpha')], { total: 80, totalPages: 10, page: 1 }))
+      .mockResolvedValueOnce(page([mkProject('p1', 'Alpha')], { total: 80, totalPages: 10, page: 10 }))
     renderPage()
     await screen.findByText('Alpha')
 
     fireEvent.click(screen.getByRole('button', { name: 'Last page' }))
 
     await waitFor(() => expect(screen.getByRole('button', { name: '10' })).toBeTruthy())
-    // Exactly the last five, and nothing past the end.
-    for (const n of ['6', '7', '8', '9', '10']) {
-      expect(screen.getByRole('button', { name: n })).toBeTruthy()
+    // Exactly the last five, nothing past the end, and 10 — not any of the others — is
+    // the one marked current.
+    for (const n of ['6', '7', '8', '9']) {
+      expect(screen.getByRole('button', { name: n }).getAttribute('aria-current')).toBeNull()
     }
+    expect(screen.getByRole('button', { name: '10' }).getAttribute('aria-current')).toBe('page')
     expect(screen.queryByRole('button', { name: '5' })).toBeNull()
     expect(screen.queryByRole('button', { name: '11' })).toBeNull()
   })
@@ -479,7 +553,46 @@ describe('create and delete', () => {
     await waitFor(() => expect(screen.queryByText('Alpha')).toBeNull()) // optimistic removal
     expect(screen.queryByTestId('projects-empty')).toBeNull() // ...but not the first-run screen
 
+    // THE DIALOG ITSELF IS STILL OPEN, HERE, WHILE THE ROW IS ALREADY GONE (round-4 finding
+    // 9). It used to close in the same commit as the optimistic removal above — batched
+    // before the request had even been sent — so its own busy state (the spinner, Cancel
+    // disabling) was set and unmounted in one render and could never be observed. The
+    // backend does real work before answering, so this window is not theoretical.
+    expect(screen.getByRole('dialog')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /cancel/i }).hasAttribute('disabled')).toBe(true)
+
     release()
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    // FOCUS LANDS ON THE HEADING, not <body>. The row (and its Delete button, the trigger
+    // Radix would otherwise try to restore focus to) left the DOM well before the dialog
+    // closed, so a detached-node no-op is exactly the failure this proves did not happen
+    // (round-4 finding 2).
+    expect(document.activeElement?.textContent).toBe('Your apps')
+  })
+
+  it('an empty page with a non-zero total is NOT the first-run screen', async () => {
+    // Round-4 finding 13, tested at the guard rather than at the frame. The race he
+    // describes — the committed render between the delete settling and the refetch effect
+    // running — is not observable from RTL, which flushes effects inside `act()`; asserting
+    // around it produced a test that passed with the fix REMOVED, so this pins the condition
+    // itself instead.
+    //
+    // `items: []` with `total: 40` is the same state that frame has, and it is reachable for
+    // real: delete the last row on page 5 and the server answers an empty page while the
+    // account still has 40 projects. "Nothing here yet" is a claim about the ACCOUNT, so it
+    // must key off `total`, never off the rows this page happens to be holding.
+    //
+    // Mutation receipt: drop `total === 0` from `showFirstRun` and this goes red.
+    h.listProjects.mockResolvedValue(page([], { total: 40, totalPages: 5, page: 5 }))
+    renderPage()
+
+    // Liveness FIRST, so the absence below means something rather than the assertion
+    // running before anything had rendered at all: the counts strip only fills in once a
+    // response has landed.
+    expect(await screen.findByText(String(COUNTS.totalApplications))).toBeTruthy()
+    await waitFor(() => expect(h.listProjects).toHaveBeenCalled())
+
+    expect(screen.queryByTestId('projects-empty')).toBeNull()
   })
 
   it('a 404 delete still refreshes the total, which the row left stale', async () => {

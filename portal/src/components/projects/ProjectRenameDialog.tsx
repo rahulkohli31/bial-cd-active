@@ -10,8 +10,14 @@
  * 54px line shared by both screens and an inline text field in it would have to grow the row and
  * fight the title's truncation, so the pencil opens this instead.
  *
- * The same portal-and-scrim treatment as `ProjectDescriptionEditor`, which is the other thing on
- * this screen that edits a project field, so the two read as one interface rather than two.
+ * BUILT ON THE VENDORED RADIX `Dialog` (§12), like the delete and create dialogs. It used to be
+ * a third hand-rolled `fixed inset-0` whose docblock claimed "the same portal-and-scrim treatment
+ * as `ProjectDescriptionEditor`" — but that file implements a real container-level focus trap
+ * and this one did not: there was no trap at all, and Escape was wired only to the `<input>`'s
+ * own `onKeyDown`, so tabbing to Cancel or Save and pressing it did nothing (round-4 review).
+ * Radix gives the trap, Escape from anywhere inside, `role="dialog"`, and focus restored to the
+ * pencil that opened it — which survives a rename, so no `onCloseAutoFocus` override is needed
+ * here the way the delete dialog needs one.
  *
  * IT CARRIES THE 8-WORD CAP (#158 §14), because §14's rule is "both entry points, or neither".
  * The server refuses a 9-word name on PATCH exactly as it does on POST, so a rename without a
@@ -21,11 +27,10 @@
  * than anywhere upstream of it.
  */
 import { useEffect, useRef, useState } from 'react'
-import { createPortal } from 'react-dom'
-import { X } from 'lucide-react'
 import { patchProject } from '../../utils/projectApi'
 import type { Project } from '../../utils/projectApi'
 import { ApiError } from '../../utils/apiError'
+import { Dialog, DialogContent, DialogTitle } from '../ui/dialog'
 import { countWords, MAX_PROJECT_NAME_WORDS } from '../../utils/words'
 
 // The VARCHAR(120) column width — a paste backstop, not the rule a person is told about.
@@ -53,6 +58,14 @@ export default function ProjectRenameDialog({ project, onProjectUpdate, onClose 
   // number under the field is the number the API will decide on.
   const words = countWords(draft)
   const tooManyWords = words > MAX_PROJECT_NAME_WORDS
+  const trimmed = draft.trim()
+  // A LEGACY NAME OVER THE CAP MUST NOT OPEN ALREADY REFUSING (round-4 review). The 8-word
+  // rule is not retroactive — names saved before it keep working — but the word gate used
+  // to fire on the UNTOUCHED draft, so opening this dialog on a stored 9-word name showed
+  // Save disabled and, if pressed, an error about text the person had not typed. Nothing
+  // forces a change: an unchanged name is a no-op close, whatever its length.
+  const unchanged = trimmed === project.name
+  const blocked = busy || (tooManyWords && !unchanged)
 
   const submit = () => {
     // A SECOND PRESS WHILE THE FIRST IS STILL IN FLIGHT DOES NOTHING, and the check has to be here
@@ -62,22 +75,26 @@ export default function ProjectRenameDialog({ project, onProjectUpdate, onClose 
     // can enforce it. Without this, a double-click or an Enter followed by a click on the still
     // focused button fires two `patchProject` calls for the same rename and closes the dialog
     // twice. Same guard, same reason, as `WorkspaceToolbar`'s Save and `StartAppControl`'s press.
+    //
+    // #180 and #173's round-4 review found this independently, on two branches, and fixed it
+    // the same way; this is #180's wording, which names the sibling call sites. `trimmed` is
+    // hoisted to the component body here because the disabled-state derivation below needs it
+    // too.
     if (busy) return
-    const trimmed = draft.trim()
     // Blocked client-side BEFORE any request: the server 400s on name:null and 422s on "". A
     // whitespace-only name never reaches the wire.
     if (trimmed === '') {
       setError('Name cannot be empty.')
       return
     }
-    // Belt-and-braces beside the counter: Enter reaches this handler directly, so an
-    // over-limit name must not get out from the keyboard path either.
-    if (tooManyWords) {
-      setError('Keep the title short — about 6 to 8 words.')
+    // BEFORE the word gate, so an untouched over-cap legacy name closes rather than errors.
+    if (unchanged) {
+      onClose()
       return
     }
-    if (trimmed === project.name) {
-      onClose()
+    // Belt-and-braces beside the counter, for the keyboard path.
+    if (tooManyWords) {
+      setError('Keep the title short — about 6 to 8 words.')
       return
     }
     setBusy(true)
@@ -93,25 +110,24 @@ export default function ProjectRenameDialog({ project, onProjectUpdate, onClose 
     })()
   }
 
-  return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 font-manrope">
-      <div className="absolute inset-0 bg-black/40" onClick={busy ? undefined : onClose} />
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label="Rename project"
-        className="relative w-full max-w-md rounded-2xl bg-white p-6 shadow-2xl"
+  return (
+    <Dialog
+      open
+      onOpenChange={(next) => {
+        // Radix routes Escape, the overlay click and the close button through here — from
+        // ANYWHERE inside the dialog, which is the point. Escape used to be wired to the
+        // input's own `onKeyDown`, so tabbing to Cancel or Save and pressing it did nothing.
+        if (!next && !busy) onClose()
+      }}
+    >
+      <DialogContent
+        // The scrim this dialog already used, kept exactly — passed as an override because
+        // the vendored default is `bg-black/80`.
+        overlayClassName="bg-black/40"
+        className="font-manrope w-full max-w-md rounded-2xl bg-white p-6 shadow-2xl gap-0 border-0"
       >
         <div className="mb-3 flex items-center justify-between">
-          <h3 className="text-base font-bold text-tertiary">Rename project</h3>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close"
-            className="rounded-lg p-1.5 text-neutral transition hover:bg-bial-bg hover:text-tertiary"
-          >
-            <X size={18} />
-          </button>
+          <DialogTitle className="text-base font-bold text-tertiary">Rename project</DialogTitle>
         </div>
 
         <input
@@ -125,7 +141,6 @@ export default function ProjectRenameDialog({ project, onProjectUpdate, onClose 
           }}
           onKeyDown={(e) => {
             if (e.key === 'Enter') submit()
-            if (e.key === 'Escape') onClose()
           }}
           className="w-full rounded-xl border border-bial-border px-3 py-2 text-sm text-tertiary focus:outline-none focus:ring-2 focus:ring-primary/30"
         />
@@ -159,16 +174,15 @@ export default function ProjectRenameDialog({ project, onProjectUpdate, onClose 
             type="button"
             onClick={submit}
             // `aria-disabled`, never `disabled` — a disabled control throws focus to the body.
-            aria-disabled={busy || tooManyWords}
+            aria-disabled={blocked}
             className={`rounded-xl bg-primary px-4 py-2 text-sm font-bold text-white transition hover:bg-primary-600 ${
-              tooManyWords ? 'cursor-not-allowed opacity-50' : ''
+              blocked ? 'cursor-not-allowed opacity-50' : ''
             }`}
           >
             {busy ? 'Saving…' : 'Save'}
           </button>
         </div>
-      </div>
-    </div>,
-    document.body,
+      </DialogContent>
+    </Dialog>
   )
 }

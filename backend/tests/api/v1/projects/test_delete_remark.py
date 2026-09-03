@@ -332,6 +332,52 @@ async def test_a_second_tombstone_for_the_same_project_is_refused(client, db_ses
             )
 
 
+async def test_the_loser_gets_a_404_through_the_route_not_a_500(client, db_session) -> None:
+    """THE ROUTE'S OWN HANDLING, exercised through HTTP rather than asserted at the ORM
+    layer — the companion to `test_a_second_tombstone_for_the_same_project_is_refused` above.
+
+    Two truly overlapping requests are not stageable against this fixture's single
+    `db_session`, but the STATE they would produce is: an existing tombstone for the project
+    about to be deleted (the winner's row, as if it had already committed). The client's own
+    DELETE then runs the whole cascade for real and hits the unique constraint mid-cascade,
+    at the autoflush `delete_project_cascade` triggers — not at the final `db.commit()` —
+    which is exactly where the loser of a real race would hit it. Before this fix that
+    IntegrityError reached `unhandled_exception_handler` uncaught: a 500 with a production
+    traceback, for a request whose target had already been deleted by the winner.
+
+    NOT ASSERTING ROW STATE AFTERWARD, deliberately: this fixture binds one session to one
+    Postgres transaction with no savepoints, so the route's own `db.rollback()` — correct
+    and necessary, since a real constraint violation aborts the whole transaction — would
+    also erase this test's own seed data. The response is the only thing worth checking here;
+    `test_a_second_tombstone_for_the_same_project_is_refused` above already pins the row-level
+    guarantee via a `SAVEPOINT`.
+    """
+    headers, user = await _auth(db_session)
+    project = await _project(db_session, user.id)
+    project_id = project.id
+
+    # The winner's row, as if this project had already been tombstoned by an earlier,
+    # since-committed request.
+    db_session.add(
+        DeletedProject(
+            project_id=project_id,
+            project_name=project.name,
+            owner_id=user.id,
+            owner_email=user.email,
+            deleted_by=user.id,
+            deleted_by_name="Someone Else",
+            remark=_words(6),
+        )
+    )
+    await db_session.commit()
+
+    resp = await _delete(client, project_id, headers, _words(6))
+
+    assert resp.status_code == 404, resp.text
+    assert "Value error" not in resp.text  # written for a person, not a stack trace
+    assert "Internal server error" not in resp.text  # the bug: this used to be a 500
+
+
 async def test_the_tombstone_records_what_actually_went_with_it(client, db_session) -> None:
     """The counts, asserted NON-ZERO — which is the only version of this test that means
     anything.

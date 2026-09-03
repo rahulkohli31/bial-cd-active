@@ -7,6 +7,14 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup } from '@testing-library/react'
+
+/** Forces every element's clip measurement in one direction — jsdom's own scrollWidth and
+ *  clientWidth are both always 0, which reads as never-clipped, so the tooltip branch (round-4
+ *  finding 3) needs this to be reachable at all. */
+function stubClip(clipped: boolean) {
+  vi.spyOn(HTMLElement.prototype, 'scrollWidth', 'get').mockReturnValue(clipped ? 200 : 100)
+  vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(100)
+}
 import ProjectCard from '../ProjectCard'
 import type { Project } from '../../../utils/projectApi'
 
@@ -71,6 +79,33 @@ describe('ProjectCard', () => {
     // accessible name can never be absorbed by an outer role="button" (the strict-mode double
     // match that forced the e2e workaround).
     expect(del.parentElement?.closest('button')).toBeNull()
+  })
+
+  it('opens a tooltip on a really clipped name, with the full text', async () => {
+    // Mutation receipt: delete the Tooltip branch from NameButton and this is the test that
+    // goes red — nothing else in the suite can see it, since jsdom's scrollWidth/clientWidth
+    // are both 0 and `clipped` would already read `false`.
+    stubClip(true)
+    render(
+      <ProjectCard
+        project={mkProject('A Very Long Project Name That Has To Clip In This Tile')}
+        onOpen={vi.fn()}
+        onDelete={vi.fn()}
+      />,
+    )
+
+    fireEvent.focus(screen.getByRole('button', { name: 'A Very Long Project Name That Has To Clip In This Tile' }))
+
+    expect(await screen.findByRole('tooltip')).toBeTruthy()
+  })
+
+  it('opens nothing extra when the name is NOT clipped', () => {
+    stubClip(false)
+    render(<ProjectCard project={mkProject('Visitor Log')} onOpen={vi.fn()} onDelete={vi.fn()} />)
+
+    fireEvent.focus(screen.getByRole('button', { name: 'Visitor Log' }))
+
+    expect(screen.queryByRole('tooltip')).toBeNull()
   })
 
   it('falls back to "Untitled project" for an empty name and still labels delete', () => {

@@ -7,8 +7,10 @@
  * row cannot render without a chat store existing, which is both wrong and the kind of
  * coupling that only shows up as a confusing test failure.
  *
- * So the function moved and `chatHistory` re-exports it: every existing caller keeps
- * working, and callers who want a date no longer buy a conversation store with it.
+ * So the function moved here. It was briefly re-exported from `chatHistory` for continuity,
+ * but #175 retired that module's chat list along with the re-export — this docblock outlived
+ * it by a round and claimed a link that no longer existed (round-4 review). The one caller
+ * today is the projects list's "Details updated" column, importing it directly.
  */
 
 /** A short relative time: `just now`, `5m ago`, `3h ago`, `12d ago`. */

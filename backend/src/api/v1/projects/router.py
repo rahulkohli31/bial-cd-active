@@ -19,6 +19,7 @@ import sqlalchemy as sa
 import structlog
 from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.exc import StaleDataError
 
 from src.api.deps import CurrentUser, DbSession
@@ -260,7 +261,12 @@ async def list_projects(
     # a lifecycle one (#158). `PublishStatusChip` gets it from `getDeployment(projectId)`,
     # which is fine for one project page and is an N-way fan-out on a list — so the list
     # reads the same definition set-wise instead, via the shared `live_app_ids` collapse.
-    live = live_app_ids().subquery()
+    # SCOPED to this owner, and the scoping happens INSIDE the collapse (round-4 fix): an
+    # unscoped `live_app_ids()` filtered afterward by `user.id` still evaluates the
+    # `DISTINCT ON` over every deployment row the PLATFORM has, because the join here cannot
+    # tell the collapse to narrow first. Measured at 25,245 apps / 112,045 deployments as a
+    # >300x cost on the first screen after sign-in — see `live_app_ids`'s docstring.
+    live = live_app_ids(owner_user_id=user.id).subquery()
     query = (
         sa.select(Project, AppRegistry.id, AppRegistry.status, live.c.app_id.is_not(None))
         .outerjoin(
@@ -279,10 +285,24 @@ async def list_projects(
                 Project.description.icontains(search, autoescape=True),
             )
         )
-    # The COUNT runs over the same filtered query the page does, minus the ordering and
-    # window — a total computed over a different predicate would render page numbers the
-    # user can click and find empty, and only at a boundary.
-    total = int(await db.scalar(sa.select(sa.func.count()).select_from(query.subquery())) or 0)
+    # THE COUNT DOES NOT NEED EITHER JOIN, and carrying them was the other half of the same
+    # cost: neither can change how many rows match. `AppRegistry.project_id` is unique
+    # (`uq_app_registry_project`, KD-4 — one app per project), and `live.c.app_id` is unique
+    # per collapse, so a project row survives an outer join to either exactly once. The count
+    # runs over the SAME predicate as the page (owner + search), just without the columns
+    # that predicate does not need — a total computed over a different predicate is the
+    # failure that would render page numbers the user can click and find empty; a total
+    # computed over a WIDER one just to reuse a query object is a cost with no such payoff.
+    count_query = sa.select(Project).where(Project.user_id == user.id)
+    if search is not None:
+        count_query = count_query.where(
+            sa.or_(
+                Project.name.icontains(search, autoescape=True),
+                Project.description.icontains(search, autoescape=True),
+            )
+        )
+    count_stmt = sa.select(sa.func.count()).select_from(count_query.subquery())
+    total = int(await db.scalar(count_stmt) or 0)
     rows = (
         await db.execute(query.order_by(Project.id.desc()).limit(limit).offset((page - 1) * limit))
     ).all()
@@ -314,7 +334,9 @@ async def project_counts(user: CurrentUser, db: DbSession) -> ProjectCountsRespo
     is not three ad-hoc queries: the list's status column reads the same definition, so
     "3 in production" above a list showing two live apps is not expressible.
     """
-    live = live_app_ids().subquery()
+    # SCOPED to this owner inside the collapse — see `live_app_ids`'s docstring and
+    # `list_projects`'s identical fix; this route had the same unscoped-collapse cost.
+    live = live_app_ids(owner_user_id=user.id).subquery()
 
     # PROJECTS, not `app_registry` rows. The product calls a project an application — the
     # page is headed "Your apps" and its subtitle reads "each project is one tool" — and a
@@ -514,30 +536,58 @@ async def delete_project(
             had_database=handles is not None,
         )
     )
-    cleanup = await delete_project_cascade(db, project, storage, user_id=user.id)
-    await append_audit(
-        db,
-        actor_id=user.id,
-        action="project:delete",
-        resource_type="project",
-        resource_id=str(project_id),
-    )
-    if handles is not None:
-        # NAMES only (D11) — never the DSN. `appId` is what makes this project-scoped row
-        # visible in the app's audit drawer (`admin.read_audit` matches on it); an app-less
-        # project simply has no app to file it under.
-        detail: dict[str, str] = {"dbName": handles.db_name, "roleName": handles.role_name}
-        if app_id is not None:
-            detail["appId"] = str(app_id)
+    # EVERYTHING FROM HERE THROUGH THE COMMIT IS THE GUARDED SECTION. The tombstone insert
+    # above is only PENDING — SQLAlchemy autoflushes it at the next query that needs a
+    # consistent view of the database, and `delete_project_cascade` issues exactly that kind
+    # of query. The loser of a race therefore hits `deleted_projects.project_id`'s unique
+    # index INSIDE the cascade's own autoflush, not at the explicit `db.commit()` below —
+    # confirmed by running this without the wider try: the IntegrityError surfaced from
+    # `delete_project_cascade`, not from the commit call.
+    try:
+        cleanup = await delete_project_cascade(db, project, storage, user_id=user.id)
         await append_audit(
             db,
             actor_id=user.id,
-            action="db:drop",
+            action="project:delete",
             resource_type="project",
             resource_id=str(project_id),
-            detail=detail,
         )
-    await db.commit()
+        if handles is not None:
+            # NAMES only (D11) — never the DSN. `appId` is what makes this project-scoped
+            # row visible in the app's audit drawer (`admin.read_audit` matches on it); an
+            # app-less project simply has no app to file it under.
+            detail: dict[str, str] = {"dbName": handles.db_name, "roleName": handles.role_name}
+            if app_id is not None:
+                detail["appId"] = str(app_id)
+            await append_audit(
+                db,
+                actor_id=user.id,
+                action="db:drop",
+                resource_type="project",
+                resource_id=str(project_id),
+                detail=detail,
+            )
+        await db.commit()
+    except IntegrityError:
+        # THE LOSER OF A DOUBLE-SUBMIT OR A RETRY. `owned_project_or_404` takes no row lock
+        # and this cascade deletes through Core `sa.delete()`, so no ORM staleness check
+        # fires the way `patch_project`'s does — the first signal either request gets that
+        # it lost the race is `deleted_projects.project_id`'s unique index refusing the
+        # second tombstone. By then the winner's transaction has already committed and the
+        # project is genuinely gone, so this mirrors `patch_project`'s own StaleDataError
+        # handling: the loser gets the same non-leaking 404 a request one second later
+        # would, not a 500 for a delete that in fact succeeded.
+        #
+        # THE EXPLICIT ROLLBACK IS LOAD-BEARING HERE IN A WAY IT ISN'T FOR StaleDataError.
+        # Postgres aborts the whole transaction the instant a real constraint violation
+        # reaches it — every statement after this one would answer "current transaction is
+        # aborted" until something rolls it back — whereas `StaleDataError` is SQLAlchemy
+        # catching a zero-row UPDATE/DELETE before any failing SQL is sent, so that
+        # connection was never poisoned. `get_db`'s own `except Exception` rolls back too,
+        # but only for what escapes this function; nothing downstream of this handler
+        # (including a caller sharing this session) should have to know that.
+        await db.rollback()
+        raise AppApiError(status.HTTP_404_NOT_FOUND, "Project not found.") from None
     if handles is not None:
         # FIRST of the post-commit sweeps, because it is the one that stops data being read:
         # sever, then force-drop the database, then drop the role. Never raises.

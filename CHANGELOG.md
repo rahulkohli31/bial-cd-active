@@ -36,9 +36,9 @@ why. (#158)
 
 - **Deleting a project now asks why**, in five to fifty words, instead of asking you to retype
   the project's name. Retyping a name proves you can read it, not that you meant it. The reason
-  is required before the Delete button will do anything, and it is kept with the deletion so an
-  administrator can see why a project went. The dialog says so, because a note that feels
-  private is not.
+  is required before the Delete button will do anything, and it is kept with the deletion
+  record. Nobody can read it back yet — that arrives with the admin console's Deletions tab —
+  and the dialog says only what is true today rather than promising the rest early.
 - **A deletion is recorded against the account that made it**, and the dialog names that account
   before you confirm. It is not something you type: a name a person can write in is a name that
   can say somebody else, and this is the field an administrator reads to find out who deleted

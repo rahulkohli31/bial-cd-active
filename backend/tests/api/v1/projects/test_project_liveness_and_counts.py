@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import datetime as dt
 
+from pydantic_ai.models.test import TestModel
+
 from src.db.models.app_registry import AppStatus
 from src.db.models.deployment import Deployment, DeploymentStatus
 from tests.api.v1.projects.test_projects_crud import _auth
@@ -316,6 +318,28 @@ async def test_a_patch_answers_serving_from_the_deployment_not_the_default(
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["name"] == "Gate Pass Log"
+    assert resp.json()["isServing"] is True
+
+
+async def test_generate_description_reports_serving_too(
+    client, db_session, set_chat_model
+) -> None:
+    """The THIRD of the three endpoints round 1's finding 1 named. Round 3 made
+    ‘_to_response’'s parameter required and this call site was already passing a computed
+    value — the code was correct from the start. What was missing was a test: nothing here
+    asserted it, so a mutant hard-coding ‘is_serving=False’ on THIS endpoint specifically
+    would have passed the whole suite.
+    """
+    set_chat_model(TestModel(custom_output_text="Tracks VIP movements at the airport."))
+    headers, user = await _auth(db_session)
+    project, app = await _project_with_app(db_session, user.id, name="Visitor Log")
+    app.current_code = {"current": {"source": "export default () => <div>x</div>", "entry": "App"}}
+    await _deploy(db_session, app, user.id)
+    await db_session.commit()
+
+    resp = await client.post(f"{_PROJECTS}/{project.id}/description:generate", headers=headers)
+
+    assert resp.status_code == 200, resp.text
     assert resp.json()["isServing"] is True
 
 

@@ -50,6 +50,7 @@ needed the same two collapses.
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 import sqlalchemy as sa
@@ -58,15 +59,35 @@ from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.deployment import Deployment, DeploymentStatus
 
 
-def live_app_ids() -> sa.Select[Any]:
+def live_app_ids(*, owner_user_id: uuid.UUID | None = None) -> sa.Select[Any]:
     """A SELECT of the `app_id`s that are live right now.
 
     Usable as a subquery on either side — `IN (...)`, a LEFT JOIN for a per-row flag, or a
     `COUNT(*)` for the dashboard — so every surface reads the same definition rather than
     re-deriving it.
+
+    `owner_user_id`, WHEN GIVEN, NARROWS THE COLLAPSE ITSELF rather than being applied by the
+    caller afterward — and that placement is the whole fix for a real bug (#173 round 4).
+    `list_projects`/`project_counts` used to build this UNSCOPED and filter by `user.id` in a
+    join outside it; the `DISTINCT ON` collapse below has no way to know that predicate exists,
+    so it evaluates over every deployment row the PLATFORM has ever recorded before the caller's
+    join narrows anything. Measured at 25,245 apps / 112,045 deployments: 60-200ms on the first
+    screen after sign-in, for one citizen's page, scaling with everyone else's deploy history
+    forever. Scoping here means the caller's `WHERE user_id = :me` is now INSIDE the thing that
+    scans deployments, not applied after.
     """
+
+    def _owned(query: sa.Select[Any]) -> sa.Select[Any]:
+        if owner_user_id is None:
+            return query
+        return query.where(
+            Deployment.app_id.in_(
+                sa.select(AppRegistry.id).where(AppRegistry.user_id == owner_user_id)
+            )
+        )
+
     last_success = (
-        sa.select(Deployment.app_id, Deployment.id)
+        _owned(sa.select(Deployment.app_id, Deployment.id))
         # THE `status` PREDICATE MUST RENDER AS A LITERAL. A plain `== DeploymentStatus.X`
         # renders `status = $1`; asyncpg prepares server-side against a long-lived pool, so
         # from the 6th execution on a connection Postgres plans generically, and a generic
@@ -88,7 +109,7 @@ def live_app_ids() -> sa.Select[Any]:
         .subquery()
     )
     last_unpublished = (
-        sa.select(Deployment.app_id, Deployment.id)
+        _owned(sa.select(Deployment.app_id, Deployment.id))
         .where(Deployment.unpublished_at.is_not(None))
         .distinct(Deployment.app_id)
         .order_by(Deployment.app_id, Deployment.id.desc())

@@ -23,42 +23,17 @@
  * description also wires `onOpen` back: lifting it out of the overlay takes it out of the
  * row's click target unless you put it back.
  */
-import { useCallback, useEffect, useRef, useState } from 'react'
 import { Trash2 } from 'lucide-react'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../ui/tooltip'
 import { statusFor, TONE_CLASS } from '../../utils/appStatusLabel'
 import { relativeTime } from '../../utils/relativeTime'
+import { useClipped } from '../../hooks/useClipped'
 import type { Project } from '../../utils/projectApi'
 
 export interface ProjectRowProps {
   project: Project
   onOpen: () => void
   onDelete: () => void
-}
-
-/**
- * Is this element's text ACTUALLY clipped? Measured after layout, never guessed from length —
- * character heuristics are wrong at every breakpoint — and re-measured on resize, because a
- * column that widens un-clips text that was clipped a moment ago.
- */
-function useClipped<T extends HTMLElement>(text: string | null) {
-  const ref = useRef<T>(null)
-  const [clipped, setClipped] = useState(false)
-
-  const measure = useCallback(() => {
-    const el = ref.current
-    if (el) setClipped(el.scrollWidth > el.clientWidth)
-  }, [])
-
-  useEffect(() => {
-    measure()
-    if (typeof ResizeObserver === 'undefined') return
-    const observer = new ResizeObserver(measure)
-    if (ref.current) observer.observe(ref.current)
-    return () => observer.disconnect()
-  }, [measure, text])
-
-  return { ref, clipped }
 }
 
 /**
@@ -85,23 +60,48 @@ function ClampedDescription({
   const { ref, clipped } = useClipped<HTMLParagraphElement>(text)
 
   if (text === null) {
-    return <p className="relative z-10 text-xs text-neutral/70 italic truncate">No description yet</p>
+    // NOTHING TO CLIP AND NOTHING TO SHOW IN A TOOLTIP, but still part of the row's click
+    // target — the populated branch below has `onClick`/`cursor-pointer`, and this one used
+    // to lack both (round-4 finding 8): a project with nothing typed yet had a dead strip
+    // across its row, on exactly the newest, emptiest projects most likely to be clicked.
+    return (
+      <p
+        onClick={onOpen}
+        className="relative z-10 text-xs text-neutral/70 italic truncate cursor-pointer"
+      >
+        No description yet
+      </p>
+    )
   }
 
-  const paragraph = (
-    <p ref={ref} onClick={onOpen} className="relative z-10 text-xs text-neutral truncate cursor-pointer">
-      {text}
-    </p>
-  )
-  if (!clipped) return paragraph
-
+  // THE TOOLTIP MACHINERY IS ALWAYS MOUNTED; only `TooltipContent` is conditional on
+  // `clipped`. Swapping the whole subtree in and out of the JSX by branch (as this used to
+  // do) puts the `<p ref>` at a different TREE POSITION depending on `clipped` — a plain
+  // `<p>` versus one nested inside `TooltipProvider > Tooltip > TooltipTrigger` — and React
+  // treats that as a REMOUNT, not an update. The `useClipped` effect's deps (`[measure,
+  // text]`) do not change on that remount, so the `ResizeObserver` never rebinds to the new
+  // node: `false→true` worked once, but `true→false` (a column widening enough to un-clip
+  // text) never fired again, leaving a stale tooltip armed on text that now fits (round-4,
+  // three reviewers independently). Keeping the wrapper constant and only toggling
+  // `TooltipContent` means the ref's element never moves, so one `ResizeObserver` keeps
+  // working for the component's whole lifetime.
   return (
     <TooltipProvider delayDuration={200}>
       <Tooltip>
-        <TooltipTrigger asChild>{paragraph}</TooltipTrigger>
-        <TooltipContent side="bottom" align="start" className="max-w-md">
-          {text}
-        </TooltipContent>
+        <TooltipTrigger asChild>
+          <p
+            ref={ref}
+            onClick={onOpen}
+            className="relative z-10 text-xs text-neutral truncate cursor-pointer"
+          >
+            {text}
+          </p>
+        </TooltipTrigger>
+        {clipped && (
+          <TooltipContent side="bottom" align="start" className="max-w-md">
+            {text}
+          </TooltipContent>
+        )}
       </Tooltip>
     </TooltipProvider>
   )
@@ -118,24 +118,26 @@ function ClampedDescription({
 function ClampedName({ name, onOpen }: { name: string; onOpen: () => void }): React.JSX.Element {
   const { ref, clipped } = useClipped<HTMLButtonElement>(name)
 
-  const button = (
-    <button
-      ref={ref}
-      onClick={onOpen}
-      className="text-sm font-semibold text-tertiary hover:text-primary transition text-left truncate max-w-full after:absolute after:inset-0 after:content-[''] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 rounded"
-    >
-      {name}
-    </button>
-  )
-  if (!clipped) return button
-
+  // Always mounted, `TooltipContent` alone conditional — see `ClampedDescription` for why:
+  // the ref'd button must stay at one tree position for its `ResizeObserver` to keep working
+  // across a `clipped` transition in either direction.
   return (
     <TooltipProvider delayDuration={200}>
       <Tooltip>
-        <TooltipTrigger asChild>{button}</TooltipTrigger>
-        <TooltipContent side="bottom" align="start" className="max-w-md">
-          {name}
-        </TooltipContent>
+        <TooltipTrigger asChild>
+          <button
+            ref={ref}
+            onClick={onOpen}
+            className="text-sm font-semibold text-tertiary hover:text-primary transition text-left truncate max-w-full after:absolute after:inset-0 after:content-[''] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 rounded"
+          >
+            {name}
+          </button>
+        </TooltipTrigger>
+        {clipped && (
+          <TooltipContent side="bottom" align="start" className="max-w-md">
+            {name}
+          </TooltipContent>
+        )}
       </Tooltip>
     </TooltipProvider>
   )

@@ -16,12 +16,12 @@
  * `onOpen` / `onDelete`, so this component is trivial to render in a test with no
  * router.
  */
-import { useCallback, useEffect, useRef, useState } from 'react'
 import { Trash2 } from 'lucide-react'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../ui/tooltip'
 import type { Project } from '../../utils/projectApi'
 import { statusFor, TONE_CLASS } from '../../utils/appStatusLabel'
 import { relativeTime } from '../../utils/relativeTime'
+import { useClipped } from '../../hooks/useClipped'
 import { Card } from '../ui/card'
 
 /**
@@ -33,44 +33,37 @@ import { Card } from '../ui/card'
  * `::after` still covers the tile.
  */
 function NameButton({ name, onOpen }: { name: string; onOpen: () => void }): React.JSX.Element {
-  const ref = useRef<HTMLSpanElement>(null)
-  const [clipped, setClipped] = useState(false)
+  // Shared with `ProjectRow` (round-4 review: this used to be a byte-identical copy).
+  // Measured on the inner span rather than the button, because that is the element
+  // `truncate` acts on — the button is as wide as the tile either way.
+  const { ref, clipped } = useClipped<HTMLSpanElement>(name)
 
-  const measure = useCallback(() => {
-    const el = ref.current
-    if (el) setClipped(el.scrollWidth > el.clientWidth)
-  }, [])
-
-  useEffect(() => {
-    measure()
-    if (typeof ResizeObserver === 'undefined') return
-    const observer = new ResizeObserver(measure)
-    if (ref.current) observer.observe(ref.current)
-    return () => observer.disconnect()
-  }, [measure, name])
-
-  const button = (
-    <button
-      type="button"
-      onClick={onOpen}
-      // The name truncates on the inner <span> so its overflow:hidden clips the text
-      // WITHOUT clipping the button's stretched ::after (a sibling of the span).
-      className="block w-full text-left text-sm font-bold text-tertiary cursor-pointer rounded-sm after:absolute after:inset-0 after:rounded-2xl focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
-    >
-      <span ref={ref} className="block truncate">
-        {name}
-      </span>
-    </button>
-  )
-  if (!clipped) return button
-
+  // ALWAYS MOUNTED; only `TooltipContent` is conditional. Swapping the tooltip subtree in
+  // and out by branch put the ref'd `<span>` at a different tree position depending on
+  // `clipped`, which React treats as a remount — the `ResizeObserver` never rebinds to the
+  // new node, so a tile widening past its clip point kept a stale tooltip armed forever
+  // (round-4). One stable position keeps one observer working for the tile's lifetime.
   return (
     <TooltipProvider delayDuration={200}>
       <Tooltip>
-        <TooltipTrigger asChild>{button}</TooltipTrigger>
-        <TooltipContent side="bottom" align="start" className="max-w-md">
-          {name}
-        </TooltipContent>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            onClick={onOpen}
+            // The name truncates on the inner <span> so its overflow:hidden clips the text
+            // WITHOUT clipping the button's stretched ::after (a sibling of the span).
+            className="block w-full text-left text-sm font-bold text-tertiary cursor-pointer rounded-sm after:absolute after:inset-0 after:rounded-2xl focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+          >
+            <span ref={ref} className="block truncate">
+              {name}
+            </span>
+          </button>
+        </TooltipTrigger>
+        {clipped && (
+          <TooltipContent side="bottom" align="start" className="max-w-md">
+            {name}
+          </TooltipContent>
+        )}
       </Tooltip>
     </TooltipProvider>
   )
