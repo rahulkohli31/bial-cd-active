@@ -22,6 +22,7 @@
  * with the markup" cannot be how any of them stops being checked.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { useState } from 'react'
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, Link, useLocation } from 'react-router-dom'
 import WorkspaceShell from '../WorkspaceShell'
@@ -40,10 +41,21 @@ import {
 } from '../workspaceChannel'
 
 vi.mock('../../layout/Navbar', () => ({ default: () => <div data-testid="navbar" /> }))
+/**
+ * THE ROW'S RENDER COUNTER, and it has to be inside the row rather than around it.
+ *
+ * The chip is an ordinary child of the row's own JSX with no memo between them, so React renders
+ * it exactly once per render of the row — which makes this stub a count of the row's renders that
+ * a wrapper around `WorkspaceToolbar` could not produce (a wrapper only sees the renders its own
+ * parent causes, and misses the ones the row's own cell subscriptions cause, which are precisely
+ * the ones "the row does not wake with the composer" is about).
+ */
+const h = vi.hoisted(() => ({ rowRenders: 0 }))
 vi.mock('../../PublishStatusChip', () => ({
-  default: ({ projectId }: { projectId: string }) => (
-    <span data-testid="publish-chip-stub" data-project={projectId} />
-  ),
+  default: function PublishStatusChipStub({ projectId }: { projectId: string }) {
+    h.rowRenders += 1
+    return <span data-testid="publish-chip-stub" data-project={projectId} />
+  },
 }))
 vi.mock('../../LivePreview', () => ({
   default: () => <div data-testid="live-preview" />,
@@ -104,7 +116,9 @@ function Surface({
   useWorkspaceProject(heading.projectId)
   usePublishHeading(heading)
   usePublishAddress({ url: appUrl, status: appUrl ? 'ready' : null }, heading.projectId)
-  usePublishPaneView(EMPTY_PANE)
+  // A FRESH OBJECT PER RENDER, which is what the real conversation surface publishes — the pane
+  // cell is identity-compared, so this is what makes a keystroke reach the channel at all.
+  usePublishPaneView({ ...EMPTY_PANE })
   usePublishSave(save, actions)
   usePublishSaveState(save.dirty)
   useAppPaneVisible(paneVisible)
@@ -562,16 +576,64 @@ describe('the back control and the rename', () => {
 })
 
 describe('the row does not wake with the composer', () => {
+  /**
+   * A chat surface with a composer in it, republishing its pane view on every keystroke exactly as
+   * the real one does — plus one control that changes something the row DOES read, which is what
+   * makes the counter's silence meaningful.
+   */
+  function Typist() {
+    const [text, setText] = useState('')
+    const [chatTitle, setChatTitle] = useState('Add an out-time column')
+    return (
+      <>
+        <input aria-label="composer" value={text} onChange={(e) => setText(e.target.value)} />
+        <button type="button" onClick={() => setChatTitle('Add an out-time and an in-time')}>
+          rename the chat
+        </button>
+        <Surface heading={{ ...CHAT_HEADING, chatTitle }} />
+      </>
+    )
+  }
+
+  const typing = () =>
+    render(
+      <MemoryRouter initialEntries={['/chat/c1']}>
+        <Routes>
+          <Route element={<WorkspaceShell />}>
+            <Route path="/chat/:chatId" element={<Typist />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    )
+
   it('★ a publish that changes nothing the row shows does not re-render it', async () => {
     // The reason the row reads its own value-compared cells rather than the pane cell, which is
-    // republished per character typed and holds handlers that cannot be compared. Asserted on the
-    // ELEMENT's identity: a re-render of the shell that produced a new node would fail the
-    // route-change scenario above too, so this pins the cheaper half — the row's DOM is stable
-    // while a surface republishes an unchanged heading and save state.
-    const { rerender } = render(<Workspace />)
-    const before = row()
-    for (let i = 0; i < 5; i += 1) rerender(<Workspace />)
-    await waitFor(() => expect(row()).toBe(before))
-    expect(title().textContent).toBe('Visitor Log — Airport Office')
+    // republished per character typed and holds handlers that cannot be compared.
+    //
+    // COUNTED, NOT COMPARED BY NODE. The version of this scenario that shipped asserted `row()` was
+    // the same ELEMENT after five re-renders — which React guarantees whether the row re-rendered
+    // five times or none, so it stayed green for the very property it was written for. Point the
+    // row at the pane cell and this one goes red; that one did not.
+    typing()
+    await waitFor(() => expect(screen.getByTestId('publish-chip-stub')).toBeTruthy())
+    const node = row()
+    const before = h.rowRenders
+
+    for (const value of ['a', 'ad', 'add', 'add ', 'add a']) {
+      fireEvent.change(screen.getByLabelText('composer'), { target: { value } })
+    }
+
+    expect(h.rowRenders).toBe(before)
+    // …and the row is still the same element with the same contents, which is the half the
+    // earlier version of this test could see.
+    expect(row()).toBe(node)
+    expect(title().textContent).toBe('Add an out-time column')
+
+    // LIVENESS: the counter is genuinely wired to the row. Something the row DOES read — the chat's
+    // own title — wakes it, so the five silent keystrokes above are a subscription that ignores the
+    // composer rather than a probe that never counts anything.
+    fireEvent.click(screen.getByRole('button', { name: 'rename the chat' }))
+    expect(h.rowRenders).toBeGreaterThan(before)
+    expect(title().textContent).toBe('Add an out-time and an in-time')
   })
 })
