@@ -1652,7 +1652,9 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     }
     endGenerating(activeId)
 
-    // EVERYTHING THAT PAINTS IS UNDER ONE GUARD, in the same order the re-attach path uses.
+    // EVERYTHING THAT PAINTS IS BEHIND ONE GUARD, in the same order and the same shape the
+    // re-attach path uses — the reader above it ends the same way, line for line, and a reader
+    // that has to be compared against its twin should not have to be un-nested first.
     //
     // The status row and the two banners used to be written inside the `try`, unguarded, while
     // the three below were not — so a reader that ended after the citizen had opened a sibling
@@ -1660,20 +1662,19 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     // a turn in a conversation they had left. `settleWorking` went the same way, repainting a
     // transcript belonging to somebody else's chat. Both paths now say the same thing once:
     // a reply is only ever told to the chat it belongs to.
-    if (stillHere()) {
-      settleWorking(assistantId, sink)
-      if (outcome === 'stalled') setTurnError('The reply stalled. Reload to catch up.')
-      else if (outcome === 'truncated' && !sink.terminal) setTurnError('The connection dropped. Reload to catch up.')
-      if (sink.terminal !== 'completed' && sink.parts.length === 0) {
-        // Failed/stopped with nothing streamed — drop the empty bubble; the error banner
-        // (or the stopped state) is the feedback.
-        setMessages((prev) => prev.filter((m) => m.id !== assistantId))
-        seqRef.current = assistantSeq
-      }
-      markInterrupted(assistantId, sink.terminal)
-      announceTerminal(sink)
-      refreshBuilds()
+    if (!stillHere()) return
+    settleWorking(assistantId, sink)
+    if (outcome === 'stalled') setTurnError('The reply stalled. Reload to catch up.')
+    else if (outcome === 'truncated' && !sink.terminal) setTurnError('The connection dropped. Reload to catch up.')
+    if (sink.terminal !== 'completed' && sink.parts.length === 0) {
+      // Failed/stopped with nothing streamed — drop the empty bubble; the error banner
+      // (or the stopped state) is the feedback.
+      setMessages((prev) => prev.filter((m) => m.id !== assistantId))
+      seqRef.current = assistantSeq
     }
+    markInterrupted(assistantId, sink.terminal)
+    announceTerminal(sink)
+    refreshBuilds()
   }
 
   /**
