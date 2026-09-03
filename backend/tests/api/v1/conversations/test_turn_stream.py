@@ -1702,6 +1702,101 @@ async def test_a_first_message_that_loses_the_insert_race_joins_the_winners_chat
     assert [item.text for item in items if isinstance(item, UserTextItem)] == ["a visitor log"]
 
 
+@pytest.mark.route_rollback
+async def test_the_loser_of_the_race_takes_the_winners_project_not_its_own_staged_one(
+    client, db_session, set_chat_model, fake_redis, fake_storage, _fresh_engine, monkeypatch
+) -> None:
+    """★ THE OTHER HALF OF JOINING THE WINNER'S CHAT: joining its PROJECT too.
+
+    The arm above rebinds `conversation` to the winner's row and the sibling `existing` arm
+    rebinds the project with it (`conversation, project_id = existing, existing.project_id`).
+    Left unrebound, everything downstream that takes the local `project_id` keeps the LOSER's
+    staged one — which app the turn pins and whose project name goes into the prompt — while
+    `start_conversation_turn` hands the engine `conversation.project_id`, the winner's. One turn
+    would then be running against one project's workspace while being told it is another's.
+
+    THE TWO PROJECTS ARE THE TEST. The sibling above races two asks that name the SAME project,
+    which is what the shipped SPA does and is exactly why it cannot see this: the staged id and
+    the winner's id are equal, so reading the wrong one is invisible. Here they differ, and each
+    project has its own app, so the pin names one of them out loud.
+
+    Mutation check: delete the `project_id = conversation.project_id` rebind in the route's
+    `except IntegrityError` arm and all three assertions below go red together."""
+    from src.api.v1.conversations import turns as turns_module
+    from tests.factories import AppRegistryFactory
+
+    set_chat_model(_streaming_text("picking up in the winner's project"))
+    user = await UserFactory.create(db_session)
+    winners_project = await ProjectFactory.create(db_session, user.id, name="the winner's project")
+    losers_project = await ProjectFactory.create(db_session, user.id, name="the loser's project")
+    winners_app = await AppRegistryFactory.create(
+        db_session, user_id=user.id, project_id=winners_project.id
+    )
+    losers_app = await AppRegistryFactory.create(
+        db_session, user_id=user.id, project_id=losers_project.id
+    )
+
+    winner = await ConversationFactory.create(
+        db_session, user.id, project_id=winners_project.id, kind=ChatKind.PLAN
+    )
+    await db_session.commit()
+    # EVERY ID READ OFF AN ORM OBJECT IS TAKEN NOW. The route's rollback expires the whole
+    # identity map (reproduced below), so an attribute read after the request is a lazy SELECT an
+    # async session answers with `MissingGreenlet` — the assertions would die on the reader
+    # rather than on what they assert.
+    chat_id, winners_project_id = winner.id, winners_project.id
+    losers_project_id = losers_project.id
+    winners_app_id, losers_app_id = winners_app.id, losers_app.id
+    headers = _headers(user)
+
+    real_rollback = db_session.rollback
+
+    async def _rollback_like_production() -> None:
+        await real_rollback()
+        db_session.expire_all()
+
+    monkeypatch.setattr(db_session, "rollback", _rollback_like_production)
+
+    real_read = turns_module._conversation_or_none
+    reads = {"n": 0}
+
+    async def _blind_the_first_read(db, uid, cid):
+        reads["n"] += 1
+        return None if reads["n"] == 1 else await real_read(db, uid, cid)
+
+    monkeypatch.setattr(turns_module, "_conversation_or_none", _blind_the_first_read)
+
+    started: dict[str, Any] = {}
+    real_start = turns_module.start_conversation_turn
+
+    async def _record_what_the_turn_was_started_with(**kwargs):
+        started.update(kwargs)
+        return await real_start(**kwargs)
+
+    monkeypatch.setattr(
+        turns_module, "start_conversation_turn", _record_what_the_turn_was_started_with
+    )
+
+    assert winners_app_id != losers_app_id  # or the pin below could not tell them apart
+    resp = await _post_first_message(
+        client, headers, chat_id, losers_project_id, kind="build", text="a visitor log"
+    )
+
+    assert resp.status_code == 202, resp.text
+    # LIVENESS: the create branch was genuinely taken and the flush genuinely collided — only the
+    # `except IntegrityError` arm reads the conversation a second time.
+    assert reads["n"] == 2, "the create branch was never taken — the blind did not take effect"
+    await _settle(_fresh_engine, chat_id)
+
+    # THE APP THE TURN PINS is the winner's project's app, never the staged project's.
+    assert started["app_id"] == winners_app_id
+    # …AND THE PROMPT DESCRIBES THAT SAME PROJECT. The pin and the words the model is given about
+    # where it is working come from the same id, or the agent is told it is somewhere it is not.
+    assert started["prompt_context"].project_name == "the winner's project"
+    # …AND SO DOES THE ROW THE ENGINE IS HANDED, which is what makes the two above agree with it.
+    assert started["conversation"].project_id == winners_project_id
+
+
 async def test_an_unknown_conversation_with_no_parentage_is_still_a_404(
     client, db_session, set_chat_model, fake_redis, fake_storage
 ) -> None:

@@ -121,9 +121,9 @@ async def db_session(test_engine, request):
     # DETACHED task touches the session while the test itself is mid-statement stops being a
     # benign interleave and becomes `InvalidRequestError: this session is provisioning a new
     # connection`. Eight deploy tests went red that way — tests about save-and-publish, which
-    # have no opinion about transaction shape and should not have to. One test needs the
-    # savepoint; it asks for it with `@pytest.mark.route_rollback`, and the other ~3,700 keep
-    # the shape they were written against.
+    # have no opinion about transaction shape and should not have to. Two tests need the
+    # savepoint — both of them on `turns.py`'s collision arm — and they ask for it with
+    # `@pytest.mark.route_rollback`; the other ~3,700 keep the shape they were written against.
     join_mode: JoinTransactionMode = (
         "create_savepoint"
         if request.node.get_closest_marker("route_rollback") is not None
