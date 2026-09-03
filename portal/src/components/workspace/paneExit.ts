@@ -28,6 +28,16 @@
  *
  * NOTHING HERE UNMOUNTS OR RE-KEYS ANYTHING. The pane is the same element throughout, with a class
  * change — the whole reason the movement is safe over a live iframe.
+ *
+ * ═══ THE ONE COST, SAID OUT LOUD ═══
+ *
+ * `visibility:hidden` is what takes the framed app out of the TAB ORDER (see `hiddenSubtree.ts`),
+ * and it cannot be applied while the card is still being watched leave — an invisible element has
+ * nothing to animate. So for {@link PANE_EXIT_MS} the departing app is announced as gone
+ * (`aria-hidden` lands immediately) but is still reachable by Tab. The clean fix is the `inert`
+ * attribute, which removes a subtree from the tab order while leaving it painted; React 18 has no
+ * supported prop for it, so it is named here rather than smuggled in as a raw attribute, and it is
+ * the first thing to revisit when this app moves to React 19.
  */
 import { useEffect, useRef, useState } from 'react'
 
