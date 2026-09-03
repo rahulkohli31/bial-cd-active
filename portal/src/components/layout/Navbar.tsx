@@ -135,6 +135,20 @@ export default function Navbar() {
     toastTimer.current = setTimeout(() => setToastMsg(null), 3000)
   }
 
+  /**
+   * SIGNING OUT GOES THROUGH THE WORKSPACE'S GUARD (plan 002, U11).
+   *
+   * It did not, and it is one of the two most-used exits out of a workspace: every nav LINK in
+   * this bar was routed through `exit` and the one control that ends the session entirely was
+   * not, so a citizen with unsaved work could lose it by pressing the single most final button
+   * on the screen, in silence. The guard is the same one, so the dialog, the save-first offer and
+   * the failed-save refusal are all the ones they have already seen.
+   *
+   * OUTSIDE A WORKSPACE `exit` is a function that simply calls what it is given, which is why
+   * every other page's sign-out is untouched by this.
+   */
+  const signOut = () => exit(() => void handleLogout())
+
   const handleLogout = async () => {
     // Await the server-side revoke (bumps token_version + revokes refresh
     // families + clears cookies). logout() never throws. Never trap the
@@ -293,7 +307,7 @@ export default function Navbar() {
                       pixels below the first. */}
                   <div className="mt-1">
                     <button
-                      onClick={handleLogout}
+                      onClick={signOut}
                       className="w-full flex items-center gap-2.5 px-4 py-2.5 text-sm text-danger hover:bg-red-50 transition"
                     >
                       <LogOut size={13} />

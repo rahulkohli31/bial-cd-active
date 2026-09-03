@@ -281,6 +281,10 @@ function ShellFrame() {
     saveDirty: useWorkspaceSaveState(),
     workspaceIsAlive: report?.state.name === 'running',
     projectId: report?.projectId ?? null,
+    // WHOSE WORK IS AT RISK. The heading already carries the name for the toolbar row, and it is
+    // the same fact — so the dialog names the project rather than saying "this app" to somebody
+    // who is, by definition, in the middle of leaving it for another one.
+    projectName: heading.projectName,
   })
 
   // A RAIL COLLAPSED BESIDE A PANE MUST NOT SURVIVE THE PANE GOING AWAY. The control that restores

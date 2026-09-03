@@ -35,6 +35,8 @@
  */
 import { useEffect, useState, type FC } from 'react'
 
+import { TEXT_MEDIA_TYPES } from '../../utils/attachmentInput'
+
 import {
   Dialog,
   DialogContent,
@@ -57,10 +59,48 @@ export interface AttachmentPreviewProps {
   onClose: () => void
 }
 
-/** Same-origin, so `frame-src 'self'` allows it. This is the whole mechanism. */
+/** Whatever this file can be addressed by — same-origin first, then whatever transient URL the
+ *  caller is holding. Used by the IMAGE branch, which no directive restricts. */
 export function attachmentSrc(target: PreviewTarget): string | null {
   if (target.attachmentId) return `/api/attachments/${encodeURIComponent(target.attachmentId)}`
   return target.dataUrl ?? null
+}
+
+/**
+ * WHAT MAY BE PUT IN A FRAME, WHICH IS NOT THE SAME QUESTION (plan 002, U11).
+ *
+ * THE DEFECT: a STAGED file — one the citizen has attached but not sent — has no id yet, so its
+ * only address is a `data:` URL. The live policy is `frame-src 'self' https://${APPS_HOSTNAME}`
+ * (`nginx.conf`, declared three times), and `data:` matches neither. So the frame was BLOCKED, and
+ * a blocked frame renders BLANK: `<iframe>` fires no `error` for a CSP refusal, so the fallback
+ * sentence never appeared either. A citizen opening a PDF they had just attached got an empty box.
+ *
+ * DIAGNOSED AGAINST THE LIVE CONFIGURATION, not against the comments. The resource directives most
+ * of this repo's comments still cite were deleted with the retired serving path and `csp.py` no
+ * longer exists; `nginx.conf` and the Caddyfile in front of it are the only authorities left, and
+ * both say the same thing about framing.
+ *
+ * So only a same-origin address is framed. Everything else is rendered by a branch that does not
+ * need a frame at all, or says plainly why it cannot be shown yet.
+ */
+function framableSrc(target: PreviewTarget): string | null {
+  return target.attachmentId ? `/api/attachments/${encodeURIComponent(target.attachmentId)}` : null
+}
+
+/** The base64 payload out of a staged file's data URL, or `null` for anything else. */
+function stagedText(target: PreviewTarget): string | null {
+  const url = target.dataUrl
+  if (!url || !url.startsWith('data:')) return null
+  const comma = url.indexOf(',')
+  if (comma < 0) return null
+  try {
+    // `atob` then a UTF-8 decode: the payload is bytes, and a CSV with a name in it is not ASCII.
+    const binary = atob(url.slice(comma + 1))
+    const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0))
+    return new TextDecoder().decode(bytes)
+  } catch {
+    return null
+  }
 }
 
 const AttachmentPreview: FC<AttachmentPreviewProps> = ({ target, onClose }) => {
@@ -73,6 +113,9 @@ const AttachmentPreview: FC<AttachmentPreviewProps> = ({ target, onClose }) => {
   if (!target) return null
   const src = attachmentSrc(target)
   const isImage = target.mediaType.startsWith('image/')
+  const isText = TEXT_MEDIA_TYPES.has(target.mediaType)
+  const framable = framableSrc(target)
+  const text = isText ? stagedText(target) : null
 
   return (
     <Dialog
@@ -95,6 +138,8 @@ const AttachmentPreview: FC<AttachmentPreviewProps> = ({ target, onClose }) => {
             expired — reload the page and try again.
           </p>
         ) : isImage ? (
+          // NO DIRECTIVE RESTRICTS AN IMAGE. `data:`, `blob:` and same-origin all render, which is
+          // why this branch never had the framing defect the others did.
           <img
             src={src}
             alt={target.name}
@@ -102,14 +147,31 @@ const AttachmentPreview: FC<AttachmentPreviewProps> = ({ target, onClose }) => {
             onError={() => setFrameFailed(true)}
             className="max-h-[70vh] w-full object-contain"
           />
-        ) : (
+        ) : text !== null ? (
+          // A TEXT FILE NEEDS NO FRAME AT ALL. It rode in a frame only because everything that was
+          // not an image did, and a `data:` frame is exactly what the policy blocks. The bytes are
+          // already here; showing them is both correct and better than a PDF viewer would be.
+          <pre
+            data-testid="attachment-preview-text"
+            className="max-h-[70vh] overflow-auto rounded-md border border-bial-border bg-bial-bg p-3 text-xs leading-relaxed text-tertiary"
+          >
+            {text}
+          </pre>
+        ) : framable !== null ? (
           <iframe
-            src={src}
+            src={framable}
             title={target.name}
             data-testid="attachment-preview-frame"
             onError={() => setFrameFailed(true)}
             className="h-[70vh] w-full rounded-md border border-bial-border"
           />
+        ) : (
+          // A STAGED PDF. There is no address for it that the framing policy allows and no way to
+          // render one in the page, so it says so rather than showing an empty box — which is what
+          // it did, silently, because a CSP-blocked frame fires no `error`.
+          <p data-testid="attachment-preview-pending" className="py-8 text-center text-sm text-neutral">
+            “{target.name}” will open here once you have sent it. It is attached and ready to go.
+          </p>
         )}
       </DialogContent>
     </Dialog>

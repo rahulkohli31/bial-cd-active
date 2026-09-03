@@ -16,6 +16,7 @@ import { isConversationGone } from '../../utils/chatErrors'
 
 import { resolvePreviewAddress } from '../../utils/previewAddress'
 import { PREVIEW_PROBE_MS, SETTLED_GONE, resolveWorkspaceState } from '../workspace/workspaceState'
+import type { StartOutcome } from '../workspace/workspaceState'
 import {
   useAppPaneVisible,
   usePublishAddress,
@@ -2478,6 +2479,9 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // What the hand-over is doing right now, so the dialog narrates instead of spinning through a
   // sequence that genuinely takes tens of seconds (plan 002, U9).
   const [handoverStep, setHandoverStep] = useState<HandoverStep | null>(null)
+  // HOW THE LAST START ENDED, or `null` when none has been attempted or the last one reached the
+  // app. Fed to the same pure map the project screen uses — see the report below.
+  const [startOutcome, setStartOutcome] = useState<StartOutcome | null>(null)
 
   // The refusal is the SAME on both paths a user can take into the one workspace — a Write
   // message and the Relaunch button — so the mapping lives once here. Returns true when it
@@ -2604,16 +2608,22 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // sentence a citizen reads when this chat's pane has nothing to frame has exactly one author in
   // the product — the same one the project screen's pane and a Plan chat's line read from.
   //
-  // NO START OUTCOME HERE. This surface has its own relaunch path with its own error handling
-  // (`session.relaunchError`, rendered by the pane's own arms), and threading a second outcome
-  // through would give one state two authors again. `onStartOutcome` therefore only refreshes.
+  // ★ A FAILED START IN A CHAT SAYS WHY (plan 002, U11), and it did not.
+  //
+  // `startOutcome` was hardcoded to `null` here on the grounds that this surface has its own
+  // relaunch path with its own error handling. That path is the SESSION's relaunch, which is a
+  // different control: a press on the PANE's start or retry — the one a citizen reaches when
+  // their app is asleep in a build chat — reported nothing at all. The spinner stopped, the same
+  // sentence came back, and pressing again did the same thing. This surface holds the outcome now,
+  // exactly as the project surface's hook does, and hands it to the same pure map so the wording
+  // still has one author.
   usePublishWorkspaceReport(
     projectId
       ? {
           state: resolveWorkspaceState({
             preview: previewState,
             projectHasSavedBuild,
-            startOutcome: null,
+            startOutcome,
             startInFlight: startPending,
           }),
           projectId,
@@ -2639,7 +2649,12 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
           // and nothing else — so an in-flight press is local state here, exactly as it is in the
           // hook the project surface uses.
           onStartPending: setStartPending,
-          onStartOutcome: () => setPreviewProbeEpoch((n) => n + 1),
+          onStartOutcome: (outcome) => {
+            setStartOutcome(outcome)
+            // A start that REACHED the app clears the outcome and asks again immediately, so the
+            // pane arrives at the running app on the press rather than on the next poll tick.
+            if (outcome === null) setPreviewProbeEpoch((n) => n + 1)
+          },
           onRefresh: () => setPreviewProbeEpoch((n) => n + 1),
           // The SAME single-slot capture the composer and the relaunch button use — first refusal
           // wins, so the dialog cannot change under the person reading it. Set directly rather

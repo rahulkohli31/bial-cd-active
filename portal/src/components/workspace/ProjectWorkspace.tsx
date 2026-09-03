@@ -60,7 +60,7 @@ import {
 } from './workspaceChannel'
 import type { ReclaimRequest } from './workspaceChannel'
 import { resolvePreviewAddress } from '../../utils/previewAddress'
-import { handOverWorkspace } from '../../utils/buildSessionApi'
+import { handOverWorkspace, saveProject } from '../../utils/buildSessionApi'
 import type { HandoverStep, ReclaimBlocked } from '../../utils/buildSessionApi'
 import type { Project } from '../../utils/projectApi'
 
@@ -204,17 +204,44 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   usePublishAddress(address, project.id)
   usePublishPaneView(paneView)
   usePublishWorkspaceReport(report)
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
+
+  /**
+   * PUSH THE WORKSPACE TO DURABLE STORAGE, from the project screen.
+   *
+   * The same call the conversation surface makes, and deliberately not shared with it: only ONE
+   * of the two is ever mounted for a given address, so there is no contest, and a hook whose whole
+   * body is three `useState`s and one request would be an abstraction over nothing.
+   *
+   * SURFACED, NEVER SWALLOWED. A save that silently fails leaves the citizen believing their work
+   * is stored, which is the one outcome worse than not offering the control at all. The server's
+   * own copy names the way out, so it is passed through rather than reworded.
+   */
+  const save = useCallback(async () => {
+    if (saving) return
+    setSaving(true)
+    setSaveError(null)
+    try {
+      await saveProject(project.id)
+      workspace.refresh()
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Could not save your work. Try again.')
+    } finally {
+      setSaving(false)
+    }
+  }, [project.id, saving, workspace])
+
   usePublishSaveState(workspace.save?.dirty ?? null)
-  // THE SAVE CONTROL'S VALUES, FOR THE TOOLBAR ROW, AND STILL NO ACTION FROM HERE.
+  // SAVE IS REACHABLE FROM THE PROJECT SCREEN (plan 002, U11), and it was not.
   //
-  // `rename` IS an action this surface owns: the row draws the project's name, and the control
-  // that edits it used to sit in the rail header the boards replace. `save` is deliberately still
-  // `null` — this plan's U11 gives the project screen a writer of the bundle, and until it does,
-  // publishing a handler would put a pressable Save on a screen with nothing behind it. The row
-  // reads `canSave` from this and draws a status rather than a button.
+  // The only writer of the bundle lived on the conversation surface, so a citizen who had built
+  // something, gone back to the project screen and then closed the tab lost it — with the rail
+  // telling them, correctly, that they had unsaved changes and offering nothing to do about it.
+  // The toolbar row is where the control lives; this is the producer behind it.
   usePublishSave(
-    { dirty: workspace.save?.dirty ?? null, saving: false, error: null },
-    { save: null, rename: startRename },
+    { dirty: workspace.save?.dirty ?? null, saving, error: saveError },
+    { save: workspace.save ? save : null, rename: startRename },
   )
   usePublishReclaim(request)
   // TWO COLUMNS ARE THE REST STATE of the project screen — not something contingent on a build
