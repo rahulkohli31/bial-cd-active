@@ -23,22 +23,32 @@ import {
 } from '../publishPresentation'
 import type { ApprovalState, DeploymentView, PublishState } from '../deployApi'
 
-/** Every value the union can hold. Adding one to `PublishState` and not here is a type error. */
-const EVERY_STATE: readonly PublishState[] = [
-  'nothing_built',
-  'draft',
-  'in_review',
-  'changes_requested',
-  'approved_ready_to_publish',
-  'approved_needs_review_again',
-  'starting_up',
-  'live_current',
-  'live_newer_work',
-  'live_drift_unknown',
-  'taken_offline',
-  'switched_off',
-  'did_not_start',
-]
+/**
+ * Every value the union can hold — as a RECORD KEYED BY THE UNION, which is what makes the claim
+ * true. It was an array annotated `readonly PublishState[]`, and TypeScript satisfies that with
+ * ANY subset: a state added to `PublishState` and not written here compiled cleanly and simply
+ * dropped out of the totality loop, the drift loop and the empty-rows loop below, with every test
+ * still green. A record literal missing a key is an error on the literal itself.
+ *
+ * `Object.keys` is the one place the key type is lost, and the assertion below restates exactly
+ * what this record's own annotation already guarantees.
+ */
+const ALL_STATES: Record<PublishState, null> = {
+  nothing_built: null,
+  draft: null,
+  in_review: null,
+  changes_requested: null,
+  approved_ready_to_publish: null,
+  approved_needs_review_again: null,
+  starting_up: null,
+  live_current: null,
+  live_newer_work: null,
+  live_drift_unknown: null,
+  taken_offline: null,
+  switched_off: null,
+  did_not_start: null,
+}
+const EVERY_STATE = Object.keys(ALL_STATES) as readonly PublishState[]
 
 const view = (over: Partial<DeploymentView> = {}): DeploymentView =>
   ({ publishState: 'draft', savedHead: null, savedAt: null, ...over }) as DeploymentView
