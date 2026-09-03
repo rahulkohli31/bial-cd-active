@@ -42,13 +42,18 @@
  * screen caused, which R3 forbids. So a stopped project's rail shows the status sentence and NO
  * save state, and the save half appears while the app is running.
  *
- * ═══ WHY THE STATUS SENTENCE APPEARS HERE AS WELL AS IN THE PANE ═══
+ * ═══ TWO DIFFERENT STATUSES, AND ONLY ONE OF THEM IS THIS SECTION'S ═══
  *
- * Because R6 asks for it, and because a citizen reading the rail should not have to look across at
- * the pane to learn whether their app is up. It is the SAME sentence — one computed value, so the
- * two cannot disagree — and this renderer deliberately carries no ACTION. R3 says exactly one
- * control starts the app, and that control is the pane's. A second Start button here would satisfy
- * "exactly one" with two.
+ * APP STATUS is about PUBLISHING — what is live, what was approved, what the citizen last saved.
+ * Whether the container is up is a different question with a different answer, and the boards give
+ * it to the PANE, which is where a citizen is already looking for their app. The rail used to
+ * carry that sentence too, on the grounds that nobody should have to look across; the boards put
+ * the publish panel in that space instead, and the workspace sentence keeps the one author it
+ * already had.
+ *
+ * This section still carries no START control. R3 says exactly one starts the app and that one is
+ * the pane's; a second here would satisfy "exactly one" with two. The action it DOES carry is the
+ * publish ladder's, which the pane has never had.
  *
  * ═══ THE HEADER AND THE COLLAPSE CONTROL ARE BOTH ELSEWHERE, ON PURPOSE ═══
  *
@@ -60,15 +65,12 @@
  */
 import ProjectDescriptionEditor from '../projects/ProjectDescriptionEditor'
 import RailComposer from './RailComposer'
-import { shortSha } from '../../utils/shortSha'
+import AppStatusPanel from './AppStatusPanel'
 import type { Project } from '../../utils/projectApi'
 import type { SaveState } from '../../utils/buildSessionApi'
-import type { WorkspaceState } from './workspaceState'
 
 export interface WorkspaceRailProps {
   project: Project
-  /** The one computed workspace value. Its sentence is rendered; its action is the pane's. */
-  workspace: WorkspaceState
   /** Non-null only while the workspace is alive — see the cost note above. */
   save: SaveState | null
   onProjectUpdate: (project: Project) => void
@@ -79,7 +81,7 @@ function SectionLabel({ children, className = 'text-neutral' }: { children: stri
   return <h2 className={`text-[10.5px] font-bold tracking-[.7px] ${className}`}>{children}</h2>
 }
 
-export default function WorkspaceRail({ project, workspace, save, onProjectUpdate }: WorkspaceRailProps) {
+export default function WorkspaceRail({ project, save, onProjectUpdate }: WorkspaceRailProps) {
   return (
     // ITS OWN SCROLLER, and a COLUMN. The shell is a full-height frame that does not scroll and
     // this is a flex child of it; `min-h-0` is what actually lets a flex child scroll, because
@@ -99,25 +101,25 @@ export default function WorkspaceRail({ project, workspace, save, onProjectUpdat
           section its provenance rows, its colour-coded states and its own action button. */}
       <section data-testid="rail-app-status" className="px-[18px] py-[15px]">
         <SectionLabel>APP STATUS</SectionLabel>
-        <p className="mt-2.5 text-sm font-semibold text-tertiary">{workspace.headline}</p>
-        {workspace.detail && <p className="mt-1 text-xs leading-snug text-neutral">{workspace.detail}</p>}
-        {/* THE SAVE HALF, which exists only while the app is running. `dirty` is TRI-STATE and
-            its `null` is "could not tell", never "clean" — so an unknown says so rather than
-            reporting that everything is saved. */}
+        {/* WHERE THE APP STANDS — publishing, approval and the citizen's own last save, from the
+            one server-computed state. `AppStatusPanel` and the toolbar row's chip put that state
+            through the same presentation map, so the two can never say different things. */}
+        <AppStatusPanel projectId={project.id} />
+        {/* WHETHER THE CONTAINER HAS WORK THE BUNDLE DOES NOT — a DIFFERENT question from the
+            panel's, and it is worth being clear about why both are here. The panel's saved row
+            says which version the citizen last SAVED, from object-store metadata, on a project
+            whose container may be long gone. This says whether the LIVE container has moved on
+            since, which only a running container can answer at all. `dirty` is TRI-STATE and its
+            `null` is "could not tell", never "clean". */}
         {save && (
           <div data-testid="rail-save-state" className="mt-3 border-t border-bial-border pt-3">
-            <p className="text-xs text-neutral">
+            <p className="text-[11.5px] text-neutral">
               {save.dirty === true
                 ? 'You have changes that are not saved yet.'
                 : save.dirty === false
                   ? 'Everything is saved.'
                   : 'We could not check for unsaved changes.'}
             </p>
-            {save.savedHead !== null && (
-              <p className="mt-1 text-[11px] tabular-nums text-neutral">
-                Last saved version <span className="font-mono">{shortSha(save.savedHead)}</span>
-              </p>
-            )}
           </div>
         )}
       </section>

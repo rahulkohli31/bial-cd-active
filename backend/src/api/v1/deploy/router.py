@@ -865,9 +865,30 @@ async def _audit_gate(
     )
 
 
-async def _saved_head_for_publish_state(
+@dataclass(frozen=True)
+class _SavedVersion:
+    """THE CITIZEN'S OWN LAST SAVE, as the saved bundle describes itself: WHICH commit
+    (`head`, from the metadata stamp) and WHEN it was written (`saved_at`, the store's own
+    last-modified on that same object). One `head()` answers both, which is why they are
+    one value rather than two reads.
+
+    The two halves are INDEPENDENTLY nullable and that is deliberate: a bundle written
+    before the stamp existed still has a last-modified, so it can say when without saying
+    which. Neither is ever invented — `None` is "no claim" on both axes."""
+
+    head: str | None
+    saved_at: datetime | None
+
+
+# Nothing to say on either axis: no store bound, no object, or a store that would not
+# answer. A single named value so the three "cannot tell" arms below are visibly the same
+# answer rather than three coincidentally-identical literals.
+_NOTHING_SAVED = _SavedVersion(head=None, saved_at=None)
+
+
+async def _saved_version_for_publish_state(
     storage: ObjectStorage | None, app_id: uuid.UUID
-) -> str | None:
+) -> _SavedVersion:
     """U15's one object-store read for the publish-state chip: the same metadata `head()`
     `_shipping_head` above and `classification/router.py`'s `_saved_version` already
     take, copied deliberately and NOT the whole-bundle read
@@ -890,15 +911,29 @@ async def _saved_head_for_publish_state(
     match its two neighbours, that is the regression — the difference is deliberate and
     the reason lives here rather than only in the plan."""
     if storage is None:
-        return None
+        return _NOTHING_SAVED
     try:
+        # THE KEY CHOICE, AND IT IS THE CITIZEN'S SAVE — `snapshot_key`, which
+        # `snapshot.Destination.saved` names "the user's explicit Save; the one key a
+        # platform-initiated write must never touch". NOT `recovery_key`, the platform's
+        # own turn-boundary autosave, and NOT any helper that picks between the two:
+        # `manager.restore_presence` PREFERS the recovery key, and
+        # `manager.newest_restore_source` returns whichever bundle is newer. Both are
+        # right for what they do (resuming a workspace), and both would be wrong here —
+        # the rail's row says "YOUR LATEST", so it must name the version the citizen
+        # chose to keep, never one the platform wrote on their behalf. Reading the newer
+        # of the two would report work as SAVED that they never saved, which is the same
+        # promotion-by-the-back-door KTD-5e exists to prevent.
         meta = await storage.head(snapshot_key(app_id))
     except StorageError:
         _log.warning("publish_state_saved_head_unavailable", app_id=str(app_id))
-        return None
+        return _NOTHING_SAVED
     if meta is None:
-        return None
-    return head_sha_from_metadata(meta.metadata)
+        return _NOTHING_SAVED
+    # `head_sha_from_metadata` answers None for an unstamped bundle; `last_modified` is
+    # whatever the store knows (also nullable). Neither absence is filled in from the
+    # other — an unstamped bundle reports its date and withholds its id.
+    return _SavedVersion(head=head_sha_from_metadata(meta.metadata), saved_at=meta.last_modified)
 
 
 @router.get(
@@ -944,11 +979,20 @@ async def latest_deployment(
     now follows.
 
     U15 ADDS `publish_state`, computed from the two rows above PLUS exactly one
-    object-store metadata HEAD (`_saved_head_for_publish_state`) — never a download, and
-    never a second query. Storage stays as optional here as everything else on this
+    object-store metadata HEAD (`_saved_version_for_publish_state`) — never a download,
+    and never a second query. Storage stays as optional here as everything else on this
     route: an unconfigured store reads the same as one that raised (see that helper),
     so this endpoint keeps needing nothing but the database, exactly as the paragraph
-    above already promises for the deploy pipeline."""
+    above already promises for the deploy pipeline.
+
+    U4 SPENDS THAT SAME HEAD TWICE INSTEAD OF ONCE. The metadata read already happening
+    for `publish_state` carries the citizen's saved commit and the store's last-modified
+    on that bundle; until now both were consumed and discarded. They now reach the wire
+    as `saved_head`/`saved_at`, which is what lets the workspace rail draw its "YOUR
+    LATEST" row on a project whose CONTAINER IS STOPPED — no sandbox dependency is
+    declared on this route, so there is nothing here that could wake one, and that is
+    the property the row depends on. `save-state` cannot answer it: that read attaches
+    to a container first, so it is silent in exactly the reclaimed case the row is for."""
     await owned_project_or_404(db, user.id, project_id)
 
     app_row = (
@@ -964,17 +1008,31 @@ async def latest_deployment(
         # here rather than in `compute_publish_state`, whose signature takes a
         # registry row as a required input precisely because every OTHER member needs
         # one.
-        return DeploymentResponse(publish_state=PublishState.NOTHING_BUILT)
+        # No app row means no bundle to have saved, so both halves of the saved row are
+        # null on the one path that never reaches the store at all.
+        return DeploymentResponse(
+            publish_state=PublishState.NOTHING_BUILT, saved_head=None, saved_at=None
+        )
 
     approval = ApprovalState.of(app_row)
     row = await deployment_for_app(db, app_id=app_row.id)
-    saved_head = await _saved_head_for_publish_state(storage, app_row.id)
-    publish_state = compute_publish_state(app_row, row, saved_head)
+    saved = await _saved_version_for_publish_state(storage, app_row.id)
+    publish_state = compute_publish_state(app_row, row, saved.head)
     if row is None:
         return DeploymentResponse(
-            app_id=str(app_row.id), approval=approval, publish_state=publish_state
+            app_id=str(app_row.id),
+            approval=approval,
+            publish_state=publish_state,
+            saved_head=saved.head,
+            saved_at=saved.saved_at,
         )
-    return DeploymentResponse.of(row, approval=approval, publish_state=publish_state)
+    return DeploymentResponse.of(
+        row,
+        approval=approval,
+        publish_state=publish_state,
+        saved_head=saved.head,
+        saved_at=saved.saved_at,
+    )
 
 
 @admin_router.post(

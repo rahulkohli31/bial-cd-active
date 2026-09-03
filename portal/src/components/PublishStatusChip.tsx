@@ -53,328 +53,22 @@ import { ChevronDown, ExternalLink } from 'lucide-react'
 import { Popover, PopoverContent, PopoverTrigger } from './ui/popover'
 import DataClassificationModal from './DataClassificationModal'
 import { usePublishState } from '../hooks/usePublishState'
-import { assertNever } from '../utils/assertNever'
 import { shortSha } from '../utils/shortSha'
-import type {
-  ApprovalState,
-  DeployOutcome,
-  DeploymentView,
-  PublishState,
-} from '../utils/deployApi'
+import {
+  ACTION_LABEL,
+  formatStamp,
+  lookFor,
+  presentationFor,
+  versionRowData,
+} from '../utils/publishPresentation'
+import type { DeployOutcome, PublishState } from '../utils/deployApi'
 
-/**
- * What a press will ATTEMPT. Every one of these except `take_it_back` is the same request
- * through the same questionnaire — the ladder requires a completed declaration on every
- * attempt, so there is no second path and no client-side threshold check. They differ only
- * in what the button honestly promises.
- */
-type ActionKind =
-  | 'send_for_review'
-  | 'publish'
-  | 'send_update_for_review'
-  | 'publish_again'
-  | 'try_again'
-  | 'take_it_back'
-
-const ACTION_LABEL: Record<ActionKind, string> = {
-  send_for_review: 'Send for review',
-  publish: 'Publish',
-  send_update_for_review: 'Send update for review',
-  publish_again: 'Publish again',
-  try_again: 'Try again',
-  take_it_back: 'Take it back',
-}
-
-/**
- * Which version this state is ABOUT. Every one comes from a column the status read already
- * selects — the registry row's submission and approval stamps, the deployment row's head
- * and timestamps. There is deliberately no "your latest saved version" row: the server
- * spends its one object-store metadata HEAD on the drift comparison and serves the answer,
- * not the head, so no saved commit reaches this client to render.
- */
-type VersionRow = 'none' | 'submitted' | 'submitted_with_note' | 'approved' | 'live' | 'last_published'
-
-interface Presentation {
-  /** The chip's own words, drift included, so the closed chip is a complete answer. */
-  label: string
-  /** Exactly one sentence. */
-  sentence: string
-  /** At most one action — or none at all, which is a state with nothing to do rather than
-   *  a control that is temporarily away. Those get NO button, never a disabled one. */
-  action: ActionKind | null
-  version: VersionRow
-}
-
-/**
- * THE map: one publish state in, one presentation out, ending in `assertNever` so a value
- * the server adds and this map has not labelled is a COMPILE error rather than a chip with
- * no words.
- *
- * TWO STATES DELIBERATELY SHARE THE LABEL "Approved" (reconciliation R-1.8). They are the
- * same state to a citizen — their app is approved — and R38 puts the difference exactly
- * where it belongs: on the button, `Publish` against `Send for review`, plus one sentence
- * each. Every other pair of states has different words, which is what makes the CLOSED
- * chip a complete answer: "Live", "Live · newer work saved" and "Live · couldn't check"
- * are three different things in three words each, and a citizen reading the last is not
- * being told that nothing of theirs is waiting.
- */
-function presentationFor(state: PublishState): Presentation {
-  switch (state) {
-    case 'nothing_built':
-      // Canvas, verbatim.
-      return {
-        label: 'Nothing built yet',
-        sentence: "Describe what you need in a chat and I'll build it.",
-        action: null,
-        version: 'none',
-      }
-    case 'draft':
-      // Canvas's label, verbatim — "Draft" survived two earlier words: "Ready to send"
-      // described a button rather than the app, and "Only you can see it" made a privacy
-      // claim nobody asked this chip to make.
-      //
-      // ITS SENTENCE IS A DEPARTURE, and a correction rather than a preference. The canvas
-      // wrote "Every app is checked by an administrator before it goes live", and that is
-      // NOT TRUE: ladder rule 7 publishes unattended when nothing on the declaration is
-      // weighted, and `AppStatus.APPROVED` is written in exactly one place — the admin
-      // approve route — so no administrator is involved at all on that path. Promising a
-      // review that will not happen is the same class of untrue assertion about server
-      // behaviour that this whole feature exists to stop making; it just happens to run in
-      // the reassuring direction. So the sentence says what a press ATTEMPTS and leaves the
-      // outcome to the server, exactly as the button does (R38).
-      return {
-        label: 'Draft',
-        sentence:
-          "Nobody else can see this yet. Send it when you're happy with it — if it " +
-          'handles anything sensitive, an administrator checks it first.',
-        action: 'send_for_review',
-        version: 'none',
-      }
-    case 'in_review':
-      // Canvas, minus its date — the version row below carries that, and saying it twice
-      // in two formats is how two sources of one fact start.
-      return {
-        label: 'In review',
-        sentence:
-          'This version is with an administrator. You can carry on making changes — ' +
-          'what you sent is already a copy.',
-        action: 'take_it_back',
-        version: 'submitted',
-      }
-    case 'changes_requested':
-      // Canvas, verbatim. The note itself is rendered below it, in the flow, because a
-      // note that lives only somewhere else is a note you can publish straight past.
-      return {
-        label: 'Changes requested',
-        sentence: 'An administrator asked for changes. Make them, then send it again.',
-        action: 'send_for_review',
-        version: 'submitted_with_note',
-      }
-    case 'approved_ready_to_publish':
-      // NO ARTBOARD. Adapted from the retired review card's approved arm with its
-      // lineage promise removed: it says an administrator approved this version and that
-      // pressing Publish is the next step, and it does NOT say whether that will publish
-      // or route. That is the R38 discipline, and it is not pedantry — the decision is
-      // taken inside the request, against a tree a `saveFirst` can move first, so no read
-      // taken before the press can honestly promise either outcome.
-      return {
-        label: 'Approved',
-        sentence:
-          'An administrator approved this version. Publishing it is the next step, ' +
-          'and it is yours to take.',
-        action: 'publish',
-        version: 'approved',
-      }
-    case 'approved_needs_review_again':
-      // NO ARTBOARD. Its whole job is to say that THIS version goes back to an
-      // administrator, without implying anything about what the other approved state's
-      // press would do.
-      return {
-        label: 'Approved',
-        sentence:
-          'An administrator approved an earlier version of this app. What you have now ' +
-          'goes back to an administrator before it can go live.',
-        action: 'send_for_review',
-        version: 'approved',
-      }
-    case 'starting_up':
-      // Canvas, with two DEPARTURES. Its opening "Approved." goes: an app published
-      // unattended under ladder rule 7 was never approved by anyone, and this state is
-      // reached both ways. And its own opening verb phrase is reworded, because it was
-      // word-for-word one of the pipeline's retired phase labels — the vocabulary this
-      // plan deletes rather than restyles, and which a guard greps the tree for. While a
-      // publish runs the chip says "Starting up" and stops there.
-      return {
-        label: 'Starting up',
-        sentence: 'Your app is coming up now — usually a few minutes. Nothing to do.',
-        action: null,
-        version: 'none',
-      }
-    case 'live_current':
-      // Canvas's "The two agree — nothing of yours is waiting", rewritten because the two
-      // rows it referred to are one row here: the canvas drew a "YOUR LATEST" row this
-      // read cannot serve. The reassurance is the half that matters and it survives.
-      return {
-        label: 'Live',
-        sentence:
-          'What is live is the version you last saved — nothing of yours is waiting.',
-        action: null,
-        version: 'live',
-      }
-    case 'live_newer_work':
-      // Canvas: its explanation and its reassurance, both — with ONE WORD CORRECTED. The
-      // canvas says "an approval is pinned to one exact build" and "keeps serving the
-      // APPROVED version", and neither is true of an app that published unattended under
-      // ladder rule 7: no administrator was involved, and `approved_commit_sha` is NULL.
-      // What IS true either way is that one exact BUILD is live and saving does not change
-      // which. That is the whole substance of the explanation, so nothing is lost by saying
-      // the true version of it.
-      //
-      // The reassurance's second half stands as a statement about server behaviour, because
-      // routing pins a submission and publishes nothing — the live build keeps serving
-      // throughout, whichever way it got there.
-      return {
-        label: 'Live · newer work saved',
-        sentence:
-          'What is live is one exact build, so anything you have saved since is a ' +
-          'different version. Your live app keeps serving that build the whole time a ' +
-          'new one is being checked.',
-        action: 'send_update_for_review',
-        version: 'live',
-      }
-    case 'live_drift_unknown':
-      // NO ARTBOARD, and written as an OCCASIONAL LAPSE rather than a standing state: it
-      // is reached only when the server's storage read would not answer, or when the saved
-      // bundle predates the version stamp. Phrased in the moment on purpose — a citizen
-      // must not read this as a property of their app or of the platform, because they
-      // will not see it again. It offers the same action a drifted app offers: withholding
-      // one would strand somebody who did save, and saying "nothing of yours is waiting"
-      // would be the exact false reassurance this feature keeps shipping.
-      return {
-        label: "Live · couldn't check",
-        sentence:
-          'Your app is live. We could not check just now whether anything newer of ' +
-          'yours is saved — try again in a minute. Your live app keeps serving the ' +
-          'build it is on the whole time a new one is being checked.',
-        action: 'send_update_for_review',
-        version: 'live',
-      }
-    case 'taken_offline':
-      // NO ARTBOARD. Verbatim from the retired Publish card, which had it right: a
-      // taken-down app has a working remedy and a switched-off one does not, and
-      // collapsing the two into one word would remove that remedy silently.
-      return {
-        label: 'Taken offline',
-        sentence:
-          'An administrator has taken this app offline. Publishing again puts it back ' +
-          'at the same address.',
-        action: 'publish_again',
-        version: 'last_published',
-      }
-    case 'switched_off':
-      // Canvas's first sentence; its second — "It is no longer reachable" — is a
-      // DEPARTURE, dropped. `disable` fails closed by severing the app's database; it does
-      // not take the container down, so reachability is not a claim this platform can
-      // stand behind. The remedy-less truth is the part that matters and it stays.
-      return {
-        label: 'Switched off',
-        sentence:
-          'An administrator switched this app off. Nothing can be published until ' +
-          'they switch it back on.',
-        action: null,
-        version: 'none',
-      }
-    case 'did_not_start':
-      // Canvas, minus BOTH of its assertions, and the same fact retires them both: an app
-      // that published unattended under ladder rule 7 was never seen by an administrator,
-      // and `approved_commit_sha` is NULL for every one of them — the common case.
-      //
-      // So "Trying again does not go back to an administrator" is cut (it is true only
-      // while an approval pin still matches, and usually there is no pin), and so is the
-      // canvas's "It WAS APPROVED but would not start", which states outright that somebody
-      // signed this off. This state is reached from any failed deployment with a non-routed
-      // code, including one a draft app started itself. What is left says only what
-      // happened, which is all the citizen needs to press the button below.
-      return {
-        label: "Didn't start",
-        sentence: 'The publish got as far as starting your app up, and then stopped.',
-        action: 'try_again',
-        version: 'none',
-      }
-    default:
-      return assertNever(state)
-  }
-}
-
-/** `25 Aug 2026, 14:20` — the canvas's form, and the half a citizen recognises. */
-function formatStamp(iso: string): string {
-  const parsed = new Date(iso)
-  if (Number.isNaN(parsed.getTime())) return iso
-  return parsed.toLocaleString(undefined, {
-    day: 'numeric',
-    month: 'short',
-    year: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-  })
-}
-
-interface VersionRowData {
-  heading: string
-  stamp: string | null
-  sha: string | null
-  /** Present only where the state says the address is worth offering. A taken-offline
-   *  address would 404, and a citizen cannot tell that from an app that has broken. */
-  url: string | null
-  note: string | null
-}
-
-function versionRowData(
-  kind: VersionRow,
-  deployment: DeploymentView | null,
-  approval: ApprovalState | null,
-): VersionRowData | null {
-  switch (kind) {
-    case 'none':
-      return null
-    case 'submitted':
-    case 'submitted_with_note':
-      return {
-        heading: 'Sent for review',
-        stamp: approval?.submittedAt ?? null,
-        sha: approval?.submittedSha ?? null,
-        url: null,
-        note: kind === 'submitted_with_note' ? (approval?.rejectionNote ?? null) : null,
-      }
-    case 'approved':
-      return {
-        heading: 'Approved version',
-        stamp: approval?.approvedAt ?? null,
-        sha: approval?.approvedCommitSha ?? null,
-        url: null,
-        note: null,
-      }
-    case 'live':
-      return {
-        heading: 'Live now',
-        stamp: deployment?.finishedAt ?? null,
-        sha: deployment?.headSha ?? null,
-        url: deployment?.url ?? null,
-        note: null,
-      }
-    case 'last_published':
-      return {
-        heading: 'Last published',
-        stamp: deployment?.finishedAt ?? null,
-        sha: deployment?.headSha ?? null,
-        // Deliberately never linked — see `taken_offline` above.
-        url: null,
-        note: null,
-      }
-    default:
-      return assertNever(kind)
-  }
-}
+/* THE PRESENTATION LAYER MOVED TO `utils/publishPresentation.ts` (plan 002, U4). What lived
+   here — the action labels, the state-to-words map with all of its copy reasoning, the version
+   rows and the date format — is now shared with the rail's APP STATUS panel, which the boards
+   make the fuller of the two surfaces. Neither renders the other; both read the same decision,
+   so the panel and this chip cannot say different things about one app. The colour map and the
+   provenance rows are new there and belong to the same decision. */
 
 /**
  * The answer to a press, and there is exactly ONE treatment for it because there is only
@@ -438,6 +132,9 @@ export default function PublishStatusChip({
 
   const state: PublishState | null = deployment?.publishState ?? null
   const presentation = state === null ? null : presentationFor(state)
+  // The pill's own colour pair, from the same one field. `lookFor` is exhaustive over the
+  // union, so a state the server adds is a compile error rather than an unpainted chip.
+  const look = state === null ? null : lookFor(state)
   const version =
     presentation === null ? null : versionRowData(presentation.version, deployment, approval)
   const busy = saving || withdrawing
@@ -568,6 +265,8 @@ export default function PublishStatusChip({
     )
   }
 
+  if (look === null) return <>{liveRegion}</>
+
   return (
     <>
       {liveRegion}
@@ -577,14 +276,21 @@ export default function PublishStatusChip({
           <button
             type="button"
             data-testid="publish-chip"
+            data-publish-state={state}
             // The state is IN the accessible name, so a screen reader user learns it
             // without opening anything — R39's "visible without opening the chip" is not
             // a sighted-only guarantee.
             aria-label={`Publish status: ${presentation.label}`}
-            className="inline-flex items-center gap-1 rounded-md border border-bial-border bg-white px-2 py-0.5 text-xs font-semibold text-tertiary transition hover:bg-surface-muted"
+            // A 999px PILL WITH ITS OWN COLOUR PAIR AND A LEADING DOT, per the board that is
+            // devoted to exactly this. It was one neutral grey `rounded-md` chip for all
+            // thirteen states: the word changed and nothing else did, so "Draft" looked
+            // identical to "Changes requested" and to "Didn't start". The colour is the
+            // signal a citizen reads before they read anything.
+            className={`inline-flex items-center gap-[7px] rounded-full border border-[rgba(15,23,42,.07)] px-[11px] py-[5px] text-[11.5px] font-bold whitespace-nowrap transition hover:brightness-[.97] ${look.pill}`}
           >
+            <span className={`h-1.5 w-1.5 flex-shrink-0 rounded-full ${look.dot}`} aria-hidden />
             {presentation.label}
-            <ChevronDown size={12} aria-hidden />
+            <ChevronDown size={11} className="opacity-55" aria-hidden />
           </button>
         </PopoverTrigger>
 

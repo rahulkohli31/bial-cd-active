@@ -13,9 +13,12 @@
  *   · "a 503 on the status read renders nothing at all". A chip that renders nothing is
  *     indistinguishable from a broken page, and this is now the only publishing surface
  *     the citizen has. It becomes the ordinary read-failure chip with a re-read.
- *   · the canvas's "YOUR LATEST" / saved-version rows. The server spends its one
- *     object-store metadata HEAD on the drift comparison and serves the answer, not the
- *     head, so no saved commit reaches this client to render.
+ *   · the canvas's "YOUR LATEST" / saved-version rows. NO LONGER TRUE, and no longer this
+ *     component's job either: plan 002's U4 made the server return the head it already
+ *     read, and the boards give those three provenance rows to the rail's APP STATUS
+ *     PANEL — the fuller of the two surfaces — where `AppStatusPanel.test.tsx` pins them.
+ *     What this file still owns is the chip: its label, its COLOUR (new in U4), its
+ *     sentence and its one action.
  *
  * The hook is mocked at the module boundary; its own behaviour is covered by
  * `usePublishState.reconciliation.test.tsx`. The questionnaire is stubbed for the same
@@ -87,6 +90,8 @@ const view = (publishState: PublishState, over: Partial<DeploymentView> = {}): D
   unpublishedAt: null,
   approval: approval(),
   publishState,
+  savedHead: null,
+  savedAt: null,
   ...over,
 })
 
@@ -141,6 +146,72 @@ beforeEach(() => {
   h.modal.current = null
 })
 afterEach(cleanup)
+
+/**
+ * THE COLOUR IS THE SIGNAL, AND IT WAS ENTIRELY MISSING (plan 002, U4).
+ *
+ * Every one of the thirteen states rendered the same neutral grey `rounded-md` chip: the word
+ * changed and nothing else did, so "Draft" was chromatically indistinguishable from "Changes
+ * requested" and from "Didn't start". `StatusCardStates` is a whole board devoted to this, with
+ * nine `color:`/`background:`/dot triples on it.
+ *
+ * ASSERTED ON THE CLASS NAMES, because jsdom computes no Tailwind styles — a `getComputedStyle`
+ * assertion cannot tell amber from grey here, which is the same reason `tailwind-tokens.test.js`
+ * exists at all. What can be checked is which token each state resolves to.
+ */
+const EXPECTED_LOOK: ReadonlyArray<readonly [PublishState, string]> = [
+  ['nothing_built', 'faint'],
+  ['draft', 'grey'],
+  ['in_review', 'amber'],
+  ['changes_requested', 'red'],
+  ['did_not_start', 'red'],
+  ['approved_ready_to_publish', 'green'],
+  ['approved_needs_review_again', 'green'],
+  ['starting_up', 'green'],
+  ['live_current', 'green'],
+  ['live_newer_work', 'green'],
+  ['live_drift_unknown', 'green'],
+  ['taken_offline', 'off'],
+  ['switched_off', 'off'],
+]
+
+describe('the chip is coloured by its state, with a leading dot', () => {
+  it('gives each state the board\'s own colour pair', () => {
+    for (const [state, family] of EXPECTED_LOOK) {
+      wire(view(state))
+      mount()
+      const chip = screen.getByTestId('publish-chip')
+      expect(chip.className, state).toContain(`text-status-${family}-fg`)
+      expect(chip.className, state).toContain(`bg-status-${family}-bg`)
+      expect(chip.querySelector(`.bg-status-${family}-dot`), state).not.toBeNull()
+      cleanup()
+    }
+  })
+
+  it('★ no two states that mean different things share a colour AND a word', () => {
+    // The defect in one assertion. Thirteen states, one grey — so the only thing telling a
+    // citizen apart "Changes requested" from "Live" was reading. Mutation receipt: return one
+    // shared look from `lookFor` and this goes red.
+    const seen = new Map<string, string>()
+    for (const [state, family] of EXPECTED_LOOK) {
+      const label = LABELS.find(([s]) => s === state)?.[1] ?? state
+      const key = `${family}|${label}`
+      const clash = seen.get(key)
+      // The two `Approved` states DO share both, deliberately — they are the same state to a
+      // citizen and the difference is on the button (R38). Nothing else may.
+      if (clash) expect([clash, state].sort()).toEqual(['approved_needs_review_again', 'approved_ready_to_publish'])
+      seen.set(key, state)
+    }
+    expect(new Set(EXPECTED_LOOK.map(([, f]) => f)).size).toBeGreaterThan(4)
+  })
+
+  it('is a 999px pill, not the rounded-md box it used to be', () => {
+    wire(view('draft'))
+    mount()
+    expect(screen.getByTestId('publish-chip').className).toContain('rounded-full')
+    expect(screen.getByTestId('publish-chip').className).not.toContain('rounded-md')
+  })
+})
 
 // ── U2 — the chip's own words ───────────────────────────────────────────────────────
 
@@ -277,7 +348,12 @@ describe('the popover explains the state and offers at most one thing to do', ()
 
     // Conditional on purpose — a zero-score declaration publishes unattended under ladder
     // rule 7, so promising a review outright would be untrue for the common case.
-    expect(pop.textContent).toContain('if it handles anything sensitive')
+    expect(pop.textContent).toContain('If it handles anything sensitive')
+    // AND THE PRIVACY CLAIM IS GONE (plan 002, U4). The sentence opened "Nobody else can see
+    // this yet", which describes who can REACH the app — the same claim the board's own notes
+    // record retiring one word earlier, as "a claim nobody asked the chip to make".
+    expect(pop.textContent).not.toMatch(/nobody else can see/i)
+    expect(pop.textContent).not.toMatch(/only you can see/i)
     expect(within(pop).getAllByRole('button')).toHaveLength(1)
     expect(screen.getByTestId('publish-action').textContent).toBe('Send for review')
   })

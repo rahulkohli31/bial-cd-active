@@ -45,6 +45,8 @@ const view = (publishState: PublishState, over: Partial<DeploymentView> = {}): D
   unpublishedAt: null,
   approval: null,
   publishState,
+  savedHead: null,
+  savedAt: null,
   ...over,
 })
 

@@ -10,7 +10,6 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, cleanup, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import WorkspaceRail from '../WorkspaceRail'
-import type { WorkspaceState } from '../workspaceState'
 import type { Project } from '../../../utils/projectApi'
 import type { SaveState } from '../../../utils/buildSessionApi'
 
@@ -44,21 +43,13 @@ const PROJECT: Project = {
   updatedAt: '2026-07-10T00:00:00Z',
 }
 
-const SAVED: WorkspaceState = {
-  name: 'not-running',
-  headline: 'Your app is saved.',
-  detail: 'It stays running while you work, so you only do this once.',
-  action: { kind: 'start', label: 'Launch Application' },
-}
-
 const noop = () => {}
 
-function renderRail(over: { workspace?: WorkspaceState; save?: SaveState | null } = {}) {
+function renderRail(over: { save?: SaveState | null } = {}) {
   return render(
     <MemoryRouter>
       <WorkspaceRail
         project={PROJECT}
-        workspace={over.workspace ?? SAVED}
         save={over.save ?? null}
         onProjectUpdate={noop}
       />
@@ -78,13 +69,18 @@ describe("R6 — what the rail carries at rest", () => {
     expect(screen.getByTestId('description-editor')).toBeTruthy()
   })
 
-  it('renders the workspace SENTENCE, from the one computed value', () => {
+  it('★ carries the PUBLISH status, and no longer the workspace sentence', () => {
+    // TWO DIFFERENT STATUSES (plan 002, U4). This section is about publishing — what is live,
+    // what was approved, what the citizen last saved. Whether the CONTAINER is up is a different
+    // question, and the boards give it to the pane, where a citizen is already looking for their
+    // app. The rail carried it too, which meant two renderers for one sentence.
     const status = screen.queryByTestId('rail-app-status')
     expect(status).toBeNull() // nothing rendered yet — guards against a stale query below
     renderRail()
 
     const block = screen.getByTestId('rail-app-status')
-    expect(within(block).getByText('Your app is saved.')).toBeTruthy()
+    expect(within(block).getByTestId('app-status-panel')).toBeTruthy()
+    expect(block.textContent).not.toMatch(/your app is saved/i)
   })
 
   it('★ carries NO start control — R3 says exactly one, and it is the pane\'s', () => {
@@ -137,21 +133,16 @@ describe('the save half, which exists only while the app is running', () => {
     expect(screen.getByTestId('rail-save-state').textContent).not.toMatch(/everything is saved/i)
   })
 
-  it('shows the SHORT saved commit, and no time', () => {
-    // No endpoint returns a saved-AT time, and a wrong time is worse than no time (R62's own
-    // principle). The commit ships; the time waits for a server field.
+  it('★ says only whether the container has moved on — the VERSION is the panel\'s row now', () => {
+    // The commit line here duplicated a fact the panel states properly: which version the
+    // citizen last saved, with its date, from object-store metadata and with no container in
+    // the request path. This block answers the question only a RUNNING container can — whether
+    // it holds work the saved bundle does not — and says nothing about versions.
     renderRail({ save: save({ savedHead: 'ccccccc1111111' }) })
 
     const block = screen.getByTestId('rail-save-state')
-    expect(block.textContent).toContain('ccccccc')
-    expect(block.textContent).not.toContain('ccccccc1111111')
-    expect(block.textContent).not.toMatch(/ago|:\d\d/)
-  })
-
-  it('omits the commit line entirely when nothing has been saved yet', () => {
-    renderRail({ save: save({ dirty: true, savedHead: null }) })
-
-    const block = screen.getByTestId('rail-app-status')
+    expect(block.textContent).toMatch(/everything is saved/i)
+    expect(block.textContent).not.toContain('ccccccc')
     expect(block.textContent).not.toMatch(/last saved version/i)
   })
 })

@@ -207,7 +207,7 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
 
   return (
     <>
-      <WorkspaceRail {...props} workspace={workspace.state} save={workspace.save} />
+      <WorkspaceRail {...props} save={workspace.save} />
       {renaming && (
         <ProjectRenameDialog
           project={project}

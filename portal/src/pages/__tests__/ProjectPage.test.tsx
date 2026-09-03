@@ -220,8 +220,13 @@ describe('ProjectPage — the app arrives behind one deliberate press (R3, AE1, 
     renderProjectPage()
 
     await screen.findByTestId('rail-app-status')
-    // R-16's exact sentence, and no negation of it anywhere on the screen.
-    await waitFor(() => expect(screen.getAllByText('Your app is saved.').length).toBeGreaterThan(0))
+    await waitFor(() => expect(h.fetchPreviewState).toHaveBeenCalled())
+    // R-16's FORBIDDEN WORDS, which is the half this suite can still see. Its positive half —
+    // that the pane says "Your app is saved." with a start control under it — moved to
+    // `AppPane.test.tsx` and `ProjectWorkspace.test.tsx` when plan 002's U4 gave the sentence
+    // ONE author: it was rendered by the rail AND by the pane, and the rail's APP STATUS
+    // section is the publish panel the boards draw now. This file renders no pane at all, so
+    // asserting the sentence here would be asserting a renderer that is not in its tree.
     expect(document.body.textContent).not.toMatch(/not running/i)
     expect(document.body.textContent).not.toMatch(/\bstopped\b/i)
   })
@@ -272,9 +277,11 @@ describe('ProjectPage — the app arrives behind one deliberate press (R3, AE1, 
     await screen.findByTestId('rail-app-status')
     const saved = await screen.findByTestId('rail-save-state')
     expect(saved.textContent).toMatch(/not saved yet/i)
-    // The short commit, not the full sha.
-    expect(saved.textContent).toContain('abc1234')
-    expect(saved.textContent).not.toContain('abc1234def')
+    // NO COMMIT HERE ANY MORE (plan 002, U4). This block answers the one question a RUNNING
+    // container can answer — whether it holds work the saved bundle does not — and the version
+    // it used to print duplicated the panel's own saved row, which states it properly, with a
+    // date, and on a project whose container is long gone.
+    expect(saved.textContent).not.toContain('abc1234')
   })
 
   it('R62: an unreadable save state says so rather than reporting that everything is saved', async () => {

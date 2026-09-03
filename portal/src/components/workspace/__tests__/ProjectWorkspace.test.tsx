@@ -180,6 +180,11 @@ describe('R3 — loading a project address frames the running app, with no chat 
     // interpret. There is no frame, because there is nothing to frame; there is a sentence.
     expect(paneRegion()).toBeTruthy()
     expect(screen.getByTestId('app-pane-empty').textContent).toMatch(/describe what you want to build/i)
+    // ★ ONE AUTHOR FOR THE WORKSPACE SENTENCE (plan 002, U4). It was rendered twice — by the
+    // pane and by the rail's status card — and the rail's APP STATUS section is the publish
+    // panel the boards draw now. `getAllByText` would tolerate a second renderer; counting is
+    // what forbids one.
+    expect(screen.queryAllByText(/describe what you want to build/i)).toHaveLength(1)
     expect(frame()).toBeNull()
     expect(frameWrapper()).toBeNull()
   })
