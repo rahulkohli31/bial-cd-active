@@ -47,37 +47,18 @@ import {
   ChevronLeft,
   ChevronRight,
   ExternalLink,
-  Monitor,
   PanelLeftClose,
   PanelLeftOpen,
   Pencil,
   RotateCcw,
   Save,
-  Smartphone,
-  Tablet,
-  type LucideIcon,
 } from 'lucide-react'
 import PublishStatusChip from '../PublishStatusChip'
 import { chatKindFor } from '../../utils/chatKind'
 import { useRailSlot, useWorkspaceActions, useWorkspaceAddress, useWorkspaceHeading, useWorkspacePaneVisible, useWorkspaceSave } from './workspaceChannel'
 import type { SaveSlot, WorkspaceActions } from './workspaceChannel'
-import { WORKSPACE_RAIL_ID } from './WorkspaceShell'
-
-/**
- * THE THREE WIDTHS THE PANE CAN FRAME AT, and their one home.
- *
- * They were `LivePreview`'s private `DEVICES` map, chosen there because the switcher lived in that
- * component's own toolbar. The switcher is in this row now and the widths are read by the device
- * card the pane draws, so the map moves up with the control and the pane imports it from here —
- * one table, not two that can disagree about what "Tablet" means.
- */
-export const DEVICES = {
-  Desktop: { icon: Monitor as LucideIcon, width: null as number | null },
-  Tablet: { icon: Tablet as LucideIcon, width: 834 }, // iPad Pro 11" portrait — Chrome DevTools preset
-  Mobile: { icon: Smartphone as LucideIcon, width: 390 }, // iPhone 12/13/14-class width
-}
-
-export type DeviceName = keyof typeof DEVICES
+import { DEVICES, type DeviceName } from './devices'
+import { WORKSPACE_RAIL_ID } from './railId'
 
 export interface WorkspaceToolbarProps {
   /** The rail's collapse, owned by the shell — the control that undoes it cannot live in the rail. */

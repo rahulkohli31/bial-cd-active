@@ -51,7 +51,7 @@
 import { useRef } from 'react'
 import LivePreview from '../LivePreview'
 import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
-import type { DeviceName } from './WorkspaceToolbar'
+import type { DeviceName } from './devices'
 import { useWorkspaceAddress, useWorkspacePane, useWorkspacePaneVisible } from './workspaceChannel'
 
 export interface AppPaneHostProps {

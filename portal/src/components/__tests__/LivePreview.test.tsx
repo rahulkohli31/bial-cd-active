@@ -467,11 +467,22 @@ describe('LivePreview — what Plan F removed, and what it deliberately did not'
     expect(source).toMatch(/e\.source/)          // the inbound-message gate, on origin AND source
     expect(source).toMatch(/sandbox=/)           // the sandbox token list
     expect(source).toMatch(/const frameKey =/)   // the frame's identity
-    // The device WIDTHS are still read here; the TABLE moved up to the toolbar row with the
-    // control that picks them (plan 002, U2), so this asserts the import rather than the literal —
-    // two copies of it is the drift this guard exists to prevent, not one copy in a new file.
-    expect(source).toMatch(/import \{ DEVICES, type DeviceName \} from '\.\/workspace\/WorkspaceToolbar'/)
+    // The device WIDTHS are still read here; the TABLE moved out with the control that picks them
+    // (plan 002, U2), so this asserts the import rather than the literal — two copies of it is the
+    // drift this guard exists to prevent, not one copy in a new file.
+    //
+    // IT POINTS AT THE LEAF, not at the toolbar that draws the switcher. Importing the table from
+    // the toolbar closed a five-module ring back into this file; `devices.ts` imports nothing of
+    // ours, so nothing can import its way back here through it.
+    expect(source).toMatch(/import \{ DEVICES, type DeviceName \} from '\.\/workspace\/devices'/)
     expect(source).toMatch(/DEVICES\[device\]\.width/)
+
+    // AND THE LEAF IS STILL A LEAF. The whole value of the move is that `devices.ts` imports
+    // nothing of ours, so no ring can form back through it; a relative import added there is what
+    // would quietly rebuild the one this replaced.
+    const table = (await import('../workspace/devices?raw')).default as string
+    expect(table).toMatch(/export const DEVICES/)
+    expect(table).not.toMatch(/from '\.\.?\//)
     expect(source).toMatch(/setCovered/)         // the cover that holds on an unknown
   })
 })

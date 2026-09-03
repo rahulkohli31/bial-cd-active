@@ -15,7 +15,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { act, render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import AppPane from '../AppPane'
-import { WORKSPACE_RAIL_ID } from '../WorkspaceShell'
+import { WORKSPACE_RAIL_ID } from '../railId'
 import {
   WorkspaceChannelProvider,
   createWorkspaceChannel,
