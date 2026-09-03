@@ -402,17 +402,27 @@ async def test_two_racing_transfers_for_one_citizen_end_with_one_container(
 
     ★ THE RACE HAS TO BE MADE REAL, AND THE COUNT HAS TO BE OF TASKS. Two tabs are two requests,
     and the only suspension point in the ask is the app-id read — but both asks here share one
-    connection, whose driver serialises them, so a bare `gather` runs the second ask only after
-    the first has finished and no interleave ever happens. `_existing_app_id` is therefore made
-    to yield first, which puts both asks past the ask's one await with neither having claimed the
-    project. And what is counted is `_stop_the_held_session` ENTRIES: `len(_stop_records)` counts
+    connection, whose driver serialises them end to end, so a bare `gather` runs the second ask
+    only after the first has finished its whole critical section and no interleave ever happens.
+    Yielding BEFORE that read does not help either: the second tab still cannot get past the
+    connection until the first is done with it, so the two are serialised exactly as before and
+    a mutation that opens a gap between the check and the write is never observed.
+
+    SO THE BARRIER SITS AFTER THE READ AND BEFORE THE CHECK, which is the only place a test can
+    hold both tabs without touching production code. `_existing_app_id` does its real round trip
+    — releasing the connection — and only then parks, and the ask has no further await, so when
+    the barrier releases both tabs are provably past every suspension point the ask has, with
+    neither having claimed the project. Whichever resumes first must therefore run the check,
+    the create and the store as one uninterrupted step; the other finds the record and joins.
+
+    WHAT IS COUNTED IS `_stop_the_held_session` ENTRIES, not records: `len(_stop_records)` counts
     KEYS, and both tabs write the same key, so it reads `1` whether one stop was started or two
     with the second silently replacing the first.
 
-    What makes one the answer is that nothing suspends between reading the record and writing it
-    — the check, the create and the store are one uninterrupted step — so the second tab cannot
-    resume in the gap. That is the property this test exists to hold, and the mutation that
-    breaks it is putting any await between them."""
+    Mutation receipt: put `await asyncio.sleep(0)` between reading `in_flight` and storing the
+    record in `request_stop_of_active_work` and the second tab resumes inside that gap, starts a
+    second stop, and `stops_started` grows to two while every other assertion here stays green.
+    (Verified by injecting it and watching this test — and only this test — go red.)"""
     user, project_a = await _mk(db_session, "stop7@rvaiglobal.com")
     manager = SessionManager()
     client = _bundles_to(FakeSandboxClient(), "6" * 40)
@@ -424,12 +434,22 @@ async def test_two_racing_transfers_for_one_citizen_end_with_one_container(
     await brain.stepped.wait()
 
     real_app_id = manager_module._existing_app_id
+    # Two parties, and only the first two asks are held: the sequential third ask further down
+    # must not wait for a partner that is never coming.
+    at_the_check = asyncio.Barrier(2)
+    parked: list[int] = []
 
-    async def _yields_before_answering(db, user_id, project_id):
-        await asyncio.sleep(0)  # both tabs are now inside the ask, neither has claimed it
-        return await real_app_id(db, user_id, project_id)
+    async def _holds_both_tabs_at_the_check(db, user_id, project_id):
+        app_id = await real_app_id(db, user_id, project_id)
+        # The read is DONE and the connection is free, so the other tab can take it, finish its
+        # own read, and arrive here too. Nothing suspends between this return and the record
+        # write, which is exactly why both tabs being here is a real race and not a staged one.
+        if len(parked) < 2:
+            parked.append(1)
+            await at_the_check.wait()
+        return app_id
 
-    monkeypatch.setattr(manager_module, "_existing_app_id", _yields_before_answering)
+    monkeypatch.setattr(manager_module, "_existing_app_id", _holds_both_tabs_at_the_check)
 
     stops_started: list[uuid.UUID] = []
     real_stop = manager._stop_the_held_session
