@@ -59,13 +59,6 @@ import { useEffect, useRef, useState } from 'react'
 export const PANE_EXIT_MS = 240
 
 /**
- * `true` for one animation's length after the pane stops being wanted, `false` otherwise.
- *
- * A pane that was never visible does not "leave", so a surface that mounts with no pane at all —
- * every plan chat opened cold, and the project screen before anything is built — goes straight to
- * its resting state with no animation and no delay.
- */
-/**
  * `inert` for as long as the pane is not part of the page — spread onto the element that already
  * carries `aria-hidden`, so "announced gone" and "out of reach" cannot drift apart.
  *
@@ -77,6 +70,13 @@ export function inertWhile(unreachable: boolean): { inert?: '' } {
   return unreachable ? { inert: '' } : {}
 }
 
+/**
+ * `true` for one animation's length after the pane stops being wanted, `false` otherwise.
+ *
+ * A pane that was never visible does not "leave", so a surface that mounts with no pane at all —
+ * every plan chat opened cold, and the project screen before anything is built — goes straight to
+ * its resting state with no animation and no delay.
+ */
 export function usePaneLeaving(visible: boolean): boolean {
   const [leaving, setLeaving] = useState(false)
   const was = useRef(visible)
