@@ -9,10 +9,17 @@
  * BLANK with no `error` event — a citizen gets an empty rectangle and nothing to explain it.
  *
  * So this component renders images and text from bytes it already holds and says a sentence for
- * anything else. The assertions below are written against the reintroduction of a frame, in either
- * of the two forms it took: a `data:` URL in an `<iframe src>`, and a same-origin
- * `/api/attachments/{id}` — which looked safe, was recommended in this file's own docblock, and is
- * refused just as completely.
+ * anything else. The assertions below are written against the reintroduction of a frame around the
+ * addresses this component can still be HANDED — a `data:` URL and a `blob:` object URL, for every
+ * media type it takes.
+ *
+ * THE SECOND FORM IS GUARDED BY THE TYPE, NOT BY A TEST, and that is worth saying rather than
+ * implying. The same-origin `/api/attachments/{id}` frame — which looked safe, was recommended in
+ * this file's own docblock, and is refused just as completely — needs an attachment id to build,
+ * and `PreviewTarget` no longer has one: it carries a name, a media type and a URL. Bringing that
+ * frame back means putting the id back on the type first, which is a deliberate act with a
+ * compiler error in front of it. No fixture here can reach that branch, so no assertion here can
+ * pretend to hold it.
  *
  * ══ R47 — NOTHING BUT THE READER DISMISSES IT ══
  *
@@ -157,10 +164,15 @@ describe('U11 — a file is never a blank box', () => {
   })
 
   it('★ FRAMES NOTHING, at any address — the regression that drew the blank box', () => {
-    // BOTH FORMS IN ONE ASSERTION. A `data:` URL in a frame is refused by `frame-src 'self'`; a
-    // same-origin `/api/attachments/{id}` is refused by the control plane's own
-    // `X-Frame-Options: DENY`, which is what makes "just address it same-origin" the wrong fix
-    // rather than the safe one. Neither fires an `error`, so neither can be recovered from.
+    // EVERY ADDRESS THIS COMPONENT CAN BE HANDED, AND EVERY KIND OF FILE: a `data:` URL for a PDF,
+    // a text file and an unknown binary type, and a `blob:` object URL for an image. A framed
+    // `data:` URL is refused by `frame-src 'self'` and fires no `error`, so the citizen gets an
+    // empty rectangle with nothing to explain it — which is the regression this scenario names.
+    //
+    // IT IS NOT THE RECEIPT FOR THE SAME-ORIGIN FORM, and claiming to be was this comment's own
+    // defect. `/api/attachments/{id}` needs an id, `PreviewTarget` no longer carries one, and no
+    // fixture below can therefore construct that branch — the deletion from the type is what holds
+    // it, and it holds it at compile time rather than here. See this file's docblock.
     for (const target of [pdf, csv, image, { name: 'x.docx', mediaType: 'application/msword', dataUrl: 'data:application/msword;base64,AA' }]) {
       render(<AttachmentPreview target={target} onClose={vi.fn()} />)
       expect(document.querySelectorAll('iframe'), target.name).toHaveLength(0)
