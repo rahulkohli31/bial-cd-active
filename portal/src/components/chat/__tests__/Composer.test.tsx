@@ -250,6 +250,36 @@ describe('the draft follows its own chat', () => {
     draw({ conversationId: 'chat-9' })
     expect(box().value).toBe('typed before the reload')
   })
+
+  it('★ a send that lands after a switch clears ITS chat, not the sibling’s live words', async () => {
+    // THE LEAK THIS IS WRITTEN AGAINST, and it is a leak the first attempt at the guard could not
+    // catch: the box performs a send from its PRESS-TIME closure, so the completion callback and
+    // the conversation it compared itself against came from the same render. The comparison was a
+    // value against itself, always true, and chat-1's accepted send therefore wrote whatever stood
+    // in the box — chat-2's half-typed sentence — over chat-1's stored draft.
+    let release = () => {}
+    const gate = new Promise<void>((r) => { release = r })
+    const onSubmit = vi.fn().mockReturnValue(gate)
+    const { rerender, props } = draw({ onSubmit })
+
+    type('for chat one')
+    fireEvent.keyDown(box(), { key: 'Enter' })
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+
+    // They step to a sibling while the request is still out, and start writing there.
+    rerender(<ComposerHarness><Composer {...props} conversationId="chat-2" /></ComposerHarness>)
+    expect(box().value).toBe('')
+    type('a sentence that belongs to chat two')
+
+    release()
+    await waitFor(() => expect(send().getAttribute('aria-disabled')).toBe('false'))
+
+    // chat-1's own message went, so chat-1's draft goes with it…
+    expect(readDraft('chat-1')).toBe('')
+    // …and the sibling keeps every word it was given, which is the half that was destroyed.
+    expect(readDraft('chat-2')).toBe('a sentence that belongs to chat two')
+    expect(box().value).toBe('a sentence that belongs to chat two')
+  })
 })
 
 describe('R55 — the relocated stop', () => {

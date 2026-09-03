@@ -51,7 +51,8 @@
  * R57 — THE CAP BYPASS. The adapter validates against what is ALREADY staged, read live off the
  *   runtime — see `stagedAttachments.tsx` for why that is a ref rather than a closure.
  * R60 — CROSS-CHAT LEAKAGE is guarded by the send path stamping the conversation at press time
- *   and the surface comparing it on completion.
+ *   and the surface comparing it, on completion, against the chat that is on screen THEN — read
+ *   through a ref, because the callback itself is press-time too. See `handleAccepted`.
  */
 import { useCallback, useEffect, useMemo, useRef, type FC, type ReactNode } from 'react'
 import { useAui, useAuiState } from '@assistant-ui/react'
@@ -221,13 +222,24 @@ const Composer: FC<ComposerProps> = ({
    * AND ONLY FOR THE CHAT IT WAS SENT IN. If the citizen moved to a sibling while the request was
    * out, what stands in the box belongs to the sibling, not to the conversation being cleared —
    * so that one's draft goes, and the sibling's own mirror keeps its own.
+   *
+   * WHICH CHAT IS ON SCREEN IS READ AT ACCEPT TIME, THROUGH A REF, and that is the whole of the
+   * correction. `ComposerBox` performs the send from its PRESS-TIME closure, so the callback it
+   * calls on completion is the one built in the same render as the `conversationId` beside it —
+   * comparing them compared a value with itself, was true however far the citizen had navigated
+   * since, and the sibling arm therefore never ran once. Sending in one chat, stepping to a
+   * sibling and typing there put the sibling's live text into the first chat's stored draft.
+   *
+   * The ref is written DURING RENDER rather than in an effect, as `LivePreview` and
+   * `useWorkspaceState` write theirs: an accepted send resolves in a microtask, which can run
+   * before a passive effect has flushed, and a ref one render behind is the same bug again.
    */
-  const handleAccepted = useCallback(
-    (sentIn: string, keptText: string) => {
-      writeDraft(sentIn, sentIn === conversationId ? keptText : '')
-    },
-    [conversationId],
-  )
+  const liveConversation = useRef(conversationId)
+  liveConversation.current = conversationId
+
+  const handleAccepted = useCallback((sentIn: string, keptText: string) => {
+    writeDraft(sentIn, sentIn === liveConversation.current ? keptText : '')
+  }, [])
 
   return (
     // NO RULE ABOVE THE BOX. Every board that draws a composer — BuildChat, PlanChat, PlainAnswer,
