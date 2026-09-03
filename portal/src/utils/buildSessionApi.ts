@@ -608,8 +608,17 @@ export async function handOverWorkspace(
   await releaseProject(projectId, deps)
 }
 
-/** What a hand-over is doing right now, so the dialog can say it rather than spin. */
-export type HandoverStep = 'stopping' | 'saving' | 'releasing' | 'starting' | 'opening'
+/**
+ * What a hand-over is doing right now, so the dialog can say it rather than spin.
+ *
+ * IT STOPS AT `starting`, AND THAT IS THE WHOLE SEQUENCE (review #39/#82). There was an `opening`
+ * member here for the chat being opened, with copy already written for it, and nothing could ever
+ * produce it: the retry's last act is a navigate, which unmounts the surface publishing the dialog
+ * in the very commit that would have carried the new step, so no render can reach it. The wait it
+ * was meant to describe is the destination's own — the chat surface and the app pane both narrate
+ * themselves as they come up — and a member no writer can set is dead code with copy attached.
+ */
+export type HandoverStep = 'stopping' | 'saving' | 'releasing' | 'starting'
 
 /** The project standing in the way, read off a `sandbox_reclaim_blocked` 409. */
 export interface ReclaimBlocked {

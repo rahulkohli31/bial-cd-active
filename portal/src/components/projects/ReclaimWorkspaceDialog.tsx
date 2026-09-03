@@ -185,15 +185,18 @@ function copyFor(
  * a button for the thirty seconds a stop-then-start actually takes is indistinguishable from a
  * dialog that has hung, and this one is standing in front of a message the citizen has typed.
  *
- * Plain language throughout, and nothing that names a mechanism: "closing", "starting", "opening"
+ * Plain language throughout, and nothing that names a mechanism: "closing", "saving", "starting"
  * are things a person can picture happening to their app.
+ *
+ * IT ENDS AT "Starting your app…", deliberately. There was a fifth line here for the chat opening;
+ * the navigate that opens it unmounts the surface publishing this dialog, so that line could never
+ * be read — see `HandoverStep`. The destination narrates its own arrival.
  */
 const STEP_SAYS: Record<HandoverStep, string> = {
   stopping: 'Closing the other app…',
   saving: 'Saving it first…',
   releasing: 'Putting it away…',
   starting: 'Starting your app…',
-  opening: 'Opening your chat…',
 }
 
 export default function ReclaimWorkspaceDialog({

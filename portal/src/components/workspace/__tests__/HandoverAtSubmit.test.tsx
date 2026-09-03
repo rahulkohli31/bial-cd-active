@@ -331,6 +331,38 @@ describe('transferring', () => {
     expect((composer() as HTMLTextAreaElement).value).toBe('add an out-time column')
   })
 
+  it('★ narrates the start too, then hands the telling over to the chat itself', async () => {
+    // R9 asks every transition to narrate itself, and the start is the longest of them: the
+    // dialog stays up across it saying so, rather than spinning. It stops there on purpose —
+    // opening the chat unmounts the surface that publishes this dialog, so the sequence ends
+    // where the destination begins narrating itself.
+    let startTheApp: (() => void) | undefined
+    api.relaunchPreview.mockRejectedValueOnce(heldBy()).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          startTheApp = () =>
+            resolve({ appId: 'app-1', previewUrl: 'https://app/', status: 'ready', ready: true, restoredFromFailedBuild: false })
+        }),
+    )
+    render(<Workspace />)
+    type('add an out-time column')
+    fireEvent.click(send())
+    await screen.findByRole('dialog')
+
+    fireEvent.click(screen.getByRole('button', { name: /stop “Car pool”/i }))
+
+    await waitFor(() =>
+      expect(screen.getByTestId('reclaim-step').textContent).toMatch(/starting your app/i),
+    )
+    // …for the WHOLE of the start: the chat has not opened yet, so this is the sentence standing
+    // in front of the citizen while they wait, not one that flashed as it finished.
+    expect(screen.queryByTestId('chat-opened')).toBeNull()
+    startTheApp?.()
+
+    await waitFor(() => expect(screen.getByTestId('chat-opened')).toBeTruthy())
+    expect(screen.queryByRole('dialog')).toBeNull()
+  })
+
   it('narrates while it works, rather than spinning', async () => {
     let releaseHandover: (() => void) | undefined
     api.handOverWorkspace.mockImplementation(
