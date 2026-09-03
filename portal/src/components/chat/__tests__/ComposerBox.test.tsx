@@ -41,9 +41,11 @@ interface DrawOptions {
   onSubmit?: (submission: ComposerSubmission) => Promise<void>
   unavailableReason?: string | null
   onUrgent?: (message: string) => void
+  /** What the box reports it KEPT once an accepted send has been reconciled. */
+  onAccepted?: (conversationId: string, keptText: string) => void
 }
 
-function draw({ onSubmit, unavailableReason = null, onUrgent = vi.fn() }: DrawOptions = {}) {
+function draw({ onSubmit, unavailableReason = null, onUrgent = vi.fn(), onAccepted }: DrawOptions = {}) {
   const submit = onSubmit ?? vi.fn().mockResolvedValue(undefined)
   const view = render(
     <ComposerHarness>
@@ -53,6 +55,7 @@ function draw({ onSubmit, unavailableReason = null, onUrgent = vi.fn() }: DrawOp
         onSubmit={submit}
         unavailableReason={unavailableReason}
         onUrgent={onUrgent}
+        {...(onAccepted ? { onAccepted } : {})}
       />
     </ComposerHarness>,
   )
@@ -218,6 +221,35 @@ describe('★ the box clears ONLY once the server has accepted', () => {
     await waitFor(() => expect(box().value).toBe(' and a second thought'))
     // The sent text was the snapshot, not what the box held when the promise settled.
     expect(onSubmit.mock.calls[0]?.[0]?.text).toBe('first message')
+  })
+
+  it('★ leaves a REWRITTEN box alone — an edit it cannot reconcile is not a licence to cut', async () => {
+    // THE THIRD OUTCOME OF THE RECONCILIATION, and the one nothing drove. An exact match clears
+    // the box and an appended tail is kept (both above); anything else — the citizen selected all
+    // and started again while the request was out — is an edit that cannot be reconciled, and the
+    // code deliberately does nothing. Mutation receipt: weaken the `startsWith` guard to an
+    // unconditional slice and this goes red with the first twenty characters chopped off a
+    // sentence the citizen can still see.
+    let release = () => {}
+    const gate = new Promise<void>((r) => { release = r })
+    const onSubmit = vi.fn().mockReturnValue(gate)
+    // The box's own report of what it kept is the settled signal — waiting on the text would be
+    // waiting for a value the box already holds, which is no wait at all.
+    const onAccepted = vi.fn()
+    draw({ onSubmit, onAccepted })
+
+    type('make the header blue')
+    fireEvent.click(send())
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+
+    type('actually make it red')
+    release()
+
+    await waitFor(() => expect(onAccepted).toHaveBeenCalledTimes(1))
+    expect(onAccepted).toHaveBeenCalledWith('chat-1', 'actually make it red')
+    expect(box().value).toBe('actually make it red')
+    // …and what went to the server was the snapshot, which is the other half of the rule.
+    expect(onSubmit.mock.calls[0]?.[0]?.text).toBe('make the header blue')
   })
 
   it('★ keeps a file ATTACHED while the send was in flight — the other half of the same rule', async () => {
