@@ -91,10 +91,10 @@ export interface AttachmentAdapterOptions {
   /**
    * What is already staged, read LIVE at ADD time — the per-message cap counts across the batch.
    *
-   * IT IS THE RUNTIME'S OWN STATE, not a copy of it (see `stagedAttachments.tsx`), so a file the
-   * composer is holding is visible here the instant `add` resolved for it. What it still cannot
-   * see is a file whose read is STILL RUNNING, because nothing is appended until then — see the
-   * claim list in `createAttachmentAdapter` for that half of the cap.
+   * IT IS READ, NOT CAPTURED (see `stagedAttachments.tsx`), so it is never older than the last
+   * paint. What it cannot see is a file whose read is STILL RUNNING — nothing is staged until then
+   * — nor one taken in the same breath as this one, because the composer's own snapshot catches up
+   * with the screen. The claim list below is what counts both.
    */
   staged: () => readonly Attachment[]
   /**
@@ -142,14 +142,20 @@ export function createAttachmentAdapter({ accept, staged, onRefused }: Attachmen
    * exactly that — both validated against nothing, and a sixth file was staged past a cap of five
    * with no refusal said.
    *
-   * So a claim is retired by the only two things that can end it:
+   * So a claim is retired by the three things that can end it:
    *
-   *   · THE COMPOSER IS HOLDING THE FILE. Its id is in the live staged list, which now counts it —
+   *   · THE COMPOSER IS HOLDING THE FILE. Its id is in the staged list, which now counts it —
    *     keeping the claim as well would count it twice and refuse a file that fits.
+   *   · THE CITIZEN TOOK THE CHIP BACK. `remove` is the composer telling us so by id, and it is
+   *     the only prompt version of that news: the rule above is applied inside `countable()`, and
+   *     `countable()` runs only when the NEXT file arrives. Until then a removed file's claim sat
+   *     in the cap and in the text budget for as long as any read was still out — erring towards
+   *     refusing a file the citizen was entitled to attach.
    *   · NOTHING IS IN FLIGHT AT ALL. Every `add` has settled, so every claim has either been
-   *     published (the case above) or discarded by a `clearAttachments()` that cancelled it. This
-   *     is what keeps a cancelled read from leaving a phantom file occupying a slot for ever, and
-   *     it costs no timer: reads only happen inside `add`, which is a later task than the settle.
+   *     published (the first case), taken back (the second), or discarded by a `clearAttachments()`
+   *     that cancelled it. This is what keeps a cancelled read from leaving a phantom file
+   *     occupying a slot for ever, and it costs no timer: reads only happen inside `add`, which is
+   *     a later task than the settle.
    *
    * A FAILED READ RELEASES ITS OWN CLAIM IMMEDIATELY, because nothing will ever be staged for it.
    */
@@ -219,10 +225,16 @@ export function createAttachmentAdapter({ accept, staged, onRefused }: Attachmen
       }
     },
 
-    async remove(): Promise<void> {
-      // NOTHING TO UNDO. The decoded bytes live on the object the library is dropping and no
-      // upload has happened, so there is no server-side state to withdraw. An empty body here is
-      // the correct implementation, not an unfinished one.
+    async remove(attachment): Promise<void> {
+      // NOTHING TO UNDO ABOUT THE FILE ITSELF. The decoded bytes live on the object the library is
+      // dropping and no upload has happened, so there is no server-side state to withdraw.
+      //
+      // THE COUNTING IS THE PART THAT IS NOT NOTHING. If this file was still holding a claim — it
+      // is, whenever no later `add` has run to notice the composer was holding it — that claim
+      // would go on occupying a slot in the per-message cap and bytes in the text budget until
+      // every read in flight had settled. The id is the one the claim was made under, because the
+      // claim and the attachment are minted as the same thing under the same name.
+      claimed.delete(attachment.id)
     },
 
     async send(attachment): Promise<CompleteAttachment> {
