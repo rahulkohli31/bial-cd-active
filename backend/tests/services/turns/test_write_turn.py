@@ -2525,6 +2525,77 @@ async def test_a_fast_operation_never_flickers_a_status_line(
     await engine._drain_long_operations(state)
 
 
+async def test_a_read_that_runs_long_is_narrated_now_that_reads_are_drawn(
+    _fresh_engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """U5's first stillness scenario, and it exists BECAUSE the unit widened what is visible.
+
+    A read used to be hidden as a class and therefore never narrated. It is drawn now — looking
+    at the app before changing it is work the citizen recognises — so a read that outruns the
+    threshold is announced and restated like any other visible step. That is a real change in how
+    often a build speaks (a build reads far more often than it installs), and it was the half of
+    the widening nothing measured.
+
+    Mutation-check: hide the read class again in `_step_label` and this goes red at the refresh
+    assertion while the `npm install` test beside it stays green."""
+    engine = _fresh_engine
+    monkeypatch.setattr(engine_module, "LONG_OPERATION_THRESHOLD_MS", 20)
+    monkeypatch.setattr(engine_module, "LONG_OPERATION_REFRESH_MS", 20)
+    state = _bare_state()
+
+    engine._on_event(state, _called("read_file", '{"path": "app/page.tsx"}', "r1"))
+    await asyncio.sleep(0.12)
+
+    labels = _step_labels(state, phase="started")
+    assert labels, "no step frame at all — the seam under test never ran"
+    announced, refreshes = labels[0], labels[1:]
+    assert announced == "Looking at your app's main page"
+    assert len(refreshes) >= 2, "the status line was said once, not REFRESHED until it completed"
+    assert set(refreshes) == {long_operation_line(announced)}
+    # …and it is still the app's AREAS, never the path, however long it runs.
+    assert "app/page.tsx" not in " ".join(labels)
+    await engine._drain_long_operations(state)
+
+
+async def test_a_housekeeping_command_that_runs_long_stays_silent(
+    _fresh_engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ U5's second stillness scenario — and the reason `hidden` was NARROWED rather than
+    deleted.
+
+    A hidden step renders nowhere, so narrating one would change no pixels while still burning a
+    frame every few seconds. The flag survives to carry exactly this, and nothing else asserted
+    it: the guard could be deleted with the whole suite green.
+
+    THE VISIBLE ARM IS THE DISCRIMINATOR, run in the same conditions in the same test — a
+    silence assertion on its own passes just as well against a threshold that never fired, or a
+    narrator that was never armed at all.
+
+    Mutation-check: delete `if hidden: return` from `_start_long_operation` and the silent arm
+    goes red while the spoken one stays green."""
+    engine = _fresh_engine
+    monkeypatch.setattr(engine_module, "LONG_OPERATION_THRESHOLD_MS", 20)
+    monkeypatch.setattr(engine_module, "LONG_OPERATION_REFRESH_MS", 20)
+    state = _bare_state()
+
+    engine._on_event(
+        state, _called("run_command", '{"command": ["mkdir", "-p", "app/lib"]}', "h1")
+    )
+    engine._on_event(state, _called("read_file", '{"path": "app/page.tsx"}', "r1"))
+    await asyncio.sleep(0.12)
+
+    spoken = [
+        label for label in _step_labels(state, phase="started") if label.startswith("Still ")
+    ]
+    # THE VISIBLE STEP SPOKE, which is what makes the housekeeping step's silence a decision.
+    assert spoken == [long_operation_line("Looking at your app's main page")] * len(spoken)
+    assert spoken, "nothing was narrated at all — the threshold never fired"
+    assert "Organized the app's files" not in " ".join(spoken)
+    # …and it was never even ARMED: no task was parked for it to refresh from.
+    assert list(state.long_operation_tasks) == ["r1"]
+    await engine._drain_long_operations(state)
+
+
 async def test_an_unclassified_command_says_nothing_about_its_argv(_fresh_engine) -> None:
     """★ The fail-closed half. The open sandbox runs arbitrary commands, so the long tail of
     them has no friendly label — and the one thing that must never happen is the shell showing
