@@ -8,8 +8,16 @@ tells us whether a next page exists. The envelope is `{items, nextCursor, hasMor
 is deliberately no `total`/`totalPages` (keyset does not cheaply provide them and they are
 not required, KD-1).
 
-This module governs the project + admin roster lists — every list endpoint the API has.
-It is the single source of truth for the platform's page-size ceiling.
+This module governs the ADMIN ROSTER lists. It is no longer every list endpoint the API
+has: `GET /v1/projects` moved to OFFSET paging under #158, because §2 specifies
+`Showing 1-8 of 12` and `Page 1 of 2` and neither sentence is expressible without a `total`
+that keyset deliberately declines to compute. The argument for that deviation is written at
+`list_projects`, and it is NOT the marketplace's ("read-only and small") — the projects list
+is owner-scoped and effectively single-writer, so the skew this module guards against is one
+person's second tab rather than a shared table.
+
+It remains the single source of truth for the platform's page-size ceiling, which the offset
+callers import rather than redeclare.
 """
 
 from __future__ import annotations

@@ -79,6 +79,29 @@ describe('renaming a project', () => {
     expect(screen.getByRole('textbox', { name: /project name/i })).toHaveProperty('value', 'Taken')
   })
 
+  it('carries the 8-word cap, so a rename is not a round trip that exists to be refused', async () => {
+    // §14: "Both entry points, or neither." Create had this from the start; the rename path
+    // did not, and it has slipped through two relocations — out of `ProjectPage` under #172,
+    // out of the rail under #175 — which is why the guard now lives beside the input.
+    render(<ProjectRenameDialog project={PROJECT} onProjectUpdate={vi.fn()} onClose={vi.fn()} />)
+
+    const input = screen.getByLabelText('Project name')
+    const save = screen.getByRole('button', { name: /save/i })
+
+    fireEvent.change(input, { target: { value: 'one two three four five six seven eight' } })
+    expect(screen.getByText('8/8 words')).toBeTruthy()
+    expect(save.getAttribute('aria-disabled')).toBe('false')
+
+    fireEvent.change(input, { target: { value: 'one two three four five six seven eight nine' } })
+    expect(screen.getByText('9/8 words')).toBeTruthy()
+    expect(save.getAttribute('aria-disabled')).toBe('true')
+
+    // And Enter must not get out either — it reaches the handler without touching Save.
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/6 to 8 words/i))
+    expect(h.patchProject).not.toHaveBeenCalled()
+  })
+
   it('renders no control with a real disabled attribute', () => {
     renderDialog()
     for (const el of screen.getAllByRole('button')) expect(el.hasAttribute('disabled')).toBe(false)

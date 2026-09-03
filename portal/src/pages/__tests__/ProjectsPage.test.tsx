@@ -407,6 +407,59 @@ describe('create and delete', () => {
     expect(screen.queryByRole('button', { name: '1' })).toBeNull()
   })
 
+  it.each([
+    [3, ['1', '2', '3'], '4'],
+    [5, ['1', '2', '3', '4', '5'], '6'],
+  ])(
+    'offers every page and no more when there are %i of them',
+    async (totalPages, expected, absent) => {
+      // The window is `min(5, totalPages)` wide, so at or below five pages it is the WHOLE
+      // set and cannot slide. Only the deep case was pinned, which left the two shapes most
+      // users actually see — a handful of pages — asserted by nothing.
+      h.listProjects.mockResolvedValue(
+        page([mkProject('p1', 'Alpha')], { total: totalPages * 8, totalPages }),
+      )
+      renderPage()
+      await screen.findByText('Alpha')
+
+      for (const n of expected) expect(screen.getByRole('button', { name: n })).toBeTruthy()
+      expect(screen.queryByRole('button', { name: absent })).toBeNull()
+    },
+  )
+
+  it('clamps at the END, so the last page is reachable and marked active', async () => {
+    // The other half of the clamp. A window that always centred would ask for pages 9-13 of
+    // 10 here; a window that never slid would strand you as it did before the fix. Neither
+    // is caught by the mid-list case above.
+    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Alpha')], { total: 80, totalPages: 10 }))
+    renderPage()
+    await screen.findByText('Alpha')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Last page' }))
+
+    await waitFor(() => expect(screen.getByRole('button', { name: '10' })).toBeTruthy())
+    // Exactly the last five, and nothing past the end.
+    for (const n of ['6', '7', '8', '9', '10']) {
+      expect(screen.getByRole('button', { name: n })).toBeTruthy()
+    }
+    expect(screen.queryByRole('button', { name: '5' })).toBeNull()
+    expect(screen.queryByRole('button', { name: '11' })).toBeNull()
+  })
+
+  it('jumps to the first page and back, without walking', async () => {
+    // §2 spells the control set literally — « ‹ 1 2 › ». Both jumps were missing.
+    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Alpha')], { total: 80, totalPages: 10 }))
+    renderPage()
+    await screen.findByText('Alpha')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Last page' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '10' })).toBeTruthy())
+
+    fireEvent.click(screen.getByRole('button', { name: 'First page' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '1' })).toBeTruthy())
+    expect(screen.queryByRole('button', { name: '10' })).toBeNull()
+  })
+
   it('deleting the last row on a page does not flash "Nothing here yet"', async () => {
     // The optimistic removal empties `items` while the request is in flight, and that
     // request drops a database. "Nothing here yet" is a claim about the ACCOUNT, so

@@ -43,12 +43,31 @@ const DialogOverlay = React.forwardRef<
 ))
 DialogOverlay.displayName = DialogPrimitive.Overlay.displayName
 
+/**
+ * TWO ADDITIONS TO THE UPSTREAM SHAPE, both because this design needs them at the call site
+ * and upstream renders the overlay and the close button internally where a caller cannot
+ * reach them:
+ *
+ *   `overlayClassName` — #158 §9 specifies a SOFTENED overlay (`bg-slate-900/15` with a 3px
+ *     backdrop blur) rather than upstream's `bg-black/80`, and §12 names overriding it as the
+ *     expected thing to do. Without this prop the only way to get there is editing the
+ *     vendored default, which would change every other dialog in the product.
+ *
+ *   `hideClose` — the project dialogs carry their own Cancel and their own X. Rendering
+ *     Radix's as well gives two close affordances in one corner.
+ *
+ * Everything else is upstream verbatim, including the whole point of moving onto it:
+ * `role="dialog"`, `aria-modal`, a focus trap, Escape-to-close and scroll lock.
+ */
 const DialogContent = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Content>,
-  React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content>
->(({ className, children, ...props }, ref) => (
+  React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content> & {
+    overlayClassName?: string
+    hideClose?: boolean
+  }
+>(({ className, children, overlayClassName, hideClose, ...props }, ref) => (
   <DialogPortal>
-    <DialogOverlay />
+    <DialogOverlay className={overlayClassName} />
     <DialogPrimitive.Content
       ref={ref}
       className={cn(
@@ -58,10 +77,12 @@ const DialogContent = React.forwardRef<
       {...props}
     >
       {children}
-      <DialogPrimitive.Close className="absolute right-4 top-4 rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none data-[state=open]:bg-muted data-[state=open]:text-muted-foreground">
-        <X className="h-4 w-4" />
-        <span className="sr-only">Close</span>
-      </DialogPrimitive.Close>
+      {!hideClose && (
+        <DialogPrimitive.Close className="absolute right-4 top-4 rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none data-[state=open]:bg-muted data-[state=open]:text-muted-foreground">
+          <X className="h-4 w-4" />
+          <span className="sr-only">Close</span>
+        </DialogPrimitive.Close>
+      )}
     </DialogPrimitive.Content>
   </DialogPortal>
 ))

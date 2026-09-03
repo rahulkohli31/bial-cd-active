@@ -99,8 +99,17 @@ def _to_response(
     app_id: uuid.UUID | None = None,
     app_status: AppStatus | None = None,
     has_relaunchable_snapshot: bool | None = None,
-    is_serving: bool = False,
+    *,
+    is_serving: bool,
 ) -> ProjectResponse:
+    """Project a row onto the wire shape.
+
+    `is_serving` IS REQUIRED, AND KEYWORD-ONLY, because a default here is a silent wrong
+    answer. It shipped as `= False` and three of the five call sites simply never passed it,
+    so `GET /{id}` reported a live app as not serving while its own field docstring says it
+    IS the server's answer. A default is what let the omission type-check; without one, a new
+    endpoint cannot forget it, and `_serving_now` is the one way to work it out.
+    """
     return ProjectResponse(
         id=project.id,
         name=project.name,
@@ -130,6 +139,22 @@ async def _project_app(
     return (row.id, row.status) if row is not None else (None, None)
 
 
+async def _serving_now(db: DbSession, app_id: uuid.UUID | None) -> bool:
+    """Is this ONE app live right now?
+
+    The single-row form of the list's collapse, reading the SAME `live_app_ids` definition
+    rather than re-deriving it — the drift `liveness.py` exists to prevent is not only
+    between surfaces, it is between the list and the detail view of the same project.
+
+    `None` means the project has no app at all, which is a confirmed False rather than an
+    unknown: nothing can be serving.
+    """
+    if app_id is None:
+        return False
+    live = live_app_ids().subquery()
+    return bool(await db.scalar(sa.select(sa.exists().where(live.c.app_id == app_id))))
+
+
 @router.post("", status_code=status.HTTP_201_CREATED, responses=error_responses(AUTH_401))
 async def create_project(body: ProjectCreate, user: CurrentUser, db: DbSession) -> ProjectResponse:
     """Create a project owned by the caller, then provision its own database (ADR-0028).
@@ -153,7 +178,9 @@ async def create_project(body: ProjectCreate, user: CurrentUser, db: DbSession) 
     await db.refresh(project)  # load server defaults (id, timestamps) before projecting
     project_id = project.id  # a plain scalar for the post-commit work (no expired-attribute I/O)
     await db.commit()
-    response = _to_response(project)
+    # A project one statement old owns no app, so nothing of its can be serving. Passed
+    # explicitly rather than defaulted: this is an answer, not an omission.
+    response = _to_response(project, is_serving=False)
     await _provision_database_or_shrug(db, project_id)
     return response
 
@@ -183,7 +210,7 @@ async def _provision_database_or_shrug(db: DbSession, project_id: uuid.UUID) -> 
 @router.get(
     "",
     responses=error_responses(
-        AUTH_401, (422, ErrorEnvelope, "Invalid pagination cursor or over-long q")
+        AUTH_401, (422, ErrorEnvelope, "Invalid page/pageSize or over-long q")
     ),
 )
 async def list_projects(
@@ -339,7 +366,9 @@ async def get_project(project_id: uuid.UUID, user: CurrentUser, db: DbSession) -
     # exact predicate `preview-state` answers with, so a cold page load and the 45-second poll
     # can never disagree about whether a restore is on offer.
     relaunchable = False if app_id is None else await restorable_presence(app_id)
-    return _to_response(project, app_id, app_status, relaunchable)
+    return _to_response(
+        project, app_id, app_status, relaunchable, is_serving=await _serving_now(db, app_id)
+    )
 
 
 @router.patch(
@@ -371,7 +400,8 @@ async def patch_project(
         # (mirrors conversations' patch-vs-delete handling).
         raise AppApiError(status.HTTP_404_NOT_FOUND, "Project not found.") from None
     await db.refresh(project)
-    return _to_response(project, *await _project_app(db, user.id, project.id))
+    app_id, app_status = await _project_app(db, user.id, project.id)
+    return _to_response(project, app_id, app_status, is_serving=await _serving_now(db, app_id))
 
 
 # Names the LIVE SESSION as the reason and the action that clears it (R9/D4: refuse, never
@@ -441,7 +471,12 @@ async def delete_project(
         await db.scalar(
             sa.select(sa.func.count())
             .select_from(Conversation)
-            .where(Conversation.project_id == project.id)
+            # BOTH predicates, matching `delete_project_cascade` exactly. Counting on
+            # `project_id` alone is not exploitable — ownership is already checked above —
+            # but it makes the recorded number and the rows actually deleted two different
+            # sets by construction, on a table whose only job is to be accurate about what
+            # went with the project.
+            .where(Conversation.project_id == project.id, Conversation.user_id == user.id)
         )
         or 0
     )
@@ -582,4 +617,4 @@ async def generate_description(
         # (not worth rewiring billing into its own transaction).
         raise AppApiError(status.HTTP_404_NOT_FOUND, "Project not found.") from None
     await db.refresh(project)
-    return _to_response(project, app.id, app.status)
+    return _to_response(project, app.id, app.status, is_serving=await _serving_now(db, app.id))

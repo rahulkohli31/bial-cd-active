@@ -30,6 +30,13 @@
  *      (`utils/words.ts` <-> `src/core/words.py`). The client keeps the person inside the
  *      limit; the server refuses independently.
  *
+ * BUILT ON THE VENDORED RADIX `Dialog` (§12), not a hand-rolled `fixed inset-0`. This is the
+ * dialog that put a REQUIRED FREE-TEXT FIELD inside a destructive confirmation, so keyboard
+ * and screen-reader users have real work to do in here — and the hand-rolled shell announced
+ * itself as nothing, trapped no focus and could not be dismissed with Escape. Radix gives
+ * `role="dialog"`, `aria-modal`, the focus trap, Escape and scroll lock. §9's softened
+ * overlay is passed as an override rather than lost.
+ *
  * The dialog does not delete anything itself — the page owns the optimistic removal
  * and the 404-vs-500 reconciliation — it only collects an informed confirmation and
  * calls `onConfirm`.
@@ -40,11 +47,15 @@ import { CONVERSATION_LIST_CAP, listProjectConversations } from '../../utils/con
 import type { Project } from '../../utils/projectApi'
 import { getStoredUser } from '../../utils/auth'
 import { Textarea } from '../ui/textarea'
+import { Dialog, DialogContent, DialogTitle } from '../ui/dialog'
 import {
   countWords,
   MAX_DELETE_REASON_WORDS,
   MIN_DELETE_REASON_WORDS,
 } from '../../utils/words'
+
+/** Ties the panel to its cascade sentence for `aria-describedby`. */
+const CASCADE_ID = 'delete-project-cascade'
 
 /** A paste backstop only — 50 words of ordinary English is far under this. */
 const MAX_DELETE_REASON_CHARS = 2000
@@ -133,21 +144,36 @@ export default function ProjectDeleteDialog({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 font-manrope">
-      {/* The softened overlay (#158 §9) — same values as the create dialog. */}
-      <div
-        className="absolute inset-0 bg-slate-900/15 backdrop-blur-[3px] [-webkit-backdrop-filter:blur(3px)]"
-        onClick={busy ? undefined : onClose}
-      />
-      <div className="relative bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
+    <Dialog
+      open
+      onOpenChange={(next) => {
+        // Radix routes Escape, the overlay click and the close button through here. `busy`
+        // holds it open mid-request exactly as the hand-rolled overlay's guard did.
+        if (!next && !busy) onClose()
+      }}
+    >
+      <DialogContent
+        hideClose
+        // §9's softened overlay, unchanged — the values, the `-webkit-` prefix, and the
+        // overlay ONLY. Passed as an override because the vendored default is `bg-black/80`.
+        overlayClassName="bg-slate-900/15 backdrop-blur-[3px] [-webkit-backdrop-filter:blur(3px)]"
+        className="font-manrope bg-white rounded-2xl shadow-2xl w-full max-w-md p-6 gap-0 border-0"
+        // The cascade sentence IS the description — what a screen reader should hear after
+        // the title, and the one thing in here a reader must not miss.
+        aria-describedby={CASCADE_ID}
+      >
         <div className="flex items-center gap-2.5">
           <div className="w-9 h-9 rounded-xl bg-red-50 flex items-center justify-center flex-shrink-0">
             <AlertTriangle size={17} className="text-danger" />
           </div>
-          <h3 className="text-base font-bold text-tertiary">Delete “{project.name}”?</h3>
+          <DialogTitle className="text-base font-bold text-tertiary">
+            Delete “{project.name}”?
+          </DialogTitle>
         </div>
 
-        <p className="text-sm text-neutral mt-3 leading-relaxed">{cascadeCopy(chatCount)}</p>
+        <p id={CASCADE_ID} className="text-sm text-neutral mt-3 leading-relaxed">
+          {cascadeCopy(chatCount)}
+        </p>
 
         <p className="text-sm font-semibold text-tertiary mt-4">
           Are you sure you want to delete this project?
@@ -177,11 +203,16 @@ export default function ProjectDeleteDialog({
             className="mt-1.5 resize-y"
           />
           <div className="flex items-baseline justify-between mt-1">
-            {/* Says who reads it. The remark is written by whoever deletes — usually the
-                owner — and read by administrators, so it is not a private note. */}
+            {/* SAYS ONLY WHAT IS TRUE TODAY. This read "An administrator can see this",
+                and nothing reads `deleted_projects` — there is no route, no schema and no
+                screen. Every deletion collects a mandatory 5-50 word justification, so a
+                promise about who reads it is a promise to a user, not an internal TODO. The
+                read surface is tracked in #176; when it lands, the stronger sentence becomes
+                true again and this reverts. Until then the copy says what the platform
+                actually does, which is keep the reason with the record. */}
             <span className="text-[11px] text-neutral">
-              Between {MIN_DELETE_REASON_WORDS} and {MAX_DELETE_REASON_WORDS} words. An
-              administrator can see this.
+              Between {MIN_DELETE_REASON_WORDS} and {MAX_DELETE_REASON_WORDS} words. Kept with
+              the deletion record.
             </span>
             <span
               className={`text-[11px] tabular-nums ${
@@ -211,7 +242,7 @@ export default function ProjectDeleteDialog({
             Cancel
           </button>
         </div>
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   )
 }

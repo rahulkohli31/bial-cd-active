@@ -54,6 +54,20 @@ describe('the shared limits', () => {
     expect(MIN_DELETE_REASON_WORDS).toBe(5)
     expect(MAX_DELETE_REASON_WORDS).toBe(50)
   })
+
+  it('counts EXACTLY at both delete-reason bounds', () => {
+    // The boundaries themselves, which nothing pinned: the dialog's cases were 2 / 6 / 51,
+    // so an off-by-one at either end survived. The server parametrises 5 and 50 directly, and
+    // client and server disagreeing at a boundary is the one failure this module exists to
+    // prevent — the counter reads 5/50, the button arms, and the API refuses.
+    const five = Array.from({ length: MIN_DELETE_REASON_WORDS }, (_, i) => `w${i}`).join(' ')
+    const fifty = Array.from({ length: MAX_DELETE_REASON_WORDS }, (_, i) => `w${i}`).join(' ')
+
+    expect(countWords(five)).toBe(MIN_DELETE_REASON_WORDS)
+    expect(countWords(`${five} extra`)).toBe(MIN_DELETE_REASON_WORDS + 1)
+    expect(countWords(fifty)).toBe(MAX_DELETE_REASON_WORDS)
+    expect(countWords(`${fifty} extra`)).toBe(MAX_DELETE_REASON_WORDS + 1)
+  })
 })
 
 describe('the whitespace set matches Python exactly', () => {

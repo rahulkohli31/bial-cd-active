@@ -43,6 +43,7 @@ from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.db.base import Base
+from src.db.mixins import UUIDv7PrimaryKeyMixin
 
 # The remark bounds (#158 §13.2), in WORDS. `src/core/words.py` owns the splitting rule and
 # `portal/src/utils/words.ts` mirrors it, because a reason accepted by the counter the user
@@ -59,18 +60,30 @@ MAX_DELETE_REMARK_CHARS = 2000
 DELETED_BY_NAME_WIDTH = 320
 
 
-class DeletedProject(Base):
+class DeletedProject(UUIDv7PrimaryKeyMixin, Base):
     """One deletion, recorded. Never joined to `projects` — that row is gone."""
 
     __tablename__ = "deleted_projects"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    # `id` comes from UUIDv7PrimaryKeyMixin — time-sortable, with a `uuidv7()` server default,
+    # like every other table (ADR-0006). It was briefly a hand-rolled uuid4, which made this
+    # the one table in the schema whose primary keys do not order by creation time; on an
+    # audit table read newest-first, that is the ordering you most want.
+    #
     # NOT a foreign key, deliberately: the project row does not exist any more, so an FK
     # would be unsatisfiable. It is kept so an administrator can correlate this with audit
     # entries and deployment history that still name the id.
-    project_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False, index=True)
+    #
+    # UNIQUE, and that is a correctness guard rather than an optimisation. `owned_project_or_404`
+    # takes no row lock and the cascade deletes through Core `sa.delete()`, so no ORM staleness
+    # check fires: a double-click or a proxy retry ran the whole delete twice and wrote TWO
+    # tombstones for one physical deletion, plus duplicate audit rows, both returning 200. On the
+    # table whose entire job is to be an accurate record of an irreversible action, an
+    # administrator who cannot tell one deletion from two is the failure. The loser of the race
+    # now fails closed on this constraint instead.
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), nullable=False, unique=True, index=True
+    )
     # COPIED, not joined. The name is what makes this row legible to a human a month later.
     project_name: Mapped[str] = mapped_column(sa.String(120), nullable=False)
     owner_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False, index=True)

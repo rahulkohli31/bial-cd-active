@@ -1,19 +1,80 @@
 /**
  * One project in the `/projects` grid: name, a description snippet (or a muted
- * "No description yet" when the field is null), and a badge marking whether the
- * project has an app yet. The app's lifecycle status (draft / approved / …) is
- * deliberately NOT surfaced here — lifecycle lives on the admin registry, not the
- * citizen project surfaces — so the badge is just "App" vs "No app yet".
+ * "No description yet" when the field is null), the status in the shared vocabulary, and
+ * when the details were last updated — the same two facts the list row shows, so the two
+ * views cannot describe one project differently.
+ *
+ * The status is NOT the "App / No app yet" binary this file used to draw. That reasoning
+ * (lifecycle belongs to the admin registry) stopped being true when publishing moved onto
+ * the citizen's own surfaces; `AppStatusBadge` below carries the current argument.
+ *
+ * A NAME TOO LONG FOR ITS TILE gets an ellipsis AND a tooltip (§14). The 8-word cap is not
+ * retroactive, so stored 120-character names are exactly the ones that clip, and the tooltip
+ * is the only way to read them. Gated on the span being MEASURED as clipped, like the list's.
  *
  * Purely presentational: the page owns navigation and deletion and injects them as
  * `onOpen` / `onDelete`, so this component is trivial to render in a test with no
  * router.
  */
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Trash2 } from 'lucide-react'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../ui/tooltip'
 import type { Project } from '../../utils/projectApi'
 import { statusFor, TONE_CLASS } from '../../utils/appStatusLabel'
 import { relativeTime } from '../../utils/relativeTime'
 import { Card } from '../ui/card'
+
+/**
+ * The tile's name: clipped with an ellipsis, and revealed in full on hover ONLY when it is
+ * really clipped (§14). Measured on the inner span rather than the button, because that is
+ * the element `truncate` acts on — the button is as wide as the tile either way.
+ *
+ * The span, not the button, also keeps `overflow:hidden` off the button so its stretched
+ * `::after` still covers the tile.
+ */
+function NameButton({ name, onOpen }: { name: string; onOpen: () => void }): React.JSX.Element {
+  const ref = useRef<HTMLSpanElement>(null)
+  const [clipped, setClipped] = useState(false)
+
+  const measure = useCallback(() => {
+    const el = ref.current
+    if (el) setClipped(el.scrollWidth > el.clientWidth)
+  }, [])
+
+  useEffect(() => {
+    measure()
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(measure)
+    if (ref.current) observer.observe(ref.current)
+    return () => observer.disconnect()
+  }, [measure, name])
+
+  const button = (
+    <button
+      type="button"
+      onClick={onOpen}
+      // The name truncates on the inner <span> so its overflow:hidden clips the text
+      // WITHOUT clipping the button's stretched ::after (a sibling of the span).
+      className="block w-full text-left text-sm font-bold text-tertiary cursor-pointer rounded-sm after:absolute after:inset-0 after:rounded-2xl focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+    >
+      <span ref={ref} className="block truncate">
+        {name}
+      </span>
+    </button>
+  )
+  if (!clipped) return button
+
+  return (
+    <TooltipProvider delayDuration={200}>
+      <Tooltip>
+        <TooltipTrigger asChild>{button}</TooltipTrigger>
+        <TooltipContent side="bottom" align="start" className="max-w-md">
+          {name}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  )
+}
 
 /**
  * The status pill, in the SHARED vocabulary (#158 §10).
@@ -60,15 +121,7 @@ export default function ProjectCard({ project, onOpen, onDelete }: ProjectCardPr
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-center gap-2.5 min-w-0">
           <h3 className="min-w-0 flex-1">
-            <button
-              type="button"
-              onClick={onOpen}
-              // The name truncates on the inner <span> so its overflow:hidden clips the text
-              // WITHOUT clipping the button's stretched ::after (a sibling of the span).
-              className="block w-full text-left text-sm font-bold text-tertiary cursor-pointer rounded-sm after:absolute after:inset-0 after:rounded-2xl focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
-            >
-              <span className="block truncate">{project.name || 'Untitled project'}</span>
-            </button>
+            <NameButton name={project.name || 'Untitled project'} onOpen={onOpen} />
           </h3>
         </div>
         <button

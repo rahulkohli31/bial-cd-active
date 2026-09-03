@@ -23,6 +23,7 @@ from src.config import settings
 from src.db.models.app_registry import AppStatus
 from src.db.models.deployment import Deployment, DeploymentStatus
 from src.services.auth.session_jwt import mint_session_jwt
+from src.services.deploy.liveness import live_app_ids
 from tests.factories import AppRegistryFactory, ProjectFactory, UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
@@ -836,3 +837,65 @@ async def test_the_success_collapse_predicate_renders_a_literal(app, client, db_
     # The unpublished-side predicate carries no parameter, so it was never affected — asserted
     # so a future "make both consistent" refactor cannot quietly parameterise this one.
     assert "unpublished_at IS NOT NULL" in compiled
+
+
+# --- the catalog and the projects list answer ONE question ----------------------
+
+
+async def test_the_catalog_lists_exactly_the_apps_liveness_calls_live(db_session) -> None:
+    """`liveness.py` says it answers "is this app live?" in one place for three surfaces and
+    that they "must not drift". This is the test that makes the sentence checkable.
+
+    `_live_catalog` used to carry its own copy of the collapse — its own `last_unpublished`
+    subquery and its own registry predicates — so the catalog was the surface that could
+    silently disagree with the projects list and the dashboard count about which apps are
+    live, and only for some apps. Membership now comes from `live_app_ids()`; the catalog's
+    remaining `last_success` alias is the row PROJECTION (it needs the url and the builder),
+    not a second membership rule.
+
+    Deliberately built over an awkward mix rather than one happy app: a plain live one, one
+    taken down, one redeployed after a takedown, one that never succeeded, and one whose
+    registry says disabled. A predicate that agreed only on the easy cases would pass a
+    one-app version of this.
+    """
+    live = await _published_app(
+        db_session, owner_email="a@x.com", name="Live", description="serving"
+    )
+    taken_down = await _published_app(
+        db_session, owner_email="b@x.com", name="Down", description="gone"
+    )
+    await _redeploy(db_session, taken_down, unpublished_at=datetime.now(UTC))
+    republished = await _published_app(
+        db_session, owner_email="c@x.com", name="Back", description="again"
+    )
+    await _redeploy(db_session, republished, unpublished_at=datetime.now(UTC))
+    await _redeploy(db_session, republished)  # newer than the takedown
+    await _published_app(
+        db_session,
+        owner_email="d@x.com",
+        name="Never",
+        description="failed",
+        status=DeploymentStatus.FAILED,
+        url=None,
+    )
+    await _published_app(
+        db_session,
+        owner_email="e@x.com",
+        name="Off",
+        description="killed",
+        app_status=AppStatus.DISABLED,
+    )
+    await db_session.flush()
+
+    catalog, deployment = _live_catalog(None)
+    in_catalog = {
+        row.app_id
+        for row in (await db_session.execute(catalog.with_only_columns(deployment.app_id))).all()
+    }
+    considered_live = set((await db_session.execute(live_app_ids())).scalars().all())
+
+    assert in_catalog == considered_live
+    # Liveness, so the equality above is not two empty sets agreeing.
+    assert live.app_id in in_catalog
+    assert republished.app_id in in_catalog
+    assert taken_down.app_id not in in_catalog

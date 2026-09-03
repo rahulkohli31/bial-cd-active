@@ -72,10 +72,10 @@ export default function AdminPage() {
               You don't have permission to access the Admin Console. Contact IT if you believe this is an error.
             </p>
             <button
-              onClick={() => navigate('/dashboard')}
+              onClick={() => navigate('/projects')}
               className="mt-6 px-5 py-2.5 rounded-xl bg-primary text-white text-sm font-semibold hover:bg-primary/90 transition"
             >
-              Back to Dashboard
+              Back to projects
             </button>
           </div>
         </div>

@@ -33,7 +33,14 @@ _TABLE = "deleted_projects"
 def upgrade() -> None:
     op.create_table(
         _TABLE,
-        sa.Column("id", PGUUID(as_uuid=True), primary_key=True),
+        # UUIDv7 like every other table (ADR-0006) — time-sortable, so an audit table read
+        # newest-first orders by its primary key.
+        sa.Column(
+            "id",
+            PGUUID(as_uuid=True),
+            primary_key=True,
+            server_default=sa.text("uuidv7()"),
+        ),
         # Deliberately NOT a ForeignKey — see the module docstring.
         sa.Column("project_id", PGUUID(as_uuid=True), nullable=False),
         sa.Column("project_name", sa.String(120), nullable=False),
@@ -62,7 +69,10 @@ def upgrade() -> None:
     # The two ways an administrator reads this: "what did this project's deletion say" and
     # "what has this person deleted". Declared on the model too, so `--autogenerate` stays
     # empty (the drift #147 was caught by).
-    op.create_index("ix_deleted_projects_project_id", _TABLE, ["project_id"])
+    # UNIQUE: one tombstone per physical deletion. Two concurrent DELETEs both passed the
+    # ownership read (no row lock) and both ran the cascade, writing two rows for one
+    # deletion. The loser now fails closed here. See the model for the full argument.
+    op.create_index("ix_deleted_projects_project_id", _TABLE, ["project_id"], unique=True)
     op.create_index("ix_deleted_projects_owner_id", _TABLE, ["owner_id"])
 
 

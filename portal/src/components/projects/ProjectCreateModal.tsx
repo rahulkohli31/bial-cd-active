@@ -15,6 +15,7 @@ import { useState } from 'react'
 import { countWords, MAX_PROJECT_NAME_WORDS } from '../../utils/words'
 import { X, Loader2 } from 'lucide-react'
 import { createProject, type Project } from '../../utils/projectApi'
+import { Dialog, DialogContent, DialogTitle } from '../ui/dialog'
 
 // The CHARACTER bound is now only a paste backstop at the column width — the limit a
 // person is told about is 8 WORDS (#158 §14), counted by the rule the server shares
@@ -61,21 +62,32 @@ export default function ProjectCreateModal({ onClose, onCreated }: ProjectCreate
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 font-manrope">
+    <Dialog
+      open
+      onOpenChange={(next) => {
+        // Escape, the overlay click and the close button all arrive here. `busy` holds it
+        // open mid-request, which is what the hand-rolled overlay's guard used to do.
+        if (!next && !busy) onClose()
+      }}
+    >
       {/* NOT shadcn's `bg-black/80`, and not the kit's 12px blur either (#158 §9). A flat
           scrim erases the page; a heavy blur costs you the row you were about to click. The
           panel earns attention from its own shadow and white, so the page behind it only
           needs softening. `-webkit-` stays for Safari: without it this degrades to a flat
           16% scrim, which is acceptable rather than broken. Overlay only — never the list
-          behind it, because `backdrop-filter` is GPU work over everything underneath. */}
-      <div
-          className="absolute inset-0 bg-slate-900/15 backdrop-blur-[3px] [-webkit-backdrop-filter:blur(3px)]"
-          onClick={busy ? undefined : onClose}
-        />
-      <div className="relative bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
+          behind it, because `backdrop-filter` is GPU work over everything underneath.
+
+          Passed as an override on the VENDORED dialog (§12) rather than a hand-rolled
+          `fixed inset-0`, so the panel also gets `role="dialog"`, `aria-modal`, a focus trap
+          and Escape — none of which the hand-rolled shell had. */}
+      <DialogContent
+        hideClose
+        overlayClassName="bg-slate-900/15 backdrop-blur-[3px] [-webkit-backdrop-filter:blur(3px)]"
+        className="font-manrope bg-white rounded-2xl shadow-2xl w-full max-w-md p-6 gap-0 border-0"
+      >
         <div className="flex items-start justify-between">
           <div>
-            <h3 className="text-base font-bold text-tertiary">New project</h3>
+            <DialogTitle className="text-base font-bold text-tertiary">New project</DialogTitle>
             <p className="text-sm text-neutral mt-0.5">A project owns one app, its description, and its chats.</p>
           </div>
           <button
@@ -157,7 +169,7 @@ export default function ProjectCreateModal({ onClose, onCreated }: ProjectCreate
             </button>
           </div>
         </form>
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   )
 }

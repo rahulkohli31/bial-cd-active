@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import pytest
 import sqlalchemy as sa
+from sqlalchemy.exc import IntegrityError
 
 from src.db.models.deleted_project import (
     MAX_DELETE_REMARK_WORDS,
@@ -33,7 +34,12 @@ from src.db.models.deleted_project import (
     DeletedProject,
 )
 from tests.api.v1.projects.test_projects_crud import _auth
-from tests.factories import ProjectFactory
+from tests.factories import (
+    AppRegistryFactory,
+    ConversationFactory,
+    ProjectFactory,
+    UserFactory,
+)
 
 _PROJECTS = "/v1/projects"
 
@@ -280,3 +286,106 @@ async def test_the_email_stands_in_when_entra_gave_no_display_name(client, db_se
     ).scalar_one()
     assert row.deleted_by_name == user.email
     assert row.deleted_by_name  # not blank, which is the failure this guards
+
+
+# --- one tombstone per physical deletion ----------------------------------------
+
+
+async def test_a_second_tombstone_for_the_same_project_is_refused(client, db_session) -> None:
+    """THE DATABASE IS THE GUARD, because nothing above it is.
+
+    `owned_project_or_404` takes no row lock, and `delete_project_cascade` deletes through
+    Core `sa.delete()` so no ORM staleness check fires. A double-click or a proxy retry
+    therefore ran the whole delete twice: two tombstones and duplicated audit rows for ONE
+    physical deletion, both requests answering 200 and the second having deleted nothing. On
+    an audit record for an irreversible action, an administrator who cannot tell one deletion
+    from two is the failure.
+
+    TWO OVERLAPPING REQUESTS ARE NOT EXPRESSIBLE HERE: the app fixture binds one
+    `db_session` to the whole test, so concurrent calls serialise on it and the race cannot
+    be staged. What IS testable is the thing that actually stops it — the unique constraint
+    the loser fails closed on — so this drives that directly. `tests/db/
+    test_migration_0036_deleted_projects.py` pins the index's existence; this pins its effect.
+    """
+    headers, user = await _auth(db_session)
+    project = await _project(db_session, user.id)
+    project_id = project.id
+
+    assert (await _delete(client, project_id, headers, _words(6))).status_code == 200
+
+    # The same project, deleted a second time: exactly what the retry would write.
+    # A SAVEPOINT, not a bare flush: the fixture wraps each test in an outer transaction it
+    # rolls back afterwards, and rolling back the session by hand deassociates that
+    # transaction and makes the teardown noisy. `begin_nested` unwinds only this insert.
+    with pytest.raises(IntegrityError):
+        async with db_session.begin_nested():
+            db_session.add(
+                DeletedProject(
+                    project_id=project_id,
+                    project_name="Visitor Log",
+                    owner_id=user.id,
+                    owner_email=user.email,
+                    deleted_by=user.id,
+                    deleted_by_name="E2E Dev User",
+                    remark=_words(6),
+                )
+            )
+
+
+async def test_the_tombstone_records_what_actually_went_with_it(client, db_session) -> None:
+    """The counts, asserted NON-ZERO — which is the only version of this test that means
+    anything.
+
+    They were previously only ever asserted at `0`/`False` on a bare project, so an
+    implementation hard-coding all three survived: `chats_deleted=0, had_app=False,
+    had_database=False` passed. These three are the only facts on the row that cannot be
+    reconstructed once the children are gone, so they are the ones worth pinning hardest.
+    """
+    headers, user = await _auth(db_session)
+    project = await _project(db_session, user.id)
+    await AppRegistryFactory.create(db_session, project_id=project.id, user_id=user.id)
+    for _ in range(3):
+        await ConversationFactory.create(db_session, user.id, project_id=project.id)
+    await db_session.commit()
+    project_id = project.id
+
+    assert (await _delete(client, project_id, headers, _words(6))).status_code == 200
+
+    row = (
+        await db_session.execute(
+            sa.select(DeletedProject).where(DeletedProject.project_id == project_id)
+        )
+    ).scalar_one()
+
+    assert row.chats_deleted == 3
+    assert row.had_app is True
+
+
+async def test_chats_are_counted_by_the_same_predicate_the_cascade_deletes_by(
+    client, db_session
+) -> None:
+    """`chats_deleted` must describe the rows that actually went.
+
+    The count read `project_id` alone while `delete_project_cascade` enumerates on
+    `project_id` AND `user_id`. Not exploitable — ownership is checked before either runs —
+    but it made the recorded number and the deleted set two different things by
+    construction, on a table whose whole job is to be accurate about what went.
+    """
+    headers, user = await _auth(db_session)
+    other = await UserFactory.create(db_session)
+    project = await _project(db_session, user.id)
+    await ConversationFactory.create(db_session, user.id, project_id=project.id)
+    # A stray row under the same project id owned by somebody else. The cascade will not
+    # delete it, so the tombstone must not count it either.
+    await ConversationFactory.create(db_session, other.id, project_id=project.id)
+    await db_session.commit()
+    project_id = project.id
+
+    assert (await _delete(client, project_id, headers, _words(6))).status_code == 200
+
+    row = (
+        await db_session.execute(
+            sa.select(DeletedProject).where(DeletedProject.project_id == project_id)
+        )
+    ).scalar_one()
+    assert row.chats_deleted == 1

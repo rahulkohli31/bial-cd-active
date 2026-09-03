@@ -120,12 +120,60 @@ describe('ProjectDeleteDialog — confirm gating', () => {
     expect(screen.getByText(/are you sure you want to delete this project/i)).toBeTruthy()
   })
 
-  it('says an administrator can read the reason', async () => {
-    // Someone writing what feels like a private note deserves to know who sees it (§13.2).
+  it('says what happens to the reason, and does not overpromise who reads it', async () => {
+    // It used to say "An administrator can see this." Nothing reads `deleted_projects` — no
+    // route, no schema, no screen — so that was a promise to a user rather than an internal
+    // TODO. The copy now states what the platform actually does; the read surface is tracked
+    // separately, and this test is what stops the old claim coming back before it lands.
     h.listProjectConversations.mockResolvedValue([])
     render(<ProjectDeleteDialog project={project} onClose={() => {}} onConfirm={vi.fn()} />)
 
-    expect(screen.getByText(/an administrator can see this/i)).toBeTruthy()
+    expect(screen.getByText(/kept with the deletion record/i)).toBeTruthy()
+    expect(screen.queryByText(/an administrator can see this/i)).toBeNull()
+  })
+
+  it('arms at EXACTLY the bounds, and disarms one word outside either', async () => {
+    // The boundaries themselves. The gating test above uses 2 / 6 / 51, so an off-by-one at
+    // either end survived it — and the server parametrises 5 and 50 directly, so a client
+    // that disagreed here would arm a button the API then refuses, with the counter reading
+    // a number the user was told was allowed.
+    h.listProjectConversations.mockResolvedValue([])
+    render(<ProjectDeleteDialog project={project} onClose={() => {}} onConfirm={vi.fn()} />)
+
+    const confirmBtn = screen.getByRole('button', { name: /delete project/i })
+    const reason = screen.getByLabelText(/why are you deleting/i)
+    const words = (n: number) => Array.from({ length: n }, (_, i) => `w${i}`).join(' ')
+
+    fireEvent.change(reason, { target: { value: words(4) } })
+    expect(confirmBtn.hasAttribute('disabled')).toBe(true)
+
+    fireEvent.change(reason, { target: { value: words(5) } }) // the floor itself
+    expect(confirmBtn.hasAttribute('disabled')).toBe(false)
+
+    fireEvent.change(reason, { target: { value: words(50) } }) // the ceiling itself
+    expect(confirmBtn.hasAttribute('disabled')).toBe(false)
+
+    fireEvent.change(reason, { target: { value: words(51) } })
+    expect(confirmBtn.hasAttribute('disabled')).toBe(true)
+  })
+
+  it('is a real modal: labelled, and dismissable with Escape', async () => {
+    // WHAT MOVING ONTO THE VENDORED DIALOG BOUGHT (§12). The hand-rolled `fixed inset-0`
+    // announced itself as nothing and could not be closed from the keyboard — in the one
+    // dialog that asks for a required free-text answer before a destructive action.
+    h.listProjectConversations.mockResolvedValue([])
+    const onClose = vi.fn()
+    render(<ProjectDeleteDialog project={project} onClose={onClose} onConfirm={vi.fn()} />)
+
+    const dialog = screen.getByRole('dialog')
+    // NOT `aria-modal`: Radix marks the rest of the document `aria-hidden` instead, which is
+    // the approach with the better assistive-technology support. Asserting `aria-modal` here
+    // would fail against a dialog that is correctly modal.
+    expect(dialog.getAttribute('aria-labelledby')).toBeTruthy()
+    expect(dialog.getAttribute('aria-describedby')).toBeTruthy()
+
+    fireEvent.keyDown(dialog, { key: 'Escape' })
+    expect(onClose).toHaveBeenCalled()
   })
 })
 

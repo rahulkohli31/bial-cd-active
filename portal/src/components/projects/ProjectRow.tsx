@@ -13,10 +13,15 @@
  * wrapping it in a link, is what breaks it. Native buttons carry Enter and Space for free,
  * so there is no key handler here and there should not be one.
  *
- * THE DESCRIPTION TOOLTIP IS CONDITIONAL, per §10: a clamped description reveals its full
- * text on hover, and a short one shows nothing. A tooltip that fires on text the reader can
- * already see in full is noise, so it is gated on the element actually being clipped
+ * BOTH TOOLTIPS ARE CONDITIONAL, per §10 (description) and §14 (name): clipped text reveals
+ * itself on hover, and text that already fits shows nothing. A tooltip firing on text the
+ * reader can see in full is noise, so each is gated on the element actually being clipped
  * (`scrollWidth > clientWidth`), measured after layout rather than guessed from length.
+ *
+ * THE DESCRIPTION HAS TO BE LIFTED ABOVE THE STRETCHED `::after` to be hoverable at all —
+ * see `ClampedDescription`. That is the same reason Delete carries `z-10`, and it is why the
+ * description also wires `onOpen` back: lifting it out of the overlay takes it out of the
+ * row's click target unless you put it back.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Trash2 } from 'lucide-react'
@@ -31,13 +36,15 @@ export interface ProjectRowProps {
   onDelete: () => void
 }
 
-/** The description cell: one line, ellipsis, and a tooltip ONLY when it is really clipped. */
-function ClampedDescription({ text }: { text: string | null }): React.JSX.Element {
-  const ref = useRef<HTMLParagraphElement>(null)
+/**
+ * Is this element's text ACTUALLY clipped? Measured after layout, never guessed from length —
+ * character heuristics are wrong at every breakpoint — and re-measured on resize, because a
+ * column that widens un-clips text that was clipped a moment ago.
+ */
+function useClipped<T extends HTMLElement>(text: string | null) {
+  const ref = useRef<T>(null)
   const [clipped, setClipped] = useState(false)
 
-  // Measured, not guessed. Character-count heuristics are wrong at every breakpoint, and
-  // this has to be re-measured when the column width changes, not only on mount.
   const measure = useCallback(() => {
     const el = ref.current
     if (el) setClipped(el.scrollWidth > el.clientWidth)
@@ -51,12 +58,38 @@ function ClampedDescription({ text }: { text: string | null }): React.JSX.Elemen
     return () => observer.disconnect()
   }, [measure, text])
 
+  return { ref, clipped }
+}
+
+/**
+ * The description cell: one line, ellipsis, and a tooltip ONLY when it is really clipped.
+ *
+ * `relative z-10` IS LOAD-BEARING AND WAS MISSING. The name button's stretched `::after` is
+ * positioned against the row, so it painted over this static sibling and took every pointer
+ * event: hovering a clipped description hit the BUTTON, and the tooltip — correctly built and
+ * correctly measured — could never open. jsdom does no hit testing, so no unit test in the
+ * suite could see it.
+ *
+ * Lifting it costs the row's click target here, so `onOpen` is wired back explicitly. It stays
+ * a `<p>` rather than becoming a button: the name is already the row's one keyboard-reachable
+ * open affordance, and a second interactive element covering the same action is the shape
+ * F-10 exists to prevent.
+ */
+function ClampedDescription({
+  text,
+  onOpen,
+}: {
+  text: string | null
+  onOpen: () => void
+}): React.JSX.Element {
+  const { ref, clipped } = useClipped<HTMLParagraphElement>(text)
+
   if (text === null) {
-    return <p className="text-xs text-neutral/70 italic truncate">No description yet</p>
+    return <p className="relative z-10 text-xs text-neutral/70 italic truncate">No description yet</p>
   }
 
   const paragraph = (
-    <p ref={ref} className="text-xs text-neutral truncate">
+    <p ref={ref} onClick={onOpen} className="relative z-10 text-xs text-neutral truncate cursor-pointer">
       {text}
     </p>
   )
@@ -74,6 +107,40 @@ function ClampedDescription({ text }: { text: string | null }): React.JSX.Elemen
   )
 }
 
+/**
+ * The name, with the SAME treatment §14 asks for: clamp with an ellipsis, show the full title
+ * on hover. The cap is not retroactive, so stored 120-character names are precisely the ones
+ * that clip — and the tooltip is the only way to read them.
+ *
+ * The button keeps its stretched `::after`: this is the row's open affordance, so it must stay
+ * the thing covering the row.
+ */
+function ClampedName({ name, onOpen }: { name: string; onOpen: () => void }): React.JSX.Element {
+  const { ref, clipped } = useClipped<HTMLButtonElement>(name)
+
+  const button = (
+    <button
+      ref={ref}
+      onClick={onOpen}
+      className="text-sm font-semibold text-tertiary hover:text-primary transition text-left truncate max-w-full after:absolute after:inset-0 after:content-[''] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 rounded"
+    >
+      {name}
+    </button>
+  )
+  if (!clipped) return button
+
+  return (
+    <TooltipProvider delayDuration={200}>
+      <Tooltip>
+        <TooltipTrigger asChild>{button}</TooltipTrigger>
+        <TooltipContent side="bottom" align="start" className="max-w-md">
+          {name}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  )
+}
+
 export default function ProjectRow({ project, onOpen, onDelete }: ProjectRowProps): React.JSX.Element {
   const status = statusFor(project)
 
@@ -82,13 +149,8 @@ export default function ProjectRow({ project, onOpen, onDelete }: ProjectRowProp
       <div className="min-w-0 flex-1">
         {/* The open affordance. Its ::after covers the row, so the whole row is the target
             without the row itself being interactive. */}
-        <button
-          onClick={onOpen}
-          className="text-sm font-semibold text-tertiary hover:text-primary transition text-left truncate max-w-full after:absolute after:inset-0 after:content-[''] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 rounded"
-        >
-          {project.name}
-        </button>
-        <ClampedDescription text={project.description} />
+        <ClampedName name={project.name} onOpen={onOpen} />
+        <ClampedDescription text={project.description} onOpen={onOpen} />
       </div>
 
       <p className="hidden sm:block text-xs text-neutral whitespace-nowrap w-28 text-right">

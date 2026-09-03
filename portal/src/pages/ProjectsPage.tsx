@@ -24,7 +24,17 @@
  */
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Plus, Search, LayoutGrid, List as ListIcon, AlertTriangle, AlertCircle, X } from 'lucide-react'
+import {
+  Plus,
+  Search,
+  LayoutGrid,
+  List as ListIcon,
+  AlertTriangle,
+  AlertCircle,
+  X,
+  ChevronsLeft,
+  ChevronsRight,
+} from 'lucide-react'
 import Navbar from '../components/layout/Navbar'
 import {
   listProjects,
@@ -106,7 +116,12 @@ export default function ProjectsPage(): React.JSX.Element {
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState<number>(PAGE_SIZES[0])
   const [q, setQ] = useState('')
+  // WHAT THE ROWS ON SCREEN ANSWER, as opposed to what was last asked for. `appliedQuery`
+  // already worked this way; `appliedPage`/`appliedPageSize` are its missing siblings, and
+  // the footer needs them for the same reason the empty state needs the query.
   const [appliedQuery, setAppliedQuery] = useState<string | null>(null)
+  const [appliedPage, setAppliedPage] = useState(1)
+  const [appliedPageSize, setAppliedPageSize] = useState<number>(PAGE_SIZES[0])
 
   const [items, setItems] = useState<Project[]>([])
   const [total, setTotal] = useState(0)
@@ -115,7 +130,11 @@ export default function ProjectsPage(): React.JSX.Element {
   const [error, setError] = useState<Error | null>(null)
   const [counts, setCounts] = useState<ProjectCounts | null>(null)
   const [reloadNonce, setReloadNonce] = useState(0)
-  const [deleteInFlight, setDeleteInFlight] = useState(false)
+  // DELETES IN FLIGHT, BY ID — not a boolean. Two overlapping deletes shared one flag, so the
+  // faster one's `finally` cleared it while the slower was still running: precisely the
+  // window the guard exists to cover. A set is the same treatment `requestId` already gets.
+  const [deletingIds, setDeletingIds] = useState<ReadonlySet<string>>(() => new Set())
+  const deleteInFlight = deletingIds.size > 0
 
   // Out-of-order guard: a slow page that lands after a newer one must not overwrite it.
   const requestId = useRef(0)
@@ -138,6 +157,8 @@ export default function ProjectsPage(): React.JSX.Element {
         setTotal(res.total)
         setTotalPages(res.totalPages)
         setAppliedQuery(debouncedQ)
+        setAppliedPage(res.page)
+        setAppliedPageSize(res.pageSize)
         setError(null)
       })
       .catch((caught: unknown) => {
@@ -159,7 +180,14 @@ export default function ProjectsPage(): React.JSX.Element {
     let alive = true
     listProjectCounts()
       .then((c) => alive && setCounts(c))
-      .catch(() => alive && setCounts(null))
+      // A REFRESH FAILURE KEEPS THE LAST KNOWN-GOOD NUMBERS. Clearing to `null` sent the
+      // tiles back to their skeleton, so a page showing real rows underneath grew three
+      // empty boxes above them — which reads as the page breaking rather than as one
+      // request failing. The skeleton means "not asked yet", and after a successful load
+      // that is no longer true. Slightly stale beats visibly broken.
+      .catch(() => {
+        /* keep `counts` as it stands */
+      })
     return () => {
       alive = false
     }
@@ -189,7 +217,7 @@ export default function ProjectsPage(): React.JSX.Element {
 
   const handleDelete = async (project: Project, remark: string): Promise<void> => {
     setDeleting(null)
-    setDeleteInFlight(true)
+    setDeletingIds((ids) => new Set(ids).add(project.id))
     setItems((rows) => rows.filter((p) => p.id !== project.id))
     try {
       await deleteProject(project.id, remark)
@@ -205,7 +233,11 @@ export default function ProjectsPage(): React.JSX.Element {
       setReloadNonce((n) => n + 1) // put the row back
       setToast(caught instanceof Error ? caught.message : 'Could not delete the project.')
     } finally {
-      setDeleteInFlight(false)
+      setDeletingIds((ids) => {
+        const next = new Set(ids)
+        next.delete(project.id)
+        return next
+      })
     }
   }
 
@@ -219,7 +251,10 @@ export default function ProjectsPage(): React.JSX.Element {
   // projects for the length of a database drop.
   const showFirstRun =
     settled && !loading && !deleteInFlight && error === null && isEmpty && appliedQuery === ''
-  const showNoMatches = settled && !loading && error === null && isEmpty && !!appliedQuery
+  // Gated on the same flag as the first run, and for the same reason: deleting the last
+  // matching row must not claim the search found nothing for the length of the round trip.
+  const showNoMatches =
+    settled && !loading && !deleteInFlight && error === null && isEmpty && !!appliedQuery
   const showRows = !isEmpty
   // A SLIDING WINDOW, not the first five. `Math.min(totalPages, 5)` rendered pages 1-5
   // whatever page you were on, so from page 6 nothing was marked active and the only way
@@ -231,7 +266,14 @@ export default function ProjectsPage(): React.JSX.Element {
     return Array.from({ length: span }, (_, i) => first + i)
   }, [page, totalPages])
 
-  const firstOnPage = useMemo(() => (page - 1) * pageSize + 1, [page, pageSize])
+  // DERIVED FROM WHAT THE ROWS ANSWER, never from what was requested. §11 requires a failed
+  // page to leave the rows already on screen intact — which it does — but the footer then
+  // narrated the page that FAILED over the rows that succeeded: 12 projects, page 2 refused,
+  // and the caption read `Showing 9–16 of 12`, a range past its own total, above rows 1-8.
+  const firstOnPage = useMemo(
+    () => (appliedPage - 1) * appliedPageSize + 1,
+    [appliedPage, appliedPageSize],
+  )
   const lastOnPage = useMemo(() => firstOnPage + items.length - 1, [firstOnPage, items.length])
 
   return (
@@ -475,11 +517,27 @@ export default function ProjectsPage(): React.JSX.Element {
                 </label>
 
                 <span className="whitespace-nowrap tabular-nums">
-                  Page {page} of {Math.max(totalPages, 1)}
+                  Page {appliedPage} of {Math.max(totalPages, 1)}
                 </span>
 
+                {/* WRAPS rather than overflowing. The number list reached `right: 534px` on a
+                    390px screen with only two pages, which put a horizontal scrollbar on the
+                    landing page and got worse with six. */}
                 <Pagination className="mx-0 w-auto">
-                  <PaginationContent>
+                  <PaginationContent className="flex-wrap justify-end">
+                    {/* §2 spells the control set literally — « ‹ 1 2 › » — and the board draws
+                        four icon buttons around the numbers. Jump-to-first/last were missing;
+                        at six pages the difference is four clicks or one. */}
+                    <PaginationItem>
+                      <PaginationLink
+                        aria-label="First page"
+                        aria-disabled={page <= 1}
+                        onClick={() => page > 1 && setPage(1)}
+                        className={page <= 1 ? 'pointer-events-none opacity-40' : undefined}
+                      >
+                        <ChevronsLeft size={15} />
+                      </PaginationLink>
+                    </PaginationItem>
                     <PaginationItem>
                       <PaginationPrevious
                         aria-disabled={page <= 1}
@@ -489,7 +547,7 @@ export default function ProjectsPage(): React.JSX.Element {
                     </PaginationItem>
                     {pageWindow.map((n) => (
                       <PaginationItem key={n}>
-                        <PaginationLink isActive={n === page} onClick={() => setPage(n)}>
+                        <PaginationLink isActive={n === appliedPage} onClick={() => setPage(n)}>
                           {n}
                         </PaginationLink>
                       </PaginationItem>
@@ -500,6 +558,18 @@ export default function ProjectsPage(): React.JSX.Element {
                         onClick={() => page < totalPages && setPage(page + 1)}
                         className={page >= totalPages ? 'pointer-events-none opacity-40' : undefined}
                       />
+                    </PaginationItem>
+                    <PaginationItem>
+                      <PaginationLink
+                        aria-label="Last page"
+                        aria-disabled={page >= totalPages}
+                        onClick={() => page < totalPages && setPage(totalPages)}
+                        className={
+                          page >= totalPages ? 'pointer-events-none opacity-40' : undefined
+                        }
+                      >
+                        <ChevronsRight size={15} />
+                      </PaginationLink>
                     </PaginationItem>
                   </PaginationContent>
                 </Pagination>

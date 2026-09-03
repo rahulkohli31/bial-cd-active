@@ -275,3 +275,61 @@ async def test_a_rejected_app_is_not_live_either(client, db_session) -> None:
     await _deploy(db_session, app, user.id)
 
     assert (await _rows(client, headers))["Refused"] is False
+
+
+# --- every endpoint that returns a project, not just the list -------------------
+
+
+async def test_the_single_project_endpoint_reports_serving_too(client, db_session) -> None:
+    """`GET /v1/projects/{id}` answers the same question the list does.
+
+    THE GAP THIS CLOSES. `is_serving` reached `_to_response` with a `bool = False` default,
+    and three of the five call sites never passed it — so a live app read as not serving on
+    every endpoint except the list, and the default is exactly what let the omission
+    type-check. Nothing was visibly broken because no portal code read the field off those
+    responses yet; the project page being rebuilt on a parallel branch is the consumer that
+    would have.
+    """
+    headers, user = await _auth(db_session)
+    project, app = await _project_with_app(db_session, user.id, name="Visitor Log")
+    await _deploy(db_session, app, user.id)
+    await db_session.commit()
+
+    resp = await client.get(f"{_PROJECTS}/{project.id}", headers=headers)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["isServing"] is True
+
+
+async def test_a_patch_answers_serving_from_the_deployment_not_the_default(
+    client, db_session
+) -> None:
+    """A rename must not flip a live app to not-serving in the response it returns."""
+    headers, user = await _auth(db_session)
+    project, app = await _project_with_app(db_session, user.id, name="Visitor Log")
+    await _deploy(db_session, app, user.id)
+    await db_session.commit()
+
+    resp = await client.patch(
+        f"{_PROJECTS}/{project.id}", headers=headers, json={"name": "Gate Pass Log"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["name"] == "Gate Pass Log"
+    assert resp.json()["isServing"] is True
+
+
+async def test_a_project_with_no_app_is_not_serving_on_the_single_endpoint(
+    client, db_session
+) -> None:
+    """The discriminating other half: False here is a CONFIRMED absence, not the old
+    default reappearing. Without this, hard-coding `is_serving=True` would pass the two
+    tests above."""
+    headers, user = await _auth(db_session)
+    project = await ProjectFactory.create(db_session, user.id, name="Nothing Built")
+    await db_session.commit()
+
+    resp = await client.get(f"{_PROJECTS}/{project.id}", headers=headers)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["isServing"] is False
