@@ -195,7 +195,9 @@ const Composer: FC<ComposerProps> = ({
     // boards draw as a locked box, and it can be true at the same time as the three above it — so
     // "an offer is pending" is not the same question as "the offer is why Send is waiting", and it
     // is the second one the treatment answers to.
-    if (cap.over) return { reason: cap.message, fromOffer: false }
+    // `capState` sets `message` exactly when `over`, and naming both is how that is said without a
+    // cast: a cap with nothing to say about itself is not a reason anyone could act on.
+    if (cap.over && cap.message) return { reason: cap.message, fromOffer: false }
     if (isRunning) return { reason: 'Replying — keep typing if you like; send unlocks when it is done.', fromOffer: false }
     if (gate?.blocked) return { reason: gate.reason, fromOffer: false }
     if (offerPending) return { reason: OFFER_GATE_NOTE, fromOffer: true }
