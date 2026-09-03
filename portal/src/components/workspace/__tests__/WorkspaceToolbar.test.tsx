@@ -222,6 +222,49 @@ describe('what the row names on each address', () => {
     expect(screen.getByRole('button', { name: 'Back to project' })).toBeTruthy()
   })
 
+  it('★ a chat still inside its load window is drawn as a CHAT, not as the project screen', () => {
+    // THE FAILURE THIS IS WRITTEN AGAINST, and it is a whole `GET /conversations/{id}` long: open
+    // a bare `/chat/{id}` — a reload, a bookmark, the hand-over out of a plan chat — and neither
+    // the kind nor the project has arrived. The row used to take that to mean "project screen": a
+    // lone <h1> reading "Your project", no breadcrumb, and a back control labelled and aimed at
+    // the projects list. A citizen who reloaded a build chat and pressed back was thrown out of
+    // the project entirely, and the row re-shaped under them when the fetch landed.
+    //
+    // The scenario above this one keeps `chatKind: 'build'`, so it asserts a state the product
+    // never actually passes through; this is the state it does.
+    render(
+      <Workspace
+        entry="/chat/c1"
+        chat={{ heading: { projectId: null, projectName: null, chatTitle: null, chatKind: null } }}
+      />,
+    )
+
+    // The discriminator between the two shapes: on the project screen "Your project" IS the <h1>;
+    // on a chat it is the breadcrumb beside it and the <h1> is the chat's own slot.
+    expect(row().textContent).toContain('Your project')
+    expect(title().textContent).toBe('')
+    // Rename belongs to the project screen; nothing on a chat address may offer it.
+    expect(screen.queryByRole('button', { name: /rename/i })).toBeNull()
+    // And the way out says where it actually goes: with no project resolved there is none to
+    // return to, so it is the list, and it says the list.
+    expect(screen.getByRole('button', { name: 'Back to projects' })).toBeTruthy()
+    // LIVENESS: the row is drawn at full height throughout, which is the property that stops the
+    // layout shifting when the fetch lands.
+    expect(row().className).toMatch(/h-\[54px\]/)
+  })
+
+  it('★ and its back control reaches the project the moment the URL names one, kind or no kind', () => {
+    render(
+      <Workspace
+        entry="/chat/c1"
+        chat={{ heading: { projectId: 'pA', projectName: null, chatTitle: null, chatKind: null } }}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Back to project' }))
+    expect(screen.getByTestId('where').textContent).toBe('/projects/pA')
+  })
+
   it('★ when the project fetch FAILED the row still names something and back still works', () => {
     // A project deleted out from under an open chat. `null` is the same value for "not yet" and
     // "never", and in both the row keeps its height, its word and its way out.

@@ -21,6 +21,12 @@
  * open of a chat address renders the row at its full height with its back control working while
  * the conversation and the project are both still resolving. See `WorkspaceHeading`.
  *
+ * WHICH OF THE TWO SHAPES IT DRAWS comes from `rail.mode` instead, and that is the whole reason
+ * the two are separate reads. The heading's fields are ANSWERS — a name, a title, a kind — and
+ * every one of them arrives from a fetch; the rail's mode is derived from the pathname, so it is
+ * right on the first frame. Deciding the shape from an answer meant the row wore the project
+ * screen's layout for the length of a cold chat open and then re-shaped under the reader.
+ *
  * It deliberately does NOT read the `pane` cell, which is the obvious place chrome already lives:
  * that cell is republished on every keystroke in the composer and is cleared to nothing when its
  * publisher unmounts. Either one alone would disqualify it.
@@ -53,7 +59,7 @@ import {
 } from 'lucide-react'
 import PublishStatusChip from '../PublishStatusChip'
 import { chatKindFor } from '../../utils/chatKind'
-import { useWorkspaceActions, useWorkspaceAddress, useWorkspaceHeading, useWorkspacePaneVisible, useWorkspaceSave } from './workspaceChannel'
+import { useRailSlot, useWorkspaceActions, useWorkspaceAddress, useWorkspaceHeading, useWorkspacePaneVisible, useWorkspaceSave } from './workspaceChannel'
 import type { SaveSlot, WorkspaceActions } from './workspaceChannel'
 import { WORKSPACE_RAIL_ID } from './WorkspaceShell'
 
@@ -99,10 +105,19 @@ export default function WorkspaceToolbar({
   const address = useWorkspaceAddress()
   const paneVisible = useWorkspacePaneVisible()
 
-  // A CHAT IS WHAT HAS A KIND, not what has a title. A freshly minted chat has no row yet and so
-  // no title at all, and the row still has to draw it as a chat rather than fall back to the
-  // project screen's layout for the seconds before the first message lands.
-  const isChat = heading.chatKind !== null
+  // WHICH SHAPE THE ROW TAKES IS A FACT ABOUT THE ADDRESS, not about the conversation. It used to
+  // be `heading.chatKind !== null`, and a kind is something only the SERVER can answer: opening a
+  // bare `/chat/{id}` — a reload, a bookmark, the hand-over out of a plan chat — spends a whole
+  // `GET /conversations/{id}` with no kind at all. For that window the row drew the PROJECT
+  // screen's shape over a chat: a lone `<h1>` reading "Your project", no breadcrumb, and a back
+  // control labelled and aimed at the projects list, which threw a citizen who reloaded and
+  // pressed back straight out of the project they were in. Then it re-shaped under them when the
+  // fetch landed — the layout shift this row is drawn by the shell to prevent.
+  //
+  // The rail's mode is that fact and it is available from the first frame: the shell derives it
+  // from the pathname and nothing else (`railModeFor`), so a chat address is a chat address before
+  // anything has been fetched. The KIND still decides only what the kind pill says.
+  const isChat = useRailSlot().mode === 'conversation'
   const kind = useMemo(() => (heading.chatKind ? chatKindFor(heading.chatKind) : null), [heading.chatKind])
   // Capitalised so JSX reads it as a component rather than as an intrinsic element. `null` is a
   // kind whose pill is the word alone — see `pillIcon`.
@@ -113,6 +128,10 @@ export default function WorkspaceToolbar({
   // row keeps its height, its back control and a word in the slot — which is what stops the layout
   // shifting under someone when the fetch lands.
   const projectName = heading.projectName ?? 'Your project'
+
+  /** The same predicate `WorkspaceShell`'s back handler uses, so the label cannot promise a
+   *  destination the press does not go to. */
+  const backToProject = isChat && heading.projectId !== null
 
   // Only when there is something to point at. The device widths and the new-tab link both describe
   // a framed app, and drawing them over an empty pane offers controls that cannot do anything.
@@ -126,8 +145,11 @@ export default function WorkspaceToolbar({
       <button
         type="button"
         onClick={onBack}
-        aria-label={isChat ? 'Back to project' : 'Back to projects'}
-        title={isChat ? 'Back to project' : 'Back to projects'}
+        // WHAT IT SAYS IS WHAT IT DOES. The shell sends this to the chat's own project only when
+        // there IS one to send it to; a chat whose project has not resolved yet goes to the
+        // projects list, and must say so rather than promising a project it cannot reach.
+        aria-label={backToProject ? 'Back to project' : 'Back to projects'}
+        title={backToProject ? 'Back to project' : 'Back to projects'}
         className="inline-flex flex-shrink-0 items-center rounded-lg p-0.5 text-neutral transition hover:text-primary"
       >
         <ChevronLeft size={16} />
@@ -164,8 +186,13 @@ export default function WorkspaceToolbar({
           >
             {/* A CHAT WITH NO TITLE YET IS THE ORDINARY CASE, not an error: the row is created by
                 the first send and its title is derived from that message. Naming the kind is more
-                use than an empty slot or a spinner. */}
-            {heading.chatTitle || `New ${kind?.word.toLowerCase() ?? 'chat'}`}
+                use than an empty slot or a spinner.
+
+                WITH NO KIND EITHER, the slot stays empty for that one fetch. "New chat" would be a
+                claim — this chat is brand new — about a chat that is far more often an existing
+                one still loading, and the row holds its 54px height regardless, so nothing shifts
+                by waiting the moment out. */}
+            {heading.chatTitle || (kind ? `New ${kind.word.toLowerCase()}` : '')}
           </h1>
         </>
       ) : (

@@ -161,16 +161,29 @@ export default function ChatRoute() {
   // whether the project already has an app (`project.appId`) without firing a mutating
   // provision call to find out. A 404 here means the project was deleted out from under
   // an open chat — show the transcript anyway, unnamed. Never redirect on this.
-  const projectId = resolution.status === 'ready' ? resolution.projectId : null
+  //
+  // WHILE THE CONVERSATION IS STILL RESOLVING, the URL's own `?projectId=` stands in. It is the
+  // only thing that knows the project during that window, and it is right whenever it is present:
+  // a chat that has not saved its first message yet carries it, and the resolution replaces it the
+  // moment the server answers. Without it the toolbar row spent the whole fetch with no project to
+  // name and no project to send its back control to.
+  const projectId =
+    resolution.status === 'ready' ? resolution.projectId : queryRef.current.projectId
 
   // WHAT THE TOOLBAR ROW NAMES (plan 002, U2). Published from the ROUTE rather than from the
   // surface below it, because this component is mounted for the whole life of the address —
   // including the loading branch, where neither the conversation nor the project has resolved and
   // the row still has to render at full height with a working back control.
   //
-  // THE KIND IS WHAT MAKES IT A CHAT HEADING, not the title: a chat this session just minted has
-  // no row and so no title, and the row must still draw it as a chat rather than falling back to
-  // the project screen's shape for the seconds before the first message lands.
+  // WHAT MAKES THE ROW DRAW A CHAT is the ADDRESS, which the shell reads off the pathname — not
+  // anything published here. Every field below is an ANSWER from a fetch, and each may legitimately
+  // be `null` on its own: a chat this session just minted has no row and so no title, and a chat
+  // whose project was deleted has no name. None of them decides the shape.
+  //
+  // THE KIND IS NOT GUESSED FROM THE QUERY the way the project is. `?kind=` is user-controllable
+  // and a saved chat's URL can legitimately still carry a stale one, so publishing it would let a
+  // hand-edited link flash the wrong pill over a real conversation. `null` costs the row its kind
+  // pill for one fetch and nothing else — the row's SHAPE comes from the address, not from here.
   usePublishHeading({
     projectId,
     projectName: project !== null && project.id === projectId ? project.name : null,
