@@ -1,29 +1,23 @@
 /**
- * ONE COMPOSER (R40, R41, R42, R43, R45, R55, R57–R60, R64, R72).
+ * THE CHAT'S COMPOSER (R40, R41, R42, R43, R45, R55, R57–R60, R64, R72; plan 002, U5).
  *
- * There were three, with three different growth, draft and restore behaviours: BuilderPage's fixed
- * two-row textarea with a sessionStorage draft and a send that holds the draft until the server
- * confirms; ChatPage's autogrowing input with no draft persistence and a blind restore; and
- * ProjectBuilder's five-row box with a REAL `disabled` on its start button. This replaces the first
- * two. The third is Plan F's to retire onto this same component, which is why the verification
- * counts IMPLEMENTATIONS rather than call sites — a call-site count goes stale the moment F lands.
+ * ═══ WHAT IS HERE AND WHAT IS NOT ═══
+ *
+ * The BOX — the border, the input, the attachment control, the send control, the chips, the
+ * dropzone and the clear-only-on-acceptance rule — is `ComposerBox`, shared with the project
+ * rail. What stays here is what the rail does not have: the character cap, the offer strip, the
+ * stop control, the context warning, and the draft that follows a conversation.
+ *
+ * The two composers differ in seven respects, so a single component with a placeholder prop would
+ * have been a fiction. They share a CORE, not an identity.
  *
  * ══ NOTHING HERE IS EVER `disabled` (R45, R64) ══
  *
  * Not the textarea, not attach, not Send — in any state, including while a turn runs, while an
  * offer is pending, and when today's budget is spent. `disabled` on the currently-focused element
  * blurs it to `document.body`, which is the mechanism behind "it blurs mid-sentence and focus never
- * comes back". This codebase records that twice already and it is not a style preference.
- *
- * Send carries `aria-disabled` with the reason in its accessible name, and THE ENFORCEMENT IS IN
- * THE HANDLER. The attribute is affordance only. A test queries the whole subtree for a real
- * `disabled` attribute and expects none, which is the mechanical form of "the library's Send is not
- * used here".
- *
- * The library's Send could not have been used: `createActionButton` renders
- * `<button disabled={props.disabled || !callback}>` and `useComposerSend` returns no callback while
- * `isRunning && !capabilities.queue` — and `queue` is never registered. So it is guaranteed to ship
- * the exact bug R45 forbids, for the whole of every turn.
+ * comes back". This codebase records that twice already and it is not a style preference. The
+ * boards say the same thing in words: the composer keeps accepting typing while the agent answers.
  *
  * ══ THE DRAFT IS CONSUMED, NOT OWNED (R-7) ══
  *
@@ -31,50 +25,33 @@
  * conversation, last-writer-wins across tabs, cleared only on a SUCCESSFUL send, throw-wrapped
  * because `sessionStorage` genuinely throws in Safari private mode rather than degrading.
  *
- * A second writer is the interleaving hazard R58 is about, so there is exactly one.
+ * IT IS WRITTEN THROUGH THE RUNTIME NOW, not through local state, because the library owns the
+ * composer's text. Hydration sets it; every keystroke mirrors it out. One writer either way.
  *
- * ══ ISSUE #154's FOUR DEFECTS ARE PROPERTIES HERE, NOT PATCHES (R57–R60) ══
+ * ══ ISSUE #154's FOUR DEFECTS ARE PROPERTIES, NOT PATCHES (R57–R60) ══
  *
- * R58 — THE DRAFT OVERWRITE. `ChatPage` did a blind `setText(rawText)` on a failed send, and
- *   because the input was fully controlled the browser's undo stack could not recover what it
- *   replaced. The better design already existed in the other file: BuilderPage HOLDS the draft
- *   until the server confirms, and therefore needs no restore at all. That is what this does — the
- *   text is never cleared optimistically, so there is nothing to put back and no race to guard.
- * R59 — DROPPED IN-FLIGHT READS. A `fileToBase64` still resolving when the composer cleared was
- *   discarded silently, and the citizen believed the model could see a file it could not. Because
- *   nothing clears until the server confirms, a read that lands late lands on the send it belongs
- *   to; if the send has already gone, the reader is TOLD rather than left with silence.
- * R57 — THE CAP BYPASS lived in `usePendingAttachments.restorePending`, which merged a restored
- *   batch with no per-message clamp. It is fixed there, and this composer additionally never
- *   CALLS it: nothing is cleared optimistically, so there is nothing to restore. Both halves
- *   matter — the clamp because the function is still exported and reachable, and the non-call
- *   because a defect you cannot reach is better than one you have guarded.
- * R60 — CROSS-CHAT LEAKAGE is guarded by the send path stamping the conversation it is sending to
- *   and comparing on completion.
+ * R58 — THE DRAFT OVERWRITE. Nothing is cleared optimistically, so a failed send leaves the text
+ *   and the files exactly where they were and there is no restore path to race with. That rule
+ *   lives in `ComposerBox`, against the library's own `composer.send()`, which empties the text
+ *   before it awaits anything.
+ * R59 — DROPPED IN-FLIGHT READS. Because nothing clears until the server confirms, a read that
+ *   lands late lands on the send it belongs to.
+ * R57 — THE CAP BYPASS. The adapter validates against what is ALREADY staged, read live off the
+ *   runtime — see `stagedAttachments.tsx` for why that is a ref rather than a closure.
+ * R60 — CROSS-CHAT LEAKAGE is guarded by the send path stamping the conversation at press time
+ *   and the surface comparing it on completion.
  */
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ChangeEvent,
-  type FC,
-  type KeyboardEvent,
-} from 'react'
-import { Paperclip, Send, X } from 'lucide-react'
-import TextareaAutosize from 'react-textarea-autosize'
+import { useCallback, useEffect, useMemo, type FC } from 'react'
+import { useAui, useAuiState } from '@assistant-ui/react'
 
-import { ACCEPT_ATTR, type PendingAttachment } from '../../utils/attachmentInput'
 import { capState, MAX_COMPOSER_CHARS } from '../../utils/composerCap'
 import { clearDraft, readDraft, writeDraft } from '../../utils/composerDraft'
-import { usePendingAttachments } from '../../hooks/usePendingAttachments'
-import Announcer from './Announcer'
-import AttachmentPreview, { type PreviewTarget } from './AttachmentPreview'
+import ComposerBox, { type ComposerSubmission } from './ComposerBox'
 import OfferStrip, { OFFER_GATE_NOTE, type OfferStripProps } from './OfferStrip'
 import StopTurnControl, { type StopTurnControlProps } from './StopTurnControl'
 
-/** What one send carries. The composer assembles it; the surface performs it. */
+export type { ComposerSubmission } from './ComposerBox'
+
 /**
  * A refusal whose message was WRITTEN FOR THE CITIZEN and is therefore safe to show.
  *
@@ -95,13 +72,6 @@ export class SendRefusal extends Error {
     this.name = 'SendRefusal'
     this.silent = opts.silent ?? false
   }
-}
-
-export interface ComposerSubmission {
-  text: string
-  attachments: PendingAttachment[]
-  /** The conversation this send belongs to, stamped at press time (R60). */
-  conversationId: string
 }
 
 export interface ComposerProps {
@@ -126,9 +96,7 @@ export interface ComposerProps {
    *
    * A SENTENCE, NOT A NUMBER AND NOT A STATE. The surface owns the transcript and therefore
    * owns the estimate (`utils/contextLimits.ts`); the composer's job is to show the line where
-   * a citizen will read it. Passing the computed sentence rather than the messages is what
-   * keeps this component free of a second opinion about how long a conversation is — the
-   * failure mode this whole guardrail is being rebuilt out of.
+   * a citizen will read it.
    *
    * IT IS NOT A GATE. Send stays available past the soft threshold; the hard boundary is the
    * server's refusal, which arrives as an ordinary turn error.
@@ -137,9 +105,6 @@ export interface ComposerProps {
   /** Urgent sentences go to the assertive slot the surface owns. */
   onUrgent: (message: string) => void
 }
-
-const MIN_ROWS = 2
-const MAX_ROWS = 12
 
 const Composer: FC<ComposerProps> = ({
   conversationId,
@@ -152,20 +117,8 @@ const Composer: FC<ComposerProps> = ({
   contextWarning,
   onUrgent,
 }) => {
-  const [text, setText] = useState('')
-  const [preview, setPreview] = useState<PreviewTarget | null>(null)
-  const inputRef = useRef<HTMLTextAreaElement>(null)
-  const fileInputRef = useRef<HTMLInputElement>(null)
-
-  const {
-    pendingAttachments,
-    handleFileSelect,
-    removePending,
-    clearPending,
-    attachToast,
-    draggingFiles,
-    dragHandlers,
-  } = usePendingAttachments()
+  const aui = useAui()
+  const text = useAuiState((s) => s.composer.text)
 
   // Hydrate the draft for whichever conversation is mounted, and re-hydrate on a switch. The store
   // is keyed per conversation, so this is what makes a draft follow its own chat rather than
@@ -175,15 +128,24 @@ const Composer: FC<ComposerProps> = ({
   // draft — they live only in memory as decoded bytes, so there is nothing to hydrate them back
   // from. Leaving them was the worse of the two: this composer is NOT remounted per chat (flat
   // routing keeps one instance), so a file picked in one chat stayed staged in the next, counted
-  // against that chat's attachment and text budgets, and would have been sent into a conversation
-  // the citizen never attached it to.
+  // against that chat's budgets, and would have been sent into a conversation the citizen never
+  // attached it to.
   useEffect(() => {
-    setText(readDraft(conversationId))
-    clearPending()
-  }, [conversationId, clearPending])
+    void aui.composer.setText(readDraft(conversationId))
+    void aui.composer.clearAttachments()
+  }, [aui, conversationId])
+
+  // THE DRAFT MIRROR. The library owns the text, so this watches it rather than intercepting a
+  // change event — which also means a paste, a drag-in and the library's own writes are all
+  // covered by one rule instead of three.
+  //
+  // NO TRUNCATION, EVER, AT ANY LENGTH. The text is stored exactly as typed or pasted; R42's whole
+  // point is that a citizen whose paste was silently cut believes it all went in.
+  useEffect(() => {
+    writeDraft(conversationId, text)
+  }, [conversationId, text])
 
   const cap = useMemo(() => capState(text), [text])
-  const hasContent = text.trim().length > 0 || pendingAttachments.length > 0
   const offerPending = Boolean(offer && !offer.spent && offer.toolCallId)
 
   /**
@@ -198,239 +160,81 @@ const Composer: FC<ComposerProps> = ({
     // press starts, so putting it first told a citizen to "choose one of the two above" while the
     // build they had just chosen was starting.
     if (cap.over) return cap.message
-    if (isRunning) return 'Replying — keep typing if you like; send unlocks when it’s done.'
+    if (isRunning) return 'Replying — keep typing if you like; send unlocks when it is done.'
     if (gate?.blocked) return gate.reason
     if (offerPending) return OFFER_GATE_NOTE
     return null
   }, [offerPending, cap.over, cap.message, isRunning, gate])
 
-  const sendUnavailable = unavailableReason !== null || !hasContent
-
-  const doSend = useCallback(async () => {
-    // THE ENFORCEMENT, and the whole of it. `aria-disabled` on the button says so; it does not do
-    // so. Pressing Enter, clicking a visually-dimmed Send and calling this directly all land here.
-    if (unavailableReason !== null || !hasContent || !conversationId) return
-
-    const submission: ComposerSubmission = {
-      text,
-      attachments: pendingAttachments,
-      // R60 — stamped at PRESS time. If the reader moves to another chat mid-send, the completion
-      // is compared against this and never writes into whichever chat they are now looking at.
-      conversationId,
-    }
-
-    try {
+  const handleSubmit = useCallback(
+    async (submission: ComposerSubmission) => {
       await onSubmit(submission)
-      // Cleared ONLY on success (R58/R59). Nothing is optimistically emptied, so a failed send
-      // leaves the text and the files exactly where they were and there is no restore path to race
-      // with — which is how the whole class of defect stops existing rather than being guarded.
-      setText('')
-      clearDraft(conversationId)
-      clearPending()
-    } catch (err) {
-      // The swallowed press: nothing sent, nothing said, nothing cleared.
-      if (err instanceof SendRefusal && err.silent) return
-      // THE REFUSAL'S OWN WORDS, but only when they were written to be read. `onSubmit` throws a
-      // distinct sentence per reason — a build running here, the daily cap, the attachment cap, no
-      // project open — and collapsing all of them into one generic line told a citizen "that did
-      // not send" while withholding the only thing that would let them act on it. Anything else
-      // that rejects keeps the generic sentence: an aborted send is already in the surface's own
-      // banner in the server's words, and a bug's message is not for this audience.
-      onUrgent(
-        err instanceof SendRefusal
-          ? err.message
-          : 'That message did not send. Everything you typed is still here — try again.',
-      )
-    }
-  }, [
-    unavailableReason,
-    hasContent,
-    conversationId,
-    text,
-    pendingAttachments,
-    onSubmit,
-    onUrgent,
-    clearPending,
-  ])
-
-  const onKeyDown = useCallback(
-    (e: KeyboardEvent<HTMLTextAreaElement>) => {
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault()
-        void doSend()
-      }
+      // The draft's own clear. The BOX clears the runtime's text and attachments on the same
+      // acceptance; this clears the copy in `sessionStorage`, which the box knows nothing about.
+      clearDraft(submission.conversationId)
     },
-    [doSend],
-  )
-
-  const onChange = useCallback(
-    (e: ChangeEvent<HTMLTextAreaElement>) => {
-      // NO truncation, ever, at any length. The text is stored exactly as typed or pasted — R42's
-      // whole point is that a citizen whose paste was silently cut believes it all went in.
-      setText(e.target.value)
-      writeDraft(conversationId, e.target.value)
-    },
-    [conversationId],
+    [onSubmit],
   )
 
   return (
-    <div
-      data-testid="composer"
-      // The drop-target state as an ATTRIBUTE, not only as a ring class. A colour change is not a
-      // thing a test can assert without pinning a Tailwind string, and it is not a thing a screen
-      // reader can perceive at all — so the state is exposed here and the ring is the visual half
-      // of the same fact. Carried over from the surface this composer replaces, where it was the
-      // one assertion the drag-and-drop suites actually discriminated on.
-      data-dragging={draggingFiles || undefined}
-      {...dragHandlers}
-      // The drop target is the WRAPPER, not the inner row: the chips and the gate note above the
-      // row are visually "the composer" too, and a drop landing on them would otherwise fall
-      // through to the browser's default handler — which navigates the tab away and discards both
-      // the draft and the staged files.
-      className={`flex flex-col gap-1 border-t border-bial-border bg-bial-surface px-3 py-2 transition ${
-        draggingFiles ? 'ring-2 ring-inset ring-primary/40' : ''
-      }`}
-    >
-      {/* ONE polite region for the attachment toast — permanently mounted, so its text is
-          announced when it arrives rather than being injected together with its region. */}
-      <Announcer message={attachToast} />
-
-      {offer && (
-        <OfferStrip
-          {...offer}
-          onFailed={onUrgent}
-        />
-      )}
-
-      {pendingAttachments.length > 0 && (
-        <div data-testid="composer-chips" className="flex flex-wrap gap-1.5 pb-1">
-          {pendingAttachments.map((a) => (
-            // Preview and remove are SEPARATE TARGETS, and remove is a SIBLING at a higher layer
-            // rather than a nested interactive descendant — the project page's own invariant.
-            <span
-              key={a.id}
-              className="relative inline-flex items-center gap-1.5 rounded-lg border border-bial-border bg-bial-bg px-2 py-1 text-xs text-tertiary"
-            >
-              <button
-                type="button"
-                onClick={() =>
-                  setPreview({
-                    name: a.name,
-                    mediaType: a.mediaType,
-                    dataUrl: `data:${a.mediaType};base64,${a.base64}`,
-                  })
-                }
-                className="max-w-[10rem] truncate hover:text-primary"
-                title={`Open ${a.name}`}
-              >
-                {a.name}
-              </button>
-              <button
-                type="button"
-                onClick={() => removePending(a.id)}
-                aria-label={`Remove ${a.name}`}
-                className="text-neutral transition hover:text-danger"
-              >
-                <X size={11} />
-              </button>
-            </span>
-          ))}
-        </div>
-      )}
-
-      {unavailableReason && (
-        <p data-testid="composer-gate-note" role="status" className="text-xs text-neutral">
-          {unavailableReason}
-        </p>
-      )}
-
-      {/* R55 — stop's permanent home. U3 built it and mounted it into the block this replaces; if
-          it were not re-mounted here it would have been deleted with `BuildProgress`, and the
-          surface would ship with a running build and no way to stop it. */}
+    <div className="flex flex-col gap-1.5 border-t border-bial-border bg-bial-surface px-3 py-2.5">
+      {/* R55 — stop's permanent home, ABOVE the box rather than inside it: it acts on the turn,
+          not on the message being composed, and a control inside the box would read as part of
+          sending one. */}
       {stop && (
-        <div className="flex justify-end pb-1">
+        <div className="flex justify-end">
           <StopTurnControl {...stop} onStopFailed={onUrgent} />
         </div>
       )}
 
-      <div className="flex items-end gap-2">
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept={ACCEPT_ATTR}
-          multiple
-          onChange={handleFileSelect}
-          className="hidden"
-          data-testid="composer-file-input"
-        />
-        {/* Attach NEVER goes unavailable. Staging a file is composing, not sending. */}
-        <button
-          type="button"
-          onClick={() => fileInputRef.current?.click()}
-          title="Attach images, PDFs or text files (CSV, TXT), or drop them anywhere in the composer"
-          aria-label="Attach a file"
-          className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-xl border border-bial-border bg-bial-bg text-neutral transition hover:bg-surface-muted hover:text-primary"
-        >
-          <Paperclip size={13} />
-        </button>
+      <ComposerBox
+        conversationId={conversationId}
+        placeholder={placeholder}
+        onSubmit={handleSubmit}
+        unavailableReason={unavailableReason}
+        onUrgent={onUrgent}
+        header={
+          offer ? (
+            /* R29 — INSIDE the box, fixed to its top, which is what the board draws: "this teal
+               strip is not text the agent typed — it is a control the interface draws". */
+            <OfferStrip {...offer} onFailed={onUrgent} />
+          ) : undefined
+        }
+        footer={
+          <>
+            {unavailableReason && (
+              <p data-testid="composer-gate-note" role="status" className="text-xs text-neutral">
+                {unavailableReason}
+              </p>
+            )}
 
-        {/* NEVER disabled, NEVER removed — in any state. Growth is bounded and then it scrolls. */}
-        <TextareaAutosize
-          ref={inputRef}
-          value={text}
-          onChange={onChange}
-          onKeyDown={onKeyDown}
-          minRows={MIN_ROWS}
-          maxRows={MAX_ROWS}
-          placeholder={placeholder}
-          data-testid="composer-input"
-          // NO maxLength. Issue #156 forbids it by name and a test asserts its absence.
-          className="flex-1 resize-none rounded-xl border border-bial-border bg-bial-bg px-3 py-2 text-sm text-tertiary transition placeholder:text-gray-400 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary/20"
-        />
+            {/* The context guardrail's SOFT half: advisory, non-blocking, and deliberately not
+                `disabled` anything. Send still works past this line; what stops a turn is the
+                server, and it says so itself. `role="status"` so it is announced once when it
+                appears rather than interrupting. */}
+            {contextWarning && (
+              <p
+                role="status"
+                data-testid="composer-context-warning"
+                className="text-xs leading-relaxed text-neutral"
+              >
+                {contextWarning}
+              </p>
+            )}
 
-        <button
-          type="button"
-          onClick={() => void doSend()}
-          aria-disabled={sendUnavailable}
-          // The reason rides in the accessible name, so a screen-reader user gets it from the
-          // control itself rather than only from a line of text elsewhere on the screen.
-          aria-label={unavailableReason ? `Send message — ${unavailableReason}` : 'Send message'}
-          title={unavailableReason ?? undefined}
-          data-testid="composer-send"
-          className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-xl bg-primary text-white transition ${
-            sendUnavailable ? 'cursor-default opacity-40' : 'hover:bg-primary-600'
-          }`}
-        >
-          <Send size={13} />
-        </button>
-      </div>
-
-      {/* The context guardrail's SOFT half: advisory, non-blocking, and deliberately not
-          `disabled` anything — see the top-of-file rule. Send still works past this line; what
-          stops a turn is the server, and it says so itself. `role="status"` so it is announced
-          once when it appears rather than interrupting. */}
-      {contextWarning && (
-        <p
-          role="status"
-          data-testid="composer-context-warning"
-          className="self-stretch text-xs leading-relaxed text-neutral"
-        >
-          {contextWarning}
-        </p>
-      )}
-
-      {/* R43 — silent until it is useful, and then exact. See `composerCap.ts` for why the number
-          is code points rather than String.length. */}
-      {cap.showCounter && (
-        <p
-          data-testid="composer-counter"
-          className={`self-end text-xs tabular-nums ${cap.over ? 'font-semibold text-danger' : 'text-neutral'}`}
-        >
-          {cap.count.toLocaleString()} / {MAX_COMPOSER_CHARS.toLocaleString()}
-        </p>
-      )}
-
-      <AttachmentPreview target={preview} onClose={() => setPreview(null)} />
+            {/* R43 — silent until it is useful, and then exact. See `composerCap.ts` for why the
+                number is code points rather than String.length. */}
+            {cap.showCounter && (
+              <p
+                data-testid="composer-counter"
+                className={`self-end text-xs tabular-nums ${cap.over ? 'font-semibold text-danger' : 'text-neutral'}`}
+              >
+                {cap.count.toLocaleString()} / {MAX_COMPOSER_CHARS.toLocaleString()}
+              </p>
+            )}
+          </>
+        }
+      />
     </div>
   )
 }

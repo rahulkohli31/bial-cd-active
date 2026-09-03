@@ -54,13 +54,13 @@ function renderComposer(projectId = 'p1') {
   )
 }
 
-const composer = () => screen.getByPlaceholderText(/Describe the app you want built/i)
+const composer = () => screen.getByPlaceholderText(/Describe the change you need/i)
 const path = () => screen.getByTestId('path').textContent ?? ''
 const routerState = () => JSON.parse(screen.getByTestId('state').textContent || 'null') as unknown
 
 const send = (text = 'a visitor log') => {
   fireEvent.change(composer(), { target: { value: text } })
-  fireEvent.click(screen.getByRole('button', { name: /start chat/i }))
+  fireEvent.click(screen.getByTestId('composer-send'))
 }
 
 beforeEach(() => {
@@ -115,7 +115,7 @@ describe('the mint-and-navigate protocol, carried through the deletion', () => {
   it('navigates nowhere on an empty or whitespace-only draft', () => {
     renderComposer()
     fireEvent.change(composer(), { target: { value: '   ' } })
-    fireEvent.click(screen.getByRole('button', { name: /start chat/i }))
+    fireEvent.click(screen.getByTestId('composer-send'))
 
     expect(screen.queryByTestId('path')).toBeNull()
   })
@@ -125,7 +125,7 @@ describe('the mint-and-navigate protocol, carried through the deletion', () => {
     // A prompt the shared guardrails reject — `spy on` is one of the harmful-content keywords.
     // If it ever stops being rejected this goes red rather than silently proving nothing.
     fireEvent.change(composer(), { target: { value: 'an app to spy on the ground crew' } })
-    fireEvent.click(screen.getByRole('button', { name: /start chat/i }))
+    fireEvent.click(screen.getByTestId('composer-send'))
 
     expect(screen.queryByTestId('path')).toBeNull()
     expect(screen.getByRole('dialog', { name: /prompt blocked/i })).toBeTruthy()

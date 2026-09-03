@@ -54,7 +54,21 @@ export const MAX_ATTACHMENTS_PER_CONVERSATION = 20
  * applied to the permanent one.
  */
 export function unsupportedFileMessage(fileName: string): string {
-  return `"${fileName}" isn't supported. Attach an image (PNG, JPEG, GIF, WebP), a PDF, or a text file (CSV, TXT).`
+  return `"${fileName}" ${unsupportedFormatMessage()}`
+}
+
+/**
+ * THE SAME ADVICE WITH NO NAME TO HANG IT ON.
+ *
+ * The composer's own validator always knows which file it refused. The LIBRARY's accept filter does
+ * not tell us: it runs before the adapter is called and its event carries a reason and its own
+ * sentence, not the file. Rather than let that path speak the library's words — "File type
+ * application/vnd… is not accepted. Accepted types: image/png,image/jpeg,…", a MIME list read out
+ * at someone who dragged in a spreadsheet — it speaks this. One author for the advice; the name is
+ * the only thing that varies.
+ */
+export function unsupportedFormatMessage(): string {
+  return "isn't supported. Attach an image (PNG, JPEG, GIF, WebP), a PDF, or a text file (CSV, TXT)."
 }
 
 /**

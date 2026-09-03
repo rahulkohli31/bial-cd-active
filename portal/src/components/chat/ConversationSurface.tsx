@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo, type FC } from 'reac
 import { useNavigate, useLocation, useParams } from 'react-router-dom'
 import Announcer, { useActivityAnnouncement } from './Announcer'
 import ChatThread from './ChatThread'
+import ChatRuntimeProvider from './runtime/ChatRuntimeProvider'
 import Composer, { SendRefusal, type ComposerSubmission } from './Composer'
 import type { BuildHandoff } from './OfferStrip'
 import ScrollToLatest from './ScrollToLatest'
@@ -2810,6 +2811,19 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
           retired (see the state's removal note above). The rail this surface fills is collapsed
           by `WorkspaceShell` instead, as a class on the `workspace-outlet` element one level up;
           from here that is invisible; this panel always renders at its own width. */}
+      {/* ONE RUNTIME, AROUND EVERYTHING THAT READS IT (plan 002, U5). It used to be built inside
+          `ChatThread`, whose provider therefore wrapped only the transcript — fine while the
+          composer was entirely hand-rolled and read nothing from it, and wrong the moment the
+          composer became the library's, because every composer primitive resolves against
+          `useAui()`. Hoisted rather than duplicated: two runtimes would give this screen two
+          composer states, and the one the citizen typed into would not be the one the transcript
+          belonged to. */}
+      <ChatRuntimeProvider
+        messages={transcript}
+        isRunning={isRunning}
+        onNew={handleAppend}
+        onCancel={handleCancel}
+      >
       <div
         id="chat-panel"
         data-testid="chat-panel"
@@ -2827,10 +2841,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
         <div className="flex-1 min-h-0">
           <ChatThread
             onGroupSealed={setSealedSummary}
-            messages={transcript}
-            isRunning={isRunning}
-            onNew={handleAppend}
-            onCancel={handleCancel}
             interruptedMessageIds={interruptedIds}
             footer={ViewportFooter}
           />
@@ -2897,7 +2907,10 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
 
         <Composer
           conversationId={buildId ?? null}
-          placeholder="Describe what you need, or ask for a change…"
+          // THE BOARD WRITES A DIFFERENT ONE PER KIND, and it is a hint rather than a mode: a
+          // build chat asks for a change to the app, a plan chat asks for a change to the plan.
+          // One sentence for both said neither.
+          placeholder={kind === 'plan' ? 'Tell me what to change…' : 'Ask for another change…'}
           onSubmit={handleSubmit}
           isRunning={isRunning}
           gate={gate}
@@ -2932,6 +2945,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
           onUrgent={setUrgent}
         />
       </div>
+      </ChatRuntimeProvider>
     </div>
   )
 }

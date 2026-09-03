@@ -18,6 +18,8 @@ import {
   type AppendMessage,
 } from '@assistant-ui/react'
 
+import { ACCEPT_ATTR } from '../../../../utils/attachmentInput'
+import { createAttachmentAdapter } from '../attachmentAdapter'
 import { useChatRuntime, EXPECTED_CAPABILITIES, type ChatRuntimeOptions } from '../useChatRuntime'
 import { convertMessage } from '../convertMessage'
 import type { ChatMessage } from '../../../../utils/messageTypes'
@@ -54,6 +56,10 @@ function mountRuntime(options: Partial<ChatRuntimeOptions> = {}) {
     isRunning: false,
     onNew: vi.fn<(m: AppendMessage) => Promise<void>>().mockResolvedValue(undefined),
     onCancel: vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
+    // REQUIRED SINCE PLAN 002's U5, and required rather than optional on purpose: the
+    // `attachments` capability is DERIVED from this adapter's presence, so a caller that could
+    // omit it would be a caller that silently turns the library's composer box off.
+    attachments: createAttachmentAdapter({ accept: ACCEPT_ATTR, staged: () => [], onRefused: () => {} }),
     ...options,
   }
 
@@ -182,22 +188,33 @@ describe('useChatRuntime — the library mints exactly one id, and we do not let
 })
 
 describe('R51a — the capability list, pinned by exact equality', () => {
-  it('registers exactly two capabilities: cancel and copy', () => {
+  it('registers exactly three capabilities: cancel, copy and attachments', () => {
     const { runtime } = mountRuntime()
 
     expect(runtime().thread.getState().capabilities).toEqual(EXPECTED_CAPABILITIES)
   })
 
-  it('the written list has TWO true entries, and cancel is one of them', () => {
-    // Stated separately because of a specific failure mode: anyone writing this test from the
-    // plan's shorter phrasing ("everything off except copy") gets a red suite, and the tempting
-    // fix is to drop `onCancel` — which silently deletes R55's stop path.
+  it('the written list has THREE true entries, and each one is load-bearing', () => {
+    // Stated separately because of a specific failure mode: anyone writing this test from a
+    // shorter phrasing ("everything off except copy") gets a red suite, and the tempting fixes
+    // are both wrong — dropping `onCancel` silently deletes R55's stop path, and dropping the
+    // attachments adapter silently turns the library's composer box off, since its add control,
+    // its chip list and its dropzone are ALL gated on that capability (plan 002, U5).
     const trueOnes = Object.entries(EXPECTED_CAPABILITIES)
       .filter(([, v]) => v)
       .map(([k]) => k)
       .sort()
 
-    expect(trueOnes).toEqual(['cancel', 'unstable_copy'])
+    expect(trueOnes).toEqual(['attachments', 'cancel', 'unstable_copy'])
+  })
+
+  it('★ attachments is registered BY the adapter, and the adapter is OURS', () => {
+    // The capability is derived from the adapter's presence, so "it is on" and "we supplied it"
+    // are the same fact — which is what keeps the library rendering a chip rather than deciding
+    // which content is re-sent. Mutation receipt: drop `adapters` from the runtime options and
+    // this goes red together with the exact-equality snapshot above.
+    const { runtime } = mountRuntime()
+    expect(runtime().thread.getState().capabilities.attachments).toBe(true)
   })
 
   it('cancel is registered BY onCancel — pressing stop reaches our handler', () => {

@@ -79,7 +79,7 @@ function renderThread({ state, chatId = 'thread-1' } = {}) {
   return { ...view, fake }
 }
 
-const composer = () => screen.getByPlaceholderText(/describe what you need/i)
+const composer = () => screen.getByPlaceholderText(/ask for another change/i)
 async function send(text = 'a visitor app') {
   await waitForGateOpen()
   fireEvent.change(composer(), { target: { value: text } })
@@ -373,7 +373,7 @@ describe('the U13 header', () => {
     renderThread()
 
     // Liveness: the composer actually mounted (a crash would leave nothing here to query).
-    await screen.findByPlaceholderText(/describe what you need/i)
+    await screen.findByPlaceholderText(/ask for another change/i)
     // No mode control of any name mounted.
     expect(screen.queryByRole('button', { name: /Mode:/i })).toBeNull()
     expect(screen.queryByText(/Mode:/i)).toBeNull()
@@ -481,7 +481,7 @@ describe('R8 live clause — a reload MID-TURN re-attaches to the running reply'
 
     // Liveness: the composer mounted — this used to wait on the now-retired mode pill, which
     // served the same "hydration settled" role; see the U13-header guard above for why it's gone.
-    await screen.findByPlaceholderText(/describe what you need/i)
+    await screen.findByPlaceholderText(/ask for another change/i)
     await waitForGateOpen()
     expect(h.readTurnStream).not.toHaveBeenCalled()
   })

@@ -1,217 +1,215 @@
 /**
  * START A CHAT — the rail's composer, its kind picker, and the mint-and-navigate protocol.
  *
- * ═══ WHY THIS FILE EXISTS, AND WHAT IT SETTLES ═══
+ * ═══ THE SAME BOX AS THE CHAT'S, AND WHY THAT NEEDED A RUNTIME HERE ═══
+ *
+ * The boards draw ONE composer, on both screens: a bordered box with the attachment control and
+ * the send control inside it. Two independently hand-rolled boxes is how the two drifted apart —
+ * one had a wide gold "Start Chat" button and a separate "Upload File" pill, the other a gold
+ * square beside the input — so the box is `ComposerBox` now, shared.
+ *
+ * That box is built on the library's composer primitives, and every one of them resolves against
+ * `useAui()`. This surface had NO runtime mounted at all, so one is mounted here: a composer-only
+ * runtime with an empty transcript, whose whole purpose is to hold the text and the staged files
+ * the box reads. Nothing streams into it and nothing renders from it.
+ *
+ * `onNew` IS DELIBERATELY UNREACHABLE. `useExternalStoreRuntime` requires it, and it is reached
+ * only through the library's own `composer.send()` — which this project never calls, because it
+ * empties the text before it awaits anything and restores it only when the ATTACHMENT tasks throw
+ * (`ComposerBox`'s docblock has the full account). Registering a working `onNew` here would create
+ * a second way to start a chat that bypasses the guardrail below, so it refuses instead.
+ *
+ * ═══ WHAT THIS FILE SETTLES, AND WHAT IT KEEPS ═══
  *
  * The protocol below — mint a v7 id, navigate to a flat chat address, carry the draft in router
- * state — lived in `ProjectBuilder.tsx`, which this plan deletes. Two plans each described it as
- * the other's: this plan's earlier draft said it "travels with Plan D's composer", and Plan D's
- * scope boundaries said the mint site is retired by this plan's U1. Each named the other, neither
- * had it in a Files list, and a protocol two plans both disown is a protocol nobody writes. It is
- * this plan's, and it is here.
- *
- * ═══ R15's PICKER, WHICH NO PLAN HAD BUILT ═══
- *
- * A citizen has to be able to choose a Plan chat or a Build chat BEFORE the first message, because
- * a chat's kind is fixed at creation and never mutates. Plan B owns the server half — creation
- * takes the kind and refuses to change it — and nothing owned the client half: `ProjectBuilder`
- * hardcoded `kind=build` into the minted address, and its own docstring called the picker for the
- * other kind "a picker nobody has designed yet". Without it this rail can only mint Build chats and
- * R11/R12 have nothing to distinguish. It belongs here because R6 already requires the kind chooser
- * beside the composer in the rail at rest.
+ * state — is this file's. So is the kind picker: a citizen has to be able to choose a Plan chat or
+ * a Build chat BEFORE the first message, because a chat's kind is fixed at creation and never
+ * mutates.
  *
  * THE TWO OPTIONS' WORDS COME FROM ONE PLACE AND ARE NOT RE-WRITTEN HERE. `utils/chatKind.ts` reads
  * the kind catalogue off the bootstrap profile — the same catalogue the server's toolset registry
- * sits beside — so what a kind is CALLED and what it DOES have exactly one author. Typing "Plan" and
- * "Shape it first" into this file would create a second, and the two would drift the first time the
- * server's wording changed.
+ * sits beside — so what a kind is CALLED and what it DOES have exactly one author.
  */
-import { useRef, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { FileSpreadsheet, FileText, Paperclip, ShieldAlert, Sparkles, X } from 'lucide-react'
+import { AssistantRuntimeProvider, useExternalStoreRuntime } from '@assistant-ui/react'
+import { ShieldAlert, X } from 'lucide-react'
 import { ToggleGroup, ToggleGroupItem } from '../ui/toggle-group'
 import { validatePrompt } from '../../utils/promptGuardrails'
 import type { PromptViolation } from '../../utils/promptGuardrails'
 import { uuidv7 } from '../../utils/conversationApi'
 import { chatKindFor } from '../../utils/chatKind'
-import { usePendingAttachments } from '../../hooks/usePendingAttachments'
-import { ACCEPT_ATTR } from '../../utils/attachmentInput'
+import ComposerBox, { type ComposerSubmission } from '../chat/ComposerBox'
+import { convertMessage } from '../chat/runtime/convertMessage'
+import type { ChatMessage } from '../../utils/messageTypes'
+import {
+  RefusalSinkProvider,
+  StagedAttachmentsBinding,
+  useBoundAttachmentAdapter,
+} from '../chat/runtime/stagedAttachments'
 import type { ChatKind } from '../../pages/ChatRoute'
 
 /**
- * The two kinds, in the order a citizen meets them. `build` is first and is the default, which is
- * the behaviour this rail inherits rather than a new decision: the retired composer minted a Build
- * chat for every send, so defaulting to Plan would silently change what the existing control does.
+ * THE TWO KINDS, IN THE BOARD'S ORDER — Plan first, then Build, with Build selected.
+ *
+ * The order is the board's and the default is this rail's inheritance: the retired composer minted
+ * a Build chat for every send, so defaulting to Plan would silently change what the control does.
+ * Order and default are separate decisions and this is the one place both are made.
  */
-const KINDS: readonly ChatKind[] = ['build', 'plan']
+const KINDS: readonly ChatKind[] = ['plan', 'build']
 
 export interface RailComposerProps {
-  /** The project every chat minted here is filed under. Required: it is what removes the picker
-   *  gate the standalone builder had, where a chat had to be told which project it belonged to. */
+  /** The project every chat minted here is filed under. */
   projectId: string
 }
 
 export default function RailComposer({ projectId }: RailComposerProps) {
+  const { adapter, stagedRef, refusalRef } = useBoundAttachmentAdapter()
+  // A COMPOSER-ONLY RUNTIME. Empty transcript, never running, nothing to cancel — every capability
+  // off except `attachments`, which is what makes the library's add control, its chips and its
+  // dropzone render at all.
+  const runtime = useExternalStoreRuntime<ChatMessage>({
+    messages: EMPTY_TRANSCRIPT,
+    isRunning: false,
+    onNew: refuseLibrarySend,
+    convertMessage,
+    adapters: { attachments: adapter },
+  })
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <RefusalSinkProvider value={refusalRef}>
+        <StagedAttachmentsBinding target={stagedRef} />
+        <RailComposerBody projectId={projectId} />
+      </RefusalSinkProvider>
+    </AssistantRuntimeProvider>
+  )
+}
+
+/** Module-level, so the runtime is not handed a fresh array on every render. */
+const EMPTY_TRANSCRIPT: readonly ChatMessage[] = []
+
+async function refuseLibrarySend(): Promise<never> {
+  throw new Error(
+    'The library composer send is not used here — sends go through `ComposerBox`, which holds the ' +
+      'message until the server accepts it. Reaching this means a library send path was rendered.',
+  )
+}
+
+function RailComposerBody({ projectId }: RailComposerProps) {
   const navigate = useNavigate()
-  const [prompt, setPrompt] = useState('')
   const [kind, setKind] = useState<ChatKind>('build')
   const [guardRailModal, setGuardRailModal] = useState<PromptViolation | null>(null)
-  const fileInputRef = useRef<HTMLInputElement>(null)
-  // The shared chat-attachment composer — the same allowlist and validation the conversation
-  // surface uses, so this first step accepts everything a later message would.
-  const { pendingAttachments, handleFileSelect, removePending, attachToast } = usePendingAttachments()
+  const [urgent, setUrgent] = useState<string | null>(null)
 
   /**
    * Mint a fresh chat and hand the draft to it. EVERY submit mints a NEW conversation — there is no
    * canonical thread per project; continuity lives in the app and its snapshots.
    */
-  const startChat = () => {
-    if (!prompt.trim()) return
-    const violation = validatePrompt(prompt)
-    if (violation) {
-      setGuardRailModal(violation)
-      return
-    }
-    // THROUGH THE SHARED `uuidv7`, never an inline `crypto.randomUUID()`. That mints a v4, and this
-    // id becomes the conversation's PRIMARY KEY, which ADR-0006 wants sortable. The retired
-    // composer's own comment records the failure this rule exists for: two sites each kept a
-    // private copy of the one-liner and both went on minting v4 long after the shared mint moved
-    // on. Do not make a third.
-    //
-    // THE KIND TRAVELS AS A QUERY PARAM, THE DRAFT AS ROUTER STATE, and the split is deliberate.
-    // Router state dies on reload and never travels in a shared link, so a bookmarked `/chat/{id}`
-    // must still be able to take its kind from somewhere — and the server is the authority once the
-    // row exists. The draft is the opposite: it is this navigation's payload and has no business
-    // surviving a reload or appearing in a URL.
-    //
-    // `freshlyMinted` tells `ChatRoute` the row does not exist yet, so it can skip a GET that can
-    // only ever 404 — doubled by two hydration fetches and doubled again by StrictMode in dev.
-    navigate(`/chat/${uuidv7()}?projectId=${encodeURIComponent(projectId)}&kind=${kind}`, {
-      state: { prompt, pendingAttachments, freshlyMinted: true },
-    })
-  }
+  const startChat = useCallback(
+    async ({ text, attachments }: ComposerSubmission) => {
+      const violation = validatePrompt(text)
+      if (violation) {
+        setGuardRailModal(violation)
+        // REJECTS RATHER THAN RESOLVES, so the box keeps the message. A resolve here would empty
+        // the composer for a send that never left — the exact loss the acceptance rule exists to
+        // prevent, arriving through the guardrail instead of through the server.
+        throw new Error('blocked by the prompt guardrail')
+      }
+      // THROUGH THE SHARED `uuidv7`, never an inline `crypto.randomUUID()`. That mints a v4, and
+      // this id becomes the conversation's PRIMARY KEY, which ADR-0006 wants sortable.
+      //
+      // THE KIND TRAVELS AS A QUERY PARAM, THE DRAFT AS ROUTER STATE, and the split is deliberate.
+      // Router state dies on reload and never travels in a shared link, so a bookmarked
+      // `/chat/{id}` must still be able to take its kind from somewhere — and the server is the
+      // authority once the row exists. The draft is the opposite: it is this navigation's payload
+      // and has no business surviving a reload or appearing in a URL.
+      //
+      // `freshlyMinted` tells `ChatRoute` the row does not exist yet, so it can skip a GET that can
+      // only ever 404 — doubled by two hydration fetches and doubled again by StrictMode in dev.
+      navigate(`/chat/${uuidv7()}?projectId=${encodeURIComponent(projectId)}&kind=${kind}`, {
+        state: { prompt: text, pendingAttachments: attachments, freshlyMinted: true },
+      })
+    },
+    [kind, navigate, projectId],
+  )
 
-  const picked = chatKindFor(kind)
+  const picked = useMemo(() => chatKindFor(kind), [kind])
 
   return (
-    // NO SECTION LABEL OF ITS OWN (plan 002, U3). "START A CHAT" is the RAIL's heading now, drawn
-    // beside the other two in the board's own type, so this component is the control and not the
-    // section around it. Two headings for one section is how the rail ended up with four cards.
     <div className="font-manrope">
-      <div className="mt-2.5 w-full bg-white rounded-2xl border border-bial-border shadow-sm">
-        <textarea
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && e.metaKey) startChat()
+      {/* THE BOARD'S SEGMENTED CONTROL: a #F0F4F8 track with a white pill on the selected item.
+          No hue at all — the selection is signalled by elevation, which is what keeps it legible
+          and is why the icon takes its colour from the label rather than from the kind. */}
+      <div className="mt-[11px]">
+        <ToggleGroup
+          type="single"
+          value={kind}
+          onValueChange={(next) => {
+            // `type="single"` with no deselect: a chat is always one kind or the other, so an
+            // empty value is not a state this control may reach — Radix hands back `''` on a
+            // re-press of the active item, and ignoring that is what keeps the two options
+            // exhaustive rather than three-valued.
+            if (next === 'build' || next === 'plan') setKind(next)
           }}
-          placeholder="Describe the app you want built... (e.g. 'Create a dashboard to track terminal 2 ground staff assignments with real-time delay alerts')"
-          rows={4}
-          className="w-full p-4 text-sm text-tertiary placeholder:text-gray-300 resize-none focus:outline-none rounded-t-2xl font-manrope leading-relaxed"
-        />
-
-        <div className="px-3 py-3 border-t border-bial-border space-y-2">
-          {/* R15's picker. `type="single"` with no deselect: a chat is always one kind or the
-              other, so an empty value is not a state this control may reach — Radix hands back
-              `''` on a re-press of the active item, and ignoring that is what keeps the two
-              options exhaustive rather than three-valued. */}
-          <ToggleGroup
-            type="single"
-            value={kind}
-            onValueChange={(next) => {
-              if (next === 'build' || next === 'plan') setKind(next)
-            }}
-            variant="outline"
-            size="sm"
-            aria-label="What kind of chat"
-            className="justify-start"
-          >
-            {KINDS.map((candidate) => {
-              const look = chatKindFor(candidate)
-              return (
-                <ToggleGroupItem key={candidate} value={candidate} aria-label={look.word}>
-                  {/* NO COLOUR OF ITS OWN. The board strokes the segment icon with the same
-                      colour as the segment's label (#1A2B34 when selected, #6B7280 when not),
-                      which `currentColor` gives for free. Tinting it separately is what put a
-                      gold wrench on an orange ground at roughly 1.2:1. */}
-                  <look.Icon size={13} />
-                  {look.word}
-                </ToggleGroupItem>
-              )
-            })}
-          </ToggleGroup>
-          {/* ONE LINE, FROM THE CATALOGUE. The empty string is the honest fallback for a bootstrap
-              that has not resolved or a kind this build does not recognise; rendering an empty
-              paragraph is better than inventing a description for it here. */}
-          {picked.description && (
-            <p data-testid="kind-description" className="text-[11px] text-neutral leading-snug">
-              {picked.description}
-            </p>
-          )}
-
-          <div className="flex flex-wrap items-center gap-2">
-            <input
-              ref={fileInputRef}
-              type="file"
-              className="hidden"
-              multiple
-              accept={ACCEPT_ATTR}
-              onChange={handleFileSelect}
-            />
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              className={`flex items-center gap-1.5 text-xs font-worksans font-medium border rounded-lg px-3 py-2 transition whitespace-nowrap flex-shrink-0 ${
-                pendingAttachments.length > 0
-                  ? 'bg-primary/5 border-primary text-primary'
-                  : 'bg-white border-bial-border text-neutral hover:border-primary hover:text-primary'
-              }`}
-            >
-              <Paperclip size={12} />
-              {pendingAttachments.length > 0
-                ? `${pendingAttachments.length} file${pendingAttachments.length > 1 ? 's' : ''}`
-                : 'Upload File'}
-            </button>
-            <button
-              type="button"
-              onClick={startChat}
-              disabled={!prompt.trim()}
-              className="ml-auto flex items-center gap-2 bg-primary hover:bg-primary-600 disabled:opacity-40 text-white font-bold text-sm px-5 py-2 rounded-xl transition shadow-sm shadow-primary/30 flex-shrink-0"
-            >
-              Start Chat <Sparkles size={13} />
-            </button>
-          </div>
-
-          {pendingAttachments.length > 0 && (
-            <div className="flex flex-wrap gap-1.5 pt-0.5">
-              {pendingAttachments.map((a) => (
-                <span
-                  key={a.id}
-                  className="flex items-center gap-1 text-[10px] font-medium bg-primary/5 text-primary border border-primary/30 rounded-md px-2 py-1"
-                >
-                  {a.mediaType === 'text/csv' ? <FileSpreadsheet size={9} /> : <FileText size={9} />}
-                  <span className="max-w-[160px] truncate">{a.name}</span>
-                  <button
-                    type="button"
-                    onClick={() => removePending(a.id)}
-                    aria-label={`Remove ${a.name}`}
-                    className="ml-0.5 hover:text-danger transition"
-                  >
-                    <X size={9} />
-                  </button>
-                </span>
-              ))}
-            </div>
-          )}
-        </div>
+          size="sm"
+          aria-label="What kind of chat"
+          className="inline-flex gap-[3px] rounded-[9px] bg-bial-bg p-[3px]"
+        >
+          {KINDS.map((candidate) => {
+            const look = chatKindFor(candidate)
+            return (
+              <ToggleGroupItem
+                key={candidate}
+                value={candidate}
+                aria-label={look.word}
+                className="gap-[5px] rounded-[7px] px-[11px] py-[5px] text-[11.5px] font-semibold data-[state=on]:font-bold"
+              >
+                {/* NO COLOUR OF ITS OWN — `currentColor`, so the icon matches its label in both
+                    states, which is the whole of how the board keeps this control legible. */}
+                <look.Icon size={12} />
+                {look.word}
+              </ToggleGroupItem>
+            )
+          })}
+        </ToggleGroup>
       </div>
 
+      {/* ONE LINE, FROM THE CATALOGUE, describing BOTH kinds — the board writes it as a single
+          sentence under the control rather than one line per option. The empty string is the
+          honest fallback for a bootstrap that has not resolved or a kind this build does not
+          recognise; rendering an empty paragraph is better than inventing a description here. */}
+      {picked.description && (
+        <p data-testid="kind-description" className="my-[9px] text-[11.5px] leading-relaxed text-neutral">
+          {picked.description}
+        </p>
+      )}
+
+      <ComposerBox
+        // The chat does not exist yet — the id is minted at submit. `projectId` stands in as the
+        // stamp, which is the right one for this surface: what a rail send belongs to is a
+        // project, not a conversation.
+        conversationId={projectId}
+        placeholder="Describe the change you need…"
+        onSubmit={startChat}
+        unavailableReason={null}
+        onUrgent={setUrgent}
+      />
+
+      {/* Attachment refusals and send failures, said out loud. `role="alert"` because a refused
+          file is a thing the citizen has to act on before their message means what they think. */}
+      {urgent && (
+        <p role="alert" className="mt-1.5 text-[11.5px] text-danger">
+          {urgent}
+        </p>
+      )}
+
       {guardRailModal && (
-        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-          <div role="dialog" aria-modal="true" aria-label="Prompt blocked" className="bg-white rounded-2xl shadow-2xl max-w-lg w-full p-6">
-            <div className="flex items-start justify-between mb-4">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div role="dialog" aria-modal="true" aria-label="Prompt blocked" className="w-full max-w-lg rounded-2xl bg-white p-6 shadow-2xl">
+            <div className="mb-4 flex items-start justify-between">
               <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-full bg-red-100 flex items-center justify-center flex-shrink-0">
+                <div className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-full bg-red-100">
                   <ShieldAlert size={20} className="text-red-500" />
                 </div>
                 <h2 className="text-base font-extrabold text-tertiary">Prompt Blocked</h2>
@@ -225,36 +223,27 @@ export default function RailComposer({ projectId }: RailComposerProps) {
                 <X size={16} />
               </button>
             </div>
-            <p className="text-sm text-neutral leading-relaxed mb-4">{guardRailModal.message}</p>
-            <div className="bg-red-50 border border-red-100 rounded-xl px-4 py-3 mb-6">
-              <p className="text-xs font-semibold text-red-500 mb-2 uppercase tracking-wide">Flagged keywords</p>
+            <p className="mb-4 text-sm leading-relaxed text-neutral">{guardRailModal.message}</p>
+            <div className="mb-6 rounded-xl border border-red-100 bg-red-50 px-4 py-3">
+              <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-red-500">Flagged keywords</p>
               <div className="flex flex-wrap gap-2">
                 {guardRailModal.flaggedKeywords.map((kw) => (
-                  <span key={kw} className="text-xs font-bold text-red-600 bg-red-100 px-2 py-0.5 rounded-full">
+                  <span key={kw} className="rounded-full bg-red-100 px-2 py-0.5 text-xs font-bold text-red-600">
                     {kw}
                   </span>
                 ))}
               </div>
             </div>
-            <div className="flex gap-3 justify-end">
+            <div className="flex justify-end gap-3">
               <button
                 type="button"
                 onClick={() => setGuardRailModal(null)}
-                className="text-sm font-bold bg-primary text-white px-5 py-2 rounded-xl hover:bg-primary/90 transition"
+                className="rounded-xl bg-primary px-5 py-2 text-sm font-bold text-white transition hover:bg-primary/90"
               >
                 Edit My Prompt
               </button>
             </div>
           </div>
-        </div>
-      )}
-
-      {/* Attachment validation only. The guardrail modal's "Contact IT Support" was this
-          component's other toast source until #157 B3 removed it: it announced a support address
-          that was not a mailto, not clickable, not copyable, and wrong. */}
-      {attachToast && (
-        <div className="fixed bottom-6 right-6 bg-tertiary text-white text-xs font-semibold px-4 py-3 rounded-xl shadow-xl z-50 max-w-xs">
-          {attachToast}
         </div>
       )}
     </div>

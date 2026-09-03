@@ -11,6 +11,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, cleanup, fireEvent, within } from '@testing-library/react'
 
 import ChatThread from '../ChatThread'
+import ChatRuntimeProvider from '../runtime/ChatRuntimeProvider'
 import { groupLabel } from '../ActivityGroup'
 import type { ChatMessage, MessagePart } from '../../../utils/messageTypes'
 import type { StepItem } from '../../../utils/turnStreamApi'
@@ -27,13 +28,14 @@ const textPart = (text: string): MessagePart => ({ type: 'text', text })
 function mount(parts: MessagePart[], opts: { isRunning?: boolean; interrupted?: boolean } = {}) {
   const message: ChatMessage = { id: 'a1', role: 'assistant', parts, seq: 1 }
   return render(
-    <ChatThread
+    <ChatRuntimeProvider
       messages={[message]}
       isRunning={opts.isRunning ?? false}
       onNew={vi.fn().mockResolvedValue(undefined)}
       onCancel={vi.fn().mockResolvedValue(undefined)}
-      interruptedMessageIds={opts.interrupted ? new Set(['a1']) : undefined}
-    />,
+    >
+      <ChatThread interruptedMessageIds={opts.interrupted ? new Set(['a1']) : undefined} />
+    </ChatRuntimeProvider>,
   )
 }
 
@@ -258,14 +260,17 @@ describe('a group reports what it amounted to, once, as it seals', () => {
     onGroupSealed: (summary: string) => void,
     opts: { isRunning?: boolean; interrupted?: boolean } = {},
   ) => (
-    <ChatThread
+    <ChatRuntimeProvider
       messages={[{ id: 'a1', role: 'assistant', parts, seq: 1 }]}
       isRunning={opts.isRunning ?? false}
       onNew={vi.fn().mockResolvedValue(undefined)}
       onCancel={vi.fn().mockResolvedValue(undefined)}
-      interruptedMessageIds={opts.interrupted ? new Set(['a1']) : undefined}
-      onGroupSealed={onGroupSealed}
-    />
+    >
+      <ChatThread
+        interruptedMessageIds={opts.interrupted ? new Set(['a1']) : undefined}
+        onGroupSealed={onGroupSealed}
+      />
+    </ChatRuntimeProvider>
   )
 
   /**

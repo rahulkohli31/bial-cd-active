@@ -81,7 +81,7 @@ function renderBuilder(chatId = 'build-X') {
  */
 async function startBuild(text = 'make it blue') {
   await waitForGateOpen()
-  const textarea = await screen.findByPlaceholderText(/describe what you need/i)
+  const textarea = await screen.findByPlaceholderText(/ask for another change/i)
   fireEvent.change(textarea, { target: { value: text } })
   fireEvent.keyDown(textarea, { key: 'Enter' })
   fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
@@ -154,7 +154,7 @@ describe('BuilderPage — the attachment user-turn is persisted before the build
   it('ABORTS the send when the upload fails — never starts a text-only build (R3)', async () => {
     h.buildUserParts.mockRejectedValue(new Error('Upload failed: storage is full.'))
     renderBuilder()
-    const textarea = await screen.findByPlaceholderText(/describe what you need/i)
+    const textarea = await screen.findByPlaceholderText(/ask for another change/i)
     fireEvent.change(textarea, { target: { value: 'use this sheet' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
 

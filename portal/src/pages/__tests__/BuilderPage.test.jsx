@@ -81,7 +81,7 @@ function renderBuilder({ chatId = 'thread-1', projectId = 'p1', projectName = 'V
   return { ...view, fake }
 }
 
-const composerIn = (c) => within(c).getByPlaceholderText(/describe what you need/i)
+const composerIn = (c) => within(c).getByPlaceholderText(/ask for another change/i)
 async function sendFrom(c, text = 'a visitor app') {
   await waitForGateOpen()
   fireEvent.change(composerIn(c), { target: { value: text } })
@@ -116,7 +116,7 @@ describe('U8 — the chat surface draws no header of its own', () => {
   it('renders none of the removed chrome, and no header either', async () => {
     const { container } = renderBuilder()
     // Settle the async adopt (getBuild → welcome message) before asserting on the header.
-    await screen.findByPlaceholderText(/describe what you need/i)
+    await screen.findByPlaceholderText(/ask for another change/i)
 
     // GONE (plan 002, U2): the breadcrumb that was the last thing left in this header. The
     // project, the chat's kind and the chat's title are drawn by the shell's toolbar row above
@@ -169,7 +169,7 @@ describe('U8 regression guard — builds/refreshBuilds survive the dropdown remo
 
     // Tab B (same project) learns of the claim over the channel, then tries to build.
     const b = renderBuilder({ chatId: 'build-B' })
-    await within(b.container).findByPlaceholderText(/describe what you need/i)
+    await within(b.container).findByPlaceholderText(/ask for another change/i)
     await flushChannel()
     await buildFrom(b.container, 'add a table')
 

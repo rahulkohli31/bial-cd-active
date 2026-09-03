@@ -67,7 +67,7 @@ const deps = () => {
   return { fake, deps: { client: makeClient(h), eventSourceFactory: () => fake } }
 }
 
-const composer = () => screen.getByPlaceholderText(/describe what you need/i)
+const composer = () => screen.getByPlaceholderText(/ask for another change/i)
 
 /**
  * How many times MessageContent was invoked for the row carrying this exact text.

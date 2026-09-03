@@ -23,6 +23,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
 
+import { ComposerHarness } from './_composerHarness'
 import Composer, { type ComposerProps, type ComposerSubmission } from '../Composer'
 import { readDraft } from '../../../utils/composerDraft'
 
@@ -39,7 +40,7 @@ function draw(over: Partial<ComposerProps> = {}) {
     onUrgent: vi.fn(),
     ...over,
   }
-  return { props, ...render(<Composer {...props} />) }
+  return { props, ...render(<ComposerHarness><Composer {...props} /></ComposerHarness>) }
 }
 
 const box = () => screen.getByTestId('composer-input') as HTMLTextAreaElement
@@ -121,7 +122,7 @@ describe('AE28 / R60 — a failure in chat A does not touch chat B', () => {
     expect(onSubmit.mock.calls[0][0].conversationId).toBe('chat-1')
 
     // The reader moves to a sibling and types there.
-    rerender(<Composer {...props} onSubmit={onSubmit} conversationId="chat-2" />)
+    rerender(<ComposerHarness><Composer {...props} onSubmit={onSubmit} conversationId="chat-2" /></ComposerHarness>)
     type('chat B’s own draft')
 
     fail() // chat A's send fails, after the move

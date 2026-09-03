@@ -183,7 +183,7 @@ describe('ProjectPage — the composer is unconditional', () => {
     expect(await screen.findByTestId('rail-app-status')).toBeTruthy()
     // The composer is present whether or not the project has an app — the exact regression that
     // caused the reverted app-first fold. (F6: no idea-starter cards inside a dedicated project.)
-    expect(screen.getByPlaceholderText(/Describe the app you want built/i)).toBeTruthy()
+    expect(screen.getByPlaceholderText(/Describe the change you need/i)).toBeTruthy()
     // The description block — a read view with an Edit button (U7: the pop-up editor).
     expect(within(screen.getByTestId('description-rail')).getByRole('button', { name: /edit/i })).toBeTruthy()
     // The passive-artefact affordances stay gone.
@@ -200,7 +200,7 @@ describe('ProjectPage — the composer is unconditional', () => {
 
     await screen.findByTestId('rail-app-status')
     // NOT collapsed under an app card — this is the reverted regression the fold must avoid.
-    expect(screen.getByPlaceholderText(/Describe the app you want built/i)).toBeTruthy()
+    expect(screen.getByPlaceholderText(/Describe the change you need/i)).toBeTruthy()
     // INERTNESS GUARDS, kept through the inversion rather than deleted with it. What Phase-1
     // removed was a passive view of stored code, a lifecycle badge and a reroute; none of the
     // three comes back with the running sandbox.
@@ -424,7 +424,7 @@ describe('ProjectPage — nothing points back to a past chat', () => {
     // Paired with a liveness check: an absence assertion passes just as happily when the page
     // crashed and rendered nothing at all.
     expect(screen.getByTestId('description-rail')).toBeTruthy()
-    expect(screen.getByPlaceholderText(/Describe the app you want built/i)).toBeTruthy()
+    expect(screen.getByPlaceholderText(/Describe the change you need/i)).toBeTruthy()
   })
 
   it('★ offers no way to reach or delete an existing chat, however many the project has', async () => {
