@@ -243,16 +243,60 @@ describe('R31 — a live group names what is happening NOW and grows in place', 
     expect(trigger().textContent).toContain('1 step')
   })
 
-  it('★ a glance inside a RUNNING group closes itself when the group seals', () => {
+  it('★ a glance inside a RUNNING group closes itself when the TURN ends', () => {
     // "A glance inside is temporary, not a new resting state" (owner ruling, 2026-09-02). Cleared
     // to "the reader has not decided" rather than to closed, so a group that also FAILED still
-    // opens itself afterwards.
-    const view = mount([stepPart(1, 'Reading your restaurants screen', 'pending')])
+    // opens itself afterwards. The turn ending is the event — `isRunning` going false — not the
+    // group's own steps settling; see the next test for why the difference is the whole finding.
+    const view = mount([stepPart(1, 'Reading your restaurants screen', 'pending')], {
+      isRunning: true,
+    })
     fireEvent.click(trigger())
     expect(trigger().getAttribute('aria-expanded')).toBe('true')
 
     view.rerender(tree([stepPart(1, 'Reading your restaurants screen', 'ok')]))
 
+    expect(trigger().getAttribute('aria-expanded')).toBe('false')
+  })
+
+  it('★ but it stays open through the pause BETWEEN two tool calls', () => {
+    // THE GAP IS NOT THE SEAL. A tool returns, and the next one starts only after the model has
+    // thought again — seconds, with adaptive reasoning on — and in that window every step emitted
+    // so far reads as settled while the turn is still very much running. Closing on that snapped
+    // the group shut under a citizen who had just pressed it open, again on every step of a build.
+    //
+    // Mutation receipt: gate the self-close on `facts.running` again instead of on the turn and
+    // the first assertion below goes red — the group closes in the gap and never reopens.
+    const view = mount([stepPart(1, 'Reading your restaurants screen', 'pending')], {
+      isRunning: true,
+    })
+    fireEvent.click(trigger())
+    expect(trigger().getAttribute('aria-expanded')).toBe('true')
+
+    // The gap: the only step so far has resolved, nothing new has started, the turn runs on.
+    view.rerender(tree([stepPart(1, 'Reading your restaurants screen', 'ok')], { isRunning: true }))
+    expect(trigger().getAttribute('aria-expanded')).toBe('true')
+
+    // The next step lands in the SAME group, and the peek is still the reader's.
+    view.rerender(
+      tree(
+        [
+          stepPart(1, 'Reading your restaurants screen', 'ok'),
+          stepPart(2, 'Updating app/page.tsx', 'pending'),
+        ],
+        { isRunning: true },
+      ),
+    )
+    expect(trigger().textContent).toContain('2 steps')
+    expect(trigger().getAttribute('aria-expanded')).toBe('true')
+
+    // The turn ends, and only now is the peek over.
+    view.rerender(
+      tree([
+        stepPart(1, 'Reading your restaurants screen', 'ok'),
+        stepPart(2, 'Updating app/page.tsx', 'ok'),
+      ]),
+    )
     expect(trigger().getAttribute('aria-expanded')).toBe('false')
   })
 
