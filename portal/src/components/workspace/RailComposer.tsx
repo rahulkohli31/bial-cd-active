@@ -6,7 +6,16 @@
  * The boards draw ONE composer, on both screens: a bordered box with the attachment control and
  * the send control inside it. Two independently hand-rolled boxes is how the two drifted apart —
  * one had a wide gold "Start Chat" button and a separate "Upload File" pill, the other a gold
- * square beside the input — so the box is `ComposerBox` now, shared.
+ * square beside the input — so the box is shared.
+ *
+ * IT IS `Composer`, NOT `ComposerBox`, AND THAT DISTINCTION IS THE WHOLE FIX. Sharing only the
+ * inner box let the two surfaces drift again in every way the box does not own: this screen had
+ * no character cap, no counter and no draft, because all three live in `Composer`. A citizen
+ * could paste 45,000 characters here with Send still lit — the server refuses at 64,000 — and
+ * lose a half-written description by stepping to another screen and back. This screen carries the
+ * LONGEST message anyone writes, the one describing the whole app, so it was the worst place to
+ * be missing them. Mount the whole composer, not its box; anything the chat's composer learns,
+ * this one learns with it.
  *
  * That box is built on the library's composer primitives, and every one of them resolves against
  * `useAui()`. This surface had NO runtime mounted at all, so one is mounted here: a composer-only
@@ -41,7 +50,8 @@ import { uuidv7 } from '../../utils/conversationApi'
 import { chatKindFor } from '../../utils/chatKind'
 import { asReclaimBlocked, relaunchPreview } from '../../utils/buildSessionApi'
 import { useWorkspaceReport } from './workspaceChannel'
-import ComposerBox, { type ComposerSubmission } from '../chat/ComposerBox'
+import Composer from '../chat/Composer'
+import { type ComposerSubmission } from '../chat/ComposerBox'
 import { SendRefusal } from '../chat/sendRefusal'
 import { convertMessage } from '../chat/runtime/convertMessage'
 import type { ChatMessage } from '../../utils/messageTypes'
@@ -257,15 +267,23 @@ function RailComposerBody({ projectId }: RailComposerProps) {
         </p>
       )}
 
-      <ComposerBox
+      <Composer
         // The chat does not exist yet — the id is minted at submit. `projectId` stands in as the
         // stamp, which is the right one for this surface: what a rail send belongs to is a
-        // project, not a conversation.
+        // project, not a conversation. It is also the DRAFT's key, which is what makes a
+        // half-written first message survive a trip to another screen and back.
         conversationId={projectId}
-        placeholder="Describe the change you need…"
+        // THE HINT FOLLOWS THE KIND, from the catalogue — never a comparison here. R72 forbids
+        // branching on a chat's kind in this directory, and the words belong beside the other
+        // per-kind wording rather than being re-written at the one place that renders them.
+        placeholder={picked.composerPlaceholder}
         onSubmit={startChat}
-        unavailableReason={null}
+        // Nothing streams into this runtime — the chat does not exist until submit mints it — so
+        // there is no turn here that could be running.
+        isRunning={false}
         onUrgent={setUrgent}
+        // The rail section owns its own gutter and ground already.
+        frameClassName="flex flex-col gap-1.5"
       />
 
       {/* Attachment refusals and send failures, said out loud. `role="alert"` because a refused

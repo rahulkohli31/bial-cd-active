@@ -54,7 +54,10 @@ function renderComposer(projectId = 'p1') {
   )
 }
 
-const composer = () => screen.getByPlaceholderText(/Describe the change you need/i)
+// BY TESTID, NOT BY PLACEHOLDER. The hint now follows the picked kind (a Plan chat changes
+// nothing, so it does not ask for "the change you need"), and a helper keyed on one kind's
+// wording cannot reach the box in the other — which is the very case the ★ test below drives.
+const composer = () => screen.getByTestId('composer-input')
 const path = () => screen.getByTestId('path').textContent ?? ''
 const routerState = () => JSON.parse(screen.getByTestId('state').textContent || 'null') as unknown
 

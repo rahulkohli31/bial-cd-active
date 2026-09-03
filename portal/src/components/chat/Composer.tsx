@@ -4,12 +4,24 @@
  * ═══ WHAT IS HERE AND WHAT IS NOT ═══
  *
  * The BOX — the border, the input, the attachment control, the send control, the chips, the
- * dropzone and the clear-only-on-acceptance rule — is `ComposerBox`, shared with the project
- * rail. What stays here is what the rail does not have: the character cap, the offer strip, the
- * stop control, the context warning, and the draft that follows a conversation.
+ * dropzone and the clear-only-on-acceptance rule — is `ComposerBox`. What is added HERE is the
+ * character cap, the counter, the gate note, the draft that follows a conversation, and the
+ * chat-only chrome: the offer strip, the stop control, the context warning.
  *
- * The two composers differ in seven respects, so a single component with a placeholder prop would
- * have been a fiction. They share a CORE, not an identity.
+ * ══ THE RAIL MOUNTS THIS COMPONENT TOO, AND THAT IS THE CORRECTION ══
+ *
+ * This docblock used to say the two composers "differ in seven respects, so a single component
+ * with a placeholder prop would have been a fiction", and the rail therefore mounted `ComposerBox`
+ * directly. The fiction was the other way round. Sharing only the inner box meant the rail had no
+ * cap, no counter and no draft — so a citizen could paste 45,000 characters there with Send still
+ * lit (the server refuses at 64,000), and lose a half-written description by stepping to another
+ * screen and back. That screen carries the LONGEST message anyone writes.
+ *
+ * The seven differences are all ABSENT PROPS. `offer`, `stop`, `contextWarning`, `footerNote` and
+ * `gate` are optional and render nothing when omitted; `isRunning` is false where no turn can run;
+ * `placeholder` and `frameClassName` are the two that genuinely differ. A component whose
+ * chat-only chrome is opt-in serves both surfaces without pretending they are the same screen —
+ * and, unlike two components, cannot drift apart again.
  *
  * ══ NOTHING HERE IS EVER `disabled` (R45, R64) ══
  *
@@ -41,7 +53,7 @@
  * R60 — CROSS-CHAT LEAKAGE is guarded by the send path stamping the conversation at press time
  *   and the surface comparing it on completion.
  */
-import { useCallback, useEffect, useMemo, type FC, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, type FC, type ReactNode } from 'react'
 import { useAui, useAuiState } from '@assistant-ui/react'
 
 import { capState, MAX_COMPOSER_CHARS } from '../../utils/composerCap'
@@ -89,6 +101,17 @@ export interface ComposerProps {
   footerNote?: ReactNode
   /** Urgent sentences go to the assertive slot the surface owns. */
   onUrgent: (message: string) => void
+  /**
+   * The frame around the box. Defaults to the chat surface's, which sits the composer on the
+   * transcript's own ground with its own gutter.
+   *
+   * It is a prop because the RAIL mounts this same composer inside a section that already owns
+   * its padding and ground — and the whole point of the rail using `Composer` rather than
+   * `ComposerBox` is that the cap, the counter and the draft come with it. Letting the frame
+   * differ is what makes one composer serve both surfaces instead of two composers drifting
+   * apart, which is what happened last time.
+   */
+  frameClassName?: string
 }
 
 const Composer: FC<ComposerProps> = ({
@@ -102,6 +125,7 @@ const Composer: FC<ComposerProps> = ({
   contextWarning,
   footerNote,
   onUrgent,
+  frameClassName = 'flex flex-col gap-1.5 bg-bial-surface px-3 py-2.5',
 }) => {
   const aui = useAui()
   const text = useAuiState((s) => s.composer.text)
@@ -116,9 +140,12 @@ const Composer: FC<ComposerProps> = ({
   // routing keeps one instance), so a file picked in one chat stayed staged in the next, counted
   // against that chat's budgets, and would have been sent into a conversation the citizen never
   // attached it to.
+  /** The conversation the mirror below is currently mirroring. See that effect for why. */
+  const mirroring = useRef<string | null>(null)
+
   useEffect(() => {
-    void aui.composer.setText(readDraft(conversationId))
-    void aui.composer.clearAttachments()
+    aui.composer.setText(readDraft(conversationId))
+    aui.composer.clearAttachments()
   }, [aui, conversationId])
 
   // THE DRAFT MIRROR. The library owns the text, so this watches it rather than intercepting a
@@ -128,6 +155,24 @@ const Composer: FC<ComposerProps> = ({
   // NO TRUNCATION, EVER, AT ANY LENGTH. The text is stored exactly as typed or pasted; R42's whole
   // point is that a citizen whose paste was silently cut believes it all went in.
   useEffect(() => {
+    const id = conversationId ?? null
+    // THE FIRST COMMIT FOR A CONVERSATION WRITES NOTHING, and that one skip is the whole guard.
+    //
+    // Hydration and this run on the SAME commit, and on it `text` is still the OUTGOING box:
+    // `setText` is synchronous, but `text` comes from `useAuiState` and only catches up on the
+    // next render. Mirroring that value would write the previous chat's box — or, on a fresh
+    // mount, an empty one — over this conversation's key, and `writeDraft(id, '')` REMOVES the
+    // key rather than storing a blank. So every draft died on the next mount, which is a reload:
+    // the first of the three losses `composerDraft.ts` exists to prevent. Nothing reported it,
+    // because an empty box where a draft should be looks exactly like never having had one.
+    //
+    // Skipping by IDENTITY rather than by timing is what makes this deterministic — no microtask
+    // to lose a race with, and the very next render (the one carrying the hydrated text) mirrors
+    // normally.
+    if (mirroring.current !== id) {
+      mirroring.current = id
+      return
+    }
     writeDraft(conversationId, text)
   }, [conversationId, text])
 
@@ -167,7 +212,7 @@ const Composer: FC<ComposerProps> = ({
     // NewBuildChat, NewPlanChat and the rest — runs the transcript's white straight down into the
     // composer's own bordered box, with nothing between them. The full-width hairline read as a
     // second edge stacked on the box's, and on a plan chat it cut the one centred column in two.
-    <div className="flex flex-col gap-1.5 bg-bial-surface px-3 py-2.5">
+    <div className={frameClassName}>
       {/* R55 — stop's permanent home, ABOVE the box rather than inside it: it acts on the turn,
           not on the message being composed, and a control inside the box would read as part of
           sending one. */}

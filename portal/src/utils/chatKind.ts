@@ -70,6 +70,23 @@ export interface ChatKindPresentation {
    * button.
    */
   pill: string
+  /**
+   * What the empty message box invites, for a chat of this kind that does not exist yet.
+   *
+   * LOCAL, for the same reason `completion` is: it is UI grammar — the hint inside a control —
+   * rather than part of what a kind IS, so there is nothing for it to drift out of sync with.
+   *
+   * It lives HERE rather than as a `kind === 'plan' ? … : …` at the one place that renders it,
+   * and that is not a style preference: R72 forbids branching on a chat's kind under `pages/`
+   * and `components/workspace/`, mechanically, because per-kind branches scattered across
+   * surfaces are how the two-page era grew. One entry per kind in the catalogue is the shape
+   * that rule leaves open.
+   *
+   * The rail asked for "the change you need" in BOTH kinds, directly under a sentence promising
+   * a Plan chat changes nothing — so the box contradicted the copy above it at exactly the
+   * moment a citizen is deciding which kind they meant.
+   */
+  composerPlaceholder: string
 }
 
 /**
@@ -80,17 +97,22 @@ export interface ChatKindPresentation {
  * that could quietly drift apart.
  */
 const CHAT_KIND_LOOKS: Readonly<
-  Partial<Record<string, Pick<ChatKindPresentation, 'completion' | 'Icon' | 'pill'>>>
+  Partial<
+    Record<string, Pick<ChatKindPresentation, 'completion' | 'Icon' | 'pill' | 'composerPlaceholder'>>
+  >
 > = {
   build: {
     completion: ' chat',
     Icon: Wrench,
     pill: 'bg-accent-light text-secondary-800',
+    composerPlaceholder: 'Describe the change you need…',
   },
   plan: {
     completion: ' chat',
     Icon: MessageSquare,
     pill: 'bg-primary-50 text-primary-dark',
+    // Names no change, because a Plan chat makes none — the line above this box says so.
+    composerPlaceholder: 'Describe what you have in mind…',
   },
 }
 
@@ -105,6 +127,8 @@ export const UNKNOWN_CHAT_KIND: ChatKindPresentation = {
   description: '',
   Icon: MessageSquare,
   pill: 'bg-status-grey-bg text-status-grey-fg',
+  // The kind is unknown, so the hint claims nothing about what sending will do.
+  composerPlaceholder: 'Describe what you need…',
 }
 
 /**
@@ -136,5 +160,6 @@ export function chatKindFor(kind: string): ChatKindPresentation {
     description: entry.description,
     Icon: look.Icon,
     pill: look.pill,
+    composerPlaceholder: look.composerPlaceholder,
   }
 }
