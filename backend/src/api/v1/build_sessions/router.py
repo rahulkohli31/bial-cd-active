@@ -647,7 +647,7 @@ class StopActiveBuildResponse(CamelModel):
     a caller proceeds on. Both the service and the turn engine hardcoded `true` on every path,
     so a stop that had not finished arrived wearing the same face as one that had — and the next
     thing the client does is take the container. See `StopOutcome` for what each state licenses:
-    `stopped` and `nothingWasRunning` are both permission to continue, `stillRunning` is not.
+    `stopped` and `nothing_was_running` are both permission to continue, `still_running` is not.
 
     The SAME shape from both routes on purpose. The ask reports the state at the instant the stop
     began; the status read reports it now. A client that had to decode two shapes would be one
@@ -771,8 +771,8 @@ async def stop_active_build(
     Now the wait lives in a detached task and `GET .../stop-state` reports how it went, so that
     number stops constraining the design and a stop may honestly take as long as it takes.
 
-    `stillRunning` means the stop is in flight, which is what the caller polls on;
-    `nothingWasRunning` means there was nothing to stop, a success the caller proceeds on, not a
+    `still_running` means the stop is in flight, which is what the caller polls on;
+    `nothing_was_running` means there was nothing to stop, a success the caller proceeds on, not a
     miss. Deliberately no 409: asking a settled project to stop is already the state you wanted.
 
     NO `build_coordination_or_503` SEAM, unlike `release` and `save` beside it, and the
@@ -811,7 +811,7 @@ async def stop_state(
     work in this repo, and the shape of that bug was a timeout read as a verdict.
 
     The browser polls this while it narrates the hand-over and proceeds only on `stopped` or
-    `nothingWasRunning`. A dropped connection costs nothing — the stop is a detached task, so
+    `nothing_was_running`. A dropped connection costs nothing — the stop is a detached task, so
     asking again picks the answer up where it was left: no work lost, no container taken.
 
     NO CSRF, and a GET, because it changes nothing. NO `build_coordination_or_503` either, for
