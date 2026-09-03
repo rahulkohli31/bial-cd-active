@@ -86,16 +86,16 @@ function PaneToolbarProbe() {
  *  present the instant it renders, independent of the toggle that used to live in it. Mounted
  *  through the REAL `WorkspaceShell`, with `PaneToolbarProbe` alongside it under the same
  *  `WorkspaceChannelProvider` so the probe reads the channel this surface actually publishes to. */
-async function renderReady() {
+async function renderReady(kind = 'build') {
   render(
-    <MemoryRouter initialEntries={['/chat/build-X?projectId=p1&kind=build']}>
+    <MemoryRouter initialEntries={[`/chat/build-X?projectId=p1&kind=${kind}`]}>
       <Routes>
         <Route element={<WorkspaceShell />}>
           <Route
             path="/chat/:chatId"
             element={
               <>
-                <ConversationSurface projectId="p1" projectName="VIP Movement" />
+                <ConversationSurface projectId="p1" projectName="VIP Movement" kind={kind} />
                 <PaneToolbarProbe />
               </>
             }
@@ -134,14 +134,18 @@ describe('BuilderPage — the retired #42 chat-panel collapse (now the shell rai
     expect(screen.getByTestId('pane-toolbar-leading-probe').textContent).toBe('')
   })
 
-  it('keeps a fixed width class always — it no longer swaps its own width; `WorkspaceShell.railWidthClass` governs the rail\'s width now', async () => {
+  it('fills the rail rather than setting a width of its own; `WorkspaceShell.railWidthClass` governs the rail', async () => {
     await renderReady()
     const panel = screen.getByTestId('chat-panel')
 
-    // LIVENESS: the panel carries its ordinary shown-state class.
-    expect(panel.className).toMatch(/w-72/)
-    // INERTNESS: nothing on this surface can drive that class to `w-0` any more — there is no
-    // toggle left to press, and the class itself is no longer a ternary on any local state.
+    // NO FIXED WIDTH AT ALL SINCE PLAN 002's U6. It was `w-72 xl:w-80` — a second, narrower
+    // column INSIDE the rail the shell had already sized, which left a dead band of ground
+    // between the transcript and the app pane. It fills the rail now, and the rail's width is
+    // the one the citizen can drag.
+    expect(panel.className).not.toMatch(/(^|\s)w-72(\s|$)/)
+    expect(panel.className).toMatch(/flex-1/)
+    // INERTNESS: nothing on this surface can drive its width to zero — there is no toggle left
+    // to press, and the class is no longer a ternary on any local state.
     expect(screen.getByTestId('pane-toolbar-leading-probe').textContent).toBe('')
     expect(panel.className).not.toMatch(/(^|\s)w-0(\s|$)/)
   })
@@ -169,5 +173,48 @@ describe('BuilderPage — the retired #42 chat-panel collapse (now the shell rai
     // asked has no subject left on THIS component. The control that must answer it lives in
     // `AppPane` and is pinned there.
     expect(screen.getByTestId('pane-toolbar-leading-probe').textContent).toBe('')
+  })
+})
+
+/**
+ * THE TWO SHAPES A CHAT SCREEN TAKES (plan 002, U6). Both are claims about this surface's own
+ * panel, which is why they are here rather than in the shell suite: the shell can see who gets the
+ * width, but only a render of the real surface can see what it does with it.
+ */
+describe('a plan chat is one centred column; a build chat sits beside its app', () => {
+  it('★ a build chat fills the rail, with no second narrower column inside it', async () => {
+    // THE DEAD BAND. The panel set `w-72 xl:w-80` INSIDE the rail the shell had already sized, so
+    // a strip of ground sat between the transcript and the app pane the whole time.
+    const panel = await renderReady('build')
+    expect(panel.getAttribute('data-chat-kind')).toBe('build')
+    expect(panel.className).toMatch(/flex-1/)
+    expect(panel.className).not.toMatch(/(^|\s)w-72(\s|$)/)
+    expect(panel.className).not.toMatch(/mx-auto/)
+  })
+
+  it('★ a plan chat centres its column rather than running edge to edge', async () => {
+    // It declares no pane, so the shell hands it the whole window — and a transcript run across
+    // 1440px is unreadable. Centring is the panel's own answer; the RAIL's width stays the
+    // citizen's to drag, which is why this is not solved by pinning the rail narrower.
+    const panel = await renderReady('plan')
+    expect(panel.getAttribute('data-chat-kind')).toBe('plan')
+    expect(panel.className).toMatch(/mx-auto/)
+    expect(panel.className).toMatch(/max-w-/)
+  })
+
+  it("★ carries the board's footer line on a plan chat, verbatim — and not on a build chat", async () => {
+    // The line was rewritten once on a misreading of "your app is not open here" as a claim about
+    // the CONTAINER. It is a claim about the screen, and the second clause is true because a plan
+    // chat's toolset has no write tools. See `PlanChatWorkspaceLine`'s docblock.
+    await renderReady('plan')
+    expect(screen.getByTestId('plan-chat-workspace-line').textContent).toContain(
+      'Planning is a conversation. Your app is not open here and nothing you say changes it.',
+    )
+
+    cleanup()
+    await renderReady('build')
+    expect(screen.queryByTestId('plan-chat-workspace-line')).toBeNull()
+    // LIVENESS: the build chat rendered, it simply has no plan-chat line.
+    expect(screen.getByTestId('chat-panel')).toBeTruthy()
   })
 })

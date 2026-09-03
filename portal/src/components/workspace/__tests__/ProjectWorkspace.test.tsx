@@ -84,12 +84,17 @@ const EMPTY_PANE: PaneView = {
   compileState: null, workspaceLost: false,
 }
 
-/** A build chat, publishing its own address — the OTHER publisher on this channel. */
-function ChatSurface({ projectId = 'pA' }: { projectId?: string }) {
+/**
+ * A chat, publishing its own address — the OTHER publisher on this channel.
+ *
+ * `pane` is the one thing the two KINDS differ on here (plan 002, U6): a build chat asks for the
+ * app to be seen, a plan chat does not. Everything else about a conversation is the same on both.
+ */
+function ChatSurface({ projectId = 'pA', pane = true }: { projectId?: string; pane?: boolean }) {
   useWorkspaceProject(projectId)
   usePublishAddress({ url: APP_URL, status: 'ready' }, projectId)
   usePublishPaneView(EMPTY_PANE)
-  useAppPaneVisible(true)
+  useAppPaneVisible(pane)
   return <div data-testid="chat-surface" />
 }
 
@@ -116,6 +121,7 @@ function Workspace({ entry = '/projects/pA', project = PROJECT }: { entry?: stri
             element={
               <>
                 <Link to="/chat/c1">to chat</Link>
+                <Link to="/plan/c2">to plan chat</Link>
                 <Surface project={project} />
               </>
             }
@@ -126,6 +132,15 @@ function Workspace({ entry = '/projects/pA', project = PROJECT }: { entry?: stri
               <>
                 <Link to="/projects/pA">to project</Link>
                 <ChatSurface />
+              </>
+            }
+          />
+          <Route
+            path="/plan/:chatId"
+            element={
+              <>
+                <Link to="/projects/pA">to project</Link>
+                <ChatSurface pane={false} />
               </>
             }
           />
@@ -402,5 +417,49 @@ describe('the channel is left as the next surface needs to find it', () => {
     // The chat surface publishes its own pane, so the frame survives on the address, not the pane.
     expect(frame()).toBe(original)
     expect(screen.getByTestId('chat-surface')).toBeTruthy()
+  })
+})
+
+/**
+ * WHAT THE SHELL DOES FOR A CHAT THAT WANTS NO PANE (plan 002, U6).
+ *
+ * The SURFACE half — that the panel fills the rail, that a plan chat centres its column, that the
+ * board's footer line appears on one kind and not the other — is `BuilderPage-panel.test.tsx`'s,
+ * where the real conversation surface renders. What is only visible HERE, through the real shell,
+ * is the relationship between the two columns: who gets the width, and whether the frame survives.
+ */
+describe('a chat that declares no pane', () => {
+  it('★ takes the whole rail, and the frame stays mounted rather than being torn down', async () => {
+    // The hide treatment, never an unmount — the same node throughout, which is what makes the
+    // board's "nothing about the app is stopped or reloaded — it is only taken off the screen" a
+    // structural fact rather than a hope.
+    api.fetchPreviewState.mockResolvedValue(
+      preview({ state: 'alive', alive: true, previewUrl: APP_URL, restorable: true }),
+    )
+    render(<Workspace />)
+    await waitFor(() => expect(frame()).toBeTruthy())
+    const original = frame()
+
+    fireEvent.click(screen.getByText('to plan chat'))
+
+    expect(rail().className).toMatch(/flex-1/)
+    expect(rail().className).not.toMatch(/lg:w-\[520px\]/)
+    expect(frameWrapper()).toBeTruthy()
+    expect(frame()).toBe(original)
+    expect(frameWrapper()?.className).toMatch(/invisible/)
+  })
+
+  it('★ and the app does not reload on the way back either', async () => {
+    api.fetchPreviewState.mockResolvedValue(
+      preview({ state: 'alive', alive: true, previewUrl: APP_URL, restorable: true }),
+    )
+    render(<Workspace />)
+    await waitFor(() => expect(frame()).toBeTruthy())
+    const original = frame()
+
+    fireEvent.click(screen.getByText('to plan chat'))
+    fireEvent.click(screen.getByText('to project'))
+
+    expect(frame()).toBe(original)
   })
 })

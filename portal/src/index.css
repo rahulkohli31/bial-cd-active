@@ -123,6 +123,15 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  /* THE APP PANE'S ENTRANCE AND EXIT (plan 002, U6). `prefers-reduced-motion` means it: the pane
+     still appears and disappears, it simply does so without travelling. Suppressed here rather
+     than behind a `matchMedia` read in the component, because this is a purely visual property
+     and a media query cannot be out of date the way a subscribed boolean can. */
+  .animate-pane-leave,
+  .animate-pane-return {
+    animation: none;
+  }
+
   .shimmer {
     background-image: none;
     -webkit-background-clip: border-box;

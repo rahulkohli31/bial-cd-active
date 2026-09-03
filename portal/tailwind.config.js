@@ -111,6 +111,7 @@ export default {
           track: '#F7F9FB',        // the resize handle's track
           grip: '#DCE3EA',         // the resize handle's grip border
           savedirty: '#F5FCFC',    // the pale teal ground behind an unsaved Save control
+          sendoff: '#D6DDE4',      // the send control with nothing to send — a ground, not an opacity
         },
         /**
          * The nine status states of `StatusCardStates`, as text / ground / dot triples. Six
@@ -158,10 +159,32 @@ export default {
           from: { height: 'var(--radix-collapsible-content-height)' },
           to: { height: '0' },
         },
+        'pane-leave': {
+          from: { opacity: '1', transform: 'translateX(0)' },
+          to: { opacity: '0', transform: 'translateX(6%)' },
+        },
+        'pane-return': {
+          from: { opacity: '0', transform: 'translateX(6%)' },
+          to: { opacity: '1', transform: 'translateX(0)' },
+        },
       },
       animation: {
         'collapsible-down': 'collapsible-down 0.2s ease-out',
         'collapsible-up': 'collapsible-up 0.2s ease-out',
+        /**
+         * THE APP PANE LEAVING AND RETURNING (plan 002, U6). `T2Sliding` is a whole board about
+         * this one movement — "the app card is sliding out to the right and fading as it goes" —
+         * and its annotation is the point: it is the MOVEMENT, not a broken screen, and "nothing
+         * about the app is stopped or reloaded — it is only taken off the screen."
+         *
+         * A TRANSITION, NOT A LIBRARY. There is no motion library in this project and none is
+         * added: the pane is one element whose visibility the shell already toggles, so a
+         * keyframe pair is the whole mechanism. Both are suppressed under
+         * `prefers-reduced-motion` in `index.css`, which is where every other one in this build
+         * is suppressed too.
+         */
+        'pane-leave': 'pane-leave 0.24s ease-in forwards',
+        'pane-return': 'pane-return 0.24s ease-out',
       },
     },
   },

@@ -2810,7 +2810,18 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
           `HIDDEN_BUT_MOUNTED`) behind its own `chatCollapsed` state — the whole mechanism R13
           retired (see the state's removal note above). The rail this surface fills is collapsed
           by `WorkspaceShell` instead, as a class on the `workspace-outlet` element one level up;
-          from here that is invisible; this panel always renders at its own width. */}
+          from here that is invisible.
+
+          AND NO FIXED WIDTH EITHER (plan 002, U6). It was `w-72 xl:w-80` — a second, narrower
+          column INSIDE the rail the shell had already sized, which left a dead band of ground
+          between the transcript and the app pane. The panel fills the rail now, and the rail's
+          width is the one the citizen can drag.
+
+          A PLAN CHAT IS THE OTHER HALF OF THE SAME RULE. It declares no pane, so the shell gives
+          it the whole window — and a transcript run edge to edge across 1440px is unreadable. So
+          it centres itself in one column at a comfortable measure, which is exactly what the
+          board draws. A build chat does not: it sits beside the app it is changing, and the two
+          are meant to read as one screen. */}
       {/* ONE RUNTIME, AROUND EVERYTHING THAT READS IT (plan 002, U5). It used to be built inside
           `ChatThread`, whose provider therefore wrapped only the transcript — fine while the
           composer was entirely hand-rolled and read nothing from it, and wrong the moment the
@@ -2827,7 +2838,16 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       <div
         id="chat-panel"
         data-testid="chat-panel"
-        className="flex flex-col bg-white border-r border-bial-border flex-shrink-0 overflow-hidden w-72 xl:w-80"
+        data-chat-kind={kind}
+        className={`flex min-w-0 flex-1 flex-col overflow-hidden bg-white ${
+          isPlanChat
+            ? // ONE CENTRED COLUMN. `mx-auto` on a `max-w` inside the full-width rail, rather
+              // than a narrower rail — the rail's width is the citizen's to drag, and pinning it
+              // for one chat kind would take that away and reintroduce the measured breakpoint
+              // the shell exists without.
+              'mx-auto w-full max-w-3xl'
+            : 'border-r border-bial-border'
+        }`}
       >
         {/* THE BORDERED HEADER IS SURRENDERED TO THE TOOLBAR ROW (plan 002, U2). It held one
             breadcrumb link back to the project and nothing else — the only thing in the product
