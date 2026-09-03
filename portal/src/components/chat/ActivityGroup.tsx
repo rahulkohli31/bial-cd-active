@@ -371,10 +371,15 @@ const ActivityGroup: FC<PropsWithChildren<{ group: ThreadGroupPart }>> = ({ grou
           >
             {label}
           </span>
+          {/* FLUSH AGAINST THE CARD'S RIGHT EDGE. Closed, the card is `w-fit` and the chevron lands
+              there anyway; OPEN, the card takes the width of its widest step row and the chevron
+              was left stranded beside a short label — "6 steps" and a chevron together in the
+              middle of a 320px header, with a dead gap after them. `ActivityAnatomy` panel 3 draws
+              it at the edge, which is also where a disclosure control is looked for. */}
           <Chevron
             size={13}
             aria-hidden="true"
-            className={`flex-shrink-0 ${problem ? 'text-problem-ink' : 'text-neutral/70'}`}
+            className={`ms-auto flex-shrink-0 ${problem ? 'text-problem-ink' : 'text-neutral/70'}`}
           />
         </button>
 

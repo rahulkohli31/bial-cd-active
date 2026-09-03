@@ -45,6 +45,7 @@ import {
   lookFor,
   presentationFor,
   provenanceRows,
+  SECONDARY_ACTIONS,
 } from '../../utils/publishPresentation'
 import type { ProvenanceRow } from '../../utils/publishPresentation'
 
@@ -201,7 +202,11 @@ export default function AppStatusPanel({ projectId, label }: AppStatusPanelProps
             }
             setShowModal(true)
           }}
-          className="mt-2.5 w-full rounded-[9px] bg-primary px-3 py-2.5 text-[12.5px] font-bold text-white transition hover:bg-primary-600"
+          className={`mt-2.5 w-full rounded-[9px] px-3 py-2.5 text-[12.5px] font-bold transition ${
+            SECONDARY_ACTIONS.has(presentation.action)
+              ? 'border border-bial-border bg-white text-tertiary hover:border-primary hover:text-primary'
+              : 'bg-primary text-white hover:bg-primary-600'
+          }`}
         >
           {withdrawing ? 'Taking it back…' : ACTION_LABEL[presentation.action]}
         </button>

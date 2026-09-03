@@ -141,8 +141,13 @@ export default function WorkspaceToolbar({
           {kind && (
             <span
               data-testid="toolbar-chat-kind"
-              className={`inline-flex flex-shrink-0 items-center rounded-full px-2.5 py-1 text-[10.5px] font-bold uppercase tracking-wide ${kind.pill}`}
+              className={`inline-flex flex-shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[10.5px] font-bold uppercase tracking-wide ${kind.pill}`}
             >
+              {/* THE GLYPH THE BOARD DRAWS INSIDE THE PILL. `BuildChat` and `PlanChat` both carry
+                  one, and it is the same icon the rail's kind picker uses for that kind — the
+                  catalogue holds exactly one per kind so the two controls cannot diverge. Decorative
+                  beside the word it accompanies, hence `aria-hidden`. */}
+              <kind.Icon size={11} aria-hidden="true" className="flex-shrink-0" />
               {kind.word}
               {kind.completion && <span className="sr-only">{kind.completion}</span>}
             </span>

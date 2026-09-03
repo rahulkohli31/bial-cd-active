@@ -50,6 +50,20 @@ export const ACTION_LABEL: Record<ActionKind, string> = {
 }
 
 /**
+ * THE ONE ACTION THE CANVAS DOES NOT PAINT TEAL, and the reason is the point.
+ *
+ * `StatusCardStates` fills every action button with `#0D7377` — the canvas's single primary-action
+ * colour — except state 3's, which it draws white with ink on a hairline. Every other action moves
+ * the app FORWARD: send it for review, send the newer version, publish. Taking a submission back
+ * moves it backwards, out of an administrator's queue. Painting it in the encouraging colour asked
+ * a citizen to withdraw their own work in exactly the same voice as it asked them to submit it.
+ *
+ * Read by both surfaces that draw an action — the rail panel and the chip's popover — so the two
+ * cannot disagree about which one this is.
+ */
+export const SECONDARY_ACTIONS: ReadonlySet<ActionKind> = new Set<ActionKind>(['take_it_back'])
+
+/**
  * Which version this state is ABOUT. Every one comes from a column the status read already
  * selects — the registry row's submission and approval stamps, the deployment row's head
  * and timestamps. There is deliberately no "your latest saved version" row: the server

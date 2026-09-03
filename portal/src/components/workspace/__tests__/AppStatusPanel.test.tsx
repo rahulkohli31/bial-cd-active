@@ -232,6 +232,28 @@ describe('the action', () => {
     }
   })
 
+  it('★ draws the ONE action the canvas does not paint teal as a secondary', () => {
+    // `StatusCardStates` fills every action button with `#0D7377` except state 3's, which it draws
+    // white with ink on a hairline. Every other action moves the app forward — send for review,
+    // send the newer version, publish. Taking a submission back moves it backwards, out of an
+    // administrator's queue, and painting it in the encouraging colour asked a citizen to withdraw
+    // their own work in exactly the same voice as it asked them to submit it.
+    wire({ deployment: view('in_review'), approval: approval({ status: 'pending' }) })
+    mount()
+    const back = screen.getByTestId('status-action')
+    expect(back.textContent).toContain('Take it back')
+    expect(back.className).toMatch(/bg-white/)
+    expect(back.className).not.toMatch(/bg-primary/)
+
+    // …and the forward action is still teal, or this would pass on a panel with no primary at all.
+    cleanup()
+    wire({ deployment: view('draft') })
+    mount()
+    const send = screen.getByTestId('status-action')
+    expect(send.textContent).toContain('Send for review')
+    expect(send.className).toMatch(/bg-primary/)
+  })
+
   it('takes a submission back directly, and opens the declaration for everything else', () => {
     const withdraw = vi.fn(async () => {})
     wire({ deployment: view('in_review'), withdraw })

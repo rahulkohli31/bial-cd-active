@@ -59,6 +59,7 @@ import {
   formatStamp,
   lookFor,
   presentationFor,
+  SECONDARY_ACTIONS,
   versionRowData,
 } from '../utils/publishPresentation'
 import type { DeployOutcome, PublishState } from '../utils/deployApi'
@@ -403,9 +404,14 @@ export default function PublishStatusChip({
               onClick={pressAction}
               aria-disabled={busy}
               title={busyReason}
-              className={`mt-3 w-full rounded-lg bg-primary px-3 py-1.5 text-xs font-semibold text-white transition ${
-                busy ? 'cursor-default opacity-40' : 'hover:bg-primary-600'
-              }`}
+              // SECONDARY WHERE THE BOARD DRAWS IT SECONDARY — `StatusCardStates` fills every
+              // action but state 3's with the primary teal. The set is shared with the rail panel
+              // so the two surfaces cannot disagree about which action that is.
+              className={`mt-3 w-full rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
+                SECONDARY_ACTIONS.has(presentation.action)
+                  ? 'border border-bial-border bg-white text-tertiary'
+                  : 'bg-primary text-white'
+              } ${busy ? 'cursor-default opacity-40' : SECONDARY_ACTIONS.has(presentation.action) ? 'hover:border-primary hover:text-primary' : 'hover:bg-primary-600'}`}
             >
               {ACTION_LABEL[presentation.action]}
             </button>
