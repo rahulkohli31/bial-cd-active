@@ -121,8 +121,19 @@ function Row({ row }: { row: ProvenanceRow }) {
 }
 
 export default function AppStatusPanel({ projectId, label }: AppStatusPanelProps) {
-  const { deployment, approval, loadError, refresh, onConfirm, saveAndPublish, unsaved, saving, withdraw, withdrawing } =
-    usePublishState(projectId)
+  const {
+    deployment,
+    approval,
+    loadError,
+    refresh,
+    onConfirm,
+    saveAndPublish,
+    unsaved,
+    saving,
+    withdraw,
+    withdrawing,
+    withdrawError,
+  } = usePublishState(projectId)
   const [showModal, setShowModal] = useState(false)
 
   const state = deployment?.publishState ?? null
@@ -210,6 +221,21 @@ export default function AppStatusPanel({ projectId, label }: AppStatusPanelProps
         >
           {withdrawing ? 'Taking it back…' : ACTION_LABEL[presentation.action]}
         </button>
+      )}
+
+      {/* A REFUSED WITHDRAWAL HAS TO BE SPOKEN, because nothing else on this panel changes when
+          one happens. `withdraw` swallows its failure into this message and does NOT re-read — so
+          without this the pill, the rows and the button all stay exactly as they were and the
+          press looks like it did nothing, which is how a citizen ends up pressing it repeatedly.
+          The ordinary case is an administrator reaching the submission first. */}
+      {withdrawError !== null && (
+        <p
+          data-testid="status-withdraw-error"
+          role="alert"
+          className="mt-2.5 text-[11.5px] leading-relaxed text-danger"
+        >
+          {withdrawError}
+        </p>
       )}
 
       {/* THE SAME QUESTION THE CHIP ASKS, because the server asks it of both: a workspace ahead

@@ -269,6 +269,34 @@ describe('the action', () => {
     expect(screen.getByTestId('data-classification-modal')).toBeTruthy()
   })
 
+  it('★ says so when the withdrawal is refused, rather than looking like nothing happened', () => {
+    // `withdraw` swallows its failure into `withdrawError` and does NOT re-read, so the pill, the
+    // rows and the button are all identical after a refusal. Both origins land here as one
+    // message: a 409 carries the server's own sentence (an administrator reached the submission
+    // first), anything else carries the hook's. Neither may be silent.
+    for (const message of [
+      'Only a submission still waiting for review can be taken back.',
+      'Could not withdraw this submission. Try again.',
+    ]) {
+      wire({ deployment: view('in_review'), approval: approval({ status: 'pending' }), withdrawError: message })
+      mount()
+      const alert = screen.getByRole('alert')
+      expect(alert.textContent, message).toBe(message)
+      // Liveness: the panel is still offering the action, so this is a refusal shown in place
+      // rather than a panel that has replaced itself with an error.
+      expect(screen.getByTestId('status-action').textContent, message).toContain('Take it back')
+      cleanup()
+    }
+  })
+
+  it('says nothing about a withdrawal that has not failed', () => {
+    // Pairs with the case above: the alert must not be a permanent fixture of the state.
+    wire({ deployment: view('in_review'), approval: approval({ status: 'pending' }) })
+    mount()
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.getByTestId('status-action').textContent).toContain('Take it back')
+  })
+
   it('renders no control with a real disabled attribute', () => {
     wire({ deployment: view('draft'), saving: true })
     mount()
