@@ -32,7 +32,7 @@
  */
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
 import { FolderOpen, Hammer, Loader2 } from 'lucide-react'
-import type { ReclaimBlocked } from '../../utils/buildSessionApi'
+import type { HandoverStep, ReclaimBlocked } from '../../utils/buildSessionApi'
 
 interface Props {
   blocked: ReclaimBlocked
@@ -62,6 +62,15 @@ interface Props {
    *  finished writing. The copy says so. */
   onSwitchAnyway: () => Promise<void>
   onCancel: () => void
+  /**
+   * WHICH STEP THE HAND-OVER HAS REACHED, or `null` before it starts (plan 002, U9).
+   *
+   * Owned by the caller rather than by this dialog, because the caller is what performs the
+   * sequence — and the sequence outlives the press: it stops the other project, waits for that to
+   * genuinely finish, saves, releases, starts this project, and only then opens the chat. A
+   * dialog that guessed at its own progress would be narrating a story rather than reporting one.
+   */
+  step?: HandoverStep | null
 }
 
 /**
@@ -109,6 +118,20 @@ function copyFor(
   /** `null` when there is nothing to save — the clean arm offers no Save button at all. */
   save: string | null
   discard: string
+  /**
+   * WHAT IS HAPPENING IN THERE RIGHT NOW, said BEFORE the citizen chooses (plan 002, U9).
+   *
+   * `agentWorking` is the wide fact — an agent mid-turn of ANY kind — and it is a separate
+   * sentence rather than a fourth arm of the map above, because it is orthogonal to all three:
+   * a workspace can be clean AND busy, and the clean arm's "everything saved stays exactly as it
+   * is" is still true while an assistant is answering a question in it. Folding the two together
+   * would have meant either withholding the clean reassurance or withholding the warning.
+   *
+   * `null` on the `building` arm, deliberately: that copy already says the build is running and
+   * has to stop, and a second sentence saying the same thing in different words is how a dialog
+   * starts sounding uncertain about its own facts.
+   */
+  working: string | null
 } {
   // The app being started, in the first line. Falls back to the plain phrasing when the caller
   // could not name it, rather than rendering an empty pair of quotes.
@@ -116,12 +139,20 @@ function copyFor(
   const incumbent = `“${blocked.projectName}”`
   const oneAtATime = 'You can work on one app at a time.'
 
+  // NO INFRASTRUCTURE VOCABULARY ANYWHERE IN THIS FUNCTION. Not "container", not "sandbox", not
+  // "workspace slot" — a citizen asked for an app and is being told they can have one at a time.
+  const working = blocked.agentWorking
+    ? `The assistant is still working in ${incumbent} right now. Carrying on will stop it where it is.`
+    : null
+
   if (blocked.building) {
     return {
       title: `Start ${starting}?`,
       body: `${oneAtATime} ${incumbent} is still being built, so it has to stop first. Stopping keeps everything the assistant has written into ${incumbent} so far — it stays where it is, and you can pick it up again later.`,
       save: `Save ${incumbent} and stop it`,
       discard: `Stop ${incumbent} without saving`,
+      // Already said, in the arm's own words. See `working` above.
+      working: null,
     }
   }
 
@@ -133,6 +164,7 @@ function copyFor(
       body: `${oneAtATime} ${incumbent} will stop so ${starting} can run. Everything saved in ${incumbent} stays exactly as it is, and starting it again later brings it back.`,
       save: null,
       discard: `Stop ${incumbent}`,
+      working,
     }
   }
 
@@ -142,7 +174,26 @@ function copyFor(
     body: `${oneAtATime} ${incumbent} will stop so ${starting} can run, and it ${unsaved}. Save it first and it comes back exactly as you left it; stop without saving and those changes go.`,
     save: `Save ${incumbent} and stop it`,
     discard: `Stop ${incumbent} without saving`,
+    working,
   }
+}
+
+/**
+ * WHAT THE DIALOG SAYS WHILE IT WORKS (plan 002, U9) — because these take real time.
+ *
+ * It is a STATUS SURFACE, not just a question: it asks, then stays up and narrates. A spinner on
+ * a button for the thirty seconds a stop-then-start actually takes is indistinguishable from a
+ * dialog that has hung, and this one is standing in front of a message the citizen has typed.
+ *
+ * Plain language throughout, and nothing that names a mechanism: "closing", "starting", "opening"
+ * are things a person can picture happening to their app.
+ */
+const STEP_SAYS: Record<HandoverStep, string> = {
+  stopping: 'Closing the other app…',
+  saving: 'Saving it first…',
+  releasing: 'Putting it away…',
+  starting: 'Starting your app…',
+  opening: 'Opening your chat…',
 }
 
 export default function ReclaimWorkspaceDialog({
@@ -151,6 +202,7 @@ export default function ReclaimWorkspaceDialog({
   onSaveAndSwitch,
   onSwitchAnyway,
   onCancel,
+  step = null,
 }: Props): React.ReactElement {
   const [busy, setBusy] = useState<null | 'save' | 'discard'>(null)
   const [error, setError] = useState<string | null>(null)
@@ -246,6 +298,23 @@ export default function ReclaimWorkspaceDialog({
         </div>
 
         <p className="text-sm text-neutral mt-3 leading-relaxed">{copy.body}</p>
+
+        {/* SAID BEFORE THE CHOICE, not after it. Whether the other project's agent is working
+            changes what the citizen is agreeing to, so it cannot arrive as a consequence. */}
+        {copy.working !== null && (
+          <p data-testid="reclaim-agent-working" className="mt-2 text-sm font-semibold text-tertiary leading-relaxed">
+            {copy.working}
+          </p>
+        )}
+
+        {/* THE NARRATION, in place of a silent spinner. `role="status"` so it is announced as it
+            changes; permanently reserved space is not needed because the buttons below stay put. */}
+        {busy !== null && step !== null && (
+          <p data-testid="reclaim-step" role="status" className="mt-3 flex items-center gap-2 text-sm text-neutral">
+            <Loader2 size={14} className="animate-spin text-primary" aria-hidden />
+            {STEP_SAYS[step]}
+          </p>
+        )}
 
         {error ? (
           <p role="alert" className="text-sm text-danger mt-3 leading-relaxed">

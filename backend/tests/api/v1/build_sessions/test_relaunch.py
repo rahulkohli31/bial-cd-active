@@ -550,6 +550,11 @@ async def test_a_registry_naming_a_different_app_refuses_the_relaunch(
     body = resp.json()["error"]
     assert body["code"] == "sandbox_reclaim_blocked"
     assert body["projectId"] == str(project_a.id)  # names the project holding the slot
+    # The THIRD entry point into the hand-over dialog, and the only one of the three whose
+    # `agentWorking` is DERIVED here rather than scripted: A's container is pardoned between
+    # turns, so nobody is mid-thought in it and the dialog must not claim otherwise. A field
+    # hardcoded true — the failure this whole unit is about — would fail exactly here.
+    assert body["agentWorking"] is False
     assert aca_wire.aca.delete_calls == []  # A's container survives the refusal
     assert aca_wire.aca.create_calls == [app_name_for(app_a)]  # B was never built
 

@@ -200,7 +200,7 @@ describe('WorkspaceShell — the grid is the shell\'s own', () => {
 
 describe('WorkspaceShell — the reclaim dialog is mounted here, its handlers stay with the publisher', () => {
   const blocked: ReclaimBlocked = {
-    projectId: 'p-other', projectName: 'Other Project', dirty: true, building: false,
+    projectId: 'p-other', projectName: 'Other Project', dirty: true, building: false, agentWorking: false,
   }
 
   function SurfaceWithRefusal({ onResolve }: { onResolve: (save: boolean) => Promise<void> }) {
@@ -209,7 +209,7 @@ describe('WorkspaceShell — the reclaim dialog is mounted here, its handlers st
     return (
       <button
         type="button"
-        onClick={() => setRequest({ blocked, startingProjectName: 'Visitor Log', resolve: onResolve, cancel: () => setRequest(null) })}
+        onClick={() => setRequest({ blocked, startingProjectName: 'Visitor Log', step: null, resolve: onResolve, cancel: () => setRequest(null) })}
       >
         refuse
       </button>

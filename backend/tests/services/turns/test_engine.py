@@ -47,7 +47,7 @@ from src.db.models.conversation import ChatKind
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.db.models.token_usage import TokenUsage
 from src.services.agent.mode_prompts import PromptContext
-from src.services.build_sessions.manager import SessionManager
+from src.services.build_sessions.manager import SessionManager, StopOutcome
 from src.services.messages.projection import (
     PLAN_OPTIONS_TOOL,
     TURN_TERMINAL_KIND,
@@ -875,7 +875,12 @@ async def test_stop_user_turn_and_wait_settles_before_it_returns(
 
     It is also keyed on the USER rather than a conversation, because the caller is a project
     switch: the refusal names a project, and a Write turn's manager session carries no
-    conversation id to look up."""
+    conversation id to look up.
+
+    UPDATED FOR THE THREE STATES. This used to assert `stopped is True`, which the code returned
+    on every path — including the timeout the docstring promised would be reported as still
+    running. `STOPPED` is now read off `task.done()`, the same fact the next line checks, so the
+    assertion cannot hold for a turn that has not finished unwinding."""
     gate = asyncio.Event()
 
     async def _stall(messages: list[ModelMessage], info: AgentInfo):
@@ -894,7 +899,7 @@ async def test_stop_user_turn_and_wait_settles_before_it_returns(
 
     stopped = await engine.stop_user_turn_and_wait(user.id, timeout_s=10)
 
-    assert stopped is True
+    assert stopped is StopOutcome.STOPPED
     # SETTLED, not merely asked to settle — this is the whole difference from `stop_turn`.
     assert state.task is not None and state.task.done()
     assert state.status == "stopped"
@@ -905,10 +910,15 @@ async def test_stop_user_turn_and_wait_settles_before_it_returns(
 async def test_stop_user_turn_and_wait_finds_nothing_when_nothing_runs(
     _fresh_engine, db_session, session_factory
 ) -> None:
-    """False, not an error. The caller's goal is "settled" and it already is — and this is the
-    COMMON path, because a build usually finishes while the user is still reading the dialog."""
+    """`NOTHING_WAS_RUNNING`, not an error. The caller's goal is "settled" and it already is —
+    and this is the COMMON path, because a build usually finishes while the user is still
+    reading the dialog. Its own named state rather than the boolean's `False`, which the
+    timeout's hardcoded `True` sat beside as an equal and opposite lie."""
     user = await UserFactory.create(db_session, email="stopnone@rvaiglobal.com")
-    assert await _fresh_engine.stop_user_turn_and_wait(user.id, timeout_s=5) is False
+    assert (
+        await _fresh_engine.stop_user_turn_and_wait(user.id, timeout_s=5)
+        is StopOutcome.NOTHING_WAS_RUNNING
+    )
 
 
 async def test_stop_user_turn_and_wait_leaves_another_users_turn_alone(
@@ -934,7 +944,10 @@ async def test_stop_user_turn_and_wait_leaves_another_users_turn_alone(
         await asyncio.sleep(0.01)
 
     stranger = await UserFactory.create(db_session, email="stopother@rvaiglobal.com")
-    assert await engine.stop_user_turn_and_wait(stranger.id, timeout_s=5) is False
+    assert (
+        await engine.stop_user_turn_and_wait(stranger.id, timeout_s=5)
+        is StopOutcome.NOTHING_WAS_RUNNING
+    )
     assert state.status == "running"  # the owner's turn is untouched
 
     gate.set()
@@ -964,10 +977,81 @@ async def test_stop_user_turn_and_wait_is_safe_to_repeat(
     while not state.text_blocks():
         await asyncio.sleep(0.01)
 
-    assert await engine.stop_user_turn_and_wait(user.id, timeout_s=10) is True
+    assert await engine.stop_user_turn_and_wait(user.id, timeout_s=10) is StopOutcome.STOPPED
     # The turn has settled, so the repeat finds nothing running — and the terminal survives.
-    assert await engine.stop_user_turn_and_wait(user.id, timeout_s=10) is False
+    # `NOTHING_WAS_RUNNING` is the engine's honest answer to a SECOND ask, and it is why the
+    # manager keeps its own record of having asked: the hand-over's status read has to keep
+    # saying "stopped" across every poll, which the engine alone could not tell it.
+    assert (
+        await engine.stop_user_turn_and_wait(user.id, timeout_s=10)
+        is StopOutcome.NOTHING_WAS_RUNNING
+    )
     assert state.ring[-1].type == "turn_ended" and state.ring[-1].status == "stopped"
+
+
+async def test_a_stop_whose_wait_expires_is_still_running_never_stopped(
+    _fresh_engine, db_session, session_factory, monkeypatch
+) -> None:
+    """*The regression this unit exists for, at the engine seam.* This call used to `return True`
+    after its wait expired — the same answer as a clean stop — while its own docstring promised
+    that a timeout would read as still running. The caller's next act is to take the container.
+
+    THE TURN IS HELD IN ITS OWN `finally`, not merely cancelled and measured a millisecond later.
+    That is the state the whole design turns on: cancellation is a request, and the cleanup that
+    actually frees the workspace — the terminal row, the watcher, `finish_turn_sandbox` — runs
+    afterwards. A test that measured before the cancel was even delivered would pass whatever the
+    code returned, which is how the old assertion survived being wrong.
+
+    NOTHING HERE DEPENDS ON A CLOCK. The turn is parked until this test lets it go, so it cannot
+    finish inside any budget; the assertion that it was genuinely unwinding waits for the cleanup
+    to be entered rather than assuming the 50 ms was enough.
+
+    And note what this pins about the SCAN: it selects on `status == "running"` at entry only, so
+    a stop asked for AFTER `_finish` has run finds nothing — which is why the manager never treats
+    this answer as the verdict and re-reads its own slot instead."""
+    unwinding = asyncio.Event()
+    let_it_finish = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def _stall(messages: list[ModelMessage], info: AgentInfo):
+        yield "partial "
+        await gate.wait()
+        yield "never"
+
+    engine = _fresh_engine
+    # The first await in the turn's `finally`, held open. Every terminal arm funnels through it,
+    # so this is the honest shape of "still unwinding" rather than a fault injected sideways.
+    linger_over = engine._write_turn_terminal
+
+    async def _linger(state, factory):
+        unwinding.set()
+        await let_it_finish.wait()
+        await linger_over(state, factory)
+
+    monkeypatch.setattr(engine, "_write_turn_terminal", _linger)
+
+    user, conv, _ = await _start(
+        engine, db_session, session_factory, FunctionModel(stream_function=_stall)
+    )
+    state = engine.peek(conv.id)
+    assert state is not None
+    while not state.text_blocks():
+        await asyncio.sleep(0.01)
+
+    timed_out = await engine.stop_user_turn_and_wait(user.id, timeout_s=0.05)
+
+    assert timed_out is StopOutcome.STILL_RUNNING
+    await asyncio.wait_for(unwinding.wait(), timeout=10)  # the cleanup is genuinely under way
+    assert state.task is not None and not state.task.done()  # ...and it really has not finished
+
+    # THE BARRIER: let the unwind complete and WAIT for it before asking again, or the second
+    # read measures a system that has not finished.
+    let_it_finish.set()
+    await _settle(engine, conv.id)
+    assert (
+        await engine.stop_user_turn_and_wait(user.id, timeout_s=10)
+        is StopOutcome.NOTHING_WAS_RUNNING
+    )
 
 
 # --- U16: the split audience -------------------------------------------------------------

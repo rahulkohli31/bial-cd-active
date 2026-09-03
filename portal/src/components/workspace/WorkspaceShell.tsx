@@ -187,6 +187,7 @@ function ReclaimSlot() {
     <ReclaimWorkspaceDialog
       blocked={reclaim.blocked}
       startingProjectName={reclaim.startingProjectName}
+      step={reclaim.step}
       onSaveAndSwitch={() => reclaim.resolve(true)}
       onSwitchAnyway={() => reclaim.resolve(false)}
       onCancel={reclaim.cancel}

@@ -47,7 +47,7 @@ import { contextState } from '../../utils/contextLimits'
 import { atLimitSendState, narrativeEnvelopes, turnPhase } from '../../utils/turnNarrative'
 import type { TurnNarrative } from '../../utils/turnNarrative'
 import { fetchSaveState, saveProject, handOverWorkspace, asReclaimBlocked, fetchPreviewState, fetchCompileState, checkWorkspace } from '../../utils/buildSessionApi'
-import type { ReclaimBlocked, PreviewState } from '../../utils/buildSessionApi'
+import type { HandoverStep, ReclaimBlocked, PreviewState } from '../../utils/buildSessionApi'
 import { resolvePlanOptions } from '../../utils/turnStreamApi'
 import { wireMessageFromParts, buildUserParts, partsToText, countAttachments, releaseUploadedAttachments } from '../../utils/attachmentStore'
 import { validateConversationAttachmentCap } from '../../utils/attachmentInput'
@@ -2475,6 +2475,9 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // Held together because they are useless apart: the banner names the project, and the retry
   // is the whole reason the refusal is survivable rather than just informative. Cleared as one.
   const [reclaim, setReclaim] = useState<{ blocked: ReclaimBlocked; retry: () => Promise<void> } | null>(null)
+  // What the hand-over is doing right now, so the dialog narrates instead of spinning through a
+  // sequence that genuinely takes tens of seconds (plan 002, U9).
+  const [handoverStep, setHandoverStep] = useState<HandoverStep | null>(null)
 
   // The refusal is the SAME on both paths a user can take into the one workspace — a Write
   // message and the Relaunch button — so the mapping lives once here. Returns true when it
@@ -2506,8 +2509,12 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   const resolveReclaim = async (save: boolean) => {
     if (!reclaim) return
     const { blocked, retry } = reclaim
-    // Stop, then save, then release — the ordering invariant lives in `handOverWorkspace`.
-    await handOverWorkspace(blocked.projectId, save)
+    try {
+    // Stop, then WAIT FOR THE STOP TO GENUINELY FINISH, then save, then release — the ordering
+    // invariant lives in `handOverWorkspace`, and so does the refusal to proceed on a stop that
+    // only timed out. The narration is the dialog's; this is what feeds it.
+    await handOverWorkspace(blocked.projectId, save, {}, setHandoverStep)
+    setHandoverStep('starting')
     // The retry is awaited BEFORE the dialog is dismissed (#83 review, finding 8). Clearing
     // first unmounts the only surface that can say "that didn't work", so a retry that failed
     // — another tab took the slot, the network blipped — looked exactly like one that worked:
@@ -2515,6 +2522,9 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     // only after it settles, and let a rejection travel back to `run()`.
     await retry()
     setReclaim(null)
+    } finally {
+      setHandoverStep(null)
+    }
   }
 
   // The dialog itself is mounted by the shell, so a refusal has somewhere to appear that is not
@@ -2527,6 +2537,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
         reclaim
           ? {
               blocked: reclaim.blocked,
+              step: handoverStep,
               // Issue #161's framing half: the dialog leads with the app being STARTED, and this
               // surface is that app. `null` while the route is still resolving the project name —
               // the dialog then falls back to the plain phrasing rather than quoting an empty

@@ -1265,7 +1265,11 @@ async def test_a_turn_in_any_kind_refuses_to_reclaim_another_projects_unsaved_wo
     # Another project of this user's holds the workspace, and it has unsaved work.
     async def _blocked(*a, **k):
         raise SandboxReclaimBlockedError(
-            project_id=uuid.uuid4(), project_name="Visitor Log", app_id=uuid.uuid4(), dirty=True
+            project_id=uuid.uuid4(),
+            project_name="Visitor Log",
+            app_id=uuid.uuid4(),
+            dirty=True,
+            agent_working=True,
         )
 
     monkey = SessionManager.reclaim_preflight
@@ -1281,6 +1285,12 @@ async def test_a_turn_in_any_kind_refuses_to_reclaim_another_projects_unsaved_wo
     error = resp.json()["error"]
     assert error["code"] == "sandbox_reclaim_blocked"  # NOT the generic "try again shortly"
     assert error["projectName"] == "Visitor Log"  # names what is in the way
+    # THE HAND-OVER'S PREFLIGHT IS THIS BODY (U9). The browser draws its dialog before it
+    # navigates, from what a refused send returns: the project holding the workspace, and
+    # whether that project's agent is mid-thought. A refusal that carried only the status left
+    # the dialog with nothing to say and no way to name either project.
+    assert error["agentWorking"] is True
+    assert error["building"] is False  # the narrow flag is untouched and travels separately
 
 
 async def test_a_redis_outage_during_the_preflight_is_503_never_a_silent_reclaim(

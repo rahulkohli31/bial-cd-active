@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 from httpx import AsyncClient
@@ -362,15 +363,45 @@ async def _stop_active(client: AsyncClient, user, project, *, csrf: bool = True)
     )
 
 
+async def _stop_state(client: AsyncClient, user, project):
+    """Deliberately WITHOUT the CSRF header. It is a GET that changes nothing, and sending one
+    would hide a route that had quietly started requiring it."""
+    return await client.get(
+        f"/v1/build-sessions/projects/{project.id}/stop-state",
+        headers=auth_headers(user, with_csrf=False),
+    )
+
+
+async def _stopped_state(client: AsyncClient, user, project) -> str:
+    """THE COMPLETION BARRIER over HTTP: poll the status read until it stops saying "still
+    running", exactly as the browser does, and fail loudly if it never does.
+
+    A bounded poll of the real condition rather than a sleep. A fixed sleep here could only be
+    too short — and would then report an absence it had never waited long enough to observe,
+    which is the harness failure that once cost this repo an entire misdirected investigation."""
+    for _ in range(400):
+        body = (await _stop_state(client, user, project)).json()
+        if body["state"] != "still_running":
+            return str(body["state"])
+        await asyncio.sleep(0.01)
+    raise AssertionError("the stop never left 'still running'")
+
+
 async def test_stop_active_build_settles_a_live_build_so_release_can_proceed(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
 ) -> None:
     """THE ORDERING, end to end over HTTP: while the agent works, save and release BOTH refuse;
-    after the stop returns, the release goes through.
+    once the STATUS READ says the work has stopped, the release goes through.
 
     That is the whole reason this route exists. The switch dialog used to offer "Save and switch"
     to a user whose project was mid-build, and the server declined both halves — so the user
-    got a choice, then an error, whichever button they pressed."""
+    got a choice, then an error, whichever button they pressed.
+
+    THE BARRIER MOVED WITH THE DESIGN. This used to assert `stopped: true` on the POST's own
+    response and treat that as "settled by the time it answered". The POST no longer waits — it
+    asks — so the release must sit below the status read, not below the ask, or it is measuring a
+    system that has not finished. The old assertion could not have caught this: the field it read
+    was hardcoded true on every path."""
     brain = BlockingBrain()
     wire.app.dependency_overrides[run_build_dependency] = lambda: brain
     user, project = await _user_project(db_session, "ctl-stop1@rvaiglobal.com")
@@ -398,11 +429,15 @@ async def test_stop_active_build_settles_a_live_build_so_release_can_proceed(
     # would let the build finish on its own and every assertion below would pass without the
     # route having done anything. Cancellation lands inside the brain's `wait()`, which is the
     # shape a real agent mid-write takes.
-    stopped = await _stop_active(client, user, project)
+    asked = await _stop_active(client, user, project)
 
-    assert stopped.status_code == 200
-    assert stopped.json()["stopped"] is True
-    # Settled BY THE TIME IT ANSWERED — the release no longer conflicts.
+    assert asked.status_code == 200
+    assert asked.json()["state"] == "still_running"  # the ask returned; the stop is in flight
+
+    # THE BARRIER. Nothing below this line runs until the status read says the work has stopped,
+    # and it is a poll of the real state rather than a wait on a clock.
+    assert await _stopped_state(client, user, project) == "stopped"
+
     after = await client.post(
         f"/v1/build-sessions/projects/{project.id}/release", headers=auth_headers(user)
     )
@@ -411,16 +446,24 @@ async def test_stop_active_build_settles_a_live_build_so_release_can_proceed(
     await drain(wire.manager, sid)
 
 
-async def test_stopping_a_settled_project_is_200_false_not_an_error(
+async def test_stopping_a_settled_project_says_nothing_was_running_not_an_error(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
 ) -> None:
-    """`stopped: false` is the answer, not a 409. The caller wants "settled" and it already is
+    """`nothingWasRunning` is the answer, not a 409. The caller wants "settled" and it already is
     — and the common path is exactly this, because the build usually finishes while the user
-    is still reading the dialog."""
+    is still reading the dialog.
+
+    ITS OWN STATE NOW, where the old `stopped: false` shared a field with a timeout's hardcoded
+    `true`. The status read agrees, which is the property the browser depends on: an ask and a
+    read of the same untouched project cannot disagree."""
     user, project = await _user_project(db_session, "ctl-stop2@rvaiglobal.com")
     resp = await _stop_active(client, user, project)
     assert resp.status_code == 200
-    assert resp.json()["stopped"] is False
+    assert resp.json()["state"] == "nothing_was_running"
+
+    read = await _stop_state(client, user, project)
+    assert read.status_code == 200
+    assert read.json()["state"] == "nothing_was_running"
 
 
 async def test_stop_active_build_is_owner_scoped_and_csrf_guarded(
@@ -434,6 +477,24 @@ async def test_stop_active_build_is_owner_scoped_and_csrf_guarded(
 
     assert (await _stop_active(client, stranger, project)).status_code == 404
     assert (await _stop_active(client, owner, project, csrf=False)).status_code == 403
+
+
+async def test_the_stop_state_read_is_owner_scoped_and_needs_no_csrf(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """ADR-0004 on the new half of the pair, and the reason it is a GET.
+
+    It changes nothing — no cancel, no teardown, nothing written — so a CSRF header would be
+    ceremony, and the browser polls it while it narrates. What it DOES leak if unscoped is
+    whether another citizen's project is busy, so a stranger gets the same non-leaking 404 the
+    ask gives."""
+    owner, project = await _user_project(db_session, "ctl-stop5@rvaiglobal.com")
+    stranger = await UserFactory.create(db_session, email="ctl-stop6@rvaiglobal.com")
+
+    assert (await _stop_state(client, stranger, project)).status_code == 404
+    mine = await _stop_state(client, owner, project)
+    assert mine.status_code == 200  # no CSRF header sent, and none needed
+    assert mine.json()["state"] == "nothing_was_running"
 
 
 async def test_stop_active_build_answers_without_redis(
@@ -454,4 +515,10 @@ async def test_stop_active_build_answers_without_redis(
     user, project = await _user_project(db_session, "ctl-stop-noredis@rvaiglobal.com")
     resp = await _stop_active(client, user, project)
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"stopped": False}  # nothing running, and it could still say so
+    assert resp.json() == {"state": "nothing_was_running"}  # and it could still say so
+
+    # The status read carries the same asymmetry, and needs it more: this is what the browser
+    # polls, so a Redis outage that silenced it would strand a hand-over mid-narration.
+    read = await _stop_state(client, user, project)
+    assert read.status_code == 200, read.text
+    assert read.json() == {"state": "nothing_was_running"}

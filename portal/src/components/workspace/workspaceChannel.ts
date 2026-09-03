@@ -63,7 +63,7 @@ import { createContext, useContext, useLayoutEffect, useRef, useSyncExternalStor
 import type LivePreview from '../LivePreview'
 import type { PreviewAddress } from '../../utils/previewAddress'
 import type { CompileState } from '../../utils/compileState'
-import type { PreviewLifeState, ReclaimBlocked } from '../../utils/buildSessionApi'
+import type { HandoverStep, PreviewLifeState, ReclaimBlocked } from '../../utils/buildSessionApi'
 import type { RelaunchError } from '../../utils/buildSessionTypes'
 import { sameWorkspaceState } from './workspaceState'
 import type { StartOutcome, WorkspaceState } from './workspaceState'
@@ -199,6 +199,16 @@ export interface ReclaimRequest {
   /** `true` saves the other project before releasing it; `false` releases without saving. */
   resolve: (save: boolean) => Promise<void>
   cancel: () => void
+  /**
+   * WHICH STEP THE HAND-OVER HAS REACHED (plan 002, U9), or `null` before one starts.
+   *
+   * It travels with the request rather than being derived by the dialog, because the SEQUENCE is
+   * the publisher's: stop the other project, wait for that to genuinely finish, save, release,
+   * start this one, and only then open the chat. Those take real time — a stop alone waits on a
+   * finish path that contains a recovery autosave — and a dialog left spinning through them is
+   * indistinguishable from one that has hung.
+   */
+  step: HandoverStep | null
 }
 
 /**

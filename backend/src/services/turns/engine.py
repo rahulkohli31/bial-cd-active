@@ -118,6 +118,7 @@ from src.services.build_sessions.manager import (
     SandboxReclaimBlockedError,
     SessionManager,
     SnapshotUnavailableError,
+    StopOutcome,
     WorkspaceUnreadableError,
 )
 from src.services.build_sessions.outcome import STOPPED_BY_USER
@@ -912,8 +913,11 @@ class TurnEngine:
         state.task.cancel()
         return True
 
-    async def stop_user_turn_and_wait(self, user_id: uuid.UUID, *, timeout_s: float) -> bool:
-        """Stop whatever turn this user is running, and WAIT for it to actually unwind.
+    async def stop_user_turn_and_wait(
+        self, user_id: uuid.UUID, *, timeout_s: float
+    ) -> StopOutcome:
+        """Stop whatever turn this user is running, WAIT for it to actually unwind, and report
+        which of the three things happened.
 
         The "stop and switch" flow needs this and `stop_turn` cannot provide it, for
         two reasons. It is keyed on a conversation the caller does not have — the refusal names
@@ -928,10 +932,14 @@ class TurnEngine:
         lands tears a container out from under a running task, the exact strand the build
         session module exists to prevent.
 
+        SO THE RETURN VALUE IS READ FROM THE TASK, not from the fact that we asked. This used to
+        `return True` after the wait whether or not the wait had expired, which said "stopped"
+        about a turn still inside its `finally` — and the docstring above promised the opposite.
+        `timeout_s` bounds the wait, never the unwind: the shielded task keeps going, and a
+        later look answers correctly.
+
         At most one turn can be running per user (`_claim_the_one_build_slot` refuses a second
-        allocation), so the scan below finds one or none. Returns True when a running turn was
-        found and awaited. `timeout_s` bounds the wait rather than hanging the request: the
-        caller must treat a timeout as "still running", never as "safe to proceed"."""
+        allocation), so the scan below finds one or none."""
         state = next(
             (
                 s
@@ -941,7 +949,7 @@ class TurnEngine:
             None,
         )
         if state is None or state.task is None:
-            return False
+            return StopOutcome.NOTHING_WAS_RUNNING
         if not state.stop_requested:
             state.stop_requested = True
             state.task.cancel()
@@ -952,7 +960,10 @@ class TurnEngine:
         # SUCCESS case here: we asked for it.
         with suppress(TimeoutError, asyncio.CancelledError, Exception):
             await asyncio.wait_for(asyncio.shield(state.task), timeout=timeout_s)
-        return True
+        # THE TASK IS THE SOURCE OF TRUTH for whether this turn has finished unwinding. A wait
+        # that expired leaves it pending, and saying anything else here is how a container gets
+        # taken from a turn still writing.
+        return StopOutcome.STOPPED if state.task.done() else StopOutcome.STILL_RUNNING
 
     # -- the detached run ---------------------------------------------------------------
 

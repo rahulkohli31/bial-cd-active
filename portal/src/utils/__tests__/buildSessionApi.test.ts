@@ -298,7 +298,31 @@ describe('buildSessionApi — lock ops + fail-closed errors (C3 §3)', () => {
 describe('asReclaimBlocked (#83)', () => {
   it('reads the occupying project off the 409', () => {
     const err = { code: 'sandbox_reclaim_blocked', details: { projectId: 'p-a', projectName: 'Lost & Found', dirty: true } }
-    expect(asReclaimBlocked(err)).toEqual({ projectId: 'p-a', projectName: 'Lost & Found', dirty: true, building: false })
+    expect(asReclaimBlocked(err)).toEqual({
+      projectId: 'p-a',
+      projectName: 'Lost & Found',
+      dirty: true,
+      building: false,
+      // ABSENT READS AS FALSE (plan 002, U9). An older backend that does not send the field
+      // cannot have an agent to report, and defaulting the other way would tell every citizen
+      // their other project is busy.
+      agentWorking: false,
+    })
+  })
+
+  it('★ carries `agentWorking` — the WIDE fact, separate from `building`', () => {
+    // `building` marks only turns whose toolset can WRITE, and the server records why widening
+    // it was wrong: it put a stop button and a hammer icon in front of someone who had only
+    // asked a question. This is the wide answer, for a different sentence the dialog needs to be
+    // able to say over a workspace it has just reported as holding nothing to lose.
+    const err = {
+      code: 'sandbox_reclaim_blocked',
+      details: { projectId: 'p-a', projectName: 'A', dirty: false, building: false, agentWorking: true },
+    }
+    const blocked = asReclaimBlocked(err)
+    expect(blocked?.agentWorking).toBe(true)
+    expect(blocked?.building).toBe(false)
+    expect(blocked?.dirty).toBe(false)
   })
 
   it('keeps dirty TRI-STATE — a non-boolean is unknown, never clean', () => {
@@ -356,6 +380,7 @@ describe('asReclaimBlocked (#83)', () => {
       projectName: 'Lost & Found',
       dirty: true,
       building: false,
+      agentWorking: false,
     })
   })
 
@@ -396,6 +421,7 @@ describe('asReclaimBlocked — a project that is still being built', () => {
       projectName: 'Lost & Found',
       dirty: null,
       building: true,
+      agentWorking: false,
     })
   })
 
@@ -424,15 +450,29 @@ describe('asReclaimBlocked — a project that is still being built', () => {
  * had to stop swallowing, and `occupyingProjectId` is the only thing the "another project
  * holds your workspace" remedy has to navigate with.
  */
+/** A clock that jumps rather than waits: the CEILING's behaviour is the thing under test, and a
+ *  test that genuinely waited two minutes for it is a test nobody runs. */
+function fastClock() {
+  let t = 0
+  return {
+    now: () => t,
+    sleep: async (ms: number) => {
+      t += ms
+    },
+  }
+}
+
 describe('handOverWorkspace — the stop → save → release ordering (#83)', () => {
   /** Records the path of every call in order, and answers each of the three routes plausibly. */
-  function recordingFetch() {
+  function recordingFetch(stopState = 'stopped') {
     const seen: string[] = []
     const fetchImpl = vi.fn<FetchImpl>(async (url: string) => {
       seen.push(new URL(url, 'http://x').pathname)
       if (url.endsWith('/save')) return res(200, { appId: 'a-1', headSha: 'deadbeef' })
       if (url.endsWith('/release')) return res(200, { released: true })
-      return res(200, { stopped: true })
+      // THREE NAMED STATES, never a boolean (plan 002, U9) — see `StopState`. The old wire said
+      // `{stopped: true}` unconditionally, which is exactly the confusion this replaced.
+      return res(200, { state: stopState })
     })
     return { seen, fetchImpl }
   }
@@ -461,10 +501,81 @@ describe('handOverWorkspace — the stop → save → release ordering (#83)', (
     const fetchImpl = vi.fn<FetchImpl>(async (url: string) => {
       seen.push(new URL(url, 'http://x').pathname)
       if (url.endsWith('/save')) return res(500, { error: { message: 'disk full' } })
-      return res(200, { stopped: true })
+      return res(200, { state: 'stopped' })
     })
     await expect(handOverWorkspace('p-1', true, { fetchImpl })).rejects.toBeInstanceOf(ApiError)
     expect(seen.some((p) => p.endsWith('/release'))).toBe(false)
+  })
+
+  it('★ WAITS for the stop to genuinely settle, and reports how far it got', async () => {
+    // THE ASK RETURNS IMMEDIATELY NOW, usually `still_running` because the unwind has barely
+    // begun. Proceeding on that would take a container out from under a task still writing to
+    // it — so the hand-over polls the state read, which is the source of truth, and only the
+    // two SETTLED answers let it carry on.
+    const seen: string[] = []
+    let asked = 0
+    const fetchImpl = vi.fn<FetchImpl>(async (url: string) => {
+      const path = new URL(url, 'http://x').pathname
+      seen.push(path)
+      if (path.endsWith('/stop-active-build')) return res(200, { state: 'still_running' })
+      if (path.endsWith('/stop-state')) {
+        asked += 1
+        return res(200, { state: asked >= 3 ? 'stopped' : 'still_running' })
+      }
+      return res(200, { released: true })
+    })
+
+    await handOverWorkspace('p-1', false, { fetchImpl })
+
+    expect(asked).toBe(3)
+    // …and the release comes only AFTER the state said so.
+    expect(seen.lastIndexOf('/api/build-sessions/projects/p-1/stop-state')).toBeLessThan(
+      seen.indexOf('/api/build-sessions/projects/p-1/release'),
+    )
+  })
+
+  it('★ a stop that never settles does NOT release, and says nothing has changed', async () => {
+    // THE DIFFERENCE BETWEEN A CLEAN STOP AND A TIMEOUT, which this repo has shipped confused
+    // before. Mutation receipt: treat `still_running` as settled and the release fires.
+    const seen: string[] = []
+    const fetchImpl = vi.fn<FetchImpl>(async (url: string) => {
+      seen.push(new URL(url, 'http://x').pathname)
+      return res(200, { state: 'still_running' })
+    })
+
+    const err = await handOverWorkspace('p-1', false, { fetchImpl }, undefined, fastClock()).catch(
+      (e: unknown) => e,
+    )
+
+    expect(err).toBeInstanceOf(ApiError)
+    expect((err as ApiError).message).toMatch(/nothing has changed/i)
+    expect(seen.some((path) => path.endsWith('/release'))).toBe(false)
+    expect(seen.some((path) => path.endsWith('/save'))).toBe(false)
+  })
+
+  it('★ "nothing was running" is a SUCCESS to proceed on, not a miss', async () => {
+    const { seen, fetchImpl } = recordingFetch('nothing_was_running')
+    await handOverWorkspace('p-1', false, { fetchImpl })
+    expect(seen.some((path) => path.endsWith('/release'))).toBe(true)
+    // …and it did not need to poll at all: the ask already answered.
+    expect(seen.some((path) => path.endsWith('/stop-state'))).toBe(false)
+  })
+
+  it('★ a body it cannot read is "still running" — the only safe default', async () => {
+    // Reading an unparseable answer as settled would let it take somebody's container.
+    const fetchImpl = vi.fn<FetchImpl>(async (url: string) =>
+      url.endsWith('/release') ? res(200, { released: true }) : res(200, { stopped: true }),
+    )
+    await expect(
+      handOverWorkspace('p-1', false, { fetchImpl }, undefined, fastClock()),
+    ).rejects.toBeInstanceOf(ApiError)
+  })
+
+  it('narrates each step, in the order it performs them', async () => {
+    const { fetchImpl } = recordingFetch()
+    const steps: string[] = []
+    await handOverWorkspace('p-1', true, { fetchImpl }, (step) => steps.push(step))
+    expect(steps).toEqual(['stopping', 'saving', 'releasing'])
   })
 
   it('carries a reclaim refusal out to the caller rather than swallowing it', async () => {

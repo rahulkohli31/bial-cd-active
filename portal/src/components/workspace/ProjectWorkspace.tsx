@@ -61,7 +61,7 @@ import {
 import type { ReclaimRequest } from './workspaceChannel'
 import { resolvePreviewAddress } from '../../utils/previewAddress'
 import { handOverWorkspace } from '../../utils/buildSessionApi'
-import type { ReclaimBlocked } from '../../utils/buildSessionApi'
+import type { HandoverStep, ReclaimBlocked } from '../../utils/buildSessionApi'
 import type { Project } from '../../utils/projectApi'
 
 export interface ProjectWorkspaceProps {
@@ -80,6 +80,9 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   // THE RENAME'S STATE IS HERE BECAUSE ITS DATA IS. The control is in the shell's toolbar row,
   // which sits above the Outlet and has no project object; this surface has both the project and
   // the update callback, so the row publishes a press upward and the editing happens down here.
+  // WHAT THE HAND-OVER IS DOING RIGHT NOW, published to the dialog so it narrates instead of
+  // spinning. Held here because this surface performs the sequence.
+  const [step, setStep] = useState<HandoverStep | null>(null)
   const [renaming, setRenaming] = useState(false)
   const startRename = useCallback(() => setRenaming(true), [])
 
@@ -126,17 +129,32 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
       blocked: reclaim.blocked,
       // The project this surface IS — the one being started, which is what the dialog leads with.
       startingProjectName: project.name,
+      step,
       resolve: async (save: boolean) => {
-        // Stop, then save, then release — the ordering invariant lives in `handOverWorkspace`.
-        // The retry is AWAITED BEFORE the dialog is dismissed, so a switch that fails can still
-        // be reported instead of vanishing with the dialog.
-        await handOverWorkspace(reclaim.blocked.projectId, save)
-        await reclaim.retry()
-        setReclaim(null)
+        try {
+          // Stop, then WAIT FOR THE STOP TO GENUINELY FINISH, then save, then release — the
+          // ordering invariant lives in `handOverWorkspace`, and so does the refusal to proceed
+          // on a stop that only timed out.
+          await handOverWorkspace(reclaim.blocked.projectId, save, {}, setStep)
+          // The retry is AWAITED BEFORE the dialog is dismissed, so a switch that fails can still
+          // be reported instead of vanishing with the dialog. It is the whole of what was refused:
+          // starting this project's app, and — from the rail — opening the chat with the message
+          // the citizen typed, which has been held in the composer throughout.
+          setStep('starting')
+          await reclaim.retry()
+          setReclaim(null)
+        } finally {
+          setStep(null)
+        }
       },
-      cancel: () => setReclaim(null),
+      cancel: () => {
+        // CANCELLING CHANGES NOTHING ANYWHERE. Nothing has been stopped, nothing released, and the
+        // typed message and its staged files are still in the composer that never sent them.
+        setReclaim(null)
+        setStep(null)
+      },
     }
-  }, [reclaim, project.name])
+  }, [reclaim, project.name, step])
 
   const report = useMemo(
     () => ({

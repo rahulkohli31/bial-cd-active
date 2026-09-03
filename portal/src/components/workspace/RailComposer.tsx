@@ -39,7 +39,10 @@ import { validatePrompt } from '../../utils/promptGuardrails'
 import type { PromptViolation } from '../../utils/promptGuardrails'
 import { uuidv7 } from '../../utils/conversationApi'
 import { chatKindFor } from '../../utils/chatKind'
+import { asReclaimBlocked, relaunchPreview } from '../../utils/buildSessionApi'
+import { useWorkspaceReport } from './workspaceChannel'
 import ComposerBox, { type ComposerSubmission } from '../chat/ComposerBox'
+import { SendRefusal } from '../chat/Composer'
 import { convertMessage } from '../chat/runtime/convertMessage'
 import type { ChatMessage } from '../../utils/messageTypes'
 import {
@@ -98,13 +101,37 @@ async function refuseLibrarySend(): Promise<never> {
 
 function RailComposerBody({ projectId }: RailComposerProps) {
   const navigate = useNavigate()
+  // THE WORKSPACE'S ONE REPORT, read rather than passed: this component sits several levels below
+  // the surface that publishes it, and the alternative is a prop chain through the rail that no
+  // component in between has any business carrying.
+  const report = useWorkspaceReport()
   const [kind, setKind] = useState<ChatKind>('build')
   const [guardRailModal, setGuardRailModal] = useState<PromptViolation | null>(null)
   const [urgent, setUrgent] = useState<string | null>(null)
 
   /**
-   * Mint a fresh chat and hand the draft to it. EVERY submit mints a NEW conversation — there is no
-   * canonical thread per project; continuity lives in the app and its snapshots.
+   * THE ONE-WORKSPACE RULE, ASKED AT SUBMIT (plan 002, U9) — and the whole of why this is not a
+   * two-line navigate any more.
+   *
+   * IT USED TO NAVIGATE FIRST. The browser jumped to the new chat address, the chat mounted, its
+   * send hit the server, and only THEN did the refusal arrive — so a citizen who had been building
+   * in another project for two minutes was interrupted by a question about a chat that had already
+   * opened in front of them. The backend's own ordering was always right: every refusal on the
+   * send path is side-effect-free before anything is persisted. It was the browser that jumped
+   * ahead of it.
+   *
+   * So the order is inverted. Nothing starts, and no address changes, before the citizen has
+   * answered:
+   *
+   *   1. ask for the workspace — the preflight, and also the start this project needs anyway
+   *   2. if it is held, the dialog opens naming BOTH projects, and this rejects so the composer
+   *      keeps the typed message and its staged files
+   *   3. on transfer the shell's dialog drains the other project, waits for a genuinely clean
+   *      stop, releases it, and then re-runs this whole function — including the navigate
+   *   4. the chat is created only once the container is ready, carrying the held message
+   *
+   * THE MESSAGE IS HELD IN THE COMPOSER THROUGHOUT, which is what makes cancelling free: nothing
+   * has been stopped, nothing released, and the text is exactly where it was.
    */
   const startChat = useCallback(
     async ({ text, attachments }: ComposerSubmission) => {
@@ -114,24 +141,69 @@ function RailComposerBody({ projectId }: RailComposerProps) {
         // REJECTS RATHER THAN RESOLVES, so the box keeps the message. A resolve here would empty
         // the composer for a send that never left — the exact loss the acceptance rule exists to
         // prevent, arriving through the guardrail instead of through the server.
-        throw new Error('blocked by the prompt guardrail')
+        //
+        // SILENT, because the modal in front of them IS the explanation. A second sentence under
+        // the composer saying "that message did not send" would be the composer talking over a
+        // dialog that has already said more, and better.
+        throw new SendRefusal('blocked by the prompt guardrail', { silent: true })
       }
-      // THROUGH THE SHARED `uuidv7`, never an inline `crypto.randomUUID()`. That mints a v4, and
-      // this id becomes the conversation's PRIMARY KEY, which ADR-0006 wants sortable.
-      //
-      // THE KIND TRAVELS AS A QUERY PARAM, THE DRAFT AS ROUTER STATE, and the split is deliberate.
-      // Router state dies on reload and never travels in a shared link, so a bookmarked
-      // `/chat/{id}` must still be able to take its kind from somewhere — and the server is the
-      // authority once the row exists. The draft is the opposite: it is this navigation's payload
-      // and has no business surviving a reload or appearing in a URL.
-      //
-      // `freshlyMinted` tells `ChatRoute` the row does not exist yet, so it can skip a GET that can
-      // only ever 404 — doubled by two hydration fetches and doubled again by StrictMode in dev.
-      navigate(`/chat/${uuidv7()}?projectId=${encodeURIComponent(projectId)}&kind=${kind}`, {
-        state: { prompt: text, pendingAttachments: attachments, freshlyMinted: true },
-      })
+
+      const open = () => {
+        // THROUGH THE SHARED `uuidv7`, never an inline `crypto.randomUUID()`. That mints a v4, and
+        // this id becomes the conversation's PRIMARY KEY, which ADR-0006 wants sortable.
+        //
+        // THE KIND TRAVELS AS A QUERY PARAM, THE DRAFT AS ROUTER STATE, and the split is
+        // deliberate. Router state dies on reload and never travels in a shared link, so a
+        // bookmarked `/chat/{id}` must still be able to take its kind from somewhere — and the
+        // server is the authority once the row exists. The draft is the opposite: it is this
+        // navigation's payload and has no business surviving a reload or appearing in a URL.
+        //
+        // `freshlyMinted` tells `ChatRoute` the row does not exist yet, so it can skip a GET that
+        // can only ever 404 — doubled by two hydration fetches and doubled again by StrictMode.
+        navigate(`/chat/${uuidv7()}?projectId=${encodeURIComponent(projectId)}&kind=${kind}`, {
+          state: { prompt: text, pendingAttachments: attachments, freshlyMinted: true },
+        })
+      }
+
+      // NOTHING TO ASK FOR WITHOUT A REPORT. A rail rendered outside a workspace has no channel to
+      // route a refusal onto and no pane to start anything into; opening the chat is then the same
+      // behaviour this surface has always had.
+      if (!report) {
+        open()
+        return
+      }
+
+      const attempt = async (): Promise<void> => {
+        report.onStartPending(true)
+        try {
+          const res = await relaunchPreview({ projectId })
+          // THE PANE FRAMES IT BEFORE THE CHAT OPENS, so the app is on screen as the transcript
+          // arrives rather than a beat behind it.
+          if (res.previewUrl) report.onStarted(res.previewUrl)
+          report.onStartOutcome(res.ready ? null : { kind: 'not-painted' })
+          open()
+        } catch (err) {
+          // DISCRIMINATED ON THE CODE. Another project holding the one workspace is a QUESTION
+          // with a remedy; everything else is a failure to report.
+          const blocked = asReclaimBlocked(err)
+          if (blocked) {
+            // The retry is this whole function again — start, then open — so a transfer that
+            // succeeds lands the citizen in the chat their message was typed for, exactly once.
+            report.onReclaimRefusal(blocked, attempt)
+            // REJECTS, so the composer keeps everything. SILENT for the same reason as the
+            // guardrail above: the dialog is the explanation, and a line under the composer
+            // repeating it in weaker words is noise over the top of it.
+            throw new SendRefusal('the workspace is held by another project', { silent: true })
+          }
+          throw err
+        } finally {
+          report.onStartPending(false)
+        }
+      }
+
+      await attempt()
     },
-    [kind, navigate, projectId],
+    [kind, navigate, projectId, report],
   )
 
   const picked = useMemo(() => chatKindFor(kind), [kind])

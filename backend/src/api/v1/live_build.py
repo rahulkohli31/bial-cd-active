@@ -91,12 +91,21 @@ class ReclaimBlockedError(CamelModel):
     # matters. The client must render a different dialog: the remedy is to stop the build
     # first, and Save/Release both refuse until it has stopped.
     building: bool
+    # → `agentWorking`: an agent is mid-turn in there, of ANY kind. DELIBERATELY WIDER than
+    # `building` and deliberately a SEPARATE field: `building` marks only turns whose toolset
+    # can write, because widening that one put a hammer icon and two Stop buttons in front of a
+    # citizen who had asked a question. The hand-over dialog needs the wide answer for a
+    # different sentence — "their agent is working, transferring will stop it" — and it must be
+    # able to say that over a workspace it has just reported as holding nothing to lose. So the
+    # two travel together: `building` decides WHICH dialog, `agentWorking` decides what that
+    # dialog says is happening right now.
+    agent_working: bool
 
 
 class ReclaimBlockedEnvelope(CamelModel):
-    """`{"error": {message, code, projectId, projectName, dirty, building}}` — the 409 a turn,
-    start or relaunch returns when taking the one sandbox slot would destroy another project's
-    work.
+    """`{"error": {message, code, projectId, projectName, dirty, building, agentWorking}}` — the
+    409 a turn, start or relaunch returns when taking the one sandbox slot would destroy another
+    project's work.
 
     Lives here rather than in `build_sessions/router.py` because two routers now answer it:
     the turn route (`conversations/turns.py`, the path a user actually walks) and relaunch."""
@@ -115,7 +124,17 @@ def reclaim_blocked_response(exc: SandboxReclaimBlockedError) -> JSONResponse:
     TWO SENTENCES, because there are two situations and only one of them is about saving. A
     project whose agent is mid-build has no settled tree to describe and cannot be released at
     all until the build stops, so telling that user their project "has unsaved changes" is both
-    untrue and a dead end — it points at a Save button the server will refuse."""
+    untrue and a dead end — it points at a Save button the server will refuse.
+
+    THE PREFLIGHT FOR THE HAND-OVER IS THIS BODY, and that is what `agentWorking` is here for.
+    The hand-over dialog has to name both projects and say whether the other one's agent is
+    mid-thought BEFORE the citizen chooses, and the alternative — teaching the cheap state poll
+    to answer it — cannot: that read is contractually forbidden from the container round trip
+    the unsaved-work half needs. Every refusal on the send path is side-effect-free before
+    anything is persisted, so asking by sending is legitimate, and all three entry points (the
+    send, the plan offer's build action, and relaunch) come through this one function — which is
+    what makes the answer identical on all three rather than correct on the one that was
+    tested."""
     if exc.building:
         message = f"“{exc.project_name}” is still being built."
     else:
@@ -131,6 +150,7 @@ def reclaim_blocked_response(exc: SandboxReclaimBlockedError) -> JSONResponse:
                 "projectName": exc.project_name,
                 "dirty": exc.dirty,
                 "building": exc.building,
+                "agentWorking": exc.agent_working,
             }
         },
     )

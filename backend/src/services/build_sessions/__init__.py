@@ -54,6 +54,7 @@ from src.services.build_sessions.manager import SessionManager as SessionManager
 from src.services.build_sessions.manager import (
     SnapshotUnavailableError as SnapshotUnavailableError,
 )
+from src.services.build_sessions.manager import StopOutcome as StopOutcome
 from src.services.build_sessions.manager import app_name_for as app_name_for
 from src.services.build_sessions.manager import get_session_manager as get_session_manager
 from src.services.build_sessions.manager import (
