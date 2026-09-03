@@ -192,6 +192,34 @@ describe('the draft is held until the server confirms (R58/R59)', () => {
     expect(readDraft('chat-1')).toBe('do not lose me')
   })
 
+  it('★ stores what the box KEPT when the citizen rewrote it mid-send, rather than clearing it', async () => {
+    // THE DIVERGENCE THIS IS WRITTEN AGAINST. The box deliberately leaves a rewritten message
+    // alone, but the draft was cleared on every accepted send — so the composer showed words that
+    // were no longer stored anywhere, and because the mirror only fires when the text CHANGES
+    // nothing ever wrote them back. A reload, or a step to a sibling chat, destroyed them.
+    let release = () => {}
+    const gate = new Promise<void>((r) => { release = r })
+    const onSubmit = vi.fn().mockReturnValue(gate)
+    draw({ onSubmit })
+
+    type('make the header blue')
+    fireEvent.keyDown(box(), { key: 'Enter' })
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    expect(send().getAttribute('aria-disabled')).toBe('true') // the send is out
+
+    // While the request is out they select all and start again.
+    type('actually make it red')
+    release()
+
+    // WAIT FOR THE SEND TO SETTLE, not for the draft to hold a value it holds already: the store
+    // is written the moment they type, so an assertion polled from the press would pass before
+    // the clearing this test is about had even had its chance to run.
+    await waitFor(() => expect(send().getAttribute('aria-disabled')).toBe('false'))
+    expect(readDraft('chat-1')).toBe('actually make it red')
+    // …and the box and the store agree, which is the property.
+    expect(box().value).toBe('actually make it red')
+  })
+
   it('stamps the conversation at PRESS time, so a mid-send switch cannot misfile it (R60)', async () => {
     const onSubmit = vi.fn().mockResolvedValue(undefined)
     draw({ onSubmit })

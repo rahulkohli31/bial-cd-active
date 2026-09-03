@@ -75,6 +75,16 @@ export interface ComposerBoxProps {
    * only sending — so this is the box's whole notion of unavailability.
    */
   unavailableReason: string | null
+  /**
+   * WHAT THE BOX ACTUALLY KEPT, once an accepted send has been reconciled — the conversation the
+   * send was stamped with, and the text still standing in the box afterwards.
+   *
+   * IT EXISTS BECAUSE THE BOX DOES NOT ALWAYS EMPTY. A citizen who rewrites the box while the
+   * request is out gets their words left alone (see `doSend`), and a caller that clears its own
+   * copy of the draft on every accepted send would then be deleting text still on screen. Anyone
+   * keeping a second copy has to be told what survived rather than assuming nothing did.
+   */
+  onAccepted?: (conversationId: string, remainingText: string) => void
   /** Rendered inside the box, above the input: the offer strip's locked treatment, and nothing else. */
   header?: React.ReactNode
   /** Rendered under the box: the cap counter, the context warning, the kind description. */
@@ -88,6 +98,7 @@ export default function ComposerBox({
   placeholder,
   onSubmit,
   unavailableReason,
+  onAccepted,
   header,
   footer,
   onUrgent,
@@ -154,10 +165,16 @@ export default function ComposerBox({
       const after = aui.composer.getState()
       // ONE BRANCH, NOT TWO. `startsWith` is true when the two are equal and the slice is then
       // empty, so an `after.text === sentText` arm ahead of this would be the same statement twice.
-      if (after.text.startsWith(sentText)) await aui.composer.setText(after.text.slice(sentText.length))
+      //
       // Anything else is an edit we cannot reconcile — the citizen rewrote the box while the
       // request was out. Leaving their words alone is the only safe answer; a stale copy of a
       // sent line is a nuisance, a deleted paragraph is the bug.
+      const kept = after.text.startsWith(sentText) ? after.text.slice(sentText.length) : after.text
+      if (kept !== after.text) await aui.composer.setText(kept)
+      // SAID OUT LOUD, because a caller holding a second copy of this text cannot see which of the
+      // two branches ran. Reported before the attachment tidying below, which can throw: the words
+      // are safe either way, and the draft is about the words.
+      onAccepted?.(conversationId, kept)
 
       // THE FILES, SAME RULE. `clearAttachments()` is all-or-nothing and the composer exposes no
       // per-file removal, so anything staged during the send is cleared with the rest and then put
@@ -170,9 +187,9 @@ export default function ComposerBox({
       // calls — may lack it. Everything reaching here is a `PendingAttachment` and carries its
       // file. A bare `if (a.file)` would drop one SILENTLY on the day that stops being true, which
       // is the exact loss the rest of this function exists to prevent.
-      const kept = after.attachments.filter((a) => !sentIds.has(a.id))
+      const keptFiles = after.attachments.filter((a) => !sentIds.has(a.id))
       await aui.composer.clearAttachments()
-      for (const a of kept) {
+      for (const a of keptFiles) {
         if (!a.file) throw new Error(`Staged attachment ${a.id} has no file to restore after a send.`)
         await aui.composer.addAttachment(a.file)
       }
@@ -197,7 +214,7 @@ export default function ComposerBox({
     } finally {
       setSending(false)
     }
-  }, [aui, conversationId, onSubmit, onUrgent, sending, unavailableReason])
+  }, [aui, conversationId, onAccepted, onSubmit, onUrgent, sending, unavailableReason])
 
   const attachmentComponents = useMemo(
     () => ({ Attachment: () => <AttachmentChip onPreview={setPreview} /> }),

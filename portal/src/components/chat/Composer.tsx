@@ -57,7 +57,7 @@ import { useCallback, useEffect, useMemo, useRef, type FC, type ReactNode } from
 import { useAui, useAuiState } from '@assistant-ui/react'
 
 import { capState, MAX_COMPOSER_CHARS } from '../../utils/composerCap'
-import { clearDraft, readDraft, writeDraft } from '../../utils/composerDraft'
+import { readDraft, writeDraft } from '../../utils/composerDraft'
 import ComposerBox, { type ComposerSubmission } from './ComposerBox'
 import OfferStrip, { OFFER_GATE_NOTE, type OfferStripProps } from './OfferStrip'
 import StopTurnControl, { type StopTurnControlProps } from './StopTurnControl'
@@ -197,14 +197,27 @@ const Composer: FC<ComposerProps> = ({
     return null
   }, [offerPending, cap.over, cap.message, isRunning, gate])
 
-  const handleSubmit = useCallback(
-    async (submission: ComposerSubmission) => {
-      await onSubmit(submission)
-      // The draft's own clear. The BOX clears the runtime's text and attachments on the same
-      // acceptance; this clears the copy in `sessionStorage`, which the box knows nothing about.
-      clearDraft(submission.conversationId)
+  /**
+   * THE DRAFT FOLLOWS THE BOX, IT DOES NOT ASSUME IT EMPTIED.
+   *
+   * This used to clear the stored draft on every accepted send. But the box does not always empty:
+   * a citizen who rewrites it while the request is out keeps their words, deliberately. The two
+   * then disagreed — the composer showed text that was no longer stored anywhere, and because the
+   * mirror above only fires when `text` CHANGES, nothing ever wrote it back. A reload, or a step
+   * to another chat, silently destroyed words still on the screen.
+   *
+   * So the box says what survived and that is what is stored. `writeDraft` with an empty string
+   * removes the key, which is the ordinary case said in one rule rather than two.
+   *
+   * AND ONLY FOR THE CHAT IT WAS SENT IN. If the citizen moved to a sibling while the request was
+   * out, what stands in the box belongs to the sibling, not to the conversation being cleared —
+   * so that one's draft goes, and the sibling's own mirror keeps its own.
+   */
+  const handleAccepted = useCallback(
+    (sentIn: string, keptText: string) => {
+      writeDraft(sentIn, sentIn === conversationId ? keptText : '')
     },
-    [onSubmit],
+    [conversationId],
   )
 
   return (
@@ -225,8 +238,9 @@ const Composer: FC<ComposerProps> = ({
       <ComposerBox
         conversationId={conversationId}
         placeholder={placeholder}
-        onSubmit={handleSubmit}
+        onSubmit={onSubmit}
         unavailableReason={unavailableReason}
+        onAccepted={handleAccepted}
         onUrgent={onUrgent}
         header={
           offer ? (

@@ -43,6 +43,11 @@ export function readDraft(conversationId: string | null | undefined): string {
   }
 }
 
+/**
+ * THE ONE WRITE, AND CLEARING IS A CASE OF IT. An empty string removes the key rather than storing
+ * a blank, so "the box emptied" and "the box now holds this" are the same statement — which is
+ * what keeps the stored copy and the visible box from disagreeing after a send.
+ */
 export function writeDraft(conversationId: string | null | undefined, text: string): void {
   if (!conversationId) return
   try {
@@ -51,8 +56,4 @@ export function writeDraft(conversationId: string | null | undefined, text: stri
   } catch {
     // No persistence this session. The composer still holds the text in React state.
   }
-}
-
-export function clearDraft(conversationId: string | null | undefined): void {
-  writeDraft(conversationId, '')
 }
