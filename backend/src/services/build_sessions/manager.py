@@ -100,6 +100,8 @@ from src.services.build_sessions.outcome import (
 )
 from src.services.build_sessions.reaper import reap_user, reconcile_user
 from src.services.build_sessions.snapshot import (
+    SNAPSHOT_EXEC_TIMEOUT_SECONDS,
+    SNAPSHOT_EXECS,
     Destination,
     RecoveryOutcome,
     consecutive_diverts,
@@ -328,23 +330,35 @@ _RECOVERY_SNAPSHOT_TIMEOUT_SECONDS: float = 60.0
 # DERIVED FROM THE PATH IT WAITS ON, not chosen. The old 30 s was picked to bound a REQUEST the
 # citizen was sitting in front of — and it was BELOW the unwind's own bounds, so an ordinary,
 # healthy turn could outlast it and be reported as "still running" for doing exactly what it is
-# supposed to do. Two numbers on the very path this waits for:
+# supposed to do. The two branches of `_stop_the_held_session` unwind differently, and the budget
+# is the LONGER of them because one number serves both:
 #
-#   * `_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS` (60 s) — `finish_turn_sandbox`'s recovery autosave,
-#     which a Write turn's `finally` runs before the slot is freed. This is the long pole, and
-#     it alone is twice the budget that used to bound the wait for it.
-#   * `_OUTCOME_WRITE_TIMEOUT_SECONDS` (10 s) — `_record_outcome`, the one DB step a BUILD
-#     session's `_do_finalize` runs on the same unwind.
+#   * A WRITE TURN's workspace: `finish_turn_sandbox`'s recovery autosave
+#     (`_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS`, 60 s — the whole sequence under one bound), then
+#     `_OUTCOME_WRITE_TIMEOUT_SECONDS` (10 s) for the record.
+#   * A BUILD session: `_do_finalize` step 1 writes the SAVED snapshot, and a user stop reaches
+#     it with `force_ended` false and nothing committed, so it runs in full. That write carries
+#     no timeout of its own — bounding it is not an option, because cutting a snapshot short is
+#     how a citizen's unsaved work disappears — so what bounds it is its parts:
+#     `SNAPSHOT_EXECS` execs of `SNAPSHOT_EXEC_TIMEOUT_SECONDS` each, plus the same 10 s record.
+#     An earlier version of this derivation named only the record and missed the snapshot
+#     entirely, which put the budget an order of magnitude UNDER the branch it claimed to sit
+#     above — the exact defect the 30 s had, reintroduced for the branch it was meant to fix.
 #
-# One budget serves both branches of `stop_active_work`, so it is their SUM rather than either
-# one: whichever branch a stop lands on, the wait sits above that branch's own bounded work
-# instead of expiring inside it. Written as the sum so it tracks either bound if it moves.
+# WHAT IS STILL NOT COVERED, said plainly rather than papered over: `write_snapshot` also takes a
+# per-app lock and finishes with a blob PUT, and neither is bounded here. So this is the bound on
+# the WORK, not a guarantee about the wall clock, and expiring it is deliberately not a verdict —
+# `_stop_the_held_session` shields the end sequence and stops WAITING, and the status read goes on
+# reading the session map. A stop that outlives this budget is still reported honestly.
 #
 # NOTHING HOLDS A REQUEST OPEN FOR THIS. Since the stop became an ask plus a status read
 # (`request_stop_of_active_work` / `stop_state_of_active_work`), this bounds a detached task,
-# not a connection — which is what makes a budget above a minute affordable at all.
+# not a connection — which is what makes a budget of minutes affordable at all.
+_SNAPSHOT_WRITE_BUDGET_SECONDS: float = SNAPSHOT_EXECS * SNAPSHOT_EXEC_TIMEOUT_SECONDS
+
 _STOP_ACTIVE_WORK_TIMEOUT_SECONDS: float = (
-    _RECOVERY_SNAPSHOT_TIMEOUT_SECONDS + _OUTCOME_WRITE_TIMEOUT_SECONDS
+    max(_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS, _SNAPSHOT_WRITE_BUDGET_SECONDS)
+    + _OUTCOME_WRITE_TIMEOUT_SECONDS
 )
 
 # How long a settled stop record is kept so a status read can still tell "stopped" from "nothing

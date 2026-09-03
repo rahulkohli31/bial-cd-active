@@ -45,6 +45,10 @@ from src.services.build_sessions.manager import (
     SessionManager,
     StopOutcome,
 )
+from src.services.build_sessions.snapshot import (
+    SNAPSHOT_EXEC_TIMEOUT_SECONDS,
+    SNAPSHOT_EXECS,
+)
 from src.services.sandbox import ExecResult
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
@@ -135,6 +139,36 @@ async def _the_slot_is_free(manager: SessionManager, user_id: uuid.UUID) -> None
             return
         await asyncio.sleep(0.001)
     raise AssertionError("the stop never settled within the barrier's budget")
+
+
+# --- the budget, derived rather than chosen -------------------------------------------
+
+
+def test_the_stop_budget_sits_above_the_unwind_each_branch_actually_runs() -> None:
+    """★ THE RULE THE NUMBER IS SUPPOSED TO OBEY, checked against the parts rather than trusted.
+
+    A budget BELOW the unwind's own bounds reports a healthy stop as one that did not finish —
+    which is what the retired 30 s did, and what the first attempt at deriving it did again for
+    the branch it was written to fix: it counted the build's 10 s record and missed the snapshot
+    `_do_finalize` writes first, an unbounded call whose parts are four execs of two minutes.
+
+    COMPUTED FROM THE PRIMITIVES, not from the intermediate the module derives, so it is a check
+    and not a restatement: if the per-exec bound or the number of execs moves, this recomputes
+    the branch's real cost and the budget has to keep up.
+
+    Mutation check: make the budget the sum of the recovery autosave and the record again and the
+    build-branch assertion goes red while the write-branch one stays green."""
+    build_branch = (
+        SNAPSHOT_EXECS * SNAPSHOT_EXEC_TIMEOUT_SECONDS
+        + manager_module._OUTCOME_WRITE_TIMEOUT_SECONDS
+    )
+    write_branch = (
+        manager_module._RECOVERY_SNAPSHOT_TIMEOUT_SECONDS
+        + manager_module._OUTCOME_WRITE_TIMEOUT_SECONDS
+    )
+    assert build_branch > 0 and write_branch > 0  # liveness: both parts are real numbers
+    assert manager_module._STOP_ACTIVE_WORK_TIMEOUT_SECONDS >= build_branch
+    assert manager_module._STOP_ACTIVE_WORK_TIMEOUT_SECONDS >= write_branch
 
 
 # --- the status read -----------------------------------------------------------------
