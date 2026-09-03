@@ -42,8 +42,11 @@ from src.main import create_app
 from src.services.messages.store import append_batch
 from src.services.turns.copy import CHAT_TOO_LONG_CODE, CHAT_TOO_LONG_TEXT
 from src.services.turns.plan_options import find_pending
-from src.services.usage.context_window import SYSTEM_PROMPT_RESERVE
-from src.services.usage.limits import DEFAULT_CONTEXT_HARD
+from src.services.usage.limits import (
+    CONTEXT_HARD_FLOOR,
+    DEFAULT_CONTEXT_HARD,
+    SYSTEM_PROMPT_RESERVE,
+)
 from tests.api.v1.conversations.conftest import _headers
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 
@@ -291,19 +294,26 @@ async def test_the_same_refusal_fires_on_the_build_from_plan_path(
     send route alone and pressing "Build this plan" walks straight past the administrator's
     number — the exact shape the daily cap's three hand-copied call sites are on record for.
 
-    Driven with a hard limit below the reserve, so the plan's own size is not what is being
-    asserted: what this pins is that the route consults the limit at all."""
+    Driven at the LOWEST ceiling an administrator can set, against a plan deliberately larger
+    than it. It used to be driven at a ceiling of 1 — which was possible then and is not now:
+    a value that low locked the citizen out of every chat they owned, so it is refused at the
+    admin route and clamped on the way back out (`CONTEXT_HARD_FLOOR`). Setting one below the
+    floor here would silently stop testing the gate, because the clamp would hand the route a
+    ceiling the plan fits comfortably inside."""
     # A REAL pending offer, produced through the genuine engine path — the handoff refuses a
     # press with no card long before it reaches any limit, so the card has to be real for the
     # GATE to be what this test is about rather than the check above it.
     user, _project, plan_chat = await _a_conversation(db_session)
-    app.dependency_overrides[chat_model_dep] = lambda: _offering_model()
+    # Comfortably past the floor once the system-prompt reserve is added to it, and well under
+    # the stored-message ceiling that would refuse the offer for a different reason entirely.
+    oversized_plan = "Log every visitor. " * 2_500
+    app.dependency_overrides[chat_model_dep] = lambda: _offering_model(plan=oversized_plan)
     planned = await _send(client, user, plan_chat.id, "plan the visitors app")
     assert planned.status_code == 202, planned.text
     await _settle(_fresh_engine, plan_chat.id)
 
-    # NOW the administrator's ceiling arrives — below anything, so the press is past it.
-    db_session.add(UserLimit(user_id=user.id, context_hard_limit=1))
+    # NOW the administrator's ceiling arrives, at the lowest value the product will store.
+    db_session.add(UserLimit(user_id=user.id, context_hard_limit=CONTEXT_HARD_FLOOR))
     await db_session.commit()
     rows_before = await db_session.scalar(
         select(func.count()).select_from(Message).where(Message.user_id == user.id)

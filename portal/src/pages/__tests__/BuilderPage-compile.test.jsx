@@ -115,7 +115,7 @@ async function send(text = 'a visitor app') {
  *  whether the stream is already the authority — so a scripted turn that skips it is lying about
  *  the one fact every real subscribe leads with. */
 const T_SNAPSHOT = (turnId = 't1', seq = 1) => ({
-  type: 'snapshot', seq, turnId, turnStatus: 'running', items: [], textSoFar: '', steps: [],
+  type: 'snapshot', seq, turnId, turnStatus: 'running', items: [], parts: [], working: false,
 })
 
 /**
@@ -296,7 +296,7 @@ describe('BuilderPage — the compile signal reaches the preview pane', () => {
 
     await turn.frame({
       type: 'snapshot', seq: 4, turnId: 't1', turnStatus: 'running',
-      items: [], textSoFar: '', steps: [], compileState: 'failed',
+      items: [], parts: [], working: false, compileState: 'failed',
     })
 
     expect(seen.at(-1)).toBe('failed')
@@ -311,7 +311,7 @@ describe('BuilderPage — the compile signal reaches the preview pane', () => {
     await turn.frame(COMPILE('failed', 5))
     await turn.frame({
       type: 'snapshot', seq: 6, turnId: 't1', turnStatus: 'running',
-      items: [], textSoFar: '', steps: [],
+      items: [], parts: [], working: false,
     })
 
     expect(seen.at(-1)).toBe('failed')

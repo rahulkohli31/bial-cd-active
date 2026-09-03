@@ -4,6 +4,8 @@ with a true total; limit edits are audited."""
 
 from __future__ import annotations
 
+import uuid
+
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,7 +15,9 @@ from src.db.models.feedback import Feedback
 from src.db.models.user_limit import UserLimit
 from src.main import create_app
 from src.services.auth.session_jwt import mint_session_jwt
+from src.services.usage.context_window import occupied_window
 from src.services.usage.gate import effective_daily_limit
+from src.services.usage.limits import CONTEXT_HARD_FLOOR, effective_context
 from tests.factories import UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
@@ -139,6 +143,66 @@ async def test_limit_validation(client, db_session) -> None:
     assert soft_ge_hard.status_code == 400
     empty = await client.patch(f"/v1/admin/users/{target.id}/limits", json={}, headers=headers)
     assert empty.status_code == 400
+
+
+async def test_a_chat_length_below_the_floor_is_refused_and_the_floor_is_named(
+    client, db_session
+) -> None:
+    """An administrator cannot store a number that locks a citizen out of the product.
+
+    Below the floor the context gate refuses EVERY conversation that person opens — the gate
+    charges the system-prompt reserve before it counts a word — and the sentence they read
+    tells them to start a new chat, which also fails. The refusal names the lowest usable
+    number because an administrator who is stopped without one has no way to pick a good value.
+
+    Mutation check: drop the `hard < CONTEXT_HARD_FLOOR` arm from the PATCH validator and this
+    goes red on the status code."""
+    target = await UserFactory.create(db_session, email="floored@rvaiglobal.com")
+    headers = await _admin(db_session)
+
+    refused = await client.patch(
+        f"/v1/admin/users/{target.id}/limits",
+        json={"contextHardLimit": CONTEXT_HARD_FLOOR - 1},
+        headers=headers,
+    )
+    assert refused.status_code == 400, refused.text
+    assert str(CONTEXT_HARD_FLOOR) in refused.text
+    # NOTHING WAS STORED. A refusal that still wrote the row would leave the citizen locked out
+    # and the administrator believing they had been stopped.
+    assert (
+        await db_session.scalar(sa.select(UserLimit).where(UserLimit.user_id == target.id)) is None
+    )
+
+    # …and the floor itself is a value an administrator may genuinely want.
+    accepted = await client.patch(
+        f"/v1/admin/users/{target.id}/limits",
+        json={"contextHardLimit": CONTEXT_HARD_FLOOR},
+        headers=headers,
+    )
+    assert accepted.status_code == 200, accepted.text
+
+
+async def test_a_limit_already_stored_below_the_floor_still_opens_a_chat(db_session) -> None:
+    """The other half of the floor, for the people the defect already reached.
+
+    A row written before the validator existed still holds its number, and validation cannot
+    reach back. Without the read-time clamp those citizens stay locked out until an
+    administrator notices and edits them by hand — and nothing in the product tells anyone that
+    is what happened.
+
+    Mutation check: drop `CONTEXT_HARD_FLOOR` from the `max(...)` in `effective_context` and
+    this goes red.
+    """
+    stored = UserLimit(user_id=uuid.uuid7(), context_hard_limit=1)
+    _soft, hard = effective_context(stored)
+    assert hard == CONTEXT_HARD_FLOOR
+    # AND THE GATE THEN LETS AN EMPTY CONVERSATION THROUGH, which is the thing the citizen
+    # actually cares about — the clamp is only worth anything if it clears the reserve the gate
+    # charges before it has counted a word.
+    assert occupied_window([], "hello") < hard
+    # The advisory warn threshold stays strictly under the ceiling it warns about, so a clamped
+    # user is not warned at the same instant they are refused.
+    assert _soft < hard
 
 
 async def test_unknown_user_is_404(client, db_session) -> None:

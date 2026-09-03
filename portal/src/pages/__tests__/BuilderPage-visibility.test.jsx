@@ -67,7 +67,7 @@ function deps() {
  * (`backend/src/api/v1/conversations/turns.py`): the consolidating frame before any model byte,
  * carrying the `turnId` this page uses to know a turn is live.
  */
-function scriptTurn(opening = [{ type: 'snapshot', seq: 1, turnId: 't1', turnStatus: 'running', items: [], textSoFar: '', steps: [] }, T_WORKSPACE(undefined, 2)]) {
+function scriptTurn(opening = [{ type: 'snapshot', seq: 1, turnId: 't1', turnStatus: 'running', items: [], parts: [], working: false }, T_WORKSPACE(undefined, 2)]) {
   const live = { emit: null, close: null }
   const impl = async ({ onFrame }) => {
     live.emit = onFrame

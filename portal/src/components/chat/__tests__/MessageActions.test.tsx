@@ -32,7 +32,9 @@ const TextPart: ThreadComponents['TextPart'] = ({ text }) => <span>{text}</span>
 const ToolGroup: ThreadComponents['ToolGroup'] = ({ children }) => <div>{children}</div>
 const ToolPart: ThreadComponents['ToolPart'] = () => null
 
-const components: ThreadComponents = { TextPart, ToolGroup, ToolPart }
+const ReasoningGroup: ThreadComponents['ReasoningGroup'] = () => null
+
+const components: ThreadComponents = { TextPart, ToolGroup, ToolPart, ReasoningGroup }
 
 const reply = (id: string, text: string): ChatMessage => ({
   id,

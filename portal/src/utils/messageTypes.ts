@@ -141,6 +141,25 @@ export interface StepPart {
   step: StepItem
 }
 
+/**
+ * The agent is REASONING — and this part carries no text, by construction.
+ *
+ * THE STATUS-ONLY GUARANTEE IS STRUCTURAL, NOT A PROMISE. Reasoning text is technical and far
+ * too much for the people who read this, so the decision is that the transcript shows THAT the
+ * agent is working and never what it is working through. The server enforces the same rule at
+ * the other end — reasoning is stored for the provider's next turn and is never projected,
+ * never framed and never sent here — and this shape is the second wall: there is no field for
+ * reasoning text to arrive in, so a later change cannot start carrying it by accident.
+ *
+ * THE ONLY PRODUCER IS THE LIVE SURFACE, which synthesises one at the head of the streaming
+ * message while the turn's `working` flag is true. It has no reload counterpart on purpose: a
+ * finished turn is not thinking, and a status line about a moment that has passed is noise in
+ * a transcript somebody is reading tomorrow.
+ */
+export interface ReasoningPart {
+  type: 'reasoning'
+}
+
 /** A build began and no outcome closed it yet — the durable anchor
  * (`conversationApi.js` only — reload path). */
 export interface BuildInProgressPart {
@@ -154,6 +173,7 @@ export type MessagePart =
   | BuildPart
   | PlanOptionsPart
   | StepPart
+  | ReasoningPart
   | BuildInProgressPart
 
 /** The in-memory message shape the conversation surface renders

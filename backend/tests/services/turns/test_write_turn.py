@@ -50,7 +50,12 @@ from pydantic_ai.models.function import (
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import BuildError, ErrorSource
-from src.api.v1.conversations.schemas import StepFrame, TextDeltaFrame
+from src.api.v1.conversations.schemas import (
+    StepFrame,
+    TextDeltaFrame,
+    TurnStepPart,
+    TurnTextPart,
+)
 from src.config import settings
 from src.core.integrity_types import BaselineIdentity
 from src.db.models.conversation import ChatKind
@@ -91,6 +96,7 @@ from src.services.turns.engine import (
 from src.services.turns.guard import _mid_reply
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 from tests.fakes import FakeSandboxClient
+from tests.transcript import rendered_text
 
 _CTX = PromptContext(user_name="Ada", project_name="Visitors", project_description=None)
 
@@ -471,13 +477,12 @@ async def test_a_read_only_write_turn_is_just_a_chat_turn(
     assert state.status == "completed"
     assert state.end_reason is None  # nothing to explain — the turn did what was asked
     assert counts["runs"] == 1  # no CONTINUE_PROMPT second pass either
-    # U15/R20 — AND THE ANSWER ACTUALLY REACHED THE SCREEN. This turn calls no
-    # `declare_done`, so the held-prose flush is the ONLY thing that will ever say it: with
-    # the flush miswired, the text sits in `pending_text` forever, the live feed shows
-    # nothing, and a reload shows the answer — the live/reload split the drop exists to
-    # prevent. Asserted on `text_so_far()` because that is both the wire content and what a
-    # reconnecting client's snapshot replays.
-    assert "It renders the visitor list." in state.text_so_far()
+    # AND THE ANSWER ACTUALLY REACHED THE SCREEN. This turn calls no `declare_done`, so the
+    # model's own prose is the ONLY thing that will ever say a word to the citizen: miswire the
+    # text sink and they watch a read step resolve and then read nothing at all. Asserted on the
+    # BLOCKS rather than a joined string — they are both what went out on the wire and what a
+    # reconnecting client's snapshot replays, and the answer is the whole of what this turn said.
+    assert state.text_blocks() == ["It renders the visitor list."]
 
 
 async def test_a_build_that_wrote_nothing_fails_instead_of_reporting_success(
@@ -1908,9 +1913,13 @@ async def test_a_green_declare_done_ends_the_turn_and_renders_the_summary(
     # is never reached because nothing ever asked for it.
     assert counts["requests"] == 2, "a third request means declare_done still buys a round-trip"
 
-    # THE RENDERED COMPLETION IS THE SUMMARY — the whole of what the citizen reads at the end.
-    rendered = state.text_so_far()
-    assert rendered == "You can add a visitor, mark them arrived, and see the list."
+    # THE RENDERED COMPLETION IS THE SUMMARY — the whole of what the citizen reads at the end,
+    # and ONE BLOCK of its own. The model wrote no prose in this turn, but it is entitled to,
+    # and the completion has to read as its own closing paragraph rather than as a sentence run
+    # onto the end of whatever the model was saying when it called the tool.
+    blocks = state.text_blocks()
+    assert blocks == ["You can add a visitor, mark them arrived, and see the list."]
+    rendered = blocks[0]
     # …and the model's own closing prose is nowhere, because it was never written. AE13, on the
     # one message that used to carry the worst of it: the whole completion, swept term by term.
     for term in _FORBIDDEN_IN_CITIZEN_COPY:
@@ -1967,8 +1976,11 @@ async def test_an_empty_summary_falls_back_to_a_plain_completion_never_to_silenc
     )
 
     assert state.status == "completed"
-    rendered = state.text_so_far()
-    assert rendered == _BUILD_FINISHED_FALLBACK
+    # ONE BLOCK, and it is ours: the harness's sentence, alone, in the place the summary the
+    # model declined to write would have gone.
+    blocks = state.text_blocks()
+    assert blocks == [_BUILD_FINISHED_FALLBACK]
+    rendered = blocks[0]
     assert rendered.strip(), "a green build must never end on an empty message"
     assert "app/page.tsx" not in rendered  # never the model's prose, on any path
     # …and it is durable, exactly like a real summary would be.
@@ -2069,7 +2081,7 @@ async def test_a_red_verdict_after_declare_done_still_goes_to_repair(
     # …and it ended on the verdict rather than the claim — no completion was ever rendered.
     assert state.status == "failed"
     assert state.end_reason == "self_heal_budget_exhausted"
-    assert "You can add a visitor" not in state.text_so_far()
+    assert "You can add a visitor" not in rendered_text(state)
 
 
 # =============================================================================
@@ -2170,8 +2182,10 @@ async def test_the_acknowledgement_never_reaches_the_stored_transcript(
     Queries the PERSISTED ROWS, not the live feed: the frame is supposed to exist in one and
     not the other, so only the durable side can tell the two apart.
 
-    Mutation-check: add the ack item to `state.steps` and the snapshot assertion goes red; write
-    it through `append_batch` and the row assertions do."""
+    Mutation-check: keep the ack in `state.steps` and the tail assertion goes red; drop the
+    `state.acknowledgement = None` the first real step performs and the snapshot assertion does
+    (an un-retired ack rides the snapshot's parts ahead of everything else); write it through
+    `append_batch` and the row assertions do."""
     engine = _fresh_engine
     user, project, conv = await _write_conversation(db_session, "u17b@rvaiglobal.com")
     manager, client = SessionManager(), FakeSandboxClient()
@@ -2202,136 +2216,241 @@ async def test_the_acknowledgement_never_reaches_the_stored_transcript(
     # catch-up snapshot a mid-turn reconnect renders.
     assert state.steps, "the turn took no steps — the tail assertion would be free"
     assert engine_module.ACK_TOOL not in {item.tool for item in state.steps.values()}
-    assert all(item.tool != engine_module.ACK_TOOL for item in engine.build_snapshot(state).steps)
-    # ONE row, once. Replaced by the first real step, never re-announced beside it.
+    snapshot_steps = [
+        part for part in engine.build_snapshot(state).parts if isinstance(part, TurnStepPart)
+    ]
+    assert snapshot_steps, "the snapshot carried no steps — the tail assertion would be free"
+    assert all(part.item.tool != engine_module.ACK_TOOL for part in snapshot_steps)
+    # ANNOUNCED ONCE, THEN RETRACTED — and the retraction is the half that was missing.
+    #
+    # Clearing `state.acknowledgement` only ever retired the ack from the catch-up SNAPSHOT, so
+    # a client that subscribed later never saw it. A client already connected had received it as
+    # a live step frame and had no way to learn it was over: it sat in that turn's activity group
+    # as a step that never resolved, and a group with an unresolved step never seals. So the row
+    # stayed under a build that finished ten minutes ago.
+    #
+    # IT LEAVES BY GOING HIDDEN, which is the cheapest correct exit rather than a shortcut: the
+    # frame union is closed and the browser drops what it does not recognise, so a new frame KIND
+    # would need the wire schema, the parser and the reducer changed together. `hidden` already
+    # means "do not draw this", is already filtered on both paths, and is already keyed by
+    # tool-call id — so the same id re-emitted hidden replaces the row in place and it goes.
     ack_frames = [
         frame
         for frame in state.ring
         if isinstance(frame, StepFrame) and frame.item.tool == engine_module.ACK_TOOL
     ]
-    assert len(ack_frames) == 1
+    assert [(frame.phase, frame.item.hidden) for frame in ack_frames] == [
+        ("started", False),
+        ("finished", True),
+    ]
+    # THE SAME tool-call id on both, because that is what makes the second REPLACE the first
+    # rather than stack a second row beside it.
+    assert {frame.tool_call_id for frame in ack_frames} == {engine_module.ACK_TOOL_CALL_ID}
+    # AND IT IS GONE BEFORE THE FIRST REAL STEP IS DRAWN, not merely by the terminal — the
+    # retraction is what the citizen sees, so its POSITION in the ring is the claim.
+    first_real_step = next(
+        frame.seq
+        for frame in state.ring
+        if isinstance(frame, StepFrame) and frame.item.tool != engine_module.ACK_TOOL
+    )
+    assert ack_frames[1].seq < first_real_step
 
 
-def _narrated(text: str) -> PartStartEvent:
+def _wrote(text: str) -> PartStartEvent:
+    """The model OPENS a stretch of prose. A fresh `TextPart` is what starts a new block."""
     return PartStartEvent(index=0, part=TextPart(content=text))
 
 
-def _narrated_more(text: str) -> PartDeltaEvent:
+def _wrote_more(text: str) -> PartDeltaEvent:
+    """…and keeps writing the same one. A delta extends the block it arrives into."""
     return PartDeltaEvent(index=0, delta=TextPartDelta(content_delta=text))
 
 
-def _text_on_the_wire(state: _TurnState) -> str:
-    return "".join(frame.text for frame in state.ring if isinstance(frame, TextDeltaFrame))
+def _wire_blocks(state: _TurnState) -> list[str]:
+    """The paragraphs a browser draws from the LIVE frames alone, rebuilt the way it draws them.
+
+    Every `text_delta` either opens a block or extends the one before it, and `new_block` is the
+    only thing on the wire that says which — so this is the live path's answer to the question
+    `state.text_blocks()` answers for the catch-up snapshot, and the two have to agree or a
+    reload changes what the citizen is reading. Joining the frames into one string instead would
+    hide exactly the disagreement worth catching."""
+    blocks: list[str] = []
+    for frame in state.ring:
+        if not isinstance(frame, TextDeltaFrame):
+            continue
+        if frame.new_block or not blocks:
+            blocks.append(frame.text)
+        else:
+            blocks[-1] += frame.text
+    return blocks
 
 
-def test_write_narration_beside_a_tool_call_never_reaches_the_live_feed(_fresh_engine) -> None:
-    """★ THE LIVE HALF of U15/R20 — the twin of `test_projection.py`'s
-    `test_write_text_beside_a_tool_call_is_dropped`, which pins only the RELOAD half.
+def _snapshot_shape(engine: TurnEngine, state: _TurnState) -> list[tuple[str, str]]:
+    """The catch-up snapshot's ordered parts as ("text", prose) / ("step", tool_call_id) — what a
+    citizen who reattaches mid-turn reads, in the order they read it."""
+    return [
+        ("text", part.text) if isinstance(part, TurnTextPart) else ("step", part.tool_call_id)
+        for part in engine.build_snapshot(state).parts
+    ]
 
-    The production failure was on the LIVE FEED: ~1900 words of developer narration (Drizzle,
-    HMR, `globalThis`) streamed straight into a citizen's chat while she waited for her app. The
-    engine comment over `_stream_text` says "mirrored live in engine._stream_text — change both
-    or reload and the live feed disagree", and until now only one of the two had a test, so a
-    regression on this side shipped green.
 
-    Mutation check: delete the `_discard_pending_text(state)` call in `_on_event`'s
-    `FunctionToolCallEvent` arm, or the WRITE branch in `_stream_text`, and this goes red."""
+async def test_write_prose_between_tool_calls_reaches_the_feed_where_it_was_written(
+    _fresh_engine,
+) -> None:
+    """★ THE LIVE HALF of the whole-voice change — the twin of `test_projection.py`'s reload
+    half, which pins the same turn once it has ended.
+
+    THIS USED TO ASSERT THE OPPOSITE. Prose written in the same response as a tool call was
+    accumulated in a buffer and deleted the moment the call arrived, on the rule that text beside
+    a tool call is the model narrating its way there. What that rule actually deleted was the
+    explanation between the receipts: a citizen watching her app being built read a column of
+    tool cards with no sentence saying what any of it was for. Every paragraph reaches her now,
+    in the place it was written.
+
+    ORDER IS THE ASSERTION, NOT PRESENCE. A response that writes, acts, writes, acts and writes
+    again is the shape the live feed could not express at all before — it drew every step and
+    then one concatenated block of text underneath — so a joined string would pass here whether
+    or not each block landed between the right steps. Three lists, because the live wire, the
+    snapshot tail and the blocks themselves all have to say the same thing: a citizen who
+    reattaches mid-build must read this turn in the order one who never left reads it.
+
+    Mutation check, one per list: discard the prose when a `FunctionToolCallEvent` arrives and
+    the first two blocks vanish; send every `text_delta` with `new_block=False` and the WIRE
+    collapses to one paragraph while the blocks stay green — which is exactly the live/reload
+    split the ordered parts exist to close; append each block to the end of `state.parts`
+    instead of in place, as the old flat tail effectively did, and only the SHAPE goes red."""
     engine = _fresh_engine
     state = _bare_state()
 
-    engine._on_event(state, _narrated("Let me check the Drizzle schema — "))
-    engine._on_event(state, _narrated_more("globalThis is undefined in the HMR boundary."))
-    engine._on_event(state, _called("read_file", '{"path": "db/schema.ts"}', "c1"))
-    # THE FLUSH BOUNDARY, run here exactly as `_run_write_once` runs it once the tool-call node
-    # has been drained. Without it this asserts nothing: held prose has not reached the wire YET
-    # in any world, and the question is whether the flush that follows still finds it.
-    engine._flush_pending_text(state)
+    engine._on_event(state, _wrote("Let me look at how the visitor list works today. "))
+    engine._on_event(state, _wrote_more("It reads every row on each render."))
+    engine._on_event(state, _called("read_file", '{"path": "app/page.tsx"}', "c1"))
+    engine._on_event(state, _wrote("It only needs one more column, so I am adding it."))
+    engine._on_event(
+        state, _called("write_file", '{"path": "app/page.tsx", "file_text": "x"}', "c2")
+    )
+    engine._on_event(state, _wrote("The arrival column is in, and the list still sorts by name."))
 
-    # LIVENESS: the turn really did stream and really did act — an assert-absence over a state
-    # where nothing happened at all would pass for the wrong reason.
-    assert _step_labels(state, phase="started"), "no step frame — the seam under test never ran"
-    assert "Drizzle" not in _text_on_the_wire(state)
-    assert "globalThis" not in _text_on_the_wire(state)
-    assert "".join(state.text_parts) == ""  # nor onto the snapshot the late subscriber reads
+    written = [
+        "Let me look at how the visitor list works today. It reads every row on each render.",
+        "It only needs one more column, so I am adding it.",
+        "The arrival column is in, and the list still sorts by name.",
+    ]
+    # LIVENESS: the seam under test really ran. Both calls became steps of their own, so the
+    # ordering below is a turn that genuinely acted between paragraphs rather than one that
+    # only ever wrote.
+    assert len(_step_labels(state, phase="started")) == 2, "the tool calls never became steps"
+    assert state.text_blocks() == written
+    assert _wire_blocks(state) == written
+    # …AND WHERE EACH BLOCK SITS, which is the whole of what changed: text, step, text, step,
+    # text — never three paragraphs swept to one end of the turn.
+    assert _snapshot_shape(engine, state) == [
+        ("text", written[0]),
+        ("step", "c1"),
+        ("text", written[1]),
+        ("step", "c2"),
+        ("text", written[2]),
+    ]
+    await engine._drain_long_operations(state)
 
 
 def test_write_prose_with_no_tool_call_after_it_is_still_the_citizens_answer(
     _fresh_engine,
 ) -> None:
-    """THE OTHER HALF, and the reason the drop is held rather than unconditional. A Write
-    response that calls NO tool is the turn's own answer — the zero-mutation ending depends on
-    it, because that turn never calls `declare_done` and nothing else would ever say anything."""
+    """THE PLAIN CASE on the Write side, and it is load-bearing rather than decorative. A Write
+    turn where the model only read files never calls `declare_done`, so a response like this one
+    is the only thing that will ever say a word to the citizen —
+    `test_a_read_only_write_turn_is_just_a_chat_turn` is the same claim end to end, and this is
+    the seam it rests on."""
     engine = _fresh_engine
     state = _bare_state()
 
-    engine._on_event(state, _narrated("Your visitor list is already showing arrival times."))
-    engine._flush_pending_text(state)
+    engine._on_event(state, _wrote("Your visitor list is already showing arrival times."))
 
-    assert "arrival times" in _text_on_the_wire(state)
-    assert "arrival times" in "".join(state.text_parts)
+    assert _wire_blocks(state) == ["Your visitor list is already showing arrival times."]
+    assert state.text_blocks() == ["Your visitor list is already showing arrival times."]
 
 
-def test_a_plan_chat_holds_its_prose_exactly_as_a_build_chat_does(_fresh_engine) -> None:
+def test_a_plan_chat_streams_its_prose_exactly_as_a_build_chat_does(_fresh_engine) -> None:
     """★ THE INVERSION (U4 / R74 / N2), and the reason it is safe to invert.
 
-    This test used to assert the opposite: that holding was Build's alone, because in a
-    planning chat the prose IS the deliverable and holding it would be a dead screen. Both
-    halves of that were true when it was written, and the first half is what changed — the
-    plan travels in the offer tool's argument now, and a mid-work word travels through
-    `tell_the_user`, so what the hold catches on this side is the same thing it always caught
-    on the other: the model narrating its way to a tool call.
+    This used to assert that a planning chat HELD its prose exactly as a build chat did: every
+    paragraph buffered until the response ended, and deleted outright if a tool call followed.
+    The hold is gone in both kinds, so what the two share now is the opposite property — a word
+    written is a word on the wire, at the moment it is written. That also buys back what the hold
+    cost and the old docstring recorded as a real price: a planning answer streams token by token
+    again instead of arriving whole, seconds later, when its response happens to end.
 
-    What it costs is real and is not hidden: the answer no longer streams token by token in a
-    planning chat. It arrives whole, when its response ends, at the same moment it always did.
-
-    Mutation check: restore the `state.kind is not ChatKind.BUILD` early return in
-    `_stream_text` and this goes red while nothing else does."""
+    Mutation check: gate `_push_text` on `state.kind is ChatKind.BUILD` and this goes red at
+    the first assertion, before one word has been drawn."""
     engine = _fresh_engine
     state = _bare_state(ChatKind.PLAN)
 
-    engine._on_event(state, _narrated("The visitor list lives in app/visitors/page.tsx."))
+    engine._on_event(state, _wrote("The visitor list already records arrival times, "))
+    # ALREADY READABLE, which is the half a block-list assertion cannot see: nothing has closed
+    # this response, the model may yet call a tool, and the citizen is reading it regardless.
+    assert _wire_blocks(state) == ["The visitor list already records arrival times, "]
 
-    # HELD, not lost: it is on the pending buffer and not on the wire.
-    assert _text_on_the_wire(state) == ""
-    assert "app/visitors/page.tsx" in "".join(state.pending_text)
+    engine._on_event(state, _wrote_more("so this is a small change."))
+    # …and the two slices are ONE paragraph rather than two. Only a fresh `TextPart` opens a
+    # block, or a turn would render a paragraph break at every chunk boundary the provider chose.
+    assert state.text_blocks() == [
+        "The visitor list already records arrival times, so this is a small change."
+    ]
 
 
-def test_a_plan_chats_narration_beside_a_tool_call_never_reaches_the_live_feed(
+async def test_a_plan_chats_prose_between_tool_calls_reaches_the_feed_where_it_was_written(
     _fresh_engine,
 ) -> None:
     """★ AE43, live half — the same response means the same thing in both kinds.
 
-    The twin of `test_write_narration_beside_a_tool_call_never_reaches_the_live_feed`, one
-    chat kind over, and the pair is the whole of what N2 asks for here: a response that writes
-    prose and calls a tool is the model narrating its way to the call, and nothing about which
-    chat it is in changes that."""
+    The twin of `test_write_prose_between_tool_calls_reaches_the_feed_where_it_was_written`, one
+    chat kind over, and the pair is the whole of what N2 asks for here. In a planning chat the
+    prose IS the deliverable, so this is the kind where deleting it was most obviously wrong:
+    the citizen asked what their app does and got a row of receipts for the files that were
+    read."""
     engine = _fresh_engine
     state = _bare_state(ChatKind.PLAN)
 
-    engine._on_event(state, _narrated("Let me look at how the visitor list works today. "))
+    engine._on_event(state, _wrote("Let me see how the visitor list works today. "))
     engine._on_event(state, _called("read_file", '{"path": "app/page.tsx"}', "p1"))
-    engine._flush_pending_text(state)
+    engine._on_event(state, _wrote("It keeps a name and a time. "))
+    engine._on_event(state, _called("search_files", '{"query": "arrival"}', "p2"))
+    engine._on_event(state, _wrote("Nothing else reads them, so the change is contained."))
 
-    assert _step_labels(state, phase="started"), "no step frame — the seam under test never ran"
-    assert _text_on_the_wire(state) == ""
-    assert "".join(state.text_parts) == ""
+    written = [
+        "Let me see how the visitor list works today. ",
+        "It keeps a name and a time. ",
+        "Nothing else reads them, so the change is contained.",
+    ]
+    # LIVENESS: both calls really became steps, so this is a turn that acted between paragraphs.
+    assert len(_step_labels(state, phase="started")) == 2, "the tool calls never became steps"
+    assert state.text_blocks() == written
+    assert _wire_blocks(state) == written
+    assert _snapshot_shape(engine, state) == [
+        ("text", written[0]),
+        ("step", "p1"),
+        ("text", written[1]),
+        ("step", "p2"),
+        ("text", written[2]),
+    ]
+    await engine._drain_long_operations(state)
 
 
 def test_a_plan_chats_answer_with_no_tool_call_after_it_still_reaches_the_citizen(
     _fresh_engine,
 ) -> None:
-    """The other half on the planning side: a response that calls NO tool is the answer, and
-    the flush is what releases it. Without a flush on this path a planning turn goes silent —
-    which is why U4 adds one at the chat run's completion, `chat_agent.run` having no node
-    boundary to hook."""
+    """The plain case on the planning side, bracketed by the two above: a response that calls no
+    tool at all is the answer itself. It lands on the wire and in the snapshot tail together, so
+    a citizen who reloads while it is being written reads the same paragraph as one who watched
+    it arrive."""
     engine = _fresh_engine
     state = _bare_state(ChatKind.PLAN)
 
-    engine._on_event(state, _narrated("Your visitor list already records arrival times."))
-    engine._flush_pending_text(state)
+    engine._on_event(state, _wrote("Your visitor list already records arrival times."))
 
-    assert "arrival times" in _text_on_the_wire(state)
-    assert "arrival times" in "".join(state.text_parts)
+    assert _wire_blocks(state) == ["Your visitor list already records arrival times."]
+    assert state.text_blocks() == ["Your visitor list already records arrival times."]
 
 
 async def test_a_long_operation_gets_a_status_line_refreshed_until_it_completes(

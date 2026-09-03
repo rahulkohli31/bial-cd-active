@@ -85,7 +85,7 @@ export type ThreadComponents = {
   /** The activity group (U6). Given the group part and its rendered children. */
   ToolGroup: ComponentType<PropsWithChildren<{ group: ThreadGroupPart }>>
   /** The working status (U1's decision): status only, never reasoning content. */
-  ReasoningGroup?: ComponentType<PropsWithChildren<{ group: ThreadGroupPart }>> | undefined
+  ReasoningGroup: ComponentType<PropsWithChildren<{ group: ThreadGroupPart }>>
   /** One row inside a group. */
   ToolPart: ToolCallMessagePartComponent
   /** Rendered above the viewport's bottom — U8's return control, U16's offer strip. */
@@ -191,9 +191,7 @@ const AssistantMessage: FC = () => {
               case 'group-tool':
                 return <ToolGroup group={part}>{children}</ToolGroup>
               case 'group-reasoning':
-                return ReasoningGroup ? (
-                  <ReasoningGroup group={part}>{children}</ReasoningGroup>
-                ) : null
+                return <ReasoningGroup group={part}>{children}</ReasoningGroup>
               case 'text':
                 return <AssistantText Component={TextPart} />
               case 'tool-call':

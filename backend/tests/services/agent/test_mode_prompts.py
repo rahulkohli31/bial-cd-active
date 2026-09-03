@@ -49,7 +49,6 @@ from src.services.agent.mode_prompts import (
     workspace_note,
 )
 from src.services.agent.toolsets import registered_tool_definitions
-from src.services.messages.projection import TELL_THE_USER_TOOL
 from src.services.orchestrator.prompt import (
     BUILD_SYSTEM_PROMPT,
     BUILD_WORKING_RULES_HEAD,
@@ -156,17 +155,22 @@ def test_write_states_the_data_integrity_rules_exactly_once() -> None:
 
 
 def test_write_speaks_to_the_person_who_asked_for_the_app() -> None:
-    """U15 / R20 / R22. Write mode carried NO audience instruction at all — Plan carried a full
+    """U15 / R20. Write mode carried NO audience instruction at all — Plan carried a full
     plain-language contract and Ask deliberately pushes the other way — and the demo build spent
     2,397 words of paths, commands, and framework nouns on a citizen. The composed Write prompt now
-    carries the audience block, and the assertions pin the bar CONCRETELY (the length, the plain
-    register, what stays behind the scenes, and that the failure turns are covered too) rather than
-    just proving some voice text exists."""
+    carries the audience block, and the assertions pin it CONCRETELY (the plain register, what
+    stays behind the scenes, and that the failure turns are covered too) rather than just proving
+    some voice text exists.
+
+    THE LENGTH BAR IS NO LONGER ASSERTED, because there is no longer one to assert. A sentence
+    telling the agent how long it may write is a decision about how much of what it produced a
+    citizen is allowed to read, and it went with the other caps. WHO is being written for did
+    not: that is what this test is about, and it is the one thing in this block that two live
+    incidents came from removing."""
     composed = compose_kind_prompt(ChatKind.BUILD, _CONTEXT)
     assert NARRATION_VOICE in composed
     lowered = composed.lower()
     assert "talking to the user" in lowered
-    assert "a couple of lines at each milestone" in lowered  # R22's length bar
     # The SAME register Plan already speaks — U15 matched a voice rather than inventing a second.
     assert "plain, everyday words" in lowered
     assert "keep the how-it's-built details behind the scenes" in lowered
@@ -181,9 +185,14 @@ def test_the_audience_block_is_emitted_exactly_once() -> None:
     """The DATA_INTEGRITY_RULES trap, one block over, and now at three sites instead of one.
 
     The contract is named by `_base()` (both kinds) and separately by `BUILD_SYSTEM_PROMPT`
-    (which cannot call `_base`), while its length half rides `BUILD_WORKING_RULES_TAIL`. Each of
-    those is a place a second copy could appear, and two prompts that state the same contract
-    twice in slightly different places are how two prompts start drifting.
+    (which cannot call `_base`). Each of those is a place a second copy could appear, and two
+    prompts that state the same contract twice in slightly different places are how two prompts
+    start drifting.
+
+    IT IS ALSO THE DELETION GUARD. The block restricts WHO the agent writes for, not what it may
+    say, and it was removed once — twice in production consequences — before that distinction
+    was written down. The pass that deleted every length cap and vocabulary rule beside it left
+    this one alone deliberately, and a count of zero here is what catches the next attempt.
 
     COUNTING IS THE POINT, and `== 1` rather than `<= 1` is the point of the counting: the
     failure this guard was extended to catch — the block being lifted out of the TAIL and never
@@ -193,11 +202,12 @@ def test_the_audience_block_is_emitted_exactly_once() -> None:
         composed = compose_kind_prompt(kind, _CONTEXT)
         assert composed.count(NARRATION_VOICE) == 1
         assert composed.count("TALKING TO THE USER") == 1
-        assert composed.count("HOW LONG —") == 1
-    build = compose_kind_prompt(ChatKind.BUILD, _CONTEXT)
-    assert build.lower().count("a couple of lines at each milestone") == 1
+        # AND NO LENGTH BAR BESIDE IT, in either kind. The per-kind "HOW LONG —" sentences went
+        # with the rest of the caps; asserting their absence here is what stops one drifting
+        # back in beside the contract it used to ride with.
+        assert "HOW LONG —" not in composed
     assert BUILD_SYSTEM_PROMPT.count(NARRATION_VOICE) == 1
-    assert BUILD_SYSTEM_PROMPT.lower().count("a couple of lines at each milestone") == 1
+    assert "HOW LONG —" not in BUILD_SYSTEM_PROMPT
 
 
 def test_the_name_the_files_instruction_went_with_the_segment_that_carried_it() -> None:
@@ -222,7 +232,7 @@ def test_the_name_the_files_instruction_went_with_the_segment_that_carried_it() 
         )
 
 
-def test_a_plan_chat_inherits_the_contract_and_only_the_length_differs() -> None:
+def test_both_kinds_inherit_the_one_audience_contract() -> None:
     """★ AE44 / R79 — the two kinds are told the same thing about their reader.
 
     A Plan chat used to carry its OWN plain-language paragraph, saying what the audience block
@@ -232,9 +242,10 @@ def test_a_plan_chat_inherits_the_contract_and_only_the_length_differs() -> None
     had no place in a turn where nothing is being built yet.
 
     That objection was real and it is what the split fixed — the build framing was one SENTENCE,
-    about length, and it is now the one per-kind variable. The rest was never build-specific.
-    So the assertion inverts: the shared block is present in both, and what differs is which
-    length clause the segment carried in."""
+    about length. That sentence and its planning twin have since gone entirely, with the rest of
+    the caps: how long the agent may write is a decision about how much of what it produced a
+    citizen is allowed to read. What is left is a contract with no per-kind half at all, which
+    is the strongest form of the thing R79 was asking for."""
     plan = compose_kind_prompt(ChatKind.PLAN, _CONTEXT)
     build = compose_kind_prompt(ChatKind.BUILD, _CONTEXT)
     assert NARRATION_VOICE in plan
@@ -247,14 +258,16 @@ def test_a_plan_chat_inherits_the_contract_and_only_the_length_differs() -> None
     assert "keep the how-it's-built details behind the scenes" in lowered
     assert "present_plan_options" in plan
 
-    # The one difference, in both directions.
-    assert "a plan is as long as it needs to be" in lowered
+    # NO PER-KIND LENGTH CLAUSE IS LEFT, in either direction. Both halves are asserted because
+    # the failure this catches is one of them drifting back in alone, which would restore the
+    # split without restoring the thing the split was for.
+    assert "a plan is as long as it needs to be" not in lowered
     assert "a couple of lines at each milestone" not in lowered
-    assert "a couple of lines at each milestone" in build.lower()
     assert "a plan is as long as it needs to be" not in build.lower()
+    assert "a couple of lines at each milestone" not in build.lower()
 
-    # AE44's other half: apart from the length clause, the two prompts say the same thing about
-    # voice. Nothing in the shared block is reachable from only one kind.
+    # AE44's other half: the two prompts say the same thing about voice, with nothing left that
+    # differs. Nothing in the shared block is reachable from only one kind.
     assert plan.count(NARRATION_VOICE) == build.count(NARRATION_VOICE) == 1
 
 
@@ -369,6 +382,24 @@ def test_the_plan_segment_never_speaks_of_forbidden_fruit() -> None:
         assert phrase not in lowered, f"prohibition prose {phrase!r} crept into a segment"
 
 
+def test_the_plan_still_says_nothing_technical_even_with_its_shape_freed() -> None:
+    """★ THE HALF THAT SURVIVED THE DE-GATING, and the distinction the owner drew.
+
+    The pass that freed the plan's SHAPE deliberately did not free its AUDIENCE. A plan is read
+    by someone who asked for an app, and naming the file it lives in tells them nothing they can
+    act on — which is the same rule the shared audience contract states for every other message,
+    applied to the one message a citizen is asked to APPROVE.
+
+    Asserted per category rather than in general: a sentence that dropped "a command" while
+    keeping the other four would still read as a no-jargon rule and would still have stopped
+    covering the thing the 2026-08-18 demo actually leaked.
+
+    Mutation check: delete any one of the five nouns from `_PLAN_SEGMENT` and this names it."""
+    lowered = _PLAN_SEGMENT.lower()
+    for banned in ("a file", "a folder", "a framework", "a library", "a command"):
+        assert banned in lowered, f"the no-jargon sentence stopped naming {banned!r}"
+
+
 def test_plan_segment_is_citizen_facing_not_a_developer_spec() -> None:
     # F9: the plan streams as ordinary assistant TEXT, so its register is dictated entirely by
     # _PLAN_SEGMENT. The developer skeleton ("the files you would touch", "the trade-offs the
@@ -389,61 +420,40 @@ def test_plan_segment_is_citizen_facing_not_a_developer_spec() -> None:
     # `test_a_plan_chat_inherits_the_contract_and_only_the_length_differs` holds that ground on
     # the composed prompt, where the model actually reads it.
     assert "plain, everyday words" in compose_kind_prompt(ChatKind.PLAN, _CONTEXT).lower()
-    assert "will do" in lowered  # "what the app or this change will DO for them"
-    assert "what you will see" in lowered
+    # THE MANDATED SHAPE IS GONE, and its absence is asserted rather than merely unmentioned.
+    # The segment used to dictate five headed sections in a fixed order, which made every plan
+    # read the same whatever was being planned. What a plan is FOR and who reads it survives;
+    # how it is arranged is the agent's, in front of the person who asked.
+    assert "five parts" not in lowered
+    assert "what this gives you" not in lowered
     assert "present_plan_options" in _PLAN_SEGMENT
     # the read-first grounding instruction stays — only the OUTPUT register changed
     assert "read the relevant files first" in lowered
 
 
-def test_the_plan_segment_names_the_five_sections_in_order() -> None:
-    """★ AE39 / R21 — the shape the origin asked a plan to have, asserted as prompt copy.
-
-    THIS IS AN ASSERTION ABOUT WHAT WE TELL THE MODEL, and that distinction is the point of
-    saying it out loud: whether a plan actually comes back with five sections is the model's
-    behaviour, observed rather than tested (R92). What can be pinned is that the instruction
-    is there, complete, and in the order a person reads in — a section quietly dropped in a
-    later edit is exactly the regression a prompt has no other way to catch.
-
-    "What stays exactly as it is" is CONDITIONAL and the segment must say so: on a first build
-    there is nothing yet to leave alone, and a section solemnly reporting that reads as
-    padding to the one person it is written for."""
-    lowered = _PLAN_SEGMENT.lower()
-    sections = [
-        "what this gives you",
-        "what you will see",
-        "what the app will remember",
-        "what stays exactly as it is",
-        "what i assumed",
-    ]
-    positions = [lowered.find(section) for section in sections]
-    assert all(at >= 0 for at in positions), dict(zip(sections, positions, strict=True))
-    assert positions == sorted(positions), "the five sections are out of order"
-    # The conditional half, and the reason it is a separate assertion: a segment that named
-    # the section but not its condition would pass the list above and still ask for a "what
-    # stays the same" paragraph on an empty project.
-    assert "leave this part out" in lowered
-
-    # The plan says nothing technical, and says so about each category rather than in general.
-    for banned in ("a file", "a folder", "a framework", "a library", "a command"):
-        assert banned in lowered, f"the no-jargon sentence stopped naming {banned!r}"
-
-
 def test_the_plan_segment_says_the_plan_travels_in_the_offer_argument() -> None:
-    """★ THE SENTENCE THAT MAKES THE WIDENED DROP SAFE (U9, and why it lands with U3/U4).
+    """★ THE SENTENCE THAT KEEPS A BUTTON ATTACHED TO SOMETHING (U9).
 
-    Prose written in the same response as a tool call does not reach the user in either kind
-    now. The old segment told the model to write the plan out and THEN call the offer — which,
-    under that rule, means the plan is written beside a tool call and disappears. The plan has
-    to travel in the argument, and the segment has to say so.
+    THE REASON CHANGED AND THE INSTRUCTION DID NOT, which is worth saying because the old reason
+    is gone: prose beside a tool call used to be thrown away, so a plan written next to the call
+    simply disappeared. It reaches the citizen now. What has not changed is that the BUTTONS are
+    attached to the argument — a plan announced beside the call leaves the person reading a plan
+    with nothing to press, which is the one thing the plan chat exists to produce.
+
+    So the segment must still say where the plan goes, and must no longer say that everything
+    else the agent writes is discarded. Both halves are asserted.
 
     Mutation check: revert this paragraph to "write the plan, then call the tool" and no other
-    test in the repo goes red — the failure is a citizen pressing a button under nothing."""
+    test in the repo goes red — the failure is a citizen reading a plan with no button."""
     lowered = _PLAN_SEGMENT.lower()
     assert "as the `plan` argument of" in lowered
     assert "not as a message beside the call" in lowered
-    # And the alternative it points at, so the model is not merely told what does not work.
-    assert TELL_THE_USER_TOOL in _PLAN_SEGMENT
+    # AND IT NO LONGER LIES TO THE MODEL. The segment used to say anything written in the same
+    # breath as a tool call "does not reach the user", which stopped being true the moment the
+    # hold was deleted — R7's whole point is that nothing tells the model something about this
+    # system that is no longer so.
+    assert "does not reach the user" not in lowered
+    assert "everything else you write does reach them" in lowered
 
 
 # THE PLAN REMINDERS' OWN F9 CHECK USED TO SIT HERE, and it is not orphaned: the reminders it

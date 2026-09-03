@@ -27,7 +27,8 @@
  * refuse — which is why it carries the same `SYSTEM_PROMPT_RESERVE` the server holds back, and
  * why the two files spell the same four-characters-to-the-token ratio.
  *
- * Every constant below is the twin of one in `backend/src/services/usage/context_window.py`.
+ * Every constant below is the twin of one in `backend/src/services/usage/` — `context_window.py`
+ * for the estimate's ratios, `limits.py` for the window numbers.
  * They are two readings of one scale; change one and change the other.
  */
 import { getStoredUser } from './auth'
@@ -45,7 +46,7 @@ export const CHARS_PER_TOKEN = 4
 export const NOMINAL_BINARY_TOKENS = 1_600
 
 /**
- * Twin of `context_window.SYSTEM_PROMPT_RESERVE` — room for the per-run system prompt, which
+ * Twin of `limits.SYSTEM_PROMPT_RESERVE` — room for the per-run system prompt, which
  * neither side can see from here. Carried in the browser's number too so the warning cannot sit
  * further from the wall than the refusal does.
  */

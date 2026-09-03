@@ -34,7 +34,7 @@ import base64
 import dataclasses
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Final, TypeGuard
 
 import sqlalchemy as sa
@@ -46,6 +46,7 @@ from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
     RetryPromptPart,
+    ThinkingPart,
     ToolCallPart,
     ToolReturnPart,
 )
@@ -65,15 +66,10 @@ _log = structlog.get_logger()
 # attachment-ref externalization). Readers of a row with a HIGHER version than they know
 # must refuse rather than guess.
 #
-# 1 -> 2 WITH REVISION 0035, AND THAT BUMP IS A CORRECTNESS REQUIREMENT, NOT HOUSEKEEPING.
-# The payload shape did not change; what changed is what the row's own `kind` stamp MEANS.
-# 0035 rewrites every historical row to `build`, and the projection's narration drop reads
-# that stamp — so without a way to tell a rewritten row from a natively-written one, prose
-# that renders today would silently stop rendering on reload for every migrated transcript
-# (a Plan turn that read files and then wrote prose in one response is the ordinary shape,
-# not an edge case). `services/messages/projection.py` therefore gates the drop on
-# `schema_version >= SCHEMA_VERSION`: a fact about WHEN a row was written, never a per-row
-# exemption keyed on the migrated stamp.
+# The payload shape never differed between 1 and 2: the bump was spent on revision 0035's
+# narration-drop gate, and that gate went out with the drop, so nothing reads the version for
+# RENDERING any more. It stays at 2 because rows on disk carry the 2 — walking it back would
+# make the refusal above fire on payloads this server wrote itself.
 SCHEMA_VERSION: Final = 2
 
 # The attachment reference marker's discriminator value. The serialized `BinaryContent` uses
@@ -177,15 +173,40 @@ def _assert_binaries_attributed(node: Any) -> None:
             _assert_binaries_attributed(getattr(node, field.name))
 
 
+THINKING_PART_KIND: Final = "thinking"
+"""The dumped part kind of a reasoning block — the one thing the redactor must not touch."""
+
+_THINKING_VERBATIM: Final = frozenset({"content", "signature"})
+"""The two fields of a reasoning block that are replayed to the provider and checked."""
+
+
 def _redact_tree(node: Any) -> Any:
     """`redact_secrets` over every string VALUE in the dumped tree (text, tool args — dict or
-    JSON-string — tool returns, thinking, error details: one uniform rule instead of a
-    per-part allowlist that drifts). Keys are structural, never redacted."""
+    JSON-string — tool returns, error details: one uniform rule instead of a per-part allowlist
+    that drifts). Keys are structural, never redacted.
+
+    ★ WITH ONE EXEMPTION, AND IT IS NOT A RELAXATION OF THE RULE — it is the rule applied to a
+    value that is not on its way out. The masker is shape-based and deliberately tuned to
+    OVER-redact, because a false positive costs nothing on a string headed for a screen. A
+    reasoning block is headed back to the SAME provider on the next turn, which verifies its
+    signature against its content: rewrite either and the block is rejected, and with it the
+    turn. An agent writing code mentions credential-shaped strings as ordinary commentary — an
+    environment variable name, a token assignment — so this is likely rather than theoretical.
+    Nothing is lost on the way out either, because a reasoning block is never projected, never
+    framed and never sent to the browser; the only thing that ever reads it is the provider.
+
+    EXEMPT BY PART KIND AND BY FIELD, not by "any string under a thinking part": a future field
+    on that part that IS user-facing would otherwise inherit the exemption silently."""
     if isinstance(node, str):
         return redact_secrets(node)
     if isinstance(node, list):
         return [_redact_tree(item) for item in node]
     if isinstance(node, dict):
+        if node.get("part_kind") == THINKING_PART_KIND:
+            return {
+                key: value if key in _THINKING_VERBATIM else _redact_tree(value)
+                for key, value in node.items()
+            }
         return {key: _redact_tree(value) for key, value in node.items()}
     return node
 
@@ -514,7 +535,40 @@ async def load_history(
     swapped = _swap_refs(combined, resolved)
     _assert_no_marker_left(swapped)
     history = ModelMessagesTypeAdapter.validate_python(swapped)
-    return repair_dangling_tool_calls(history)
+    return repair_dangling_tool_calls(_without_broken_reasoning(history))
+
+
+def _without_broken_reasoning(history: list[ModelMessage]) -> list[ModelMessage]:
+    """Drop reasoning blocks that cannot be replayed, rather than replay them broken.
+
+    ★ FAIL CLOSED, AND THE FAILURE MODE IS WHY. A `ThinkingPart` is sent back to the provider
+    only when it still carries the SIGNATURE that provider issued for it; without one the
+    library takes a different branch and sends the reasoning CONTENT as ordinary assistant
+    text wrapped in `<thinking>` tags. That turns a block the citizen was never meant to see
+    into part of the model's own visible transcript for the rest of the conversation, and it
+    does it silently — which is strictly worse than the turn simply thinking afresh.
+
+    NOTHING SHOULD EVER REACH THIS. The redaction pass exempts the block's content and its
+    signature, and the store writes what the library serialized. It exists for the case that
+    slipped through anyway — a row written before that exemption, a payload edited by hand,
+    a provider that stopped issuing signatures — where the honest answer is to lose the
+    reasoning and keep the transcript.
+
+    Messages without reasoning are returned UNCHANGED, by identity: the ordinary conversation
+    has no thinking parts at all, and rebuilding every response would be a copy per turn for
+    nothing."""
+    kept: list[ModelMessage] = []
+    for message in history:
+        if not isinstance(message, ModelResponse):
+            kept.append(message)
+            continue
+        parts = [
+            part
+            for part in message.parts
+            if not (isinstance(part, ThinkingPart) and not part.signature)
+        ]
+        kept.append(message if len(parts) == len(message.parts) else replace(message, parts=parts))
+    return kept
 
 
 async def load_rows(

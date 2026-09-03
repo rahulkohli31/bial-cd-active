@@ -145,7 +145,12 @@ def test_system_prompt_tells_the_agent_who_is_reading() -> None:
     from src.core.prompt_blocks import NARRATION_VOICE
 
     assert BUILD_SYSTEM_PROMPT.count(NARRATION_VOICE) == 1
-    assert BUILD_SYSTEM_PROMPT.lower().count("a couple of lines at each milestone") == 1
+    # AND NO LENGTH BAR BESIDE IT. The per-kind "how long" sentence used to ride
+    # `BUILD_WORKING_RULES_TAIL` next to this block and went with the rest of the caps: telling
+    # the agent how long it may write is deciding how much of what it produced a citizen may
+    # read. WHO it writes for is a different rule and is the one that stayed.
+    assert "a couple of lines at each milestone" not in BUILD_SYSTEM_PROMPT.lower()
+    assert "HOW LONG —" not in BUILD_SYSTEM_PROMPT
     lowered = BUILD_SYSTEM_PROMPT.lower()
     assert "talking to the user" in lowered
     assert "plain, everyday words" in lowered
@@ -200,7 +205,13 @@ def test_completion_promises_no_round_trip_after_declare_done() -> None:
     # R22/AE13 — and what the summary must BE, since it is now the last thing the user reads.
     assert "the last thing the user reads" in completion
     assert "what they can now do" in completion
-    assert "no file names, commands, libraries or frameworks" in completion
+    # THE VOCABULARY CLAUSE IS GONE, and its absence is asserted rather than merely unmentioned.
+    # "with no file names, commands, libraries or frameworks in it" told the agent which WORDS
+    # its closing message could not contain — a restriction on what it may say rather than on
+    # who it is saying it to. What replaced it is the audience: an account of what the person
+    # can now do with their app, written to the person who asked for it.
+    assert "no file names, commands, libraries or frameworks" not in completion
+    assert "written to the person who asked for it" in completion
 
     # LIVENESS — the repair arm's promise is unchanged and still made.
     assert "does NOT check out you will receive the diagnostic" in completion

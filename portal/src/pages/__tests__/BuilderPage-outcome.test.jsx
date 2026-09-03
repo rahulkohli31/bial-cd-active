@@ -103,7 +103,7 @@ async function send(text) {
  *  depends on (Stop needs `liveTurnIdRef` populated WHILE the turn is still running, not only at
  *  its terminal). */
 const T_SNAPSHOT = (turnId, seq = 1) => ({
-  type: 'snapshot', seq, turnId, turnStatus: 'running', items: [], textSoFar: '', steps: [],
+  type: 'snapshot', seq, turnId, turnStatus: 'running', items: [], parts: [], working: false,
 })
 
 /**

@@ -10,6 +10,60 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 > `1.7.0` section is added above them and tagged `v1.7.0`; the betas stay as the record of how it
 > got there. A version number marks a build, not a merge.
 
+## [1.7.0-beta.6] - 2026-09-02
+
+The agent's whole voice.
+
+### Added
+
+- **The agent's writing reaches you as it is written, in the order it was written.** It used to be
+  held back until the turn ended, and any sentence written beside an action was thrown away
+  outright — so the account of a build was a row of receipts with the explanation between them
+  deleted. Words and steps now arrive interleaved, and a chat you reload reads in exactly the order
+  you watched it happen in.
+- **The agent can think for as long as a question needs, and the thinking costs you nothing.**
+  Reasoning tokens no longer count against your daily allowance.
+
+### Changed
+
+- **Nothing is said in the agent's name that the agent did not write.** "Getting started on that…"
+  is the platform's own line, and it used to sit there spinning underneath an answer you had already
+  finished reading. It is taken back off the screen the moment there is anything real above it.
+- **You can see what the agent read to get somewhere.** A build's activity used to open on a write,
+  with no account of what was looked at first. Reads are drawn now. Only plumbing stays hidden — a
+  configuration file, a housekeeping command — and a step that failed is never hidden.
+- **The agent writes at the length the answer needs.** The rules that capped how much it could say,
+  forced every plan into the same five parts, and prescribed how it had to sign off are gone. What
+  stays is who it is writing for.
+
+### Fixed
+
+- **Two first messages racing on the same new chat no longer lose one of them.** The message that
+  lost the race was answered with a bare failure, and the citizen watched their sentence vanish
+  while the reply it had started was already running in the other chat. It now joins the chat that
+  won, with the message intact.
+- **An administrator can no longer set a per-conversation maximum that locks someone out.** Below a
+  floor, the limit refused every chat that person opened — including a brand-new empty one — and
+  told them to start a new chat, which was the one thing that also failed. The form refuses the
+  value with a sentence saying why, and a value already stored below the floor is clamped on read,
+  so the people the defect already reached are working again without an administrator touching
+  anything.
+- **A reload in the middle of a build no longer shows you every sentence twice.** The turn's stored
+  prose and the re-told live turn were both drawn.
+- **"Working on your app" stays where the agent actually is.** It was pinned to the top of the
+  reply, so a build that thought again between steps pushed everything you had already read down
+  the screen until it stopped.
+
+### Notes
+
+- The backend dependency stack was brought current and every floor pinned — pydantic-ai 2.37, and
+  an Anthropic SDK that now carries its own fork of its HTTP client. That upgrade is what made the
+  reasoning allowance reachable at all.
+- A verification pass over this wave, with nothing to see on screen: six tests that the branch had
+  left red or hanging are green, the test fixture that made a route's own rollback observable is
+  scoped to the two tests that need it rather than reshaping all 3,700, and a handful of comments
+  and docstrings that described mechanisms this wave deleted now describe what is there.
+
 ## [1.7.0-beta.5] - 2026-09-02
 
 The project screen becomes the app.

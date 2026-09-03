@@ -34,11 +34,14 @@ from typing import Literal
 
 import structlog
 from pydantic_ai import Agent, BinaryContent
+from pydantic_ai._agent_graph import AgentNode
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import ModelMessage, ModelRequest
 from pydantic_ai.models import Model
 from pydantic_ai.models.anthropic import AnthropicModelSettings
+from pydantic_ai.result import FinalResult
 from pydantic_ai.usage import RequestUsage, UsageLimits
+from pydantic_graph import End
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import (
@@ -499,8 +502,21 @@ class BuildOrchestrator:
                 anthropic_cache=CACHE_TTL,
             ),
         ) as run:
-            node = run.next_node
-            while not Agent.is_end_node(node):
+            # ANNOTATED, AND WALKED WITH `isinstance` RATHER THAN `Agent.is_end_node`.
+            #
+            # The library offers that classmethod and its docstring recommends it over isinstance
+            # "to preserve the generic parameters while narrowing". That is true of the POSITIVE
+            # branch and is not what this loop needs: it needs the NEGATIVE one, and the guard is
+            # a `TypeIs[End[FinalResult[S]]]` whose `S` is inferable only from the argument. Call
+            # it on the bare class and `ty` binds `S` to `Unknown`, so `End[FinalResult[str]]`
+            # survives the negation and every `run.next(node)` below it reads as possibly-End.
+            #
+            # Annotating the variable is what makes plain `isinstance` exact instead: the union
+            # is written down, so the negative branch is precisely the node type, and all four
+            # checkers agree. The annotation is also the honest documentation — this loop walks
+            # a graph, and what it walks was previously inferred and invisible.
+            node: AgentNode[BuildDeps, str] | End[FinalResult[str]] = run.next_node
+            while not isinstance(node, End):
                 if Agent.is_model_request_node(node):
                     # Enforce in a short read-only session that CLOSES before the model call, so
                     # no DB connection is held idle-in-transaction across the (multi-minute) LLM

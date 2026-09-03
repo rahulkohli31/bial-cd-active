@@ -266,6 +266,48 @@ def test_the_bound_does_not_price_a_cache_read_like_fresh_input() -> None:
     assert _run_spend(mostly_cached) < mostly_cached.total_tokens / 5
 
 
+def test_the_platform_s_thinking_is_not_charged_to_the_citizen() -> None:
+    """★ THE OWNER'S RULING (2026-09-02): the meter shows what the citizen spent on their app,
+    not what the platform spent thinking about it.
+
+    Reasoning is a choice this platform made on their behalf. They did not ask for it, they
+    cannot see it, and they cannot turn it off — so a daily allowance that moved because the
+    platform thought harder would move for a reason the person has no way to act on.
+
+    THE SUBTRACTION IS SOUND BECAUSE THE PROVIDER BILLS THINKING *INSIDE* `output_tokens`
+    rather than beside it, so `thinking_tokens` is a readable subset of the output total. The
+    first assertion is what would catch someone "fixing" this by adding instead: adding would
+    make a reasoning turn cost MORE than its own output.
+
+    Mutation check: pass `usage.output_tokens` straight through in `_citizen_output_tokens` and
+    the second assertion goes red; add instead of subtract and the third does."""
+    from pydantic_ai.usage import RunUsage
+
+    from src.services.turns.engine import _citizen_output_tokens, _run_spend
+
+    thought_hard = RunUsage(
+        input_tokens=1_000,
+        output_tokens=900,  # of which 700 was the platform thinking
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+        details={"thinking_tokens": 700},
+    )
+    # A SUBSET, never an addition — the fixture is only honest if this holds.
+    assert thought_hard.details["thinking_tokens"] < thought_hard.output_tokens
+    assert _citizen_output_tokens(thought_hard) == 200
+    # 1_000 fresh input + 200 of the citizen's own output. The 700 the platform spent thinking
+    # is charged to nobody.
+    assert _run_spend(thought_hard) == 1_200
+
+    # AND A TURN THAT DID NOT THINK IS UNCHANGED, which is the half that proves the subtraction
+    # is reading a real key rather than discounting every turn. The provider OMITS the key
+    # entirely when a response used no thinking, so this is the ordinary shape and not an edge.
+    plain = RunUsage(input_tokens=1_000, output_tokens=900)
+    assert "thinking_tokens" not in plain.details
+    assert _citizen_output_tokens(plain) == 900
+    assert _run_spend(plain) == 1_900
+
+
 def test_the_run_bound_and_the_daily_meter_weigh_a_token_identically() -> None:
     """ONE POLICY, TWO READERS. The daily meter is a SQL column expression and the run bound is
     an in-process scalar, so they cannot share an implementation — but they must not drift into

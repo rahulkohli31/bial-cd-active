@@ -393,14 +393,16 @@ describe('R8 live clause — a reload MID-TURN re-attaches to the running reply'
     })
     h.readTurnStream.mockImplementation(
       turnStreaming([
-        { type: 'snapshot', seq: 4, turnId: 't-live', turnStatus: 'running', textSoFar: 'It tracks visitor', items: [], steps: [] },
-        { type: 'text_delta', seq: 5, text: ' passes.' },
+        { type: 'snapshot', seq: 4, turnId: 't-live', turnStatus: 'running', parts: [{ type: 'text', text: 'It tracks visitor' }], working: false, items: [] },
+        { type: 'text_delta', seq: 5, text: ' passes.', newBlock: false },
         { type: 'turn_ended', seq: 6, turnId: 't-live', status: 'completed' },
       ]),
     )
     renderThread()
 
-    // The snapshot's textSoFar plus the tail — the whole reply, not just what arrived after.
+    // The snapshot's own block plus the tail that CONTINUES it — the whole reply, not just what
+    // arrived after, and not two paragraphs where the model wrote one. `newBlock: false` is what
+    // says the delta belongs to the block the snapshot delivered.
     expect(await screen.findByText(/It tracks visitor passes\./)).toBeTruthy()
     const [args] = h.readTurnStream.mock.calls[0]
     expect(args.conversationId).toBe('thread-1')
@@ -408,6 +410,69 @@ describe('R8 live clause — a reload MID-TURN re-attaches to the running reply'
     // Cursor-0 on purpose: `lastSeq` counts frames this tab never saw, so replaying from it
     // would silently drop the prefix the snapshot is carrying.
     expect(args.cursor).toBe(0)
+  })
+
+  it('tells the re-attached turn ONCE, prose included', async () => {
+    // The reload hydrates the turn's persisted rows AND re-tells the same turn into a fresh
+    // streaming message. Prose written beside a tool call is stored now — the projection stopped
+    // dropping it — so the stored copy and the re-told copy are both on screen unless the
+    // in-flight suppression covers text as well as steps. The citizen read every sentence twice.
+    h.getBuild.mockResolvedValue({
+      id: 'thread-1',
+      mode: 'ask',
+      activeTurn: { turnId: 't-live', lastSeq: 3 },
+      messages: [
+        { id: 'srv_1_u_0', role: 'user', seq: 1, parts: [{ type: 'text', text: 'add a page' }] },
+        { id: 'srv_2_a_0', role: 'assistant', seq: 2, parts: [{ type: 'text', text: 'Let me look at the page.' }] },
+      ],
+    })
+    h.readTurnStream.mockImplementation(
+      turnStreaming([
+        {
+          type: 'snapshot',
+          seq: 3,
+          turnId: 't-live',
+          turnStatus: 'running',
+          parts: [{ type: 'text', text: 'Let me look at the page.' }],
+          working: false,
+          items: [],
+        },
+      ]),
+    )
+    renderThread()
+
+    // Once, not twice — and `findAllByText` rather than `findByText` so the assertion is about
+    // the COUNT: `findByText` throws on multiple matches, which reads as a broken query.
+    const drawn = await screen.findAllByText(/Let me look at the page\./)
+    expect(drawn).toHaveLength(1)
+  })
+
+  it('draws the working status BELOW prose already on screen, not above it', async () => {
+    // A build thinks again between tool calls — adaptive thinking is on — so `working` goes true
+    // again after the citizen has already read a paragraph. The status row used to be pinned to
+    // index 0 of the streaming message, which pushed everything they had read down the screen
+    // until the burst ended. Asserted on ORDER, because presence passes either way.
+    h.getBuild.mockResolvedValue({
+      id: 'thread-1',
+      mode: 'ask',
+      activeTurn: { turnId: 't-live', lastSeq: 0 },
+      messages: [{ id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'build it' }] }],
+    })
+    h.readTurnStream.mockImplementation(
+      turnStreaming([
+        { type: 'snapshot', seq: 1, turnId: 't-live', turnStatus: 'running', parts: [], working: false, items: [] },
+        { type: 'text_delta', seq: 2, text: 'Let me look at the page.', newBlock: true },
+        { type: 'working', seq: 3, working: true },
+      ]),
+    )
+    const { container } = renderThread()
+
+    await screen.findByText(/Let me look at the page\./)
+    await screen.findByTestId('working-status')
+    const rendered = Array.from(
+      container.querySelectorAll('[data-testid="assistant-message"] p, [data-testid="working-status"]'),
+    ).map((node) => node.getAttribute('data-testid') ?? node.textContent)
+    expect(rendered).toEqual(['Let me look at the page.', 'working-status'])
   })
 
   it('does not re-subscribe when no turn is running', async () => {

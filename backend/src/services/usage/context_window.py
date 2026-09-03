@@ -49,7 +49,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.user_limit import UserLimit
-from src.services.usage.limits import effective_context
+from src.services.usage.limits import SYSTEM_PROMPT_RESERVE, effective_context
 
 CHARS_PER_TOKEN: Final = 4
 """The estimate's one constant. Four characters to the token is the ratio the retired
@@ -73,20 +73,6 @@ not a conservative estimate. It is recorded rather than fixed because the honest
 page count the platform does not store yet (persisted at upload, as the deck branch already
 does for its own reasons); charging by byte length instead would resurrect the 1.7 M-token
 absurdity above. Until then: prose conversations are guarded, document-heavy ones are not."""
-
-SYSTEM_PROMPT_RESERVE: Final = 8_000
-"""Room held back for what this function cannot see.
-
-The per-run system prompt is composed inside the turn engine, AFTER this gate has decided, so
-it is not in the history and not in the prompt. Measured at the time of writing: the Plan
-segment composes to ~1,800 tokens and the Build segment — the larger — to ~4,400, before the
-tool schemas the run also carries. 8,000 covers the larger of the two with room for the
-schemas and for both to grow.
-
-Without it the gate is quietly permissive at exactly the setting that matters most: the
-DEFAULT hard limit equals the model's own window, so a conversation measured at 199,000 would
-be waved through into a prompt that is really 204,000 and fail at the model instead — which is
-the opaque failure this whole guardrail exists to replace."""
 
 
 class ContextWindowExceededError(Exception):

@@ -111,7 +111,7 @@ function deps() {
  * depend on being true the moment a turn opens, not only once it ends.
  */
 function scriptTurn(opening: unknown[] = [
-  { type: 'snapshot', seq: 1, turnId: 't1', turnStatus: 'running', items: [], textSoFar: '', steps: [] },
+  { type: 'snapshot', seq: 1, turnId: 't1', turnStatus: 'running', items: [], parts: [], working: false },
   T_WORKSPACE(undefined, 2),
 ]) {
   const live: { emit: ((frame: unknown) => void) | null; close: ((outcome: string) => void) | null } = {

@@ -7,9 +7,15 @@ is reading the conversation.
 
 ★ THE TEST THAT MATTERS MOST is `test_no_marks_and_work_landed_says_it_could_not_tell`. The
 finished half is agent-supplied, so an agent that built everything and marked nothing looks
-exactly like one that built nothing. Stating "these four remain" in the platform's own voice on
+exactly like one that built nothing. Stating "these three remain" in the platform's own voice on
 that evidence would be a false fact the citizen has no reason to doubt — worse than the agent's
 own recollection, which is what this unit exists to replace.
+
+NOTHING HERE COUNTS PIECES ANY MORE (U6). The four-piece ceiling was enforced twice — once in
+the tool body, which taught the model to retry, and once in the renderer, which drew nothing —
+so a round the agent had sized well was refused to the model and shown to nobody. Both numbers
+are gone, and what is left is the single rule that is not a matter of taste: a first round may
+name only pieces the citizen was told had been picked up.
 
 WHAT THESE TESTS DO NOT PROVE. Every one runs against a scripted transcript, so the script
 decides that the tool was called. Whether the model actually proposes against a nine-screen
@@ -42,7 +48,6 @@ from src.db.models.harness_counter import HarnessCount, HarnessCounter
 from src.db.models.message import Message, MessageEntryKind
 from src.services.agent.conversation_tools import propose_first_slice, tell_the_user
 from src.services.messages.projection import (
-    MAX_FIRST_SLICE,
     AssistantTextItem,
     agreed_slice,
     finished_slice,
@@ -59,6 +64,7 @@ from src.services.turns.copy import (
 )
 from src.services.turns.engine import TurnEngine, _TurnState
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
+from tests.transcript import rendered_text
 
 _NINE = [
     "Sign-in for staff",
@@ -116,31 +122,51 @@ def _state(kind: ChatKind = ChatKind.BUILD) -> _TurnState:
     )
 
 
-# --- the bound: the ceiling is code, the floor is not --------------------------------------
+# --- nothing is counted; a round may name only what was found -------------------------------
 
 
-async def test_a_slice_of_four_is_allowed_and_five_is_refused() -> None:
-    """★ R83's binding half, at the boundary. FOUR passes and FIVE is refused, so an off-by-one
-    in the comparison dies here — a fixture of nine would pass against `>` and `>=` alike.
+@pytest.mark.parametrize("first", [_NINE[:5], _NINE], ids=["one-over-the-old-bound", "all-nine"])
+async def test_a_first_slice_over_the_old_ceiling_is_accepted_and_drawn_whole(
+    first: list[str],
+) -> None:
+    """★ U6 — the ceiling is gone from BOTH readers, and the second assertion is the reason this
+    is not a one-line test.
 
-    The refusal NAMES the bound and says what to do about it, because a model that trips it has
-    to choose differently, not merely try again."""
-    assert await propose_first_slice(_ctx(), _NINE, _NINE[:MAX_FIRST_SLICE], _WHY, _QUESTION)
-    with pytest.raises(ModelRetry) as refused:
-        await propose_first_slice(_ctx(), _NINE, _NINE[: MAX_FIRST_SLICE + 1], _WHY, _QUESTION)
-    assert str(MAX_FIRST_SLICE) in str(refused.value)
+    Four pieces was the bound and it was enforced twice, by the tool body and again by the
+    renderer. A proposal one piece over it was therefore refused at the tool AND drawn nowhere:
+    the model was told to retry a judgement it had already made well, and the citizen read
+    silence at the moment the agent had proposed something. Asserting only that the body now
+    accepts would leave exactly the half that produced the silence untested.
+
+    NINE IS HERE BESIDE FIVE because what was removed is the ceiling, not a higher ceiling. How
+    much belongs in a first round is a judgement about the person asking and the size of what
+    they asked for, and there is no number at which the platform starts overruling it.
+
+    Mutation check: restore `len(first) > 4` to `_bad_slice` or to `_slice_argument` — either
+    one alone — and this goes red."""
+    assert await propose_first_slice(_ctx(), _NINE, first, _WHY, _QUESTION)
+
+    rendered = proposal_from_args(_args(_NINE, first))
+    assert rendered is not None
+    # Read the bullets UNDER the first-round lead, not the ones in the full list above it:
+    # every piece in a first round also appears in `found`, so checking the whole message
+    # would pass even if the round itself had been drawn empty.
+    round_section = rendered.split(PROPOSAL_FIRST_LEAD, 1)[1]
+    for piece in first:
+        assert f"- {piece}" in round_section
 
 
 async def test_a_slice_of_exactly_one_large_piece_is_allowed() -> None:
-    """★ R83's SOFT half, and the reason the floor is prompt copy rather than a check.
+    """★ There is no floor either, and the prompt is where guidance about one belongs.
 
     Twenty pages describing one screen is one piece (R84). A hard floor of two would refuse an
     honest single-piece slice inside the tool body and leave the model no recovery except to
     split something that should not be split, or to name a piece it does not intend to build —
     which then shows up as a padded remainder in the closing account.
 
-    Mutation check: add `len(first) < 2` to `_bad_slice` and this goes red while every other
-    test in this file stays green, which is exactly how the defect would have shipped."""
+    Mutation check: add `len(first) < 2` to `_bad_slice` and this goes red — and so does the
+    whitespace row of the equivalence table below, which is the same defect seen from the
+    renderer's side."""
     one = ["A visitor check-in screen"]
     assert await propose_first_slice(_ctx(), one, one, _WHY, _QUESTION)
 
@@ -191,11 +217,15 @@ def test_a_slice_that_covers_everything_promises_no_next_round() -> None:
 
 
 def test_a_proposal_the_tool_would_refuse_renders_nothing() -> None:
-    """One rule, read by the body and by both emitters. A five-piece slice never reaches a
-    screen even if a call carrying one somehow reached a stored row."""
-    assert proposal_from_args(_args(_NINE, _NINE[:5])) is None
+    """One rule, read by the body and by both emitters. A call the model is being told to retry
+    never reaches a screen, even if it somehow reached a stored row."""
     assert proposal_from_args(_args(_NINE, ["not in the found list"])) is None
+    assert proposal_from_args(_args([], _THREE)) is None
+    assert proposal_from_args(_args(_NINE, [])) is None
     assert proposal_from_args("not json") is None
+    # LIVENESS: the same renderer still draws an honourable call, so those Nones are refusals
+    # rather than a renderer that has quietly stopped drawing proposals at all.
+    assert proposal_from_args(_args(_NINE, _THREE)) is not None
 
 
 def test_a_piece_named_twice_is_one_piece() -> None:
@@ -228,8 +258,12 @@ def test_the_agreement_is_the_latest_honourable_proposal_in_the_conversation() -
     assert agreed_slice(messages) == later
 
     # A refused shape does not become the agreement — it silently replaced a good one before.
+    # A round naming a piece nobody was told had been picked up is what that looks like now
+    # that no count is enforced: it is the one rule the body has left.
     messages.append(
-        ModelResponse(parts=[ToolCallPart("propose_first_slice", _args(_NINE, _NINE), "p3")])
+        ModelResponse(
+            parts=[ToolCallPart("propose_first_slice", _args(_NINE, ["A dark mode toggle"]), "p3")]
+        )
     )
     assert agreed_slice(messages) == later
     assert agreed_slice([]) == []
@@ -351,6 +385,34 @@ def test_a_second_proposal_replaces_the_agreement_and_its_marks() -> None:
     )
 
 
+def test_a_round_over_the_old_ceiling_still_gets_a_closing_account_of_what_is_left() -> None:
+    """★ U6'S OTHER HALF — de-capping the proposal must not cost the citizen the closing account.
+
+    The two are one code path. The live emitter records `agreed_pieces` from the RENDERED
+    proposal, so a proposal the renderer refused to draw agreed nothing at all: a nine-piece
+    build ended with no account of what was outstanding, which is silence rather than a wrong
+    list, and silence is why the old ceiling never showed up as a defect in the remainder.
+
+    So this drives the whole live path for a round the old bound would have cut — propose nine,
+    mark two as they land — and reads the sentence the turn would close with.
+
+    Mutation check: restore the ceiling to `_slice_argument` and this goes red on all three
+    assertions at once: nothing is drawn, nothing is agreed, and the turn closes saying
+    nothing about the seven pieces still to do."""
+    engine, state = TurnEngine(), _state()
+    engine._on_event(state, _proposed(_NINE, _NINE))
+    engine._on_event(state, _marked(_NINE[0], call_id="m1"))
+    engine._on_event(state, _marked(_NINE[3], call_id="m2"))
+
+    # LIVENESS: the proposal reached the citizen. An agreement recorded from a card nobody was
+    # shown would be a worse defect than the one being fixed, not the fix.
+    assert PROPOSAL_EVERYTHING_LEAD in rendered_text(state)
+    assert state.agreed_pieces == _NINE
+
+    left = [piece for piece in _NINE if piece not in {_NINE[0], _NINE[3]}]
+    assert _remainder(state, touched=True) == REMAINDER_TEXT.format(pieces=", ".join(left))
+
+
 # --- live and reload agree, and no branch reads the kind ------------------------------------
 
 
@@ -401,7 +463,7 @@ async def test_the_proposal_reads_the_same_live_and_after_reload_in_either_kind(
     )
     reloaded = [i.text for i in project_rows(rows) if isinstance(i, AssistantTextItem)]
 
-    assert reloaded == ["".join(state.text_parts)]
+    assert reloaded == state.text_blocks()
     assert PROPOSAL_EVERYTHING_LEAD in reloaded[0]
     # And it is not a step — the transcript shows the proposal, never `Used propose_first_slice`.
     assert "propose_first_slice" not in reloaded[0]
@@ -410,7 +472,7 @@ async def test_the_proposal_reads_the_same_live_and_after_reload_in_either_kind(
 # --- U14 / R92: counted at the tool boundary, never read out of a transcript -----------------
 #
 # These two counters are what answer the question the scripted-transcript tests above
-# deliberately do not: whether the bounded-first-slice behaviour actually HAPPENS. Both are
+# deliberately do not: whether the first-slice negotiation actually HAPPENS. Both are
 # facts about tool calls, which is the only kind of fact this plan lets anything act on.
 
 
@@ -424,14 +486,16 @@ async def test_an_accepted_proposal_is_counted_once_and_a_refused_one_not_at_all
 ) -> None:
     """★ The denominator is proposals the citizen was actually shown.
 
-    A refused proposal — over the bound, or naming a piece nobody found — reached no screen and
-    agreed nothing, so counting it would make the number "times the model tried" and quietly
-    inflate the very behaviour it exists to measure.
+    A refused proposal — one naming a piece nobody found — reached no screen and agreed
+    nothing, so counting it would make the number "times the model tried" and quietly inflate
+    the very behaviour it exists to measure.
 
-    Mutation check: move the count above the bound checks and this goes red at two."""
+    Mutation check: move the count above the refusal and this goes red at two."""
     await propose_first_slice(_ctx(), _NINE, _THREE, _WHY, _QUESTION)
     with pytest.raises(ModelRetry):
-        await propose_first_slice(_ctx(), _NINE, _NINE[:5], _WHY, _QUESTION)
+        await propose_first_slice(
+            _ctx(), _NINE, ["A visitor list", "A dark mode toggle"], _WHY, _QUESTION
+        )
 
     assert await _counted(db_session, HarnessCounter.FIRST_SLICE_PROPOSED) == [1]
 
@@ -551,7 +615,7 @@ async def test_a_mark_naming_a_piece_nobody_agreed_to_cannot_defeat_the_could_no
     )
 
     # LIVENESS: the branch ran — the words reached the citizen.
-    assert "That one is in." in "".join(state.text_parts)
+    assert "That one is in." in rendered_text(state)
     # The bogus mark is not recorded, so the honest arm is still reachable.
     assert state.finished_pieces == set()
     assert _remainder(state, touched=True) == CANNOT_TELL_WHAT_REMAINS_TEXT
@@ -572,13 +636,13 @@ async def test_a_mark_naming_a_piece_nobody_agreed_to_cannot_defeat_the_could_no
 @pytest.mark.parametrize(
     "found,first",
     [
-        (_NINE, ["A visitor list"] * 5),  # five entries, ONE piece — the case that diverged
-        (_NINE, [" A visitor list ", "A visitor list"]),  # whitespace makes a false second
-        (_NINE, _NINE[:MAX_FIRST_SLICE]),  # exactly at the ceiling
-        (_NINE, _NINE[: MAX_FIRST_SLICE + 1]),  # genuinely over it
+        (_NINE, _NINE),  # everything found, all of it proposed — accepted by both, now
+        (_NINE, ["A visitor list", "A dark mode toggle"]),  # a piece nobody was told about
+        ([" A visitor list ", "A search box"], ["A visitor list"]),  # padding across the two
         ([" ", ""], ["A visitor list"]),  # nothing usable in `found`
+        (_NINE, ["   "]),  # nothing usable in `first`
     ],
-    ids=["repeated", "whitespace-dupe", "at-ceiling", "over-ceiling", "empty-found"],
+    ids=["all-of-it", "stray-piece", "whitespace-across-the-lists", "empty-found", "empty-first"],
 )
 async def test_the_body_refuses_exactly_what_the_renderer_declines_to_draw(
     found: list[str], first: list[str]
@@ -588,23 +652,32 @@ async def test_the_body_refuses_exactly_what_the_renderer_declines_to_draw(
     The tool body decides what the MODEL is told; `_slice_argument` decides what the CITIZEN
     sees. They run at different moments — the live emitter draws the card at the call event,
     before this body has executed — so a disagreement is not a tidiness problem: it puts a
-    proposal on screen that the model is simultaneously being told to retry, and pins
-    `agreed_pieces` to a slice nobody accepted.
+    proposal on screen that the model is simultaneously being told to retry, or leaves a
+    citizen reading nothing where the model was told its proposal had landed.
 
-    THEY DID DISAGREE. The body counted the raw `first` list and the renderer counted the
-    de-duplicated one, so `["A visitor list"] * 5` was refused as five pieces and drawn as one.
-    Both now clean through `clean_pieces` before judging.
+    THEY DID DISAGREE, TWICE OVER, AND BOTH TIMES OVER A COUNT. The body counted the raw `first`
+    list while the renderer counted the de-duplicated one, so a round naming one piece five
+    times was refused as five and drawn as one; and the four-piece ceiling itself was two
+    numbers that had to be kept in step by hand. The counts are gone from both sides, which
+    removes the class rather than the instances — so the table is no longer a set of shapes near
+    a bound but the rules the two readers still share.
 
-    Asserted as an EQUIVALENCE over the shapes where the two could drift, rather than by
-    re-testing each bound — the bounds already have their own tests, and what was missing was
-    anything checking the two readers agree.
+    Asserted as an EQUIVALENCE, because what matters is that the two agree, not what either
+    decides: each rule already has its own test above.
 
-    Mutation check (run): strip instead of clean in the body (`[p.strip() for p in first]`) and
-    `repeated` goes red. Only that one — `whitespace-dupe` survives it, because two entries are
-    still under the ceiling however they are counted, so both readers accept it either way. It
-    stays in the table as a shape that COULD diverge if the ceiling ever moved to one, not as a
-    case carrying the mutant; claiming otherwise would be the kind of unearned coverage this
-    file's other docstrings are careful about."""
+    Mutation check (run), one per row: restore `len(first) > 4` to `_bad_slice` OR to
+    `_slice_argument` — either alone — and `all-of-it` goes red; drop the stray check from
+    `_bad_slice` and `stray-piece` goes red; have either reader take the raw argument lists
+    instead of cleaning them and `whitespace-across-the-lists` goes red, because the two then
+    disagree about whether a padded name is the same piece; drop the `not first` guard from the
+    body and `empty-first` goes red.
+
+    TWO THINGS THIS TABLE NO LONGER CLAIMS, because claiming them would be the unearned coverage
+    its other rows are chosen to avoid. Stripping WITHOUT de-duplicating survives every row now:
+    nothing turns on how many entries name one piece once neither reader counts, which is why the
+    two duplicate-shaped rows that used to sit here are deleted rather than kept as decoration.
+    And `empty-found` carries no single-line mutant either — it pins the two emptiness guards
+    jointly, against a reader that started drawing a proposal with nothing in it."""
     body_refused: bool
     try:
         await propose_first_slice(_ctx(), found, first, _WHY, _QUESTION)

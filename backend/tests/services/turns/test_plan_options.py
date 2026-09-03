@@ -6,7 +6,11 @@ member left for a resolution to be.
 U4's inertness guards live here too: the prose heuristic that used to infer a plan from the
 model's TEXT — counting list items, scanning for a trailing `?` — is gone, and so is the
 forced retry and the fabricated card it fed. Nothing anywhere issues a second model request,
-or invents a card, as a consequence of what the model wrote."""
+or invents a card, as a consequence of what the model wrote.
+
+The platform's own voice on this path lives here too: a turn that produced no words produces no
+assistant message at all, and the one sentence the platform still authors when an offer is
+refused rides a system row of its own rather than a `ModelResponse` in the model's name."""
 
 from __future__ import annotations
 
@@ -17,7 +21,6 @@ import json
 from typing import get_args
 
 import pytest
-import sqlalchemy as sa
 from pydantic import SecretStr
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models.function import (
@@ -31,16 +34,21 @@ from src.api.v1.conversations._shared import MAX_MESSAGE_TEXT_CHARS
 from src.api.v1.conversations.turns import ResolvePlanOptionsResponse
 from src.config import settings
 from src.db.models.conversation import ChatKind
-from src.db.models.message import Message, MessageEntryKind
+from src.db.models.message import MessageEntryKind
 from src.services.agent import toolsets as toolsets_module
 from src.services.agent.mode_prompts import PromptContext
 from src.services.build_sessions.manager import SessionManager
-from src.services.messages.projection import AssistantTextItem, PlanOptionsItem, project_rows
+from src.services.messages.projection import (
+    AssistantTextItem,
+    PlanOptionsItem,
+    StepItem,
+    project_rows,
+)
 from src.services.messages.store import load_history, load_rows
 from src.services.sandbox.config import SandboxConfig
 from src.services.turns import engine as engine_module
 from src.services.turns import plan_options as plan_options_module
-from src.services.turns.copy import NOTHING_TO_SHOW_YET_TEXT, PLAN_NOT_KEPT_TEXT
+from src.services.turns.copy import PLAN_NOT_KEPT_TEXT
 from src.services.turns.engine import TurnEngine, plan_from_call, set_turn_engine_for_tests
 from src.services.turns.guard import _mid_reply
 from src.services.turns.plan_options import (
@@ -57,6 +65,7 @@ from src.services.turns.plan_options import (
 )
 from tests.factories import ConversationFactory, UserFactory
 from tests.fakes import FakeSandboxClient
+from tests.transcript import rendered_text
 
 _CTX = PromptContext(user_name="Ada", project_name="Visitors", project_description=None)
 
@@ -395,7 +404,7 @@ async def test_a_run_cut_off_mid_argument_records_no_offer_and_no_partial_plan(
         await asyncio.wait_for(state.task, timeout=10)
 
     assert state.status == "stopped"
-    assert state.text_so_far() == ""  # no plan, partial or otherwise, reached the live feed
+    assert state.text_blocks() == []  # no plan, partial or otherwise, reached the live feed
     assert not [f for f in state.ring if f.type == "plan_options"]
 
     # WRITE-BEFORE-DONE: a run that never completed persists no TURN row — no offer, no
@@ -418,7 +427,11 @@ async def test_an_empty_plan_argument_records_no_offer_and_says_so_once(
 ) -> None:
     """Error path (U5/R28a). A whitespace-only argument is nothing to build from — the exact
     defect the retired heuristic used to manufacture, a Build-it button under a plan nobody
-    wrote. The call comes off what is persisted; one platform-authored line explains why."""
+    wrote. The call comes off what is persisted; one platform-authored line explains why.
+
+    THE LINE IS THE PLATFORM'S AND THE RECORD NOW SAYS SO. It reaches the citizen exactly as it
+    always did, and the second half of this test is about where it comes FROM — a system row of
+    the platform's own rather than a response written in the model's name."""
 
     async def _stream(messages, info: AgentInfo):
         yield _call_options(plan="   ")
@@ -435,12 +448,43 @@ async def test_an_empty_plan_argument_records_no_offer_and_says_so_once(
 
     assert state.status == "completed"
     assert await find_pending(db_session, user_id=user.id, conversation_id=conv.id) is None
-    assert state.text_so_far() == PLAN_NOT_KEPT_TEXT
+    # SAID ONCE, AND SAID ALONE. Compared as the whole block list rather than searched for: a
+    # substring check passes just as happily with the sentence repeated, or buried under prose
+    # the platform was never supposed to add beside it.
+    assert state.text_blocks() == [PLAN_NOT_KEPT_TEXT]
 
-    rows = await load_rows(db_session, user_id=user.id, conversation_id=conv.id)
+    rows = await load_rows(
+        db_session, user_id=user.id, conversation_id=conv.id, include_hidden=True
+    )
     items = project_rows(list(rows))
     assert [i.text for i in items if isinstance(i, AssistantTextItem)] == [PLAN_NOT_KEPT_TEXT]
     assert not [i for i in items if isinstance(i, PlanOptionsItem)]
+
+    # THE PROVENANCE IS THE CHANGE, so it is pinned as hard as the words are. The sentence
+    # explains a refusal the PLATFORM made, and it used to be appended to the run's own batch as
+    # a `ModelResponse` — stored, replayed and read back as something the model had written. It
+    # now rides one visible `SYSTEM_EVENT` row of its own, stamped with the platform-text kind
+    # and the turn it belongs to, and reaches the citizen through the projection's arm for a
+    # visible system row of an unknown kind. What they read is unchanged; the record has stopped
+    # attributing it to the model.
+    platform_rows = [
+        row
+        for row in rows
+        if isinstance(row.meta, dict) and row.meta.get("kind") == engine_module.PLATFORM_TEXT_KIND
+    ]
+    assert len(platform_rows) == 1
+    assert platform_rows[0].entry_kind is MessageEntryKind.SYSTEM_EVENT
+    assert platform_rows[0].meta == {
+        "kind": engine_module.PLATFORM_TEXT_KIND,
+        "turnId": str(state.turn_id),
+    }
+    # …AND NOWHERE ELSE. Exactly one row in the whole transcript carries the sentence, which is
+    # the assertion that goes red if it is ever written into the model's batch as well — a
+    # regression the rendered text above could not see, because the citizen would still read it
+    # once while the model's own history carried a reply it never made.
+    assert [row.id for row in rows if PLAN_NOT_KEPT_TEXT in str(row.payload)] == [
+        platform_rows[0].id
+    ]
     for row in rows:
         for message in row.payload:
             assert "present_plan_options" not in str(message.get("parts", []))
@@ -450,7 +494,8 @@ async def test_an_over_ceiling_plan_argument_records_no_offer_and_is_not_truncat
     _fresh_engine, db_session, session_factory
 ) -> None:
     """Error path (U5/R44). An argument past the stored-message ceiling is REFUSED, never
-    trimmed: a plan cut mid-sentence is one the citizen would agree to sight-unseen."""
+    trimmed: a plan cut mid-sentence is one the citizen would agree to sight-unseen. The
+    refusal is explained by the same platform-authored line, on the same platform-owned row."""
     huge_plan = "x" * (MAX_MESSAGE_TEXT_CHARS + 1)
 
     async def _stream(messages, info: AgentInfo):
@@ -468,13 +513,23 @@ async def test_an_over_ceiling_plan_argument_records_no_offer_and_is_not_truncat
 
     assert state.status == "completed"
     assert await find_pending(db_session, user_id=user.id, conversation_id=conv.id) is None
-    assert state.text_so_far() == PLAN_NOT_KEPT_TEXT  # refused outright, not trimmed to fit
+    assert state.text_blocks() == [PLAN_NOT_KEPT_TEXT]  # refused outright, not trimmed to fit
 
-    rows = await load_rows(db_session, user_id=user.id, conversation_id=conv.id)
+    rows = await load_rows(
+        db_session, user_id=user.id, conversation_id=conv.id, include_hidden=True
+    )
     for row in rows:
         assert huge_plan[:200] not in str(row.payload)  # no fragment of the refused plan survives
     items = project_rows(list(rows))
     assert [i.text for i in items if isinstance(i, AssistantTextItem)] == [PLAN_NOT_KEPT_TEXT]
+    # The same platform row as the empty-argument refusal, restated here rather than left to the
+    # sibling test: these two are the pair a reader compares, and a provenance assertion on only
+    # one of them reads as an accident of whichever test was written second.
+    assert [
+        row.entry_kind
+        for row in rows
+        if isinstance(row.meta, dict) and row.meta.get("kind") == engine_module.PLATFORM_TEXT_KIND
+    ] == [MessageEntryKind.SYSTEM_EVENT]
 
 
 # --- U4: the prose heuristic, the forced retry and the fabricated card are all gone -------
@@ -771,44 +826,45 @@ async def test_build_started_after_a_raced_refine_writes_no_second_wire_return(
     assert projected[0].state == "build"
 
 
-# --- U11 / R77: where the agent said nothing, the platform still speaks ---------------------
+# --- nothing is written in the model's name -------------------------------------------------
 #
-# WIDENING THE DROP CREATED THIS NEED, which is why the two ship together. Before U4 a planning
-# turn always had its prose; now a turn whose every response called a tool renders a row of
-# activity and not one word. R75 sanctions an agent CHOOSING to stay quiet — but at the
-# terminal those two states are indistinguishable, and telling them apart would mean reading
-# the agent's prose, which is the one thing nothing here does. So R77 wins outright.
+# WHAT USED TO BE HERE, AND WHY IT IS NOT. While prose written beside a tool call was dropped at
+# render time, a turn that explained itself between two calls could reach its end with a screen
+# of finished steps and not one word — so the platform wrote a closing sentence of its own into
+# the transcript, as a `ModelResponse`, in the model's name, to cover it. The drop is gone. A
+# wordless turn now means the agent chose not to speak, which is legitimate, and the sentence
+# that existed to paper over a case that no longer arises went with it.
+#
+# The one platform sentence still reachable on this path is the refused-offer line, and the two
+# refusal tests above pin where it now lives: its own visible `SYSTEM_EVENT` row, stamped with
+# the platform-text kind, never a response inside the run's own batch.
 
 
-async def test_a_turn_that_never_said_anything_still_ends_readable(
+async def test_a_turn_that_only_used_a_tool_leaves_no_words_behind(
     _fresh_engine, db_session, session_factory
 ) -> None:
-    """★ R77 — the failure mode is a screen of finished steps and no message.
+    """★ The turn that reads a file and then has nothing to say now says nothing.
 
-    The turn reads a file and then produces nothing a person can read. Without the fallback
-    the citizen is left looking at a COMPLETED turn that never spoke: not "the agent had
-    nothing to add", which is legitimate, but a product that appears to have forgotten to
-    answer.
+    THE SHAPE IS NARROWER THAN "EVERY RESPONSE CALLED A TOOL", and that is worth stating rather
+    than quietly writing a fixture that happens to pass. The literal shape cannot end a
+    pydantic-ai run at all: the loop stops only on a response with no tool call, and a response
+    with no usable output either is retried and then fails the turn — a different terminal with
+    its own message. What reaches this arm is a final response whose text is present but empty of
+    content, so that is the case under test.
 
-    THE SHAPE HERE IS NARROWER THAN THE PLAN ASSUMED, and it is worth saying why rather than
-    writing a fixture that passes. "Every response called a tool" cannot end a pydantic-ai run
-    at all — the loop only stops on a response with no tool call, and one with no usable text
-    either is retried and then fails the turn, which is a different terminal with its own
-    message. What reaches THIS arm is a final response whose text is there but empty of
-    content, which the flush correctly declines to push. That is the reachable case, so it is
-    the one under test.
+    LIVE AND ON RELOAD, because a sentence that appears on one path and not the other is the
+    failure this guards. The read step is asserted on both sides for the same reason: an absence
+    assertion that passes because the turn rendered nothing whatsoever would prove the opposite
+    of what it claims.
 
-    IT IS DURABLE TOO, not merely on the wire. A line the live feed shows and a reload removes
-    is worse than no line, so it travels the same write-before-done seam as every other reply
-    on this path.
-
-    Mutation check: delete the `if not state.text_parts` arm in the chat run and this goes red
-    on both assertions at once."""
+    Mutation check: restore the arm that pushed a platform-authored sentence whenever a turn
+    produced no prose, and this goes red twice over — on the live blocks and on the projected
+    items — while every other test in this file stays green."""
     engine, (user, conv) = _fresh_engine, await _plan_conversation(db_session)
 
     requests = 0
 
-    async def _all_tools_no_words(messages: list[ModelMessage], info: AgentInfo):
+    async def _reads_then_says_nothing(messages: list[ModelMessage], info: AgentInfo):
         nonlocal requests
         requests += 1
         if requests == 1:
@@ -824,33 +880,43 @@ async def test_a_turn_that_never_said_anything_still_ends_readable(
         engine,
         db_session,
         session_factory,
-        FunctionModel(stream_function=_all_tools_no_words),
+        FunctionModel(stream_function=_reads_then_says_nothing),
         user,
         conv,
     )
 
     assert state.status == "completed"
-    assert state.text_so_far() == NOTHING_TO_SHOW_YET_TEXT
-    rows = (
-        await db_session.scalars(
-            sa.select(Message)
-            .where(Message.conversation_id == conv.id, Message.entry_kind == MessageEntryKind.TURN)
-            .order_by(Message.seq)
-        )
-    ).all()
-    assert any(NOTHING_TO_SHOW_YET_TEXT in str(row.payload) for row in rows), (
-        "the closing line reached the screen but not the transcript"
+    # NOT ONE READABLE WORD. The model's closing response was whitespace, which the live path
+    # carries through as an empty block and the reload projection drops outright — so what the
+    # citizen is given is nothing, and nothing is what the platform adds to it.
+    assert rendered_text(state).strip() == ""
+
+    rows = await load_rows(
+        db_session, user_id=user.id, conversation_id=conv.id, include_hidden=True
     )
+    # No row anywhere claims to be the platform speaking on this turn's behalf.
+    assert not [
+        row
+        for row in rows
+        if isinstance(row.meta, dict) and row.meta.get("kind") == engine_module.PLATFORM_TEXT_KIND
+    ]
+    items = project_rows(list(rows))
+    assert not [i for i in items if isinstance(i, AssistantTextItem)]
+    # LIVENESS, on both paths. The turn is not empty — it did the work and shows the work — so
+    # the two absences above are about what was said, not about a transcript that never rendered.
+    assert [i.tool for i in items if isinstance(i, StepItem)] == ["read_file"]
+    assert "r1" in state.steps
 
 
-async def test_a_turn_that_answered_gains_no_extra_closing_line(
+async def test_a_plain_answer_turn_shows_the_answer_and_no_activity_at_all(
     _fresh_engine, db_session, session_factory
 ) -> None:
-    """The other half, and the one that keeps the fallback from becoming noise on every turn.
+    """The other half, and the one that keeps the platform quiet on an ordinary turn.
 
-    A response that calls no tool IS the answer; U4's flush releases it, `text_parts` is not
-    empty, and the platform stays quiet. Without this, every ordinary turn would end with a
-    line telling the citizen there was nothing to show underneath the thing they were shown."""
+    A response that calls no tool IS the answer. Nothing is appended underneath it — a closing
+    line telling the citizen there was nothing to show, sitting beneath the thing they were just
+    shown, is the noise this unit removes — and nothing is manufactured beside it either: a turn
+    that needed no tools has no activity to display, so `steps` stays empty."""
     engine, (user, conv) = _fresh_engine, await _plan_conversation(db_session)
 
     async def _just_answers(messages: list[ModelMessage], info: AgentInfo):
@@ -865,25 +931,28 @@ async def test_a_turn_that_answered_gains_no_extra_closing_line(
         conv,
     )
 
-    assert "arrival times" in state.text_so_far()
-    assert NOTHING_TO_SHOW_YET_TEXT not in state.text_so_far()
+    assert state.text_blocks() == ["Your visitor list already records arrival times."]
+    assert state.steps == {}
 
 
-async def test_a_turn_whose_only_words_were_spoken_mid_work_needs_no_closing_line(
+async def test_the_words_spoken_mid_work_are_the_whole_of_what_the_turn_says(
     _fresh_engine, db_session, session_factory
 ) -> None:
-    """★ THE INTERACTION BETWEEN THE TWO UNITS, and the reason the test is on `text_parts`
-    rather than on "did the model write a final message".
+    """★ The turn that spoke through the voice channel and then closed on nothing.
 
-    This turn calls tools all the way through and writes no closing prose — but it SPOKE, so
-    the citizen has something to read and the platform must not add a second, contradictory
-    line saying there was nothing to show."""
+    The citizen has something to read, so the platform must not follow it with a second sentence
+    of its own — least of all one saying there was nothing to show, underneath a line the agent
+    had just written.
+
+    FILTERED ON `strip()` BECAUSE THE CLOSING RESPONSE IS WHITESPACE: an empty block live, and
+    dropped entirely by the reload projection. What is pinned here is that no READABLE block
+    joins the spoken one, which is the claim that would break if the platform started writing."""
     engine, (user, conv) = _fresh_engine, await _plan_conversation(db_session)
     spoken = "Looking at how your visitor list works today."
 
     requests = 0
 
-    async def _speaks_then_reads(messages: list[ModelMessage], info: AgentInfo):
+    async def _speaks_then_says_nothing(messages: list[ModelMessage], info: AgentInfo):
         nonlocal requests
         requests += 1
         if requests == 1:
@@ -901,25 +970,26 @@ async def test_a_turn_whose_only_words_were_spoken_mid_work_needs_no_closing_lin
         engine,
         db_session,
         session_factory,
-        FunctionModel(stream_function=_speaks_then_reads),
+        FunctionModel(stream_function=_speaks_then_says_nothing),
         user,
         conv,
     )
 
-    assert spoken in state.text_so_far()
-    assert NOTHING_TO_SHOW_YET_TEXT not in state.text_so_far()
+    assert [block for block in state.text_blocks() if block.strip()] == [spoken]
 
 
-async def test_a_planning_answer_survives_the_widened_drop(
+async def test_prose_written_after_a_tool_call_is_the_whole_of_the_answer(
     _fresh_engine, db_session, session_factory
 ) -> None:
-    """★ U4's flush, at the seam that needed it. `chat_agent.run` has no node boundary, so
-    without the flush added at run completion a planning turn's held answer would never be
-    released and every ordinary question would end in the R77 fallback instead of an answer.
+    """★ The turn the drop used to break, and the one the platform must not talk over.
 
-    Mutation check: remove `self._flush_pending_text(state)` after the run and this goes red
-    with the closing line in place of the answer — which is exactly how the bug would present
-    in production, and why it is worth a test that names it."""
+    The agent reads a file and then answers. The answer reaches the citizen — prose written in
+    the same response as a tool call is no longer withheld and deleted — and it is the WHOLE of
+    what the turn says: no second block from the platform closing a turn that already had an
+    answer in it.
+
+    Mutation check: append any platform-authored sentence at the end of a chat run and this goes
+    red on the block list, where a substring check would still find the answer inside it."""
     engine, (user, conv) = _fresh_engine, await _plan_conversation(db_session)
 
     async def _reads_then_answers(messages: list[ModelMessage], info: AgentInfo):
@@ -941,4 +1011,5 @@ async def test_a_planning_answer_survives_the_widened_drop(
         conv,
     )
 
-    assert state.text_so_far() == "Your visitor list shows who arrived and when."
+    assert state.text_blocks() == ["Your visitor list shows who arrived and when."]
+    assert "r1" in state.steps  # liveness: the read happened, and the answer came after it

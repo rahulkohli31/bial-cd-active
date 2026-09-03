@@ -43,6 +43,7 @@ from src.services.turns.engine import (
 )
 from tests.api.v1.conversations.conftest import _headers
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
+from tests.transcript import rendered_text
 
 # The turn-driving fixtures live in `conftest.py` — four files needed the same four, and
 # two of them were the 3rd and 4th copy. Named here rather than autouse there, because the
@@ -119,7 +120,18 @@ async def test_post_202_then_stream_replays_full_turn(
     assert frames[0].type == "snapshot"
     assert frames[0].turn_id == turn_id
     assert frames[0].turn_status == "completed"
-    assert frames[0].text_so_far == "hello world"
+    # THE SNAPSHOT'S ORDERED PARTS, asserted as a LIST because the order is the whole point.
+    # Prose is all this turn produced: the opening acknowledgement is retracted by the FIRST
+    # WORDS on screen (`_push_text`), so a settled prose-only turn carries no step at all — see
+    # `test_a_turn_that_only_writes_prose_retracts_the_acknowledgement_too`. Both deltas belong
+    # to one text part, so they are ONE block rather than two paragraphs: `new_block` is what
+    # draws that line, not the number of deltas.
+    assert [part.type for part in frames[0].parts] == ["text"]
+    assert not any(
+        part.type == "step" and part.tool_call_id == engine_module.ACK_TOOL_CALL_ID
+        for part in frames[0].parts
+    )
+    assert [part.text for part in frames[0].parts if part.type == "text"] == ["hello world"]
     # The persisted user turn rides the snapshot's projected items.
     assert any(item.type == "user_text" and item.text == "hello" for item in frames[0].items)
 
@@ -141,9 +153,7 @@ async def test_mid_turn_subscribe_gets_snapshot_then_tail(
 
     state = _fresh_engine.peek(conv.id)
     assert state is not None
-    while not (
-        state.text_parts or state.pending_text
-    ):  # the first delta is out — we are genuinely mid-turn
+    while not state.text_blocks():  # the first block is out — we are genuinely mid-turn
         await asyncio.sleep(0.01)
 
     # httpx's ASGITransport buffers a streaming response until the app completes, so the
@@ -161,16 +171,27 @@ async def test_mid_turn_subscribe_gets_snapshot_then_tail(
     frames = _frames_of(events.text)
     assert frames[0].type == "snapshot"
     assert frames[0].turn_status == "running"  # built BEFORE the release: genuinely mid-turn
-    # THE SNAPSHOT'S TEXT IS EMPTY MID-RESPONSE, and that is U4's stated cost rather than a
-    # defect. Prose is held until its response ends and proves it called no tool, so a client
-    # that reconnects mid-answer sees the steps and no partial text. The snapshot is still
-    # doing its job — it reports the turn is RUNNING, which is what stops the client showing
-    # a finished-looking transcript — and the answer arrives whole the moment it is released.
-    assert frames[0].text_so_far == ""
+    # THE SNAPSHOT CARRIES THE PROSE ALREADY WRITTEN, at the position it was written in. It
+    # used to be empty here by design: prose was held until its response ended and proved it had
+    # called no tool, so a citizen who reconnected mid-answer read the steps and none of the
+    # words. Nothing is held any more — a block is on the wire and in the turn's ordered parts
+    # the moment it is written — so a reattaching reader picks the answer up where it really is.
+    # PROSE ALONE: the opening acknowledgement is retracted by the first words on screen, so a
+    # reader who reattaches mid-answer is handed the answer and nothing else.
+    assert [part.type for part in frames[0].parts] == ["text"]
+    snapshot_text = [part.text for part in frames[0].parts if part.type == "text"]
+    assert snapshot_text == ["first "]
+    # …AND THE TAIL CONTINUES THAT BLOCK RATHER THAN OPENING A SECOND ONE. `new_block` is the
+    # only thing that tells a client where one paragraph ends and the next begins, so a `True`
+    # here would break one sentence in half on the reconnecting reader's screen and nowhere
+    # else — the two-renderers-disagreeing defect, arriving through the reconnect instead.
+    tail = [f for f in frames if f.type == "text_delta"]
+    assert [f.new_block for f in tail] == [False]
     # Snapshot + tail still converge on the whole answer, which is the property that actually
     # matters to a reconnecting reader: nothing is lost and nothing is doubled.
-    deltas = "".join(f.text for f in frames if f.type == "text_delta")
-    assert frames[0].text_so_far + deltas == "first second"
+    deltas = "".join(f.text for f in tail)
+    assert deltas == "second"
+    assert "".join(snapshot_text) + deltas == "first second"
     assert frames[-1].type == "turn_ended" and frames[-1].status == "completed"
     assert events.text.endswith("data: [DONE]\n\n")
 
@@ -181,6 +202,116 @@ async def test_mid_turn_subscribe_gets_snapshot_then_tail(
     # collector against an event loop pytest has already closed, which surfaces as an error at
     # teardown rather than as a failure here.
     await _settle(_fresh_engine, conv.id)
+
+
+async def test_a_turn_that_writes_acts_and_writes_again_reads_the_same_live_and_caught_up(
+    client, db_session, set_chat_model, _fresh_engine
+) -> None:
+    """★ THE HEADLINE PROPERTY, END TO END, ON THE WIRE.
+
+    Prose written in the same response as a tool call used to be held and then deleted the
+    moment the call arrived, on the rule that text beside a tool call is the model narrating
+    its way there. A turn could therefore only ever end in ONE block of text, always last —
+    which is the only reason the live feed (every step, then one concatenated block) and a
+    reloaded transcript (one item per stored part, interleaved) ever agreed. This turn writes,
+    reads a file, and writes again, so the two would disagree on it if either half of the
+    change were missing.
+
+    BOTH PATHS, COMPARED AS SEQUENCES. The tail is reassembled the way the browser draws it —
+    a delta either opens a block or extends the one before it, and a step takes its place once
+    when it starts, its resolved twin replacing it rather than moving it — and set against the
+    ordered parts the catch-up snapshot hands a citizen who reloaded. Compared as LISTS: a
+    joined string would pass whether or not the two agreed about where the step sits, and where
+    it sits is the entire question."""
+    from pydantic_ai.models.function import DeltaToolCall, DeltaToolCalls
+
+    gate = asyncio.Event()
+    at_the_door = asyncio.Event()
+
+    async def _writes_acts_writes(messages: list[ModelMessage], info: AgentInfo):
+        if len(messages) == 1:
+            # HELD AT THE DOOR so the subscription below is open for the whole turn: its
+            # snapshot must carry nothing but the acknowledgement, or the tail is not the whole
+            # record and the comparison at the end proves less than it claims to.
+            at_the_door.set()
+            await gate.wait()
+            yield "Let me see what is on the page. "
+            yield DeltaToolCalls(
+                {
+                    0: DeltaToolCall(
+                        name="read_file",
+                        json_args=json.dumps({"path": "app/page.tsx"}),
+                        tool_call_id="look-1",
+                    )
+                }
+            )
+        else:
+            yield "That is the starter template, untouched."
+
+    user, conv = await _auth_with_conversation(db_session)
+    set_chat_model(FunctionModel(stream_function=_writes_acts_writes))
+    headers = _headers(user)
+    assert (await _post_turn(client, headers, conv)).status_code == 202
+
+    state = _fresh_engine.peek(conv.id)
+    assert state is not None
+    # WAIT UNTIL THE MODEL IS ACTUALLY AT THE DOOR before opening the subscription. The app and
+    # the fixtures share ONE session here, and the turn task holds it while it writes the user's
+    # message row; a GET issued before that finishes waits on the same session, while the turn
+    # waits on a gate this test only opens once the GET has subscribed — a circular wait that
+    # hangs the suite rather than failing it. Once the stream function has been entered that
+    # write is done and the session is free, which is the state the comment below assumes.
+    await asyncio.wait_for(at_the_door.wait(), timeout=10)
+    # httpx's ASGITransport buffers a streaming response until the app completes, so the GET
+    # rides a concurrent task: it subscribes while the model is still at the gate, then the
+    # gate releases and the buffered result carries the snapshot plus the whole tail.
+    reader = asyncio.create_task(
+        client.get(f"/v1/conversations/{conv.id}/events", headers=headers)
+    )
+    while not state.subscribers:  # the route registered its queue — subscription is live
+        await asyncio.sleep(0.01)
+    gate.set()
+    events = await asyncio.wait_for(reader, timeout=10)
+    await _settle(_fresh_engine, conv.id)
+
+    frames = _frames_of(events.text)
+    assert frames[0].type == "snapshot" and frames[0].turn_status == "running"
+    # Nothing but the acknowledgement had happened when the subscription opened, so everything
+    # this turn produced is in the tail rather than split across the snapshot and the tail.
+    assert [part.type for part in frames[0].parts] == ["step"]
+    assert frames[0].parts[0].tool_call_id == engine_module.ACK_TOOL_CALL_ID
+
+    live: list[tuple[str, str]] = []
+    for frame in frames[1:]:
+        if frame.type == "text_delta":
+            if frame.new_block or not live or live[-1][0] != "text":
+                live.append(("text", frame.text))
+            else:
+                live[-1] = ("text", live[-1][1] + frame.text)
+        elif frame.type == "step" and frame.phase == "started":
+            live.append(("step", frame.tool_call_id))
+    # Liveness: the stream really carried this turn to its end, so the sequence compared below
+    # is a whole turn and not a truncated read that happens to match another truncated read.
+    assert frames[-1].type == "turn_ended" and frames[-1].status == "completed"
+
+    # THE CITIZEN WHO RELOADED: the same turn, rebuilt from its catch-up snapshot alone.
+    replay = await client.get(f"/v1/conversations/{conv.id}/events", headers=headers)
+    snapshot = _frames_of(replay.text)[0]
+    assert snapshot.type == "snapshot" and snapshot.turn_status == "completed"
+    caught_up = [
+        ("text", part.text) if part.type == "text" else ("step", part.tool_call_id)
+        for part in snapshot.parts
+    ]
+
+    # Steps are compared by `tool_call_id` — the key both shapes carry and the one the browser
+    # replaces a pending card on — rather than by label, which is the renderer's business and
+    # would make this a test of the label translator instead of a test of the order.
+    assert live == caught_up
+    assert [kind for kind, _ in live] == ["text", "step", "text"]
+    assert [body for kind, body in live if kind == "text"] == [
+        "Let me see what is on the page. ",
+        "That is the starter template, untouched.",
+    ]
 
 
 async def test_the_acknowledgement_actually_reaches_a_subscriber(
@@ -203,8 +334,10 @@ async def test_the_acknowledgement_actually_reaches_a_subscriber(
     asserts the acknowledgement is in the DELIVERED frames. Assert against the wire, not the ring:
     that distinction is the entire defect."""
     gate = asyncio.Event()
+    at_the_door = asyncio.Event()
 
     async def _paced(messages: list[ModelMessage], info: AgentInfo):
+        at_the_door.set()
         await gate.wait()
         yield "done"
 
@@ -216,6 +349,9 @@ async def test_the_acknowledgement_actually_reaches_a_subscriber(
     state = _fresh_engine.peek(conv.id)
     assert state is not None
 
+    # The turn task must be AT THE DOOR before the subscription opens — see the test above for
+    # why a GET issued while the turn still holds the shared session hangs instead of failing.
+    await asyncio.wait_for(at_the_door.wait(), timeout=10)
     reader = asyncio.create_task(
         client.get(f"/v1/conversations/{conv.id}/events", headers=_headers(user))
     )
@@ -259,6 +395,14 @@ async def test_second_post_while_running_is_409(
     set_chat_model(FunctionModel(stream_function=_stall))
     headers = _headers(user)
     assert (await _post_turn(client, headers, conv)).status_code == 202
+    # LET THE TURN REACH THE MODEL before posting again, the way the two tests below do. The app
+    # and the fixtures share ONE session here, so a second request issued while the turn task is
+    # still mid-flush lands on a session in `prepared` state and the test fails on plumbing
+    # rather than on the 409 it is about. The first delta is proof the flush is behind us.
+    state = _fresh_engine.peek(conv.id)
+    assert state is not None
+    while not state.text_blocks():
+        await asyncio.sleep(0.01)
     second = await _post_turn(client, headers, conv, text="again")
     assert second.status_code == 409
     gate.set()
@@ -282,13 +426,17 @@ async def test_stop_endpoint_cancels_and_record_stays_truthful(
 
     state = _fresh_engine.peek(conv.id)
     assert state is not None
-    while not (state.text_parts or state.pending_text):
+    while not state.text_blocks():
         await asyncio.sleep(0.01)
 
     stop = await client.post(f"/v1/conversations/{conv.id}/turns/{turn_id}/stop", headers=headers)
     assert stop.status_code == 200 and stop.json()["status"] == "stopping"
     await _settle(_fresh_engine, conv.id)
     assert state.status == "stopped"
+    # AND THE HALF-SENTENCE THEY ALREADY READ IS STILL THEIRS. `partial ` was on the citizen's
+    # screen before they pressed stop, and a stop that swept it back out of the turn's parts
+    # would leave the record disagreeing with what they saw — the opposite of truthful.
+    assert state.text_blocks() == ["partial "]
 
     again = await client.post(f"/v1/conversations/{conv.id}/turns/{turn_id}/stop", headers=headers)
     assert again.status_code == 200 and again.json()["status"] == "already_settled"
@@ -332,13 +480,14 @@ async def test_model_failure_travels_in_band(
     assert state.error_message == _TURN_FAILED_MESSAGE
     error_frames = [f for f in state.ring if f.type == "error"]
     assert [f.message for f in error_frames] == [_TURN_FAILED_MESSAGE]
-    # AND THE MODEL'S HALF-SENTENCE DOES NOT LEAK. `before ` was streamed and then the run
-    # died. Under the widened hold (U4/R74) prose is buffered until its response completes, and
-    # a response that never completes never flushes — so a citizen reading a failed turn gets
-    # one platform sentence rather than an abandoned fragment trailing off mid-thought.
+    # AND THE MODEL'S HALF-SENTENCE IS KEPT, WHICH IS THE CHANGE. `before ` was streamed and
+    # then the run died. It was on the citizen's screen the instant it was written and there is
+    # no buffer left to withdraw it from, so the record says what they actually read: the one
+    # fragment the model managed, with the platform's sentence delivered BESIDE it on the error
+    # frame rather than mixed into the model's own prose.
+    assert state.text_blocks() == ["before "]
     assert "before" not in (state.error_message or "")
-    assert "before" not in state.text_so_far()
-    assert "upstream fell over" not in state.text_so_far()  # nor the raw exception text
+    assert "upstream fell over" not in rendered_text(state)  # nor the raw exception text
 
 
 # --- ownership + gating -------------------------------------------------------------------
@@ -741,7 +890,7 @@ async def test_reconnect_with_cursor_resumes_tail_only_without_duplicating_text(
 
     state = _fresh_engine.peek(conv.id)
     assert state is not None
-    while not (state.text_parts or state.pending_text):
+    while not state.text_blocks():
         await asyncio.sleep(0.01)
     cursor = state.seq  # everything up to here is already in hand
 
@@ -758,15 +907,15 @@ async def test_reconnect_with_cursor_resumes_tail_only_without_duplicating_text(
     frames = _frames_of(events.text)
     assert frames, "the resume delivered nothing"
     assert frames[0].type != "snapshot"  # tail-only: continuity was provable
-    # NOTHING AT OR BEFORE THE CURSOR IS RE-SENT — the property this test is actually about,
-    # asserted on the sequence numbers rather than on the words. It used to be asserted by
-    # showing that "alpha" was absent, which only worked while the two deltas reached the wire
-    # separately: prose is held now (U4), so the whole answer arrives as one block AFTER the
-    # cursor. That block is legitimately in the tail, and "alpha not in replayed" would now be
-    # asserting that the resume lost half the answer.
+    # NOTHING AT OR BEFORE THE CURSOR IS RE-SENT, and the words can say so again now that
+    # nothing is held: `alpha ` reached the wire as its own frame the moment it was written, so
+    # it is genuinely behind the cursor and a resume that repeated it would double half the
+    # answer on screen. Asserted on the sequence numbers AND on the text, because each covers
+    # the other's blind spot — a resume that delivered nothing at all passes the seq check
+    # alone, and the words are what prove the rest of the answer did arrive.
     assert all(frame.seq > cursor for frame in frames)
     replayed = "".join(f.text for f in frames if f.type == "text_delta")
-    assert replayed == "alpha omega"
+    assert replayed == "omega"
     assert frames[-1].type == "turn_ended"
 
     # SETTLE THE TASK, not just the stream. `turn_ended` is delivered from inside the run, and
@@ -796,7 +945,7 @@ async def test_active_turn_in_conversation_read_while_running(
     turn_id = (await _post_turn(client, headers, conv)).json()["turnId"]
     state = _fresh_engine.peek(conv.id)
     assert state is not None
-    while not (state.text_parts or state.pending_text):
+    while not state.text_blocks():
         await asyncio.sleep(0.01)
 
     detail = (await client.get(f"/v1/conversations/{conv.id}", headers=headers)).json()
@@ -1402,6 +1551,145 @@ async def test_a_create_block_on_a_conversation_that_already_exists_is_ignored(
     # chat's kind is fixed at creation and there is no route that changes it.
     assert row.kind is ChatKind.BUILD
     assert await _conversation_count(db_session, user_id) == before
+
+
+@pytest.mark.route_rollback
+async def test_a_first_message_that_loses_the_insert_race_joins_the_winners_chat(
+    client, db_session, set_chat_model, fake_redis, fake_storage, _fresh_engine, monkeypatch
+) -> None:
+    """★ U7 — THE GENUINE RACE, AND THE ONLY ARM OF THIS ROUTE THAT RUNS AFTER SOMETHING BROKE.
+
+    THE ORDINARY DOUBLE SEND NEVER GETS HERE. It is answered by the owner-scoped read at the top
+    of the route — one SELECT rather than a failed INSERT — and the test above pins that fast
+    path. What lands here is two first messages on the same client-minted id genuinely in flight
+    at once: a duplicated tab on a fresh chat, or a client that re-posted, where BOTH found
+    nothing at that read and one of them loses the insert. Without the arm the loser got a bare
+    500 — the citizen was told their message had failed and watched it vanish from the screen
+    while the reply it started was, in fact, running in the chat the winner had just created.
+
+    DRIVEN BY BLINDING THE IDEMPOTENCY READ, because a unit suite cannot put two sessions in
+    flight at once. The row is already there and `_conversation_or_none` answers `None` exactly
+    once, so the route takes the create branch it would have taken in the real race, the flush
+    lands on the primary key, and the arm runs against a winner that genuinely exists. THE
+    SECOND CALL IS THE ARM'S OWN RE-READ, which is why the count below is a liveness assertion
+    and not bookkeeping: a blind that failed to take effect would leave this test passing on the
+    ordinary fast path, proving nothing about the branch it claims to cover.
+
+    IT IS REACHABLE AT ALL BECAUSE OF `@pytest.mark.route_rollback`, which makes `db_session`
+    join the fixtures' transaction by SAVEPOINT (tests/conftest.py). Without it the route's
+    `db.rollback()` unwinds the one transaction the fixtures and the app share, so the next
+    statement dies before any assertion can run — which is why this arm and its sibling in
+    `transition.py` both shipped with no coverage of the branch that only runs when something
+    has already gone wrong. With it the rollback unwinds the route's own savepoint and nothing
+    else. The marker is per-test on purpose: a savepoint-joined session provisions its
+    connection lazily, and every test whose detached task shares that session breaks under it.
+
+    AND THAT IS ALSO WHAT MAKES THE FIXTURE LIE, so the expiry is put back by hand below. A
+    savepoint rollback expires only what changed inside the savepoint; the real one expires the
+    WHOLE identity map, so in production every instance this request had already loaded — the
+    `user` and the `project` the prompt context is built from — comes back from `db.rollback()`
+    needing a lazy SELECT, which an async session cannot perform inline and answers with
+    `MissingGreenlet`. That is a 500 on the one path written to prevent a 500. `expire_all()`
+    on the way out of the rollback reproduces it exactly, and it is what makes the route's two
+    `db.refresh` calls mutation-detectable: delete either one and this test goes red.
+    """
+    from src.api.v1.conversations import turns as turns_module
+    from src.db.models.message import Message
+    from src.services.messages.projection import UserTextItem, project_rows
+    from src.services.messages.store import load_rows
+
+    set_chat_model(_streaming_text("picking up where the winner left off"))
+    user = await UserFactory.create(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    # THE WINNER, created the way the racing request would have created it — and deliberately
+    # given a kind and a title the loser's `create` block disagrees with, so the assertions at
+    # the end can tell "continued on the winner's row" from "quietly used the staged object".
+    winner = await ConversationFactory.create(
+        db_session,
+        user.id,
+        project_id=project.id,
+        kind=ChatKind.PLAN,
+        title="the winner's title",
+    )
+    # COMMIT, so the savepoint holding this setup is released before the request opens its own.
+    # The route's rollback can then reach only what the route itself wrote.
+    await db_session.commit()
+    user_id, project_id, chat_id = user.id, project.id, winner.id
+    headers = _headers(user)
+    before = await _conversation_count(db_session, user_id)
+
+    # THE PRODUCTION ROLLBACK, not the fixture's. See the docstring: the joined session turns the
+    # route's rollback into a savepoint rollback, which leaves the identity map loaded. Expiring
+    # it here restores the state the real one leaves behind, at the exact moment it leaves it.
+    real_rollback = db_session.rollback
+
+    async def _rollback_like_production() -> None:
+        # THE ONE THING A SAVEPOINT ROLLBACK DOES NOT DO. A savepoint rollback expires only what
+        # changed inside the savepoint; the real one expires the WHOLE identity map, so every
+        # instance the request had already loaded comes back needing a lazy SELECT. That is what
+        # makes the route's two `db.refresh` calls load-bearing, and deleting either of them
+        # turns this test red on `MissingGreenlet` — which is the 500 it is here to prevent.
+        await real_rollback()
+        db_session.expire_all()
+
+    monkeypatch.setattr(db_session, "rollback", _rollback_like_production)
+
+    real_read = turns_module._conversation_or_none
+    reads = {"n": 0}
+
+    async def _blind_the_first_read(db, uid, cid):
+        """`None` once — the answer the losing request really got — then the truth."""
+        reads["n"] += 1
+        if reads["n"] == 1:
+            return None
+        return await real_read(db, uid, cid)
+
+    monkeypatch.setattr(turns_module, "_conversation_or_none", _blind_the_first_read)
+
+    resp = await _post_first_message(client, headers, chat_id, project_id, kind="build")
+
+    # A SUCCESS, NOT A SERVER ERROR: the loser's message is accepted and its turn is real.
+    assert resp.status_code == 202, resp.text
+    turn_id = resp.json()["turnId"]
+    # LIVENESS: the create branch was genuinely taken and the flush genuinely collided. Only the
+    # `except IntegrityError` arm reads the conversation a second time, so a test that reached
+    # here with one read would be pinning the fast path under this test's name.
+    assert reads["n"] == 2, "the create branch was never taken — the blind did not take effect"
+    await _settle(_fresh_engine, chat_id)
+
+    # …AND THE TURN IS THE WINNER'S CHAT'S TURN, not a turn on a row that does not exist.
+    state = _fresh_engine.peek(chat_id)
+    assert state is not None
+    assert str(state.turn_id) == turn_id
+    assert state.conversation_id == chat_id
+
+    # EXACTLY ONE ROW. The failed insert left nothing behind, and the list is no longer than the
+    # winner already made it — a second row under this id is the outcome the arm exists to
+    # prevent, and the database's primary key is the only thing that ever said so.
+    with_that_id = await db_session.scalar(
+        sa.select(sa.func.count()).select_from(Conversation).where(Conversation.id == chat_id)
+    )
+    assert int(with_that_id or 0) == 1
+    assert await _conversation_count(db_session, user_id) == before
+
+    # THE WINNER'S ROW IS UNTOUCHED. The loser's `create` block said `build`; the row it joined
+    # is the Plan chat the winner made, with the winner's title. A chat's kind is fixed at
+    # creation, and losing a race is not a route that changes it.
+    row = await db_session.scalar(sa.select(Conversation).where(Conversation.id == chat_id))
+    assert row is not None
+    assert row.kind is ChatKind.PLAN
+    assert row.title == "the winner's title"
+
+    # AND THE MESSAGE THE CITIZEN TYPED IS IN THAT CHAT. This is the half the 500 destroyed:
+    # the conflict was never the citizen's problem, losing their sentence was.
+    stored = await db_session.scalar(
+        sa.select(sa.func.count()).select_from(Message).where(Message.conversation_id == chat_id)
+    )
+    assert int(stored or 0) >= 1
+    items = project_rows(
+        list(await load_rows(db_session, user_id=user_id, conversation_id=chat_id))
+    )
+    assert [item.text for item in items if isinstance(item, UserTextItem)] == ["a visitor log"]
 
 
 async def test_an_unknown_conversation_with_no_parentage_is_still_a_404(

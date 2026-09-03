@@ -26,10 +26,10 @@ from pydantic_ai.messages import (
 from src.services.usage.context_window import (
     CHARS_PER_TOKEN,
     NOMINAL_BINARY_TOKENS,
-    SYSTEM_PROMPT_RESERVE,
     occupied_window,
 )
 from src.services.usage.gate import weighted_spend
+from src.services.usage.limits import SYSTEM_PROMPT_RESERVE
 
 
 def _user(text: str) -> ModelRequest:

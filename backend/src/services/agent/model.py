@@ -15,8 +15,7 @@ sidesteps it initially.
 
 from __future__ import annotations
 
-import httpx
-from anthropic import AsyncAnthropicFoundry
+from anthropic import AsyncAnthropicFoundry, Timeout
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.providers.anthropic import AnthropicProvider
 
@@ -58,7 +57,12 @@ def build_foundry_client(config: FoundryConfig) -> AsyncAnthropicFoundry:
     build harness's streaming turns (see `FoundryConfig` for the read-vs-connect rationale). A
     `read` timeout is httpx's per-CHUNK idle timeout on a streamed response, so it bounds the
     gap between model chunks, not the whole turn; `write`/`pool` inherit the `read` default."""
-    timeout = httpx.Timeout(config.read_timeout_s, connect=config.connect_timeout_s)
+    # THE SDK'S OWN `Timeout`, NOT `httpx.Timeout`. The Anthropic client moved onto a vendored
+    # httpx fork (`httpx2`) in 1.x, so the two `Timeout` classes are no longer the same type and
+    # the plain httpx one stopped being accepted. Taking it from the SDK's public re-export
+    # means we follow whichever httpx it vendors next, instead of pinning ourselves to a private
+    # module path that is free to move again.
+    timeout = Timeout(config.read_timeout_s, connect=config.connect_timeout_s)
     if config.auth_mode == "api_key":
         if config.api_key is None:
             # The config validator already enforces this pairing; narrow + fail closed.

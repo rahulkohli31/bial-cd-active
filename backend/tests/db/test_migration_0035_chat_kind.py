@@ -96,10 +96,12 @@ async def test_no_column_called_mode_survives_on_either_table(db_session, table:
 
 
 def test_the_schema_version_was_bumped_with_the_revision() -> None:
-    """Not housekeeping: the backfill rewrote every historical row's kind stamp to `build`, and
-    the projection's narration drop reads that stamp. `schema_version` is what tells a rewritten
-    row from a natively-written one, so without this bump a migrated Plan turn's prose would
-    stop rendering on reload. See `tests/services/messages/test_projection.py`."""
+    """The bump was spent on the gate that told a rewritten row from a natively-written one:
+    the backfill rewrote every historical row's kind stamp to `build`, and the projection's
+    narration drop keyed on that stamp. The drop and its gate are both gone now — prose is no
+    longer held or dropped — so nothing reads the version for RENDERING. It stays at 2 because
+    rows on disk carry the 2, and lowering it would make `load_history`'s newer-than-me refusal
+    fire on payloads this server wrote itself."""
     assert SCHEMA_VERSION == 2
 
 

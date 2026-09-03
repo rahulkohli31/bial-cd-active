@@ -207,10 +207,17 @@ export function messagesFromProjection(
       }
     } else if (item.type === 'step') {
       // A stored friendly agent step (U6/U15) — the reload half of the build narrative.
-      // Hidden steps (reads) stay out of the transcript, same rule as the live feed —
-      // checked on the RAW item.hidden, unchanged, since that's a structural filter
-      // (reload drops hidden steps before they become a message at all; live forwards
-      // them and the surface filters them out of the parts it paints) this fix doesn't touch.
+      // Hidden steps stay out of the transcript, same rule as the live feed — checked on the
+      // RAW item.hidden, which is a structural filter (reload drops hidden steps before they
+      // become a message at all; live forwards them and the surface filters them out of the
+      // parts it paints).
+      //
+      // WHAT `hidden` MEANS IS NARROWER THAN IT WAS. It used to mark reads as well, which is
+      // why a build's activity opened on a write with no account of what the agent had looked
+      // at to get there. Reads are drawn now; the flag is down to plumbing — a write to a
+      // configuration file, a housekeeping shell command — and never covers a step that
+      // FAILED, whatever class it belongs to. The server decides all of that; this filter is
+      // unchanged and deliberately holds no opinion of its own.
       if (!item.hidden) {
         // Narrowed via toStepItem — the same function the live path uses — rather than a
         // raw cast. Only returns null if the value isn't a record at all, which can't

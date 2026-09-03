@@ -34,6 +34,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic_ai import BinaryContent
 from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
 from pydantic_ai.models import Model
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.api.deps import CurrentUser, DbSession
@@ -473,9 +474,6 @@ async def start_turn(
     # together with the first message, so a failure between the two leaves neither — and every
     # refusal below it still rolls the row back through `get_db`. Committing here would restore the
     # exact orphan this reorder exists to remove, one line lower down.
-    #
-    # The refresh is not optional: server-default timestamps on a fresh row raise `MissingGreenlet`
-    # when projected without one.
     if staged is not None:
         conversation = Conversation(
             id=conversation_id,
@@ -486,9 +484,48 @@ async def start_turn(
             context=staged.context,
         )
         db.add(conversation)
-        await db.flush()
-        await db.refresh(conversation)
-    if conversation is None:  # unreachable: one of the two arms above always binds it
+        try:
+            await db.flush()
+        except IntegrityError:
+            # THE RACE BACKSTOP, transcribed from `transition.build_it` — the sibling route that
+            # creates a conversation the same way and has had this arm all along.
+            #
+            # THE ORDINARY DOUBLE SEND NEVER REACHES HERE: it was answered by the owner-scoped
+            # read at the top of this route, which is one SELECT rather than a failed INSERT.
+            # What lands here is two first messages on the same minted id genuinely in flight at
+            # once — a duplicated tab on a fresh chat, or a client that re-posted — where both
+            # found nothing up there and one of them loses this insert. Without the arm that
+            # loser got a bare 500: the citizen was told their message failed and watched it
+            # vanish from the screen while the reply it started was actually running.
+            #
+            # `rollback` rather than a savepoint, for the same reason the sibling gives: this is
+            # the one path holding an object the database refused, it has to go, and nothing
+            # this request has written so far is durable — the row above is the first write, and
+            # it is deliberately flushed rather than committed.
+            #
+            # THE RE-READ CANNOT COME BACK EMPTY on the path that gets here. Postgres blocks a
+            # duplicate-key insert until the transaction holding the key settles, so an
+            # `IntegrityError` means the winner has already committed and is visible. An empty
+            # read would mean the id belongs to another owner, and the 404 below is then the
+            # same non-leaking answer every other cross-owner lookup gives.
+            await db.rollback()
+            # THE ROLLBACK EXPIRES EVERY ORM INSTANCE THIS REQUEST HAS LOADED, and both of the
+            # ones below are read after it — `user.id` scopes the re-read on the very next line
+            # and every query under it, and `user.display_name`/`user.email` and `project.name`
+            # compose the prompt context. An expired attribute is fetched lazily, which in an
+            # ASYNC session is IO in a place SQLAlchemy cannot await: it raises `MissingGreenlet`
+            # and the citizen gets exactly the bare 500 this arm exists to replace. Refreshed
+            # explicitly, awaited, so the reads below are ordinary attribute reads again — two
+            # SELECTs on a path that only runs when two first messages genuinely raced.
+            await db.refresh(user)
+            await db.refresh(project)
+            conversation = await _conversation_or_none(db, user.id, conversation_id)
+        else:
+            # The refresh is not optional: server-default timestamps on a fresh row raise
+            # `MissingGreenlet` when projected without one. It belongs to the winning arm only —
+            # the loser's row was loaded by a SELECT and already has them.
+            await db.refresh(conversation)
+    if conversation is None:  # the losing arm's cross-owner id; otherwise unreachable
         raise AppApiError(404, "Conversation not found.")
 
     # Free text while plan options are pending resolves them as an implicit "keep refining"

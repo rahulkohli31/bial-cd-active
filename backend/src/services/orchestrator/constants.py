@@ -19,7 +19,10 @@ surface is frozen for this track). Two guards are load-bearing security boundari
 from __future__ import annotations
 
 import posixpath
-from typing import Literal
+from typing import Final, Literal
+
+from anthropic.types.beta import BetaThinkingConfigParam
+from pydantic_ai.profiles.anthropic import AnthropicEffort
 
 # --- self-heal + model budgets (KD-7) ----------------------------------------
 
@@ -273,6 +276,29 @@ MAX_OUTPUT_TOKENS = 64_000
 
 TEMPERATURE = 0.0
 """Deterministic generation — a build task wants the same edit for the same diagnostic."""
+
+ADAPTIVE_THINKING: Final[BetaThinkingConfigParam] = {"type": "adaptive"}
+"""How reasoning is asked for, and it is not a token budget.
+
+The deployed model REFUSES a numeric budget outright: its provider profile disallows budget
+thinking, and the library raises before the request rather than letting the provider return a
+400, directing callers to adaptive thinking plus an effort level. So the two knobs are this and
+the effort below — a shape the owner's ruling ("medium for planning, high for building") maps
+onto directly, rather than two token counts nobody could defend.
+
+Asserted against the REAL provider model in test, never a double: the refusal lives in
+`AnthropicModel.prepare_request`, which a stub never executes, so a test that trusted a fake
+would go green on a combination the live gateway rejects."""
+
+PLAN_EFFORT: Final[AnthropicEffort] = "medium"
+"""How hard the model thinks in a planning turn (owner's ruling)."""
+
+BUILD_EFFORT: Final[AnthropicEffort] = "high"
+"""How hard the model thinks in a build turn (owner's ruling).
+
+Higher than planning because a build is where the thinking is spent on something that has to
+work: the model is reading real files, choosing an edit, and answering a compiler. A plan is a
+conversation about what to build, and the person is still in it."""
 
 CACHE_TTL: Literal["1h"] = "1h"
 """TTL for every Anthropic prompt-cache breakpoint the loop sets (`anthropic_cache_instructions`,

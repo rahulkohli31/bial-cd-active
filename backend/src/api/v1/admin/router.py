@@ -153,6 +153,7 @@ from src.services.storage.reconcile import (
 )
 from src.services.usage.gate import billable_spend, ist_today, resolve_daily_limit
 from src.services.usage.limits import (
+    CONTEXT_HARD_FLOOR,
     DEFAULT_CONTEXT_HARD,
     DEFAULT_CONTEXT_SOFT,
     MODEL_CONTEXT_WINDOW,
@@ -1871,8 +1872,22 @@ async def set_user_limits(
                 400, f"{to_camel(field)} must be a positive integer, or null to reset to default."
             )
         changes[field] = value
-    if (hard := changes.get("context_hard_limit")) is not None and hard > MODEL_CONTEXT_WINDOW:
-        raise AppApiError(400, "contextHardLimit cannot exceed the model context window.")
+    if (hard := changes.get("context_hard_limit")) is not None:
+        if hard > MODEL_CONTEXT_WINDOW:
+            raise AppApiError(400, "contextHardLimit cannot exceed the model context window.")
+        # THE FLOOR, AND THE ADMINISTRATOR IS TOLD THE NUMBER. Below it the context gate
+        # refuses every conversation that person opens — including a brand-new empty one,
+        # because the gate charges the system-prompt reserve before it counts a word — and the
+        # refusal they read tells them to start a new chat, which also fails. A form that
+        # accepted the number and silently locked someone out is the defect; naming the lowest
+        # usable value is the whole fix at this end. The read-time clamp in `effective_context`
+        # is the other end, for the people a value stored before this validator already reached.
+        if hard < CONTEXT_HARD_FLOOR:
+            raise AppApiError(
+                400,
+                f"contextHardLimit cannot be below {CONTEXT_HARD_FLOOR}. Under that, every "
+                "chat this person opens is refused before they have typed anything.",
+            )
     soft, hard = changes.get("context_soft_limit"), changes.get("context_hard_limit")
     if soft is not None and hard is not None and soft >= hard:
         raise AppApiError(400, "contextSoftLimit must be less than contextHardLimit.")

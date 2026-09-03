@@ -66,8 +66,8 @@ def build_profile() -> ApiSettings | WorkerSettings:
     `BIAL_ROLE=worker` on the worker's container and nowhere else.
     """
     if os.getenv(ROLE_ENV_VAR, "api").strip().lower() == "worker":
-        return WorkerSettings()  # ty: ignore[missing-argument]  # pyright: ignore[reportCallIssue]
-    return ApiSettings()  # ty: ignore[missing-argument]  # pyright: ignore[reportCallIssue]
+        return WorkerSettings()  # pyright: ignore[reportCallIssue]
+    return ApiSettings()  # pyright: ignore[reportCallIssue]
 
 
 def resolve_settings() -> ApiSettings | WorkerSettings:

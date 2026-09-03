@@ -109,12 +109,46 @@ class ConversationDetailResponse(CamelModel):
 # types never silently break an older parser that revalidates a stream.
 
 
+class TurnTextPart(CamelModel):
+    """One block of the turn's prose, at the position it took."""
+
+    type: Literal["text"] = "text"
+    text: str
+
+
+class TurnStepPart(CamelModel):
+    """One of the turn's steps, at the position it took.
+
+    `tool_call_id` is the SAME key the live `StepFrame` carries, so a step that resolves
+    after this snapshot replaces the one the snapshot delivered instead of stacking a second
+    copy beside it. It used to be absent, and a client had to key a snapshot's steps on
+    `seq`+`tool` — which is `0`+the tool name for every in-flight step, so two concurrent
+    reads collided on one key and a reattaching citizen lost one of them."""
+
+    type: Literal["step"] = "step"
+    tool_call_id: str
+    item: StepItem
+
+
+TurnPart = Annotated[TurnTextPart | TurnStepPart, Field(discriminator="type")]
+"""What a turn has produced so far, prose and steps INTERLEAVED in emission order.
+
+A flat "text so far" string beside an unordered step list cannot express a turn that wrote,
+acted, and wrote again — the two shapes agreed only while a turn was guaranteed at most one
+block of text, always last. That guarantee came from prose beside a tool call being thrown
+away; with it gone, the snapshot has to carry the order, or a citizen who reloads mid-turn
+reads the same turn in a different order from one who never left."""
+
+
 class SnapshotFrame(CamelModel):
     """The catch-up snapshot — always the first frame of a subscription that cannot prove
     gap-free continuity (fresh subscribe, F5, cursor fallen out of the ring). `items` are
-    the turn's PERSISTED rows projected through the one U6 derivation; `text_so_far` and
-    `steps` are the in-memory tail the DB does not hold yet. A client renders snapshot
-    state then applies the live tail from `seq`.
+    the turn's PERSISTED rows projected through the one U6 derivation. A client renders
+    snapshot state then applies the live tail from `seq`.
+
+    `parts` is the in-memory tail the DB does not hold yet — the turn's prose and its steps
+    in one ordered list, hidden steps included (`hidden` is a render hint, and filtering it
+    here once cost a mid-turn reconnect the very steps the other two paths kept).
 
     `error_message` carries the WHY of a failed turn. The in-band `error` frame lives only in
     the ring, so a subscriber that arrives after the failure — or whose cursor fell past it —
@@ -137,8 +171,10 @@ class SnapshotFrame(CamelModel):
     turn_id: str | None
     turn_status: Literal["idle", "running", "completed", "failed", "stopped"]
     items: list[DisplayItem] = Field(default_factory=list)
-    text_so_far: str = ""
-    steps: list[StepItem] = Field(default_factory=list)
+    parts: list[TurnPart] = Field(default_factory=list)
+    # The same catch-up reasoning as the fields below: a client that reattaches while the model
+    # is mid-thought would otherwise see a still screen until the next frame changed something.
+    working: bool = False
     error_message: str | None = None
     workspace_state: Literal["preparing", "ready", "unavailable"] | None = None
     preview_url: str | None = None
@@ -147,11 +183,34 @@ class SnapshotFrame(CamelModel):
 
 
 class TextDeltaFrame(CamelModel):
-    """One streamed slice of the assistant's reply text."""
+    """One streamed slice of the assistant's reply text.
+
+    `new_block` says this slice OPENS a block rather than continuing the current one — the
+    live half of the boundary the reload projection gets for free from one stored `TextPart`
+    per item. Without it a client could only concatenate, and a turn that wrote, acted and
+    wrote again would render as one paragraph under all of its steps live, and as two
+    paragraphs around them after a reload."""
 
     type: Literal["text_delta"] = "text_delta"
     seq: int
     text: str
+    new_block: bool = False
+
+
+class WorkingFrame(CamelModel):
+    """The model is REASONING — and this is the whole of what reasoning becomes.
+
+    A BOOLEAN, NEVER THE TEXT. Reasoning blocks are stored so the provider can be given them
+    back on the next turn (it rejects a tool call whose reasoning block is missing), and they
+    are never projected, never framed and never sent to the browser. What the citizen reads is
+    one status line saying the agent is working.
+
+    EDGE-TRIGGERED: emitted when the flag CHANGES, not per reasoning delta, which would put
+    thousands of identical frames through a ring sized for a turn's whole narrative."""
+
+    type: Literal["working"] = "working"
+    seq: int
+    working: bool
 
 
 class StepFrame(CamelModel):
@@ -337,6 +396,7 @@ _KNOWN_FRAME_TAGS: Final = frozenset(
         "snapshot",
         "text_delta",
         "step",
+        "working",
         "plan_options",
         "error",
         "turn_ended",
@@ -365,6 +425,7 @@ TurnStreamFrame = Annotated[
     Annotated[SnapshotFrame, Tag("snapshot")]
     | Annotated[TextDeltaFrame, Tag("text_delta")]
     | Annotated[StepFrame, Tag("step")]
+    | Annotated[WorkingFrame, Tag("working")]
     | Annotated[PlanOptionsFrame, Tag("plan_options")]
     | Annotated[TurnErrorFrame, Tag("error")]
     | Annotated[TurnEndedFrame, Tag("turn_ended")]

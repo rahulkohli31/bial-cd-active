@@ -90,10 +90,31 @@ describe('the poll runs only while something is actually changing on its own', (
     try {
       // Fake timers BEFORE render: an interval created under real timers is not moved by
       // advancing a fake clock afterwards.
-      renderHook(() => usePublishState('p1'))
-      await vi.advanceTimersByTimeAsync(0)
+      const { result } = renderHook(() => usePublishState('p1'))
+      // INSIDE `act`, AND THAT IS WHAT MAKES THIS DETERMINISTIC.
+      //
+      // The hook reads once on mount and only THEN decides whether to poll: the interval is
+      // armed by an effect that depends on the state the mount read sets. Advancing the clock
+      // outside `act` lets the mock's promise resolve without React having applied that state,
+      // so whether the interval existed during the measurement window came down to how busy the
+      // machine was — the mount call landed inside the window instead and was counted as a poll.
+      // It passed on a quiet run and failed under a full suite, in both directions.
+      //
+      // Verified rather than assumed: outside `act` the read lands (one call) while the hook's
+      // own state is still `undefined`; one `act`-wrapped tick later the state is there and the
+      // next thirty seconds produce exactly the six polls the five-second interval owes.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      // LIVENESS: the baseline is only meaningful if the mount read actually landed. Without
+      // this, a hook that never read at all would give `0 - 0 == 0` and satisfy three of these
+      // four assertions for entirely the wrong reason.
+      expect(getDeployment.mock.calls.length).toBeGreaterThan(0)
+      expect(result.current.deployment?.publishState).toBe(publishState)
       const afterMount = getDeployment.mock.calls.length
-      await vi.advanceTimersByTimeAsync(30_000)
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
       return getDeployment.mock.calls.length - afterMount
     } finally {
       vi.useRealTimers()

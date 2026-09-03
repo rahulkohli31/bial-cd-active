@@ -9,9 +9,15 @@ import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
-import httpx
+# THE SDK'S VENDORED HTTPX, NOT THE ONE `src/` USES. The Anthropic client moved onto a fork
+# (`httpx2`) in 1.x, so its transports and its request/response types are no longer the
+# top-level `httpx` ones, and a plain `httpx.MockTransport` under its client is a type error.
+# Declared in the `dev` group rather than reached through `anthropic._base_client`, which is a
+# private re-export mypy and pyright both refuse. If the SDK ever vendors something else this
+# fails loudly at the swap below, which is the right way for it to fail.
+import httpx2
 import pytest
-from anthropic import APITimeoutError, AsyncAnthropicFoundry
+from anthropic import APITimeoutError, AsyncAnthropicFoundry, Timeout
 from anthropic.types import RawContentBlockDeltaEvent, TextBlock, TextDelta
 from pydantic_ai.models.anthropic import AnthropicModel
 
@@ -35,9 +41,10 @@ def _config(**overrides) -> FoundryConfig:
     return FoundryConfig.model_validate(data)
 
 
-def _timeout_of(client: AsyncAnthropicFoundry) -> httpx.Timeout:
-    # `client.timeout` is typed `float | Timeout | None`; narrow to the httpx.Timeout we passed.
-    assert isinstance(client.timeout, httpx.Timeout)
+def _timeout_of(client: AsyncAnthropicFoundry) -> Timeout:
+    # `client.timeout` is typed `float | Timeout | None`; narrow to the `Timeout` we passed —
+    # the SDK's public re-export, which is what `build_foundry_client` constructs.
+    assert isinstance(client.timeout, Timeout)
     return client.timeout
 
 
@@ -120,7 +127,7 @@ def test_entra_client_also_applies_timeout_and_retries(monkeypatch: pytest.Monke
 # dead endpoint surfaces a catchable timeout instead of a hang, and a slow-but-alive stream is
 # never falsely aborted (the false-BuildResult(FAILED) scenario). Retry BACKOFF is zeroed via
 # `INITIAL_RETRY_DELAY` so no test ever sleeps a real backoff; the two timeout tests run against
-# a REAL localhost socket because `httpx.MockTransport` ignores timeouts entirely — a MockTransport
+# a REAL localhost socket because a MockTransport ignores timeouts entirely — a MockTransport
 # timeout test would pass no matter how broken the timeout wiring was.
 
 _A_COMPLETED_MESSAGE: dict[str, Any] = {
@@ -211,16 +218,16 @@ async def test_transient_connection_errors_are_retried_to_success(
     client = build_foundry_client(_config(max_retries=2))
     attempts = 0
 
-    def flaky(request: httpx.Request) -> httpx.Response:
+    def flaky(request: httpx2.Request) -> httpx2.Response:
         nonlocal attempts
         attempts += 1
         if attempts <= 2:
-            raise httpx.ConnectError("connection refused")
-        return httpx.Response(200, json=_A_COMPLETED_MESSAGE)
+            raise httpx2.ConnectError("connection refused")
+        return httpx2.Response(200, json=_A_COMPLETED_MESSAGE)
 
     # Swap the transport UNDER the built client so the SDK's own retry loop (the thing U8 tuned)
     # stays fully in play; only the network is faked.
-    client._client._transport = httpx.MockTransport(flaky)
+    client._client._transport = httpx2.MockTransport(flaky)
     msg = await client.messages.create(
         model="claude-opus", max_tokens=16, messages=[{"role": "user", "content": "hi"}]
     )

@@ -7,13 +7,24 @@ and externalized-then-rehydrated binaries. Equality is asserted on CANONICAL DUM
 2.5.0 validates an image `BinaryContent` back as its `BinaryImage` subclass, so dataclass
 equality is class-strict while the wire shape is identical — the dump IS the contract.
 
+REASONING BLOCKS ARE THE ONE EXEMPTION to "redact every string in the tree", and they own the
+other seam here too. A thinking part's `content` and `signature` reach the row VERBATIM,
+because the provider verifies the signature against the content when the block is replayed on
+the next turn and the masker is tuned to over-redact; nothing is lost by exempting them,
+because a reasoning block is never projected, never framed and never sent to the browser. At
+the load seam the rule inverts: a thinking part that has lost its signature is DROPPED rather
+than replayed, because the library sends an unsigned block's content back as visible
+assistant text.
+
 Also pinned here, against the installed pydantic-ai (upgrade tripwires):
   * the CachePoint hazard — an unknown dict inside user content validates SILENTLY as
     `CachePoint`, which is exactly why the loader's marker swap must be exhaustive;
   * the Anthropic wire mapping of a marker followed by a user prompt — consecutive user-role
     messages in order (marker first; the API folds same-role neighbours);
   * the no-prompt-run gotcha — `agent.run(None, history-ending-in-marker)` adopts the marker
-    as the prompt (so the turn engine must never start a run without a real user prompt).
+    as the prompt (so the turn engine must never start a run without a real user prompt);
+  * the `<thinking>`-tag fallback — an unsigned reasoning block maps to a VISIBLE assistant
+    text block, which is the failure the load-seam drop exists to prevent.
 """
 
 from __future__ import annotations
@@ -32,12 +43,14 @@ from pydantic_ai.messages import (
     ModelResponse,
     RetryPromptPart,
     TextPart,
+    ThinkingPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
 )
 from pydantic_ai.models.function import FunctionModel
 
+from src.core.redaction import redact_secrets
 from src.db.models.conversation import ChatKind
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.services.agent.mode_prompts import workspace_note
@@ -207,6 +220,211 @@ async def test_dsn_in_tool_args_is_stored_redacted(db_session, thread):
     row = await db_session.get(Message, stored.id)
     assert row is not None
     assert password not in str(row.payload)
+
+
+# --- reasoning: verbatim to the row, dropped when it cannot be replayed -------
+
+
+def test_a_reasoning_block_reaches_the_row_verbatim_while_the_prose_beside_it_is_redacted():
+    """The masker's ONE exemption, next to the thing that proves it is scoped rather than a hole.
+
+    An agent writing code narrates in credential-shaped strings as a matter of course: the
+    environment variable it must not put in the browser bundle, the token assignment it thought
+    better of, the API key it moved to the server. `redact_secrets` matches on SHAPE and is
+    deliberately tuned to over-redact — which costs nothing on a string headed for a screen and
+    costs the whole turn here, because the provider verifies a reasoning block's signature
+    against its content when the block is replayed and one rewritten character fails that check.
+    So the block goes to the row byte-for-byte, while the sentence the agent actually SAID —
+    carrying the very same token — is masked exactly as it always was.
+
+    Mutation check: drop `content` from `_THINKING_VERBATIM`, or the `part_kind` guard that
+    selects it, and the reasoning arrives as the masked string this test compares against.
+    """
+    reasoning = (
+        "The template reads BIAL_DATA_BASE_URL at boot. Setting "
+        "BIAL_APP_TOKEN=tok_9f2b1c4d7e in the env file would ship it to the browser, so I will "
+        'keep apiKey = "sk_live_51H8xQ2abcdefghijkl" on the server instead.'
+    )
+    # A signature is an opaque blob and the masker matches on shape, so a `bial_…`-shaped run
+    # inside one is a collision waiting to happen rather than a contrivance. It is written to be
+    # a string the masker demonstrably rewrites because a signature it happened to leave alone
+    # would prove nothing at all about the exemption.
+    signature = "ErUBCkYIBBgCIkAxbial_9f2b1c4d7e0a1b2c3d4e/QQ=="
+    spoken = 'I moved apiKey = "sk_live_51H8xQ2abcdefghijkl" to the server, so nothing leaks.'
+    # The premise both assertions below rest on: these are strings the masker MANGLES. Without
+    # this, "arrived intact" could hold for text the masker never had an opinion about.
+    assert redact_secrets(reasoning) != reasoning
+    assert redact_secrets(signature) != signature
+
+    [dumped] = dump_for_row(
+        [
+            ModelResponse(
+                parts=[
+                    ThinkingPart(
+                        content=reasoning,
+                        signature=signature,
+                        provider_name="anthropic",
+                        provider_details={"note": "BIAL_APP_TOKEN=tok_9f2b1c4d7e"},
+                    ),
+                    TextPart(content=spoken),
+                ]
+            )
+        ]
+    )
+    thinking, text = dumped["parts"]
+    assert thinking["content"] == reasoning
+    assert thinking["signature"] == signature
+    # The exemption is by FIELD, not "any string under a thinking part": a sibling field on the
+    # SAME part is masked like anything else, so a future user-facing field cannot inherit the
+    # exemption merely by being added there.
+    assert thinking["provider_details"] == {"note": "BIAL_APP_TOKEN=***"}
+    # And the prose beside it is redacted as ever — while still reading as a sentence, which is
+    # what says the row holds a masked line rather than nothing at all.
+    assert "sk_live_51H8xQ2abcdefghijkl" not in text["content"]
+    assert text["content"] == 'I moved apiKey = "***" to the server, so nothing leaks.'
+
+
+async def test_a_provider_redacted_reasoning_block_survives_the_round_trip(db_session, thread):
+    """`redacted_thinking` is reasoning the PROVIDER itself withheld: pydantic-ai maps that block
+    to a `ThinkingPart` carrying the id `redacted_thinking`, NO content whatsoever, and the
+    opaque blob in `signature` — which is the entire block. It has to come back exactly as it
+    went in, because the next turn replays it and Anthropic refuses a tool call that is not
+    preceded by the reasoning that led to it; losing the block wedges the turn that follows.
+
+    Mutation check: key the load seam's drop on the block's content instead of its signature and
+    this one — empty content, signature intact — is thrown away as if it were broken.
+    """
+    user, conversation = thread
+    signature = "ErUBCkYIBBgCIkAxRedactedBlobPayload/9f2b1c4d=="
+    history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content="add a filter to the visitors table")]),
+        ModelResponse(
+            parts=[
+                ThinkingPart(
+                    id="redacted_thinking",
+                    content="",
+                    signature=signature,
+                    provider_name="anthropic",
+                ),
+                ToolCallPart(
+                    tool_name="read_file", args={"path": "app/page.tsx"}, tool_call_id="r"
+                ),
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(tool_name="read_file", content="export default 1", tool_call_id="r")
+            ]
+        ),
+    ]
+    await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        messages=history,
+        entry_kind=MessageEntryKind.TURN,
+        kind=ChatKind.BUILD,
+    )
+    loaded = await load_history(
+        db_session, user_id=user.id, conversation_id=conversation.id, rehydrate=_no_refs
+    )
+    (block,) = [
+        part
+        for message in loaded
+        if isinstance(message, ModelResponse)
+        for part in message.parts
+        if isinstance(part, ThinkingPart)
+    ]
+    assert block.id == "redacted_thinking"
+    assert block.content == ""
+    assert block.signature == signature  # the blob IS the block; a rewrite is a rejected turn
+    # …and the block still sits in front of the tool call it belongs to, which is the shape the
+    # provider actually checks.
+    assert _dump(loaded) == _dump(history)
+
+
+async def test_reasoning_with_no_signature_is_dropped_at_the_load_seam(db_session, thread):
+    """Fail closed: a reasoning block that has lost its signature can no longer be replayed AS
+    reasoning, and the library's fallback is not to skip it — it sends the content back as an
+    ordinary assistant TEXT block wrapped in `<thinking>` tags (pinned below). That would turn a
+    block the citizen was never meant to see into part of the model's own visible transcript for
+    the rest of the conversation, silently. Losing the reasoning and keeping the transcript is
+    the strictly better trade, so the load seam drops it.
+
+    Nothing should ever reach this — the persist seam writes what the library serialized and the
+    masker leaves signatures alone — but a row written before that exemption, or a payload edited
+    by hand, is exactly the case it exists for.
+    """
+    user, conversation = thread
+    reasoning = "The citizen never sees this. BIAL_APP_TOKEN=tok_9f2b1c4d7e is server-only."
+    await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        messages=[
+            ModelRequest(parts=[UserPromptPart(content="add a filter")]),
+            ModelResponse(
+                parts=[
+                    ThinkingPart(content=reasoning),  # no signature — unreplayable
+                    TextPart(content="I added the filter."),
+                ]
+            ),
+        ],
+        entry_kind=MessageEntryKind.TURN,
+        kind=ChatKind.BUILD,
+    )
+    loaded = await load_history(
+        db_session, user_id=user.id, conversation_id=conversation.id, rehydrate=_no_refs
+    )
+    assert not [
+        part
+        for message in loaded
+        if isinstance(message, ModelResponse)
+        for part in message.parts
+        if isinstance(part, ThinkingPart)
+    ]
+    assert reasoning not in str(_dump(loaded))
+    # LIVENESS — the absence above must be the drop doing its job, not the whole history failing
+    # to load. The prompt and the words that rode beside the reasoning both survive.
+    (text,) = [
+        part
+        for message in loaded
+        if isinstance(message, ModelResponse)
+        for part in message.parts
+        if isinstance(part, TextPart)
+    ]
+    assert text.content == "I added the filter."
+    assert any(
+        isinstance(message, ModelRequest)
+        and any(isinstance(part, UserPromptPart) for part in message.parts)
+        for message in loaded
+    )
+
+
+async def test_a_response_emptied_by_the_reasoning_drop_leaves_nothing_on_the_wire():
+    """The hazard the drop introduces, closed by the mapping rather than by us.
+
+    A response whose ONLY part was an unsigned reasoning block comes out of the load seam with
+    zero parts — and this file's other rule is that an empty-parts message is poison, because
+    Anthropic rejects a message with an empty content block. The mapping omits such a message
+    entirely instead of sending an empty one, so the drop cannot wedge a turn. If an upgrade
+    changes that, the load seam has to start dropping the emptied response too.
+    """
+    from pydantic_ai.models import ModelRequestParameters
+    from pydantic_ai.models.anthropic import AnthropicModel
+    from pydantic_ai.providers.anthropic import AnthropicProvider
+
+    model = AnthropicModel("claude-sonnet-4-5", provider=AnthropicProvider(api_key="offline"))
+    messages: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content="add a filter")]),
+        ModelResponse(parts=[]),  # what the drop leaves behind
+        ModelRequest(parts=[UserPromptPart(content="and a date column")]),
+    ]
+    params = model.customize_request_parameters(ModelRequestParameters())
+    _, wire = await model._map_message(messages, params, {})  # noqa: SLF001 — pinned-version seam
+    # Both real prompts ride; the emptied response is simply not there (they fold as neighbours).
+    assert [message["role"] for message in wire] == ["user", "user"]
+    assert "add a filter" in str(wire[0]) and "and a date column" in str(wire[1])
 
 
 # --- attachment externalization + rehydration ---------------------------------
@@ -530,12 +748,15 @@ def _assert_anthropic_pairing(messages: list[ModelMessage]) -> None:
             }
         elif isinstance(message, ModelRequest):
             for part in message.parts:
-                rides_as_tool_result = isinstance(part, ToolReturnPart) or (
+                # Written inline rather than through a `rides_as_tool_result` flag so the
+                # isinstance narrowing survives to the assert: both arms carry `tool_call_id`,
+                # the wider part union does not, and a bare `RetryPromptPart` (no tool name) is
+                # a user message rather than a tool answer.
+                if isinstance(part, ToolReturnPart) or (
                     isinstance(part, RetryPromptPart) and part.tool_name is not None
-                )
-                if rides_as_tool_result:
-                    assert part.tool_call_id in seen_calls, (  # type: ignore[union-attr]
-                        f"orphan tool answer {part.tool_call_id!r} would 400 on the wire"  # type: ignore[union-attr]
+                ):
+                    assert part.tool_call_id in seen_calls, (
+                        f"orphan tool answer {part.tool_call_id!r} would 400 on the wire"
                     )
 
 
@@ -987,6 +1208,43 @@ async def test_no_prompt_run_adopts_a_trailing_injected_note_as_the_prompt():
     assert isinstance(part, UserPromptPart)
     # The note IS the effective prompt — exactly what a caller must never let happen.
     assert "checked this app's workspace just now" in str(part.content)
+
+
+async def test_unsigned_reasoning_maps_to_a_visible_assistant_text_block():
+    """WHY the load seam drops an unsigned reasoning block rather than keeping it, pinned against
+    the installed pydantic-ai.
+
+    A `ThinkingPart` rides the wire as a `thinking` block only while it still carries the
+    signature its provider issued. Without one the mapping takes the other branch and emits the
+    reasoning CONTENT as an ordinary assistant TEXT block wrapped in `<thinking>` tags — private
+    reasoning promoted into the model's own visible transcript, silently and permanently. If an
+    upgrade changes this branch, `_without_broken_reasoning` can be revisited; until then the
+    drop is the only safe reading.
+    """
+    from pydantic_ai.models import ModelRequestParameters
+    from pydantic_ai.models.anthropic import AnthropicModel
+    from pydantic_ai.providers.anthropic import AnthropicProvider
+
+    reasoning = "Private: the token lives only in the server env."
+    model = AnthropicModel("claude-sonnet-4-5", provider=AnthropicProvider(api_key="offline"))
+    messages: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content="add a filter")]),
+        ModelResponse(
+            parts=[ThinkingPart(content=reasoning), TextPart(content="I added the filter.")]
+        ),
+    ]
+    params = model.customize_request_parameters(ModelRequestParameters())
+    _, wire = await model._map_message(messages, params, {})  # noqa: SLF001 — pinned-version seam
+    assistant = wire[1]
+    assert assistant["role"] == "assistant"
+    # Stringified rather than indexed, because a mapped block is a typed union of two dozen
+    # shapes. What matters is the pair: the reasoning is on the wire, wrapped in the tags, as a
+    # TEXT block — indistinguishable from something the model said out loud — and no `thinking`
+    # block was emitted for it at all.
+    rendered = str(assistant["content"])
+    assert reasoning in rendered and "<thinking>" in rendered
+    assert "'type': 'text'" in rendered
+    assert "'type': 'thinking'" not in rendered
 
 
 def test_dump_strips_run_instructions_from_the_payload():

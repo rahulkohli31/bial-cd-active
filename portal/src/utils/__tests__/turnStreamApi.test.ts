@@ -21,7 +21,8 @@ import {
 import * as turnStreamApi from '../turnStreamApi'
 
 const SNAPSHOT =
-  '{"type":"snapshot","seq":3,"turnId":"t1","turnStatus":"running","items":[],"textSoFar":"hi ","steps":[]}'
+  '{"type":"snapshot","seq":3,"turnId":"t1","turnStatus":"running","items":[],' +
+  '"parts":[{"type":"text","text":"hi "}],"working":false}'
 const DELTA = '{"type":"text_delta","seq":4,"text":"there"}'
 const ENDED = '{"type":"turn_ended","seq":5,"turnId":"t1","status":"completed"}'
 
@@ -112,9 +113,21 @@ describe('the known-frame narrowing (a cast is not a parse)', () => {
     // A terminal with an unreadable status is still a terminal — never lost, read as failed.
     const [ended] = parseOne('{"type":"turn_ended","seq":9,"turnId":"t","status":"nonsense"}')
     expect(ended).toMatchObject({ type: 'turn_ended', status: 'failed' })
-    // An unreadable snapshot status reads as idle, and its bad steps are dropped, not spread.
-    const [snap] = parseOne('{"type":"snapshot","seq":1,"turnStatus":"nonsense","steps":["x"]}')
-    expect(snap).toMatchObject({ type: 'snapshot', turnStatus: 'idle', steps: [], textSoFar: '' })
+    // An unreadable snapshot status reads as idle, and its unusable PARTS are dropped one by
+    // one rather than spread through. Three shapes at once: a part that is not an object at
+    // all, a step part with no `toolCallId` (the key the live tail replaces it by — without one
+    // it is a row that can never resolve), and a good text part that must survive beside them.
+    const [snap] = parseOne(
+      '{"type":"snapshot","seq":1,"turnStatus":"nonsense","parts":' +
+        '["x",{"type":"step","item":{"type":"step","seq":1,"tool":"t","label":"l","state":"ok"}},' +
+        '{"type":"text","text":"kept"}]}',
+    )
+    expect(snap).toMatchObject({
+      type: 'snapshot',
+      turnStatus: 'idle',
+      parts: [{ type: 'text', text: 'kept' }],
+      working: false,
+    })
   })
 })
 
@@ -159,7 +172,7 @@ describe('the compile frame (R17/R18) — an absent signal is never good news', 
     // framework error screen for the whole gap. The snapshot is what closes it.
     const [frame] = parseOne(
       '{"type":"snapshot","seq":3,"turnId":"t1","turnStatus":"running","items":[],' +
-        '"textSoFar":"","steps":[],"compileState":"failed"}',
+        '"parts":[],"working":false,"compileState":"failed"}',
     )
     expect(frame).toMatchObject({ type: 'snapshot', compileState: 'failed' })
   })
@@ -169,7 +182,7 @@ describe('the compile frame (R17/R18) — an absent signal is never good news', 
     // uncover a pane on the strength of a field the server never sent.
     const [frame] = parseOne(
       '{"type":"snapshot","seq":3,"turnId":"t1","turnStatus":"running","items":[],' +
-        '"textSoFar":"","steps":[]}',
+        '"parts":[],"working":false}',
     )
     expect(frame).toMatchObject({ type: 'snapshot', compileState: null })
   })

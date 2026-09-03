@@ -114,12 +114,13 @@ def _environment_of(env: dict[str, str]) -> Iterator[None]:
 def _boot[P: (ApiSettings, WorkerSettings)](profile: type[P], env: dict[str, str]) -> P:
     """Construct `profile` from EXACTLY `env`, through the real environment source, with the env
     file disabled so nothing on disk can supply a missing block."""
-    # Env-sourced fields are invisible to ty/pyright (mypy's pydantic plugin does see them), and
-    # `_env_file` is a pydantic-settings init kwarg rather than a model field. Same suppression
-    # pair `src/config.py` has always carried on `Settings()`.
+    # Env-sourced fields are invisible to pyright (mypy's pydantic plugin does see them, and
+    # ty stopped needing the pair when pydantic-settings 2.15 landed), and `_env_file` is a
+    # pydantic-settings init kwarg rather than a model field. Same suppression `src/config.py`
+    # carries on `Settings()`.
     with _environment_of(env):
-        return profile(  # ty: ignore[missing-argument]
-            _env_file=None  # ty: ignore[unknown-argument]  # pyright: ignore[reportCallIssue]
+        return profile(
+            _env_file=None  # pyright: ignore[reportCallIssue]
         )
 
 
@@ -317,8 +318,8 @@ def test_a_mistyped_nested_key_fails_on_every_profile(
         _environment_of({**env, **_STORE, "OBJECT_STORE__ACCOUNT_URLL": "typo"}),
         pytest.raises(ValidationError),
     ):
-        profile(  # ty: ignore[missing-argument]
-            _env_file=None  # ty: ignore[unknown-argument]  # pyright: ignore[reportCallIssue]
+        profile(
+            _env_file=None  # pyright: ignore[reportCallIssue]
         )
 
 

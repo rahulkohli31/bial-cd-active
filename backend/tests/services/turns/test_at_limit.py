@@ -476,8 +476,8 @@ def _boot(env: dict[str, str]):
     os.environ["PATH"] = saved.get("PATH", "")
     os.environ.update(env)
     try:
-        return ApiSettings(  # ty: ignore[missing-argument]
-            _env_file=None  # ty: ignore[unknown-argument]  # pyright: ignore[reportCallIssue]
+        return ApiSettings(
+            _env_file=None  # pyright: ignore[reportCallIssue]
         )
     finally:
         os.environ.clear()
