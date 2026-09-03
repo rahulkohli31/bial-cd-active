@@ -499,6 +499,16 @@ const STOP_READ_TIMEOUT_MS = 15_000
  * than treated as "still running for ever" — the browser losing the network is not evidence about
  * the other project's turn — and the caller can simply ask again afterwards, because the stop
  * itself is running server-side and the state read is idempotent.
+ *
+ * BUT A DECIDED ANSWER IS NOT A BLIP, AND RETRYING ONE IS ITS OWN DEFECT (review #38). A session
+ * that expired mid-hand-over answers 401 to every read; `authFetch` attempts a refresh on each of
+ * them, so the dialog sat on "Closing the other app…" for two minutes issuing a hundred reads and
+ * a hundred refresh attempts — the very traffic the refresh path documents as tripping
+ * reuse-detection — and then said "The other project has not finished what it was doing yet",
+ * which is a claim about that project's turn and had nothing to do with what actually failed. A
+ * 403 (or a 404 from a project deleted in another tab) behaved the same way. Those statuses are
+ * answers the poll cannot change, so they travel straight out to the dialog, which says the true
+ * thing immediately. Everything else — an abort, a dropped socket, a 5xx — is still a blip.
  */
 export interface StopWaitClock {
   now: () => number
@@ -511,6 +521,15 @@ export const REAL_CLOCK: StopWaitClock = {
   now: () => Date.now(),
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 }
+
+/**
+ * The statuses a repeat of the same read can only answer the same way: the session is gone, this
+ * user may not ask, or there is no such project. Deliberately NOT 5xx — a server that fell over
+ * mid-stop may well be up on the next tick, and the stop is still running behind it.
+ */
+const DECIDED_STATUSES: ReadonlySet<number> = new Set([401, 403, 404])
+
+const isDecided = (err: unknown): boolean => err instanceof ApiError && DECIDED_STATUSES.has(err.status)
 
 export async function awaitStopSettled(
   projectId: string,
@@ -526,7 +545,8 @@ export async function awaitStopSettled(
     try {
       last = await readStopStateOf(projectId, deps, abandon.signal)
       if (stopSettled(last)) return last
-    } catch {
+    } catch (err) {
+      if (isDecided(err)) throw err
       // Retried below. See the docblock: a read that failed — or was abandoned — decided nothing.
     } finally {
       clearTimeout(bell)
