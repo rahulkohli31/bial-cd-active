@@ -25,7 +25,7 @@ import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/re
 
 import { ComposerHarness } from './_composerHarness'
 import Composer, { type ComposerProps } from '../Composer'
-import { OFFER_GATE_NOTE } from '../OfferStrip'
+import { OFFER_GATE_NOTE, OFFER_LOCKED_NOTE } from '../OfferStrip'
 import { readDraft, writeDraft } from '../../../utils/composerDraft'
 
 afterEach(() => {
@@ -361,6 +361,24 @@ describe('attachments', () => {
   })
 })
 
+describe('★ an offer waiting, drawn the way the boards draw it', () => {
+  it('★ draws the board\'s locked box, and its teal line beneath, while an offer waits', () => {
+    // `PlanReady` draws the locked composer as a whole: the input row on `#F8FAFC`, the paperclip
+    // at 40%, the sentence INSIDE the box where the placeholder was, and a centred teal line under
+    // it. Only the send circle carried any of it, and the in-box sentence had been relocated to a
+    // small grey note below — so the box still looked writable while a tool call waited.
+    draw({ offer: { toolCallId: 'c1', conversationId: 'chat-1', spent: false, onBuild: vi.fn(), onKeepPlanning: vi.fn() } })
+
+    expect(box().getAttribute('placeholder')).toBe(OFFER_GATE_NOTE)
+    expect(screen.getByTestId('composer').className).toMatch(/bg-canvas-offerlock/)
+    expect(screen.getByLabelText('Attach a file').className).toMatch(/opacity-40/)
+    const note = gateNote()
+    expect(note?.textContent).toBe(OFFER_LOCKED_NOTE)
+    expect(note?.className).toMatch(/text-center/)
+    expect(note?.className).toMatch(/text-canvas-offerink/)
+  })
+})
+
 describe('one composer, both kinds (R72)', () => {
   it('behaves identically whichever kind mounted it — the placeholder is the only difference', () => {
     // The placeholder is a HINT, not a mode: nothing downstream reads it, and every behaviour
@@ -418,7 +436,21 @@ describe('the send-unavailable cascade, with more than one arm true', () => {
   it('the offer speaks only when nothing more immediate is true', () => {
     draw({ isRunning: false, offer })
     type('short enough')
-    expect(gateNote()?.textContent).toBe(OFFER_GATE_NOTE)
+    // WHEN THE OFFER IS THE REASON, IT SPEAKS FROM INSIDE THE BOX — which is where both boards
+    // draw it — and the line under the box becomes the board's other sentence.
+    expect(box().getAttribute('placeholder')).toBe(OFFER_GATE_NOTE)
+    expect(gateNote()?.textContent).toBe(OFFER_LOCKED_NOTE)
+  })
+
+  it('★ and a more immediate reason takes the box back: white, its own hint, its own line', () => {
+    // The offer is still pending here. Only the reason that WON drives the treatment, so a build
+    // running under a waiting offer must not leave the box wearing the lock while the note under
+    // it talks about something else.
+    draw({ isRunning: false, gate, offer })
+    type('short enough')
+    expect(box().getAttribute('placeholder')).toBe('Ask for another change…')
+    expect(screen.getByTestId('composer').className).toMatch(/bg-white/)
+    expect(gateNote()?.textContent).toMatch(/Building your app/i)
   })
 
   it('says exactly ONE of them, however many are true', () => {

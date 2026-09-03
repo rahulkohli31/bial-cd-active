@@ -133,6 +133,7 @@ export default {
           offerrule: '#D9EBEC',    // …the hairline under it
           offeredge: '#CDE9EA',    // …and the box's own border while the offer is live
           offerink: '#0A5C5F',     // the strip's headline — darker than the action teal, on purpose
+          offerlock: '#F8FAFC',    // …and the input row's ground while that offer waits to be answered
         },
         /**
          * The nine status states of `StatusCardStates`, as text / ground / dot triples. Six

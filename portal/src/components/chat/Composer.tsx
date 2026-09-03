@@ -59,7 +59,7 @@ import { useAui, useAuiState } from '@assistant-ui/react'
 import { capState, MAX_COMPOSER_CHARS } from '../../utils/composerCap'
 import { readDraft, writeDraft } from '../../utils/composerDraft'
 import ComposerBox, { type ComposerSubmission } from './ComposerBox'
-import OfferStrip, { OFFER_GATE_NOTE, type OfferStripProps } from './OfferStrip'
+import OfferStrip, { OFFER_GATE_NOTE, OFFER_LOCKED_NOTE, type OfferStripProps } from './OfferStrip'
 import StopTurnControl, { type StopTurnControlProps } from './StopTurnControl'
 
 export type { ComposerSubmission } from './ComposerBox'
@@ -183,19 +183,26 @@ const Composer: FC<ComposerProps> = ({
    * Why Send is unavailable — one sentence, always stated, with a distinct reason per cause.
    * Plain language: a citizen reading this asked for an app and is watching it get made.
    */
-  const unavailableReason = useMemo<string | null>(() => {
+  const unavailable = useMemo<{ reason: string; fromOffer: boolean } | null>(() => {
     // THE ORDER IS BY IMMEDIACY, and the offer is LAST on purpose. All four block Send, but the
     // first three describe something happening right now — the citizen's own text is too long, a
     // reply is arriving, their app is being built — while a pending offer describes a question
     // still waiting. The offer also stays pending for the whole of the round trip its own Build
     // press starts, so putting it first told a citizen to "choose one of the two above" while the
     // build they had just chosen was starting.
-    if (cap.over) return cap.message
-    if (isRunning) return 'Replying — keep typing if you like; send unlocks when it is done.'
-    if (gate?.blocked) return gate.reason
-    if (offerPending) return OFFER_GATE_NOTE
+    //
+    // WHICH ARM WON IS PART OF THE ANSWER, not a detail of it. The offer's arm is the only one the
+    // boards draw as a locked box, and it can be true at the same time as the three above it — so
+    // "an offer is pending" is not the same question as "the offer is why Send is waiting", and it
+    // is the second one the treatment answers to.
+    if (cap.over) return { reason: cap.message, fromOffer: false }
+    if (isRunning) return { reason: 'Replying — keep typing if you like; send unlocks when it is done.', fromOffer: false }
+    if (gate?.blocked) return { reason: gate.reason, fromOffer: false }
+    if (offerPending) return { reason: OFFER_GATE_NOTE, fromOffer: true }
     return null
   }, [offerPending, cap.over, cap.message, isRunning, gate])
+  const unavailableReason = unavailable?.reason ?? null
+  const offerLocked = unavailable?.fromOffer ?? false
 
   /**
    * THE DRAFT FOLLOWS THE BOX, IT DOES NOT ASSUME IT EMPTIED.
@@ -240,6 +247,7 @@ const Composer: FC<ComposerProps> = ({
         placeholder={placeholder}
         onSubmit={onSubmit}
         unavailableReason={unavailableReason}
+        locked={offerLocked}
         onAccepted={handleAccepted}
         onUrgent={onUrgent}
         header={
@@ -251,9 +259,23 @@ const Composer: FC<ComposerProps> = ({
         }
         footer={
           <>
+            {/* THE LINE UNDER THE BOX, AND WHICH LINE IT IS. For the three immediate reasons it is
+                the reason itself, small and grey, sitting where a status note belongs. While an
+                offer waits the reason has moved INTO the box (see `locked`), and the boards put a
+                second sentence here instead: centred, in the strip's teal, saying that neither
+                answer is the wrong one. Repeating the in-box sentence here would be the composer
+                saying the same thing twice and the reassurance not at all. */}
             {unavailableReason && (
-              <p data-testid="composer-gate-note" role="status" className="text-xs text-neutral">
-                {unavailableReason}
+              <p
+                data-testid="composer-gate-note"
+                role="status"
+                className={
+                  offerLocked
+                    ? 'text-center text-[11px] leading-relaxed text-canvas-offerink'
+                    : 'text-xs text-neutral'
+                }
+              >
+                {offerLocked ? OFFER_LOCKED_NOTE : unavailableReason}
               </p>
             )}
 

@@ -76,6 +76,17 @@ export interface ComposerBoxProps {
    */
   unavailableReason: string | null
   /**
+   * THE BOX IS WAITING ON AN ANSWER THAT IS NOT A MESSAGE, and the board draws that as a whole
+   * treatment rather than as a greyed send circle: the input row on a pale ground, the paperclip
+   * dimmed, and the reason sitting where the placeholder was (`PlanReady`, `PlanRevised`).
+   *
+   * IT IS A SEPARATE FLAG FROM `unavailableReason` BECAUSE IT IS A DIFFERENT CLAIM. Send waits for
+   * four reasons and three of them — the text is too long, a reply is arriving, a build is running
+   * — leave the box white on every board that draws them. Only a pending question locks it, so
+   * only a pending question wears the lock.
+   */
+  locked?: boolean
+  /**
    * WHAT THE BOX ACTUALLY KEPT, once an accepted send has been reconciled — the conversation the
    * send was stamped with, and the text still standing in the box afterwards.
    *
@@ -102,6 +113,7 @@ export default function ComposerBox({
   placeholder,
   onSubmit,
   unavailableReason,
+  locked = false,
   onAccepted,
   header,
   footer,
@@ -280,9 +292,13 @@ export default function ComposerBox({
           // THE BORDER ANSWERS TO THE HEADER. `PlanReady` draws the box `#CDE9EA` while the offer
           // strip is fixed to its top, so the strip and the box read as one card rather than as a
           // banner sitting on an unrelated control. The header slot's only occupant is that strip.
-          className={`flex w-full flex-col gap-2.5 rounded-[14px] border bg-white px-3 py-[11px] ${
-            header ? 'border-canvas-offeredge' : 'border-bial-border'
-          }`}
+          //
+          // THE GROUND ANSWERS TO THE LOCK, which is a narrower question — a spent offer keeps the
+          // teal border and gets its box back. `#F8FAFC` is the board's, and it is a ground rather
+          // than an opacity so the box still reads as a control rather than as a ghost.
+          className={`flex w-full flex-col gap-2.5 rounded-[14px] border px-3 py-[11px] ${
+            locked ? 'bg-canvas-offerlock' : 'bg-white'
+          } ${header ? 'border-canvas-offeredge' : 'border-bial-border'}`}
         >
           {header}
 
@@ -304,7 +320,11 @@ export default function ComposerBox({
               derived from `thread.isDisabled`, which this project never sets, so the attribute is
               absent rather than false; the guard test asserts the absence directly. */}
           <ComposerPrimitive.Input
-            placeholder={placeholder}
+            // THE REASON GOES WHERE THE PLACEHOLDER WAS while the box is locked, because that is
+            // where both boards draw it — inside the box, at the point the citizen is aiming at
+            // when they try to type. A hint to describe a change is not the true thing to say to
+            // someone who cannot send one.
+            placeholder={locked && unavailableReason ? unavailableReason : placeholder}
             data-testid="composer-input"
             rows={1}
             // NO maxLength. Issue #156 forbids it by name and a test asserts its absence.
@@ -324,7 +344,9 @@ export default function ComposerBox({
               data-testid="composer-attach"
               aria-label="Attach a file"
               title="Attach images, PDFs or text files (CSV, TXT), or drop them anywhere in the composer"
-              className="ms-auto inline-flex text-neutral transition hover:text-primary"
+              // DIMMED WITH THE BOX, never unavailable. The board draws it at 40% while an offer
+              // waits, and it stays pressable at 40%: staging a file is composing, not answering.
+              className={`ms-auto inline-flex text-neutral transition hover:text-primary${locked ? ' opacity-40' : ''}`}
             >
               <Paperclip size={16} />
             </ComposerPrimitive.AddAttachment>

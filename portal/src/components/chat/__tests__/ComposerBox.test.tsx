@@ -43,9 +43,10 @@ interface DrawOptions {
   onUrgent?: (message: string) => void
   /** What the box reports it KEPT once an accepted send has been reconciled. */
   onAccepted?: (conversationId: string, keptText: string) => void
+  locked?: boolean
 }
 
-function draw({ onSubmit, unavailableReason = null, onUrgent = vi.fn(), onAccepted }: DrawOptions = {}) {
+function draw({ onSubmit, unavailableReason = null, onUrgent = vi.fn(), onAccepted, locked = false }: DrawOptions = {}) {
   const submit = onSubmit ?? vi.fn().mockResolvedValue(undefined)
   const view = render(
     <ComposerHarness>
@@ -54,6 +55,7 @@ function draw({ onSubmit, unavailableReason = null, onUrgent = vi.fn(), onAccept
         placeholder="Describe the change you need…"
         onSubmit={submit}
         unavailableReason={unavailableReason}
+        locked={locked}
         onUrgent={onUrgent}
         {...(onAccepted ? { onAccepted } : {})}
       />
@@ -135,6 +137,37 @@ describe('★ the pale send circle means LOCKED, not "you have not typed yet"', 
     expect(send().getAttribute('aria-disabled')).toBe('true')
     fireEvent.click(send())
     expect(onSubmit).not.toHaveBeenCalled()
+  })
+})
+
+describe('★ the board\'s locked box, while an offer waits for an answer', () => {
+  // `PlanReady` and `PlanRevised` draw the whole box locked, not just its send circle: the input
+  // row on `#F8FAFC`, the paperclip at 40%, and the sentence sitting INSIDE the box where the
+  // placeholder was. Only the send circle carried it, so a citizen read a composer that still
+  // looked writable while a tool call waited on an answer — the exact confusion the board's own
+  // annotation exists to remove.
+
+  it('puts the reason where the placeholder was, on the board\'s ground, with the paperclip dimmed', () => {
+    const { container } = draw({ unavailableReason: 'Choose one of the two above to carry on…', locked: true })
+
+    expect(box().getAttribute('placeholder')).toBe('Choose one of the two above to carry on…')
+    expect(screen.getByTestId('composer').className).toMatch(/bg-canvas-offerlock/)
+    expect(screen.getByTestId('composer-attach').className).toMatch(/opacity-40/)
+    // AND STILL NOTHING IS `disabled`. The box is locked to the eye and to Send; the paperclip is
+    // dimmed and still pressable, because staging a file is composing rather than answering.
+    expect(container.querySelectorAll('[disabled]')).toHaveLength(0)
+    fireEvent.change(box(), { target: { value: 'typed anyway' } })
+    expect(box().value).toBe('typed anyway')
+  })
+
+  it('leaves a merely-WAITING box white, with its own hint — which is what every other board draws', () => {
+    // The lock is the answer to a question, not the look of a busy composer. Keying it off
+    // `unavailableReason` instead would put it on every running turn, on fourteen boards that
+    // draw the box white throughout.
+    draw({ unavailableReason: 'Replying — keep typing if you like; send unlocks when it is done.' })
+    expect(box().getAttribute('placeholder')).toBe('Describe the change you need…')
+    expect(screen.getByTestId('composer').className).toMatch(/bg-white/)
+    expect(screen.getByTestId('composer-attach').className).not.toMatch(/opacity-40/)
   })
 })
 
