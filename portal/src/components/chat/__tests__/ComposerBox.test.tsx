@@ -48,10 +48,10 @@ interface DrawOptions {
 
 function draw({ onSubmit, unavailableReason = null, onUrgent = vi.fn(), onAccepted, locked = false }: DrawOptions = {}) {
   const submit = onSubmit ?? vi.fn().mockResolvedValue(undefined)
-  const view = render(
+  const mount = (conversationId: string) => (
     <ComposerHarness>
       <ComposerBox
-        conversationId="chat-1"
+        conversationId={conversationId}
         placeholder="Describe the change you need…"
         onSubmit={submit}
         unavailableReason={unavailableReason}
@@ -59,9 +59,13 @@ function draw({ onSubmit, unavailableReason = null, onUrgent = vi.fn(), onAccept
         onUrgent={onUrgent}
         {...(onAccepted ? { onAccepted } : {})}
       />
-    </ComposerHarness>,
+    </ComposerHarness>
   )
-  return { ...view, submit, onUrgent }
+  const view = render(mount('chat-1'))
+  /** Step to a sibling chat. A PROP CHANGE, not a remount — flat routing keeps one box for every
+   *  conversation, which is the whole reason a send can outlive the chat it was pressed in. */
+  const switchTo = (conversationId: string) => view.rerender(mount(conversationId))
+  return { ...view, switchTo, submit, onUrgent }
 }
 
 const box = () => screen.getByTestId('composer-input') as HTMLTextAreaElement
@@ -283,6 +287,53 @@ describe('★ the box clears ONLY once the server has accepted', () => {
     expect(box().value).toBe('actually make it red')
     // …and what went to the server was the snapshot, which is the other half of the rule.
     expect(onSubmit.mock.calls[0]?.[0]?.text).toBe('make the header blue')
+  })
+
+  it('★ leaves a SIBLING chat alone when the send it outlived finally lands', async () => {
+    // THE RECONCILIATION IS ABOUT ONE CHAT, AND THIS BOX SERVES ALL OF THEM. Flat routing swaps
+    // the conversation rather than remounting the composer, so an accepted send can land while
+    // the citizen is writing next door — and every rule the two tests above establish would then
+    // be applied to the sibling's box.
+    //
+    // THE TAIL RULE IS THE ONE THAT BITES, and it bites hardest on the shortest messages: send
+    // "hi" here, step next door, type "hi there", and the slice reads the sibling's line as an
+    // append to a message that chat never saw, leaving them looking at " there".
+    //
+    // Mutation receipt: drop the `liveConversation` guard in `doSend` and this goes red three
+    // times over — the box reads " there", the sibling's file is decoded a second time to put it
+    // back after a clear it never asked for, and the chat that sent is told it kept " there".
+    const decodes = vi.spyOn(FileReader.prototype, 'readAsDataURL')
+    let release = () => {}
+    const gate = new Promise<void>((r) => { release = r })
+    const onSubmit = vi.fn().mockReturnValue(gate)
+    const onAccepted = vi.fn()
+    const { switchTo, onUrgent } = draw({ onSubmit, onAccepted })
+
+    type('hi')
+    fireEvent.click(send())
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+
+    switchTo('chat-2')
+    type('hi there')
+    drop(new File(['id,name'], 'sibling.csv', { type: 'text/csv' }))
+    await waitFor(() => expect(screen.getByTestId('composer-chips').textContent).toContain('sibling.csv'))
+    expect(decodes).toHaveBeenCalledTimes(1)
+
+    release()
+    // THE WHOLE SEND HAS TO SETTLE, tidying and all, before any of this can be read: Send comes
+    // back only in the `finally`, which is after everything the guard is there to skip.
+    await waitFor(() => expect(send().getAttribute('aria-disabled')).toBe('false'))
+
+    expect(box().value).toBe('hi there')
+    expect(screen.getByTestId('composer-chips').textContent).toContain('sibling.csv')
+    // ONE decode, so the chip is the file the citizen staged rather than a copy put back after a
+    // clear — the attachment half of the same guard.
+    expect(decodes).toHaveBeenCalledTimes(1)
+    // The chat that DID send is told its box kept nothing, because nothing on screen is its.
+    expect(onAccepted).toHaveBeenCalledWith('chat-1', '')
+    // …and the send SUCCEEDED, so nothing says otherwise.
+    expect(onUrgent).not.toHaveBeenCalled()
+    decodes.mockRestore()
   })
 
   it('★ keeps a file ATTACHED while the send was in flight — the other half of the same rule', async () => {

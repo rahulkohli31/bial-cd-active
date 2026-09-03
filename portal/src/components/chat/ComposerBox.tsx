@@ -41,8 +41,12 @@
  * itself, and clears ONLY once the server has accepted. A refused send leaves everything exactly
  * where it was, and there is therefore no restore path to race with — the whole class of defect
  * stops existing rather than being guarded.
+ *
+ * AND ONLY OVER THE CHAT IT WAS SENT IN. This box is not remounted per conversation, so an
+ * accepted send can land while a sibling chat is on screen; what it clears is then decided
+ * against the chat being typed into rather than the one it belongs to. See `liveConversation`.
  */
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ComposerPrimitive, useAui, useAuiState } from '@assistant-ui/react'
 import { Paperclip, Send, X } from 'lucide-react'
 
@@ -87,13 +91,18 @@ export interface ComposerBoxProps {
    */
   locked?: boolean
   /**
-   * WHAT THE BOX ACTUALLY KEPT, once an accepted send has been reconciled — the conversation the
-   * send was stamped with, and the text still standing in the box afterwards.
+   * WHAT THE BOX ACTUALLY KEPT FOR THAT CHAT, once an accepted send has been reconciled — the
+   * conversation the send was stamped with, and the text still standing in its box afterwards.
    *
    * IT EXISTS BECAUSE THE BOX DOES NOT ALWAYS EMPTY. A citizen who rewrites the box while the
    * request is out gets their words left alone (see `doSend`), and a caller that clears its own
    * copy of the draft on every accepted send would then be deleting text still on screen. Anyone
    * keeping a second copy has to be told what survived rather than assuming nothing did.
+   *
+   * IT IS EMPTY WHENEVER THE CITIZEN HAS MOVED ON, and that is an answer rather than a shrug:
+   * nothing on screen belongs to the chat that was sent in any more, so nothing of its box
+   * survived. The caller stores exactly what it is told either way and needs no second opinion
+   * about which chat is showing.
    */
   onAccepted?: (conversationId: string, remainingText: string) => void
   /** Rendered inside the box, above the input: the offer strip's locked treatment, and nothing else. */
@@ -122,6 +131,22 @@ export default function ComposerBox({
   const aui = useAui()
   const [preview, setPreview] = useState<PreviewTarget | null>(null)
   const [sending, setSending] = useState(false)
+
+  /**
+   * WHICH CHAT IS ON SCREEN NOW, as opposed to the one Send was pressed in — the whole of what
+   * makes the reconciliation below safe.
+   *
+   * THIS BOX IS ONE LONG-LIVED INSTANCE. Flat routing swaps `conversationId` rather than
+   * remounting, so a send still out when the citizen steps to a sibling finishes over somebody
+   * else's composing. `doSend` runs entirely from its press-time closure, so the `conversationId`
+   * beside it is the one the send belongs to and this ref is the one being typed into.
+   *
+   * WRITTEN DURING RENDER rather than in an effect, as `Composer` and `LivePreview` write theirs:
+   * an accepted send resolves in a microtask, which can run before a passive effect has flushed,
+   * and a ref one render behind is the same bug with more steps.
+   */
+  const liveConversation = useRef(conversationId)
+  liveConversation.current = conversationId
 
   // READ THROUGH THE STORE, so the control re-renders when the citizen types or attaches. The
   // VALUES are read again at press time from `getState()` — a render-scoped copy would be one
@@ -175,6 +200,26 @@ export default function ComposerBox({
     try {
       await onSubmit({ text: sentText, attachments, conversationId })
       accepted = true
+
+      // THE CHAT MOVED ON WHILE THE REQUEST WAS OUT, and then there is nothing here to reconcile:
+      // the box on screen belongs to a sibling, and every rule below would be applied to somebody
+      // else's composing. The prefix slice is the one that bites — send "hi" here, step next
+      // door, type "hi there", and the tail rule would cut the sibling's line down to " there",
+      // because it reads as an append to a message that was never typed in this chat.
+      //
+      // THE FILES ARE THE SAME QUESTION. `clearAttachments()` empties the whole composer, so
+      // tidying up after this send would take the sibling's staged files with it and then put
+      // them back through a second decode — a chip that blinks out and returns, in a chat that
+      // sent nothing.
+      //
+      // THE SEND ITSELF STILL SUCCEEDED, and is reported as such: `accepted` is already true, so
+      // nothing downstream says a message failed, and the chat it was sent in is told its box
+      // kept nothing — because nothing on screen is its any more.
+      if (liveConversation.current !== conversationId) {
+        onAccepted?.(conversationId, '')
+        return
+      }
+
       // CLEARED ONLY ON SUCCESS, AND ONLY WHAT WAS SENT. Nothing is optimistically emptied, so a
       // failed send leaves everything exactly where it was and there is no restore path to race
       // with; and anything added since the press survives, because it was never sent.

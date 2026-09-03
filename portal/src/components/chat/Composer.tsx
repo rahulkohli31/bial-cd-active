@@ -50,11 +50,12 @@
  *   lands late lands on the send it belongs to.
  * R57 — THE CAP BYPASS. The adapter validates against what is ALREADY staged, read live off the
  *   runtime — see `stagedAttachments.tsx` for why that is a ref rather than a closure.
- * R60 — CROSS-CHAT LEAKAGE is guarded by the send path stamping the conversation at press time
- *   and the surface comparing it, on completion, against the chat that is on screen THEN — read
- *   through a ref, because the callback itself is press-time too. See `handleAccepted`.
+ * R60 — CROSS-CHAT LEAKAGE is guarded in ONE place, `ComposerBox`: the send stamps its
+ *   conversation at press time and, on completion, compares it against the chat that is on screen
+ *   THEN — read through a ref, because the callback itself is press-time too. A send whose chat
+ *   the citizen has left touches neither the box nor the chips nor this file's stored draft.
  */
-import { useCallback, useEffect, useMemo, useRef, type FC, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, type FC, type ReactNode } from 'react'
 import { useAui, useAuiState } from '@assistant-ui/react'
 
 import { capState, MAX_COMPOSER_CHARS } from '../../utils/composerCap'
@@ -207,40 +208,6 @@ const Composer: FC<ComposerProps> = ({
   const unavailableReason = unavailable?.reason ?? null
   const offerLocked = unavailable?.fromOffer ?? false
 
-  /**
-   * THE DRAFT FOLLOWS THE BOX, IT DOES NOT ASSUME IT EMPTIED.
-   *
-   * This used to clear the stored draft on every accepted send. But the box does not always empty:
-   * a citizen who rewrites it while the request is out keeps their words, deliberately. The two
-   * then disagreed — the composer showed text that was no longer stored anywhere, and because the
-   * mirror above only fires when `text` CHANGES, nothing ever wrote it back. A reload, or a step
-   * to another chat, silently destroyed words still on the screen.
-   *
-   * So the box says what survived and that is what is stored. `writeDraft` with an empty string
-   * removes the key, which is the ordinary case said in one rule rather than two.
-   *
-   * AND ONLY FOR THE CHAT IT WAS SENT IN. If the citizen moved to a sibling while the request was
-   * out, what stands in the box belongs to the sibling, not to the conversation being cleared —
-   * so that one's draft goes, and the sibling's own mirror keeps its own.
-   *
-   * WHICH CHAT IS ON SCREEN IS READ AT ACCEPT TIME, THROUGH A REF, and that is the whole of the
-   * correction. `ComposerBox` performs the send from its PRESS-TIME closure, so the callback it
-   * calls on completion is the one built in the same render as the `conversationId` beside it —
-   * comparing them compared a value with itself, was true however far the citizen had navigated
-   * since, and the sibling arm therefore never ran once. Sending in one chat, stepping to a
-   * sibling and typing there put the sibling's live text into the first chat's stored draft.
-   *
-   * The ref is written DURING RENDER rather than in an effect, as `LivePreview` and
-   * `useWorkspaceState` write theirs: an accepted send resolves in a microtask, which can run
-   * before a passive effect has flushed, and a ref one render behind is the same bug again.
-   */
-  const liveConversation = useRef(conversationId)
-  liveConversation.current = conversationId
-
-  const handleAccepted = useCallback((sentIn: string, keptText: string) => {
-    writeDraft(sentIn, sentIn === liveConversation.current ? keptText : '')
-  }, [])
-
   return (
     // NO RULE ABOVE THE BOX. Every board that draws a composer — BuildChat, PlanChat, PlainAnswer,
     // NewBuildChat, NewPlanChat and the rest — runs the transcript's white straight down into the
@@ -262,7 +229,24 @@ const Composer: FC<ComposerProps> = ({
         onSubmit={onSubmit}
         unavailableReason={unavailableReason}
         locked={offerLocked}
-        onAccepted={handleAccepted}
+        /* THE DRAFT FOLLOWS THE BOX, IT DOES NOT ASSUME IT EMPTIED — which is why this is the
+           box's report and not a clear.
+
+           Clearing the stored draft on every accepted send used to be the rule. But the box does
+           not always empty: a citizen who rewrites it while the request is out keeps their words,
+           deliberately. The two then disagreed — the composer showed text that was no longer
+           stored anywhere, and because the mirror above only fires when `text` CHANGES, nothing
+           ever wrote it back. A reload, or a step to another chat, silently destroyed words still
+           on the screen.
+
+           So the box says which chat it reconciled and what survived in it, and that is what is
+           stored, verbatim. `writeDraft` with an empty string removes the key, which covers the
+           ordinary send and the send whose chat the citizen has since left — the box reports
+           nothing kept for that one, because by then nothing on screen is its. Deciding that here
+           as well is the second opinion that made this wrong before: the callback is built in the
+           same render as the `conversationId` beside it, so comparing the two compared a value
+           with itself and the sibling arm never ran. */
+        onAccepted={writeDraft}
         onUrgent={onUrgent}
         header={
           offer ? (
