@@ -32,7 +32,7 @@ const h = vi.hoisted(() => ({
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), stopTurn: vi.fn(),
   resolvePlanOptions: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(), relaunchPreview: vi.fn(),
-  fetchSaveState: vi.fn(),
+  fetchSaveState: vi.fn(), fetchPreviewState: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
@@ -59,12 +59,18 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
 vi.mock('../../utils/buildSessionApi', async (orig) => ({
   ...(await orig()),
   fetchSaveState: (...a) => h.fetchSaveState(...a),
+  // The workspace read, and the start `StartAppControl` imports DIRECTLY from this module rather
+  // than through the injected client — both are what the failed-launch scenario at the bottom
+  // drives, and leaving either real would put this suite on the network.
+  fetchPreviewState: (...a) => h.fetchPreviewState(...a),
+  relaunchPreview: (...a) => h.relaunchPreview(...a),
 }))
 
 import {
   FakeEventSource, makeClient, primeClient, primeTurn, renderBuilder, send, waitForGateOpen,
-  planReply, turnStreaming, PLAN_CARD_ID,
+  planReply, turnStreaming, PLAN_CARD_ID, findStartAppControl,
 } from './_builderSession.jsx'
+import { ApiError } from '../../utils/apiError'
 
 const deps = () => {
   const fake = new FakeEventSource('x')
@@ -83,6 +89,13 @@ beforeEach(() => {
   h.listProjectConversations.mockResolvedValue([])
   h.buildUserParts.mockImplementation(async (t) => [{ type: 'text', text: t }])
   h.fetchSaveState.mockResolvedValue({ dirty: false })
+  // Neither the workspace read nor the start is this file's subject by default: answered so
+  // nothing reaches a real `fetch`, and re-primed by the two scenarios that are about them.
+  h.fetchPreviewState.mockResolvedValue({
+    state: 'unknown', alive: false, previewUrl: null,
+    occupyingProjectName: null, occupyingProjectId: null, restorable: null,
+  })
+  h.relaunchPreview.mockResolvedValue({ appId: 'a1', previewUrl: 'https://app/', status: 'ready', ready: true, restoredFromFailedBuild: false })
 })
 afterEach(cleanup)
 
@@ -300,5 +313,30 @@ describe('U9 — the offer\'s Build reaches the SAME hand-over dialog as the com
     for (const word of [/container/i, /sandbox/i, /workspace slot/i, /session/i, /409/]) {
       expect(text, String(word)).not.toMatch(word)
     }
+  })
+})
+
+describe('U11 — a failed launch INSIDE a chat says why', () => {
+  it('puts the server\'s reason on the pane, not just a stopped spinner', async () => {
+    // The press used to report nothing at all here: the spinner stopped, the same sentence came
+    // back, and pressing again did the same thing — because this surface handed the shared map a
+    // hardcoded `null` for the outcome on the grounds that it had a relaunch path of its own.
+    // That path belongs to a different control. Nothing rendered the pane's own failure, and
+    // nothing went red when it did not.
+    h.fetchPreviewState.mockResolvedValue({
+      state: 'asleep', alive: false, previewUrl: null,
+      occupyingProjectName: null, occupyingProjectId: null, restorable: true,
+    })
+    h.relaunchPreview.mockRejectedValue(
+      new ApiError('Your app could not be brought back just now.', 503),
+    )
+    renderBuilder({ deps: deps().deps })
+
+    fireEvent.click(await findStartAppControl())
+
+    expect(await screen.findByText('We could not start your app.')).toBeTruthy()
+    // THE SERVER'S OWN WORDS, carried verbatim — the specific half, and the only thing that tells
+    // the citizen what to do differently.
+    expect(screen.getByText('Your app could not be brought back just now.')).toBeTruthy()
   })
 })
