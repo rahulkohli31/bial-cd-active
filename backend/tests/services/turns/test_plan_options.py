@@ -39,6 +39,7 @@ from src.services.agent import toolsets as toolsets_module
 from src.services.agent.mode_prompts import PromptContext
 from src.services.build_sessions.manager import SessionManager
 from src.services.messages.projection import (
+    PLATFORM_TEXT_KIND,
     AssistantTextItem,
     PlanOptionsItem,
     StepItem,
@@ -527,27 +528,39 @@ async def test_an_empty_plan_argument_records_no_offer_and_says_so_once(
     # explains a refusal the PLATFORM made, and it used to be appended to the run's own batch as
     # a `ModelResponse` — stored, replayed and read back as something the model had written. It
     # now rides one visible `SYSTEM_EVENT` row of its own, stamped with the platform-text kind
-    # and the turn it belongs to, and reaches the citizen through the projection's arm for a
-    # visible system row of an unknown kind. What they read is unchanged; the record has stopped
-    # attributing it to the model.
+    # and the turn it belongs to, carrying the words in `meta` and NO payload at all, and it
+    # reaches the citizen through the projection's arm for that kind. What they read is
+    # unchanged; the record has stopped attributing it to the model.
     platform_rows = [
         row
         for row in rows
-        if isinstance(row.meta, dict) and row.meta.get("kind") == engine_module.PLATFORM_TEXT_KIND
+        if isinstance(row.meta, dict) and row.meta.get("kind") == PLATFORM_TEXT_KIND
     ]
     assert len(platform_rows) == 1
     assert platform_rows[0].entry_kind is MessageEntryKind.SYSTEM_EVENT
     assert platform_rows[0].meta == {
-        "kind": engine_module.PLATFORM_TEXT_KIND,
+        "kind": PLATFORM_TEXT_KIND,
         "turnId": str(state.turn_id),
+        "text": PLAN_NOT_KEPT_TEXT,
     }
-    # …AND NOWHERE ELSE. Exactly one row in the whole transcript carries the sentence, which is
-    # the assertion that goes red if it is ever written into the model's batch as well — a
-    # regression the rendered text above could not see, because the citizen would still read it
-    # once while the model's own history carried a reply it never made.
-    assert [row.id for row in rows if PLAN_NOT_KEPT_TEXT in str(row.payload)] == [
-        platform_rows[0].id
-    ]
+    # ★ AND THE MODEL IS NEVER TOLD IT SAID THIS. `load_history` flattens every row's payload —
+    # hidden ones included, and with no filter by kind or entry kind — so a sentence stored in a
+    # payload is a sentence the NEXT turn hands the model as a paragraph it wrote itself, to
+    # build on or repeat. The empty payload is what keeps it out, the same way the turn-terminal
+    # row stays out, and it is asserted DIRECTLY rather than only through the reader: the reader
+    # returns nothing at all for this turn (the refused call was stripped, which left the run
+    # with no persistable message of its own), so an absence read off it alone would hold just as
+    # well against a row that still carried the sentence in a payload nobody happened to load.
+    assert platform_rows[0].payload == []
+    assert not any(PLAN_NOT_KEPT_TEXT in str(row.payload) for row in rows)
+
+    async def _noop_rehydrate(_attachment_ids):
+        raise AssertionError("no attachments in this history")
+
+    history = await load_history(
+        db_session, user_id=user.id, conversation_id=conv.id, rehydrate=_noop_rehydrate
+    )
+    assert not any(PLAN_NOT_KEPT_TEXT in str(message) for message in history)
     for row in rows:
         for message in row.payload:
             assert "present_plan_options" not in str(message.get("parts", []))
@@ -591,7 +604,7 @@ async def test_an_over_ceiling_plan_argument_records_no_offer_and_is_not_truncat
     assert [
         row.entry_kind
         for row in rows
-        if isinstance(row.meta, dict) and row.meta.get("kind") == engine_module.PLATFORM_TEXT_KIND
+        if isinstance(row.meta, dict) and row.meta.get("kind") == PLATFORM_TEXT_KIND
     ] == [MessageEntryKind.SYSTEM_EVENT]
 
 
@@ -961,7 +974,7 @@ async def test_a_turn_that_only_used_a_tool_leaves_no_words_behind(
     assert not [
         row
         for row in rows
-        if isinstance(row.meta, dict) and row.meta.get("kind") == engine_module.PLATFORM_TEXT_KIND
+        if isinstance(row.meta, dict) and row.meta.get("kind") == PLATFORM_TEXT_KIND
     ]
     items = project_rows(list(rows))
     assert not [i for i in items if isinstance(i, AssistantTextItem)]

@@ -124,6 +124,7 @@ from src.services.build_sessions.manager import (
 from src.services.build_sessions.outcome import STOPPED_BY_USER
 from src.services.messages.projection import (
     PLAN_OPTIONS_TOOL,
+    PLATFORM_TEXT_KIND,
     PROPOSE_SLICE_TOOL,
     TELL_THE_USER_TOOL,
     TURN_TERMINAL_KIND,
@@ -213,20 +214,6 @@ ENDED_TURN_TTL_S = 300.0
 _STEPS_CAP = 256
 
 TurnStatus = Literal["running", "completed", "failed", "stopped"]
-
-PLATFORM_TEXT_KIND: Final = "platform_text"
-"""The row meta that says a sentence in the transcript is the PLATFORM's, not the model's.
-
-WHAT IT BUYS TODAY is the record: the row is a `SYSTEM_EVENT` carrying the platform's own
-words, so nothing downstream — a reader, an operator, an audit — has to infer authorship from
-a sentence that looks exactly like a reply. It renders to the citizen exactly as it did
-before, through the projection's arm for a visible system row with text, which exists so a
-lifecycle entry degrades to prose rather than vanishing.
-
-WHAT IT IS FOR NEXT is plan 009, which is building the durable, typed home for platform
-speech on the turn-terminal row. This is the marker that row adopts. Naming it here rather
-than inventing a second rendering now is deliberate: two homes would show the citizen the
-same sentence twice."""
 
 # What a turn failure tells the subscriber. Internal detail stays in the server log.
 _TURN_FAILED_MESSAGE = "The assistant hit a problem and this turn was stopped."
@@ -1187,26 +1174,6 @@ class TurnEngine:
                     batches: list[
                         tuple[list[ModelMessage], dict[str, Any] | None, MessageEntryKind]
                     ] = [(persistable, self._pending_meta(deferred), MessageEntryKind.TURN)]
-                    if platform_text is not None:
-                        # ITS OWN ROW, AND NOT IN THE MODEL'S NAME. This sentence is the
-                        # platform's — it explains a refusal the platform made — and it used to
-                        # be appended to the run's own messages as a `ModelResponse`, which
-                        # stored it as something the model had written. It renders to the
-                        # citizen exactly as it did: a visible system row carrying text already
-                        # projects as assistant prose, which is the arm that exists so a
-                        # lifecycle entry degrades to prose rather than vanishing.
-                        #
-                        # NO SECOND LIVE HOME. Plan 009 is building the durable, typed home for
-                        # platform speech on the turn-terminal row; when it lands this is the
-                        # row it adopts. Routing the sentence to a live-only banner in the
-                        # meantime would give the citizen the same words twice.
-                        batches.append(
-                            (
-                                [ModelResponse(parts=[TextPart(content=platform_text)])],
-                                {"kind": PLATFORM_TEXT_KIND, "turnId": str(state.turn_id)},
-                                MessageEntryKind.SYSTEM_EVENT,
-                            )
-                        )
 
                     # NO SECOND MODEL REQUEST IS ISSUED HERE, and none is issued anywhere as a
                     # consequence of what the model wrote. The forced retry that used to sit at
@@ -1232,6 +1199,41 @@ class TurnEngine:
                                     kind=state.kind,
                                     meta=meta,
                                 )
+                        if platform_text is not None:
+                            # ITS OWN ROW, IN NOBODY'S NAME BUT THE PLATFORM'S. This sentence
+                            # explains a refusal the platform made. It used to be appended to
+                            # the run's own messages as a `ModelResponse`, which stored it as
+                            # something the model had written — and `load_history` flattens
+                            # every row's payload, so the next turn handed the model its own
+                            # explanation back as a paragraph it had authored and could build
+                            # on or repeat.
+                            #
+                            # AN EMPTY PAYLOAD, WITH THE WORDS IN `meta`, which is the pattern
+                            # the turn-terminal row already uses and the one `load_history`'s
+                            # docstring names: hiddenness is a render predicate and was never a
+                            # statement about what the model may see, so a row that must not
+                            # reach the model carries no messages at all. The projection reads
+                            # the sentence straight out of `meta` and renders it exactly as it
+                            # did before — the citizen's transcript is unchanged; only the
+                            # model's copy is gone.
+                            #
+                            # NO SECOND LIVE HOME. Plan 009 is building the durable, typed home
+                            # for platform speech on the turn-terminal row; when it lands this
+                            # is the row it adopts. Routing the sentence to a live-only banner
+                            # in the meantime would give the citizen the same words twice.
+                            await append_batch(
+                                db,
+                                user_id=state.user_id,
+                                conversation_id=state.conversation_id,
+                                messages=[],
+                                entry_kind=MessageEntryKind.SYSTEM_EVENT,
+                                kind=state.kind,
+                                meta={
+                                    "kind": PLATFORM_TEXT_KIND,
+                                    "turnId": str(state.turn_id),
+                                    "text": platform_text,
+                                },
+                            )
                         await db.commit()
                     except Exception as exc:
                         raise _PersistFailedError from exc

@@ -48,6 +48,22 @@ PROPOSE_SLICE_TOOL: Final = "propose_first_slice"
 other two are: the live emitter and this one must agree on the spelling, and the stored call is
 the record both of them read."""
 
+PLATFORM_TEXT_KIND: Final = "platform_text"
+"""`meta.kind` of a row whose sentence is the PLATFORM's, not the model's.
+
+WHAT IT BUYS is the record AND the model's silence, and the second half is the one that took
+work. The row is a `SYSTEM_EVENT`, so nothing downstream — a reader, an operator, an audit —
+has to infer authorship from a sentence that looks exactly like a reply; and it carries NO
+payload, so `load_history` — which flattens every row's messages regardless of kind or
+visibility — has nothing of it to hand back to the model as words the model wrote. The
+sentence lives in `meta.text` and the arm below renders it from there, which is why taking it
+out of the payload changes nothing the citizen sees.
+
+WHAT IT IS FOR NEXT is plan 009, which is building the durable, typed home for platform
+speech on the turn-terminal row. This is the marker that row adopts. Naming it here rather
+than inventing a second rendering now is deliberate: two homes would show the citizen the
+same sentence twice."""
+
 TURN_TERMINAL_KIND: Final = "turn_terminal"
 """`meta.kind` of the durable turn-terminal row. Named here, beside the arm that reads it, and
 imported by the engine that writes it — one spelling, because a writer and a reader that each
@@ -1021,6 +1037,21 @@ def project_rows(rows: Sequence[Message]) -> list[DisplayItem]:
                 continue
             if row.visibility is MessageVisibility.HIDDEN:
                 continue  # hidden system rows render nothing
+            if kind == PLATFORM_TEXT_KIND:
+                # THE WORDS COME OUT OF `meta`, because the payload is empty on purpose — see
+                # the constant above. The citizen reads the sentence exactly as they always
+                # have; it is the model that no longer receives it.
+                #
+                # THE PAYLOAD FALLBACK IS FOR THE ROWS ALREADY WRITTEN. Rows from before the
+                # sentence moved carry it as a `ModelResponse` and no `meta.text`, and a
+                # transcript that silently dropped a paragraph a citizen had read is a worse
+                # outcome than the replay this changed. Their model-facing copy stays; only
+                # rows written from now on are out of the model's history.
+                spoken = meta.get("text")
+                text = spoken if isinstance(spoken, str) else _payload_text(row.payload)
+                if text:
+                    items.append(AssistantTextItem(seq=row.seq, text=text))
+                continue
             if kind == "build_outcome" and isinstance(session_id, str):
                 preview = meta.get("previewUrl")
                 items.append(
