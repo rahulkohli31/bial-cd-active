@@ -54,7 +54,7 @@ import { memo, useCallback } from 'react'
 import { Box, Locate, Play, type LucideIcon } from 'lucide-react'
 import AppPaneHost from './AppPaneHost'
 import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
-import { usePaneLeaving } from './paneExit'
+import { inertWhile, usePaneLeaving } from './paneExit'
 import StartAppControl from './StartAppControl'
 import type { DeviceName } from './devices'
 import { WORKSPACE_RAIL_ID } from './railId'
@@ -166,6 +166,16 @@ function AppPane({ device, reloadNonce }: AppPaneProps) {
       // movement is for the eye; a reader who is not watching it should not be told about an app
       // that is leaving.
       aria-hidden={!visible}
+      // AND OUT OF REACH ON THE SAME FACT, from the same moment. `aria-hidden` is the half a
+      // screen reader obeys; this is the half a keyboard obeys, and they are given one condition
+      // so they cannot come apart.
+      //
+      // IT IS THE LEAVE THAT NEEDS IT. At rest the pane is `visibility:hidden`, which drops its
+      // subtree from the tab order on its own — but the column holds its SIZE for one animation so
+      // the card can be watched going, and an invisible element has nothing to animate. For that
+      // quarter of a second the skip control below and the framed app were both still one Tab
+      // away, on a region already announced as gone. See `paneExit.ts` for the empty string.
+      {...inertWhile(!visible)}
       className={
         visible
           ? 'flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden'

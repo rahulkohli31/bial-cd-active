@@ -29,15 +29,23 @@
  * NOTHING HERE UNMOUNTS OR RE-KEYS ANYTHING. The pane is the same element throughout, with a class
  * change — the whole reason the movement is safe over a live iframe.
  *
- * ═══ THE ONE COST, SAID OUT LOUD ═══
+ * ═══ THE ONE COST, AND HOW IT IS PAID ═══
  *
  * `visibility:hidden` is what takes the framed app out of the TAB ORDER (see `hiddenSubtree.ts`),
  * and it cannot be applied while the card is still being watched leave — an invisible element has
- * nothing to animate. So for {@link PANE_EXIT_MS} the departing app is announced as gone
- * (`aria-hidden` lands immediately) but is still reachable by Tab. The clean fix is the `inert`
- * attribute, which removes a subtree from the tab order while leaving it painted; React 18 has no
- * supported prop for it, so it is named here rather than smuggled in as a raw attribute, and it is
- * the first thing to revisit when this app moves to React 19.
+ * nothing to animate. So for {@link PANE_EXIT_MS} the departing app was announced as gone
+ * (`aria-hidden` lands immediately) and still reachable by Tab: a quarter of a second in which a
+ * keyboard could land on the skip control, or inside the frame of an app that is no longer on the
+ * screen. `hiddenSubtree.ts` names that pairing for what it is — a WCAG 4.1.2 violation.
+ *
+ * `inert` is the attribute for exactly this: it removes a subtree from the tab order and the
+ * accessibility tree while leaving it PAINTED, which is the pair the animation needs. This file
+ * used to say React 18 had no supported prop for it and leave it for the React 19 upgrade. That
+ * was half true — a boolean `inert` is dropped with a warning, and `@types/react` 18 declares no
+ * such prop — but the attribute's own serialisation is the EMPTY STRING, and React passes a
+ * string-valued unknown attribute through exactly as given. {@link inertWhile} hands it over that
+ * way, through a spread, which is the one form TypeScript accepts without a cast. On React 19 it
+ * becomes `inert={unreachable}` and the helper goes away.
  */
 import { useEffect, useRef, useState } from 'react'
 
@@ -57,6 +65,18 @@ export const PANE_EXIT_MS = 240
  * every plan chat opened cold, and the project screen before anything is built — goes straight to
  * its resting state with no animation and no delay.
  */
+/**
+ * `inert` for as long as the pane is not part of the page — spread onto the element that already
+ * carries `aria-hidden`, so "announced gone" and "out of reach" cannot drift apart.
+ *
+ * ABSENT RATHER THAN `inert={false}` when the pane is reachable, and that is not a style choice:
+ * `inert` is a boolean attribute, so ANY value makes a subtree unreachable and `inert="false"`
+ * would take the whole pane out of the tab order for good.
+ */
+export function inertWhile(unreachable: boolean): { inert?: '' } {
+  return unreachable ? { inert: '' } : {}
+}
+
 export function usePaneLeaving(visible: boolean): boolean {
   const [leaving, setLeaving] = useState(false)
   const was = useRef(visible)

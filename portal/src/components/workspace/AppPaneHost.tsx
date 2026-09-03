@@ -135,7 +135,15 @@ export default function AppPaneHost({ device, reloadNonce, leaving }: AppPaneHos
         visible
           ? 'flex-1 min-w-0 overflow-hidden animate-pane-return'
           : leaving
-            ? 'flex-1 min-w-0 overflow-hidden'
+            ? // ON ITS WAY OUT, at full size, because the column above is playing a keyframe over
+              // this element and `w-0` would leave it playing over nothing.
+              //
+              // THE FOCUS CONTAINMENT IS NOT MISSING FROM THIS ARM, it is one level up: the
+              // section carries `inert` for as long as the pane is unwanted, and `inert` covers a
+              // whole subtree, so the fading frame is out of the tab order for the entire hold.
+              // Do not reach for `HIDDEN_BUT_MOUNTED` here to close a gap that is already closed
+              // — it would delete the movement it is meant to protect.
+              'flex-1 min-w-0 overflow-hidden'
             : // Zero size AND out of reach. The width alone would only clip it; HIDDEN_BUT_MOUNTED is
               // what takes the framed app out of the tab order and out of the accessibility tree.
               `w-0 flex-shrink-0 overflow-hidden ${HIDDEN_BUT_MOUNTED}`

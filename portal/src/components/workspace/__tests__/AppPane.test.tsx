@@ -441,6 +441,53 @@ describe('the movement between the two layouts (plan 002, U6)', () => {
     expect(container.querySelector('iframe')).toBeTruthy()
   })
 
+  it('★ stays out of the keyboard’s reach for the WHOLE leave, not only once it has gone', async () => {
+    // THE GAP THIS IS WRITTEN AGAINST. The column holds its size for the length of the animation so
+    // the card can be watched leaving, which means `visibility:hidden` — the thing that takes a
+    // subtree out of the tab order — cannot land yet. For those 240ms the pane was announced as
+    // gone and still one Tab away: a keyboard could land on the skip control, or inside the frame
+    // of an app that was no longer on the screen. `hiddenSubtree.ts` names that pairing a WCAG
+    // 4.1.2 violation, and this is the applier where what is hidden is a whole application.
+    //
+    // ASSERTED AS THE ATTRIBUTE, and honestly: jsdom implements no part of `inert` — it neither
+    // reflects the property nor refuses a `focus()` inside one — so a focus simulation here would
+    // be inventing a browser rather than testing one. The attribute IS the mechanism a browser
+    // obeys, which is the same bargain the `aria-hidden` assertions in this file already make.
+    const { container, channel } = renderPane(framed, true)
+    // A pane somebody is looking at is reachable, or the assertion below proves nothing.
+    expect(region().hasAttribute('inert')).toBe(false)
+
+    act(() => channel.visible.set(false))
+
+    // MID-LEAVE: still sized, still animating, still framing the app — and unreachable.
+    expect(paneClasses(container)).toContain('animate-pane-leave')
+    expect(paneClasses(container)).not.toContain('invisible')
+    expect(region().hasAttribute('inert')).toBe(true)
+    // LIVENESS, and the reason a subtree attribute is the right shape: the two focusable things
+    // inside the region are the skip control and the frame itself, and both are covered by one
+    // attribute rather than by a list this test would have to keep up with.
+    expect(container.querySelector('iframe')?.closest('[inert]')).toBe(region())
+    expect(region().querySelector('button')?.textContent).toMatch(/skip past your app/i)
+
+    // AND IT IS STILL UNREACHABLE ONCE THE HOLD ENDS, where `visibility:hidden` takes over.
+    await waitFor(() => expect(paneClasses(container)).toContain('w-0'))
+    expect(region().hasAttribute('inert')).toBe(true)
+  })
+
+  it('★ becomes reachable again the moment the pane is back', async () => {
+    // The other direction, and the one that would turn this fix into a worse bug than the one it
+    // fixes: an `inert` that never lifted would leave a citizen looking at their app unable to
+    // reach anything in it, with nothing on the screen to explain why.
+    const { container, channel } = renderPane(framed, true)
+
+    act(() => channel.visible.set(false))
+    await waitFor(() => expect(paneClasses(container)).toContain('w-0'))
+    act(() => channel.visible.set(true))
+
+    expect(region().hasAttribute('inert')).toBe(false)
+    expect(container.querySelector('iframe')?.closest('[inert]')).toBeNull()
+  })
+
   it('★ carries the return half of the pair when the pane comes back', async () => {
     const { container, channel } = renderPane(framed, true)
     expect(container.querySelector('[data-testid="app-pane"]')?.className).toMatch(/animate-pane-return/)
