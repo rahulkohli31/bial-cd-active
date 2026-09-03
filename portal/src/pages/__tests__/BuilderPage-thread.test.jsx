@@ -456,6 +456,11 @@ describe('R8 live clause — a reload MID-TURN re-attaches to the running reply'
     // Once, not twice — and `getAllByText` rather than `getByText` so the assertion is about the
     // COUNT: `getByText` throws on multiple matches, which reads as a broken query.
     expect(screen.getAllByText(/Let me look at the page\./)).toHaveLength(1)
+    // ★ AND THE CITIZEN'S OWN MESSAGE SURVIVED IT. The stored user row is `srv_` plus one text
+    // part, sitting at exactly the seq the boundary is drawn from, so the suppression deleted it
+    // — the reply arrived with nothing above it saying what had been asked. Nothing re-tells a
+    // prompt, so this is the assertion that tells de-duplication apart from loss.
+    expect(screen.getByText('add a page')).toBeTruthy()
   })
 
   it('draws the working status BELOW prose already on screen, not above it', async () => {

@@ -2132,6 +2132,15 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       // written on seq and parts alone would delete the very message it is protecting.
       const stepOnly = parts.length > 0 && parts.every((p) => p?.type === 'step')
       const reTold =
+        // NEVER THE CITIZEN'S OWN MESSAGE, and the guard is not defensive. The boundary IS the
+        // user row's seq, and a stored user row is `srv_` plus a single text part — so it
+        // matched this rule exactly and `>=` deleted it. A citizen who reloaded mid-build
+        // watched their own words disappear and the reply arrive with nothing above it saying
+        // what had been asked. Nothing put them back either: the snapshot re-tells the
+        // assistant's prose and steps and never the prompt, so this was loss, not
+        // de-duplication. (It was invisible while the rule was steps-only; widening it to
+        // prose is what let a text row through.)
+        msg.role !== 'user' &&
         msg.id.startsWith('srv_') &&
         parts.length > 0 &&
         parts.every((p) => p?.type === 'step' || p?.type === 'text')
