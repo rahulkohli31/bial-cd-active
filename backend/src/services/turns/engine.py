@@ -3105,9 +3105,12 @@ class TurnEngine:
         THE FLAG RIDES THE TURN, NOT A MESSAGE, and that is the seam an earlier draft of this
         got wrong. The browser's status renderer is reached only when a message actually
         carries a part of the reasoning kind, so a boolean alone renders nothing — what the
-        chat surface does with this is synthesise a CONTENT-FREE reasoning part at the head of
-        the streaming message while it is true. Content-free is the point: the part carries no
-        text, so "status only, never the reasoning" is structural rather than a promise.
+        chat surface does with this is synthesise a CONTENT-FREE reasoning part at the TAIL of
+        the streaming message while it is true — the model is thinking at the end of what it has
+        written so far, and pinning the part to the head put "Working on your app" above
+        paragraphs the citizen had already read, which made the whole turn appear to jump down
+        the screen. Content-free is the point: the part carries no text, so "status only, never
+        the reasoning" is structural rather than a promise.
 
         EDGE-TRIGGERED. Reasoning arrives as a stream of deltas, and a frame per delta would
         put thousands of identical frames through a ring sized for a turn's whole narrative."""
