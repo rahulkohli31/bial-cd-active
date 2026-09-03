@@ -345,18 +345,23 @@ describe('messagesFromProjection — keys are unique per ITEM, not per row (N3)'
   const keysOf = (projection) => messagesFromProjection(projection).map((m) => m.id)
   const unique = (keys) => new Set(keys).size === keys.length
 
-  it('THE BUG: one row projecting two assistant_text items yields two DISTINCT keys', () => {
-    const keys = keysOf([
+  it('two assistant_text items in one row become ONE reply, under one key', () => {
+    // N3's collision is answered by there being nothing to collide: consecutive assistant
+    // content is now PARTS of one reply rather than separate messages. The source ordinal is
+    // still in the key, which is what keeps it unique against everything around it.
+    const messages = messagesFromProjection([
       { type: 'assistant_text', seq: 4, mode: 'write', text: 'first part' },
       { type: 'assistant_text', seq: 4, mode: 'write', text: 'second part' },
     ])
-    expect(keys).toHaveLength(2)
-    expect(unique(keys)).toBe(true)
+    expect(messages).toHaveLength(1)
+    expect(messages[0].parts.map((p) => p.text)).toEqual(['first part', 'second part'])
+    expect(unique(messages.map((m) => m.id))).toBe(true)
   })
 
-  it('holds for every kind that can repeat within one row', () => {
-    // The same collision shape for _u / _s / _b / _p / _g, since any of them can be emitted
-    // more than once for a single stored row.
+  it('keys stay unique across kinds that can repeat within one row', () => {
+    // Two user turns, one coalesced reply carrying both steps, and two in-progress markers —
+    // five messages, five distinct keys. What matters here is uniqueness, not the count: a
+    // duplicate key is what React says "may cause children to be duplicated and/or omitted".
     const keys = keysOf([
       { type: 'user_text', seq: 1, mode: 'ask', text: 'a', attachmentIds: [] },
       { type: 'user_text', seq: 1, mode: 'ask', text: 'b', attachmentIds: [] },
@@ -365,7 +370,7 @@ describe('messagesFromProjection — keys are unique per ITEM, not per row (N3)'
       { type: 'build_in_progress', seq: 3, sessionId: 's' },
       { type: 'build_in_progress', seq: 3, sessionId: 's' },
     ])
-    expect(keys).toHaveLength(6)
+    expect(keys).toHaveLength(5)
     expect(unique(keys)).toBe(true)
   })
 
@@ -402,11 +407,79 @@ describe('messagesFromProjection — keys are unique per ITEM, not per row (N3)'
   it('a hidden step does not renumber the items after it', () => {
     // The ordinal counts SOURCE position precisely so that flipping a step's `hidden` cannot
     // shift every later key — which an output-array index would have done.
+    // A user turn between the two replies, so each one opens its OWN message and therefore
+    // shows its own key — otherwise the trailing text joins the reply above it and the ordinal
+    // under test never reaches an id.
     const withHidden = [
       { type: 'step', seq: 1, tool: 'write_file', label: 'x', state: 'ok', hidden: false },
       { type: 'step', seq: 2, tool: 'read_file', label: 'y', state: 'ok', hidden: true },
-      { type: 'assistant_text', seq: 3, mode: 'write', text: 'done' },
+      { type: 'user_text', seq: 3, mode: 'ask', text: 'and now?', attachmentIds: [] },
+      { type: 'assistant_text', seq: 4, mode: 'write', text: 'done' },
     ]
-    expect(keysOf(withHidden)).toEqual(['srv_1_s_0', 'srv_3_a_2'])
+    // `_3` and not `_2`: the ordinal counts SOURCE position, so dropping the hidden step at
+    // index 1 does not pull the items after it down.
+    expect(keysOf(withHidden)).toEqual(['srv_1_s_0', 'srv_3_u_2', 'srv_4_a_3'])
+  })
+})
+
+/**
+ * ONE REPLY IS ONE MESSAGE — the regression guard for the copy control.
+ *
+ * A citizen asks once and is answered once. This path used to push a separate message per
+ * projection item, so a reply of prose-and-steps came back from a reload as seven or fourteen
+ * messages. Anything mounted per message multiplied with them: a real eight-turn transcript
+ * offered 41 copy buttons, and none of them copied the reply that had been read — only the
+ * fragment beside it. The live path never had this shape (`streamingParts` builds one ordered
+ * part list per turn), so this was also a live-vs-reload divergence against R72/AE43.
+ */
+describe('one reply is one message (the copy-control guard)', () => {
+  it('prose and steps interleaved come back as ONE assistant message, in order', () => {
+    const messages = messagesFromProjection([
+      { type: 'user_text', seq: 0, mode: 'ask', text: 'build me a visitor log', attachmentIds: [] },
+      { type: 'assistant_text', seq: 1, mode: 'write', text: "I'll start by looking around." },
+      { type: 'step', seq: 2, tool: 'read_file', label: "Looked through the app's files", state: 'ok', hidden: false },
+      { type: 'step', seq: 3, tool: 'read_file', label: 'Looked at the main page', state: 'ok', hidden: false },
+      { type: 'assistant_text', seq: 4, mode: 'write', text: 'Now let me build the schema.' },
+      { type: 'step', seq: 5, tool: 'write_file', label: 'Updated the page', state: 'ok', hidden: false },
+    ])
+
+    expect(messages.map((m) => m.role)).toEqual(['user', 'assistant'])
+    // ORDER IS THE RENDER: the library groups ADJACENT tool parts, so this part list draws one
+    // paragraph, a group of two steps, a second paragraph, then a group of one.
+    expect(messages[1].parts.map((p) => p.type)).toEqual(['text', 'step', 'step', 'text', 'step'])
+  })
+
+  it('a new question starts a new reply', () => {
+    const messages = messagesFromProjection([
+      { type: 'user_text', seq: 0, mode: 'ask', text: 'first', attachmentIds: [] },
+      { type: 'assistant_text', seq: 1, mode: 'write', text: 'answer one' },
+      { type: 'user_text', seq: 2, mode: 'ask', text: 'second', attachmentIds: [] },
+      { type: 'assistant_text', seq: 3, mode: 'write', text: 'answer two' },
+    ])
+    expect(messages.map((m) => m.role)).toEqual(['user', 'assistant', 'user', 'assistant'])
+    expect(messages.filter((m) => m.role === 'assistant')).toHaveLength(2)
+  })
+
+  it('a banner ends the reply rather than joining it', () => {
+    // The outcome bubble is its own message on the live path too, so it stays one here.
+    const messages = messagesFromProjection([
+      { type: 'assistant_text', seq: 1, mode: 'write', text: 'working on it' },
+      { type: 'banner', seq: 2, mode: 'write', banner: 'completed', text: 'Done.', previewUrl: null, sessionId: 's1' },
+      { type: 'assistant_text', seq: 3, mode: 'write', text: 'anything else?' },
+    ])
+    expect(messages).toHaveLength(3)
+    expect(messages[1].parts.map((p) => p.type)).toEqual(['text', 'build'])
+  })
+
+  it('a hidden step does not split the reply around it', () => {
+    // Dropping a step must not seal the group and open a second one — the adjacency the
+    // library's grouping reads is the whole reason hidden steps are dropped, not positioned.
+    const messages = messagesFromProjection([
+      { type: 'step', seq: 1, tool: 'write_file', label: 'x', state: 'ok', hidden: false },
+      { type: 'step', seq: 2, tool: 'read_file', label: 'plumbing', state: 'ok', hidden: true },
+      { type: 'step', seq: 3, tool: 'write_file', label: 'y', state: 'ok', hidden: false },
+    ])
+    expect(messages).toHaveLength(1)
+    expect(messages[0].parts).toHaveLength(2)
   })
 })

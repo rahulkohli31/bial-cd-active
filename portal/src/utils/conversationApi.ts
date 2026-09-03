@@ -12,7 +12,7 @@ import { authFetch } from './api'
 import type { AuthFetchDeps } from './api'
 import { readApiError } from './apiError'
 import { toPlanOptionsItem, toStepItem } from './turnStreamApi'
-import type { ChatMessage } from './messageTypes'
+import type { ChatMessage, MessagePart } from './messageTypes'
 
 /** The in-memory header shape pages expect, normalized from the server's raw doc.
  *
@@ -142,6 +142,41 @@ export function messagesFromProjection(
   onUnknown: (item: RawProjectionItem) => void = reportUnknownProjectionItem,
 ): ChatMessage[] {
   const messages: ChatMessage[] = []
+
+  /**
+   * THE ASSISTANT MESSAGE CURRENTLY BEING FILLED — one per reply, not one per item.
+   *
+   * A citizen asks once and is answered once, and a reply is prose and steps interleaved. The
+   * LIVE path has always built it that way: `streamingParts` returns ONE ordered `MessagePart[]`
+   * for the whole turn, and the library coalesces adjacent tool parts into an activity group,
+   * so a paragraph written between two runs of steps seals one group and opens the next.
+   *
+   * This path used to push a SEPARATE message per projection item, so the same reply came back
+   * from a reload as seven, or fourteen, assistant messages. Everything hung off a message then
+   * multiplied with them — most visibly the copy control, which sits on each one: a real
+   * transcript offered 41 copy buttons where it should offer 8, none of which copied the reply
+   * a citizen had actually read, only the fragment beside it. Live and reload are supposed to
+   * render identically (R72/AE43); they did not, and the reload half was wrong.
+   *
+   * Only `assistant_text` and `step` accumulate, which is exactly the set `streamingParts`
+   * carries. Banners, offers and the in-progress marker stay their own messages on both paths.
+   */
+  let open: (ChatMessage & { parts: MessagePart[] }) | null = null
+
+  /** End the current reply. The next assistant item starts a new one. */
+  const seal = (): void => {
+    open = null
+  }
+
+  /** Add a part to the reply in progress, or start a reply with it. */
+  const addToReply = (part: MessagePart, id: string, seq: number): void => {
+    if (open) {
+      open.parts.push(part)
+      return
+    }
+    open = { id, role: 'assistant', parts: [part], seq }
+    messages.push(open)
+  }
   // THE KEY CARRIES THE ITEM'S POSITION, not just its seq (N3). One `messages` row can project
   // SEVERAL items — an assistant turn with two text parts, a row that yields both a step and a
   // banner — and every one of them inherits that row's seq. Keyed `srv_{seq}_{kind}` alone,
@@ -154,6 +189,7 @@ export function messagesFromProjection(
   // re-renders and across refetches that append.
   for (const [index, item] of (projection || []).entries()) {
     if (item.type === 'user_text') {
+      seal()
       messages.push({
         id: `srv_${item.seq}_u_${index}`,
         role: 'user',
@@ -161,13 +197,9 @@ export function messagesFromProjection(
         seq: item.seq,
       })
     } else if (item.type === 'assistant_text') {
-      messages.push({
-        id: `srv_${item.seq}_a_${index}`,
-        role: 'assistant',
-        parts: [{ type: 'text', text: item.text as string }],
-        seq: item.seq,
-      })
+      addToReply({ type: 'text', text: item.text as string }, `srv_${item.seq}_a_${index}`, item.seq)
     } else if (item.type === 'banner') {
+      seal()
       // The builder outcome bubble: the stored sentence + the build part the page's
       // existing renderer reads (status derives from the banner kind).
       messages.push({
@@ -198,6 +230,7 @@ export function messagesFromProjection(
       // message is pushed for it, same as the live path's `if (item === null) return null`.
       const planItem = toPlanOptionsItem(item)
       if (planItem !== null) {
+        seal()
         messages.push({
           id: `srv_${item.seq}_p_${index}`,
           role: 'assistant',
@@ -226,15 +259,11 @@ export function messagesFromProjection(
         // nothing to show"), not because this branch can realistically trigger it today.
         const stepItem = toStepItem(item)
         if (stepItem !== null) {
-          messages.push({
-            id: `srv_${item.seq}_s_${index}`,
-            role: 'assistant',
-            parts: [{ type: 'step', step: stepItem }],
-            seq: item.seq,
-          })
+          addToReply({ type: 'step', step: stepItem }, `srv_${item.seq}_s_${index}`, item.seq)
         }
       }
     } else if (item.type === 'build_in_progress') {
+      seal()
       // A build began and no outcome closed it — the page reattaches to the live session
       // when there is one, and states the durable truth when there is not (U15).
       messages.push({
