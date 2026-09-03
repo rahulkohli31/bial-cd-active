@@ -175,6 +175,40 @@ describe('what the handle remembers, and what it does not', () => {
     expect(widthOf()).toBe('600px')
   })
 
+  it('★ a press on the divider that never moved remembers nothing', () => {
+    // THE DEFECT THIS IS WRITTEN AGAINST. A remembered width replaces BOTH opening widths, so
+    // committing on every `pointerup` meant one stray click on the 9px divider inside a chat
+    // pinned every project screen at the chat's 520px — a preference the citizen never expressed.
+    render(<Workspace />)
+    fireEvent.pointerDown(handle(), { pointerId: 1, clientX: 400 })
+    fireEvent.pointerUp(handle(), { pointerId: 1, clientX: 400 })
+
+    expect(window.localStorage.getItem('bial:rail-width')).toBeNull()
+    // LIVENESS: the same handle in the same render DOES remember a real drag, so the assertion
+    // above is a guard holding rather than a handle that stopped working.
+    drag(560)
+    expect(window.localStorage.getItem('bial:rail-width')).toBe('560')
+  })
+
+  it('★ one drag writes the preference once, including the browser\'s own capture-loss echo', () => {
+    // `end` is wired to `pointerup`, `pointercancel` AND `lostpointercapture`, and releasing
+    // capture inside it makes the browser queue a `lostpointercapture` of its own — so a single
+    // drag entered the commit twice. jsdom's capture stubs fire no such event, which is why the
+    // echo is dispatched here explicitly: it is what a real browser does after every drag.
+    const writes = vi.spyOn(Storage.prototype, 'setItem')
+    render(<Workspace />)
+
+    fireEvent.pointerDown(handle(), { pointerId: 1, clientX: 400 })
+    fireEvent.pointerMove(handle(), { pointerId: 1, clientX: 560 })
+    fireEvent.pointerUp(handle(), { pointerId: 1, clientX: 560 })
+    fireEvent.lostPointerCapture(handle(), { pointerId: 1 })
+
+    expect(writes.mock.calls.filter(([key]) => key === 'bial:rail-width')).toEqual([
+      ['bial:rail-width', '560'],
+    ])
+    writes.mockRestore()
+  })
+
   it('opens at the board\'s own width when nothing is remembered', () => {
     render(<Workspace />)
     expect(widthOf()).toBe('400px')
