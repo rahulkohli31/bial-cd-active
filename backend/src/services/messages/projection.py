@@ -807,9 +807,10 @@ def finished_from_args(args: Any) -> str | None:
     """The piece a `tell_the_user` call marked finished, or None when it marked none.
 
     Separate from `update_from_args` because the two answer different questions and either can
-    be present without the other: an update with no mark is the ordinary case, and a mark whose
-    update was over the ceiling still happened — the piece IS finished, and losing that because
-    the sentence was too long would corrupt the closing account over a copy problem."""
+    be present without the other: an update with no mark is the ordinary case, and a mark that
+    arrives with nothing showable beside it — an empty or unparseable `update` — still happened.
+    The piece IS finished, and losing that because the sentence alongside it could not be
+    rendered would corrupt the closing account over a copy problem."""
     finished = _args_dict(args).get("finished")
     if not isinstance(finished, str):
         return None
