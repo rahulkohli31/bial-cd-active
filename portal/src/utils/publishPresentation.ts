@@ -508,6 +508,30 @@ export function provenanceRows(
     tone: 'ink',
   }
 
+  /**
+   * NO APPROVAL MEANS NO APPROVED ROW, rather than an APPROVED row saying it cannot tell.
+   *
+   * An app that published unattended under ladder rule 7 was never seen by an administrator, and
+   * that is the common case rather than the exotic one: `approved_at` and `approved_commit_sha`
+   * are both NULL for every one of them. The row rendered anyway, and a row whose heading is
+   * APPROVED and whose whole value is "We could not tell" reads as "an administrator approved
+   * this and the platform lost the record" — an approval that never happened, which is exactly
+   * the claim the sentences above are written three times over to avoid. The absent row says the
+   * true thing by saying nothing.
+   *
+   * EITHER HALF ANSWERS IT: the two are written together in one place server-side and are never
+   * apart (`deployApi.ts`, `ApprovalState.approvedAt`).
+   *
+   * The two `approved_*` states keep the row unconditionally, and must: those states ASSERT an
+   * approval, so a missing stamp there is a genuine "we could not tell" about a real event.
+   */
+  const wasApproved = (approval?.approvedAt ?? approval?.approvedCommitSha ?? null) !== null
+  const liveRows = (tone: RowTone): ProvenanceRow[] => [
+    published,
+    ...(wasApproved ? [approved] : []),
+    savedRow(deployment, 'YOUR LATEST', tone),
+  ]
+
   switch (state) {
     // NOTHING TO SHOW, AND NOT BECAUSE A FETCH IS MISSING. A project with nothing built has no
     // version of anything; a publish in flight and a switched-off app both have nothing a row
@@ -525,16 +549,17 @@ export function provenanceRows(
     case 'approved_ready_to_publish':
     case 'approved_needs_review_again':
       return [approved, savedRow(deployment, 'LAST SAVED', 'ink')]
-    // THE THREE ROWS THE BOARD DRAWS, and the one that is amber. Only `live_newer_work` is
+    // THE ROWS THE BOARD DRAWS — three where an administrator approved the version, two where
+    // nobody did (see `wasApproved`) — and the one that is amber. Only `live_newer_work` is
     // KNOWN to have drifted: `live_current` knows the two agree, and `live_drift_unknown` is
     // the state where the server could not tell — and a colour that says "yours is newer"
     // there would be the same false claim in the other direction.
     case 'live_current':
-      return [published, approved, savedRow(deployment, 'YOUR LATEST', 'ink')]
+      return liveRows('ink')
     case 'live_newer_work':
-      return [published, approved, savedRow(deployment, 'YOUR LATEST', 'drift')]
+      return liveRows('drift')
     case 'live_drift_unknown':
-      return [published, approved, savedRow(deployment, 'YOUR LATEST', 'ink')]
+      return liveRows('ink')
     case 'taken_offline':
       return [
         { ...published, label: 'LAST PUBLISHED', url: null },
