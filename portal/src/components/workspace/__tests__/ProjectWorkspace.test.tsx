@@ -446,7 +446,11 @@ describe('a chat that declares no pane', () => {
     expect(rail().className).not.toMatch(/lg:w-\[520px\]/)
     expect(frameWrapper()).toBeTruthy()
     expect(frame()).toBe(original)
-    expect(frameWrapper()?.className).toMatch(/invisible/)
+    // AWAITED, because the app is taken off the screen rather than snatched off it (plan 002, U6):
+    // the column holds its size for one animation while the card slides out, and only then does
+    // the hide treatment land. The frame identity above is the assertion that must hold throughout.
+    await waitFor(() => expect(frameWrapper()?.className).toMatch(/invisible/))
+    expect(frame()).toBe(original)
   })
 
   it('★ and the app does not reload on the way back either', async () => {

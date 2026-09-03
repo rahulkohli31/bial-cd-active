@@ -39,7 +39,7 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { useState, useEffect, type ReactNode } from 'react'
-import { render, screen, fireEvent, cleanup, act } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, act, waitFor } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, Link, useParams } from 'react-router-dom'
 import WorkspaceShell from '../WorkspaceShell'
 import {
@@ -185,7 +185,7 @@ describe('AppPaneHost — the frame outlives a move between the two addresses (A
     expect(loads).toBe(0)
   })
 
-  it('hides the pane on the project address rather than discarding it', () => {
+  it('hides the pane on the project address rather than discarding it', async () => {
     // "Hidden, not unmounted" IS the requirement: the pane is a cross-origin frame whose `src` is
     // re-issued on remount, and re-issuing it means a full reload plus a fresh framing handshake.
     render(<Workspace chatSurface={<ChatSurface />} />)
@@ -196,9 +196,12 @@ describe('AppPaneHost — the frame outlives a move between the two addresses (A
     const wrapper = paneWrapper()
     expect(wrapper).toBeTruthy()
     expect(frame()).toBeTruthy() // the liveness half: a host that threw would read as a pass
-    expect(wrapper?.className).toMatch(/invisible/)
-    expect(wrapper?.className).toMatch(/w-0/)
+    // AWAITED, because the departure is drawn rather than instant (plan 002, U6): the column holds
+    // its size for one animation while the card slides out, then collapses. The reader is told it
+    // is gone immediately, which is the assertion that needs no wait.
     expect(wrapper?.getAttribute('aria-hidden')).toBe('true')
+    await waitFor(() => expect(paneWrapper()?.className).toMatch(/invisible/))
+    expect(paneWrapper()?.className).toMatch(/w-0/)
   })
 
   it('leaves the frame alone when the conversation unmounts MID-BUILD', () => {
@@ -361,7 +364,7 @@ describe('AppPaneHost — a hidden pane is genuinely inert, at shell level', () 
   // assertions cannot observe anything the shell mounts and would stay green against a pane
   // leaking onto the project screen. Its assertions still pass and stay Plan F's to invert
   // deliberately; they are not evidence for this unit.
-  it('is in the document, out of the tab order, out of the accessibility tree, and offers nothing', () => {
+  it('is in the document, out of the tab order, out of the accessibility tree, and offers nothing', async () => {
     render(<Workspace chatSurface={<ChatSurface />} />)
     fireEvent.click(screen.getByText('to project'))
 
@@ -371,9 +374,10 @@ describe('AppPaneHost — a hidden pane is genuinely inert, at shell level', () 
     expect(wrapper.querySelector('iframe')).toBeTruthy()
 
     // `visibility:hidden` rather than `aria-hidden` alone: zero width and overflow:hidden clip a
-    // subtree visually but leave its descendants in the tab order.
-    expect(wrapper.className).toMatch(/invisible/)
+    // subtree visually but leave its descendants in the tab order. Awaited because the pane draws
+    // its departure first (plan 002, U6) — `aria-hidden` is the half that lands immediately.
     expect(wrapper.getAttribute('aria-hidden')).toBe('true')
+    await waitFor(() => expect(paneWrapper()?.className).toMatch(/invisible/))
 
     // None of the affordances the project screen's tests pin the absence of arrive with it.
     for (const name of [/view app/i, /continue building/i, /open app/i]) {

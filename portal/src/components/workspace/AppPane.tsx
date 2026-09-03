@@ -54,6 +54,7 @@ import { memo, useCallback } from 'react'
 import { Box, Locate, Play, type LucideIcon } from 'lucide-react'
 import AppPaneHost from './AppPaneHost'
 import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
+import { usePaneLeaving } from './paneExit'
 import StartAppControl from './StartAppControl'
 import { WORKSPACE_RAIL_ID } from './WorkspaceShell'
 import type { DeviceName } from './WorkspaceToolbar'
@@ -129,6 +130,10 @@ function AppPane({ device, reloadNonce }: AppPaneProps) {
   // ZERO IN BOTH DIRECTIONS, because this column sits in a flex row above the stacking threshold
   // and a flex COLUMN below it — a width alone leaves a full-height band under a stacked rail.
   const visible = useWorkspacePaneVisible()
+  // THE EXIT THE BOARD DRAWS, and the reason it needs a state of its own: see `paneExit.ts`. This
+  // column is the outermost thing that collapses, so the hold is decided here and handed to the
+  // host — the two must not disagree about whether they are still on their way out.
+  const leaving = usePaneLeaving(visible)
 
   /**
    * MOVE FOCUS BACK TO THE RAIL, and do it by focusing the region rather than hunting for its
@@ -157,13 +162,23 @@ function AppPane({ device, reloadNonce }: AppPaneProps) {
     <section
       data-testid="app-pane-region"
       aria-label="Your app"
+      // ANNOUNCED AS GONE THE MOMENT IT IS UNWANTED, even while it is still on its way out. The
+      // movement is for the eye; a reader who is not watching it should not be told about an app
+      // that is leaving.
       aria-hidden={!visible}
       className={
         visible
           ? 'flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden'
-          : // Hidden, never unmounted — the whole point of the sibling host is that leaving a
-            // build chat for a plan chat must not re-issue the frame's `src`.
-            `w-0 h-0 flex-shrink-0 overflow-hidden ${HIDDEN_BUT_MOUNTED}`
+          : leaving
+            ? // ON ITS WAY OUT (plan 002, U6). The column keeps its size for one animation while
+              // the card slides right and fades — `w-0` here instead would make the keyframe
+              // unobservable, which is why the utility existed unused. The rail beside it is
+              // already growing, which is the board's "the conversation is already settling
+              // towards the middle of the window".
+              'flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden animate-pane-leave'
+            : // Hidden, never unmounted — the whole point of the sibling host is that leaving a
+              // build chat for a plan chat must not re-issue the frame's `src`.
+              `w-0 h-0 flex-shrink-0 overflow-hidden ${HIDDEN_BUT_MOUNTED}`
       }
     >
       {/* VISIBLE ON FOCUS ONLY. It is the standard skip-link treatment: out of the way for a
@@ -192,7 +207,7 @@ function AppPane({ device, reloadNonce }: AppPaneProps) {
         // IT DRAWS ITS OWN CARD — `LivePreview` frames the iframe in a padded `#e8edf2` box with a
         // rounded, shadowed white surround — which is why the card below is on the EMPTY arm only.
         // A second card around the first would be two borders and two shadows on one app.
-        <AppPaneHost device={device} reloadNonce={reloadNonce} />
+        <AppPaneHost device={device} reloadNonce={reloadNonce} leaving={leaving} />
       ) : (
         // THE EMPTY PANE IS A NAMED REGION WITH A CARD IN IT, which is what `PreviewOff`,
         // `NothingBuilt` and `PreviewStarting` draw — and only those three. The label is the tell:
