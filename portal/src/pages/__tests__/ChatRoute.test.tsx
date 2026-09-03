@@ -123,6 +123,10 @@ const conversation = (over: Record<string, unknown> = {}) => ({
 
 beforeEach(() => {
   vi.clearAllMocks()
+  // EACH TEST IS A FRESH PAGE LOAD. The route remembers a chat's project per tab so the toolbar
+  // row has a back target during the next load window, and a memory left behind by the test
+  // above would make "a chat this browser has never seen" quietly untrue.
+  sessionStorage.clear()
   h.authFetch.mockResolvedValue({ ok: true } as Response)
   h.getProject.mockResolvedValue({ id: 'p1', name: 'VIP Movement', description: null, appId: null, appStatus: null, createdAt: '', updatedAt: '' })
 })
@@ -290,6 +294,57 @@ describe('ChatRoute — what it publishes for the toolbar row', () => {
     // load window rather than a route that never resolved.
     land?.(conversation({ kind: 'build', title: 'Add an out-time column' }))
     await waitFor(() => expect(heading()).toBe('p1|VIP Movement|build|Add an out-time column'))
+  })
+
+  it('★ names the project this tab already learned, on a reload that carries no query', async () => {
+    // THE ORDINARY CASE, and the one the URL fallback above cannot reach. A chat's address is
+    // rewritten to the bare `/chat/{id}` the instant its first message lands, so every reload,
+    // bookmark and shared link into an existing chat arrives with nothing in the query — and for
+    // the whole of the next `GET` the row had no project to name and a back control aimed at the
+    // projects list, out of the project the citizen was working in.
+    //
+    // The memory is EARNED here rather than seeded: the first render is the visit that learns the
+    // project, and the second is the reload that reads it back. Seeding storage directly would
+    // pass even if nothing ever wrote to it.
+    h.getConversation.mockResolvedValue(conversation({ kind: 'build', title: 'Add an out-time column' }))
+    renderRoute('/chat/c1')
+    await waitFor(() => expect(heading()).toBe('p1|VIP Movement|build|Add an out-time column'))
+    cleanup()
+
+    let land: ((value: unknown) => void) | undefined
+    h.getConversation.mockImplementation(() => new Promise((res) => { land = res }))
+
+    renderRoute('/chat/c1') // the reload: no ?projectId=, no ?kind=
+
+    await waitFor(() => expect(heading()).toBe('p1|null|null|null'))
+    // LIVENESS: the same render goes on to publish the server's answer, so the state above is a
+    // load window and not a route that never resolved.
+    land?.(conversation({ kind: 'build', title: 'Add an out-time column' }))
+    await waitFor(() => expect(heading()).toBe('p1|VIP Movement|build|Add an out-time column'))
+  })
+
+  it('★ and claims nothing for a chat this browser has never seen', async () => {
+    // The memory is a memory, never a guess. This tab HAS learned a project — from a different
+    // chat — so the neutral shape here is a real answer rather than an empty store: it says the
+    // memory is per chat, and a chat nobody has opened inherits nothing from the one beside it.
+    // Mutation receipt: drop the chat id from the storage key and this goes red while the reload
+    // scenario above stays green.
+    h.getConversation.mockResolvedValue(conversation())
+    renderRoute('/chat/c1')
+    await waitFor(() => expect(heading()).toBe('p1|VIP Movement|plan|T'))
+    cleanup()
+
+    let land: ((value: unknown) => void) | undefined
+    h.getConversation.mockImplementation(() => new Promise((res) => { land = res }))
+
+    renderRoute('/chat/never-seen')
+
+    await waitFor(() => expect(screen.getByRole('status', { name: /loading chat/i })).toBeTruthy())
+    expect(heading()).toBe('null|null|null|null')
+    // LIVENESS: this chat does resolve, so the neutral shape above is a load window and not a
+    // route that never answered.
+    land?.(conversation({ id: 'never-seen' }))
+    await waitFor(() => expect(heading()).toBe('p1|VIP Movement|plan|T'))
   })
 
   it('★ withholds a project NAME that belongs to a different project', async () => {

@@ -30,13 +30,14 @@
  * in dev. See `freshlyMinted` below for why the skip is keyed on router state and not on
  * the query.
  */
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Navigate, useLocation, useParams, useSearchParams } from 'react-router-dom'
 import ConversationSlot from '../components/workspace/ConversationSlot'
 import { usePublishHeading } from '../components/workspace/workspaceChannel'
 import { getConversation } from '../utils/conversationApi'
 import { getProject } from '../utils/projectApi'
 import { markChatOpened } from '../utils/observe'
+import { recallChatProject, rememberChatProject } from '../utils/chatProjectMemory'
 import type { Project } from '../utils/projectApi'
 
 export type ChatKind = 'plan' | 'build'
@@ -109,6 +110,13 @@ export default function ChatRoute() {
       // included — which is precisely the case `markChatOpened` refuses, because a project this
       // load never opened has no denominator to be the numerator of.
       markChatOpened(projectId)
+      // AND REMEMBERED FOR THE NEXT LOAD WINDOW, at the same one seam and for the same reason it
+      // is the right seam: every arm passes through here knowing the chat's project, and this is
+      // the only place that is true. A reload of this chat arrives as a bare `/chat/{id}` — the
+      // query is rewritten away the moment the first message lands — so without this the row
+      // spends the whole of the next `GET` with no project to name and a back control pointed out
+      // of the project the citizen is working in.
+      rememberChatProject(chatId, projectId)
       setResolution({ status: 'ready', chatId, kind, projectId, title })
     }
 
@@ -162,13 +170,22 @@ export default function ChatRoute() {
   // provision call to find out. A 404 here means the project was deleted out from under
   // an open chat — show the transcript anyway, unnamed. Never redirect on this.
   //
-  // WHILE THE CONVERSATION IS STILL RESOLVING, the URL's own `?projectId=` stands in. It is the
-  // only thing that knows the project during that window, and it is right whenever it is present:
-  // a chat that has not saved its first message yet carries it, and the resolution replaces it the
-  // moment the server answers. Without it the toolbar row spent the whole fetch with no project to
-  // name and no project to send its back control to.
+  // WHILE THE CONVERSATION IS STILL RESOLVING, the URL's own `?projectId=` stands in. It is right
+  // whenever it is present: a chat that has not saved its first message yet carries it, and the
+  // resolution replaces it the moment the server answers.
+  //
+  // AND WHEN THE URL CARRIES NOTHING — which is the ORDINARY case, because the query is rewritten
+  // away the instant the first message lands, so every reload, bookmark and shared link into an
+  // existing chat is a bare `/chat/{id}` — what this tab was told last time stands in instead.
+  // Without it the row spent the whole fetch with no project to name and its back control sent a
+  // citizen out to the projects list, out of the project they were working in, while the label
+  // said so. A chat this browser has never seen still has neither, and keeps the neutral shape:
+  // this is a memory, never a guess.
+  const remembered = useMemo(() => recallChatProject(chatId), [chatId])
   const projectId =
-    resolution.status === 'ready' ? resolution.projectId : queryRef.current.projectId
+    resolution.status === 'ready'
+      ? resolution.projectId
+      : (queryRef.current.projectId ?? remembered)
 
   // WHAT THE TOOLBAR ROW NAMES (plan 002, U2). Published from the ROUTE rather than from the
   // surface below it, because this component is mounted for the whole life of the address —
