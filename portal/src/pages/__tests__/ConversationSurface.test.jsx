@@ -271,3 +271,34 @@ describe('the per-conversation guardrail reaches the composer', () => {
     expect(screen.queryByTestId('composer-context-warning')).toBeNull()
   })
 })
+
+describe('U9 — the offer\'s Build reaches the SAME hand-over dialog as the composer', () => {
+  it('opens the shell\'s dialog naming both projects, in citizen language', async () => {
+    // THE THIRD DOOR. Three presses can be refused because another project holds the one
+    // workspace — a rail send, the pane's start control, and this one — and the plan asks that
+    // they be proven identical rather than correct on the one that was tested. This is the one
+    // with no test: it once shipped rendering the refusal as plain red text with no way to act,
+    // and a regression there would look exactly like that again while every suite stayed green.
+    h.readTurnStream.mockImplementation(turnStreaming(planReply('Here is the plan.', PLAN_CARD_ID)))
+    h.buildFromPlan.mockRejectedValue(
+      Object.assign(new Error('“Car pool” is still open.'), {
+        code: 'sandbox_reclaim_blocked',
+        details: { projectId: 'pA', projectName: 'Car pool', dirty: false, building: false },
+      }),
+    )
+    renderBuilder({ deps: deps().deps })
+    await send('plan me a thing')
+
+    fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
+
+    const dialog = await screen.findByRole('dialog')
+    const text = dialog.textContent ?? ''
+    // The SAME two names the rail's own scenario asserts (HandoverAtSubmit.test.tsx): the app
+    // being started leads, and the one in the way is named so the choice is about something.
+    expect(text).toContain('VIP Movement')
+    expect(text).toContain('Car pool')
+    for (const word of [/container/i, /sandbox/i, /workspace slot/i, /session/i, /409/]) {
+      expect(text, String(word)).not.toMatch(word)
+    }
+  })
+})
