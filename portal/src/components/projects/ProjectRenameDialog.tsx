@@ -38,6 +38,14 @@ export default function ProjectRenameDialog({ project, onProjectUpdate, onClose 
   }, [])
 
   const submit = () => {
+    // A SECOND PRESS WHILE THE FIRST IS STILL IN FLIGHT DOES NOTHING, and the check has to be here
+    // rather than on the control. The Save button carries `aria-disabled` and never a real
+    // `disabled` attribute — a disabled control throws focus to the document body — so the
+    // announcement of inertness is all `aria-disabled` gives; the handler is the only thing that
+    // can enforce it. Without this, a double-click or an Enter followed by a click on the still
+    // focused button fires two `patchProject` calls for the same rename and closes the dialog
+    // twice. Same guard, same reason, as `WorkspaceToolbar`'s Save and `StartAppControl`'s press.
+    if (busy) return
     const trimmed = draft.trim()
     // Blocked client-side BEFORE any request: the server 400s on name:null and 422s on "". A
     // whitespace-only name never reaches the wire.
