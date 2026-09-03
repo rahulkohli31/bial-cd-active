@@ -85,6 +85,45 @@ hold their own string literal are one typo away from a row nobody projects."""
 # there; looking at the app before changing it is work the citizen recognises.
 _READ_ONLY_BINARIES: Final = frozenset({"ls", "cat", "head", "tail", "grep", "sed", "find", "wc"})
 
+# …EXCEPT WHEN THEY ARE ASKED TO WRITE. Two of the binaries above are read-only by default and
+# destructive on a flag: `sed -i` rewrites the file in place and `find -delete` removes what it
+# matched. Membership in the set is decided by argv[0], so without this both would draw the
+# read class's line — "Inspected the app's files" — over a command that changed or deleted the
+# citizen's work, and the change would appear nowhere else in the feed. That mislabel cost
+# nothing while the read class was hidden; drawing the class makes it a false statement on
+# screen, which is the opposite of what showing reads was for.
+#
+# KEYED BY BINARY, because the same letter means different things: `-i` is in-place for `sed`
+# and case-insensitive for `grep`. One flag list shared across the set would send every
+# `grep -i` to the fallback for no reason.
+_FIND_ACTIONS_THAT_ACT: Final = frozenset({"-delete", "-exec", "-execdir", "-ok", "-okdir"})
+
+
+def _sed_rewrites_in_place(argv: list[str]) -> bool:
+    """Does this `sed` argv carry `-i`, in any of the spellings the flag actually takes?
+
+    `-i`, `-i.bak` (the suffix rides the flag) and `-ni` (bundled with another short flag) are
+    all in-place, so this reads the CLUSTER rather than matching a literal. `i` appears in no
+    other short option `sed` takes, which is what makes reading the cluster safe."""
+    for arg in argv[1:]:
+        if arg == "--in-place" or arg.startswith("--in-place="):
+            return True
+        if arg.startswith("-") and not arg.startswith("--") and "i" in arg.split(".", 1)[0]:
+            return True
+    return False
+
+
+def _reads_without_writing(argv: list[str]) -> bool:
+    """Is this argv in the read-only class AND not one of its members asked to mutate?"""
+    if not argv or argv[0] not in _READ_ONLY_BINARIES:
+        return False
+    if argv[0] == "sed":
+        return not _sed_rewrites_in_place(argv)
+    if argv[0] == "find":
+        return not any(arg in _FIND_ACTIONS_THAT_ACT for arg in argv[1:])
+    return True
+
+
 # Housekeeping shell verbs — plumbing the citizen never needs to see, and one of the only two
 # things `hidden` still marks (the other is a write to a configuration file). Drawing these
 # prints a generic line that says nothing about the app; the model still gets the raw output,
@@ -295,8 +334,11 @@ def _classify_command(argv: list[str]) -> tuple[str, bool]:
         return (_LBL_TIDY, False)
     if ("run" in rest[:1] and "dev" in rest) or "next dev" in joined:
         return (_LBL_PREVIEW, False)
-    if head in _READ_ONLY_BINARIES:
-        # The shell half of the read class, and visible with the rest of it.
+    if _reads_without_writing(argv):
+        # The shell half of the read class, and visible with the rest of it. A member of that
+        # class carrying a mutating flag falls through to the fallback below instead: the feed
+        # says "Working on your app", which is true of a write, rather than claiming an
+        # inspection that never happened.
         return ("Inspected the app's files", False)
     if head in _HOUSEKEEPING_BINARIES:
         # STILL HIDDEN, and this is now one of only two things `hidden` marks. `mkdir`, `mv`,
@@ -426,15 +468,17 @@ def command_needs_the_long_timeout(argv: list[str]) -> bool:
 def command_only_inspects(argv: list[str]) -> bool:
     """Does this argv only LOOK at the workspace (`cat`, `sed -n`, `grep`, `ls`, `wc`)?
 
-    Read off the same `_READ_ONLY_BINARIES` set the classifier hides steps by, so there is one
-    answer to "is this an inspection" and not two that can disagree.
+    Read off the same predicate the classifier labels steps by, so there is one answer to "is
+    this an inspection" and not two that can disagree.
 
     U22's consumer is the output formatter (`orchestrator/tools`): a build log may have its
     predictable dependency-manager chatter dropped, but an inspection's output IS file content,
     and a filter that silently removes a line from it hands the model a file that does not say
     what the file says. Fails CLOSED for the long tail — an unrecognized binary is treated as a
-    log, which at worst keeps a noise line, never deletes a real one."""
-    return bool(argv) and argv[0] in _READ_ONLY_BINARIES
+    log, which at worst keeps a noise line, never deletes a real one. A `sed -i` or a
+    `find -delete` is treated as a log for the same reason it is labelled as one: it is not an
+    inspection."""
+    return _reads_without_writing(argv)
 
 
 def long_operation_line(label: str) -> str:

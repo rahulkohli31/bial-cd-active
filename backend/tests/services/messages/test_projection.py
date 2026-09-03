@@ -46,6 +46,7 @@ from src.services.messages.projection import (
     classify_command,
     classify_file_step,
     classify_tool_call,
+    command_only_inspects,
     project_rows,
 )
 from src.services.messages.store import (
@@ -941,6 +942,51 @@ def test_only_configuration_writes_and_housekeeping_are_hidden_on_the_shared_ent
         assert label.strip(), tool
     assert classify_tool_call("write_file", '{"path": "tsconfig.json"}')[1] is True
     assert classify_tool_call("run_command", '{"command": ["mkdir", "-p", "app/lib"]}')[1] is True
+
+
+def test_a_read_binary_asked_to_write_is_never_drawn_as_an_inspection() -> None:
+    """★ U5's read class is decided by argv[0], and two of its members write on a flag.
+
+    `sed -i` rewrites a file in place and `find -delete` removes what it matched — both routine
+    agent edits in an open sandbox, and both would otherwise draw "Inspected the app's files"
+    over a command that changed the citizen's app, with the write appearing nowhere else in the
+    activity group. While the class was hidden the mislabel cost nothing; drawing the class made
+    it a false statement on screen.
+
+    THE FALLBACK IS THE ANSWER, not a new write label: "Working on your app" is true of every
+    one of these, and the classifier's own rule is that anything it cannot name confidently
+    fails closed to it rather than guessing.
+
+    THE SPELLINGS ARE THE TEST. `-i.bak` carries its suffix on the flag and `-ni` bundles it
+    with another short option, so a classifier matching the literal `-i` would pass the first
+    case and mislabel the other two.
+
+    Mutation check: return the read label for any `argv[0] in _READ_ONLY_BINARIES` again and
+    every writing case below goes red while the reading cases stay green."""
+    for writing in (
+        ["sed", "-i", "s/a/b/", "app/page.tsx"],
+        ["sed", "-i.bak", "s/a/b/", "app/page.tsx"],
+        ["sed", "-ni", "1,5p", "app/page.tsx"],
+        ["sed", "--in-place", "s/a/b/", "app/page.tsx"],
+        ["find", "app", "-name", "*.tmp", "-delete"],
+        ["find", "app", "-name", "*.tsx", "-exec", "sed", "-i", "s/a/b/", "{}", ";"],
+    ):
+        label, hidden = classify_command(writing)
+        assert label == "Working on your app", writing
+        assert hidden is False, writing
+        assert command_only_inspects(writing) is False, writing
+    # THE DISCRIMINATOR. The same two binaries reading, plus the one whose `-i` means something
+    # else entirely — a `grep -i` is case-insensitive and must not be dragged into the fallback
+    # by a flag list shared across the class.
+    for reading in (
+        ["sed", "-n", "1,5p", "app/page.tsx"],
+        ["find", "app", "-name", "*.tsx"],
+        ["grep", "-i", "visitors", "app/page.tsx"],
+    ):
+        label, hidden = classify_command(reading)
+        assert label == "Inspected the app's files", reading
+        assert hidden is False, reading
+        assert command_only_inspects(reading) is True, reading
 
 
 def test_classify_command_fails_closed_on_the_long_tail() -> None:
