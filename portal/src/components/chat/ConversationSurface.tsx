@@ -2145,7 +2145,11 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
    *     (`hasUpcomingMessage`), so dropping it hands identity for the whole turn to the library.
    *     An empty text part renders no element anyway, so keeping it costs nothing on screen.
    *
-   *  2. THE TURN IN FLIGHT IS TOLD ONCE. See `reToldFromSeq`.
+   *  2. A RE-TOLD TURN IS TOLD ONCE, AND GOES ON BEING TOLD ONCE. The boundary is latched when
+   *     the re-telling starts and deliberately OUTLIVES the stream that made it, because the
+   *     re-told message outlives it too: deriving it from "a turn is in flight here" switched the
+   *     suppression off at the terminal and every stored row came back beside its own re-telling,
+   *     for the rest of the page session. See `reToldFromSeq`.
    */
   const transcript = useMemo(() => {
     const kept: ChatMessage[] = []
@@ -2153,10 +2157,17 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       const parts = msg.parts ?? []
       // THE WHOLE RE-TOLD TURN, not just its steps. The live message is the authority for the
       // turn in flight — the snapshot's ordered `parts` were built to make that true — so every
-      // STORED row it is re-telling has to go, prose included. It used to be steps alone, and
-      // that was sufficient only while the projection dropped a response's prose whenever the
-      // response also called a tool. That drop is gone, so a citizen who reloads mid-build now
-      // has each of those sentences on disk AND in the re-told turn, and read them twice.
+      // STORED row of the AGENT's it is re-telling has to go, prose included. It used to be steps
+      // alone, and that was sufficient only while the projection dropped a response's prose
+      // whenever the response also called a tool. That drop is gone, so a citizen who reloads
+      // mid-build now has each of those sentences on disk AND in the re-told turn, and read them
+      // twice.
+      //
+      // WITH ONE EXCEPTION, AND IT IS NOT A DEFENSIVE ONE: the citizen's own message. The
+      // snapshot re-tells the agent's prose and steps and never the prompt, so a user row inside
+      // the boundary has no second copy to be de-duplicated against — deleting it is pure loss,
+      // and the reply then arrives with nothing above it saying what was asked. The `role` guard
+      // below is where that exception lives, with the account of how it was found.
       //
       // `srv_` IS WHAT KEEPS THE LIVE MESSAGE ALIVE. Only `messagesFromProjection` mints that
       // prefix, so it names a STORED row exactly; the streaming message carries the local id
