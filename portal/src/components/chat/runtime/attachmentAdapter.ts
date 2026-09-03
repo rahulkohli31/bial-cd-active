@@ -88,7 +88,14 @@ export class AttachmentRefusal extends Error {
 export interface AttachmentAdapterOptions {
   /** The MIME/extension list the OS picker and the validator both use. */
   accept: string
-  /** What is already staged, read at ADD time — the per-message cap counts across the batch. */
+  /**
+   * What is already staged, read at ADD time — the per-message cap counts across the batch.
+   *
+   * IT LAGS BY A RENDER, WHICH IS WHY IT IS NOT THE WHOLE ANSWER. The runtime appends an
+   * attachment only after `add` has resolved, and the ref this reads is written during a React
+   * render after that. See the claim list in `createAttachmentAdapter` for the half of the cap
+   * this cannot carry.
+   */
   staged: () => readonly Attachment[]
   /**
    * SAY A REFUSAL OUT LOUD, because the library will not.
@@ -111,21 +118,58 @@ function kindOf(mediaType: string): PendingAttachment['type'] {
 }
 
 export function createAttachmentAdapter({ accept, staged, onRefused }: AttachmentAdapterOptions): AttachmentAdapter {
+  /**
+   * WHAT THIS ADAPTER HAS ALREADY SAID YES TO IN THE CURRENT GESTURE, and the whole of why the
+   * cap survives a multi-file drop.
+   *
+   * ONE DROP IS N CONCURRENT `add` CALLS. The dropzone, the OS picker and the paste handler all
+   * fan out with `Promise.all(files.map(…))`, so every file in one gesture starts its `add` in the
+   * SAME tick. `staged()` cannot see any of them: the runtime appends an attachment only after
+   * `add` resolves, and the ref is written a render later still. So eight files dropped at once
+   * each validated against an empty list and all eight went through — the cap bypass R57 records,
+   * reintroduced by the gap between a synchronous check and an asynchronous state update.
+   *
+   * Counting what THIS adapter has accepted closes it, because the accept and the count happen in
+   * the same synchronous stretch — there is no await between them for a sibling to slip through.
+   *
+   * A GESTURE IS A TICK, AND THE LIST DIES WITH IT. The claims exist only to bridge the gap until
+   * `staged()` catches up, so they are dropped at the end of the tick that made them: a later
+   * gesture is a later task, by which time the runtime has published everything that landed. That
+   * is also what keeps a cancelled add — `clearAttachments()` cancels every in-flight one — from
+   * leaving a phantom file permanently occupying a slot in the cap.
+   */
+  let claimed: { mediaType: string; size: number }[] = []
+  let closing = false
+
+  function claim(mediaType: string, size: number): void {
+    if (!closing) {
+      closing = true
+      queueMicrotask(() => {
+        claimed = []
+        closing = false
+      })
+    }
+    claimed.push({ mediaType, size })
+  }
+
   return {
     accept,
 
     async add({ file }): Promise<PendingAttachment> {
-      // OUR VALIDATION, AGAINST WHAT IS ALREADY STAGED. The per-message file cap and the
-      // per-conversation text-byte budget are both cumulative, so the check has to see the
-      // current list rather than only the arriving file — which is the cap bypass R57 records.
-      const current = payloadsOf(staged())
+      // OUR VALIDATION, AGAINST WHAT IS ALREADY STAGED AND WHAT THIS GESTURE HAS ALREADY TAKEN.
+      // The per-message file cap and the per-conversation text-byte budget are both cumulative, so
+      // the check has to see both lists rather than only the arriving file.
+      const mediaType = resolveMediaType(file)
+      const current = [...payloadsOf(staged()), ...claimed]
       const verdict = validateAttachmentFiles([file], current.length, textAttachmentBytes(current))
       if ('error' in verdict && verdict.error) {
         onRefused(verdict.error)
         throw new AttachmentRefusal(verdict.error)
       }
+      // BEFORE THE READ, NOT AFTER IT. `fileToBase64` is the await the siblings would slip
+      // through; claiming the slot first is what makes the check above see them.
+      claim(mediaType, file.size)
 
-      const mediaType = resolveMediaType(file)
       const payload: OurAttachment = {
         id: newAttachmentId(),
         name: file.name,

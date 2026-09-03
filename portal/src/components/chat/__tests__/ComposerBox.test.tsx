@@ -62,10 +62,15 @@ function draw({ onSubmit, unavailableReason = null, onUrgent = vi.fn() }: DrawOp
 const box = () => screen.getByTestId('composer-input') as HTMLTextAreaElement
 const send = () => screen.getByTestId('composer-send')
 const type = (value: string) => fireEvent.change(box(), { target: { value } })
-const drop = (file: File) =>
+const drop = (file: File) => dropAll(file)
+/** ONE gesture carrying several files — a multi-select in the OS picker, or a handful dragged in
+ *  together. The library adds every one of them concurrently, which is the shape that matters. */
+const dropAll = (...files: File[]) =>
   fireEvent.drop(screen.getByTestId('composer-dropzone'), {
-    dataTransfer: { types: ['Files'], files: [file] },
+    dataTransfer: { types: ['Files'], files },
   })
+/** The staged chips, counted by the one control each chip owns. */
+const chips = () => screen.queryAllByLabelText(/^Remove /)
 
 describe('the board\'s shape: one box, both controls inside it', () => {
   it('puts the attachment control and the send control INSIDE the box, not beside it', () => {
@@ -359,6 +364,40 @@ describe('★ the attachment pipeline stays ours', () => {
     drop(new File(['x'], 'slides.pptx', { type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' }))
     await waitFor(() => expect(onUrgent).toHaveBeenCalledTimes(1))
     expect(onUrgent.mock.calls[0]?.[0]).toMatch(/isn't supported|is not supported/i)
+  })
+
+  it('★ holds the cap when EIGHT files arrive in ONE gesture, which is how the library adds them', async () => {
+    // THE REGRESSION THIS IS WRITTEN AGAINST. The dropzone, the OS picker and the paste handler
+    // all fan out with `Promise.all(files.map(…))`, so every file in one drop starts its `add`
+    // before any of them finishes. Validating against `staged()` alone therefore validated all
+    // eight against an empty list, and all eight were staged with nothing said — 5 is the cap.
+    // Mutation receipt: drop the adapter's claim list and this goes red at eight chips.
+    const onUrgent = vi.fn()
+    draw({ onUrgent })
+
+    dropAll(...Array.from({ length: 8 }, (_, i) => new File(['x'], `f${i}.png`, { type: 'image/png' })))
+
+    // WAIT FOR THE WHOLE GESTURE TO SETTLE, not for a count to pass through 5 on its way to 8:
+    // every one of the eight files ends as either a chip or a refusal, so their sum is the one
+    // condition that is true exactly once and only at the end.
+    await waitFor(() => expect(chips().length + onUrgent.mock.calls.length).toBe(8))
+    expect(chips()).toHaveLength(5)
+    expect(onUrgent.mock.calls.at(-1)?.[0]).toMatch(/at most 5 files/i)
+  })
+
+  it('★ holds the 512 KB text budget inside one gesture too — the other cap the same gap opened', async () => {
+    // Inline text rides in every turn of the conversation, so the budget is cumulative. Three
+    // 250 KB spreadsheets dropped together are 750 KB; two fit and the third is refused, and
+    // saying so is the difference between a bounded prompt and a silently doubled one.
+    const onUrgent = vi.fn()
+    draw({ onUrgent })
+    const sheet = (name: string) => new File([new Uint8Array(250 * 1024)], name, { type: 'text/csv' })
+
+    dropAll(sheet('jan.csv'), sheet('feb.csv'), sheet('mar.csv'))
+
+    await waitFor(() => expect(chips().length + onUrgent.mock.calls.length).toBe(3))
+    expect(chips()).toHaveLength(2)
+    expect(onUrgent.mock.calls.at(-1)?.[0]).toMatch(/512 KB total limit/i)
   })
 
   it('★ counts against the per-message cap across a batch, not one file at a time', async () => {
