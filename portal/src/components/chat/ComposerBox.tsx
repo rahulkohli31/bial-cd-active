@@ -87,7 +87,11 @@ export interface ComposerBoxProps {
   onAccepted?: (conversationId: string, remainingText: string) => void
   /** Rendered inside the box, above the input: the offer strip's locked treatment, and nothing else. */
   header?: React.ReactNode
-  /** Rendered under the box: the cap counter, the context warning, the kind description. */
+  /**
+   * Rendered under the box: the cap counter, the context warning, the kind description. It sits
+   * INSIDE the dropzone, because a drop that lands on it must be claimed rather than falling
+   * through to the browser.
+   */
   footer?: React.ReactNode
   /** Said out loud when a file is refused, and when a send is. */
   onUrgent: (message: string) => void
@@ -253,11 +257,20 @@ export default function ComposerBox({
 
   return (
     <>
-      {/* THE DROPZONE IS THE WHOLE BOX, not the input row. The chips and the strip above the row
-          are visually "the composer" too, and a drop landing on them would otherwise fall through
-          to the browser's default handler — which navigates the tab away and discards both the
-          draft and the staged files. */}
-      <ComposerPrimitive.AttachmentDropzone data-testid="composer-dropzone">
+      {/* THE DROPZONE IS EVERYTHING THAT READS AS THE COMPOSER, not the bordered box.
+          The chips, the strip above the row and — the part this had wrong — the FOOTER under the
+          box are all visually "the composer" to the person aiming at it. The footer is the gate
+          note, the context warning, the plan chat's standing line and the character counter: on a
+          running turn there is always a live strip of text there, and a drop landing a few pixels
+          low fell through to the browser's default handler, which navigates the tab to the file
+          and takes every staged attachment with it. The library only prevents that inside its own
+          element, so the footer has to be inside it. */}
+      <ComposerPrimitive.AttachmentDropzone
+        data-testid="composer-dropzone"
+        // The column and its gap were the frame's; they move here with the footer so the box, the
+        // notes and the counter still stack exactly as they did.
+        className="flex w-full flex-col gap-1.5"
+      >
         <ComposerPrimitive.Root
           data-testid="composer"
           onSubmit={(event) => {
@@ -336,9 +349,9 @@ export default function ComposerBox({
             </button>
           </div>
         </ComposerPrimitive.Root>
-      </ComposerPrimitive.AttachmentDropzone>
 
-      {footer}
+        {footer}
+      </ComposerPrimitive.AttachmentDropzone>
 
       <AttachmentPreview target={preview} onClose={() => setPreview(null)} />
     </>

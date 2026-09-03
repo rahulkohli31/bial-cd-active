@@ -303,6 +303,29 @@ describe('attachments', () => {
     noRealDisabled(container)
   })
 
+  it('★ claims a drop on the NOTE UNDER the box, which is where a mis-aimed one lands', async () => {
+    // THE STRIP UNDER THE BOX IS PART OF THE COMPOSER TO WHOEVER IS AIMING AT IT — the gate note,
+    // the context warning, the standing caption and the counter — and on a running turn there is
+    // always text there. Left outside the drop target, a drop a few pixels low fell through to the
+    // browser's default handler, which navigates the tab to the file and takes every staged
+    // attachment with it.
+    draw({ isRunning: true })
+    const note = screen.getByTestId('composer-gate-note')
+
+    const notCancelled = fireEvent.drop(note, {
+      dataTransfer: {
+        types: ['Files'],
+        files: [new File(['id,name\n1,Priya'], 'payroll.csv', { type: 'text/csv' })],
+      },
+    })
+
+    // `dispatchEvent` returns false exactly when something called `preventDefault` — which is the
+    // difference between the composer taking the file and the browser leaving the page.
+    expect(notCancelled).toBe(false)
+    // …and the file was actually staged, so the drop was claimed rather than merely swallowed.
+    await waitFor(() => expect(screen.getByTestId('composer-chips').textContent).toContain('payroll.csv'))
+  })
+
   it('attach never goes unavailable — staging a file is composing, not sending', () => {
     draw({ isRunning: true })
     const attach = screen.getByLabelText('Attach a file')
