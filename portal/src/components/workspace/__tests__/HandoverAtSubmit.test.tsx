@@ -77,6 +77,28 @@ function Where() {
   return <span data-testid="where">{loc.pathname + loc.search}</span>
 }
 
+/**
+ * The chat that opens, standing in for the real surface — and showing WHAT THE NAVIGATION CARRIED.
+ *
+ * The message and its files travel in router state and are fired by the mounted chat
+ * (`ConversationSurface`'s `fireHandoffPrompt` reads `location.state.pendingAttachments`), so the
+ * state is where a hand-over either keeps them or eats them.
+ */
+function ChatOpened() {
+  const carried = (useLocation().state ?? {}) as {
+    prompt?: string
+    pendingAttachments?: { name: string }[]
+  }
+  return (
+    <div data-testid="chat-opened">
+      <span data-testid="carried-prompt">{carried.prompt}</span>
+      <span data-testid="carried-files">
+        {(carried.pendingAttachments ?? []).map((file) => file.name).join(', ')}
+      </span>
+    </div>
+  )
+}
+
 function Workspace({ project = PROJECT }: { project?: Project } = {}) {
   return (
     <MemoryRouter initialEntries={['/projects/pB']}>
@@ -87,7 +109,7 @@ function Workspace({ project = PROJECT }: { project?: Project } = {}) {
             path="/projects/:projectId"
             element={<ProjectWorkspace project={project} onProjectUpdate={() => {}} />}
           />
-          <Route path="/chat/:chatId" element={<div data-testid="chat-opened" />} />
+          <Route path="/chat/:chatId" element={<ChatOpened />} />
         </Route>
       </Routes>
     </MemoryRouter>
@@ -361,6 +383,86 @@ describe('transferring', () => {
 
     await waitFor(() => expect(screen.getByTestId('chat-opened')).toBeTruthy())
     expect(screen.queryByRole('dialog')).toBeNull()
+  })
+
+  it('★ carries the FILES across the hand-over too, not just the words (plan 002, U5)', async () => {
+    // U5's verification is that "a refused send never loses a message, and a hand-over never eats
+    // an attachment". The refused half was pinned; the files were not — and they are the half most
+    // easily lost, because they live only as decoded bytes in a composer the hand-over is about to
+    // navigate away from. Removing `pendingAttachments` from the navigation's state passed every
+    // test before this one.
+    api.relaunchPreview
+      .mockRejectedValueOnce(heldBy())
+      .mockResolvedValue({ appId: 'app-1', previewUrl: 'https://app/', status: 'ready', ready: true, restoredFromFailedBuild: false })
+    render(<Workspace />)
+    type('add an out-time column')
+    // STAGED BY DROP rather than through the add control, which opens an OS picker jsdom cannot
+    // drive — the dropzone reaches the same `addAttachment`, so this is the real path.
+    fireEvent.drop(screen.getByTestId('composer-dropzone'), {
+      dataTransfer: {
+        types: ['Files'],
+        files: [new File(['id,name\n1,Priya'], 'visitors.csv', { type: 'text/csv' })],
+      },
+    })
+    await waitFor(() =>
+      expect(screen.getByTestId('composer-chips').textContent).toContain('visitors.csv'),
+    )
+
+    fireEvent.click(send())
+    await screen.findByRole('dialog')
+
+    // THE REFUSAL KEPT BOTH — the message and the file are still in the composer that never sent.
+    expect((composer() as HTMLTextAreaElement).value).toBe('add an out-time column')
+    expect(screen.getByTestId('composer-chips').textContent).toContain('visitors.csv')
+
+    fireEvent.click(screen.getByRole('button', { name: /stop “Car pool”/i }))
+
+    await waitFor(() => expect(screen.getByTestId('chat-opened')).toBeTruthy())
+    // …and the hand-over carried BOTH into the chat it opened, in one navigation.
+    expect(screen.getByTestId('carried-prompt').textContent).toBe('add an out-time column')
+    expect(screen.getByTestId('carried-files').textContent).toContain('visitors.csv')
+  })
+
+  it('★ a reload part-way through the transfer strands neither a chat nor a message (plan 002, U9)', async () => {
+    // The transfer spans a stop that can run for over a minute, and a citizen can reload in the
+    // middle of it. The dialog is in-memory and goes with the tab; what must NOT happen is a chat
+    // opening without anybody asking, or the typed message disappearing with the dialog.
+    //
+    // THE CONTAINER HALF OF THIS CLAIM IS THE SERVER'S and is proven there —
+    // `test_a_dropped_connection_mid_stop_loses_no_work_and_takes_no_container`. The stop runs as a
+    // detached task and the state read is idempotent, so nothing here can take a container.
+    let finishTheStop: (() => void) | undefined
+    api.handOverWorkspace.mockImplementation(
+      () => new Promise<void>((resolve) => { finishTheStop = resolve }),
+    )
+    api.relaunchPreview
+      .mockRejectedValueOnce(heldBy())
+      .mockResolvedValue({ appId: 'app-1', previewUrl: 'https://app/', status: 'ready', ready: true, restoredFromFailedBuild: false })
+    const first = render(<Workspace />)
+    type('add an out-time column')
+    fireEvent.click(send())
+    await screen.findByRole('dialog')
+    fireEvent.click(screen.getByRole('button', { name: /stop “Car pool”/i }))
+    await waitFor(() => expect(api.handOverWorkspace).toHaveBeenCalledTimes(1))
+
+    // THE RELOAD, mid-stop: everything in memory goes, and the tab comes back on the project.
+    first.unmount()
+    render(<Workspace />)
+    finishTheStop?.()
+
+    // Nothing opened behind them while the tab was reloading.
+    expect(screen.queryByTestId('chat-opened')).toBeNull()
+    expect(where()).toBe('/projects/pB')
+    // …and their message came back with the screen, so the send they were part-way through is one
+    // press away rather than retyped.
+    await waitFor(() => expect((composer() as HTMLTextAreaElement).value).toBe('add an out-time column'))
+
+    fireEvent.click(send())
+
+    await waitFor(() => expect(screen.getByTestId('chat-opened')).toBeTruthy())
+    // ONE chat, from the one send that was actually answered.
+    expect(screen.getAllByTestId('chat-opened')).toHaveLength(1)
+    expect(screen.getByTestId('carried-prompt').textContent).toBe('add an out-time column')
   })
 
   it('narrates while it works, rather than spinning', async () => {
