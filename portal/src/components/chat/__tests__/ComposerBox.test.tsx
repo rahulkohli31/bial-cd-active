@@ -465,6 +465,51 @@ describe('★ the attachment pipeline stays ours', () => {
     expect(onUrgent.mock.calls.at(-1)?.[0]).toMatch(/512 KB total limit/i)
   })
 
+  it('★ holds the cap across two gestures a MICROTASK apart, not only inside one', async () => {
+    // THE HOLE THE FIRST FIX LEFT. The claim list was dropped at the end of the tick that made it,
+    // on the reasoning that a later gesture is a later task by which time everything that landed
+    // has been published. Nothing is published until `fileToBase64` resolves, and `FileReader`
+    // resolves on a TASK — so a second gesture one microtask later saw an empty staged list AND an
+    // empty claim list, and a sixth file went in past a cap of five with nothing said.
+    //
+    // A FAST REPEATED PASTE OF A LARGE IMAGE IS EXACTLY THIS. The bigger the file, the longer the
+    // read, and the wider the window — so the failure got MORE likely as the cap mattered more.
+    const onUrgent = vi.fn()
+    draw({ onUrgent })
+
+    dropAll(...Array.from({ length: 5 }, (_, i) => new File(['x'], `first-${i}.png`, { type: 'image/png' })))
+    // ONE MICROTASK, which is the whole point: the five reads are still out (jsdom's FileReader
+    // resolves on a task, exactly as a browser's does), so nothing has been staged yet either.
+    await Promise.resolve()
+    expect(chips()).toHaveLength(0)
+    drop(new File(['x'], 'sixth.png', { type: 'image/png' }))
+
+    await waitFor(() => expect(chips().length + onUrgent.mock.calls.length).toBe(6))
+    expect(chips()).toHaveLength(5)
+    expect(onUrgent.mock.calls.at(-1)?.[0]).toMatch(/at most 5 files/i)
+    expect(screen.getByTestId('composer-chips').textContent).not.toContain('sixth.png')
+  })
+
+  it('★ and gives the slot back when the read that claimed it never lands', async () => {
+    // THE OTHER HALF OF THE SAME RULE, and the failure a longer-lived claim invites: a claim that
+    // outlived its file would sit in the cap for ever, and a citizen who cleared the composer
+    // would find they could attach nothing. Five files are staged and then cleared by a send;
+    // five more must be attachable afterwards.
+    const onUrgent = vi.fn()
+    const submit = vi.fn().mockResolvedValue(undefined)
+    draw({ onUrgent, onSubmit: submit })
+    dropAll(...Array.from({ length: 5 }, (_, i) => new File(['x'], `a${i}.png`, { type: 'image/png' })))
+    await waitFor(() => expect(chips()).toHaveLength(5))
+
+    type('send them')
+    fireEvent.click(send())
+    await waitFor(() => expect(chips()).toHaveLength(0))
+
+    dropAll(...Array.from({ length: 5 }, (_, i) => new File(['x'], `b${i}.png`, { type: 'image/png' })))
+    await waitFor(() => expect(chips()).toHaveLength(5))
+    expect(onUrgent).not.toHaveBeenCalled()
+  })
+
   it('★ counts against the per-message cap across a batch, not one file at a time', async () => {
     // The cap bypass R57 records: a check that sees only the arriving file lets a sixth through.
     // The adapter reads the LIVE staged list rather than a closure, which is what makes the sixth

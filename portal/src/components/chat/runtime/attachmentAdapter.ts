@@ -89,12 +89,12 @@ export interface AttachmentAdapterOptions {
   /** The MIME/extension list the OS picker and the validator both use. */
   accept: string
   /**
-   * What is already staged, read at ADD time — the per-message cap counts across the batch.
+   * What is already staged, read LIVE at ADD time — the per-message cap counts across the batch.
    *
-   * IT LAGS BY A RENDER, WHICH IS WHY IT IS NOT THE WHOLE ANSWER. The runtime appends an
-   * attachment only after `add` has resolved, and the ref this reads is written during a React
-   * render after that. See the claim list in `createAttachmentAdapter` for the half of the cap
-   * this cannot carry.
+   * IT IS THE RUNTIME'S OWN STATE, not a copy of it (see `stagedAttachments.tsx`), so a file the
+   * composer is holding is visible here the instant `add` resolved for it. What it still cannot
+   * see is a file whose read is STILL RUNNING, because nothing is appended until then — see the
+   * claim list in `createAttachmentAdapter` for that half of the cap.
    */
   staged: () => readonly Attachment[]
   /**
@@ -119,37 +119,49 @@ function kindOf(mediaType: string): PendingAttachment['type'] {
 
 export function createAttachmentAdapter({ accept, staged, onRefused }: AttachmentAdapterOptions): AttachmentAdapter {
   /**
-   * WHAT THIS ADAPTER HAS ALREADY SAID YES TO IN THE CURRENT GESTURE, and the whole of why the
-   * cap survives a multi-file drop.
+   * WHAT THIS ADAPTER HAS SAID YES TO AND IS STILL READING, and the whole of why the cap survives
+   * a multi-file drop.
    *
    * ONE DROP IS N CONCURRENT `add` CALLS. The dropzone, the OS picker and the paste handler all
    * fan out with `Promise.all(files.map(…))`, so every file in one gesture starts its `add` in the
-   * SAME tick. `staged()` cannot see any of them: the runtime appends an attachment only after
-   * `add` resolves, and the ref is written a render later still. So eight files dropped at once
-   * each validated against an empty list and all eight went through — the cap bypass R57 records,
-   * reintroduced by the gap between a synchronous check and an asynchronous state update.
+   * SAME tick. `staged()` cannot see any of them, because the runtime appends an attachment only
+   * once `add` has resolved. So eight files dropped at once each validated against an empty list
+   * and all eight went through — the cap bypass R57 records, reintroduced by the gap between a
+   * synchronous check and an asynchronous read.
    *
    * Counting what THIS adapter has accepted closes it, because the accept and the count happen in
    * the same synchronous stretch — there is no await between them for a sibling to slip through.
    *
-   * A GESTURE IS A TICK, AND THE LIST DIES WITH IT. The claims exist only to bridge the gap until
-   * `staged()` catches up, so they are dropped at the end of the tick that made them: a later
-   * gesture is a later task, by which time the runtime has published everything that landed. That
-   * is also what keeps a cancelled add — `clearAttachments()` cancels every in-flight one — from
-   * leaving a phantom file permanently occupying a slot in the cap.
+   * ══ A CLAIM LIVES UNTIL THE FILE IS SOMEBODY ELSE'S TO COUNT ══
+   *
+   * The claims used to be dropped at the end of the tick that made them, on the reasoning that "a
+   * later gesture is a later task, by which time the runtime has published everything that
+   * landed". That was not true, and its being nearly true is what made it survive review: nothing
+   * is published until `fileToBase64` resolves, and `FileReader` resolves on a TASK, not a
+   * microtask. So two gestures a microtask apart — a fast repeated paste of a large image is
+   * exactly that — both validated against nothing, and a sixth file was staged past a cap of five
+   * with no refusal said.
+   *
+   * So a claim is retired by the only two things that can end it:
+   *
+   *   · THE COMPOSER IS HOLDING THE FILE. Its id is in the live staged list, which now counts it —
+   *     keeping the claim as well would count it twice and refuse a file that fits.
+   *   · NOTHING IS IN FLIGHT AT ALL. Every `add` has settled, so every claim has either been
+   *     published (the case above) or discarded by a `clearAttachments()` that cancelled it. This
+   *     is what keeps a cancelled read from leaving a phantom file occupying a slot for ever, and
+   *     it costs no timer: reads only happen inside `add`, which is a later task than the settle.
+   *
+   * A FAILED READ RELEASES ITS OWN CLAIM IMMEDIATELY, because nothing will ever be staged for it.
    */
-  let claimed: { mediaType: string; size: number }[] = []
-  let closing = false
+  const claimed = new Map<string, { mediaType: string; size: number }>()
+  let reading = 0
 
-  function claim(mediaType: string, size: number): void {
-    if (!closing) {
-      closing = true
-      queueMicrotask(() => {
-        claimed = []
-        closing = false
-      })
-    }
-    claimed.push({ mediaType, size })
+  /** What the caps must count right now: what the composer holds, plus what is still being read. */
+  function countable(): { mediaType: string; size: number }[] {
+    const stagedNow = payloadsOf(staged())
+    if (reading === 0) claimed.clear()
+    else for (const p of stagedNow) claimed.delete(p.id)
+    return [...stagedNow, ...claimed.values()]
   }
 
   return {
@@ -160,7 +172,7 @@ export function createAttachmentAdapter({ accept, staged, onRefused }: Attachmen
       // The per-message file cap and the per-conversation text-byte budget are both cumulative, so
       // the check has to see both lists rather than only the arriving file.
       const mediaType = resolveMediaType(file)
-      const current = [...payloadsOf(staged()), ...claimed]
+      const current = countable()
       const verdict = validateAttachmentFiles([file], current.length, textAttachmentBytes(current))
       if ('error' in verdict && verdict.error) {
         onRefused(verdict.error)
@@ -168,28 +180,43 @@ export function createAttachmentAdapter({ accept, staged, onRefused }: Attachmen
       }
       // BEFORE THE READ, NOT AFTER IT. `fileToBase64` is the await the siblings would slip
       // through; claiming the slot first is what makes the check above see them.
-      claim(mediaType, file.size)
+      //
+      // THE ID IS MINTED HERE RATHER THAN AT PAYLOAD TIME, because it is what lets the claim be
+      // recognised in the staged list once the composer is holding the file — the claim and the
+      // attachment have to be the same thing under the same name, or they are counted twice.
+      const id = newAttachmentId()
+      claimed.set(id, { mediaType, size: file.size })
+      reading += 1
 
-      const payload: OurAttachment = {
-        id: newAttachmentId(),
-        name: file.name,
-        mediaType,
-        size: file.size,
-        base64: await fileToBase64(file),
+      try {
+        const payload: OurAttachment = {
+          id,
+          name: file.name,
+          mediaType,
+          size: file.size,
+          base64: await fileToBase64(file),
+        }
+        const attachment: PendingAttachment & Carried = {
+          id: payload.id,
+          type: kindOf(mediaType),
+          name: payload.name,
+          contentType: mediaType,
+          file,
+          // `requires-action` / `composer-send` is the library's own vocabulary for "staged, not
+          // yet sent". It is the honest status: nothing has been uploaded and nothing will be
+          // until the citizen presses send.
+          status: { type: 'requires-action', reason: 'composer-send' },
+          [PAYLOAD]: payload,
+        }
+        return attachment
+      } catch (err) {
+        // THE READ ITSELF FAILED, so nothing will ever be staged under this id and holding the
+        // slot would refuse a file the citizen is entitled to attach.
+        claimed.delete(id)
+        throw err
+      } finally {
+        reading -= 1
       }
-      const attachment: PendingAttachment & Carried = {
-        id: payload.id,
-        type: kindOf(mediaType),
-        name: payload.name,
-        contentType: mediaType,
-        file,
-        // `requires-action` / `composer-send` is the library's own vocabulary for "staged, not
-        // yet sent". It is the honest status: nothing has been uploaded and nothing will be
-        // until the citizen presses send.
-        status: { type: 'requires-action', reason: 'composer-send' },
-        [PAYLOAD]: payload,
-      }
-      return attachment
     },
 
     async remove(): Promise<void> {
