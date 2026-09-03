@@ -412,11 +412,16 @@ describe('R8 live clause — a reload MID-TURN re-attaches to the running reply'
     expect(args.cursor).toBe(0)
   })
 
-  it('tells the re-attached turn ONCE, prose included', async () => {
+  it('tells the re-attached turn ONCE, prose included — and still does after it ENDS', async () => {
     // The reload hydrates the turn's persisted rows AND re-tells the same turn into a fresh
     // streaming message. Prose written beside a tool call is stored now — the projection stopped
     // dropping it — so the stored copy and the re-told copy are both on screen unless the
     // in-flight suppression covers text as well as steps. The citizen read every sentence twice.
+    //
+    // ★ THE TURN IS RUN TO ITS TERMINAL HERE, and that is the whole point of the fixture. The
+    // suppression used to be derived from "a turn is streaming in this chat", so it switched off
+    // at `turn_ended` while the re-told message stayed — and the second copy came back a few
+    // minutes later, permanently. Asserting mid-stream could never see that.
     h.getBuild.mockResolvedValue({
       id: 'thread-1',
       mode: 'ask',
@@ -437,14 +442,20 @@ describe('R8 live clause — a reload MID-TURN re-attaches to the running reply'
           working: false,
           items: [],
         },
+        // The tail exists ONLY in the re-telling, so waiting for it is what makes the count
+        // below deterministic: it cannot be on screen until the whole stream has been read and
+        // the turn has settled. `findAllByText` alone resolves on the FIRST match — the stored
+        // copy — which is why this assertion used to pass or fail depending on what else ran.
+        { type: 'text_delta', seq: 4, text: ' Adding it now.', newBlock: false },
+        { type: 'turn_ended', seq: 5, turnId: 't-live', status: 'completed' },
       ]),
     )
     renderThread()
 
-    // Once, not twice — and `findAllByText` rather than `findByText` so the assertion is about
-    // the COUNT: `findByText` throws on multiple matches, which reads as a broken query.
-    const drawn = await screen.findAllByText(/Let me look at the page\./)
-    expect(drawn).toHaveLength(1)
+    await screen.findByText(/Let me look at the page\. Adding it now\./)
+    // Once, not twice — and `getAllByText` rather than `getByText` so the assertion is about the
+    // COUNT: `getByText` throws on multiple matches, which reads as a broken query.
+    expect(screen.getAllByText(/Let me look at the page\./)).toHaveLength(1)
   })
 
   it('draws the working status BELOW prose already on screen, not above it', async () => {
