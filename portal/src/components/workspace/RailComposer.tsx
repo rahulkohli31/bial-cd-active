@@ -94,10 +94,11 @@ export default function RailComposer({ projectId }: RailComposerProps) {
   const picked = chatKindFor(kind)
 
   return (
+    // NO SECTION LABEL OF ITS OWN (plan 002, U3). "START A CHAT" is the RAIL's heading now, drawn
+    // beside the other two in the board's own type, so this component is the control and not the
+    // section around it. Two headings for one section is how the rail ended up with four cards.
     <div className="font-manrope">
-      <h2 className="text-[11px] font-bold uppercase tracking-wide text-neutral mb-2">Start a chat</h2>
-
-      <div className="w-full bg-white rounded-2xl border border-bial-border shadow-sm">
+      <div className="mt-2.5 w-full bg-white rounded-2xl border border-bial-border shadow-sm">
         <textarea
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}

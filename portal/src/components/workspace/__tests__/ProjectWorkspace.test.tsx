@@ -100,11 +100,7 @@ function Surface({ project = PROJECT }: { project?: Project }) {
   return (
     <ProjectWorkspace
       project={project}
-      chats={[]}
-      chatsError={null}
       onProjectUpdate={noop}
-      onOpenChat={noop}
-      onDeleteChat={noop}
     />
   )
 }

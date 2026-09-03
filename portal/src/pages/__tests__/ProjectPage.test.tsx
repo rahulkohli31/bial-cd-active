@@ -387,141 +387,69 @@ describe('ProjectPage — an outlet child that owns its own scroller (Plan A, U3
   })
 })
 
-/** The row container a chat title sits in — the kind badge is its SIBLING (F-10), so this is
- *  what makes "the right badge on the right row" assertable instead of merely "a badge exists". */
-function rowFor(title: string): HTMLElement {
-  const row = screen.getByRole('button', { name: title }).closest('div.group')
-  expect(row, `no conversation row for "${title}"`).toBeTruthy()
-  return row as HTMLElement
-}
-
 /**
- * KEPT ENTIRELY, AND THE REASON IS RECORDED RATHER THAN IMPLIED. This block was going to move into
- * a chat-history rail; history was withheld by a client call before it was built. So the recents
- * section stays exactly where it is — it is the only project-scoped way to delete a conversation
- * and the only route back to an EXISTING chat, and deleting it with nothing to replace it would
- * retire both silently. Nothing here is inverted and nothing moves.
+ * THE RECENTS LIST IS DELETED, AND ITS TWENTY-ODD ASSERTIONS WITH IT (plan 002, U3).
+ *
+ * What stood here characterised a section the client asked not to have: row anatomy, the kind
+ * badge's screen-reader phrase, the fallback word for an unrecognised kind, the ⋮ menu's Open and
+ * Delete, the optimistic removal, and the empty-state copy. The ruling of 2026-09-02 is that
+ * nothing points back to a chat, running or finished — so the list, its read, the prop chain that
+ * fed it and the delete handler are gone, and so are the tests that pinned them.
+ *
+ * THEY WERE READ BEFORE THEY WERE DELETED, which is the point of writing this down: two
+ * capabilities went with the markup — the only route back to an existing chat, and the only way to
+ * delete one — and both are the owner's decision rather than collateral. Chats, their plans and
+ * their uploaded files all stay in the database.
+ *
+ * WHAT REPLACES THEM is one assertion that the list is genuinely gone rather than merely
+ * unrendered, paired with a liveness check, plus the search below over every piece of copy that
+ * offered it. `chatKindFor`'s own fallback behaviour — the part of the deleted block that was
+ * about a module rather than about this list — is still pinned in `utils/__tests__/chatKind.test.ts`.
  */
-describe('ProjectPage — conversations as a plain recents list (U3)', () => {
-  it('renders icon · title · kind badge · relative date · ⋮ with no new-chat buttons', async () => {
+describe('ProjectPage — nothing points back to a past chat', () => {
+  it('★ renders no conversations section, and asks the server for no list', async () => {
     h.getProject.mockResolvedValue(makeProject())
-    h.listProjectConversations.mockResolvedValue([
-      { id: 'c1', kind: 'plan', projectId: 'p1', title: 'Scope the fields', updatedAt: '2026-07-10T00:00:00Z' },
-      { id: 'c2', kind: 'build', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
-    ])
-    renderProjectPage()
-
-    expect(await screen.findByText('Scope the fields')).toBeTruthy()
-    expect(h.listProjectConversations).toHaveBeenCalledWith('p1')
-    const list = screen.getByTestId('conversations')
-    // Liveness first: the rest of the row is still there, so nothing below can pass on a
-    // half-rendered list.
-    expect(within(list).getAllByText('1h ago').length).toBe(2)
-    expect(within(list).getByRole('button', { name: /actions for build the screen/i })).toBeTruthy()
-    // R16 — each row SAYS which kind it is, on the row that is that kind.
-    expect(within(rowFor('Build the screen')).getByText('Build')).toBeTruthy()
-    expect(within(rowFor('Scope the fields')).getByText('Plan')).toBeTruthy()
-    // …and still no New-chat buttons anywhere: the other half of the old assertion.
-    expect(screen.queryByRole('button', { name: /new build chat/i })).toBeNull()
-    expect(screen.queryByRole('button', { name: /new plan chat/i })).toBeNull()
-  })
-
-  it('the badge reads as the full phrase, not a bare noun', async () => {
-    // The visible word is half of it: the badge's COMPLETE text is what a screen reader says,
-    // and "Build" alone is not a sentence about anything. A badge with no visually-hidden
-    // completion is the mutant this catches.
-    h.getProject.mockResolvedValue(makeProject())
-    h.listProjectConversations.mockResolvedValue([
-      { id: 'c1', kind: 'plan', projectId: 'p1', title: 'Scope the fields', updatedAt: '2026-07-10T00:00:00Z' },
-      { id: 'c2', kind: 'build', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
-    ])
-    renderProjectPage()
-
-    await screen.findByText('Scope the fields')
-    expect(within(rowFor('Build the screen')).getByText('Build').textContent).toBe('Build chat')
-    expect(within(rowFor('Scope the fields')).getByText('Plan').textContent).toBe('Plan chat')
-  })
-
-  it('a kind this vocabulary does not have gets the fallback word, not the Plan word', async () => {
-    // ASM5, the live defect the badge exposes. `ConversationKind` has THREE values and the old
-    // `kind === 'builder'` test put `assistant` in the Plan arm — invisible behind an icon,
-    // a lie behind a word.
-    h.getProject.mockResolvedValue(makeProject())
-    h.listProjectConversations.mockResolvedValue([
-      { id: 'c3', kind: 'assistant', projectId: 'p1', title: 'Ask about gates', updatedAt: '2026-07-11T00:00:00Z' }, // a retired value, still on old rows
-    ])
-    renderProjectPage()
-
-    await screen.findByText('Ask about gates')
-    const row = rowFor('Ask about gates')
-    expect(within(row).getByText('Chat')).toBeTruthy()
-    expect(within(row).queryByText('Plan')).toBeNull()
-    expect(within(row).queryByText('Build')).toBeNull()
-  })
-
-  it('a malformed row (kind coerced to "") still renders, with the fallback word', async () => {
-    // `narrowChat` legitimately produces `kind: ''` for a row the API sent malformed. The
-    // lookup must answer it rather than throw or invent a kind.
-    h.getProject.mockResolvedValue(makeProject())
-    h.listProjectConversations.mockResolvedValue([
-      { id: 'c4', kind: 42, projectId: 'p1', title: 'Malformed row', updatedAt: '2026-07-11T00:00:00Z' },
-    ])
-    renderProjectPage()
-
-    await screen.findByText('Malformed row')
-    expect(within(rowFor('Malformed row')).getByText('Chat')).toBeTruthy()
-  })
-
-  it('clicking a row title navigates to /chat/{id}', async () => {
-    h.getProject.mockResolvedValue(makeProject())
-    h.listProjectConversations.mockResolvedValue([
-      { id: 'c2', kind: 'build', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
-    ])
-    renderProjectPage()
-
-    fireEvent.click(await screen.findByRole('button', { name: 'Build the screen' }))
-    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('/chat/c2'))
-  })
-
-  it('the ⋮ menu exposes Open and Delete; Delete removes the row optimistically', async () => {
-    h.getProject.mockResolvedValue(makeProject())
-    h.listProjectConversations.mockResolvedValue([
-      { id: 'c2', kind: 'build', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
-    ])
-    h.deleteConversation.mockResolvedValue(true)
-    renderProjectPage()
-
-    fireEvent.click(await screen.findByRole('button', { name: /actions for build the screen/i }))
-    expect(screen.getByRole('button', { name: 'Open' })).toBeTruthy()
-    const del = screen.getByRole('button', { name: 'Delete' })
-
-    fireEvent.click(del)
-    await waitFor(() => expect(screen.queryByText('Build the screen')).toBeNull())
-    expect(h.deleteConversation).toHaveBeenCalledWith('c2')
-  })
-
-  it('the ⋮ button is a SIBLING of the title button, not an interactive descendant (F-10)', async () => {
-    h.getProject.mockResolvedValue(makeProject())
-    h.listProjectConversations.mockResolvedValue([
-      { id: 'c2', kind: 'build', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
-    ])
-    renderProjectPage()
-
-    const title = await screen.findByRole('button', { name: 'Build the screen' })
-    // No interactive element nests inside the title button.
-    expect(title.querySelector('button')).toBeNull()
-    // The actions button exists elsewhere in the row, not under the title button.
-    const actions = screen.getByRole('button', { name: /actions for build the screen/i })
-    expect(title.contains(actions)).toBe(false)
-  })
-
-  it('empty state shows the exact copy', async () => {
-    h.getProject.mockResolvedValue(makeProject())
-    h.listProjectConversations.mockResolvedValue([])
     renderProjectPage()
 
     await screen.findByTestId('rail-app-status')
-    expect(screen.getByText('No conversations yet — start a build or plan above.')).toBeTruthy()
+    expect(screen.queryByTestId('conversations')).toBeNull()
+    expect(h.listProjectConversations).not.toHaveBeenCalled()
+    // Paired with a liveness check: an absence assertion passes just as happily when the page
+    // crashed and rendered nothing at all.
+    expect(screen.getByTestId('description-rail')).toBeTruthy()
+    expect(screen.getByPlaceholderText(/Describe the app you want built/i)).toBeTruthy()
+  })
+
+  it('★ offers no way to reach or delete an existing chat, however many the project has', async () => {
+    // A project with chats renders the same rail as a project with none — the list is not hidden
+    // behind an empty state, it does not exist.
+    h.getProject.mockResolvedValue(makeProject())
+    h.listProjectConversations.mockResolvedValue([
+      { id: 'c1', kind: 'plan', projectId: 'p1', title: 'Scope the fields', updatedAt: '2026-07-10T00:00:00Z' },
+      { id: 'c2', kind: 'build', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
+    ])
+    renderProjectPage()
+
+    await screen.findByTestId('rail-app-status')
+    expect(screen.queryByText('Scope the fields')).toBeNull()
+    expect(screen.queryByText('Build the screen')).toBeNull()
+    expect(screen.queryByRole('button', { name: /^delete$/i })).toBeNull()
+    expect(h.deleteConversation).not.toHaveBeenCalled()
+    expect(screen.getByTestId('description-rail')).toBeTruthy()
+  })
+
+  it('offers no copy anywhere on the screen that promises past conversations', async () => {
+    // Removing a control is not finished when the markup goes. The words that advertised it are
+    // part of the control.
+    h.getProject.mockResolvedValue(makeProject())
+    renderProjectPage()
+
+    await screen.findByTestId('rail-app-status')
+    const screenText = document.body.textContent ?? ''
+    expect(screenText).not.toMatch(/conversations · this project/i)
+    expect(screenText).not.toMatch(/no conversations yet/i)
+    expect(screenText).not.toMatch(/past (chats|conversations)/i)
+    expect(screenText).not.toMatch(/recent (chats|conversations|builds)/i)
   })
 })
 

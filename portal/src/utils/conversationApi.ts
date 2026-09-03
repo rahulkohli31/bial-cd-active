@@ -375,12 +375,13 @@ export async function patchConversation(id: string, patch: Record<string, unknow
   return res.json()
 }
 
-/** Delete a conversation (header + messages + its attachment objects, server-side). */
-export async function deleteConversation(id: string, deps: AuthFetchDeps = {}): Promise<true> {
-  const res = await authFetch(`/api/conversations/${encodeURIComponent(id)}`, { method: 'DELETE' }, deps)
-  if (!res.ok && res.status !== 404) throw await readApiError(res, 'Failed to delete conversation')
-  return true
-}
+/* THE DELETE WRAPPER IS GONE (plan 002, U3). Its one caller was the project rail's list of past
+   conversations, and the ruling of 2026-09-02 removed the list: nothing points back to a chat,
+   running or finished, so nothing offers to delete one either. The SERVER route is untouched —
+   this is a client with no caller, not a capability the backend has lost — and chats, their plans
+   and their uploaded files all stay. Cleanup, if the client ever asks for it, is a scheduled job.
+   Recorded here rather than removed silently, because the next person reaching for a delete needs
+   to know it was a decision. */
 
 // Client-minted ids + timestamps (Decision 3): ids are no longer guessable `chat_<timestamp>`.
 //
@@ -431,7 +432,6 @@ export interface ConversationStore {
   loadHistory: (deps?: AuthFetchDeps) => Promise<(ConversationHeader | null)[]>
   newConversation: () => string
   getConversation: (id: string, deps?: AuthFetchDeps) => Promise<ConversationWithMessages | null>
-  deleteConversation: (id: string, deps?: AuthFetchDeps) => Promise<true>
   createConversation: (
     id: string,
     header?: Partial<Omit<CreateConversationArgs, 'kind'>>,
@@ -444,7 +444,6 @@ export function createConversationStore(kind: string): ConversationStore {
     loadHistory: (deps) => listConversations(kind, deps),
     newConversation: () => newId(),
     getConversation: (id, deps) => getConversation(id, deps),
-    deleteConversation: (id, deps) => deleteConversation(id, deps),
     // UNCHECKED (matches pre-migration behavior): `header` is asserted to carry
     // whatever CreateConversationArgs still needs (projectId) once merged with `kind`.
     createConversation: (id, header = {}, deps) => createConversation(id, { kind, ...header } as CreateConversationArgs, deps),

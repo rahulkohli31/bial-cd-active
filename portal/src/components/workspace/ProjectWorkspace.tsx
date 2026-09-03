@@ -46,7 +46,6 @@
 import { useCallback, useMemo, useState } from 'react'
 import WorkspaceRail from './WorkspaceRail'
 import ProjectRenameDialog from '../projects/ProjectRenameDialog'
-import type { ChatSummary } from '../../utils/conversationApi'
 import { useWorkspaceState } from './useWorkspaceState'
 import type { StartOutcome } from './workspaceState'
 import {
@@ -67,11 +66,7 @@ import type { Project } from '../../utils/projectApi'
 
 export interface ProjectWorkspaceProps {
   project: Project
-  chats: ChatSummary[]
-  chatsError: string | null
   onProjectUpdate: (project: Project) => void
-  onOpenChat: (chatId: string) => void
-  onDeleteChat: (chatId: string) => void
 }
 
 export default function ProjectWorkspace(props: ProjectWorkspaceProps) {

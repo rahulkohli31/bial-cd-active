@@ -1,13 +1,37 @@
 /**
- * THE RAIL'S CONTENTS AT REST (Plan F, U1) — everything R6 asks the project screen to carry.
+ * THE RAIL — one white column, three sections, hairlines between them (plan 002, U3).
  *
  * ═══ WHAT THIS IS NOT ═══
  *
  * It is not a page and it is not a grid. The two-column frame belongs to `WorkspaceShell`, above
  * the Outlet, and this fills the Outlet's column. An implementer who builds rail-plus-pane in here
  * has produced a second two-column layout nested in the first, and every "the app did not remount"
- * assertion in this plan fails on the first navigation to a chat — because this component does not
- * match that address and the one holding the iframe must.
+ * assertion fails on the first navigation to a chat — because this component does not match that
+ * address and the one holding the iframe must.
+ *
+ * ═══ THE SHAPE THE BOARDS DRAW, AND WHAT IT REPLACES ═══
+ *
+ * A #F0F4F8 rail with four floating white cards on it became a #FFFFFF rail with sections divided
+ * by 1px #E2E8F0 rules. That is not decoration: it changes what those two colours MEAN. #E2E8F0 is
+ * the divider on every board (262 occurrences) and had become a card outline; #F0F4F8 is the page
+ * behind the APP and had become the rail's own ground.
+ *
+ * Three sections, in the board's order — START A CHAT, APP STATUS, DESCRIPTION — with the
+ * description pushed to the foot by a spacer, exactly as `Main` and `NothingBuilt` draw it.
+ *
+ * ═══ THE CONVERSATIONS LIST IS GONE, AND WHAT THAT COSTS IS THE OWNER'S DECISION ═══
+ *
+ * A fourth card listed this project's past chats. It is deleted — the list, its read, the prop
+ * chain that fed it all the way up through the page, and the delete-chat handler that had no other
+ * caller. The client asked not to have a list of past conversations, and the ruling of 2026-09-02
+ * is that NOTHING points back to a chat, running or finished: leaving a chat means starting a new
+ * one.
+ *
+ * TWO CAPABILITIES GO WITH IT, KNOWINGLY. The only route back to an EXISTING chat, and the only
+ * way to delete one. Chats, their plans and their uploaded files all stay in the database,
+ * untouched; cleanup, if it is ever wanted, is a scheduled job the client can ask for later. This
+ * is recorded here rather than only in a pull request because the next person to read this file
+ * will otherwise reasonably assume it was an oversight.
  *
  * ═══ R6's FOUR THINGS, AND THE ONE WITH A CONSTRAINT ATTACHED ═══
  *
@@ -16,9 +40,7 @@
  * `fetchSaveState` runs two `git` executions inside the container, so it may only be asked while
  * the workspace is alive — asking a stopped project whether it has unsaved work is a start the
  * screen caused, which R3 forbids. So a stopped project's rail shows the status sentence and NO
- * save state, NO commit and NO time, and the save half appears while the app is running. That is
- * a stated consequence, not an omission, and a saved-at TIME waits on a server field that does not
- * exist yet (no endpoint returns one).
+ * save state, and the save half appears while the app is running.
  *
  * ═══ WHY THE STATUS SENTENCE APPEARS HERE AS WELL AS IN THE PANE ═══
  *
@@ -28,22 +50,17 @@
  * control starts the app, and that control is the pane's. A second Start button here would satisfy
  * "exactly one" with two.
  *
- * ═══ THE COLLAPSE CONTROL IS NOT IN THIS FILE, ON PURPOSE ═══
+ * ═══ THE HEADER AND THE COLLAPSE CONTROL ARE BOTH ELSEWHERE, ON PURPOSE ═══
  *
- * A collapsed rail is `w-0` and `invisible`: out of the tab order and out of the accessibility
- * tree. A toggle living inside it would be a one-way door — press it once and nothing can undo it
- * without a reload. It is published into the PANE's leading toolbar slot instead, which is exactly
- * where the conversation surface already puts its own chat-panel toggle, and it points back here
- * through `aria-controls`.
+ * Back, the project name, the status chip and rename went to the toolbar row (U2), which is drawn
+ * above both columns and therefore survives a collapse — the rail's own header did not, which is
+ * what made the project name vanish on the very board that draws it staying. The collapse control
+ * is there too: a collapsed rail is `w-0` and `invisible`, out of the tab order and out of the
+ * accessibility tree, so a toggle living inside it would be a one-way door.
  */
-import { useEffect, useState } from 'react'
-import { MoreVertical } from 'lucide-react'
 import ProjectDescriptionEditor from '../projects/ProjectDescriptionEditor'
 import RailComposer from './RailComposer'
-import { chatKindFor } from '../../utils/chatKind'
-import { relativeTime } from '../../utils/chatHistory'
 import { shortSha } from '../../utils/shortSha'
-import type { ChatSummary } from '../../utils/conversationApi'
 import type { Project } from '../../utils/projectApi'
 import type { SaveState } from '../../utils/buildSessionApi'
 import type { WorkspaceState } from './workspaceState'
@@ -54,200 +71,75 @@ export interface WorkspaceRailProps {
   workspace: WorkspaceState
   /** Non-null only while the workspace is alive — see the cost note above. */
   save: SaveState | null
-  chats: ChatSummary[]
-  chatsError: string | null
   onProjectUpdate: (project: Project) => void
-  onOpenChat: (chatId: string) => void
-  onDeleteChat: (chatId: string) => void
 }
 
-export default function WorkspaceRail({
-  project,
-  workspace,
-  save,
-  chats,
-  chatsError,
-  onProjectUpdate,
-  onOpenChat,
-  onDeleteChat,
-}: WorkspaceRailProps) {
-  // OWNED HERE, BECAUSE THIS IS THE ONLY COMPONENT THAT RENDERS THEM. Both were lifted to
-  // `ProjectPage` and threaded down through `ProjectWorkspace`, which cost nine props across two
-  // interfaces to reach one renderer — and neither is state anybody above can act on: a half-typed
-  // name and an open ⋮ menu mean nothing to a route.
-  const [menuOpenId, setMenuOpenId] = useState<string | null>(null)
+/** The board's section label: 10.5px, weight 700, .7px tracking. Its colour is per-section. */
+function SectionLabel({ children, className = 'text-neutral' }: { children: string; className?: string }) {
+  return <h2 className={`text-[10.5px] font-bold tracking-[.7px] ${className}`}>{children}</h2>
+}
 
-  // Close the row action menu on Escape or an outside click while it is open.
-  useEffect(() => {
-    if (!menuOpenId) return undefined
-    const onDown = () => setMenuOpenId(null)
-    const onEsc = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setMenuOpenId(null)
-    }
-    document.addEventListener('mousedown', onDown)
-    document.addEventListener('keydown', onEsc)
-    return () => {
-      document.removeEventListener('mousedown', onDown)
-      document.removeEventListener('keydown', onEsc)
-    }
-  }, [menuOpenId])
-
+export default function WorkspaceRail({ project, workspace, save, onProjectUpdate }: WorkspaceRailProps) {
   return (
-    // ITS OWN SCROLLER. The shell is a full-height frame that does not scroll, and this is a flex
-    // child of it — without `overflow-y-auto` a project with twenty conversations clips its list
-    // with no way to reach the bottom. `min-h-0` is what actually lets a flex child scroll: without
-    // it the child's min-content height wins and the overflow never has anywhere to happen.
-    <main className="flex-1 min-h-0 overflow-y-auto">
-      <div className="w-full px-5 py-6 space-y-5">
-        {/* THE HEADER IS SURRENDERED TO THE TOOLBAR ROW (plan 002, U2). Back, the project name,
-            the status chip and the rename control all lived here, inside a 400px column — which is
-            why the name truncated at the rail's width and vanished entirely when the rail was
-            collapsed, the opposite of what the collapse board draws. They are drawn once by the
-            shell now, above both columns, so they survive a collapse by construction.
-
-            `onBack` is still a prop and still `ProjectPage`'s: the row's own back control routes
-            through the shell's unsaved-work guard, and this one is what the load-error branch of
-            that page uses. */}
-
+    // ITS OWN SCROLLER, and a COLUMN. The shell is a full-height frame that does not scroll and
+    // this is a flex child of it; `min-h-0` is what actually lets a flex child scroll, because
+    // without it the child's min-content height wins and the overflow never has anywhere to
+    // happen. The column is what lets the description sit at the foot on a tall screen, as the
+    // boards draw it, and scroll normally on a short one.
+    <main className="flex flex-1 min-h-0 flex-col overflow-y-auto bg-white">
+      <section className="px-[18px] pb-[15px] pt-4">
+        <SectionLabel className="text-primary-900">START A CHAT</SectionLabel>
         <RailComposer projectId={project.id} />
+      </section>
 
-        {/* R6's app status. THE SENTENCE ONLY — the action belongs to the pane (see the docblock).
-            Same computed value, so the two surfaces cannot say different things. */}
-        <section data-testid="rail-app-status" className="bg-white border border-bial-border rounded-2xl p-4">
-          <h2 className="text-[11px] font-bold uppercase tracking-wide text-neutral mb-2">Your app</h2>
-          <p className="text-sm font-semibold text-tertiary">{workspace.headline}</p>
-          {workspace.detail && <p className="text-xs text-neutral mt-1 leading-snug">{workspace.detail}</p>}
-          {/* THE SAVE HALF, which exists only while the app is running. `dirty` is TRI-STATE and
-              its `null` is "could not tell", never "clean" — so an unknown says so rather than
-              reporting that everything is saved. */}
-          {save && (
-            <div data-testid="rail-save-state" className="mt-3 pt-3 border-t border-bial-border">
-              <p className="text-xs text-neutral">
-                {save.dirty === true
-                  ? 'You have changes that are not saved yet.'
-                  : save.dirty === false
-                    ? 'Everything is saved.'
-                    : 'We could not check for unsaved changes.'}
-              </p>
-              {save.savedHead !== null && (
-                <p className="text-[11px] text-neutral mt-1 tabular-nums">
-                  Last saved version <span className="font-mono">{shortSha(save.savedHead)}</span>
-                </p>
-              )}
-            </div>
-          )}
-        </section>
+      <div className="h-px flex-shrink-0 bg-bial-border" />
 
-        {/* THE TESTID IS KEPT DELIBERATELY. This block is no longer a right-hand `aside` — the
-            rail IS the left column now — but it is the same description block with the same
-            read-view-plus-Edit-pop-up behaviour, and five assertions in `ProjectPage.test.tsx`
-            still say something true about it. Renaming the handle would have retired them as
-            collateral of a layout change, which is exactly the silent removal L8 forbids. */}
-        <section data-testid="description-rail" className="bg-white border border-bial-border rounded-2xl p-4">
-          <ProjectDescriptionEditor
-            projectId={project.id}
-            description={project.description}
-            onProjectUpdate={onProjectUpdate}
-          />
-        </section>
-
-        {/* CONVERSATIONS — a plain recents list, KEPT EXACTLY AS IT WAS.
-            It was going to move into a history rail, and history was withheld by a client call
-            before it was built. Deleting the section now would retire two capabilities silently:
-            the only project-scoped way to delete a conversation, and the only route back to an
-            EXISTING chat (everything else in the portal navigates to a newly minted one). It
-            stays, unstyled and unmoved, until history is decided. */}
-        <section data-testid="conversations" className="bg-white border border-bial-border rounded-2xl p-5">
-          <h2 className="text-sm font-bold text-tertiary mb-4">Conversations · this project</h2>
-
-          {chatsError ? (
-            <p className="text-xs text-danger" role="alert">
-              {chatsError}
+      {/* R6's app status. THE SENTENCE ONLY — the action belongs to the pane (see the docblock).
+          Same computed value, so the two surfaces cannot say different things. U4 gives this
+          section its provenance rows, its colour-coded states and its own action button. */}
+      <section data-testid="rail-app-status" className="px-[18px] py-[15px]">
+        <SectionLabel>APP STATUS</SectionLabel>
+        <p className="mt-2.5 text-sm font-semibold text-tertiary">{workspace.headline}</p>
+        {workspace.detail && <p className="mt-1 text-xs leading-snug text-neutral">{workspace.detail}</p>}
+        {/* THE SAVE HALF, which exists only while the app is running. `dirty` is TRI-STATE and
+            its `null` is "could not tell", never "clean" — so an unknown says so rather than
+            reporting that everything is saved. */}
+        {save && (
+          <div data-testid="rail-save-state" className="mt-3 border-t border-bial-border pt-3">
+            <p className="text-xs text-neutral">
+              {save.dirty === true
+                ? 'You have changes that are not saved yet.'
+                : save.dirty === false
+                  ? 'Everything is saved.'
+                  : 'We could not check for unsaved changes.'}
             </p>
-          ) : chats.length === 0 ? (
-            <p className="text-sm text-neutral">No conversations yet — start a build or plan above.</p>
-          ) : (
-            <div className="space-y-2">
-              {chats.map((chat) => {
-                // One lookup, not a two-way test on a many-valued field: a retired `assistant`
-                // row used to draw the Plan icon, which a word cannot get away with.
-                const kind = chatKindFor(chat.kind)
-                const menuOpen = menuOpenId === chat.id
-                return (
-                  // F-10: the row is a plain container. The title is a real <button> whose
-                  // stretched ::after covers the row, so the whole row opens the chat — but the
-                  // ⋮ menu is a SIBLING button layered above it, never an interactive descendant.
-                  <div
-                    key={chat.id}
-                    className="group relative flex items-center gap-3 bg-white border border-bial-border rounded-xl px-4 py-3 hover:border-primary/40 hover:shadow-sm transition"
-                  >
-                    <h3 className="min-w-0 flex-1">
-                      <button
-                        type="button"
-                        onClick={() => onOpenChat(chat.id)}
-                        className="block w-full text-left text-sm font-semibold text-tertiary cursor-pointer rounded-sm after:absolute after:inset-0 after:rounded-xl focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
-                      >
-                        <span className="block truncate">{chat.title || 'Untitled'}</span>
-                      </button>
-                    </h3>
-                    <span
-                      className={`inline-flex flex-shrink-0 items-center rounded-full px-2.5 py-1 text-[10px] font-bold uppercase tracking-wide ${kind.pill}`}
-                    >
-                      {/* The word is shown; the completion is read but not seen, so the screen
-                          says "Build" and the element's text says "Build chat". An `aria-label`
-                          on a role-less span is not reliably exposed — it would satisfy a test
-                          and help nobody — so the name is built from text. */}
-                      {kind.word}
-                      {kind.completion && <span className="sr-only">{kind.completion}</span>}
-                    </span>
-                    <span className="text-[11px] text-neutral flex-shrink-0 tabular-nums">
-                      {relativeTime(chat.updatedAt)}
-                    </span>
-                    <div className="relative z-10 flex-shrink-0">
-                      <button
-                        type="button"
-                        onMouseDown={(e) => e.stopPropagation()}
-                        onClick={() => setMenuOpenId(menuOpen ? null : chat.id)}
-                        aria-label={`Actions for ${chat.title || 'conversation'}`}
-                        className="p-1 rounded-lg text-neutral hover:text-primary hover:bg-surface-muted transition"
-                      >
-                        <MoreVertical size={16} />
-                      </button>
-                      {menuOpen && (
-                        <div
-                          onMouseDown={(e) => e.stopPropagation()}
-                          className="absolute right-0 top-8 z-20 w-32 bg-white rounded-lg border border-bial-border shadow-xl py-1"
-                        >
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setMenuOpenId(null)
-                              onOpenChat(chat.id)
-                            }}
-                            className="w-full text-left px-3 py-2 text-sm text-tertiary hover:bg-bial-bg transition"
-                          >
-                            Open
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setMenuOpenId(null)
-                              onDeleteChat(chat.id)
-                            }}
-                            className="w-full text-left px-3 py-2 text-sm text-danger hover:bg-red-50 transition"
-                          >
-                            Delete
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )
-              })}
-            </div>
-          )}
-        </section>
-      </div>
+            {save.savedHead !== null && (
+              <p className="mt-1 text-[11px] tabular-nums text-neutral">
+                Last saved version <span className="font-mono">{shortSha(save.savedHead)}</span>
+              </p>
+            )}
+          </div>
+        )}
+      </section>
+
+      {/* THE BOARD'S SPACER. On a tall screen the description sits at the foot of the rail rather
+          than floating under the status; on a short one it collapses and the rail scrolls. */}
+      <div className="min-h-0 flex-1" />
+
+      <div className="h-px flex-shrink-0 bg-bial-border" />
+
+      {/* THE TESTID IS KEPT DELIBERATELY. This is no longer a bordered card — the rail is one
+          panel of sections now — but it is the same description block with the same
+          read-view-plus-Edit-pop-up behaviour, and several assertions still say something true
+          about it. Renaming the handle would have retired them as collateral of a layout change,
+          which is exactly the silent removal the removal convention forbids. */}
+      <section data-testid="description-rail" className="px-[18px] pb-4 pt-3.5">
+        <ProjectDescriptionEditor
+          projectId={project.id}
+          description={project.description}
+          onProjectUpdate={onProjectUpdate}
+        />
+      </section>
     </main>
   )
 }

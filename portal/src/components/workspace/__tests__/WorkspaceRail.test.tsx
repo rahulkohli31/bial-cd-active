@@ -60,11 +60,7 @@ function renderRail(over: { workspace?: WorkspaceState; save?: SaveState | null 
         project={PROJECT}
         workspace={over.workspace ?? SAVED}
         save={over.save ?? null}
-        chats={[]}
-        chatsError={null}
         onProjectUpdate={noop}
-        onOpenChat={noop}
-        onDeleteChat={noop}
       />
     </MemoryRouter>,
   )
@@ -180,13 +176,32 @@ describe('the publishing chip and the recents survive the rewrite', () => {
     expect(screen.getByTestId('description-rail')).toBeTruthy()
   })
 
-  it('keeps the recents section, with its empty-state copy', () => {
-    // It carries the only project-scoped way to delete a conversation and the only route back to an
-    // EXISTING chat. Chat history was withheld before it was built, so removing this now would
-    // retire both silently.
-    renderRail()
+  it('★ renders exactly three sections, in the board\'s order, with no card borders between them', () => {
+    // THE SHAPE, AND THE FOURTH SECTION THAT IS NOT THERE. A grey rail with four floating white
+    // cards became a white rail with three sections and 1px rules — which is not decoration: it
+    // gives #E2E8F0 back its role as the divider and #F0F4F8 back its role as the ground behind
+    // the app. The fourth card was the recents list, deleted by the owner's ruling.
+    const { container } = renderRail()
 
-    expect(screen.getByTestId('conversations')).toBeTruthy()
-    expect(screen.getByText('No conversations yet — start a build or plan above.')).toBeTruthy()
+    expect(screen.queryByTestId('conversations')).toBeNull()
+    expect(screen.queryByText(/no conversations yet/i)).toBeNull()
+
+    const labels = Array.from(container.querySelectorAll('h2')).map((h) => h.textContent)
+    // The third section's heading is the description editor's own, which this suite stubs — so
+    // the two the RAIL draws are asserted here, in order, and the stub's presence stands for the
+    // third. `ProjectPage.test.tsx` renders the real editor and sees its heading.
+    expect(labels).toEqual(['START A CHAT', 'APP STATUS'])
+    expect(screen.getByTestId('description-editor')).toBeTruthy()
+
+    // No section carries a border, a radius or a fill of its own.
+    for (const testid of ['rail-app-status', 'description-rail']) {
+      const section = screen.getByTestId(testid)
+      expect(section.className).not.toMatch(/border-bial-border/)
+      expect(section.className).not.toMatch(/rounded-2xl/)
+      expect(section.className).not.toMatch(/bg-white/)
+    }
+    // …and the rail itself is the white surface, with hairlines between the sections.
+    expect(container.querySelector('main')?.className).toMatch(/bg-white/)
+    expect(container.querySelectorAll('div.h-px').length).toBe(2)
   })
 })

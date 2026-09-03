@@ -43,27 +43,11 @@ import { useCallback, useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { ArrowLeft } from 'lucide-react'
 import ProjectWorkspace from '../components/workspace/ProjectWorkspace'
-import type { ChatSummary } from '../utils/conversationApi'
 import { usePublishHeading, useWorkspaceProject } from '../components/workspace/workspaceChannel'
 import { getProject } from '../utils/projectApi'
 import type { Project } from '../utils/projectApi'
-import { ApiError, isRecord } from '../utils/apiError'
-import { listProjectConversations, deleteConversation } from '../utils/conversationApi'
+import { ApiError } from '../utils/apiError'
 import { markProjectOpened } from '../utils/observe'
-
-/**
- * `conversationApi` is untyped JavaScript, so its rows reach us as `unknown` in practice even
- * where the inferred type says otherwise. Parse, don't validate: guard the shape once, here.
- */
-function narrowChat(row: unknown): ChatSummary {
-  if (!isRecord(row)) return { id: '', kind: '', title: '', updatedAt: '' }
-  return {
-    id: typeof row.id === 'string' ? row.id : '',
-    kind: typeof row.kind === 'string' ? row.kind : '',
-    title: typeof row.title === 'string' ? row.title : '',
-    updatedAt: typeof row.updatedAt === 'string' ? row.updatedAt : '',
-  }
-}
 
 export default function ProjectPage() {
   const { projectId } = useParams()
@@ -80,9 +64,6 @@ export default function ProjectPage() {
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
 
-  const [chats, setChats] = useState<ChatSummary[]>([])
-  const [chatsError, setChatsError] = useState<string | null>(null)
-
   // WHAT THE TOOLBAR ROW NAMES, PUBLISHED FROM THE ROUTE (plan 002, U2) — above the early returns
   // below, for the same reason the project declaration is above them. The loading and load-error
   // branches are still this project's screen, and the row draws its back control and holds its own
@@ -96,7 +77,6 @@ export default function ProjectPage() {
   })
 
   const goToProjects = useCallback(() => navigate('/projects', { replace: true }), [navigate])
-  const openChat = useCallback((chatId: string) => navigate(`/chat/${chatId}`), [navigate])
 
   // Load the project. A 404 means it was deleted elsewhere — bounce to the index rather than
   // strand the user on a dead page.
@@ -135,37 +115,13 @@ export default function ProjectPage() {
     }
   }, [projectId, goToProjects])
 
-  // Load the project's chats. Deliberately NOT keyset-paginated like `/projects`:
-  // `GET /api/conversations?projectId=` caps at 200 with no cursor. Fine at pilot scale; a
-  // documented divergence, not a bug (see conversationApi.listProjectConversations).
-  const refreshChats = useCallback(async (): Promise<void> => {
-    if (!projectId) return
-    try {
-      const rows = await listProjectConversations(projectId)
-      setChats(rows.map(narrowChat))
-      setChatsError(null)
-    } catch (err) {
-      setChatsError(err instanceof ApiError ? err.message : 'Could not load this project’s chats.')
-    }
-  }, [projectId])
-
-  useEffect(() => {
-    void refreshChats()
-  }, [refreshChats])
-
-  const handleDeleteChat = useCallback(
-    (id: string): void => {
-      setChats((prev) => prev.filter((c) => c.id !== id)) // optimistic
-      void (async () => {
-        try {
-          await deleteConversation(id)
-        } catch {
-          void refreshChats() // reconcile — the row reappears if the delete didn't land
-        }
-      })()
-    },
-    [refreshChats],
-  )
+  /* THE CHATS READ, ITS ERROR AND THE DELETE HANDLER ARE GONE (plan 002, U3). They existed for
+     one renderer, the rail's "Conversations · this project" list, which the client asked not to
+     have — and the ruling of 2026-09-02 is that nothing points back to a chat, running or
+     finished. Removing the list removed the only route back to an existing chat AND the only way
+     to delete one; both are the owner's decision, taken knowingly. Chats, their plans and their
+     uploaded files stay in the database. Said here as well as in the rail because this is where
+     the reads used to be, and an absent fetch explains itself to nobody. */
 
   if (loading) {
     return (
@@ -200,11 +156,7 @@ export default function ProjectPage() {
   return (
     <ProjectWorkspace
       project={project}
-      chats={chats}
-      chatsError={chatsError}
       onProjectUpdate={setProject}
-      onOpenChat={openChat}
-      onDeleteChat={handleDeleteChat}
     />
   )
 }

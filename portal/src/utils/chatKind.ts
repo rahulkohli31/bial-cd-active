@@ -20,11 +20,13 @@
  * Tailwind class, and re-pointing those too would just move the "what does this look like"
  * decision somewhere it does not belong.
  *
- * THIS IS THE SINGLE FRONTEND SOURCE of what a kind is CALLED and what it DOES (R73) — and today
- * it has exactly ONE reader, the project page's chat list. Said plainly rather than as an
- * aspiration, because one surface still spells the words itself: the help page's prose, a named
- * deferral rather than an oversight — the copy rides a later release. When it does catch up, it
- * should read the `description` this module already carries rather than restating it.
+ * THIS IS THE SINGLE FRONTEND SOURCE of what a kind is CALLED and what it DOES (R73). Its readers
+ * are the toolbar row's kind pill and the rail composer's kind picker — the project page's chat
+ * list was the original one and it is gone (plan 002, U3: nothing points back to a past chat).
+ * Said plainly rather than as an aspiration, because one surface still spells the words itself:
+ * the help page's prose, a named deferral rather than an oversight — the copy rides a later
+ * release. When it does catch up, it should read the `description` this module already carries
+ * rather than restating it.
  *
  * (The paragraph above used to name a SECOND surface too — the composer's mode chooser,
  * `components/chat/ModeSwitcher.tsx`, on a different axis, ask/plan/write, not the stored kind.
