@@ -18,8 +18,9 @@
  *
  * `sessionStorage`, for the same reasons as the composer draft beside it: this is tab-scoped
  * knowledge about what the citizen is looking at right now, and dying with the tab is the correct
- * lifetime. It also means the memory cannot outlive a sign-out into someone else's session in the
- * way a `localStorage` copy would.
+ * lifetime. It dies with the TAB, not with the sign-in: a sign-out and sign-in in the same tab keeps
+ * it, which is harmless — the id is only a back target, and the project read behind it is scoped to
+ * the signed-in user on the server, so a stale id can at worst point one fetch at a 404.
  *
  * Storage access is wrapped because `sessionStorage` genuinely throws rather than degrading —
  * Safari's private mode on quota, and any embedding that blocks storage access. The defined
