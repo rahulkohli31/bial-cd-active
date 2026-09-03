@@ -120,7 +120,17 @@ function railWidthClass(collapsed: boolean, paneVisible: boolean): string {
   // Zero width AND out of reach. Width alone would only clip it, leaving its composer, its links
   // and its menus in the tab order — the WCAG 4.1.2 violation `hiddenSubtree.ts` records. The
   // subtree stays MOUNTED, so a draft and a scroll position survive a hide/show cycle.
-  if (collapsed) return `w-0 flex-shrink-0 border-r-0 overflow-hidden ${HIDDEN_BUT_MOUNTED}`
+  //
+  // ZERO IN BOTH DIRECTIONS, and the height is not belt-and-braces — it is the whole of the fix
+  // below the stacking threshold. This element is a child of a flex ROW above the threshold and a
+  // flex COLUMN below it. In the column, `w-0` constrains nothing and `flex-shrink-0` pins the rail
+  // at its full CONTENT height, so Hide details on a narrow window left an invisible 1,586px band
+  // where the rail had been and pushed the app pane to y=1697 with a height of 0 — the citizen
+  // presses "give the app the screen" and every pixel of the workspace goes blank. Measured in a
+  // browser at 1024px; no suite saw it, because jsdom lays nothing out and the class was read as a
+  // string. Above the threshold a zero height is equally correct: the element is already zero-width
+  // and hidden, so nothing is left for a height to stretch.
+  if (collapsed) return `w-0 h-0 flex-shrink-0 border-r-0 overflow-hidden ${HIDDEN_BUT_MOUNTED}`
   if (!paneVisible) return 'flex-1'
   // Stacked below the threshold (`flex-1`, sharing the column), the citizen's own width above it.
   return 'flex-1 wide:flex-none wide:w-[var(--rail-w)]'

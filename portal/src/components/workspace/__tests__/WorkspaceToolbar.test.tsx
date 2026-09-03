@@ -267,6 +267,27 @@ describe('collapsing the rail', () => {
     expect(screen.getByRole('button', { name: 'Back to projects' })).toBeTruthy()
   })
 
+  it('★ collapses in BOTH directions, because below the threshold the columns stack', () => {
+    // THE BROKEN SCREEN THIS IS WRITTEN AGAINST, found in a browser at 1024px and invisible to
+    // every suite because jsdom lays nothing out. The rail is a child of a flex ROW above the
+    // stacking threshold and a flex COLUMN below it. `w-0 flex-shrink-0` collapses it in the row
+    // and does nothing at all in the column: the rail kept its full 1,586px CONTENT height, so
+    // pressing "Hide details" on a narrow window left an invisible band exactly where the rail had
+    // been and pushed the app pane to y=1697 with a height of zero. The citizen presses the control
+    // whose whole promise is "give the app the screen" and the entire workspace goes blank.
+    //
+    // A class assertion is all jsdom can carry — which is precisely why the class has to be pinned
+    // here rather than trusted to a layout nobody in this suite computes.
+    render(<Workspace />)
+    fireEvent.click(screen.getByRole('button', { name: 'Hide details' }))
+
+    const rail = screen.getByTestId('workspace-outlet')
+    expect(rail.className).toMatch(/(^|\s)h-0(\s|$)/)
+    expect(rail.className).toMatch(/(^|\s)w-0(\s|$)/)
+    // Liveness: the same press still hides it, so this is not passing on a rail that never collapsed.
+    expect(rail.className).toMatch(/invisible/)
+  })
+
   it('the toggle points at the rail it hides', () => {
     render(<Workspace />)
     const toggle = screen.getByRole('button', { name: 'Hide details' })
