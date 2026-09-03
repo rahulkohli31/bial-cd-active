@@ -225,7 +225,7 @@ interface TurnSink {
    *
    *  IT IS NOT A PART, because the server never sends one and never will: reasoning text is
    *  stored for the provider's next turn and is never framed. The flag is turned INTO a
-   *  content-free reasoning part at the head of the streaming message by `streamingParts`,
+   *  content-free reasoning part at the TAIL of the streaming message by `streamingParts`,
    *  because the library's status renderer is reached only when a message actually carries a
    *  part of that kind — a boolean riding the turn renders nothing at all on its own. */
   working: boolean
