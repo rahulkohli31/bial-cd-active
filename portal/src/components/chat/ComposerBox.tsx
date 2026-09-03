@@ -198,7 +198,12 @@ export default function ComposerBox({
             event.preventDefault()
             void doSend()
           }}
-          className="flex w-full flex-col gap-2.5 rounded-[14px] border border-bial-border bg-white px-3 py-[11px]"
+          // THE BORDER ANSWERS TO THE HEADER. `PlanReady` draws the box `#CDE9EA` while the offer
+          // strip is fixed to its top, so the strip and the box read as one card rather than as a
+          // banner sitting on an unrelated control. The header slot's only occupant is that strip.
+          className={`flex w-full flex-col gap-2.5 rounded-[14px] border bg-white px-3 py-[11px] ${
+            header ? 'border-canvas-offeredge' : 'border-bial-border'
+          }`}
         >
           {header}
 

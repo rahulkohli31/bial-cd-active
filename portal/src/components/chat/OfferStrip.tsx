@@ -56,7 +56,7 @@
  * let a stale second tab write stale requirements into a permanent first message.
  */
 import { useCallback, useRef, useState, type FC } from 'react'
-import { Loader2, Sparkles } from 'lucide-react'
+import { Loader2, Wand2 } from 'lucide-react'
 
 import { uuidv7 } from '../../utils/conversationApi'
 import { usePrefersReducedMotion } from './ToolActivityLine'
@@ -87,6 +87,19 @@ export const BUILD_LABEL = 'Build this plan'
 export const KEEP_PLANNING_LABEL = 'Keep planning'
 /** The canvas's wording for why sending waits. */
 export const OFFER_GATE_NOTE = 'Choose one of the two above to carry on…'
+/**
+ * WHAT THE STRIP SAYS BEFORE ANYBODY PRESSES ANYTHING, verbatim from `PlanReady`.
+ *
+ * The board's annotation is the requirement, and it is about register rather than decoration:
+ * "this teal strip is not text the agent typed — it is a control the interface draws". Two bare
+ * buttons at the right of the box read as chrome; nothing distinguished them from Send, and
+ * nothing said what pressing one would DO. A citizen pressed "Build this plan" with no statement
+ * anywhere on the screen that it opens a second chat and leaves this one alone — which is the one
+ * thing they would want to know before pressing it.
+ */
+export const OFFER_HEADLINE = 'This looks ready to build.'
+export const OFFER_EXPLANATION =
+  'Opens a new Build chat with the message above as its first instruction. This chat stays exactly as it is.'
 
 const OfferStrip: FC<OfferStripProps> = ({
   toolCallId,
@@ -139,19 +152,30 @@ const OfferStrip: FC<OfferStripProps> = ({
   const spin = reducedMotion ? undefined : 'animate-spin'
 
   return (
+    // A BAND ACROSS THE TOP OF THE BOX, edge to edge — the negative margins undo the composer's own
+    // padding so the strip meets its border, which is what "fixed to the top of the message box"
+    // means on the board. `ComposerBox` turns the box's own border teal while this is mounted, so
+    // the two read as one card.
     <div
       data-testid="offer-strip"
       data-spent={spent ? 'true' : 'false'}
-      className={`flex flex-wrap items-center justify-end gap-2 px-1 pb-2 ${
+      className={`-mx-3 -mt-[11px] flex flex-wrap items-center gap-3 rounded-t-[13px] border-b border-canvas-offerrule bg-canvas-offer px-3.5 py-3 ${
         spent ? 'opacity-70' : ''
       }`}
     >
+      <Wand2 size={18} aria-hidden className="flex-shrink-0 text-primary" />
+
+      <div className="min-w-0 flex-1 basis-48">
+        <p className="text-[12.5px] font-bold text-canvas-offerink">{OFFER_HEADLINE}</p>
+        <p className="mt-0.5 text-[11px] leading-[1.55] text-neutral">{OFFER_EXPLANATION}</p>
+      </div>
+
       <button
         type="button"
         onClick={handleKeepPlanning}
         aria-disabled={busy !== null}
         data-testid="offer-keep-planning"
-        className="inline-flex items-center gap-1.5 rounded-lg border border-bial-border bg-white px-3 py-2 text-xs font-semibold text-tertiary transition hover:border-primary hover:text-primary"
+        className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-[10px] border border-slate-300 bg-white px-3.5 py-2.5 text-[12.5px] font-semibold text-slate-600 transition hover:border-primary hover:text-primary"
       >
         {busy === 'refine' && <Loader2 size={13} className={spin} />}
         {KEEP_PLANNING_LABEL}
@@ -161,9 +185,9 @@ const OfferStrip: FC<OfferStripProps> = ({
         onClick={handleBuild}
         aria-disabled={busy !== null}
         data-testid="offer-build"
-        className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-xs font-bold text-white transition hover:bg-primary-600"
+        className="inline-flex items-center gap-[7px] whitespace-nowrap rounded-[10px] bg-primary px-[15px] py-2.5 text-[12.5px] font-bold text-white transition hover:bg-primary-600"
       >
-        {busy === 'build' ? <Loader2 size={13} className={spin} /> : <Sparkles size={13} />}
+        {busy === 'build' ? <Loader2 size={13} className={spin} /> : <Wand2 size={13} aria-hidden />}
         {BUILD_LABEL}
       </button>
     </div>

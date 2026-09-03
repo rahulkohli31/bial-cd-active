@@ -12,7 +12,7 @@ import { render, screen, cleanup, fireEvent, within } from '@testing-library/rea
 
 import ChatThread from '../ChatThread'
 import ChatRuntimeProvider from '../runtime/ChatRuntimeProvider'
-import { groupLabel } from '../ActivityGroup'
+import { groupLabel, stepIconFor } from '../ActivityGroup'
 import type { ChatMessage, MessagePart } from '../../../utils/messageTypes'
 import type { StepItem } from '../../../utils/turnStreamApi'
 
@@ -425,5 +425,64 @@ describe('a group reports what it amounted to, once, as it seals', () => {
     rerender(withReporter(done, onGroupSealed))
     rerender(withReporter(done, onGroupSealed))
     expect(onGroupSealed).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('★ the icon map speaks the server\'s vocabulary, not a guess at it', () => {
+  // `ActivityAnatomy` never draws an empty tile: every glyph on it names a kind of call. The first
+  // cut of `stepIconFor` matched verbs the projection does not emit — `reading`, `adding`,
+  // `putting`, `creating`, `installing`, `finishing` — and had no branch for the ones it does, so a
+  // quarter of the tiles in a real 61-message transcript drew the featureless fallback circle.
+  //
+  // THESE ARE THE SERVER'S ACTUAL WORDS, copied from `backend/src/services/messages/projection.py`.
+  // If a label there is reworded, this list is what goes red.
+  const EMITTED: [string, string][] = [
+    ["Looking at your app's main page", 'read'],
+    ["Looked through the app's files", 'read'],
+    ["Inspected the app's files", 'read'],
+    ['Read app/page.tsx', 'read'],
+    ['Building your app', 'build'],
+    ['Working on your app', 'build'],
+    ['Updating app/page.tsx', 'edit'],
+    ['Edited `app/page.tsx`.', 'edit'],
+    ['Setting up the tools your app needs', 'prepare'],
+    ["Getting your app's data ready", 'prepare'],
+    ['Making sure everything fits together', 'check'],
+    ['Verifying the build…', 'check'],
+    ['Wrapping up the build', 'finish'],
+    ['Tidying things up', 'finish'],
+    ["Organized the app's files", 'finish'],
+  ]
+
+  for (const [label, kind] of EMITTED) {
+    it(`gives "${label}" a named icon (${kind}), not the fallback dot`, () => {
+      expect(stepIconFor(label).displayName).not.toBe('Circle')
+    })
+  }
+
+  it('★ groups the vocabulary rather than giving every label its own glyph', () => {
+    // A DIFFERENT assertion from the one above, and the reason both are here: "not the fallback"
+    // passes on a map that returns a different icon for every string, which is not what the board
+    // draws — its glyphs name KINDS. So the reads must agree with each other and differ from the
+    // writes.
+    const iconOf = (label: string) => stepIconFor(label).displayName
+    expect(iconOf("Looked through the app's files")).toBe(iconOf('Looking at your app'))
+    expect(iconOf("Inspected the app's files")).toBe(iconOf('Looking at your app'))
+    expect(iconOf('Building your app')).not.toBe(iconOf('Looking at your app'))
+    expect(iconOf('Making sure everything fits together')).not.toBe(iconOf('Building your app'))
+  })
+
+  it('★ sees through the "Still …" prefix a slow step is wrapped in', () => {
+    // The projection fronts a long-running step's OWN words rather than replacing them, so the raw
+    // string starts with "Still" — and the steps a citizen stares at longest were exactly the ones
+    // being sent to the neutral dot.
+    expect(stepIconFor('Still setting up the tools your app needs').displayName)
+      .toBe(stepIconFor('Setting up the tools your app needs').displayName)
+  })
+
+  it('keeps the fallback for a call the SERVER could not name either', () => {
+    // `Used {tool_name}` is the projection admitting it has no words for this one. Guessing an icon
+    // here would be a claim about what the agent did that nothing on the wire supports.
+    expect(stepIconFor('Used fetch_output_slice').displayName).toBe('Circle')
   })
 })

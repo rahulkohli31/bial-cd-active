@@ -129,6 +129,10 @@ export default {
           sendoff: '#D6DDE4',      // the send control with nothing to send — a ground, not an opacity
           tilelive: '#E0F5F6',     // a tool tile whose step is running (= primary-50)
           tileedge: '#B3E6E9',     // …and its border (= primary-100)
+          offer: '#F5FBFB',        // the plan-ready strip's ground, fixed to the top of the box
+          offerrule: '#D9EBEC',    // …the hairline under it
+          offeredge: '#CDE9EA',    // …and the box's own border while the offer is live
+          offerink: '#0A5C5F',     // the strip's headline — darker than the action teal, on purpose
         },
         /**
          * The nine status states of `StatusCardStates`, as text / ground / dot triples. Six

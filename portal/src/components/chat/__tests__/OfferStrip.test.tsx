@@ -66,6 +66,38 @@ describe('the two buttons, and the words on them', () => {
   })
 })
 
+describe('★ the strip SAYS what it is, which is what makes it a control and not chrome', () => {
+  // `PlanReady`'s annotation is the requirement, and it is about register: "this teal strip is not
+  // text the agent typed — it is a control the interface draws". It shipped as two bare buttons at
+  // the right of the box, which is indistinguishable from chrome — nothing marked them off from
+  // Send, and nothing anywhere on the screen said what pressing one would DO. A citizen pressed
+  // "Build this plan" with no statement that it opens a SECOND chat and leaves this one alone,
+  // which is the one thing they would want to know first.
+
+  it('carries the board\'s headline and its one line of explanation', () => {
+    draw()
+    const strip = screen.getByTestId('offer-strip')
+    expect(strip.textContent).toContain('This looks ready to build.')
+    expect(strip.textContent).toContain(
+      'Opens a new Build chat with the message above as its first instruction. This chat stays exactly as it is.',
+    )
+  })
+
+  it('is a band on the box\'s ground, not a right-aligned button row', () => {
+    // The ground and the hairline under it are what set the strip apart from the box it sits on.
+    // Without them the copy above would read as one more paragraph of the conversation.
+    draw()
+    const cls = screen.getByTestId('offer-strip').className
+    expect(cls.split(/\s+/)).toContain('bg-canvas-offer')
+    expect(cls).toMatch(/border-canvas-offerrule/)
+  })
+
+  it('says it while SPENT too — the sentence is about what the buttons do, not about a pending call', () => {
+    draw({ spent: true })
+    expect(screen.getByTestId('offer-strip').textContent).toContain('This looks ready to build.')
+  })
+})
+
 describe('the strip IS its tool call id', () => {
   it('renders nothing at all without one, rather than a dead button', () => {
     const { container } = draw({ toolCallId: null })

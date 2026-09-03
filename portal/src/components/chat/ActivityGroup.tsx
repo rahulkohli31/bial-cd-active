@@ -58,7 +58,7 @@ import {
   Flag,
   Hammer,
   Package,
-  Plus,
+  Pencil,
   ShieldCheck,
   type LucideIcon,
 } from 'lucide-react'
@@ -182,13 +182,38 @@ export function groupLabel(facts: GroupFacts, interrupted: boolean): string {
  * discipline is that it never makes one.
  */
 export function stepIconFor(label: string): LucideIcon {
-  const words = label.toLowerCase()
-  if (words.startsWith('reading') || words.startsWith('checking') || words.startsWith('looking')) return Eye
-  if (words.startsWith('adding') || words.startsWith('putting') || words.startsWith('creating')) return Plus
-  if (words.startsWith('setting up') || words.startsWith('installing')) return Package
-  if (words.startsWith('making sure') || words.startsWith('verifying')) return ShieldCheck
-  if (words.startsWith('wrapping up') || words.startsWith('finishing')) return Flag
+  // `Still ` FRONTS ANY OTHER LABEL. The projection wraps a long-running step's own words rather
+  // than replacing them ("Still setting up the tools your app needs"), so matching the raw string
+  // would send every slow step — the ones a citizen stares at longest — to the neutral dot.
+  const words = label.toLowerCase().replace(/^still\s+/, '')
+
+  // THE VOCABULARY IS THE SERVER'S, and these are its actual words rather than a guess at them.
+  // The first cut of this map matched `reading` / `adding` / `putting` / `creating` / `installing`
+  // / `finishing`, and the projection emits NONE of those — while the words it does emit, `looked`
+  // / `inspected` / `read` / `updating` / `getting` / `edited`, had no branch at all. A quarter of
+  // the tiles in a real transcript therefore drew the featureless fallback circle, which is the one
+  // thing `ActivityAnatomy` never draws: every tile on it names a kind of call.
+  //
+  // Read alongside `backend/src/services/messages/projection.py`, which is where these words are
+  // written. A label added there without a branch here is not an error — it is the fallback below,
+  // doing its job.
+  if (
+    words.startsWith('looking') ||
+    words.startsWith('looked') ||
+    words.startsWith('inspected') ||
+    words.startsWith('reading') ||
+    words.startsWith('read ') ||
+    words.startsWith('checking')
+  ) {
+    return Eye
+  }
   if (words.startsWith('building') || words.startsWith('working')) return Hammer
+  if (words.startsWith('updating') || words.startsWith('edited') || words.startsWith('inserted')) return Pencil
+  if (words.startsWith('setting up') || words.startsWith('getting') || words.startsWith('installing')) return Package
+  if (words.startsWith('making sure') || words.startsWith('verifying')) return ShieldCheck
+  if (words.startsWith('wrapping up') || words.startsWith('tidying') || words.startsWith('organized')) return Flag
+  // THE FALLBACK IS STILL THE POINT OF THE SHAPE — `Used {tool_name}` reaches it, and should: the
+  // projection could not name that call either, so neither may this.
   return Circle
 }
 
