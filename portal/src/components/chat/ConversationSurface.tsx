@@ -1552,6 +1552,9 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     // persisted and the reply runs detached regardless of what this tab does next — so the
     // catch below must split on it: everything after the accept is subscription plumbing.
     let posted = false
+    // DECLARED OUT HERE, as the re-attach path declares its own, because what the reader ended as
+    // is read below — after the guard that decides whether anything may be painted at all.
+    let outcome: StreamOutcome
     try {
       await startTurn(
         activeId,
@@ -1580,16 +1583,13 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       const controller = new AbortController()
       streamAbortRef.current = controller
       const onFrame = turnFrameHandler(activeId, assistantId, sink)
-      let outcome = await readTurnStream({ conversationId: activeId, signal: controller.signal, onFrame })
+      outcome = await readTurnStream({ conversationId: activeId, signal: controller.signal, onFrame })
       if (outcome === 'truncated' && !sink.terminal && !controller.signal.aborted) {
         // A dropped socket before the terminal: one resubscribe consolidates the turn so far
         // via the server snapshot then tails to the end (resume-once). A second truncation is
         // a real drop — reload is the honest fallback.
         outcome = await readTurnStream({ conversationId: activeId, signal: controller.signal, onFrame })
       }
-      if (outcome === 'stalled') setTurnError('The reply stalled. Reload to catch up.')
-      else if (outcome === 'truncated' && !sink.terminal) setTurnError('The connection dropped. Reload to catch up.')
-      settleWorking(assistantId, sink)
     } catch (err) {
       // Whether the reclaim DIALOG has taken ownership of settling the composer's promise: its
       // retry closure carries the same `onSent`/`onAbort`, so settling here as well would reject a
@@ -1652,7 +1652,18 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     }
     endGenerating(activeId)
 
+    // EVERYTHING THAT PAINTS IS UNDER ONE GUARD, in the same order the re-attach path uses.
+    //
+    // The status row and the two banners used to be written inside the `try`, unguarded, while
+    // the three below were not — so a reader that ended after the citizen had opened a sibling
+    // chat wrote "The reply stalled" and "The connection dropped" onto THAT chat's screen, about
+    // a turn in a conversation they had left. `settleWorking` went the same way, repainting a
+    // transcript belonging to somebody else's chat. Both paths now say the same thing once:
+    // a reply is only ever told to the chat it belongs to.
     if (stillHere()) {
+      settleWorking(assistantId, sink)
+      if (outcome === 'stalled') setTurnError('The reply stalled. Reload to catch up.')
+      else if (outcome === 'truncated' && !sink.terminal) setTurnError('The connection dropped. Reload to catch up.')
       if (sink.terminal !== 'completed' && sink.parts.length === 0) {
         // Failed/stopped with nothing streamed — drop the empty bubble; the error banner
         // (or the stopped state) is the feedback.

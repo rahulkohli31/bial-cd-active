@@ -353,6 +353,47 @@ describe('an in-flight turn belongs to ONE chat (G2)', () => {
       expect(h.startTurn).toHaveBeenCalledWith('chat-B', expect.anything(), expect.anything(), expect.anything()),
     )
   })
+
+  it('★ a reply that ends after the reader has left says nothing in the chat they moved to', async () => {
+    // THE ASYMMETRY THIS IS WRITTEN AGAINST. The re-attach path drops everything it was going to
+    // paint the moment the reader has moved on; the SEND path wrote its two banners and cleared
+    // its status row outside that guard. So a connection that died in chat A after the citizen
+    // opened chat B put "The reply stalled. Reload to catch up." on chat B's screen — advice
+    // about a turn in a conversation they had left, over a chat that was working perfectly.
+    let dropTheConnection
+    h.readTurnStream.mockImplementation(() => new Promise((resolve) => { dropTheConnection = resolve }))
+    h.getBuild.mockResolvedValue({ id: 'chat-A', kind: 'build', messages: [] })
+    const { deps: d } = deps()
+    const { rerender } = renderAt('chat-A', d)
+    await waitForGateOpen()
+    type('a question')
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalledWith('chat-A', expect.anything(), expect.anything(), expect.anything()))
+
+    // They open a sibling while A's reply is still coming — the same instance, flat routing.
+    h.getBuild.mockResolvedValue({
+      id: 'chat-B',
+      kind: 'build',
+      messages: [{ id: 'b0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'about the other app' }] }],
+    })
+    rerender(
+      <MemoryRouter initialEntries={['/x']}>
+        <ConversationSurface chatId="chat-B" projectId="p1" projectName="VIP Movement" buildSessionDeps={d} />
+      </MemoryRouter>,
+    )
+    await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
+    await screen.findByText('about the other app')
+
+    // …and only THEN does chat A's connection die.
+    await act(async () => { dropTheConnection('stalled') })
+
+    expect(screen.queryByText(/The reply stalled/i)).toBeNull()
+    expect(screen.queryByText(/The connection dropped/i)).toBeNull()
+    // LIVENESS: chat B is still on screen and still itself, so the two absences are absences
+    // rather than a surface that threw its way to an empty page.
+    expect(screen.getByText('about the other app')).toBeTruthy()
+    expect(composer()).toBeTruthy()
+  })
 })
 
 describe('a typed draft survives (G3)', () => {
