@@ -478,8 +478,8 @@ export async function readStopStateOf(
  * anything failed — the likeliest reason for passing two minutes is a large app being packed up
  * exactly as it should be, which is why the sentence in `handOverWorkspace` says so.
  */
-const STOP_POLL_MS = 1200
-const STOP_CEILING_MS = 120_000
+export const STOP_POLL_MS = 1200
+export const STOP_CEILING_MS = 120_000
 /**
  * HOW LONG ONE READ MAY HANG BEFORE IT IS ABANDONED — and why this is a REAL timer and not the
  * injected clock's.

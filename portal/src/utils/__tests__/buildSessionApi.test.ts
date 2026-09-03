@@ -11,6 +11,8 @@ import {
   releaseProject,
   fetchPreviewState,
   handOverWorkspace,
+  STOP_CEILING_MS,
+  STOP_POLL_MS,
 } from '../buildSessionApi'
 import { ApiError } from '../apiError'
 
@@ -700,10 +702,18 @@ describe('handOverWorkspace — the stop → save → release ordering (#83)', (
     expect((err as ApiError).message).not.toMatch(
       /fail|could not|did not|timed out|container|sandbox|server|api/i,
     )
-    // AND IT IS THE TWO-MINUTE WAIT THAT PRODUCED IT: a 120s ceiling at one read every 1.2s. This
-    // is the assertion that holds the ceiling where the owner put it — raising it to the server's
-    // budget would make this 409 reads, and the citizen would sit in front of the modal for them.
-    expect(reads()).toBe(100)
+    // AND IT IS THE TWO-MINUTE WAIT THAT PRODUCED IT — two assertions, because those are two
+    // separate decisions and only one of them is this test's business to hold.
+    //
+    // HOW LONG A CITIZEN IS HELD is the owner's decision, and the one worth a fixed number:
+    // raising the ceiling to the server's eight-minute budget is exactly the change that must not
+    // pass, and it fails here by name rather than through an arithmetic nobody would read.
+    expect(STOP_CEILING_MS).toBe(2 * 60 * 1000)
+    // HOW OFTEN IT ASKS is a decision about traffic, and it must be free to move without this
+    // going red for a reason that has nothing to do with the citizen. So the count is derived
+    // rather than written out as 100: `Math.ceil`, because the loop checks the deadline BEFORE
+    // each read, so a poll that does not divide the ceiling evenly still gets its last one in.
+    expect(reads()).toBe(Math.ceil(STOP_CEILING_MS / STOP_POLL_MS))
   })
 
   it('carries a reclaim refusal out to the caller rather than swallowing it', async () => {
