@@ -179,6 +179,23 @@ describe('what the row names on each address', () => {
     expect(screen.getByTestId('publish-chip-stub')).toBeTruthy()
   })
 
+  it('★ draws the BUILD pill as the word alone, and the PLAN pill with the glyph its board has', () => {
+    // The row shipped a Lucide wrench inside the BUILD pill that no BuildChat-family board draws.
+    // The two kinds genuinely differ here — PLAN carries an 11px message-square, BUILD is the word
+    // — so the assertion is a pair: the absence on one kind, the presence on the other, in the
+    // same row. An absence alone would pass against a pill that stopped rendering at all.
+    render(<Workspace entry="/chat/c1" />)
+    const build = screen.getByTestId('toolbar-chat-kind')
+    expect(build.textContent).toContain('Build')
+    expect(build.querySelector('svg')).toBeNull()
+
+    cleanup()
+    render(<Workspace entry="/chat/c1" chat={{ heading: { ...CHAT_HEADING, chatKind: 'plan' } }} />)
+    const plan = screen.getByTestId('toolbar-chat-kind')
+    expect(plan.textContent).toContain('Plan')
+    expect(plan.querySelector('svg')).toBeTruthy()
+  })
+
   it('a freshly created chat, whose title is not yet known, names its kind rather than nothing', () => {
     // The ordinary case, not an error: the row is created by the first send and its title is
     // derived from that message. A blank <h1> or a spinner would both be worse than the kind.
