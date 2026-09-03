@@ -37,6 +37,7 @@ import pytest
 import redis.asyncio as aioredis
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from src.config import settings
 from src.db.models.user import User
@@ -434,6 +435,73 @@ async def test_two_racing_transfers_for_one_citizen_end_with_one_container(
     assert await manager.stop_state_of_active_work(db_session, user, project_a) is (
         StopOutcome.STOPPED
     )
+
+
+async def test_a_stop_that_breaks_is_logged_against_the_citizen_it_broke_for(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A detached stop that raises names WHO it failed for, not just that something failed.
+
+    The callback exists because an un-retrieved task exception surfaces only as a warning at
+    collection time, attached to nothing anyone is looking at. A line with no keys is barely
+    better: nothing in this service binds structlog contextvars, so a detached task inherits no
+    request scope, and an operator watching "stop of active work failed" repeat cannot tell
+    which citizen is stuck or which container is still holding a workspace.
+
+    Mutation check: drop the identifiers from the `_log.error` call and the key assertions go red
+    while the message assertion stays green."""
+    user, project_a = await _mk(db_session, "stop8@rvaiglobal.com")
+    manager = SessionManager()
+    client = _bundles_to(FakeSandboxClient(), "7" * 40)
+    brain = _HoldsItsOwnUnwind()
+
+    await manager.start(
+        db_session, user, project_a, "build it", run_build=brain, sandbox_client=client
+    )
+    await brain.stepped.wait()
+    session = manager.active_session_for(user.id)
+    assert session is not None
+    app_id = session.app_id
+
+    real_stop = manager._stop_the_held_session
+
+    async def _breaks(_user_id, _app_id, **_kwargs):
+        raise RuntimeError("the stop itself broke")
+
+    monkeypatch.setattr(manager, "_stop_the_held_session", _breaks)
+    with capture_logs() as logs:
+        assert (
+            await manager.request_stop_of_active_work(
+                db_session, user, project_a, sandbox_client=client
+            )
+            is StopOutcome.STILL_RUNNING
+        )
+        record = manager._stop_records[(user.id, project_a)]
+        with pytest.raises(RuntimeError):
+            await asyncio.wait_for(record.task, timeout=5)
+        await asyncio.sleep(0)  # the done-callback runs on the next loop pass
+
+    failures = [line for line in logs if line["event"] == "stop of active work failed"]
+    assert len(failures) == 1
+    assert failures[0]["user_id"] == str(user.id)
+    assert failures[0]["project_id"] == str(project_a)
+    assert failures[0]["app_id"] == str(app_id)
+
+    # AND THE MANAGER IS NOT WEDGED BY IT: a broken stop leaves the record settled rather than
+    # in flight, so the next ask starts a real one and the container is still given up.
+    monkeypatch.setattr(manager, "_stop_the_held_session", real_stop)
+    assert (
+        await manager.request_stop_of_active_work(
+            db_session, user, project_a, sandbox_client=client
+        )
+        is StopOutcome.STILL_RUNNING
+    )
+    brain.let_go.set()
+    retry = manager._stop_records[(user.id, project_a)]
+    assert await asyncio.wait_for(retry.task, timeout=10) is StopOutcome.STOPPED
 
 
 # --- the two predicates, held apart --------------------------------------------------

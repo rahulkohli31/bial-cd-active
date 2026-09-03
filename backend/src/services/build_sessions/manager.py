@@ -33,6 +33,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from typing import Final, Literal
 
 import redis.asyncio as aioredis
@@ -526,18 +527,37 @@ class _StopRecord:
     requested_at: datetime
 
 
-def _log_a_stop_that_failed(task: asyncio.Task[StopOutcome]) -> None:
-    """A detached stop that raised, said out loud.
+def _log_a_stop_that_failed(
+    task: asyncio.Task[StopOutcome],
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    app_id: uuid.UUID,
+) -> None:
+    """A detached stop that raised, said out loud — and said WHOSE.
 
     The status read does not depend on this — it reads the session map, so a crashed stop still
     reports honestly as "still running" while the session is held. But a stop that breaks is an
     operator's problem the moment it repeats, and an un-retrieved task exception surfaces only
-    as a warning at collection time, attached to nothing anyone is looking at."""
+    as a warning at collection time, attached to nothing anyone is looking at.
+
+    THE IDENTIFIERS ARE THE WHOLE POINT of logging it here rather than leaving it to the
+    collector. Nothing in this service binds structlog contextvars, so a detached task inherits
+    no request scope — a bare line saying a stop failed tells an operator watching it repeat
+    nothing they can act on: not which citizen is stuck, not which project, not which container
+    is still holding a workspace. They are passed in rather than read off the record, because
+    the record is keyed by the same pair and a lookup here would race the prune."""
     if task.cancelled():
         return
     failure = task.exception()
     if failure is not None:
-        _log.error("stop of active work failed", exc_info=failure)
+        _log.error(
+            "stop of active work failed",
+            exc_info=failure,
+            user_id=str(user_id),
+            project_id=str(project_id),
+            app_id=str(app_id),
+        )
 
 
 class WorkspaceUnreadableError(Exception):
@@ -2161,8 +2181,15 @@ class SessionManager:
         )
         # A stop that raises must not vanish into an un-retrieved task exception at GC time. The
         # status read still answers correctly either way — it reads the session map, not this
-        # task — but an operator needs to know the stop itself broke.
-        task.add_done_callback(_log_a_stop_that_failed)
+        # task — but an operator needs to know the stop itself broke, and WHOSE.
+        task.add_done_callback(
+            partial(
+                _log_a_stop_that_failed,
+                user_id=user.id,
+                project_id=project_id,
+                app_id=app_id,
+            )
+        )
         self._stop_records[key] = _StopRecord(
             app_id=app_id, task=task, requested_at=datetime.now(UTC)
         )
