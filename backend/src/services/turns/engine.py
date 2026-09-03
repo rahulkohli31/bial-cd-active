@@ -592,6 +592,13 @@ class _TurnState:
     # of both meant it reached nobody. Cleared by the first real step, which is what "replaced by
     # the first real step" has to mean on a transport where the ring frame is unreachable.
     acknowledgement: StepItem | None = None
+    # The "Writing up the plan…" status's call id, tracked for exactly the reason the ack above
+    # is: it is a PLATFORM-owned status with no durable counterpart, so the only thing that can
+    # ever take it off a watching tab is this engine deciding to. The offer arm withdraws it when
+    # the plan lands; a Plan turn that fails or is stopped in the window between the block opening
+    # and the argument completing never reaches that arm, and without this the terminal has no way
+    # to name the step it must withdraw. `None` on every turn that never opened one.
+    plan_status_tool_call_id: str | None = None
     #: Is the model REASONING right now — the only thing reasoning is allowed to become.
     #:
     #: A boolean, never the text. The blocks are stored so the next turn can replay them and
@@ -2761,7 +2768,12 @@ class TurnEngine:
         IT HAS NO DURABLE COUNTERPART, and that is deliberate rather than an omission: a status
         that exists only while a turn is streaming has nothing to say on a reloaded transcript,
         which shows the plan and the offer and never the moment before them. Same reasoning as
-        the turn's opening acknowledgement, which is also never persisted."""
+        the turn's opening acknowledgement, which is also never persisted.
+
+        REMEMBERED ON THE STATE, so the terminal can withdraw it. Nothing else in `state.steps`
+        is the platform's to retract — every other entry is a real tool step whose row is
+        authoritative — so `_finish` cannot find this one by looking, and a Plan turn that fails
+        or is stopped mid-argument would otherwise leave it spinning under a turn that is over."""
         item = StepItem(
             seq=0,  # transient: no row, so no row seq
             tool=PLAN_OPTIONS_TOOL,
@@ -2769,6 +2781,7 @@ class TurnEngine:
             state="pending",
             hidden=False,
         )
+        state.plan_status_tool_call_id = tool_call_id
         self._open_step(state, tool_call_id, item)
 
     def _emit_plan_options(self, state: _TurnState, tool_call_id: str) -> None:
@@ -3065,9 +3078,15 @@ class TurnEngine:
 
         NOT USED BY THE EVICTION at the steps cap: an evicted step is a REAL step that ran and
         whose row is authoritative — trimming the snapshot to bound memory must not tell a
-        watching tab that the work never happened."""
+        watching tab that the work never happened.
+
+        IDEMPOTENT, and the plan status's own bookkeeping is cleared here so it stays that way:
+        the offer arm withdraws the status when the plan lands, and the terminal must then find
+        nothing left to withdraw rather than emit a second hidden frame for the same id."""
         item = state.steps.get(tool_call_id)
         state.drop_step(tool_call_id)
+        if state.plan_status_tool_call_id == tool_call_id:
+            state.plan_status_tool_call_id = None
         if item is None:
             return
         self._emit(
@@ -3241,6 +3260,15 @@ class TurnEngine:
         # with "Getting started on that…" still spinning under a turn that is over. Idempotent,
         # so the ordinary turn that already retired it emits nothing here.
         self._retire_acknowledgement(state)
+        # NOR BY THE PLAN'S OWN STATUS, for the same reason. "Writing up the plan…" opens the
+        # moment the tool's block does and is withdrawn when the argument lands, but a turn that
+        # fails or is stopped in the thousands of tokens between those two moments never reaches
+        # the offer arm — so a watching tab kept a spinning row under a turn that had ended, and
+        # only a reload cleared it. Nothing else in `state.steps` is retracted here: every other
+        # entry is a real tool step whose row is authoritative, and telling a tab that work it
+        # watched happen never happened is the opposite defect.
+        if state.plan_status_tool_call_id is not None:
+            self._retract_step(state, state.plan_status_tool_call_id)
         # THE STATUS CANNOT OUTLIVE THE TURN. A turn that ended while the last thing it did was
         # think — a failure mid-reasoning, a stop — would otherwise leave "Working on your app"
         # under a turn that is over.

@@ -429,7 +429,17 @@ async def test_a_run_cut_off_mid_argument_records_no_offer_and_no_partial_plan(
     """Covers AE32, and the closely related edge case: a run stopped after the started status
     but before the argument completes leaves the status out of the reload too. `content_block_
     start` puts the tool's NAME on the wire before any argument arrives (U5), so a stop that
-    lands in that window must not leave a half-written plan anywhere — live, or durable."""
+    lands in that window must not leave a half-written plan anywhere — live, or durable.
+
+    ★ AND THE STATUS ITSELF CANNOT OUTLIVE THE TURN, which is the half the absence checks below
+    cannot see. "Writing up the plan…" is withdrawn by the OFFER arm when the argument lands,
+    and a turn that ends in this window never reaches that arm — so a tab that was already
+    connected had the started frame and nothing after it, and kept a spinning row under a turn
+    that was over for the rest of the session. Only a reload cleared it. The terminal withdraws
+    it instead, which is what the shape comparison and the hidden frame at the end assert.
+
+    Mutation check: drop the `plan_status_tool_call_id` retraction from `_finish` and the live
+    shape grows a `step:present_plan_options` the reloaded transcript does not have."""
     engine = _fresh_engine
     gate = asyncio.Event()
 
@@ -484,6 +494,21 @@ async def test_a_run_cut_off_mid_argument_records_no_offer_and_no_partial_plan(
     assert [row.entry_kind for row in rows] == [MessageEntryKind.SYSTEM_EVENT]
     assert rows[0].payload == []
     assert rows[0].meta is not None and rows[0].meta["status"] == "stopped"
+
+    # AND THE WATCHING TAB IS TOLD, which the assertions above cannot see: they read the
+    # snapshot and the durable rows, and the started frame went out on the wire before either
+    # existed. Reduced as shapes, so what is compared is what each surface still SHOWS.
+    assert live_shape(state) == [] == reload_shape(project_rows(list(rows)))
+
+    # The withdrawal is a FRAME on the status's own call id, and the item it carries is hidden —
+    # the only way a tab that was already connected can learn the status is over. Exactly one, so
+    # the terminal cannot double up with the offer arm on a turn that reached both.
+    withdrawals = [
+        f
+        for f in state.ring
+        if f.type == "step" and f.tool_call_id == "opt-cut" and f.phase == "finished"
+    ]
+    assert len(withdrawals) == 1 and withdrawals[0].item.hidden is True
 
 
 async def test_an_empty_plan_argument_records_no_offer_and_says_so_once(
