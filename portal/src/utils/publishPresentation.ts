@@ -64,11 +64,15 @@ export const ACTION_LABEL: Record<ActionKind, string> = {
 export const SECONDARY_ACTIONS: ReadonlySet<ActionKind> = new Set<ActionKind>(['take_it_back'])
 
 /**
- * Which version this state is ABOUT. Every one comes from a column the status read already
- * selects — the registry row's submission and approval stamps, the deployment row's head
- * and timestamps. There is deliberately no "your latest saved version" row: the server
- * spends its one object-store metadata HEAD on the drift comparison and serves the answer,
- * not the head, so no saved commit reaches this client to render.
+ * Which version this state is ABOUT — the ONE version the chip's popover names. Every one comes
+ * from a column the status read already selects: the registry row's submission and approval
+ * stamps, the deployment row's head and timestamps.
+ *
+ * THE CITIZEN'S OWN SAVE IS NOT ONE OF THESE, and not because it is unavailable — U4 made the
+ * status read return the saved head and its timestamp, and `savedRow` below renders them. It is
+ * not here because this type answers "which version is this state about", which has one answer,
+ * while the saved version exists to be CONTRASTED with it. That contrast is a list rather than a
+ * row, so it belongs to `provenanceRows` and the rail panel that draws them.
  */
 export type VersionRow = 'none' | 'submitted' | 'submitted_with_note' | 'approved' | 'live' | 'last_published'
 
@@ -197,8 +201,9 @@ export function presentationFor(state: PublishState): Presentation {
       }
     case 'live_current':
       // Canvas's "The two agree — nothing of yours is waiting", rewritten because the two
-      // rows it referred to are one row here: the canvas drew a "YOUR LATEST" row this
-      // read cannot serve. The reassurance is the half that matters and it survives.
+      // rows it referred to are one row in the CHIP: its popover names a single version, and
+      // the canvas's "YOUR LATEST" row is drawn by the rail panel from `provenanceRows`. The
+      // reassurance is the half that matters here and it survives.
       return {
         label: 'Live',
         sentence:
