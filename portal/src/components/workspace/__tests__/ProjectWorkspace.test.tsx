@@ -308,14 +308,14 @@ describe('AE37 — the stacked crossing is a class, not a remount', () => {
     await waitFor(() => expect(frame()).toBeTruthy())
 
     expect(grid().className).toMatch(/flex-col/)
-    expect(grid().className).toMatch(/lg:flex-row/)
+    expect(grid().className).toMatch(/wide:flex-row/)
   })
 
-  it('gives the project rail the narrower of the two settled widths', async () => {
+  it('gives the project rail the narrower of the two OPENING widths', async () => {
     render(<Workspace />)
     await waitFor(() => expect(screen.getByTestId('description-editor')).toBeTruthy())
 
-    expect(rail().className).toMatch(/lg:w-\[400px\]/)
+    expect(rail().style.getPropertyValue('--rail-w')).toBe('400px')
     expect(rail().getAttribute('data-rail-mode')).toBe('details')
   })
 })

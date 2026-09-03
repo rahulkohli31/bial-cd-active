@@ -43,11 +43,13 @@
  * against the nearest scroll container and that container has moved.
  */
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
-import { useCallback, useEffect, useLayoutEffect, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useState, type CSSProperties } from 'react'
 import Navbar from '../layout/Navbar'
 import ReclaimWorkspaceDialog from '../projects/ReclaimWorkspaceDialog'
 import AppPane from './AppPane'
+import RailResizeHandle from './RailResizeHandle'
 import WorkspaceToolbar from './WorkspaceToolbar'
+import { clampRailWidth, openingWidth, readRailWidth, writeRailWidth } from './railWidth'
 import type { DeviceName } from './WorkspaceToolbar'
 import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
 import { WorkspaceExitProvider, useUnsavedWorkGuard } from './UnsavedWorkGuard'
@@ -89,29 +91,39 @@ function railModeFor(pathname: string): RailMode {
 /**
  * THE RAIL'S WIDTH IS A CLASS ON ONE PERSISTENT ELEMENT — never a conditional render of two trees.
  *
- * Two settled widths and a collapse, taken from the canvas's 400px and 520px. The conversation
- * gets the wider one because it holds a transcript and a composer; the project's details do not.
+ * ═══ THE WIDTH IS A CUSTOM PROPERTY NOW, AND THE MECHANISM IS THE POINT (plan 002, U7) ═══
  *
- * TWO THINGS THIS DELIBERATELY IS NOT. It is not a draggable divider — two settled widths plus one
- * collapse is the whole requirement, and the panel library the obvious path reaches for has renamed
- * its exports. And it is not a measured breakpoint: the stacked crossing below is a responsive
- * class on the same container, so no `matchMedia` and no `ResizeObserver` enters this plan and
- * AE37 holds by construction.
+ * The boundary is draggable, which the earlier decision here refused. That refusal is amended: the
+ * canvas devotes an artboard to the stops, and "someone who wants the app at full width already
+ * has a control for it" is an argument for bounded resizing, not against it.
+ *
+ * WHAT IT IS NOT IS A PANEL LIBRARY, and that is the load-bearing half. `react-resizable-panels` —
+ * which the board itself names — takes its direction as a VALUE rather than as a class and applies
+ * sizes inline, which reintroduces the measured breakpoint this shell was built without and fights
+ * the width classes. Worse, a plan chat has no pane, and a conditionally rendered second panel
+ * would remount the group's children — the one thing the pane host forbids, because it reloads the
+ * citizen's app.
+ *
+ * So: keep the responsive class for stacking, keep ONE element, and drive its width from a custom
+ * property that is consumed ONLY above the stacking threshold. The stacked arm keeps its flexible
+ * width untouched, no `matchMedia` and no `ResizeObserver` enters the shell, and AE37 — crossing
+ * the threshold is a layout change, not a remount — still holds by construction.
+ *
+ * COLLAPSE MUST ZERO THE PROPERTY, not merely add a zero-width class. The hide treatment keeps the
+ * element's layout box, so a leftover `--rail-w` leaves an invisible 400px gap where the rail was.
  *
  * WHEN NOTHING WANTS THE PANE the rail is the whole surface and takes the remaining space — a
  * planning conversation, which has no pane at all, must not be pinned to 520px with a void beside
- * it. That is why `paneVisible` is read before either width.
+ * it. That is why `paneVisible` is read before the width at all.
  */
-function railWidthClass(mode: RailMode, collapsed: boolean, paneVisible: boolean): string {
+function railWidthClass(collapsed: boolean, paneVisible: boolean): string {
   // Zero width AND out of reach. Width alone would only clip it, leaving its composer, its links
   // and its menus in the tab order — the WCAG 4.1.2 violation `hiddenSubtree.ts` records. The
   // subtree stays MOUNTED, so a draft and a scroll position survive a hide/show cycle.
   if (collapsed) return `w-0 flex-shrink-0 border-r-0 overflow-hidden ${HIDDEN_BUT_MOUNTED}`
   if (!paneVisible) return 'flex-1'
-  // Stacked below the threshold (`flex-1`, sharing the column), settled beside the pane above it.
-  return mode === 'conversation'
-    ? 'flex-1 lg:flex-none lg:w-[520px]'
-    : 'flex-1 lg:flex-none lg:w-[400px]'
+  // Stacked below the threshold (`flex-1`, sharing the column), the citizen's own width above it.
+  return 'flex-1 wide:flex-none wide:w-[var(--rail-w)]'
 }
 
 /**
@@ -227,6 +239,22 @@ function ShellFrame() {
   const [device, setDevice] = useState<DeviceName>('Desktop')
   const [reloadNonce, setReloadNonce] = useState(0)
   const heading = useWorkspaceHeading()
+
+  /**
+   * THE BOUNDARY THE CITIZEN CAN MOVE (plan 002, U7).
+   *
+   * REMEMBERED ONCE, READ ONCE. The stored preference is read on the first render and not watched
+   * afterwards: it is a per-person setting, so nothing else can change it while a workspace is
+   * open, and subscribing to storage would be a listener with no writer.
+   *
+   * `null` FROM STORAGE IS NOT A WIDTH. It means the citizen has never dragged one, and the two
+   * opening widths differ — 400px for a project's details, 520px for a conversation, because a
+   * transcript needs more room than a status panel. Substituting a number here would pick one of
+   * them for both. Once they HAVE dragged, their width replaces both, which is the board's own
+   * sentence: "drag it once and every project opens there".
+   */
+  const [remembered, setRemembered] = useState<number | null>(readRailWidth)
+  const railWidth = remembered ?? openingWidth(mode)
   // WHICH COLUMN GROWS, and it is not a cosmetic choice. The two columns are the conversation and
   // the app, and the conversation is the SIZED one whenever the app is on screen: the builder
   // surface's chat panel sets its own 288px and the pane takes everything left over, which is
@@ -301,7 +329,7 @@ function ShellFrame() {
            the pane host is this element's SIBLING and the rail's contents are its Outlet child,
            the direction swap happens on their COMMON parent, which is the whole reason the grid
            has to be in one place. `rail.stacked` stays a deliberate force-stack override. */
-        className={`flex flex-1 min-h-0 overflow-hidden ${rail.stacked ? 'flex-col' : 'flex-col lg:flex-row'}`}
+        className={`flex flex-1 min-h-0 overflow-hidden ${rail.stacked ? 'flex-col' : 'flex-col wide:flex-row'}`}
       >
         {/* The outlet column — THE RAIL. The project surface or the chat surface renders inside
             it, and its width is a class on this one persistent element: the details width, the
@@ -311,10 +339,28 @@ function ShellFrame() {
           id={WORKSPACE_RAIL_ID}
           data-testid="workspace-outlet"
           data-rail-mode={mode}
-          className={`min-w-0 min-h-0 flex flex-col overflow-hidden ${railWidthClass(mode, collapsed, paneVisible)}`}
+          // COLLAPSE ZEROES THE PROPERTY, it does not merely stop consuming it. The hide treatment
+          // keeps the element's layout box, so a leftover width would leave an invisible gap
+          // exactly where the rail was — a strip of nothing the citizen cannot see and cannot
+          // click past.
+          style={{ '--rail-w': `${collapsed ? 0 : railWidth}px` } as CSSProperties}
+          className={`min-w-0 min-h-0 flex flex-col overflow-hidden ${railWidthClass(collapsed, paneVisible)}`}
         >
           <Outlet />
         </div>
+        {/* THE HANDLE, BETWEEN THE TWO COLUMNS. Rendered only when there are two: a collapsed rail
+            has no boundary to move, and a surface that declares no pane — every plan chat — is the
+            whole window, so a divider in it would divide nothing. Its own class hides it below the
+            stacking threshold, where the board says it must disappear rather than become a control
+            that cannot help. */}
+        {paneVisible && !collapsed && (
+          <RailResizeHandle
+            width={railWidth}
+            controls={WORKSPACE_RAIL_ID}
+            onResize={(next) => setRemembered(clampRailWidth(next))}
+            onCommit={writeRailWidth}
+          />
+        )}
         {/* The pane column — a SIBLING of the Outlet, which is what stops any route change from
             reaching it. This is the whole of R8's mechanism, in one line of JSX.
             `AppPane` (Plan F, U4) wraps the host with the region label, the skip control and the

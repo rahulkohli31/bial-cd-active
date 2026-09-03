@@ -303,15 +303,19 @@ describe('AppPaneHost — which column grows, and which one is sized', () => {
 
   /** The rail is the sized column: a settled width, and not the one that grows, at `lg`. */
   const expectRailIsSized = (className: string) => {
-    expect(className).toMatch(/lg:flex-none/)
-    expect(className).toMatch(/lg:w-\[\d+px\]/)
+    // ONE CLASS, ONE CUSTOM PROPERTY (plan 002, U7). The width was a literal per rail mode; it is
+    // the citizen's own now, carried on `--rail-w` and consumed only above the stacking threshold.
+    // The class no longer says WHICH width — that is the element's style — so the assertion is
+    // that the rail is SIZED rather than growing.
+    expect(className).toMatch(/wide:flex-none/)
+    expect(className).toMatch(/wide:w-\[var\(--rail-w\)\]/)
   }
 
   /** The rail is the whole surface: it grows, and carries no settled width to be pinned to. */
   const expectRailIsEverything = (className: string) => {
     expect(className).toMatch(/flex-1/)
-    expect(className).not.toMatch(/lg:w-\[/)
-    expect(className).not.toMatch(/lg:flex-none/)
+    expect(className).not.toMatch(/wide:w-\[/)
+    expect(className).not.toMatch(/wide:flex-none/)
   }
 
   it('with the pane visible, the conversation column is SIZED and the pane takes the rest', () => {
@@ -340,11 +344,14 @@ describe('AppPaneHost — which column grows, and which one is sized', () => {
     expectRailIsSized(outlet().className)
   })
 
-  it('gives the conversation the WIDER of the two settled widths', () => {
-    // Two settled widths, and which is which is not arbitrary: a conversation holds a transcript
+  it('gives the conversation the WIDER of the two OPENING widths', () => {
+    // Two opening widths, and which is which is not arbitrary: a conversation holds a transcript
     // and a composer, the project's details do not. Taken from the canvas's 400px and 520px.
+    // They are the OPENING widths now rather than settled ones — once the citizen has dragged,
+    // their own width replaces both, which is the board's "drag it once and every project opens
+    // there". The number lives on the element's style, because the class is shared.
     render(<Workspace chatSurface={<ChatSurface />} />)
-    expect(outlet().className).toMatch(/lg:w-\[520px\]/)
+    expect(outlet().style.getPropertyValue('--rail-w')).toBe('520px')
   })
 })
 

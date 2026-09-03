@@ -8,6 +8,21 @@ export default {
   content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}', './node_modules/streamdown/dist/**/*.js'],
   theme: {
     extend: {
+      /**
+       * THE STACKING THRESHOLD, AS THE BOARD NUMBERS IT (plan 002, U7).
+       *
+       * `ResizeBounds` is explicit: the handle is "ignored below 1100px of window — there is not
+       * enough room for two useful columns, so the app pane stacks under the conversation and the
+       * handle disappears rather than becoming a control that cannot help."
+       *
+       * Its own screen rather than Tailwind's `lg` (1024px), because the number is a design
+       * decision with a stated reason and borrowing a framework default would make it look like
+       * one. Named `wide` rather than `xl` so it cannot be mistaken for a position in the stock
+       * ramp — it sits between `lg` and `xl` and belongs to one layout.
+       */
+      screens: {
+        wide: '1100px',
+      },
       colors: {
         // shadcn/ui token names (U13 prep) — ADDITIVE ONLY. Every pre-existing name
         // (primary/secondary/accent/…) keeps its literal hex DEFAULT so the 70+ existing
