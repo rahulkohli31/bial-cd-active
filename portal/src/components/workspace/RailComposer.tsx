@@ -214,11 +214,17 @@ function RailComposerBody({ projectId }: RailComposerProps) {
           // citizen who created a project, described their app and pressed Send read "That message
           // did not send" and got no chat, on every attempt.
           //
+          // ON THE CODE, NOT THE STATUS. This endpoint answers 404 for a second, unrelated reason
+          // — a project that is deleted or is not this citizen's — and a bare status match opened
+          // a chat onto it too, which then failed a beat later with nothing left to blame. Only
+          // the snapshot gate carries `no_saved_build`; every other 404 is a real failure and is
+          // reported as one.
+          //
           // THE QUESTION IS STILL ASKED FIRST, which is why this is a mapping and not a skipped
           // preflight. The server refuses a held workspace ABOVE the snapshot gate, so a brand-new
           // project's first message still meets the dialog before any address changes — and issue
           // #161's own reproduction is a submit in a project with nothing built yet.
-          if (err instanceof ApiError && err.status === 404) {
+          if (err instanceof ApiError && err.status === 404 && err.code === 'no_saved_build') {
             open()
             return
           }

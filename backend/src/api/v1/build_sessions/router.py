@@ -459,8 +459,18 @@ async def relaunch_preview(
         except NoSnapshotToRelaunchError as exc:
             # Confirmed-absent (or vanished) snapshot: nothing to relaunch, and there is no
             # blank-template fallback (an empty app is not a preview of the user's work). 404.
+            #
+            # CODED, because this route answers 404 for TWO unrelated reasons and a client has to
+            # tell them apart. `owned_project_or_404` fails a deleted or someone else's project
+            # with the same status; the rail treats "nothing saved to bring back" as a normal
+            # first message and opens the chat anyway (review #1), which for the other 404 would
+            # open a chat that dies a beat later instead of reporting the failure. Only this one
+            # carries `no_saved_build`, so the rail's arm can be exact — the same reason
+            # `sandbox_reclaim_blocked` names itself rather than letting a client match prose.
             raise AppApiError(
-                status.HTTP_404_NOT_FOUND, "No saved build to relaunch. Build the app first."
+                status.HTTP_404_NOT_FOUND,
+                "No saved build to relaunch. Build the app first.",
+                code="no_saved_build",
             ) from exc
         except (SnapshotUnavailableError, SandboxUnreachableError, SandboxError) as exc:
             # Transient/unknown snapshot state, a restore that failed every attempt, or the dev

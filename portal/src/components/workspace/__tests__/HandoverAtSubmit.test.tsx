@@ -198,9 +198,13 @@ describe('the question arrives BEFORE anything moves', () => {
 
 describe('a project with nothing built yet — the first message anybody sends', () => {
   /** What the server answers when there is no saved build to bring back: the snapshot gate, 404,
-   *  and deliberately no blank-template arm. */
+   *  `no_saved_build`, and deliberately no blank-template arm. */
   const nothingToRelaunch = () =>
-    new ApiError('No saved build to relaunch. Build the app first.', 404)
+    new ApiError('No saved build to relaunch. Build the app first.', 404, 'no_saved_build')
+
+  /** The OTHER 404 the same endpoint answers — a project that is gone, or was never this
+   *  citizen's. Same status, no code, and nothing to open a chat onto. */
+  const projectGone = () => new ApiError('Project not found.', 404)
 
   const NEVER_BUILT: Project = { ...PROJECT, appId: null, hasRelaunchableSnapshot: false }
 
@@ -243,6 +247,23 @@ describe('a project with nothing built yet — the first message anybody sends',
     expect(await screen.findByRole('dialog')).toBeTruthy()
     expect(where()).toBe('/projects/pB')
     expect(screen.queryByTestId('chat-opened')).toBeNull()
+  })
+
+  it('★ a project that is gone is reported, not opened — same 404, no code', async () => {
+    // THE ARM IS ON THE CODE, NOT THE STATUS. `owned_project_or_404` answers this endpoint with
+    // an uncoded 404 for a deleted or someone else's project. Matching the status alone opened a
+    // chat onto it, which then died a beat later with no explanation attached to the send that
+    // caused it. Mutation receipt: drop `&& err.code === 'no_saved_build'` from the rail and this
+    // goes red while the scenario above stays green.
+    api.relaunchPreview.mockRejectedValue(projectGone())
+    render(<Workspace project={NEVER_BUILT} />)
+    type('an app to log visitors at the gate')
+
+    fireEvent.click(send())
+
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/did not send/i))
+    expect(screen.queryByTestId('chat-opened')).toBeNull()
+    expect(where()).toBe('/projects/pB')
   })
 
   it('a genuine failure to start is still reported, and opens nothing', async () => {
