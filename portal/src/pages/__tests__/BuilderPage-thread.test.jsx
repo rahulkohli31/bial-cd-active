@@ -13,7 +13,7 @@
  *    below, under "the U13 header".
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, cleanup, within } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, cleanup, within, act } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import {
   FakeEventSource, makeClient, primeClient, BRIEF, PLAN_CARD_ID, primeTurn,
@@ -474,13 +474,12 @@ describe('R8 live clause — a reload MID-TURN re-attaches to the running reply'
       activeTurn: { turnId: 't-live', lastSeq: 0 },
       messages: [{ id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'build it' }] }],
     })
-    h.readTurnStream.mockImplementation(
-      turnStreaming([
-        { type: 'snapshot', seq: 1, turnId: 't-live', turnStatus: 'running', parts: [], working: false, items: [] },
-        { type: 'text_delta', seq: 2, text: 'Let me look at the page.', newBlock: true },
-        { type: 'working', seq: 3, working: true },
-      ]),
-    )
+    h.readTurnStream.mockImplementation(async ({ onFrame }) => {
+      onFrame({ type: 'snapshot', seq: 1, turnId: 't-live', turnStatus: 'running', parts: [], working: false, items: [] })
+      onFrame({ type: 'text_delta', seq: 2, text: 'Let me look at the page.', newBlock: true })
+      onFrame({ type: 'working', seq: 3, working: true })
+      return new Promise(() => {})
+    })
     const { container } = renderThread()
 
     await screen.findByText(/Let me look at the page\./)
@@ -489,6 +488,49 @@ describe('R8 live clause — a reload MID-TURN re-attaches to the running reply'
       container.querySelectorAll('[data-testid="assistant-message"] p, [data-testid="working-status"]'),
     ).map((node) => node.getAttribute('data-testid') ?? node.textContent)
     expect(rendered).toEqual(['Let me look at the page.', 'working-status'])
+  })
+
+  it('stops saying the agent is working when the stream dies without a terminal', async () => {
+    // Pull the network during a reasoning burst and the reader gives up without a `turn_ended`
+    // frame — the one arm that ever cleared the status. `endGenerating` runs, the composer
+    // re-opens, the banner says the reply stalled — and "Working on your app" stayed on the
+    // transcript above it, describing a turn nothing was watching any more. Nothing re-reads the
+    // transcript afterwards, so it said so until the citizen reloaded the page, and they could
+    // send a new message underneath a status line still claiming the last one was in progress.
+    h.getBuild.mockResolvedValue({
+      id: 'thread-1',
+      mode: 'ask',
+      activeTurn: { turnId: 't-live', lastSeq: 1 },
+      messages: [{ id: 'srv_1_u_0', role: 'user', seq: 1, parts: [{ type: 'text', text: 'add a page' }] }],
+    })
+    // HELD OPEN, then dropped — not scripted and resolved. The turn has to be genuinely mid-burst
+    // when the connection dies, because the flag is only stale if it was set while the reader was
+    // alive; a stream that ends before the assertions could never tell the two apart.
+    let dropTheConnection
+    h.readTurnStream.mockImplementation(async ({ onFrame }) => {
+      onFrame({ type: 'snapshot', seq: 2, turnId: 't-live', turnStatus: 'running', parts: [{ type: 'text', text: 'Let me look at the page.' }], working: false, items: [] })
+      onFrame({ type: 'working', seq: 3, working: true })
+      await new Promise((resolve) => { dropTheConnection = resolve })
+      // …and it dies there: no `turn_ended`, no reason, nothing more to read.
+      return 'stalled'
+    })
+    renderThread()
+
+    // The turn is on screen and VISIBLY thinking before anything is asserted about how it ends —
+    // otherwise the absence below would also pass on a surface that never drew the status at all.
+    await screen.findByText(/Let me look at the page\./)
+    await screen.findByTestId('working-status')
+    await act(async () => dropTheConnection())
+
+    // ASSERTED ON THE SETTLED SHAPE, synchronously after that flush. The banner is written on the
+    // very exit that now clears the status, so having it on screen is the proof that everything
+    // the reader's ending scheduled has already been committed — including the repaint that would
+    // have drawn the stale status row.
+    expect(screen.getByText(/The reply stalled\. Reload to catch up\./)).toBeTruthy()
+    expect(screen.queryByTestId('working-status')).toBeNull()
+    // LIVENESS, because an empty transcript would also have no status row: what the turn DID say
+    // is still on screen under the banner.
+    expect(screen.getByText(/Let me look at the page\./)).toBeTruthy()
   })
 
   it('does not re-subscribe when no turn is running', async () => {

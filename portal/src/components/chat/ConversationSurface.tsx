@@ -1183,6 +1183,25 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     [releaseBuildClaim, settleSaveState],
   )
 
+  /**
+   * THE STATUS ROW DIES WITH THE READER, not only at the turn's terminal.
+   *
+   * `streamingParts` synthesises "Working on your app" from `sink.working`, and the only arm
+   * that clears the flag is the `turn_ended` frame — the fast path, and it stays. The two
+   * non-terminal ways out of a reader have no such frame: a stall, and a second truncation
+   * after the one resume. Both then call `endGenerating`, so the composer re-opens and the
+   * banner says the connection dropped — while the transcript above it went on saying the agent
+   * was working, on a turn nobody was watching any more. Nothing re-reads the transcript after
+   * that, so it kept saying so until the citizen reloaded the page.
+   */
+  const settleWorking = useCallback((assistantId: string, sink: TurnSink) => {
+    if (!sink.working) return
+    sink.working = false
+    setMessages((prev) =>
+      prev.map((m) => (m.id === assistantId ? { ...m, parts: streamingParts(sink) } : m)),
+    )
+  }, [])
+
   /** Arm (d)'s way out: re-run the same adopt round-trip that could not be completed. */
   const retryGateCheck = () => {
     const pending = gateRetryRef.current
@@ -1411,6 +1430,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     }
     endGenerating(activeId)
     if (!stillHere()) return
+    settleWorking(assistantId, sink)
     if (outcome === 'stalled') setTurnError('The reply stalled. Reload to catch up.')
     else if (outcome === 'truncated' && !sink.terminal) setTurnError('The connection dropped. Reload to catch up.')
     if (sink.terminal !== 'completed' && sink.parts.length === 0) {
@@ -1569,6 +1589,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       }
       if (outcome === 'stalled') setTurnError('The reply stalled. Reload to catch up.')
       else if (outcome === 'truncated' && !sink.terminal) setTurnError('The connection dropped. Reload to catch up.')
+      settleWorking(assistantId, sink)
     } catch (err) {
       // Whether the reclaim DIALOG has taken ownership of settling the composer's promise: its
       // retry closure carries the same `onSent`/`onAbort`, so settling here as well would reject a
