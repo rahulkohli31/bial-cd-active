@@ -331,7 +331,7 @@ describe('transferring', () => {
   it('★ a failure part-way leaves the citizen with an explanation AND their message', async () => {
     api.relaunchPreview.mockRejectedValue(heldBy())
     api.handOverWorkspace.mockRejectedValue(
-      new Error('The other project has not finished what it was doing yet. Nothing has changed — try again in a moment.'),
+      new Error('The other app is still saving its work. Nothing has changed — give it a moment and try again.'),
     )
     render(<Workspace />)
     type('add an out-time column')

@@ -648,8 +648,8 @@ describe('handOverWorkspace — the stop → save → release ordering (#83)', (
 
   it('★ a session that expired mid-hand-over says so AT ONCE, rather than polling for two minutes', async () => {
     // Every retry of a 401 re-attempts a token refresh, so the old behaviour was ~100 reads and
-    // ~100 refreshes across two minutes, ending in "The other project has not finished what it
-    // was doing yet" — a sentence about somebody else's turn, for an expired session.
+    // ~100 refreshes across two minutes, ending in the ceiling's sentence about the other app
+    // still saving its work — a sentence about somebody else's app, for an expired session.
     const { fetchImpl, reads, seen } = pollingFetch(async () =>
       res(401, { error: { message: 'Not authenticated' } }),
     )
@@ -660,7 +660,7 @@ describe('handOverWorkspace — the stop → save → release ordering (#83)', (
 
     expect(err).toBeInstanceOf(ApiError)
     expect((err as ApiError).status).toBe(401)
-    expect((err as ApiError).message).not.toMatch(/has not finished/i)
+    expect((err as ApiError).message).not.toMatch(/still saving its work/i)
     expect(reads()).toBe(1)
     // Nothing was taken from the other project on the way out.
     expect(seen.some((path) => path.endsWith('/release'))).toBe(false)
@@ -677,6 +677,33 @@ describe('handOverWorkspace — the stop → save → release ordering (#83)', (
 
     expect(reads()).toBe(2)
     expect(seen.some((path) => path.endsWith('/release'))).toBe(true)
+  })
+
+  it('★ at the ceiling it says the other app is still saving, not that anything failed', async () => {
+    // THE OWNER'S DECISION ON REVIEW #45, pinned as copy. The server's stop budget is now a little
+    // over eight minutes — its derivation covers the snapshot a build's unwind writes — while the
+    // browser's wait deliberately stays at two, because nobody should be held in front of a modal
+    // for eight. That makes arriving here ORDINARY rather than alarming: the likeliest cause is a
+    // large app being packed away exactly as it should be, and the stop is still running behind
+    // the sentence. So the one line the citizen reads must not read as a failure in the other
+    // project, and it must point at the remedy, which is only to ask again.
+    const { fetchImpl, reads } = pollingFetch(async () => res(200, { state: 'still_running' }))
+
+    const err = await handOverWorkspace('p-1', false, { fetchImpl }, undefined, fastClock()).catch(
+      (e: unknown) => e,
+    )
+
+    expect((err as ApiError).message).toBe(
+      'The other app is still saving its work. Nothing has changed — give it a moment and try again.',
+    )
+    // NOT A WORD OF BLAME, and not one word a citizen could not act on.
+    expect((err as ApiError).message).not.toMatch(
+      /fail|could not|did not|timed out|container|sandbox|server|api/i,
+    )
+    // AND IT IS THE TWO-MINUTE WAIT THAT PRODUCED IT: a 120s ceiling at one read every 1.2s. This
+    // is the assertion that holds the ceiling where the owner put it — raising it to the server's
+    // budget would make this 409 reads, and the citizen would sit in front of the modal for them.
+    expect(reads()).toBe(100)
   })
 
   it('carries a reclaim refusal out to the caller rather than swallowing it', async () => {

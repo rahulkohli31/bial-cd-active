@@ -464,9 +464,19 @@ export async function readStopStateOf(
  * number constrains anything: the read is cheap, nothing is held open, and the ceiling only
  * decides when the dialog stops saying "closing…" and starts saying it could not.
  *
- * The ceiling is deliberately above the server's own stop budget, which is itself derived from
- * the recovery autosave inside the finish path — so an ordinary healthy turn finishes well inside
- * it, and reaching it means something is genuinely wrong rather than merely slow.
+ * THE CEILING IS DELIBERATELY BELOW THE SERVER'S OWN STOP BUDGET, which is the opposite of what
+ * this said when the two were closer together. That budget is derived from the work a stop
+ * actually waits on, and the derivation now includes the snapshot a build's unwind writes — four
+ * bounded steps of two minutes each — which puts it a little over eight minutes. Nobody should be
+ * held in front of a modal for eight minutes to learn whether they may switch projects, so the
+ * browser stops WAITING first, at two.
+ *
+ * WHICH COSTS NOTHING, BECAUSE EXPIRING HERE IS NOT A VERDICT. The stop runs as a detached task
+ * server-side; the state read is the authority and is idempotent; and the hand-over proceeds on
+ * nothing but a settled answer. So reaching this ceiling ends the WAIT, not the stop, and a
+ * second press picks it up wherever it has got to. What must not be said at this point is that
+ * anything failed — the likeliest reason for passing two minutes is a large app being packed up
+ * exactly as it should be, which is why the sentence in `handOverWorkspace` says so.
  */
 const STOP_POLL_MS = 1200
 const STOP_CEILING_MS = 120_000
@@ -504,8 +514,8 @@ const STOP_READ_TIMEOUT_MS = 15_000
  * that expired mid-hand-over answers 401 to every read; `authFetch` attempts a refresh on each of
  * them, so the dialog sat on "Closing the other app…" for two minutes issuing a hundred reads and
  * a hundred refresh attempts — the very traffic the refresh path documents as tripping
- * reuse-detection — and then said "The other project has not finished what it was doing yet",
- * which is a claim about that project's turn and had nothing to do with what actually failed. A
+ * reuse-detection — and then answered with the ceiling's own sentence, which describes the other
+ * project still packing its work away and had nothing to do with what actually failed. A
  * 403 (or a 404 from a project deleted in another tab) behaved the same way. Those statuses are
  * answers the poll cannot change, so they travel straight out to the dialog, which says the true
  * thing immediately. Everything else — an abort, a dropped socket, a 5xx — is still a blip.
@@ -595,7 +605,12 @@ export async function handOverWorkspace(
     // NOT AN ERROR OF OURS, AND NOT A REASON TO TAKE THE CONTAINER. Everything the citizen has is
     // still where it was; what failed is the wait, and asking again is the remedy.
     throw new ApiError(
-      'The other project has not finished what it was doing yet. Nothing has changed — try again in a moment.',
+      // THE TRUE THING AT TWO MINUTES, which is not "that project failed" (review #45). The
+      // browser's ceiling is under the server's on purpose — see `STOP_CEILING_MS` — so arriving
+      // here almost always means the other app is still putting its work away, and the wait is
+      // what ran out rather than the stop. Nothing has been taken from either project, and asking
+      // again resumes the same stop instead of starting a second one.
+      'The other app is still saving its work. Nothing has changed — give it a moment and try again.',
       409,
       'stop_did_not_settle',
     )
