@@ -85,6 +85,35 @@ describe('the known-frame narrowing (a cast is not a parse)', () => {
     })
   })
 
+  it('reads `newBlock` as the wire\'s own `true`, and fails closed for everything else', () => {
+    // THE FAIL-CLOSED DEFAULT IS LOAD-BEARING, and until now nothing exercised it through the real
+    // parser: every other test that names `newBlock` mocks `readTurnStream` and hands the frame
+    // handler a JS object, which never reaches this narrowing at all. A missing flag continues the
+    // block already open — two paragraphs run together at worst. Defaulting it TRUE would split a
+    // reply at every delta boundary, one paragraph per token, which is what the citizen would read.
+    //
+    // Mutation receipt: `parsed.newBlock !== false` or `!== undefined` fails the absent case;
+    // `Boolean(parsed.newBlock)` or `!!parsed.newBlock` fails the "yes"/1 cases; a typo in the key
+    // fails the first — and none of them is a type error, because `parsed` is a bag of unknowns.
+    const newBlockOf = (json: string) => {
+      const [frame] = parseOne(json)
+      // Narrowed rather than cast, and it doubles as the liveness half: a frame that failed to
+      // parse at all would otherwise make every expectation below vacuous.
+      if (!frame || frame.type !== 'text_delta') {
+        throw new Error(`expected a text_delta frame, got ${frame ? frame.type : 'nothing'}`)
+      }
+      return frame.newBlock
+    }
+
+    expect(newBlockOf('{"type":"text_delta","seq":4,"text":"there","newBlock":true}')).toBe(true)
+    // Absent — the server said nothing, so the block already open continues.
+    expect(newBlockOf('{"type":"text_delta","seq":4,"text":"there"}')).toBe(false)
+    expect(newBlockOf('{"type":"text_delta","seq":4,"text":"there","newBlock":false}')).toBe(false)
+    // Present but not the boolean: a coercion would read either of these as a paragraph break.
+    expect(newBlockOf('{"type":"text_delta","seq":4,"text":"there","newBlock":"yes"}')).toBe(false)
+    expect(newBlockOf('{"type":"text_delta","seq":4,"text":"there","newBlock":1}')).toBe(false)
+  })
+
   it('drops a tool\'s arguments and result even when a frame still carries them', () => {
     // THE FRAME ABOVE FEEDS THIS ONE ON PURPOSE: it is the same wire text, including a
     // `detail` object holding the tool's args and result. The server stopped sending that
