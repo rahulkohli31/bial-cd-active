@@ -86,10 +86,6 @@ from src.services.agent.read_tools import ReadOnlyWorkspace, read_only_toolset
 from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.tools import sandbox_toolset
 
-PLAN_OPTIONS_TOOL = "present_plan_options"
-"""The Plan-mode confirmation tool's wire name — U11's detect-and-force logic and the
-projection's resolution-state derivation both key on it."""
-
 
 @dataclass
 class ReadDeps:
