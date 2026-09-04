@@ -7,9 +7,14 @@
 // vibe-coded .jsx surface alongside the typed .ts/.tsx one), deliberately NOT a stricter bar:
 // the point is to make the command runnable again, not to relitigate the codebase's style.
 //
-// Type-AWARE linting is deliberately off. It needs a tsconfig project per file, and the portal's
-// .jsx majority isn't in one — `tsc --noEmit` already owns type truth here (and runs in the gate),
-// so the duplicate would cost minutes for nothing.
+// Type-AWARE linting is deliberately off, and the reason has outlived its original wording. This
+// used to say the portal's ".jsx majority" was not in a tsconfig project. There is no such
+// majority any more — the tree is 226 typed files (.ts/.tsx) against 42 untyped (.js/.jsx), and
+// the migration is what inverted it. The decision still holds on the two reasons that survive:
+// `tsc --noEmit` already owns type truth here and runs in the same gate, so type-aware rules
+// would be a duplicate costing minutes; and the untyped files that remain are still outside a
+// project, so enabling it would mean either excluding them or manufacturing a project for files
+// deliberately left untyped.
 
 import js from '@eslint/js'
 import globals from 'globals'
