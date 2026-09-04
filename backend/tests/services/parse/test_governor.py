@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import datetime
 import io
+import struct
+import zipfile
 
 import openpyxl
 import pytest
@@ -27,6 +29,21 @@ def _xlsx(rows: list[list[object]], merges: list[str] | None = None) -> bytes:
     buffer = io.BytesIO()
     wb.save(buffer)
     return buffer.getvalue()
+
+
+def _lying_zip(entries: dict[str, bytes], declared_uncompressed: int) -> bytes:
+    """A real archive whose central directory DECLARES `declared_uncompressed` bytes.
+
+    The pre-filter sums the declared sizes and never inflates to check, precisely because
+    they are attacker-controllable — so an overstated size is the threat, not a cheat.
+    """
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, data in entries.items():
+            archive.writestr(name, data)
+    raw = buffer.getvalue()
+    cdh = raw.index(b"\x50\x4b\x01\x02")  # PK\x01\x02 — first central-directory header
+    return raw[: cdh + 24] + struct.pack("<I", declared_uncompressed) + raw[cdh + 28 :]
 
 
 # --- parser logic (in-process) -------------------------------------------------
@@ -92,19 +109,39 @@ def test_unsupported_kind_is_415() -> None:
     assert exc.value.code == "UNSUPPORTED_TYPE"
 
 
-def test_non_office_bytes_as_xlsx_rejected() -> None:
-    with pytest.raises(FileParseError) as exc:
-        parse_dispatch(b"not a zip at all", "xlsx", "x.xlsx", None)
+def test_non_office_bytes_rejected_by_the_structure_gate() -> None:
+    # Under the EOCD minimum, so the zip pre-filter no-ops and the OPC structural gate is
+    # what refuses this. Status and code pin the dispatch's `OfficeExtractError` → clean-400
+    # mapping (without it the governor would report a generic 500); the message pins that the
+    # GATE refused it, not mammoth choking downstream — which is the same 400 and the same
+    # code, so without this line the test passes with the gate deleted.
+    with pytest.raises(FileParseError, match="missing ZIP signature") as exc:
+        parse_dispatch(b"not a zip at all", "extract_word", "x.docx", None)
     assert exc.value.status == 400
+    assert exc.value.code == "INVALID_OFFICE_FILE"
+
+
+def test_zip_bomb_refused_before_the_extract() -> None:
+    # The entry is the one the excel structural gate looks for, so if the pre-filter were
+    # dropped this file would reach openpyxl and fail as a 400 — never as a 413.
+    bomb = _lying_zip({"xl/workbook.xml": b"<workbook/>"}, 400 * 1024 * 1024)
+    with pytest.raises(FileParseError) as exc:
+        parse_dispatch(bomb, "extract_excel", "x.xlsx", None)
+    assert exc.value.status == 413
+    assert exc.value.code == "FILE_TOO_LARGE"
 
 
 # --- governor (killable subprocess) --------------------------------------------
 
 
 async def test_governor_parses_in_subprocess() -> None:
+    # The live chat path: openpyxl runs in the spawned child and the Markdown payload
+    # crosses the Queue intact.
     data = _xlsx([["Name"], ["Alice"]])
-    result = await run_parse(data, "xlsx", "x.xlsx", None)
-    assert result["rows"] == [{"Name": "Alice"}]
+    result = await run_parse(data, "extract_excel", "x.xlsx", None)
+    assert result["format"] == "excel"
+    assert "Alice" in result["text"]
+    assert result["truncated"] is False
 
 
 async def test_governor_timeout_is_413() -> None:
