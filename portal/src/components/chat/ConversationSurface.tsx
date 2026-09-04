@@ -400,14 +400,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   const params = useParams()
   const buildId = chatIdProp ?? params.chatId
   const initialPrompt = location.state?.prompt || ''
-  // `theme` used to ride in here from the builder's Select Theme control. Nothing
-  // downstream ever read it — not the prompt, not the sandbox, not the generated app —
-  // so the control and this key went together (#157 B1). Rows written before that keep an
-  // orphan `theme` in their stored context; harmless, and no migration is needed because
-  // nothing reads it.
-  const contextRef = useRef<{ uploadedFiles: unknown[] }>({
-    uploadedFiles: location.state?.uploadedFiles || [],
-  })
   const dropTransientQuery = useDropTransientQuery()
 
   // The one build-session owner (feed + preview + status + keep-alive timers). Tests
@@ -965,8 +957,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
           return
         }
         loadedBuildRef.current = buildId
-        // UNCHECKED (matches pre-migration behavior): the stored context's shape is asserted.
-        if (saved?.context) contextRef.current = saved.context as { uploadedFiles: unknown[] }
         const restored = saved?.messages ?? []
         if (restored.length > 0) {
           // Seed the next seq from the highest PERSISTED seq, not the array length: a transcript
@@ -1456,7 +1446,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
    * silently guess at a vague prompt.
    *
    * Create-before-stream is load-bearing: the stateless relay 404s an unknown conversation,
-   * and the row is what carries the project parentage + context that ground the first turn.
+   * and the row is what carries the project parentage that grounds the first turn.
    *
    * ══ `onSent` IS THE MOMENT THE COMPOSER MAY EMPTY, AND IT IS NOT THE END OF THE TURN ══
    *
@@ -1523,8 +1513,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
             projectId,
             kind,
             title: derivedTitle ?? '',
-            // `context` is whatever this surface was seeded with; it travels unchanged.
-            context: contextRef.current,
           }
         : undefined
     // OPTIMISTIC, AND DELIBERATELY SO. The row is created inside the turn's own transaction and a

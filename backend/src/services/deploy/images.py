@@ -339,8 +339,3 @@ async def aclose_image_builder() -> None:
     builder, _builder = _builder, None
     if builder is not None:
         await builder.aclose()
-
-
-def set_image_builder_for_tests(builder: ImageBuilder | None) -> None:
-    global _builder
-    _builder = builder

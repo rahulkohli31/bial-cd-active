@@ -39,7 +39,6 @@ from dataclasses import dataclass
 import structlog
 
 from src.services.storage import get_storage, recovery_key
-from src.services.storage.bundle import BundleValidationError, parse_bundle_head_sha
 from src.services.storage.errors import StorageError, StorageUnconfiguredError
 
 _log = structlog.get_logger()
@@ -166,17 +165,3 @@ async def confirm_durable_copy(
     return CopyVerdict(
         CopyState.CONFIRMED_CURRENT, "the recovery copy matches HEAD on a clean tree"
     )
-
-
-def head_of_bundle(data: bytes) -> str | None:
-    """The `head_sha` a bundle's own header declares, or `None` if it is not a bundle.
-
-    Used to confirm a freshly-taken copy actually contains what it claims, rather than trusting
-    the metadata we just wrote alongside it — the write and the check must not share a source."""
-    try:
-        return parse_bundle_head_sha(data)
-    except BundleValidationError:
-        # NARROW ON PURPOSE (`fail-first.md`): the bundle parser has exactly one failure mode
-        # worth absorbing here — "these bytes are not a v2 git bundle". Anything else is a bug in
-        # the reader and must not be turned into a quiet `None` on a path that authorises deletes.
-        return None

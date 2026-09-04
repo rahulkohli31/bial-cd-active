@@ -47,7 +47,6 @@ WHICH BLOCKS EACH ROLE READS
     GOTENBERG_URL        feature switch              --
     SPA_DIST_DIR         feature switch              --
     FRONTEND_URL         knob (https:// gated in production)
-    BACKEND_URL          knob                        --
     DAILY_TOKEN_LIMIT    knob                        --
     DB_AUTH_MODE         knob (core)                 knob (core)
     DB_ENTRA_CLIENT_ID   knob (core)                 knob (core)
@@ -66,6 +65,5 @@ from src.settings.api import ApiSettings as ApiSettings
 from src.settings.core import ROLE_ENV_VAR as ROLE_ENV_VAR
 from src.settings.core import SETTINGS_CONFIG as SETTINGS_CONFIG
 from src.settings.core import CoreSettings as CoreSettings
-from src.settings.core import Role as Role
 from src.settings.foundry import FoundryConfig as FoundryConfig
 from src.settings.worker import WorkerSettings as WorkerSettings

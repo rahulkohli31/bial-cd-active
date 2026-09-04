@@ -58,9 +58,6 @@ from src.services.build_sessions.manager import StopOutcome as StopOutcome
 from src.services.build_sessions.manager import app_name_for as app_name_for
 from src.services.build_sessions.manager import get_session_manager as get_session_manager
 from src.services.build_sessions.manager import (
-    reset_session_manager_for_tests as reset_session_manager_for_tests,
-)
-from src.services.build_sessions.manager import (
     set_session_manager_for_tests as set_session_manager_for_tests,
 )
 from src.services.build_sessions.reaper import reap_user as reap_user

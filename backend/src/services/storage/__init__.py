@@ -27,7 +27,6 @@ from src.services.storage.errors import StorageNotFoundError as StorageNotFoundE
 from src.services.storage.errors import StorageSignError as StorageSignError
 from src.services.storage.errors import StorageUnconfiguredError as StorageUnconfiguredError
 from src.services.storage.errors import StorageUploadError as StorageUploadError
-from src.services.storage.errors import UnsupportedCapabilityError as UnsupportedCapabilityError
 from src.services.storage.factory import create_storage as create_storage
 from src.services.storage.keys import SNAPSHOT_HEAD_METADATA_KEY as SNAPSHOT_HEAD_METADATA_KEY
 from src.services.storage.keys import app_file_key as app_file_key

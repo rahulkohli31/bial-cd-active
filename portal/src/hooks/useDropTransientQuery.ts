@@ -26,8 +26,8 @@ import { useLocation, useNavigate } from 'react-router-dom'
  * still there, the fire-once ref had died with the mount, and the opening turn ran a second time
  * — billed again, on a thread the user was only re-reading.
  *
- * Nothing needs it to survive: `initialPrompt`, `uploadedFiles` and `mode` are all read
- * at MOUNT, `pendingAttachments` is read inside `fireHandoffPrompt` which runs BEFORE this, and
+ * Nothing needs it to survive: `initialPrompt` and `mode` are read at MOUNT,
+ * `pendingAttachments` is read inside `fireHandoffPrompt` which runs BEFORE this, and
  * after a reload the server's saved header is authoritative for every one of them.
  *
  * Both pages need this and neither owns it, so it lives here rather than as two byte-identical

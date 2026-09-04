@@ -428,12 +428,13 @@ async def test_a_failed_deploy_can_still_own_a_live_container_and_is_torn_down(
     settles FAILED at step 6 leaves `pub-<app_id>` running, externally addressable, holding
     the app's database URL and Blob SAS, and billing.
 
-    Resolving through `store.last_successful` — as this route originally did — answered "this
-    app has never been published, there is nothing to unpublish" while exactly that container
-    served traffic. Resolving through `store.latest_for_app` tears it down.
+    Resolving through the newest SUCCEEDED row — as this route originally did, through a
+    `store.last_successful` accessor since deleted — answered "this app has never been
+    published, there is nothing to unpublish" while exactly that container served traffic.
+    Resolving through `store.latest_for_app` tears it down.
 
-    Mutation receipt: swap `latest_for_app` back to `last_successful` in router.py and this
-    goes red with a 409 `never_deployed`."""
+    Mutation receipt: narrow `latest_for_app`'s query to `status == SUCCEEDED` and this goes red
+    with a 409 `never_deployed`."""
     admin_headers = await _admin(db_session)
     owner, app_row = await _owned_app(db_session)
     failed = await _deployment(
@@ -465,9 +466,9 @@ async def test_a_redeploy_that_failed_after_an_unpublish_is_still_torn_down(
     """The subtler half of the same bug. History: succeeded (then unpublished) -> redeploy
     that FAILED at the readiness check, re-creating the container.
 
-    `last_successful` returns the OLD succeeded row, which is already stamped, so the route
-    took its already-down early return and answered 200 while the re-created container was
-    live. Reading the newest row instead makes "is this app live" a question about the latest
+    A newest-SUCCEEDED read returns the OLD succeeded row, which is already stamped, so the
+    route took its already-down early return and answered 200 while the re-created container
+    was live. Reading the newest row instead makes "is this app live" a question about the latest
     attempt, which is the only reading that can be right."""
     admin_headers = await _admin(db_session)
     owner, app_row = await _owned_app(db_session)

@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator
-from typing import Any, Literal
+from typing import Literal
 
 import sqlalchemy as sa
 import structlog
@@ -137,7 +137,6 @@ class NewConversation(CamelModel):
     # than coerced, because "which chat is this" decides what the model can do.
     kind: ChatKind
     title: str | None = None
-    context: Any = None
 
 
 class StartTurnBody(CamelModel):
@@ -491,7 +490,6 @@ async def start_turn(
             project_id=project_id,
             kind=staged.kind,
             title=staged.title,
-            context=staged.context,
         )
         db.add(conversation)
         try:

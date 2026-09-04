@@ -122,7 +122,6 @@ class ApiSettings(CoreSettings):
     # because it feeds security surfaces. It is the one field that does not sit cleanly in one
     # tier — do not add a fifth tier to accommodate it.
     FRONTEND_URL: str = "http://localhost:5173"
-    BACKEND_URL: str = "http://localhost:8000"
 
     # Global per-user daily token cap — the effective limit when a user has no per-user override
     # row. `PositiveInt` fails a non-positive value at startup, so the daily gate can never be

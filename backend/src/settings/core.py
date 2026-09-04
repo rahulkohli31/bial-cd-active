@@ -60,7 +60,6 @@ SETTINGS_CONFIG = SettingsConfigDict(
 
 # Which role this process plays. Read from the environment by `src/config.py` to pick a profile;
 # a deployment sets it on the worker's container and nowhere else, so the default is the API.
-Role = Literal["api", "worker"]
 ROLE_ENV_VAR = "BIAL_ROLE"
 
 

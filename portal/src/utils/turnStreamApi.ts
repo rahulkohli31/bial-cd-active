@@ -596,7 +596,6 @@ export interface NewConversationParentage {
   projectId: string
   kind: 'plan' | 'build'
   title?: string
-  context?: unknown
 }
 
 export async function startTurn(

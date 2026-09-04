@@ -512,9 +512,10 @@ def test_no_segment_promises_an_emptiness_signal_that_never_arrives(kind: ChatKi
     """★ U20 / R26 — THE PROMISE IS GONE BECAUSE THE SIGNAL NEVER ARRIVES.
 
     The retired Ask segment told the model "If there is no app yet, your tools will tell you
-    truthfully." `EmptyProjectWorkspace` — the only workspace that answers that way — was
-    reachable from one branch of `turns/engine._workspace_for`, and that branch required
-    `sandbox_client is None`: NO SANDBOX SERVICE CONFIGURED. In the configured deployment a
+    truthfully." The only workspace that answered that way was reachable from one branch of
+    the turn's workspace resolver, and that branch required `sandbox_client is None`: NO
+    SANDBOX SERVICE CONFIGURED. That branch — and the workspace behind it — are since gone
+    (`_pin_workspace` has one arm). In the configured deployment a
     brand-new project gets the live container like every other project, and the container holds
     the golden template — so the reads come back FULL, of template files, and a model waiting
     for an emptiness signal spends round-trips looking for one that is not coming.

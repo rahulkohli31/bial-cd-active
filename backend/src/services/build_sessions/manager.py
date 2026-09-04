@@ -288,12 +288,6 @@ def _terminal_status(reason: str) -> Literal[BuildSessionStatus.ENDED, BuildSess
 # reach. The repo does have scheduled work — ADR-0011.)
 _ENDED_RETENTION_SECONDS: float = 300.0
 
-# The whole budget for one turn-boundary recovery copy. It runs inside `asyncio.shield` and
-# BEFORE the build slot and the conversation guard are released, so this is the longest a
-# container that stopped answering can hold a user's session hostage. Generous enough for a
-# large tree over `/exec`; far short of the 900 s the client would otherwise allow per call.
-_RECOVERY_COPY_BUDGET_SECONDS: float = 180.0
-
 # How long a start will wait for an ended-but-still-finalizing session's shielded end
 # sequence before keeping the 409 — a refine sent right after natural completion must not
 # bounce off its own finished build (the finalize is usually sub-second; the bound only
@@ -324,6 +318,12 @@ _OUTCOME_WRITE_TIMEOUT_SECONDS: float = 10.0
 # is already capped individually, but five of them in a row is minutes, and a wedged container must
 # not hold the turn's ending open. Generous enough for a real bundle over the supervisor, short
 # enough that failing is quicker than hanging.
+#
+# AND IT IS THE TURN-BOUNDARY RECOVERY COPY'S ONLY BOUND. A separate 180 s budget used to wrap
+# that copy; the autosave reconciliation replaced its `asyncio.timeout` arm with this one and
+# left the constant behind, unread, contradicting the number actually enforced — so it has been
+# swept. The copy is bounded here, not unbounded, and `_STOP_ACTIVE_WORK_TIMEOUT_SECONDS` below
+# derives from THIS number. (The reaper's own copy is a different path and carries no wrapper.)
 _RECOVERY_SNAPSHOT_TIMEOUT_SECONDS: float = 60.0
 
 # How long "stop the work so I can switch projects" waits for the turn to actually unwind.
@@ -4119,8 +4119,3 @@ def get_session_manager() -> SessionManager:
 def set_session_manager_for_tests(manager: SessionManager | None) -> None:
     global _manager_singleton
     _manager_singleton = manager
-
-
-def reset_session_manager_for_tests() -> None:
-    global _manager_singleton
-    _manager_singleton = None

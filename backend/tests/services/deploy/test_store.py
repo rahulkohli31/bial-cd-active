@@ -191,24 +191,6 @@ async def test_latest_for_app_is_creation_ordered(db_session) -> None:
     assert latest is not None and latest.id == second
 
 
-async def test_last_successful_skips_failures_and_digestless_rows(db_session) -> None:
-    """The rollback source must name an image that actually exists in the registry."""
-    user, app = await _app(db_session)
-
-    good = await _claimed(db_session, app_id=app.id, user_id=user.id)
-    await store.succeed(
-        db_session, good, url="https://good.example", image_digest="sha256:" + "aa" * 32
-    )
-    # A success that never got as far as an image — not a rollback target.
-    digestless = await _claimed(db_session, app_id=app.id, user_id=user.id)
-    await store.succeed(db_session, digestless, url="https://nodigest.example")
-    broken = await _claimed(db_session, app_id=app.id, user_id=user.id)
-    await store.fail(db_session, broken, code="acr_build_failed")
-
-    rollback = await store.last_successful(db_session, app_id=app.id)
-    assert rollback is not None and rollback.id == good
-
-
 async def test_stalled_lists_only_unbeaten_in_flight_rows(db_session) -> None:
     user, app_a = await _app(db_session)
     app_b = await AppRegistryFactory.create(db_session, user_id=user.id)

@@ -93,6 +93,13 @@ class Conversation(UUIDv7PrimaryKeyMixin, TimestampMixin, OwnedByUserMixin, Base
     # Derived client-side from the first message; mutable via PATCH. TEXT (short in
     # practice — the SPA caps it ~40 chars — but unbounded here).
     title: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
-    # Opaque builder-generation settings ({theme, uploadedFiles, dataSchema, …}) — stored
-    # verbatim, never inspected by the server.
+    # An opaque SPA-owned bag: stored verbatim, never inspected by the server, and settable
+    # through `POST /conversations` and the header PATCH.
+    #
+    # NOTHING WRITES IT TODAY, AND IT IS KEPT ANYWAY. It carried the Express-POC builder's
+    # generation settings; `theme` went with the Select Theme control (#157 B1) and
+    # `uploadedFiles` never had a producer, so the last live round trip through it was dead and
+    # has been removed. Production rows still hold POC-era payloads no code can reconstruct, so
+    # the column stays and a `DROP COLUMN` is a separate, staged decision — not a dead-code
+    # sweep. The read path is untouched: a row's stored value is still served on the header.
     context: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)

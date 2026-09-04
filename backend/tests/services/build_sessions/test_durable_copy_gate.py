@@ -27,11 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.models.worker_pass import PassOutcome, WorkerPass
 from src.services.build_sessions import durable_copy, pass_history
 from src.services.build_sessions.alarms import RECOVERY_WRITE_DID_NOT_LAND_EVENT
-from src.services.build_sessions.durable_copy import (
-    CopyState,
-    confirm_durable_copy,
-    head_of_bundle,
-)
+from src.services.build_sessions.durable_copy import CopyState, confirm_durable_copy
 from src.services.build_sessions.pass_history import (
     _ATTEMPT_MEANING,
     CopyAttempt,
@@ -303,13 +299,6 @@ async def test_an_unreachable_container_with_no_bundle_still_escalates(
     assert (
         await confirm_durable_copy(APP, container_head=None, container_dirty=None)
     ).may_destroy is False
-
-
-def test_a_bundle_header_is_checked_against_itself_not_its_metadata() -> None:
-    """The write and the check must not share a source. Confirming a fresh copy by re-reading the
-    metadata we just wrote proves only that we can write metadata."""
-    assert head_of_bundle(a_git_bundle(HEAD)) == HEAD
-    assert head_of_bundle(b"not a bundle at all") is None
 
 
 # --- reap_user is gated too, which it never was ------------------------------------

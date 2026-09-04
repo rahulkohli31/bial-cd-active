@@ -1142,8 +1142,8 @@ async def unpublish(
     THE ROW TO STAMP IS THE NEWEST ONE, NOT THE NEWEST SUCCEEDED ONE. The pipeline creates the
     container app at step 5 and only then awaits the revision, so an attempt that settles
     FAILED at step 6 leaves `pub-<app_id>` running, externally addressable, holding the app's
-    database URL and Blob SAS, and billing. Resolving through `last_successful` would answer
-    "never published" while exactly that container served traffic — and on a
+    database URL and Blob SAS, and billing. Resolving through the newest SUCCEEDED row would
+    answer "never published" while exactly that container served traffic — and on a
     succeeded-then-unpublished-then-failed history it would take the already-down early return
     and leave the re-created container up. `latest_for_app` closes both. A missing row is still
     a safe 409: the container is only ever created by a pipeline that owns a deployment row,

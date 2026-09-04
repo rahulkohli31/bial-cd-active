@@ -1124,11 +1124,6 @@ def get_deploy_service() -> DeployService:
     return _service
 
 
-def set_deploy_service_for_tests(service: DeployService | None) -> None:
-    global _service
-    _service = service
-
-
 async def deployment_for_app(db: AsyncSession, *, app_id: uuid.UUID) -> Deployment | None:
     """The latest deploy attempt — the read behind the status endpoint."""
     return await store.latest_for_app(db, app_id=app_id)
