@@ -53,7 +53,7 @@ const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), stopTurn: vi.fn(),
-  switchMode: vi.fn(), resolvePlanOptions: vi.fn(),
+  resolvePlanOptions: vi.fn(),
   start: vi.fn(), relaunchPreview: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
   fetchPreviewState: vi.fn(), fetchSaveState: vi.fn(),
 }))
@@ -84,12 +84,16 @@ vi.mock('../../utils/attachmentStore', async (orig) => ({
   ...(await orig<typeof import('../../utils/attachmentStore')>()),
   buildUserParts: h.buildUserParts,
 }))
+// `switchMode` is GONE — a chat's kind is fixed at creation, so there is no per-thread
+// setting left to switch, and a factory that still listed it would be mocking an export the
+// real module no longer has. This file was the last of ten still carrying the key; the other
+// nine already said so here. `resolvePlanOptions` is a real export, kept mocked only because
+// the surface reaches for it when a plan offer is answered — never exercised here.
 vi.mock('../../utils/turnStreamApi', async (orig) => ({
   ...(await orig<typeof import('../../utils/turnStreamApi')>()),
   startTurn: (...a: unknown[]) => h.startTurn(...a),
   readTurnStream: (...a: unknown[]) => h.readTurnStream(...a),
   buildFromPlan: (...a: unknown[]) => h.buildFromPlan(...a),
-  switchMode: (...a: unknown[]) => h.switchMode(...a),
   resolvePlanOptions: (...a: unknown[]) => h.resolvePlanOptions(...a),
   stopTurn: (...a: unknown[]) => h.stopTurn(...a),
 }))

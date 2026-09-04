@@ -45,7 +45,6 @@ import {
 } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
-  sendMessage: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), stopTurn: vi.fn(),
   resolvePlanOptions: vi.fn(), uuidv7: vi.fn(),
   loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),

@@ -27,7 +27,6 @@ import {
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
-  sendMessage: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
   resolvePlanOptions: vi.fn(),
   previewProps: [],

@@ -48,7 +48,6 @@ import WorkspaceShell from '../../components/workspace/WorkspaceShell'
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), appendBuilderMessage: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
-  sendMessage: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({

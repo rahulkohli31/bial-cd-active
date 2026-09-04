@@ -242,16 +242,6 @@ export const findStartAppControl = () =>
   screen.findByRole('button', { name: /^(Launch Application|Try again)$/ })
 
 /**
- * The empty-pane placeholder (`NoFrame`, `AppPane.tsx`) — what the pane shows in place of the real
- * iframe host whenever the workspace map's own veto says nothing is serving, or nothing has been
- * resolved yet. It carries the map's INTERNAL state name as `data-workspace-state` — never
- * rendered as copy, so a suite that asserts against it survives a copy rewrite nobody has to come
- * back and tell every test about. Prefer this over matching the sentence itself.
- */
-export const appPaneEmpty = () => document.querySelector('[data-testid="app-pane-empty"]')
-export const workspaceStateName = () => appPaneEmpty()?.getAttribute('data-workspace-state') ?? null
-
-/**
  * Stamp `sessionProjectRef` — the ONE thing `StartAppControl`'s own click path needs and never
  * itself provides — WITHOUT the reattach handing the resolver an address of its own.
  *
@@ -338,9 +328,6 @@ export async function sendAndConfirm(text = 'a visitor app') {
   fireEvent.click(build)
   return build
 }
-
-/** Wait until a plan-options card's Build-it is on screen (without confirming it). */
-export const findPlanCard = () => screen.findByRole('button', { name: /^Build this plan$/ })
 
 /**
  * Annotated because TypeScript suites use this harness too (`*.test.tsx`), and without it TS
