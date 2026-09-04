@@ -1,61 +1,26 @@
 /**
- * Open an attachment's bytes (held as base64) in a new browser tab via a
- * short-lived blob: URL. Used for PDFs (and any non-image type): the strict
- * main-app CSP blocks embedding data:/blob: documents in an iframe — the same
- * gotcha the builder preview hit — but a top-level navigation to a blob: URL is
- * allowed.
+ * Open or save an attachment the server already serves, from the object URL
+ * `attachmentApi` cached for it. Two helpers, one technique.
  *
- * We open via a user-gesture <a target="_blank"> click rather than
- * window.open(): window.open with `noopener` returns null even on success, so
- * its return value can't tell "popup blocked" from "opened fine". An anchor
- * click from the originating user gesture isn't popup-blocked and needs no such
- * check. No `download` attribute → the browser renders the PDF inline.
+ * A NEW TAB RATHER THAN A FRAME. The strict main-app CSP blocks embedding a
+ * blob:/data: document in an iframe — the same gotcha the builder preview hit —
+ * so a PDF, or any other non-image type, cannot be shown in place. A top-level
+ * navigation to the object URL is allowed, and is what these do.
+ *
+ * AN ANCHOR CLICK RATHER THAN window.open(). window.open with `noopener`
+ * returns null even on success, so its return value can't tell "popup blocked"
+ * from "opened fine". An anchor click from the originating user gesture isn't
+ * popup-blocked and needs no such check. What separates viewing from saving is
+ * the `download` attribute alone: absent below, the browser renders the PDF
+ * inline; present, it writes the file out.
+ *
+ * NEITHER REVOKES THE URL. Both take one the caller already holds, and the
+ * caller's cache owns its lifetime.
  */
-
-/** Decode raw base64 (no data: prefix) into a typed Blob. */
-export function base64ToBlob(base64: string, mediaType: string): Blob {
-  const binary = atob(base64)
-  const bytes = new Uint8Array(binary.length)
-  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
-  return new Blob([bytes], { type: mediaType })
-}
-
-/**
- * Open `base64` bytes (default application/pdf) in a new tab. Returns false if
- * there are no bytes or the blob can't be built, so callers can surface a
- * "no longer available" message. The blob URL is revoked after a delay so the
- * opened tab has time to read it.
- */
-export function openAttachmentBytes(base64: string, name?: string, mediaType = 'application/pdf'): boolean {
-  if (!base64) return false
-  let url: string
-  try {
-    url = URL.createObjectURL(base64ToBlob(base64, mediaType))
-  } catch {
-    return false
-  }
-  const a = document.createElement('a')
-  a.href = url
-  a.target = '_blank'
-  a.rel = 'noopener noreferrer'
-  if (name) a.title = name
-  document.body.appendChild(a)
-  a.click()
-  document.body.removeChild(a)
-  setTimeout(() => URL.revokeObjectURL(url), 60_000)
-  return true
-}
-
-/** Convenience alias for the common PDF case. */
-export function openPdf(base64: string, name?: string): boolean {
-  return openAttachmentBytes(base64, name, 'application/pdf')
-}
 
 /**
  * Open an EXISTING object URL (e.g. one served by attachmentApi and cached) in a
- * new tab via the same user-gesture anchor click. Unlike openAttachmentBytes it
- * does NOT revoke the URL — the caller's cache owns its lifetime. Returns false
- * if there's no URL.
+ * new tab via a user-gesture anchor click. Returns false if there's no URL.
  */
 export function openUrlInNewTab(url: string, name?: string): boolean {
   if (!url) return false
@@ -75,7 +40,7 @@ export function openUrlInNewTab(url: string, name?: string): boolean {
  * originals are served as octet-stream (the server can't tell `.docx` from
  * `.xlsx` by bytes), so the filename + extension come from the part's `name` via
  * the `download` attribute — that's what gives the saved file its correct
- * extension (Decision 9). Does NOT revoke the URL (the caller's cache owns it).
+ * extension (Decision 9).
  */
 export function downloadObjectUrl(url: string, name?: string): boolean {
   if (!url) return false

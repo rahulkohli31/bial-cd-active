@@ -1,18 +1,12 @@
 import { Streamdown, defaultRemarkPlugins } from 'streamdown'
 import remarkBreaks from 'remark-breaks'
 import type { AnchorHTMLAttributes, HTMLAttributes } from 'react'
-import AttachmentChips from '../AttachmentChips'
-import { partsToText, attachmentsFromParts } from '../../utils/attachmentStore'
+import { partsToText } from '../../utils/attachmentStore'
 import type { MessagePart } from '../../utils/messageTypes'
 
 export interface MessageContentProps {
   parts: MessagePart[] | string
   isUser?: boolean
-  /** Shrinks the assistant markdown's typography to match a narrow rail (the chat panel
-   *  beside a live app pane) — `prose-sm`'s own font-size otherwise wins over the bubble's
-   *  inherited `text-xs`, rendering assistant text visibly larger than user text in the same
-   *  thread. Leave unset for a full-width surface, which `prose-sm` was sized for. */
-  compact?: boolean
   /** True only while THIS message is the one actively streaming in. An incomplete
    *  markdown document re-parses per token — bold popping in when the closing `**`
    *  lands, an unterminated code fence rendering the growing tail as a code block —
@@ -66,9 +60,14 @@ function MarkdownStrong({ node: _node, ...props }: HTMLAttributes<HTMLElement> &
  * Render one chat message bubble's inner content from the neutral `parts[]` model — the
  * Streamdown variant, used by the one conversation surface for both chat kinds.
  *
- * `partsToText` yields the prose for display (text parts only); `attachmentsFromParts`
- * yields the attachment descriptors (file parts + inline-text attachments) rendered
- * as chips above the text. A plain string is still accepted defensively.
+ * PROSE ONLY. `partsToText` yields the text parts and nothing else; the attachment chips are
+ * the THREAD's to draw, from its own `UserAttachments` slot (`ChatThread.tsx`), not this
+ * component's. It used to render them here as well, which was one render of the same
+ * descriptors in two places for as long as anything passed it an array.
+ *
+ * BOTH SHAPES ARE REAL. The live call site — the thread's text-part slot — hands down a
+ * plain string, and the 21 parity cases below hand down `TextPart[]`, so `partsToText`'s
+ * union is load-bearing rather than defensive.
  *
  * `mode="static"` is load-bearing, not decorative: Streamdown's own default is
  * `mode="streaming"` with `parseIncompleteMarkdown` on, which keeps "repairing" the text
@@ -103,57 +102,43 @@ function MarkdownStrong({ node: _node, ...props }: HTMLAttributes<HTMLElement> &
  * case (an allowlisted tag renders, a disallowed one doesn't) against the actually-installed
  * package, not assumed from docs.
  */
-export default function MessageContent({ parts, isUser, compact, isStreaming }: MessageContentProps) {
+export default function MessageContent({ parts, isUser, isStreaming }: MessageContentProps) {
   const text = partsToText(parts)
-  // attachmentsFromParts only accepts the array form; its own Array.isArray guard
-  // already returns [] for anything else, so the defensive string case is covered.
-  const attachments = attachmentsFromParts(Array.isArray(parts) ? parts : [])
   const renderAsPlainText = isUser || isStreaming
-  return (
-    <>
-      {attachments.length > 0 && <AttachmentChips attachments={attachments} />}
-      {renderAsPlainText ? (
-        <div className="whitespace-pre-wrap break-words">{text}</div>
-      ) : (
-        <div
-          className={`prose prose-sm max-w-none prose-p:my-1 prose-ul:my-1 prose-ol:my-1 prose-li:my-0.5 prose-strong:text-tertiary prose-ul:pl-4 prose-ol:pl-4 ${
-            compact
-              ? 'prose-p:text-xs prose-li:text-xs prose-headings:text-xs prose-headings:font-semibold'
-              : ''
-          }`}
-        >
-          <Streamdown
-            mode="static"
-            // Streamdown's own default remarkPlugins (Object.values(defaultRemarkPlugins))
-            // include a codeMeta plugin (fenced-code `meta` parsing, e.g. `startLine=`) — this
-            // array REPLACES rather than extends that default, so spreading it back in first
-            // keeps codeMeta alongside the gfm/breaks this component actually needs.
-            remarkPlugins={[...Object.values(defaultRemarkPlugins), remarkBreaks]}
-            disallowedElements={['img', 'picture', 'source']}
-            unwrapDisallowed
-            // No table copy/download controls: Streamdown's default CSV/TSV export is
-            // unescaped and BOM-prefixed, so Excel opens it as a real CSV — a model-authored
-            // cell beginning =, +, - or @ becomes a live formula the instant the file opens.
-            // Model output is prompt-injection reachable, so that export has to stay off
-            // rather than trust every cell to never start with one of those characters.
-            controls={{ table: false }}
-            components={{
-              a: MarkdownLink,
-              strong: MarkdownStrong,
-              // A GFM table has no intrinsic wrap; without this a wide one turns the whole
-              // transcript column (which sits in an overflow-y-auto ancestor, computing
-              // overflow-x to auto) horizontal-scrollable the moment the model emits one.
-              table: ({ node: _node, ...props }) => (
-                <div className="overflow-x-auto">
-                  <table {...props} />
-                </div>
-              ),
-            }}
-          >
-            {text}
-          </Streamdown>
-        </div>
-      )}
-    </>
+  return renderAsPlainText ? (
+    <div className="whitespace-pre-wrap break-words">{text}</div>
+  ) : (
+    <div className="prose prose-sm max-w-none prose-p:my-1 prose-ul:my-1 prose-ol:my-1 prose-li:my-0.5 prose-strong:text-tertiary prose-ul:pl-4 prose-ol:pl-4">
+      <Streamdown
+        mode="static"
+        // Streamdown's own default remarkPlugins (Object.values(defaultRemarkPlugins))
+        // include a codeMeta plugin (fenced-code `meta` parsing, e.g. `startLine=`) — this
+        // array REPLACES rather than extends that default, so spreading it back in first
+        // keeps codeMeta alongside the gfm/breaks this component actually needs.
+        remarkPlugins={[...Object.values(defaultRemarkPlugins), remarkBreaks]}
+        disallowedElements={['img', 'picture', 'source']}
+        unwrapDisallowed
+        // No table copy/download controls: Streamdown's default CSV/TSV export is
+        // unescaped and BOM-prefixed, so Excel opens it as a real CSV — a model-authored
+        // cell beginning =, +, - or @ becomes a live formula the instant the file opens.
+        // Model output is prompt-injection reachable, so that export has to stay off
+        // rather than trust every cell to never start with one of those characters.
+        controls={{ table: false }}
+        components={{
+          a: MarkdownLink,
+          strong: MarkdownStrong,
+          // A GFM table has no intrinsic wrap; without this a wide one turns the whole
+          // transcript column (which sits in an overflow-y-auto ancestor, computing
+          // overflow-x to auto) horizontal-scrollable the moment the model emits one.
+          table: ({ node: _node, ...props }) => (
+            <div className="overflow-x-auto">
+              <table {...props} />
+            </div>
+          ),
+        }}
+      >
+        {text}
+      </Streamdown>
+    </div>
   )
 }

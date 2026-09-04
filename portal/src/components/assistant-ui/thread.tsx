@@ -7,6 +7,14 @@
  * `src/__tests__/tailwind-tokens.test.js` is what stops a v4 token creeping back in — every one of
  * them renders as NOTHING on 3.4.17 with no build error and no failing test.
  *
+ * `tw-shimmer` IS THE ONE WORTH NAMING, because the registry's `tool-group` labels a running group
+ * with its `ShimmerLabel` and reaching for the package is the obvious move. DO NOT INSTALL IT: it
+ * declares `peerDependencies: { tailwindcss: ">=4.0.0-0" }` and ships `@property`, `@theme inline`
+ * and `@utility`, none of which 3.4.17 understands — so its CSS would pass through this build as
+ * dead text, the label would not animate, and nothing would say so. A hand-written keyframe was
+ * carried here instead and then deleted unused, because no label in this thread ever wore it; if
+ * one needs a shimmer, it is a keyframe to write, not a dependency to add.
+ *
  * ══ ONLY WHAT RENDERS WAS PORTED ══
  *
  * Dropped ON ARRIVAL rather than carried through the rewrite and then deleted — applying the v4→v3

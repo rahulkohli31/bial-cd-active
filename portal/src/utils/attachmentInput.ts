@@ -193,14 +193,3 @@ export function fileToBase64(file: File): Promise<string> {
 export function newAttachmentId() {
   return `att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
 }
-
-/** The lightweight pre-upload ref `toAttachmentRef` strips a `PendingAttachment`
- * down to. Distinct from `attachmentApi.ts`'s `AttachmentRef` (the POST-upload
- * server-returned ref) — same-sounding name, different shape/purpose, so this
- * one gets its own name rather than colliding. */
-export type PendingAttachmentRef = Pick<PendingAttachment, 'id' | 'name' | 'mediaType' | 'size'>
-
-/** Strip transient base64 to the lightweight ref persisted in the conversation. */
-export function toAttachmentRef({ id, name, mediaType, size }: PendingAttachmentRef): PendingAttachmentRef {
-  return { id, name, mediaType, size }
-}

@@ -1,5 +1,11 @@
 /**
- * Guard: the vendored-registry and hand-written CSS residue this sweep removed stays removed.
+ * Guard: the vendored-registry and hand-written CSS residue these sweeps removed stays removed.
+ *
+ * TWO SWEEPS, ONE LIST. The vendored primitives and design tokens came out first; the
+ * assistant-ui era's CSS tail — the shimmer label that never landed and the keyframes the
+ * Collapsible primitive left behind when it was deleted — came out after. Same defect, same
+ * invisibility, same rule shape, so they are asserted together rather than in a second file that
+ * would have to repeat all of the reasoning below.
  *
  * NOTHING ELSE CAN GO RED WHEN IT COMES BACK, which is how all of it arrived. Every item below
  * was an EXPORT nobody imported, a `cva` key nobody selected, or a raw CSS rule no class name
@@ -105,6 +111,20 @@ const RULES: Rule[] = [
     scope: 'source',
     forbidden: /^\s*success:/m,
     deleted: "        success: '#22C55E',",
+  },
+  {
+    file: 'src/index.css',
+    what: 'the hand-written shimmer keyframe and its class — no label in this build ever wore it',
+    scope: 'source',
+    forbidden: /\bshimmer\b/,
+    deleted: '  animation: shimmer 2.4s linear infinite;',
+  },
+  {
+    file: 'tailwind.config.js',
+    what: 'the collapsible keyframes and animations, which outlived the Radix primitive they drove',
+    scope: 'source',
+    forbidden: /\bcollapsible-(?:down|up)\b/,
+    deleted: "        'collapsible-down': 'collapsible-down 0.2s ease-out',",
   },
 ]
 

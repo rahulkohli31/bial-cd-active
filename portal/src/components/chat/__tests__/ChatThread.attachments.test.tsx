@@ -140,6 +140,27 @@ describe('the transcript draws the chip and not the file', () => {
     expect(bubble.textContent).toContain('What is the total?')
   })
 
+  it('draws each chip ONCE, and draws it from the thread\'s own slot', () => {
+    render(<Harness messages={[withCsv()]} />)
+    // `getAllByText` with a length, not `getByText`, so a second chip fails as "2, expected 1"
+    // rather than as a multiple-match throw that reads like a selector mistake. The slot is
+    // `UserAttachments` (thread.tsx:307) and it is the user branch's alone — nothing in this
+    // product puts an attachment on an assistant message.
+    expect(screen.getAllByText('payroll.csv')).toHaveLength(1)
+  })
+
+  it('and MessageContent draws no chip of its own, given the array form that used to make it', () => {
+    // THE HALF THE TRANSCRIPT ABOVE CANNOT SEE, and the one with teeth. `MessageContent` used to
+    // render chips itself from the same descriptors; the case above would not notice it coming
+    // back, because the thread's text slot hands down a plain STRING and the in-bubble render read
+    // the array. The union is still accepted — the 21 parity cases pass arrays — so nothing in the
+    // type system stops it, and this is what does.
+    const { container } = render(<MessageContent parts={withCsv().parts} />)
+    expect(container.textContent).not.toContain('payroll.csv')
+    // LIVENESS — the prose still renders, so the absence above is a filter and not a dead render.
+    expect(container.textContent).toContain('What is the total?')
+  })
+
   it('an image attachment is visible at all — it converts to no library part', async () => {
     render(<Harness messages={[withImage()]} />)
     const bubble = screen.getByTestId('user-message')

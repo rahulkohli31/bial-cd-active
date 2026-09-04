@@ -1,56 +1,70 @@
+/**
+ * THE TWO OBJECT-URL HELPERS, WHICH IS ALL THIS MODULE IS NOW.
+ *
+ * This file used to test the base64 chain (`base64ToBlob` → `openAttachmentBytes` → `openPdf`)
+ * from the AttachmentLightbox era. The pipeline moved to server-served object URLs, that chain
+ * lost its last caller, and it went. What was never covered is what survived — `AttachmentChips`
+ * reaches both helpers below on a click — so the file is repointed rather than deleted.
+ *
+ * WHAT IS WORTH ASSERTING HERE, given neither helper has a return value that carries much: that
+ * exactly ONE action happens per call (a tab-open that also downloads, or the reverse, is the
+ * failure mode of getting `target`/`download` wrong on the same anchor), that the new-tab path
+ * carries `rel="noopener noreferrer"`, and that NEITHER revokes the URL — the caller's cache owns
+ * its lifetime, and revoking here would break every later click on the same chip.
+ */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { base64ToBlob, openAttachmentBytes, openPdf } from '../attachmentViewer'
+import { openUrlInNewTab, downloadObjectUrl } from '../attachmentViewer'
 
-describe('base64ToBlob', () => {
-  it('decodes raw base64 into a typed Blob of the right size', () => {
-    const blob = base64ToBlob('QUJD', 'application/pdf') // base64('ABC')
-    expect(blob.type).toBe('application/pdf')
-    expect(blob.size).toBe(3)
-  })
-})
-
-describe('openAttachmentBytes / openPdf', () => {
-  let clickSpy
+describe('openUrlInNewTab / downloadObjectUrl', () => {
+  let anchors
   beforeEach(() => {
-    // jsdom implements neither of these — stub them.
-    URL.createObjectURL = vi.fn(() => 'blob:mock-url')
+    // jsdom implements neither, and would warn "navigation not implemented" on a real click.
     URL.revokeObjectURL = vi.fn()
-    // Spy on the anchor click (jsdom would otherwise warn "navigation not implemented").
-    clickSpy = vi.fn()
+    anchors = []
     const realCreate = document.createElement.bind(document)
     vi.spyOn(document, 'createElement').mockImplementation((tag) => {
       const el = realCreate(tag)
-      if (tag === 'a') el.click = clickSpy
+      if (tag === 'a') {
+        el.click = vi.fn()
+        anchors.push(el)
+      }
       return el
     })
-    vi.useFakeTimers()
   })
   afterEach(() => {
-    delete URL.createObjectURL
     delete URL.revokeObjectURL
     vi.restoreAllMocks()
-    vi.useRealTimers()
   })
 
-  it('returns false (and builds nothing) when there are no bytes', () => {
-    expect(openAttachmentBytes('', 'a.pdf')).toBe(false)
-    expect(URL.createObjectURL).not.toHaveBeenCalled()
-    expect(clickSpy).not.toHaveBeenCalled()
+  it('opens a cached object URL in a new tab with one click, and does not revoke it', () => {
+    expect(openUrlInNewTab('blob:cached', 'spec.pdf')).toBe(true)
+    expect(anchors).toHaveLength(1)
+    const [a] = anchors
+    expect(a.click).toHaveBeenCalledOnce() // exactly one action — no double tab+download
+    expect(a.getAttribute('href')).toBe('blob:cached')
+    expect(a.getAttribute('target')).toBe('_blank')
+    expect(a.getAttribute('rel')).toBe('noopener noreferrer')
+    expect(a.hasAttribute('download')).toBe(false) // absent → the browser renders the PDF inline
+    expect(URL.revokeObjectURL).not.toHaveBeenCalled() // the caller's cache owns the lifetime
   })
 
-  it('opens the blob URL via a single new-tab anchor click and revokes it later', () => {
-    expect(openPdf('QUJD', 'a.pdf')).toBe(true)
-    expect(URL.createObjectURL).toHaveBeenCalledOnce()
-    expect(clickSpy).toHaveBeenCalledOnce() // exactly one action — no double tab+download
-    vi.advanceTimersByTime(60_000)
-    expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:mock-url')
+  it('returns false (and builds nothing) when there is no URL', () => {
+    expect(openUrlInNewTab('', 'spec.pdf')).toBe(false)
+    expect(downloadObjectUrl('', 'spec.pdf')).toBe(false)
+    expect(anchors).toHaveLength(0)
   })
 
-  it('returns false when the blob cannot be built (no spurious open)', () => {
-    URL.createObjectURL = vi.fn(() => {
-      throw new Error('boom')
-    })
-    expect(openPdf('QUJD', 'x.pdf')).toBe(false)
-    expect(clickSpy).not.toHaveBeenCalled()
+  it('downloads under the part name, which is what gives the saved file its extension', () => {
+    expect(downloadObjectUrl('blob:cached', 'payroll.xlsx')).toBe(true)
+    const [a] = anchors
+    expect(a.click).toHaveBeenCalledOnce()
+    expect(a.getAttribute('download')).toBe('payroll.xlsx')
+    expect(a.getAttribute('target')).toBeNull() // a download, not a second tab
+    expect(URL.revokeObjectURL).not.toHaveBeenCalled()
+  })
+
+  it('falls back to a generic name rather than saving an unnamed file', () => {
+    expect(downloadObjectUrl('blob:cached')).toBe(true)
+    expect(anchors[0].getAttribute('download')).toBe('download')
   })
 })

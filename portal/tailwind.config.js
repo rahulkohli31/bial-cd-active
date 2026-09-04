@@ -180,19 +180,7 @@ export default {
         md: 'calc(var(--radius) - 2px)',
         sm: 'calc(var(--radius) - 4px)',
       },
-      // Radix Collapsible drives the activity group's expand-in-place. It measures the
-      // panel and publishes `--radix-collapsible-content-height`; the animation is ours to
-      // declare. `tailwindcss-animate` does NOT ship these — it ships enter/exit utilities —
-      // so `animate-collapsible-down` resolves to nothing without this and the group snaps.
       keyframes: {
-        'collapsible-down': {
-          from: { height: '0' },
-          to: { height: 'var(--radix-collapsible-content-height)' },
-        },
-        'collapsible-up': {
-          from: { height: 'var(--radix-collapsible-content-height)' },
-          to: { height: '0' },
-        },
         'pane-leave': {
           from: { opacity: '1', transform: 'translateX(0)' },
           to: { opacity: '0', transform: 'translateX(6%)' },
@@ -203,8 +191,6 @@ export default {
         },
       },
       animation: {
-        'collapsible-down': 'collapsible-down 0.2s ease-out',
-        'collapsible-up': 'collapsible-up 0.2s ease-out',
         /**
          * THE APP PANE LEAVING AND RETURNING (plan 002, U6). `T2Sliding` is a whole board about
          * this one movement — "the app card is sliding out to the right and fading as it goes" —
