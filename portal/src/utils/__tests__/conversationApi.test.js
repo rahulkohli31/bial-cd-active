@@ -4,9 +4,7 @@ import {
   listConversations,
   listProjectConversations,
   getConversation,
-  createConversation,
   messagesFromProjection,
-  patchConversation,
   createConversationStore,
   deriveTitle,
 } from '../conversationApi'
@@ -241,39 +239,35 @@ describe('messagesFromProjection — the loud fallback arm (Plan D U4, L4)', () 
   })
 })
 
-describe('createConversation / patchConversation / deleteConversation', () => {
-  it('POSTs {id, projectId, kind} (+title/context when given) to the conversations route', async () => {
-    // `mode` is gone from CreateConversationArgs and from ConversationHeader — proven from BOTH
-    // ends here, not merely by asserting the new shape: a stray `mode` on the CALL never reaches
-    // the wire body (createConversation destructures only the named fields it still has), and a
-    // `mode` on the SERVER doc never survives normalizeHeader into the returned header.
-    const fetchImpl = vi.fn(async () => ({ ok: true, status: 201, json: async () => ({ conversation: { _id: 'c1', kind: 'plan', projectId: 'p1', mode: 'plan' } }) }))
-    const header = await createConversation('c1', { projectId: 'p1', kind: 'plan', title: 'T', mode: 'plan' }, deps(fetchImpl))
-    const [url, opts] = fetchImpl.mock.calls[0]
-    expect(url).toBe('/api/conversations')
-    expect(opts.method).toBe('POST')
-    expect(JSON.parse(opts.body)).toEqual({ id: 'c1', projectId: 'p1', kind: 'plan', title: 'T' })
-    expect(header).toMatchObject({ id: 'c1', kind: 'plan', projectId: 'p1' })
-    expect(header).not.toHaveProperty('mode')
-  })
-  it('createConversation rejects on failure (no silent drop)', async () => {
-    const fetchImpl = vi.fn(async () => ({ ok: false, status: 409, json: async () => ({ error: { message: 'id already in use' } }) }))
-    await expect(createConversation('c1', { projectId: 'p1', kind: 'plan' }, deps(fetchImpl))).rejects.toThrow('id already in use')
-  })
-  it('patchConversation PATCHes the body', async () => {
-    const patchFetch = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) }))
-    await patchConversation('c1', { title: 'new' }, deps(patchFetch))
-    expect(patchFetch.mock.calls[0][1].method).toBe('PATCH')
-  })
-
-  it('★ offers no delete at all — the module and the store both', async () => {
-    // `deleteConversation` had exactly one caller, the project rail's past-conversations list, and
-    // the ruling of 2026-09-02 deleted the list: nothing points back to a chat, so nothing offers
-    // to delete one. The SERVER route is untouched. Asserted rather than left silent so that
-    // re-adding a client has to be a decision someone makes on purpose.
+describe('the create / patch / delete round trips are gone', () => {
+  /**
+   * A GUARD, not deleted coverage (plan 001, unit 6). All three were clients with no caller, and
+   * each lost its caller to a decision rather than to an accident.
+   *
+   * `createConversation` and `patchConversation`: a row's parentage rides its FIRST TURN now
+   * (`startTurn`'s `create` block), written inside that turn's transaction after every
+   * side-effect-free refusal — so a refused first message no longer leaves a titled, empty chat
+   * in the project, which is what the separate `POST /conversations` round trip did. The wire
+   * contract this block used to assert — THE CHAT'S KIND IS BOUND INTO THE CREATE BODY — moved
+   * with it, to `turnStreamApi.test.ts`, against the request that now carries it.
+   *
+   * `deleteConversation` had exactly one caller, the project rail's past-conversations list, and
+   * the ruling of 2026-09-02 deleted the list: nothing points back to a chat, so nothing offers
+   * to delete one. The SERVER routes are all untouched. Asserted rather than left silent so that
+   * re-adding any of these clients has to be a decision someone makes on purpose.
+   */
+  it('★ neither the module nor the store offers create, patch or delete', async () => {
     const mod = await import('../conversationApi')
+    expect('createConversation' in mod).toBe(false)
+    expect('patchConversation' in mod).toBe(false)
     expect('deleteConversation' in mod).toBe(false)
-    expect('deleteConversation' in mod.createConversationStore('plan')).toBe(false)
+    const store = mod.createConversationStore('plan')
+    expect('createConversation' in store).toBe(false)
+    expect('deleteConversation' in store).toBe(false)
+    // Paired with a liveness assertion: the READ half is still there, so the absences above are
+    // real absences and not an empty module or an empty store object.
+    expect(typeof mod.listProjectConversations).toBe('function')
+    expect(typeof store.getConversation).toBe('function')
   })
 })
 
@@ -319,14 +313,6 @@ describe('createConversationStore', () => {
     // `crypto.randomUUID()` regression here shows up as a `4` in the version nibble.
     expect(a[14]).toBe('7')
     expect(store.newConversation()).not.toBe(a)
-  })
-
-  it('createConversation binds the kind into the create body', async () => {
-    const fetchImpl = vi.fn(async () => ({ ok: true, status: 201, json: async () => ({ conversation: { _id: 'c1', kind: 'assistant' } }) }))
-    const store = createConversationStore('assistant')
-    await store.createConversation('c1', { projectId: 'p1', title: 'T' }, deps(fetchImpl))
-    const body = JSON.parse(fetchImpl.mock.calls[0][1].body)
-    expect(body).toEqual({ id: 'c1', projectId: 'p1', kind: 'assistant', title: 'T' })
   })
 })
 

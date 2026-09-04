@@ -20,19 +20,6 @@ import type { ChatMessage, MessagePart } from './messageTypes'
  * The header used to carry a second field beside it, a per-thread setting the citizen could move
  * mid-conversation; there is no such field on the wire any more, and nothing here should look for
  * one. A chat that needs to do the other thing is a different chat. */
-/**
- * The chat-row shape a project's rail renders — a deliberate narrowing of `ConversationHeader`,
- * not a second spelling of it. It lives HERE, beside the rows it is narrowed from, because its
- * owner is the API boundary that parses them: defining it on the component that renders it made
- * the page importing its own parsed shape back out of a leaf.
- */
-export interface ChatSummary {
-  id: string
-  kind: string
-  title: string
-  updatedAt: string
-}
-
 export interface ConversationHeader {
   id: string
   kind: string
@@ -353,63 +340,29 @@ export async function getConversation(id: string, deps: AuthFetchDeps = {}): Pro
   }
 }
 
-/**
- * Create the conversation row BEFORE its first turn (U7). The id is still client-minted
- * (`newConversation()`); the server 404s a chat turn whose conversation does not exist, so
- * every send path creates-or-confirms first. Idempotent per owner: a re-POST of the same
- * mint answers 200 with the existing header.
- */
-export interface CreateConversationArgs {
-  projectId: string
-  /** REQUIRED, and the server has no default: what a chat is has to be decided by whoever opens
-   *  it, because it can never be changed afterwards. */
-  kind: string
-  title?: string
-  context?: unknown
-}
+/* THE ROW-CREATE AND HEADER-PATCH WRAPPERS ARE GONE (plan 001, unit 6), and the ruling of
+   2026-09-02 is why nothing is left to point them at.
 
-export async function createConversation(
-  id: string,
-  { projectId, kind, title, context }: CreateConversationArgs,
-  deps: AuthFetchDeps = {},
-): Promise<ConversationHeader | null> {
-  const body: { id: string; projectId: string; kind: string; title?: string; context?: unknown } = {
-    id,
-    projectId,
-    kind,
-  }
-  if (title !== undefined) body.title = title
-  if (context !== undefined) body.context = context
-  const res = await authFetch(
-    '/api/conversations',
-    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
-    deps,
-  )
-  if (!res.ok) throw await readApiError(res, 'Failed to create the conversation')
-  // UNCHECKED (matches pre-migration behavior): the shape is asserted, not validated.
-  const data = (await res.json()) as { conversation: unknown }
-  return normalizeHeader(data.conversation)
-}
+   A CHAT'S ROW IS NO LONGER CREATED BY A ROUND TRIP OF ITS OWN. It used to be: `POST
+   /conversations` committed the row, and the first turn went out behind it — and that create
+   route's only workspace awareness was a project-ownership check, so a first message the
+   workspace then refused left a real, titled, empty chat sitting in the project. The row's
+   parentage rides the turn itself now (`startTurn`'s `create` block, `turnStreamApi.ts`): it
+   carries the chat's KIND and is written inside the turn's own transaction, after every
+   side-effect-free refusal, so a refusal rolls it back. `PATCH /conversations/{id}` lost its
+   client the same way — the header a page used to patch is written by the turn that derives it.
 
-/** Patch a header: any of `{ title, context, code }`. `code` is the builder snapshot.
- * Return typed `unknown` — no real caller reads the resolved value (verified: only
- * this file's own test calls patchConversation; it isn't wired into any live page). */
-export async function patchConversation(id: string, patch: Record<string, unknown>, deps: AuthFetchDeps = {}): Promise<unknown> {
-  const res = await authFetch(
-    `/api/conversations/${encodeURIComponent(id)}`,
-    { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) },
-    deps,
-  )
-  if (!res.ok) throw await readApiError(res, 'Failed to update conversation')
-  return res.json()
-}
+   NOTHING RENDERS A LIST OF CHATS, which is the other half. The ruling of 2026-09-02 is that
+   nothing points back to a chat, running or finished: there is no recents list in the rail and
+   no chat list inside a chat. So there is no row to summarise (the narrowed `ChatSummary` row
+   shape went with it), no row to date (`relativeTime` rendered each row's "1h ago") and no row
+   to delete (`deleteConversation` was reached only through that list's ⋮ menu). The SERVER
+   routes are all untouched — these are clients with no caller, not capabilities the backend has
+   lost — and chats, their plans and their uploaded files all stay. Cleanup, if the client ever
+   asks for it, is a scheduled job rather than a control.
 
-/* THE DELETE WRAPPER IS GONE (plan 002, U3). Its one caller was the project rail's list of past
-   conversations, and the ruling of 2026-09-02 removed the list: nothing points back to a chat,
-   running or finished, so nothing offers to delete one either. The SERVER route is untouched —
-   this is a client with no caller, not a capability the backend has lost — and chats, their plans
-   and their uploaded files all stay. Cleanup, if the client ever asks for it, is a scheduled job.
-   Recorded here rather than removed silently, because the next person reaching for a delete needs
+   Recorded here rather than removed in silence, because an export that simply stops existing
+   tells the next reader nothing about why, and the next person reaching for any of these needs
    to know it was a decision. */
 
 // Client-minted ids + timestamps (Decision 3): ids are no longer guessable `chat_<timestamp>`.
@@ -450,22 +403,15 @@ export function deriveTitle(text: string): string {
 }
 
 /**
- * Build an async store for one conversation `kind` (plan | build),
- * preserving the names `builderHistory` re-exports.
- * `newConversation` stays SYNCHRONOUS — it mints a UUID with no network; U7 moves
- * row creation to an explicit `createConversation` call the send path makes BEFORE
- * the first turn (the legacy appears-on-first-append upsert died with the message
- * API — the server persists turns itself now).
+ * Build an async READ store for one conversation `kind` (plan | build), preserving the names
+ * `builderHistory` re-exports. `newConversation` stays SYNCHRONOUS — it mints a UUID with no
+ * network. There is no create member: a row's parentage rides its first turn now (see the
+ * retirement note above), so there is nothing left here to create a row with.
  */
 export interface ConversationStore {
   loadHistory: (deps?: AuthFetchDeps) => Promise<(ConversationHeader | null)[]>
   newConversation: () => string
   getConversation: (id: string, deps?: AuthFetchDeps) => Promise<ConversationWithMessages | null>
-  createConversation: (
-    id: string,
-    header?: Partial<Omit<CreateConversationArgs, 'kind'>>,
-    deps?: AuthFetchDeps,
-  ) => Promise<ConversationHeader | null>
 }
 
 export function createConversationStore(kind: string): ConversationStore {
@@ -473,8 +419,5 @@ export function createConversationStore(kind: string): ConversationStore {
     loadHistory: (deps) => listConversations(kind, deps),
     newConversation: () => newId(),
     getConversation: (id, deps) => getConversation(id, deps),
-    // UNCHECKED (matches pre-migration behavior): `header` is asserted to carry
-    // whatever CreateConversationArgs still needs (projectId) once merged with `kind`.
-    createConversation: (id, header = {}, deps) => createConversation(id, { kind, ...header } as CreateConversationArgs, deps),
   }
 }

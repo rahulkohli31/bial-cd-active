@@ -1,27 +1,26 @@
-import { describe, it, expect, vi } from 'vitest'
-import { createBuild } from '../builderHistory'
-
-const deps = (fetchImpl) => ({ fetchImpl, getToken: () => 'tok', refresh: vi.fn() })
+import { describe, it, expect } from 'vitest'
+import * as builderHistory from '../builderHistory'
 
 describe('builderHistory', () => {
-  it('createBuild POSTs the build-kind create body (U7: row exists before the first turn)', async () => {
-    const fetchImpl = vi.fn(async () => ({
-      ok: true,
-      status: 201,
-      json: async () => ({ conversation: { _id: 'build-1', kind: 'build', projectId: 'p1' } }),
-    }))
-    await createBuild('build-1', { projectId: 'p1', title: 'T', context: { theme: 'bial' } }, deps(fetchImpl))
-    const [url, opts] = fetchImpl.mock.calls[0]
-    expect(url).toBe('/api/conversations')
-    expect(opts.method).toBe('POST')
-    // U1 collapsed the old three-value kind + ask/plan/write mode into one two-valued ChatKind
-    // (plan | build) — the server 422s on the retired 'builder' string.
-    expect(JSON.parse(opts.body)).toEqual({
-      id: 'build-1',
-      projectId: 'p1',
-      kind: 'build',
-      title: 'T',
-      context: { theme: 'bial' },
-    })
+  /**
+   * A GUARD, not deleted coverage (plan 001, unit 6). This file used to assert that `createBuild`
+   * POSTed `{ id, projectId, kind: 'build', title, context }` to `/api/conversations` a full round
+   * trip before the first turn. That route's only workspace awareness was a project-ownership
+   * check, so a first message the workspace then refused left a real, titled, empty build chat
+   * behind it. The row's parentage rides the turn itself now, and the wire assertion this file
+   * made — the create body carries `kind: 'build'` — lives in `turnStreamApi.test.ts`, against
+   * the request that actually carries it.
+   *
+   * What is left here is a READ store. Re-adding a create verb would rebuild the round trip
+   * R-18 removed, so its absence is asserted rather than left silent.
+   */
+  it('exports no create verb — a build row is created by its first turn', () => {
+    expect('createBuild' in builderHistory).toBe(false)
+    expect(builderHistory.createBuild).toBeUndefined()
+    // Paired with a liveness assertion so the absence above cannot false-green on a module
+    // that failed to load anything at all.
+    expect(typeof builderHistory.loadBuilds).toBe('function')
+    expect(typeof builderHistory.getBuild).toBe('function')
+    expect(typeof builderHistory.deriveTitle).toBe('function')
   })
 })

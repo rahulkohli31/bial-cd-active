@@ -1,5 +1,5 @@
 /**
- * Typed client for the owner-facing approval flow (`/api/apps/:appId/{withdraw,status}`),
+ * Typed client for the owner-facing approval flow (`POST /api/apps/:appId/withdraw`),
  * mirroring `projectApi.ts`: every call is `fn(args, deps = {})` forwarding `deps` to
  * `authFetch`, responses arrive as `unknown` and pass through a narrower that throws
  * `ApiError` on a structurally-invalid row — never cast, never `any`.
@@ -17,29 +17,18 @@
  * own PENDING submission back to draft. It sends NO body — the server knows which
  * submission is pending — and its 409 carries self-describing server copy, so the control
  * renders `err.message` directly without client-side string matching.
- */
+ *
+ * IT IS THE ONLY VERB LEFT HERE, and that is the second point. There was an app-scoped
+ * `getApprovalStatus` beside it, the typed client for `GET /apps/:id/status`, written for the
+ * approval card at the foot of the chat; the canvas's `Removals` board took that card out and
+ * nothing reached the getter afterwards. The publish and review surfaces read the lifecycle off
+ * the PROJECT-scoped deploy status instead (`deployApi`), so both share one poll lifetime and
+ * cannot end up telling the citizen two different things — a second, app-scoped poll re-added
+ * here is exactly what would break that. The SERVER route is untouched; `approvalApi.test.ts`
+ * guards the getter's absence rather than having deleted the coverage. */
 import { ApiError, isRecord, readApiError } from './apiError'
 import { authFetch } from './api'
 import type { AppStatus, AuthFetchDeps } from './projectApi'
-
-/** The owner's view of the app's approval lifecycle (GET /apps/:id/status). */
-export interface AppApprovalStatus {
-  appId: string
-  status: AppStatus
-  rejectionNote: string | null
-  /** The submission under review — null until the first submit. */
-  submissionId: string | null
-  commitSha: string | null
-  submittedAt: string | null
-  /** The manual-runbook deploy marker — null until an admin marks the app deployed. */
-  deployedAt: string | null
-  /**
-   * Where the app is live. Null both before any deploy AND when the admin recorded a
-   * deploy without an address, so the Live link is gated on THIS — never on
-   * `deployedAt` or `status === 'approved'`.
-   */
-  deployedUrl: string | null
-}
 
 /** What a successful withdrawal left behind (POST /apps/:id/withdraw): the app, back at
  *  draft. The queue item is REMOVED, not replaced — an administrator mid-review sees it
@@ -47,13 +36,6 @@ export interface AppApprovalStatus {
 export interface WithdrawResult {
   appId: string
   status: AppStatus
-}
-
-// NOTE: stricter than projectApi.ts's same-role helper — this one collapses '' to
-// null. The name makes that difference visible at the call sites (a reader who knows
-// projectApi's `asStringOrNull` won't mistake this for the identical behavior).
-function nonEmptyStringOrNull(value: unknown): string | null {
-  return typeof value === 'string' && value !== '' ? value : null
 }
 
 function toAppStatus(value: unknown): AppStatus {
@@ -71,47 +53,11 @@ function toAppStatus(value: unknown): AppStatus {
   throw new ApiError('The server returned an app status we could not read.', 500)
 }
 
-function toApprovalStatus(value: unknown): AppApprovalStatus {
-  if (!isRecord(value) || typeof value.appId !== 'string' || value.appId === '') {
-    throw new ApiError('The server returned an app we could not read.', 500)
-  }
-  return {
-    appId: value.appId,
-    status: toAppStatus(value.status),
-    rejectionNote: nonEmptyStringOrNull(value.rejectionNote),
-    submissionId: nonEmptyStringOrNull(value.submissionId),
-    commitSha: nonEmptyStringOrNull(value.commitSha),
-    submittedAt: nonEmptyStringOrNull(value.submittedAt),
-    deployedAt: nonEmptyStringOrNull(value.deployedAt),
-    // The server parses this as an https URL before it is ever stored, so the
-    // narrower's job here is only shape (string-or-null), not scheme.
-    deployedUrl: nonEmptyStringOrNull(value.deployedUrl),
-  }
-}
-
 function toWithdrawResult(value: unknown): WithdrawResult {
   if (!isRecord(value) || typeof value.appId !== 'string' || value.appId === '') {
     throw new ApiError('The server returned an app we could not read.', 500)
   }
   return { appId: value.appId, status: toAppStatus(value.status) }
-}
-
-/**
- * Owner-scoped read of the app's approval lifecycle — the typed client for the live
- * `GET /apps/:id/status` route.
- *
- * NOT what the citizen's publish and review surfaces read any more (U12). They take the
- * lifecycle off the project-scoped deploy status instead, so both of them share one poll
- * lifetime and cannot end up telling the citizen two different things. Reach for this
- * only from a surface that genuinely holds an app id and nothing else.
- */
-export async function getApprovalStatus(
-  appId: string,
-  deps: AuthFetchDeps = {},
-): Promise<AppApprovalStatus> {
-  const res = await authFetch(`/api/apps/${encodeURIComponent(appId)}/status`, {}, deps)
-  if (!res.ok) throw await readApiError(res, 'Failed to read the app status')
-  return toApprovalStatus(await res.json())
 }
 
 /**
