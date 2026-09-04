@@ -18,7 +18,8 @@ import { useLocation, useNavigate } from 'react-router-dom'
  *    built from the render-time location would snap them back to the chat they left.
  *
  * AND IT DROPS THE ROUTER STATE WITH THE QUERY, because both are the same thing: a one-shot
- * hand-off from the project composer (`{prompt, mode, pendingAttachments}`), consumed at
+ * hand-off from the rail composer (`{prompt, pendingAttachments, freshlyMinted}` —
+ * `RailComposer.tsx`), consumed at
  * mount and worthless afterwards. Carrying it forward is not harmless — it is N1. Both pages call
  * `window.history.replaceState` before firing the hand-off, but that rewrites the browser entry
  * WITHOUT emitting a popstate, so react-router's in-memory `location.state` survives it; this
@@ -26,7 +27,7 @@ import { useLocation, useNavigate } from 'react-router-dom'
  * still there, the fire-once ref had died with the mount, and the opening turn ran a second time
  * — billed again, on a thread the user was only re-reading.
  *
- * Nothing needs it to survive: `initialPrompt` and `mode` are read at MOUNT,
+ * Nothing needs it to survive: `initialPrompt` is read at MOUNT,
  * `pendingAttachments` is read inside `fireHandoffPrompt` which runs BEFORE this, and
  * after a reload the server's saved header is authoritative for every one of them.
  *
