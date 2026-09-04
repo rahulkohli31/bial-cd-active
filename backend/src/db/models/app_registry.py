@@ -190,6 +190,9 @@ class AppRegistry(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base)
     # a blank slate. `conversations.code` is demoted to a per-session working buffer;
     # THIS is authoritative. NULL until the first build. Scope: code continuity only —
     # versioning/branching/history stay deferred to the file-system + sandbox phase.
+    #
+    # AUDIT-2026-09-03 · verified-alive: intentionally retained pending verification — see
+    # the audit record.
     current_code: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
     # The submission under review (APPROVAL R1/R4): `submit` copies the app's

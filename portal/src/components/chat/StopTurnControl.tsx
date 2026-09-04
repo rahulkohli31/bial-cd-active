@@ -33,6 +33,12 @@
  * the control mid-interaction — the same defect U15 avoids on the copy button. The word stays
  * "Stop" in every state; the in-flight state is carried by the glyph and by `title`, which is the
  * `aria-disabled`-plus-reason shape the composer's Send already uses.
+ *
+ * AUDIT-2026-09-03 · canvas-divergence: the Removals board removes "both Stop buttons" and says
+ * stopping a response is being rebuilt on its own with nothing shipping in its place — this
+ * control ships, is imported and rendered by `Composer.tsx`, and is reachable in both kinds of
+ * chat — redrawing that board row to match what ships settles it and retires this marker with
+ * the guard in `src/__tests__/audit-2026-09-03.test.ts`, which fails if the wiring is removed.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Loader2, Square } from 'lucide-react'

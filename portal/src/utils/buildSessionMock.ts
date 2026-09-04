@@ -8,6 +8,8 @@
  * consumed that surface once the real endpoints landed (each test suite primes its own
  * `vi.fn()` client bag instead), so it was deleted — the fake transport below is the
  * only export anything imports.
+ *
+ * AUDIT-2026-09-03 · verified-alive: intentionally retained pending verification — see the audit record.
  */
 import type { EventSourceLike } from './buildSessionEvents'
 import type { ProgressEnvelope } from './buildSessionTypes'

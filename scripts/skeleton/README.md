@@ -75,3 +75,7 @@ locally; instead the template was proven via a direct `next dev` (this harness) 
 supervisor env-scrub was verified against `app.py`'s predicate. The frame-proof above uses a
 Node stand-in for Caddy so the **C8 framing mechanism** is proven for real without Docker —
 the header/token values are byte-identical to `sandbox/Caddyfile`.
+
+## Status
+
+AUDIT-2026-09-03 · verified-alive: intentionally retained pending verification — see the audit record.

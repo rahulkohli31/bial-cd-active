@@ -11,7 +11,9 @@ export interface MessageContentProps {
    *  markdown document re-parses per token — bold popping in when the closing `**`
    *  lands, an unterminated code fence rendering the growing tail as a code block —
    *  so a streaming assistant message renders as plain text (same treatment as the
-   *  user branch) until it settles, then switches to the real markdown render. */
+   *  user branch) until it settles, then switches to the real markdown render.
+   *
+   *  AUDIT-2026-09-03 · verified-alive: intentionally retained pending verification — see the audit record. */
   isStreaming?: boolean
 }
 

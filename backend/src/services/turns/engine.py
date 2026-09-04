@@ -1430,7 +1430,15 @@ class TurnEngine:
         the pin bought is paid for better and for more cases: the instruction to follow the
         code's reality where it differs from what the plan assumed lives in the Build chat's
         own prompt, which works for a plan built weeks later rather than only when two snapshot
-        heads happen to differ."""
+        heads happen to differ.
+
+        AUDIT-2026-09-03 · canvas-divergence: the Removals board removes "the sandbox in
+        planning", saying a Plan chat reads the latest copy of the app instead and stops
+        holding a container — this method resolves the project's LIVE container for both
+        kinds, with one arm and no branch — redrawing that board row to match what ships
+        settles it and retires this marker with the guard in
+        `tests/services/turns/test_pin_workspace_one_arm.py`, which fails if the branch the
+        board describes is ever put back."""
         attach = partial(
             self._attach_sandbox,
             state,
