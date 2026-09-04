@@ -144,7 +144,8 @@ describe('the gate withholds SENDING, not typing (N10)', () => {
     // HONEST LIMIT: jsdom does not implement blur-on-disable, so the `activeElement` assertions
     // below cannot by themselves catch a reintroduced `disabled` — they pin the no-focus-grab half.
     // The mechanism itself is pinned by asserting the attribute, here and in the sibling test
-    // above; only a real browser reproduces the blur (`.mythos` scenarios cover that).
+    // above; only a real browser reproduces the blur, so that half is covered by a browser run
+    // rather than here.
     h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
     // Hold the turn OPEN across the assertion. With a stream that settles in the same tick the
     // composer is already re-enabled by the time focus is read, and the blur goes unseen — the
