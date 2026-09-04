@@ -10,10 +10,20 @@
  * explicit invalidate (after login/logout/refresh). A server-side revoke surfaces
  * on the next refresh/mutation 401.
  *
- * The legacy `getAccessToken`/`refreshAccessToken` exports remain as documented
- * shims so not-yet-migrated Express (Bearer) call sites still compile — there is
- * no bearer token in the cookie model, so `getAccessToken` returns null and those
- * Express calls 401 until each API migrates to the cookie session (KD-10).
+ * THE TWO BEARER-ERA NAMES ARE NOT A MATCHED PAIR, and this paragraph replaces one that said
+ * they were. It described both `getAccessToken` and `refreshAccessToken` as shims kept so
+ * "not-yet-migrated Express (Bearer) call sites still compile", with those calls 401ing until
+ * each API migrated. There are no Express call sites: that backend was deleted in fde58e8b, and
+ * nothing in this package depends on it. And only ONE of the two is a shim:
+ *
+ *  - `getAccessToken` IS one. It returns null and always will, and it survives for a reason that
+ *    has nothing to do with Express — it is the default of `authFetch`'s injectable `getToken`
+ *    seam, and its widened return type is what stops every TypeScript caller's dep bag from
+ *    narrowing to `() => null`. Its own docblock says so.
+ *  - `refreshAccessToken` is LIVE, load-bearing, and the most delicate function in this file:
+ *    the cross-tab Web-Locks single-flight silent refresh, called on the /auth/me 401 retry at
+ *    :118 and by `authFetch`. It keeps its Bearer-era NAME and nothing else; two tabs racing the
+ *    same refresh cookie would trip the server's reuse-detection and force a full re-auth.
  */
 
 // Relative path: the vite dev proxy (and the production edge) route /api/v1/auth/*
@@ -311,7 +321,9 @@ export async function logout(): Promise<boolean> {
   }
 }
 
-// --- legacy Bearer shims (retired; kept so Express call sites compile) --------
+// --- the one surviving Bearer-era name ---------------------------------------
+// Kept for the seam it anchors, not for a caller: see this file's header, and the
+// docblock below, which states the reason that actually still holds.
 
 /**
  * No bearer token exists in the cookie model — always null (KD-10 shim). The
