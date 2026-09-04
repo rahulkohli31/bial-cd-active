@@ -5,6 +5,7 @@ import UsersLimitsPanel from '../components/admin/UsersLimitsPanel'
 import GlobalLimitsPanel from '../components/admin/GlobalLimitsPanel'
 import FeedbackPanel from '../components/admin/FeedbackPanel'
 import AppRegistryPanel from '../components/admin/AppRegistryPanel'
+import DeletedProjectsPanel from '../components/admin/DeletedProjectsPanel'
 import { Info, Lock, AlertCircle } from 'lucide-react'
 import { getStoredUser } from '../utils/auth'
 
@@ -27,6 +28,9 @@ const TABS = [
   { id: 'users', label: 'Users & Limits' },
   { id: 'globalLimits', label: 'Global Limits' },
   { id: 'feedback', label: 'Feedback' },
+  // #176 — the reader for `deleted_projects`. Deleting a project requires a written reason
+  // (§13.2); until this tab existed nothing could retrieve one.
+  { id: 'deletions', label: 'Deletions' },
 ]
 
 /**
@@ -113,6 +117,7 @@ export default function AdminPage() {
           <div className="p-4">
             {activeTab === 'apps' && <AppRegistryPanel onToast={showToast} />}
             {activeTab === 'users' && <UsersLimitsPanel onToast={showToast} />}
+            {activeTab === 'deletions' && <DeletedProjectsPanel onToast={showToast} />}
             {activeTab === 'globalLimits' && <GlobalLimitsPanel onToast={showToast} />}
             {activeTab === 'feedback' && <FeedbackPanel />}
           </div>

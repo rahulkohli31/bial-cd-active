@@ -21,17 +21,14 @@
  *
  *      THE TYPE-THE-NAME GATE IS GONE. Retyping a name proves you can read, not that you
  *      meant it — and it taught people to copy-paste past the warning they were meant to be
- *      reading. The reason is a better gate for the same purpose AND it is meant to still be
- *      useful a month later: it is kept on a `deleted_projects` tombstone. NOTHING READS THAT
- *      TABLE YET as of this PR — the admin read surface is tracked separately (#176) — so
- *      the helper text says only what is true today (kept with the record) rather than
- *      promising a reader that does not exist. Round-4 review caught this docblock saying
- *      the stronger thing a paragraph away from the copy that had already been walked back;
- *      say the same true thing in both places.
+ *      reading. The reason is a better gate for the same purpose AND it is still useful a
+ *      month later: it is kept on a `deleted_projects` tombstone an administrator can read,
+ *      on the admin console's Deletions tab (#176, this PR). The helper text says so,
+ *      because someone writing a private-feeling note deserves to know who sees it.
  *
- *      Once #176 lands, this reverts to the stronger claim — someone writing a
- *      private-feeling note deserves to know an administrator sees it — in both the
- *      helper text and here.
+ *      Both this paragraph and that helper text were walked back for exactly one release,
+ *      while the tombstone had no reader — a promise about who reads a person's words is a
+ *      promise to that person. They are restored together, here, because the reader exists.
  *
  *      The count is validated HERE and again on the server, with the same splitting rule
  *      (`utils/words.ts` <-> `src/core/words.py`). The client keeps the person inside the
@@ -210,16 +207,23 @@ export default function ProjectDeleteDialog({
             className="mt-1.5 resize-y"
           />
           <div className="flex items-baseline justify-between mt-1">
-            {/* SAYS ONLY WHAT IS TRUE TODAY. This read "An administrator can see this",
-                and nothing reads `deleted_projects` — there is no route, no schema and no
-                screen. Every deletion collects a mandatory 5-50 word justification, so a
-                promise about who reads it is a promise to a user, not an internal TODO. The
-                read surface is tracked in #176; when it lands, the stronger sentence becomes
-                true again and this reverts. Until then the copy says what the platform
-                actually does, which is keep the reason with the record. */}
+            {/* SAYS WHO READS IT, and it is true again as of #176. This sentence was
+                softened to "Kept with the deletion record." for exactly as long as nothing
+                could retrieve one — a promise about who reads a person's words is a promise
+                to that person, not an internal TODO. The admin console's Deletions tab is
+                that reader now, so the stronger claim is restored. §13.2 asks for it:
+                someone writing what feels like a private note deserves to know it is not.
+
+                "SEARCH AND READ", not "see". The two are not the same promise, and the
+                difference is the one the writer actually cares about: "an administrator can
+                see this" is read as "if they go looking at my project", while the Deletions
+                tab is full-text searchable across every reason ever written. Somebody can
+                arrive at these words without ever having heard of this project, by searching
+                for a phrase in them. Telling the writer only the weaker half would be
+                accurate about the mechanism and misleading about the exposure. */}
             <span className="text-[11px] text-neutral">
-              Between {MIN_DELETE_REASON_WORDS} and {MAX_DELETE_REASON_WORDS} words. Kept with
-              the deletion record.
+              Between {MIN_DELETE_REASON_WORDS} and {MAX_DELETE_REASON_WORDS} words. An
+              administrator can search and read this.
             </span>
             <span
               className={`text-[11px] tabular-nums ${

@@ -15,10 +15,16 @@
  *
  * `AppRegistryPanel` (the 'apps' tab, active by default) is rendered for REAL here, with
  * only its API module mocked — the fix under test is what AdminPage does with a callback
- * a real panel really invokes, not a synthetic one. The other three tabs' panels never
- * report a failure through this channel (their own catch blocks call `setActionError` /
- * `setApplyError` instead — see UsersLimitsPanel/GlobalLimitsPanel), so they are stubbed
- * out to keep this file's mock surface to what the fix actually touches.
+ * a real panel really invokes, not a synthetic one. `UsersLimitsPanel`, `GlobalLimitsPanel`
+ * and `FeedbackPanel` report their failures through their own state (`setActionError` /
+ * `setApplyError`) rather than this channel, so they are stubbed out to keep this file's mock
+ * surface to what the fix actually touches. `DeletedProjectsPanel` is stubbed for a different
+ * reason — see its own describe at the bottom, which is about the TAB existing, not the toast.
+ *
+ * (This paragraph said "the other three tabs" while the console had five, and claimed those
+ * panels never use this channel while `DeletedProjectsPanel` does. Both were true when it was
+ * written and stopped being true as tabs were added — which is the same rot the Deletions
+ * tripwire below exists to catch, in prose rather than in code.)
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
@@ -46,6 +52,13 @@ vi.mock('../../utils/appRegistryApi', () => h)
 vi.mock('../../components/admin/UsersLimitsPanel', () => ({ default: () => null }))
 vi.mock('../../components/admin/GlobalLimitsPanel', () => ({ default: () => null }))
 vi.mock('../../components/admin/FeedbackPanel', () => ({ default: () => null }))
+// Stubbed to a MARKER rather than `null`: the test at the bottom needs to prove the Deletions
+// tab actually mounts this panel, and a null stub is indistinguishable from a tab that renders
+// nothing. Until now this panel was the one AdminPage import left unmocked, which passed only
+// because 'apps' is the default tab and no test ever clicked away from it.
+vi.mock('../../components/admin/DeletedProjectsPanel', () => ({
+  default: () => <div data-testid="deletions-panel" />,
+}))
 
 import AdminPage from '../AdminPage'
 
@@ -204,5 +217,35 @@ describe('two messages in quick succession (U15 edge case)', () => {
       expect(toast.textContent).toContain('approved')
       expect(toast.textContent).not.toContain('Could not reach the registry.')
     })
+  })
+})
+
+describe('the Deletions tab exists and mounts its panel', () => {
+  // THE COUNTERPART TRIPWIRE. #173 asserted that ProjectDeleteDialog did NOT say "An
+  // administrator can see this", so the claim could not return before a reader did. #176
+  // restores the claim and removes that assertion — but removing a tripwire is only safe if its
+  // other half gets installed, and it did not. The result was that deleting this entire tab left
+  // the full portal suite green while the delete dialog went on promising every citizen that an
+  // administrator can read the reason they wrote.
+  //
+  // These two tests are that other half: the promise in the dialog and the surface that makes it
+  // true now fail together.
+  //
+  // Mutation receipt: remove the `deletions` entry from `TABS`, or the
+  // `activeTab === 'deletions' && <DeletedProjectsPanel …/>` line, and these go red.
+
+  it('offers Deletions in the tab bar', () => {
+    renderAdmin()
+
+    expect(screen.getByRole('button', { name: 'Deletions' })).toBeTruthy()
+  })
+
+  it('mounts the deletions panel when the tab is chosen', () => {
+    renderAdmin()
+    expect(screen.queryByTestId('deletions-panel')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Deletions' }))
+
+    expect(screen.getByTestId('deletions-panel')).toBeTruthy()
   })
 })

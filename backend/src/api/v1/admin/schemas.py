@@ -13,6 +13,7 @@ from typing import Annotated, Any
 
 from pydantic import AfterValidator, AnyUrl, Field, UrlConstraints
 
+from src.api.v1.pagination import DEFAULT_PAGE_SIZE
 from src.db.models.app_registry import MAX_DEPLOYED_URL, ApprovalRoute, AppStatus
 from src.schemas import CamelModel
 
@@ -666,3 +667,94 @@ class HarnessCountersResponse(CamelModel):
 
     counters: list[HarnessCounterRow]
     since: datetime
+
+
+# --- deleted projects (`/admin/deleted-projects/*`) -----------------------------
+
+
+class DeletedProjectsQuery(CamelModel):
+    """The search body for `POST /admin/deleted-projects/search`.
+
+    A BODY RATHER THAN QUERY PARAMS, and the method is the point rather than the ergonomics.
+    The route commits an audit row — its own comment says "A READ THAT WRITES" — but
+    `main.py`'s `refuse_cross_origin_writes` only guards POST/PUT/PATCH/DELETE, precisely
+    because a GET is not supposed to mutate. As a GET this route sat outside that guard with
+    a `SameSite=Lax` session cookie and generated apps served same-site, so app code written
+    by a model from a citizen's prompt could drive an admin's session into writing audit rows
+    under their identity. POST puts it back inside the guard, picks up `RequireCsrf`'s
+    double-submit token, and forces a preflight a same-site app cannot satisfy.
+
+    It also takes the search term out of the URL, and so out of uvicorn's `access_log` and
+    the gateway's `requestUri` — two audiences wider than `superadmin_emails`, holding a
+    citizen's words for a retention this repo does not control.
+
+    EVERY FIELD IS A BARE TYPE, deliberately, and this is load-bearing rather than lazy.
+    `pagination.py` argues that this platform answers a bad page argument with one
+    `{"error": {"message"}}` 422; a Pydantic constraint (`ge=`, `le=`) or a `datetime`
+    coercion failure emits FastAPI's native `{"detail": [...]}` instead, putting two
+    different 422 bodies on one endpoint that `error_responses(...)` cannot both document.
+    So the validating stays in the handler, on `parse_cursor` / `clean_limit` /
+    `clean_search` / `parse_deleted_at_bound`, exactly as it did when these were query
+    params.
+    """
+
+    cursor: str | None = None
+    limit: int = DEFAULT_PAGE_SIZE
+    q: str | None = None
+    # The date range #176 asked for ("filters worth having: by owner, and by date range").
+    # ISO-8601 strings, parsed in the handler for the reason the class docstring gives — a
+    # `datetime` annotation here would hand a malformed date to Pydantic and produce the
+    # wrong 422 shape. Inclusive on both ends: an administrator asking for a day means that
+    # whole day, and a half-open upper bound silently drops the last row of it.
+    deleted_from: str | None = None
+    deleted_to: str | None = None
+
+
+class DeletedProjectOut(CamelModel):
+    """One deletion, as an administrator reads it (#176).
+
+    Every field is a VALUE copied at the moment of deletion, not a join: the project row, its
+    app, its database and its chats are all gone by the time this row is written, so there is
+    nothing left to join to. That is why the tombstone stores rather than references.
+
+    `deletedBy` AND `deletedByName` ARE NOT THE SAME KIND OF FACT, and this screen is exactly
+    where the difference matters. `deletedBy` is the account that acted, taken from the
+    authenticated session and never from a request body. `deletedByName` is the readable label
+    for it — also stamped server-side, from `display_name` or the email when Entra gave us
+    none — so the two cannot disagree. It was briefly a client-supplied field, which meant a
+    browser signed in as one person could file a deletion under somebody else's name; that is
+    the question this row exists to answer, so it is now unspoofable by construction.
+
+    The three counts are what went with the project. They cannot be reconstructed once the
+    children are deleted, which is why they are captured at deletion time rather than derived.
+    """
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    project_name: str
+    owner_id: uuid.UUID
+    owner_email: str
+    deleted_by: uuid.UUID
+    deleted_by_name: str
+    deleted_at: datetime
+    remark: str
+    chats_deleted: int
+    had_app: bool
+    had_database: bool
+
+
+class DeletedProjectsResponse(CamelModel):
+    """A keyset page of deletions, newest first.
+
+    KEYSET, NOT THE OFFSET ENVELOPE the projects list uses — and the distinction is not
+    arbitrary. `/v1/projects` deviated to offset because §2 specifies `Showing 1-8 of 12` and
+    `Page 1 of 2`, neither of which is expressible without a `total`. Nothing here asks for
+    one, and the two reasons `pagination.py` prefers keyset both hold: the table is
+    APPEND-ONLY (no row is ever updated or deleted, so a page walk cannot skew) and the walk
+    is over a UUIDv7 primary key, so `ORDER BY id DESC` already IS newest-first and the cursor
+    is just the last row's id.
+    """
+
+    deletions: list[DeletedProjectOut]
+    next_cursor: str | None
+    has_more: bool
