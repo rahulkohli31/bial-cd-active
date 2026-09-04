@@ -1,7 +1,8 @@
 /**
- * ProjectDeleteDialog — the two guarantees a destructive confirm owes the user:
- *   1. The confirm button will not arm until the typed text matches the project
- *      name EXACTLY — a trailing space or wrong case is not a match.
+ * ProjectDeleteDialog — the guarantees a destructive confirm owes the user:
+ *   1. The confirm button will not arm until the reason is a valid 5-50 words,
+ *      and the dialog NAMES the account the deletion will be recorded against
+ *      without asking anyone to type it.
  *   2. It names the cascade with a real chat count, and it never flashes
  *      "all 0 chats" while that count is still in flight — the numberless copy
  *      stands in until the count resolves.
@@ -12,7 +13,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, act, cleanup } from '@testing-library/react'
 
-const h = vi.hoisted(() => ({ listProjectConversations: vi.fn() }))
+const h = vi.hoisted(() => ({ listProjectConversations: vi.fn(), getStoredUser: vi.fn() }))
+vi.mock('../../../utils/auth', () => ({ getStoredUser: h.getStoredUser }))
 vi.mock('../../../utils/conversationApi', () => ({
   listProjectConversations: h.listProjectConversations,
   // The real server cap. The dialog compares the count against it, so a mock that omits it
@@ -30,40 +32,148 @@ const project: Project = {
   appId: null,
   appStatus: null,
   hasRelaunchableSnapshot: null,
+  isServing: false,
   createdAt: '',
   updatedAt: '',
 }
 
 beforeEach(() => {
   vi.clearAllMocks()
+  h.getStoredUser.mockReturnValue({ email: 'asha@bial.example', display_name: 'Asha Rao' })
 })
 afterEach(() => cleanup())
 
 describe('ProjectDeleteDialog — confirm gating', () => {
-  it('arms confirm only when the typed name matches exactly (trailing space / wrong case do not count)', async () => {
+  it('arms confirm on a VALID REASON, not on retyping the name (#158 §13.1)', async () => {
+    // FLIPPED, not deleted (§16.2). This used to assert the confirm button stayed disabled
+    // until the project's name was retyped exactly — trailing space and wrong case both
+    // refused. That gate is gone: retyping a name proves you can read, not that you meant
+    // it, and it taught people to copy-paste straight past the warning. The reason is the
+    // new gate, and unlike the name it is still worth something a month later.
     h.listProjectConversations.mockResolvedValue([{}, {}])
     const onConfirm = vi.fn()
     render(<ProjectDeleteDialog project={project} onClose={() => {}} onConfirm={onConfirm} />)
 
-    // Flush the count effect so the resolving promise does not fire an un-acted update.
     expect(await screen.findByText(/all 2 chats/i)).toBeTruthy()
 
     const confirmBtn = screen.getByRole('button', { name: /delete project/i })
-    const input = screen.getByLabelText(/type the project name/i)
+    const reason = screen.getByLabelText(/why are you deleting/i)
 
-    expect(confirmBtn.hasAttribute('disabled')).toBe(true) // nothing typed yet
+    expect(confirmBtn.hasAttribute('disabled')).toBe(true) // nothing written yet
 
-    fireEvent.change(input, { target: { value: 'VIP Movement ' } }) // trailing space
+    fireEvent.change(reason, { target: { value: 'not needed' } }) // 2 words
     expect(confirmBtn.hasAttribute('disabled')).toBe(true)
 
-    fireEvent.change(input, { target: { value: 'vip movement' } }) // wrong case
-    expect(confirmBtn.hasAttribute('disabled')).toBe(true)
-
-    fireEvent.change(input, { target: { value: 'VIP Movement' } }) // exact
+    fireEvent.change(reason, { target: { value: 'no longer needed by ground ops' } }) // 6
     expect(confirmBtn.hasAttribute('disabled')).toBe(false)
 
+    // Past the upper bound it disarms again — both ends are enforced, not just the lower.
+    fireEvent.change(reason, { target: { value: 'word '.repeat(51) } })
+    expect(confirmBtn.hasAttribute('disabled')).toBe(true)
+
+    fireEvent.change(reason, { target: { value: 'no longer needed by ground ops' } })
     fireEvent.click(confirmBtn)
-    expect(onConfirm).toHaveBeenCalledTimes(1)
+    // The reason travels to the caller: the page forwards it to the API, which refuses
+    // independently if it is out of bounds.
+    expect(onConfirm).toHaveBeenCalledWith('no longer needed by ground ops')
+  })
+
+  it('NAMES the account without asking for it, and cannot be edited', async () => {
+    // The field was briefly a required text input. A name this dialog can set is a name
+    // that can disagree with the account that acted, and that is the one question the
+    // stored name exists to answer — so it is shown, never collected.
+    h.listProjectConversations.mockResolvedValue([])
+    render(<ProjectDeleteDialog project={project} onClose={() => {}} onConfirm={vi.fn()} />)
+
+    expect(screen.getByText(/recorded against asha rao/i)).toBeTruthy()
+    expect(screen.queryByLabelText(/your name/i)).toBeNull()
+    // Liveness: the reason IS still an input, so the absence above means something.
+    expect(screen.getByLabelText(/why are you deleting/i)).toBeTruthy()
+  })
+
+  it('falls back to the email when Entra gave no display name', async () => {
+    h.getStoredUser.mockReturnValue({ email: 'asha@bial.example', display_name: null })
+    h.listProjectConversations.mockResolvedValue([])
+    render(<ProjectDeleteDialog project={project} onClose={() => {}} onConfirm={vi.fn()} />)
+
+    expect(screen.getByText(/recorded against asha@bial\.example/i)).toBeTruthy()
+  })
+
+  it('still says the deletion is recorded when the profile is not cached', async () => {
+    // The cold path. It must not name nobody, and it must not invent a name — the server
+    // stamps the row correctly either way, so the copy says the true thing without one.
+    h.getStoredUser.mockReturnValue(null)
+    h.listProjectConversations.mockResolvedValue([])
+    render(<ProjectDeleteDialog project={project} onClose={() => {}} onConfirm={vi.fn()} />)
+
+    expect(screen.getByText(/recorded against your account/i)).toBeTruthy()
+  })
+
+  it('no longer asks for the project name at all', async () => {
+    // The inertness half: the old input is gone, not merely bypassed.
+    h.listProjectConversations.mockResolvedValue([])
+    render(<ProjectDeleteDialog project={project} onClose={() => {}} onConfirm={vi.fn()} />)
+
+    expect(screen.queryByLabelText(/type the project name/i)).toBeNull()
+    // Liveness, so the absence above means something.
+    expect(screen.getByLabelText(/why are you deleting/i)).toBeTruthy()
+    expect(screen.getByText(/are you sure you want to delete this project/i)).toBeTruthy()
+  })
+
+  it('says what happens to the reason, and does not overpromise who reads it', async () => {
+    // It used to say "An administrator can see this." Nothing reads `deleted_projects` — no
+    // route, no schema, no screen — so that was a promise to a user rather than an internal
+    // TODO. The copy now states what the platform actually does; the read surface is tracked
+    // separately, and this test is what stops the old claim coming back before it lands.
+    h.listProjectConversations.mockResolvedValue([])
+    render(<ProjectDeleteDialog project={project} onClose={() => {}} onConfirm={vi.fn()} />)
+
+    expect(screen.getByText(/kept with the deletion record/i)).toBeTruthy()
+    expect(screen.queryByText(/an administrator can see this/i)).toBeNull()
+  })
+
+  it('arms at EXACTLY the bounds, and disarms one word outside either', async () => {
+    // The boundaries themselves. The gating test above uses 2 / 6 / 51, so an off-by-one at
+    // either end survived it — and the server parametrises 5 and 50 directly, so a client
+    // that disagreed here would arm a button the API then refuses, with the counter reading
+    // a number the user was told was allowed.
+    h.listProjectConversations.mockResolvedValue([])
+    render(<ProjectDeleteDialog project={project} onClose={() => {}} onConfirm={vi.fn()} />)
+
+    const confirmBtn = screen.getByRole('button', { name: /delete project/i })
+    const reason = screen.getByLabelText(/why are you deleting/i)
+    const words = (n: number) => Array.from({ length: n }, (_, i) => `w${i}`).join(' ')
+
+    fireEvent.change(reason, { target: { value: words(4) } })
+    expect(confirmBtn.hasAttribute('disabled')).toBe(true)
+
+    fireEvent.change(reason, { target: { value: words(5) } }) // the floor itself
+    expect(confirmBtn.hasAttribute('disabled')).toBe(false)
+
+    fireEvent.change(reason, { target: { value: words(50) } }) // the ceiling itself
+    expect(confirmBtn.hasAttribute('disabled')).toBe(false)
+
+    fireEvent.change(reason, { target: { value: words(51) } })
+    expect(confirmBtn.hasAttribute('disabled')).toBe(true)
+  })
+
+  it('is a real modal: labelled, and dismissable with Escape', async () => {
+    // WHAT MOVING ONTO THE VENDORED DIALOG BOUGHT (§12). The hand-rolled `fixed inset-0`
+    // announced itself as nothing and could not be closed from the keyboard — in the one
+    // dialog that asks for a required free-text answer before a destructive action.
+    h.listProjectConversations.mockResolvedValue([])
+    const onClose = vi.fn()
+    render(<ProjectDeleteDialog project={project} onClose={onClose} onConfirm={vi.fn()} />)
+
+    const dialog = screen.getByRole('dialog')
+    // NOT `aria-modal`: Radix marks the rest of the document `aria-hidden` instead, which is
+    // the approach with the better assistive-technology support. Asserting `aria-modal` here
+    // would fail against a dialog that is correctly modal.
+    expect(dialog.getAttribute('aria-labelledby')).toBeTruthy()
+    expect(dialog.getAttribute('aria-describedby')).toBeTruthy()
+
+    fireEvent.keyDown(dialog, { key: 'Escape' })
+    expect(onClose).toHaveBeenCalled()
   })
 })
 

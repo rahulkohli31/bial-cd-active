@@ -32,6 +32,7 @@ from sqlalchemy.pool import NullPool
 from src.config import settings
 from src.db.models.app_registry import AppRegistry
 from src.db.models.audit import AuditLog
+from src.db.models.deleted_project import DeletedProject
 from src.db.models.project import Project
 from src.db.models.project_database import ProjectDatabase
 from src.services.appdb import teardown as appdb_teardown
@@ -39,6 +40,7 @@ from src.services.appdb.engine import get_maintenance_engine
 from src.services.appdb.provision import control_plane_dsn, ensure_project_database
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.storage import AppContainerStore
+from tests.api.v1.projects.conftest import DELETE_BODY
 from tests.factories import AppRegistryFactory, ProjectFactory, UserFactory
 from tests.services.appdb.helpers import scalar_on
 
@@ -104,7 +106,12 @@ async def test_delete_drops_the_database_the_role_and_the_container(
     _override_container_store(app, containers)
     headers, user, project, app_row, record = await _project_with_database(db_session)
 
-    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    resp = await client.request(
+        "DELETE",
+        f"/v1/projects/{project.id}",
+        headers=headers,
+        json=DELETE_BODY,
+    )
 
     assert resp.status_code == 200
     # Rows first: the registry row goes with the project (ON DELETE CASCADE), which is what
@@ -131,6 +138,18 @@ async def test_delete_drops_the_database_the_role_and_the_container(
         "appId": str(app_row.id),
     }
 
+    # THE ONLY TEST THAT EVER PROVISIONS A REAL DATABASE THROUGH THE DELETE PATH, so it is
+    # the only one that can prove `had_database` is ever actually `True`. Every OTHER
+    # tombstone test builds its project via the bare factory, where `teardown_handles()`
+    # always returns `None` — a mutant hard-coding `had_database=False` on the
+    # `DeletedProject(...)` construction passed every one of them.
+    tombstone = await db_session.scalar(
+        sa.select(DeletedProject).where(DeletedProject.project_id == project.id)
+    )
+    assert tombstone is not None
+    assert tombstone.had_database is True
+    assert tombstone.had_app is True
+
 
 async def test_an_app_less_project_still_has_its_database_dropped(
     app: Any, client: AsyncClient, db_session: AsyncSession
@@ -144,7 +163,12 @@ async def test_an_app_less_project_still_has_its_database_dropped(
     record = await ensure_project_database(db_session, project.id)
     assert record is not None
 
-    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    resp = await client.request(
+        "DELETE",
+        f"/v1/projects/{project.id}",
+        headers=headers,
+        json=DELETE_BODY,
+    )
 
     assert resp.status_code == 200
     assert await _catalog(_DATABASE_EXISTS, db=record.db_name) is False
@@ -198,7 +222,12 @@ async def test_a_live_preview_connection_does_not_survive_the_delete(
         async with preview.connect() as connection:
             assert await connection.scalar(sa.text("SELECT 1")) == 1
 
-            resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+            resp = await client.request(
+                "DELETE",
+                f"/v1/projects/{project.id}",
+                headers=headers,
+                json=DELETE_BODY,
+            )
             assert resp.status_code == 200
     except DBAPIError:
         pass  # the forced-out connection may fail on its way out; that is the point
@@ -238,7 +267,12 @@ async def test_a_live_build_still_refuses_the_delete_and_leaves_the_database_alo
         },
     )
 
-    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    resp = await client.request(
+        "DELETE",
+        f"/v1/projects/{project.id}",
+        headers=headers,
+        json=DELETE_BODY,
+    )
 
     assert resp.status_code == 409
     assert await db_session.get(Project, project.id) is not None
@@ -270,7 +304,12 @@ async def test_a_failed_drop_logs_an_orphan_and_still_returns_success(
 
     monkeypatch.setattr(appdb_teardown, "_drop_database", explode)
     with structlog.testing.capture_logs() as captured:
-        resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+        resp = await client.request(
+            "DELETE",
+            f"/v1/projects/{project.id}",
+            headers=headers,
+            json=DELETE_BODY,
+        )
 
     assert resp.status_code == 200
     assert await db_session.get(Project, project.id) is None
@@ -301,7 +340,12 @@ async def test_a_salt_that_cannot_reach_the_cluster_still_returns_success(
     # the real engine, so the orphan is still observable and the session hook still cleans it.
     monkeypatch.setattr(appdb_teardown, "get_maintenance_engine", lambda: _UnreachableEngine())
     with structlog.testing.capture_logs() as captured:
-        resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+        resp = await client.request(
+            "DELETE",
+            f"/v1/projects/{project.id}",
+            headers=headers,
+            json=DELETE_BODY,
+        )
 
     assert resp.status_code == 200
     assert await db_session.get(Project, project.id) is None
@@ -321,7 +365,12 @@ async def test_a_project_without_a_database_deletes_exactly_as_before(
     project = await ProjectFactory.create(db_session, user.id)
     await db_session.commit()
 
-    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    resp = await client.request(
+        "DELETE",
+        f"/v1/projects/{project.id}",
+        headers=headers,
+        json=DELETE_BODY,
+    )
 
     assert resp.status_code == 200
     assert await db_session.get(Project, project.id) is None

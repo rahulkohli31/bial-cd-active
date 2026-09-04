@@ -42,12 +42,13 @@ from src.api.v1.pagination import (
     clean_search,
 )
 from src.core.errors import AppApiError
-from src.db.models.app_registry import AppRegistry, AppStatus
+from src.db.models.app_registry import AppRegistry
 from src.db.models.deployment import Deployment, DeploymentStatus
 from src.db.models.project import DESCRIPTION_TSV_REGCONFIG, Project
 from src.db.models.user import User
 from src.schemas import AUTH_401, ErrorEnvelope, error_responses
 from src.schemas.marketplace import MarketplaceEntry, MarketplaceListResponse
+from src.services.deploy.liveness import live_app_ids
 
 router = APIRouter(prefix="/marketplace", tags=["marketplace"])
 
@@ -215,13 +216,16 @@ def _live_catalog(search: str | None) -> tuple[sa.Select[Any], type[Deployment]]
     the raw `Deployment` class no longer participates in the FROM clause once the collapse
     is in place.
     """
-    last_unpublished = (
-        sa.select(Deployment.app_id, Deployment.id)
-        .where(Deployment.unpublished_at.is_not(None))
-        .distinct(Deployment.app_id)
-        .order_by(Deployment.app_id, Deployment.id.desc())
-        .subquery()
-    )
+    # MEMBERSHIP IS `live_app_ids()`, NOT A SECOND COPY OF IT. This function used to carry its
+    # own `last_unpublished` collapse and its own registry predicates, which is how the
+    # catalog could drift into disagreeing with the projects list and the dashboard count
+    # about whether an app is live — silently, and only for some apps. `liveness.py` says it
+    # answers that question "in one place"; this is what makes the sentence true.
+    #
+    # `last_success` BELOW STAYS, and it is not a second membership rule: it is the row
+    # PROJECTION. The catalog lists a deployment's `url` and its builder, so it needs the
+    # actual newest-succeeded row, which a select of `app_id`s cannot give it. Membership
+    # decides WHICH apps; this decides WHAT is shown for each.
     last_success = (
         sa.select(Deployment)
         # THE `status` PREDICATE MUST RENDER AS A LITERAL, which is what `literal_execute`
@@ -258,21 +262,14 @@ def _live_catalog(search: str | None) -> tuple[sa.Select[Any], type[Deployment]]
     query = (
         sa.select(deployment.id)
         .select_from(deployment)
-        # OUTER: an app that has never been unpublished has no row here, and must still list.
-        .outerjoin(last_unpublished, last_unpublished.c.app_id == deployment.app_id)
         .join(AppRegistry, AppRegistry.id == deployment.app_id)
         .join(Project, Project.id == AppRegistry.project_id)
         # The builder, for their display name only. INNER join: an app with no owner row is
         # not a catalog entry, it is a data-integrity problem, and it should not be listed.
         .join(User, User.id == deployment.user_id)
-        .where(
-            sa.or_(
-                last_unpublished.c.id.is_(None),
-                last_unpublished.c.id < deployment.id,
-            ),
-            AppRegistry.status.notin_((AppStatus.DISABLED, AppStatus.REJECTED)),
-            AppRegistry.rejection_standing.is_(False),
-        )
+        # The takedown comparison and both registry predicates now live in ONE place. A
+        # semi-join, so Postgres still uses the same two partial indexes (migration 0034).
+        .where(AppRegistry.id.in_(live_app_ids()))
     )
     if search is not None:
         query = query.where(Project.description_tsv.op("@@")(_tsquery(search)))

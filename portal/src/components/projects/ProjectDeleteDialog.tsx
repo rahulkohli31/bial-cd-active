@@ -9,9 +9,40 @@
  *      in flight, or if the count call fails, it falls back to copy that still names
  *      the cascade WITHOUT a number ("all of its chats") — it must never flash
  *      "all 0 chats" from a count that simply has not resolved yet.
- *   2. It makes the click deliberate: the confirm button stays disabled until the
- *      user types the project's name back exactly (a trailing space or wrong case
- *      does not count).
+ *   2. It asks WHY, in 5-50 words, and the confirm button stays disabled until that
+ *      reason is inside the bounds (#158 §13.1/§13.2).
+ *
+ *      IT NAMES WHO, BUT DOES NOT ASK. The deletion is recorded against an account, and the
+ *      dialog says which one — but the server stamps that from the session and ignores
+ *      anything sent for it. The field briefly WAS a required input, and that was wrong: a
+ *      name this dialog could set is a name that can disagree with the account that acted,
+ *      and it is the field an administrator reads to answer precisely that question. Shown,
+ *      never collected.
+ *
+ *      THE TYPE-THE-NAME GATE IS GONE. Retyping a name proves you can read, not that you
+ *      meant it — and it taught people to copy-paste past the warning they were meant to be
+ *      reading. The reason is a better gate for the same purpose AND it is meant to still be
+ *      useful a month later: it is kept on a `deleted_projects` tombstone. NOTHING READS THAT
+ *      TABLE YET as of this PR — the admin read surface is tracked separately (#176) — so
+ *      the helper text says only what is true today (kept with the record) rather than
+ *      promising a reader that does not exist. Round-4 review caught this docblock saying
+ *      the stronger thing a paragraph away from the copy that had already been walked back;
+ *      say the same true thing in both places.
+ *
+ *      Once #176 lands, this reverts to the stronger claim — someone writing a
+ *      private-feeling note deserves to know an administrator sees it — in both the
+ *      helper text and here.
+ *
+ *      The count is validated HERE and again on the server, with the same splitting rule
+ *      (`utils/words.ts` <-> `src/core/words.py`). The client keeps the person inside the
+ *      limit; the server refuses independently.
+ *
+ * BUILT ON THE VENDORED RADIX `Dialog` (§12), not a hand-rolled `fixed inset-0`. This is the
+ * dialog that put a REQUIRED FREE-TEXT FIELD inside a destructive confirmation, so keyboard
+ * and screen-reader users have real work to do in here — and the hand-rolled shell announced
+ * itself as nothing, trapped no focus and could not be dismissed with Escape. Radix gives
+ * `role="dialog"`, `aria-modal`, the focus trap, Escape and scroll lock. §9's softened
+ * overlay is passed as an override rather than lost.
  *
  * The dialog does not delete anything itself — the page owns the optimistic removal
  * and the 404-vs-500 reconciliation — it only collects an informed confirmation and
@@ -21,6 +52,20 @@ import { useEffect, useState } from 'react'
 import { AlertTriangle, Loader2 } from 'lucide-react'
 import { CONVERSATION_LIST_CAP, listProjectConversations } from '../../utils/conversationApi'
 import type { Project } from '../../utils/projectApi'
+import { getStoredUser } from '../../utils/auth'
+import { Textarea } from '../ui/textarea'
+import { Dialog, DialogContent, DialogTitle } from '../ui/dialog'
+import {
+  countWords,
+  MAX_DELETE_REASON_WORDS,
+  MIN_DELETE_REASON_WORDS,
+} from '../../utils/words'
+
+/** Ties the panel to its cascade sentence for `aria-describedby`. */
+const CASCADE_ID = 'delete-project-cascade'
+
+/** A paste backstop only — 50 words of ordinary English is far under this. */
+const MAX_DELETE_REASON_CHARS = 2000
 
 /**
  * `null` count = not resolved yet (loading, or the count call failed) → name the cascade with
@@ -53,7 +98,8 @@ function cascadeCopy(chatCount: number | null): string {
 export interface ProjectDeleteDialogProps {
   project: Project
   onClose: () => void
-  onConfirm: () => void | Promise<void>
+  /** Receives the reason, which the page forwards to the API. */
+  onConfirm: (remark: string) => void | Promise<void>
 }
 
 export default function ProjectDeleteDialog({
@@ -62,7 +108,7 @@ export default function ProjectDeleteDialog({
   onConfirm,
 }: ProjectDeleteDialogProps): React.JSX.Element {
   const [chatCount, setChatCount] = useState<number | null>(null)
-  const [typed, setTyped] = useState('')
+  const [remark, setRemark] = useState('')
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
@@ -82,44 +128,113 @@ export default function ProjectDeleteDialog({
     }
   }, [project.id])
 
-  const confirmArmed = typed === project.name && !busy
+  const words = countWords(remark)
+  const remarkValid = words >= MIN_DELETE_REASON_WORDS && words <= MAX_DELETE_REASON_WORDS
+  // `busy` STAYS in the guard: the button must still disable while the request is in
+  // flight, which is a different concern from whether the reason is valid.
+  const canDelete = remarkValid && !busy
+
+  // WHO THIS WILL BE RECORDED AGAINST, shown rather than asked. The server stamps the name
+  // from the session and ignores anything the client sends, so this is a readback of what
+  // WILL be stored, not an input that decides it — which is why it cannot be edited.
+  //
+  // `null` when the profile has not been cached (it is fetched at sign-in, so this is the
+  // rare cold path). The row is still stamped correctly either way, so the fallback says
+  // the true thing without naming anybody it cannot name.
+  const me = getStoredUser()
+  const signedAs = me === null ? null : me.display_name || me.email
 
   const confirm = async (): Promise<void> => {
-    if (!confirmArmed) return
+    if (!canDelete) return
     setBusy(true)
-    await onConfirm()
+    await onConfirm(remark)
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 font-manrope">
-      <div className="absolute inset-0 bg-black/40" onClick={busy ? undefined : onClose} />
-      <div className="relative bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
+    <Dialog
+      open
+      onOpenChange={(next) => {
+        // Radix routes Escape, the overlay click and the close button through here. `busy`
+        // holds it open mid-request exactly as the hand-rolled overlay's guard did.
+        if (!next && !busy) onClose()
+      }}
+    >
+      <DialogContent
+        hideClose
+        // §9's softened overlay, unchanged — the values, the `-webkit-` prefix, and the
+        // overlay ONLY. Passed as an override because the vendored default is `bg-black/80`.
+        overlayClassName="bg-slate-900/15 backdrop-blur-[3px] [-webkit-backdrop-filter:blur(3px)]"
+        className="font-manrope bg-white rounded-2xl shadow-2xl w-full max-w-md p-6 gap-0 border-0"
+        // The cascade sentence IS the description — what a screen reader should hear after
+        // the title, and the one thing in here a reader must not miss.
+        aria-describedby={CASCADE_ID}
+      >
         <div className="flex items-center gap-2.5">
           <div className="w-9 h-9 rounded-xl bg-red-50 flex items-center justify-center flex-shrink-0">
             <AlertTriangle size={17} className="text-danger" />
           </div>
-          <h3 className="text-base font-bold text-tertiary">Delete “{project.name}”?</h3>
+          <DialogTitle className="text-base font-bold text-tertiary">
+            Delete “{project.name}”?
+          </DialogTitle>
         </div>
 
-        <p className="text-sm text-neutral mt-3 leading-relaxed">{cascadeCopy(chatCount)}</p>
+        <p id={CASCADE_ID} className="text-sm text-neutral mt-3 leading-relaxed">
+          {cascadeCopy(chatCount)}
+        </p>
 
-        <label className="block mt-4">
+        <p className="text-sm font-semibold text-tertiary mt-4">
+          Are you sure you want to delete this project?
+        </p>
+
+        {/* NAMED, NOT ASKED. Telling someone which account a permanent deletion is about to
+            be recorded against is worth a line; asking them to type it is not, because a
+            typed name can name the wrong person and this is the field an administrator
+            reads to find out who deleted something. */}
+        <p className="text-[11px] text-neutral mt-3">
+          {signedAs === null
+            ? 'This deletion is recorded against your account.'
+            : `Recorded against ${signedAs}.`}
+        </p>
+
+        <label className="block mt-3">
           <span className="text-xs font-semibold text-tertiary">
-            Type <span className="font-bold text-danger">{project.name}</span> to confirm
+            Why are you deleting this project?
           </span>
-          <input
+          <Textarea
             autoFocus
-            value={typed}
-            onChange={(e) => setTyped(e.target.value)}
-            aria-label="Type the project name to confirm deletion"
-            className="mt-1.5 w-full border border-bial-border rounded-xl px-3 py-2.5 text-sm text-tertiary focus:outline-none focus:ring-2 focus:ring-danger/30 focus:border-danger"
+            value={remark}
+            onChange={(e) => setRemark(e.target.value)}
+            rows={3}
+            maxLength={MAX_DELETE_REASON_CHARS}
+            aria-label="Why are you deleting this project?"
+            className="mt-1.5 resize-y"
           />
+          <div className="flex items-baseline justify-between mt-1">
+            {/* SAYS ONLY WHAT IS TRUE TODAY. This read "An administrator can see this",
+                and nothing reads `deleted_projects` — there is no route, no schema and no
+                screen. Every deletion collects a mandatory 5-50 word justification, so a
+                promise about who reads it is a promise to a user, not an internal TODO. The
+                read surface is tracked in #176; when it lands, the stronger sentence becomes
+                true again and this reverts. Until then the copy says what the platform
+                actually does, which is keep the reason with the record. */}
+            <span className="text-[11px] text-neutral">
+              Between {MIN_DELETE_REASON_WORDS} and {MAX_DELETE_REASON_WORDS} words. Kept with
+              the deletion record.
+            </span>
+            <span
+              className={`text-[11px] tabular-nums ${
+                remark.length > 0 && !remarkValid ? 'text-danger font-semibold' : 'text-neutral'
+              }`}
+            >
+              {words}/{MAX_DELETE_REASON_WORDS} words
+            </span>
+          </div>
         </label>
 
         <div className="flex gap-3 mt-5">
           <button
             type="button"
-            disabled={!confirmArmed}
+            disabled={!canDelete}
             onClick={() => void confirm()}
             className="flex-1 flex items-center justify-center gap-2 bg-red-600 hover:bg-red-700 text-white font-semibold py-2.5 rounded-xl transition text-sm disabled:opacity-50 disabled:cursor-not-allowed"
           >
@@ -134,7 +249,7 @@ export default function ProjectDeleteDialog({
             Cancel
           </button>
         </div>
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   )
 }

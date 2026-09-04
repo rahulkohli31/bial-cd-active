@@ -23,7 +23,9 @@ function isSignoutWarningState(value: unknown): value is SignoutWarningState {
 // The app's authenticated landing route — the primary RequireAuth-wrapped page in
 // App.tsx (`/` and any unknown path both redirect to `/login`; `/dashboard` is the
 // first real signed-in screen). A signed-in visitor is forwarded here.
-const HOME_ROUTE = '/dashboard'
+// §7 retired the welcome page; `/dashboard` still resolves but only to redirect here. Landing
+// on it made every sign-in pay a redirect for a page that no longer exists.
+const HOME_ROUTE = '/projects'
 
 // Signout-reason banners (client-recorded on logout / expiry). Record<string,
 // string> since consumeSignoutReason() reads back a plain string (whatever

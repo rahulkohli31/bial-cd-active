@@ -1,7 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import LoginPage from './pages/LoginPage'
-import Dashboard from './pages/Dashboard'
 import HelpPage from './pages/HelpPage'
 import AdminPage from './pages/AdminPage'
 import ChatRoute from './pages/ChatRoute'
@@ -72,10 +71,17 @@ export default function App() {
       <Routes>
         <Route path="/" element={<Navigate to="/login" replace />} />
         <Route path="/login" element={<LoginPage />} />
-        <Route path="/dashboard" element={<RequireAuth><Dashboard /></RequireAuth>} />
-        {/* Enterprise Space + Team Space removed (POC dummy features) — redirect old links. */}
-        <Route path="/enterprise" element={<Navigate to="/dashboard" replace />} />
-        <Route path="/teamspace" element={<Navigate to="/dashboard" replace />} />
+        {/* THE PROJECT LIST IS THE LANDING SCREEN (#158 §7). `/dashboard` used to be a
+            welcome page whose only job was a button to `/projects`; once the project list
+            carries the summary numbers, that hop has nothing left to do. Both addresses
+            still resolve so existing links, bookmarks and the navbar keep working — the
+            welcome page is what went, not the URL. */}
+        <Route path="/dashboard" element={<Navigate to="/projects" replace />} />
+        {/* Enterprise Space + Team Space were POC features, removed long ago. These
+            redirects outlived the welcome page they pointed at; they now land on the list
+            like everything else. Worth deleting once nothing links to them. */}
+        <Route path="/enterprise" element={<Navigate to="/projects" replace />} />
+        <Route path="/teamspace" element={<Navigate to="/projects" replace />} />
 
         {/* Project-first: a project is the thing you open, name, and return to. */}
         <Route path="/projects" element={<RequireAuth><ProjectsPage /></RequireAuth>} />

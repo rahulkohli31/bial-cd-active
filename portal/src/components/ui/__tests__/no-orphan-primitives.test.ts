@@ -63,17 +63,24 @@ function importersOf(name: string, files: string[]): string[] {
 }
 
 describe('vendored ui primitives', () => {
-  it('the five orphaned primitives are gone from disk, not merely unimported', () => {
+  it('the primitives removed as orphans are gone from disk, not merely unimported', () => {
     // A file still on disk is a file someone can import back — and an unused Radix
     // dependency is the half of the removal that a source-only sweep leaves behind.
-    const removed = ['avatar', 'skeleton', 'tooltip', 'collapsible', 'dropdown-menu']
+    //
+    // `skeleton` and `tooltip` LEFT THIS LIST, and the distinction is the whole point of
+    // the guard rather than an exception to it. They were removed for having no consumer;
+    // #158 gave them one — the projects list's loading state and the row's
+    // clipped-description tooltip — so they are vendored deliberately now. What this
+    // asserts is "nothing sits here unused", not "these five names are banned forever";
+    // the second test below is what actually enforces that, and it covers them too.
+    const removed = ['avatar', 'collapsible', 'dropdown-menu']
     expect(primitives().filter((name) => removed.includes(name))).toEqual([])
 
     const manifest = JSON.parse(
       readFileSync(path.resolve(process.cwd(), 'package.json'), 'utf8'),
     ) as { dependencies: Record<string, string> }
     const stillDeclared = removed.filter((name) => `@radix-ui/react-${name}` in manifest.dependencies)
-    // `skeleton` has no Radix package of its own; the other four did.
+    // Every name left in the list has a Radix package of its own.
     expect(stillDeclared).toEqual([])
   })
 

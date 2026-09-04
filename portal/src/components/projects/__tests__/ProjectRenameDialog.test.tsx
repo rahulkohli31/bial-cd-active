@@ -79,10 +79,39 @@ describe('renaming a project', () => {
     expect(screen.getByRole('textbox', { name: /project name/i })).toHaveProperty('value', 'Taken')
   })
 
+  it('carries the 8-word cap, so a rename is not a round trip that exists to be refused', async () => {
+    // §14: "Both entry points, or neither." Create had this from the start; the rename path
+    // did not, and it has slipped through two relocations — out of `ProjectPage` under #172,
+    // out of the rail under #175 — which is why the guard now lives beside the input.
+    render(<ProjectRenameDialog project={PROJECT} onProjectUpdate={vi.fn()} onClose={vi.fn()} />)
+
+    const input = screen.getByLabelText('Project name')
+    const save = screen.getByRole('button', { name: /save/i })
+
+    fireEvent.change(input, { target: { value: 'one two three four five six seven eight' } })
+    expect(screen.getByText('8/8 words')).toBeTruthy()
+    expect(save.getAttribute('aria-disabled')).toBe('false')
+
+    fireEvent.change(input, { target: { value: 'one two three four five six seven eight nine' } })
+    expect(screen.getByText('9/8 words')).toBeTruthy()
+    expect(save.getAttribute('aria-disabled')).toBe('true')
+
+    // And Enter must not get out either — it reaches the handler without touching Save.
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/6 to 8 words/i))
+    expect(h.patchProject).not.toHaveBeenCalled()
+  })
+
   it('renders no control with a real disabled attribute', () => {
     renderDialog()
     for (const el of screen.getAllByRole('button')) expect(el.hasAttribute('disabled')).toBe(false)
   })
+
+  // NOTE ON THE OVERLAP: #180's review of #174/#175 and #173's round-4 review found the
+  // double-submit independently, on two branches, and both added the same `if (busy) return`.
+  // #180's three cases below are the more thorough pair of hands — they hold the button node
+  // across the busy transition and check `onClose` is not called twice — so this branch's own
+  // single-request test was dropped in the merge rather than kept alongside them.
 
   describe('a second press while the first rename is still in flight', () => {
     /** A request that never settles, so the whole test happens inside the busy window. */
@@ -134,5 +163,40 @@ describe('renaming a project', () => {
       await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1))
       expect(h.patchProject).toHaveBeenCalledTimes(1)
     })
+  })
+
+  it('is a real modal: Escape closes it from ANYWHERE inside, not just the input', async () => {
+    // Round-4 finding 14. This was a third hand-rolled `fixed inset-0` with no focus trap,
+    // and Escape bound to the input's own `onKeyDown` — so tabbing to Cancel or Save and
+    // pressing Escape did nothing. Radix handles it at the container now.
+    const onClose = vi.fn()
+    renderDialog(vi.fn(), onClose)
+
+    const dialog = screen.getByRole('dialog')
+    expect(dialog.getAttribute('aria-labelledby')).toBeTruthy() // named by its own title
+
+    fireEvent.keyDown(screen.getByRole('button', { name: 'Cancel' }), { key: 'Escape' })
+
+    await waitFor(() => expect(onClose).toHaveBeenCalled())
+  })
+
+  it('a legacy name over the cap opens ready to close, not already refusing', async () => {
+    // Round-4 review: the 8-word rule is not retroactive, but the word gate fired on the
+    // UNTOUCHED draft — so opening this on a stored 9-word name showed Save disabled and,
+    // if pressed, an error about text the person had not typed. Nothing forces a change.
+    const legacy = { ...PROJECT, name: 'one two three four five six seven eight nine' }
+    const onClose = vi.fn()
+    render(<ProjectRenameDialog project={legacy} onProjectUpdate={vi.fn()} onClose={onClose} />)
+
+    // Over the cap, and the counter says so — but Save is not refusing an untouched name.
+    expect(screen.getByText('9/8 words')).toBeTruthy()
+    const save = screen.getByRole('button', { name: 'Save' })
+    expect(save.getAttribute('aria-disabled')).toBe('false')
+
+    fireEvent.click(save)
+
+    await waitFor(() => expect(onClose).toHaveBeenCalled())
+    expect(h.patchProject).not.toHaveBeenCalled() // a no-op close, not a rename
+    expect(screen.queryByRole('alert')).toBeNull() // and no manufactured error
   })
 })

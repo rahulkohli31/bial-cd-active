@@ -68,6 +68,30 @@ def app_api_error_handler(request: Request, exc: Exception) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content={"error": error})
 
 
+# Pydantic prefixes every `ValueError` a validator raises with "Value error, ". That
+# prefix is machine vocabulary, and this envelope is not machine-only: `apiError.ts`
+# resolves a 422 as `error.message` -> `detail[].msg` -> ... and renders the result, so
+# whatever a validator says reaches a citizen's screen verbatim. Before this, renaming a
+# project too long read:
+#
+#     Value error, name must be at most 120 characters
+#
+# The validators now write for a person (#158 §14), and the prefix is the one part they
+# cannot remove themselves — it is added after they raise. So it comes off HERE, at the
+# boundary that already exists to curate what leaves.
+#
+# Only the prefix goes. Pydantic's own messages ("Field required", "Input should be a
+# valid string") do not carry it and are untouched, and the `type`/`loc` a client matches
+# on are unchanged.
+_VALUE_ERROR_PREFIX = "Value error, "
+
+
+def _user_facing(msg: object) -> object:
+    if isinstance(msg, str) and msg.startswith(_VALUE_ERROR_PREFIX):
+        return msg[len(_VALUE_ERROR_PREFIX) :]
+    return msg
+
+
 def validation_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     # Typed as Exception to match Starlette's handler signature; Starlette only
     # dispatches RequestValidationError here.
@@ -79,7 +103,7 @@ def validation_exception_handler(request: Request, exc: Exception) -> JSONRespon
     # Keep field location and message; drop `input` and `ctx`, which can carry the
     # submitted value (e.g. a plaintext password) or the whole request body.
     safe_errors = [
-        {"type": err.get("type"), "loc": err.get("loc"), "msg": err.get("msg")}
+        {"type": err.get("type"), "loc": err.get("loc"), "msg": _user_facing(err.get("msg"))}
         for err in exc.errors()
     ]
     return JSONResponse(

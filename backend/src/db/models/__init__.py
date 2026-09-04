@@ -12,6 +12,7 @@ from src.db.models.classification_review import (
     ClassificationReviewStatus as ClassificationReviewStatus,
 )
 from src.db.models.conversation import Conversation as Conversation
+from src.db.models.deleted_project import DeletedProject as DeletedProject
 from src.db.models.deployment import Deployment as Deployment
 from src.db.models.feedback import Feedback as Feedback
 from src.db.models.harness_counter import HarnessCount as HarnessCount

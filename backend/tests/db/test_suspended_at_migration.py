@@ -66,4 +66,4 @@ def test_chain_ends_at_a_single_linear_head() -> None:
     # `down_revision` really is the head you expected to build on.
     config = Config(str(_BACKEND_ROOT / "alembic.ini"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0035_chat_kind"]
+    assert heads == ["0036_deleted_projects"]

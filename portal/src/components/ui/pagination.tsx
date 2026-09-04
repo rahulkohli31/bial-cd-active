@@ -24,7 +24,9 @@ function Pagination({ className, ...props }: React.ComponentProps<'nav'>): React
   return (
     <nav
       // Named for assistive tech: several lists can share a page, and "pagination" alone
-      // does not say which one this drives.
+      // does not say which one this drives. This is the DEFAULT, for the marketplace that
+      // vendored it first — the props spread below it, so any other list passes its own
+      // (`ProjectsPage` sends "Projects pagination") and overrides this cleanly.
       aria-label="Marketplace pagination"
       className={cn('mx-auto flex w-full justify-center', className)}
       {...props}

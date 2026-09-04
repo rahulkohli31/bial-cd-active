@@ -40,7 +40,6 @@ const { page } = vi.hoisted(() => ({
   page: (name) => ({ default: () => <div data-testid={name} /> }),
 }))
 vi.mock('./pages/LoginPage', () => page('login'))
-vi.mock('./pages/Dashboard', () => page('dashboard'))
 vi.mock('./pages/HelpPage', () => page('help'))
 vi.mock('./pages/AdminPage', () => page('admin'))
 vi.mock('./pages/ProjectsPage', () => page('projects'))
@@ -246,10 +245,24 @@ describe('App — the auth guard sits ABOVE the shell', () => {
   })
 })
 
+describe('the welcome page is gone (#158 §7)', () => {
+  it.each(['/dashboard', '/enterprise', '/teamspace'])(
+    '%s lands on the project list instead of its own page',
+    (path) => {
+      // INERTNESS, not coverage. `/dashboard` was a welcome screen whose only job was a
+      // button to `/projects`; the list now carries the summary numbers that made the hop
+      // worth taking. The ADDRESS still resolves so links and bookmarks do not break — what
+      // went is the page, and this asserts nothing renders in its place.
+      renderAt(path)
+      expect(screen.getByTestId('projects')).toBeTruthy()
+      expect(screen.queryByTestId('dashboard')).toBeNull()
+    },
+  )
+})
+
 describe('App — addresses outside a project get no workspace frame', () => {
   it.each([
     ['/projects', 'projects'],
-    ['/dashboard', 'dashboard'],
     ['/help', 'help'],
   ])('%s renders its page with no shell around it', (path, testId) => {
     // The layout wraps the two addresses INSIDE a project and nothing else. A projects index or a
