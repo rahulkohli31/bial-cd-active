@@ -74,25 +74,6 @@ export interface RelaunchPreviewResponse {
   ready: boolean
 }
 
-/**
- * Why a relaunch failed, discriminated for the U6 response matrix (404 no saved build / 503
- * transient / anything else).
- *
- * NO CONSUMER SINCE THE RELAUNCH CHAIN WAS RETIRED, and kept deliberately rather than swept with
- * it. A 409 was never a member because it had a first-class state of its own — `blocked`, with the
- * banner and force-end button this unit deleted — so re-encoding it here would have given one
- * failure two renderings. The live relaunch caller (`StartAppControl`, which reaches
- * `relaunchPreview` directly) classifies its own failures into `WorkspaceState` instead. This
- * survives as the shape a future re-wiring would narrow onto; the audit record carries the reason.
- */
-export type RelaunchErrorKind = 'not_found' | 'unavailable' | 'failed'
-
-export interface RelaunchError {
-  kind: RelaunchErrorKind
-  /** User-facing copy — the server's own message where it sent one (it is the approved wording). */
-  message: string
-}
-
 /** `POST …/stop` body — an optional free-text reason for the audit / activity feed. */
 export interface StopBuildRequest {
   reason?: string | null
