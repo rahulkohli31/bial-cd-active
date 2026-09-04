@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import re
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -19,6 +20,7 @@ from src.api.v1.build_sessions.schemas import (
     LIVENESS_LEASE_TTL_SECONDS,
     RELAUNCH_PREVIEW_STAY_SECONDS,
 )
+from src.main import create_app
 from src.services.build_sessions import locks, pass_history, reaper
 from src.services.build_sessions.pass_history import CopyAttempt
 from src.services.build_sessions.snapshot import reset_divert_streaks_for_tests
@@ -1085,3 +1087,32 @@ async def test_the_reclamation_passes_own_predicate_agrees(fake_redis: aioredis.
     spared = await claim_for_container(fake_redis, app_name=SBX)
     assert spared is not None and spared.starting is True
     assert spared.spares_the_container is True
+
+
+_A_ROUTE_IN_PROSE = re.compile(r"`(?:GET|POST|PATCH|PUT|DELETE) (/v1/[A-Za-z0-9/_{}.-]+)`")
+
+
+def test_every_route_the_reapers_prose_hands_an_operator_actually_resolves() -> None:
+    """THE COMMENT IS AN INCIDENT-TIME INSTRUCTION, so it is asserted like one.
+
+    The module docstring names the Azure-side inventory endpoint as the ONLY way to see a
+    container whose registry record is gone — the twelve-day, ~$80 case it describes. An
+    operator reads that line mid-incident and pastes it. It named `/v1/admin/reconcile-sandboxes`
+    while the governance router mounts at `/admin/apps`, so the paste 404'd and the one lever
+    that closes the gap looked absent.
+
+    Asserted against the MOUNTED app rather than against a hard-coded string, because the
+    failure mode is a prefix moving underneath the prose, not the prose being mistyped: pinning
+    the literal would go red on the fix and green on the rot. `openapi()` is the resolution
+    point — `include_router` defers to `_IncludedRouter`, so `app.routes` holds no paths until
+    the schema is built.
+
+    Mutation check: drop `/apps` from the docstring's URL and this goes red."""
+    source = Path(reaper.__file__).read_text(encoding="utf-8")
+    named = set(_A_ROUTE_IN_PROSE.findall(source))
+    assert named, "the reaper's prose names no route; this guard has lost its subject"
+
+    mounted = set(create_app().openapi()["paths"])
+    assert named <= mounted, (
+        f"the reaper's prose hands an operator {sorted(named - mounted)}, which no route serves"
+    )

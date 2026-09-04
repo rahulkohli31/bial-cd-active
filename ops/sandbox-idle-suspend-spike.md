@@ -96,7 +96,7 @@ raising the slot count from 1 to 2–3 becomes nearly free, if it is even still 
 
 - A project switch no longer destroys unsaved work (#83).
 - A reclaimed preview no longer pretends to be live (#83).
-- Containers nothing is tracking are now reportable (`POST /v1/admin/reconcile-sandboxes`) —
+- Containers nothing is tracking are now reportable (`POST /v1/admin/apps/reconcile-sandboxes`) —
   the twelve-day orphan class.
 - Every Write turn autosaves to a recovery slot.
 

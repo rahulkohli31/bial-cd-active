@@ -21,7 +21,7 @@ A sandbox whose registry entry is gone
 — a flushed or replaced Redis, a container older than the registry, a teardown that failed after
 `delete_registry` — is invisible here FOREVER and bills until a human notices; one did, for
 twelve days. The Azure-side view that closes that gap is `inventory.take_sandbox_inventory`,
-surfaced at `POST /v1/admin/reconcile-sandboxes`, and it REPORTS rather than deletes.
+surfaced at `POST /v1/admin/apps/reconcile-sandboxes`, and it REPORTS rather than deletes.
 
 Reaper ordering for one stale user (C5): mark-ending → teardown → clear registry →
 release lock (LAST). The reaper reclaims a possibly-drifted lock via the value-guarded
