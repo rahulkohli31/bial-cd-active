@@ -85,25 +85,30 @@ const WELL_FORMED = /AUDIT-\d{4}-\d{2}-\d{2} · (?:canvas-divergence|verified-al
 
 interface Marker { site: string; text: string; wellFormed: boolean; cls: string | null }
 
-function markers(): Marker[] {
+/** Every marker in one source, as a pure function of its text — so the fixture below can drive
+ *  the SAME extractor the repo scan uses, without needing a marker to exist on disk. */
+function markersIn(rel: string, source: string): Marker[] {
+  if (!STEM.test(source)) return []
   const found: Marker[] = []
-  for (const file of walk(REPO_ROOT)) {
-    const rel = path.relative(REPO_ROOT, file)
-    if (rel === SELF) continue
-    const source = readFileSync(file, 'utf8')
-    if (!STEM.test(source)) continue
-    source.split('\n').forEach((line, i) => {
-      if (!STEM.test(line)) return
-      const cls = /· (canvas-divergence|verified-alive):/.exec(line)?.[1] ?? null
-      found.push({
-        site: `${rel}:${i + 1}`,
-        text: line.trim(),
-        wellFormed: WELL_FORMED.test(line),
-        cls,
-      })
+  source.split('\n').forEach((line, i) => {
+    if (!STEM.test(line)) return
+    const cls = /· (canvas-divergence|verified-alive):/.exec(line)?.[1] ?? null
+    found.push({
+      site: `${rel}:${i + 1}`,
+      text: line.trim(),
+      wellFormed: WELL_FORMED.test(line),
+      cls,
     })
-  }
+  })
   return found
+}
+
+const scanned = walk(REPO_ROOT).map((file) => path.relative(REPO_ROOT, file))
+
+function markers(): Marker[] {
+  return scanned
+    .filter((rel) => rel !== SELF)
+    .flatMap((rel) => markersIn(rel, readFileSync(path.join(REPO_ROOT, rel), 'utf8')))
 }
 
 describe('the AUDIT-<date> marker convention', () => {
@@ -114,14 +119,30 @@ describe('the AUDIT-<date> marker convention', () => {
     expect(malformed).toEqual([])
   })
 
-  it('is actually in use, in both halves of the stack, so the scan is not vacuously green', () => {
-    // Three independent liveness assertions, because every check above is an ABSENCE check and an
-    // absence check with a broken finder is green forever. If `walk` resolved the wrong root or
-    // `STEM` stopped matching, all three of these fail loudly instead.
-    expect(all.some((m) => m.cls === 'canvas-divergence')).toBe(true)
-    expect(all.some((m) => m.cls === 'verified-alive')).toBe(true)
-    expect(all.some((m) => m.site.startsWith('portal/'))).toBe(true)
-    expect(all.some((m) => m.site.startsWith('backend/'))).toBe(true)
+  it('the scan is not vacuously green — it reaches both halves of the repo and the extractor works', () => {
+    // LIVENESS, and deliberately NOT "a marker exists". The check above is an ABSENCE check, and
+    // an absence check with a broken finder is green for ever — but an earlier draft proved that
+    // by asserting the backlog still had markers in it, which made this file go RED on its own
+    // success: finishing the audit and removing the last marker would have failed the guard that
+    // exists to police markers. So liveness is proven the two ways that stay true afterwards.
+    //
+    // One: the walk reaches the repository. If `REPO_ROOT` resolved somewhere else — or `walk`
+    // silently returned nothing — these fail instead of passing on an empty set.
+    expect(scanned.filter((rel) => rel.startsWith('portal/')).length).toBeGreaterThan(50)
+    expect(scanned.filter((rel) => rel.startsWith('backend/')).length).toBeGreaterThan(50)
+    expect(scanned).toContain(SELF)
+
+    // Two: the extractor finds and CLASSIFIES a marker, driven on a fixture rather than on
+    // whatever happens to be checked in. If `STEM` or the class regex drifted, this fails
+    // whether or not a real marker is left anywhere in the tree.
+    const found = markersIn('fixture.ts', [
+      'const x = 1',
+      '// AUDIT-2026-09-03 · verified-alive: intentionally retained pending verification',
+      '// AUDIT-2026-09-03 · canvas-divergence: the board says X — Y ships — Z settles it',
+    ].join('\n'))
+    expect(found.map((m) => m.cls)).toEqual(['verified-alive', 'canvas-divergence'])
+    expect(found.map((m) => m.site)).toEqual(['fixture.ts:2', 'fixture.ts:3'])
+    expect(found.every((m) => m.wellFormed)).toBe(true)
   })
 
   it('the guard can actually fail — a stem without a class, or with an unknown one, is reported', () => {

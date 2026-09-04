@@ -35,7 +35,9 @@
  *    renew may still be succeeding, so nothing else signals the dead feed.
  *
  * `buildLock` is NOT consulted here — its `blockedBy` pre-check lives at the composer (U5); the
- * authoritative barrier is C3 `start`'s 409 (KTD-7), surfaced as `blocked`.
+ * authoritative barrier is the server's 409 (KTD-7). This hook no longer surfaces that 409 at
+ * all: `blocked` went with the `start` client above, so the two callers that can still provoke
+ * one — `relaunchPreview` and the turn stream — each render it in their own surface's words.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError } from '../utils/apiError'

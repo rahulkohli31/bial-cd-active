@@ -9,8 +9,10 @@
 //
 // Type-AWARE linting is deliberately off, and the reason has outlived its original wording. This
 // used to say the portal's ".jsx majority" was not in a tsconfig project. There is no such
-// majority any more — the tree is 226 typed files (.ts/.tsx) against 42 untyped (.js/.jsx), and
-// the migration is what inverted it. The decision still holds on the two reasons that survive:
+// majority any more — the tree is overwhelmingly .ts/.tsx and the migration is what inverted it
+// (count it with `git ls-files 'portal/src/**' | grep -c` rather than trusting a number written
+// here, which is the shape of comment this sweep exists to remove). The decision still holds on
+// the two reasons that survive:
 // `tsc --noEmit` already owns type truth here and runs in the same gate, so type-aware rules
 // would be a duplicate costing minutes; and the untyped files that remain are still outside a
 // project, so enabling it would mean either excluding them or manufacturing a project for files

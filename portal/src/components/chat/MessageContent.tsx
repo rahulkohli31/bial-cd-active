@@ -68,7 +68,7 @@ function MarkdownStrong({ node: _node, ...props }: HTMLAttributes<HTMLElement> &
  * descriptors in two places for as long as anything passed it an array.
  *
  * BOTH SHAPES ARE REAL. The live call site — the thread's text-part slot — hands down a
- * plain string, and the 21 parity cases below hand down `TextPart[]`, so `partsToText`'s
+ * plain string, and the parity cases in `MessageContent.test.tsx` hand down `TextPart[]`, so `partsToText`'s
  * union is load-bearing rather than defensive.
  *
  * `mode="static"` is load-bearing, not decorative: Streamdown's own default is

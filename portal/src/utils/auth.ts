@@ -21,8 +21,8 @@
  *    seam, and its widened return type is what stops every TypeScript caller's dep bag from
  *    narrowing to `() => null`. Its own docblock says so.
  *  - `refreshAccessToken` is LIVE, load-bearing, and the most delicate function in this file:
- *    the cross-tab Web-Locks single-flight silent refresh, called on the /auth/me 401 retry at
- *    :118 and by `authFetch`. It keeps its Bearer-era NAME and nothing else; two tabs racing the
+ *    the cross-tab Web-Locks single-flight silent refresh, called on the `/auth/me` 401 retry in
+ *    `fetchMe`, and by `authFetch`. It keeps its Bearer-era NAME and nothing else; two tabs racing the
  *    same refresh cookie would trip the server's reuse-detection and force a full re-auth.
  */
 

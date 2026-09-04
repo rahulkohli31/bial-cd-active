@@ -7,7 +7,7 @@ never sees raw `.pptx`. The conversion engine is a self-hosted
 HTTP service), so confidential BIAL/KPMG decks **never leave the Azure tenant**.
 
 The control plane talks to exactly one Gotenberg route
-(`services/extract/deck.py:91`):
+(`services/extract/deck._render_with_gotenberg`):
 
 ```
 POST {GOTENBERG_URL}/forms/libreoffice/convert     (multipart, field name: files)
