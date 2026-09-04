@@ -43,16 +43,15 @@ import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import { FakeEventSource, makeClient, primeClient, waitForGateOpen, PREVIEW_URL, T_STEP, T_WORKSPACE, T_PREVIEW, T_BUILD_END } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
-  loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
-  deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
+  loadBuilds: vi.fn(), getBuild: vi.fn(),
+  listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), stopTurn: vi.fn(),
   resolvePlanOptions: vi.fn(),
   start: vi.fn(), relaunchPreview: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
-  loadBuilds: h.loadBuilds, newBuild: h.newBuild, createBuild: h.createBuild,
-  getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t) => (t || '').slice(0, 40),
+  loadBuilds: h.loadBuilds, getBuild: h.getBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
@@ -166,17 +165,27 @@ const findOutcome = async () => {
   return outcomeCards()[outcomeCards().length - 1]
 }
 
-/** Any `build` part the page tried to PERSIST — it must never write one; the server does. */
-const persistedOutcomes = () =>
-  h.createBuild.mock.calls
-    .flatMap(([, message]) => message.parts || [])
-    .filter((p) => p?.type === 'build')
+/**
+ * Everything the page actually PUT ON THE WIRE — one JSON string per send.
+ *
+ * THIS USED TO READ `h.createBuild.mock.calls` AND COULD NEVER HAVE FAILED. That wrapper's
+ * second argument was a conversation HEADER (`{projectId, title?, context?}`), never a message,
+ * so `message.parts` was always `undefined`, the `|| []` swallowed it, and the filter returned
+ * an empty array for every possible run. The wrapper is now deleted (plan 001, unit 6), which
+ * is what surfaced it — the spy went away and the vacuum showed.
+ *
+ * The send path makes exactly one server call now, `startTurn`, and it narrows the composer's
+ * parts through `wireMessageFromParts` into `{text, attachmentTexts, attachmentIds}` — so a
+ * build part cannot ride it by construction. Asserting on the serialized payload keeps the
+ * claim honest against BOTH ways that could stop being true: a parts-carrying body coming back,
+ * or an outcome sentence being written into `text`.
+ */
+const wireSends = () => h.startTurn.mock.calls.map((call) => JSON.stringify(call))
 
 beforeEach(() => {
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
   primeClient(h)
-  h.createBuild.mockResolvedValue({ ok: true })
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
@@ -219,7 +228,16 @@ describe('showing the outcome', () => {
 
     // Two writers would mean two records for one build (the server's row and this one), and the
     // server's is the one that survives a closed tab.
-    expect(persistedOutcomes()).toHaveLength(0)
+    //
+    // LIVENESS FIRST, because this is an assert-absence test: zero sends would satisfy the
+    // absence below while proving nothing, which is precisely how its predecessor passed for
+    // as long as it existed.
+    const sends = wireSends()
+    expect(sends.length).toBeGreaterThan(0)
+    for (const payload of sends) {
+      expect(payload).not.toMatch(/"type"\s*:\s*"build"/)
+      expect(payload).not.toMatch(OUTCOME_SENTENCE)
+    }
   })
 
   it('shows a failed build with its reason', async () => {

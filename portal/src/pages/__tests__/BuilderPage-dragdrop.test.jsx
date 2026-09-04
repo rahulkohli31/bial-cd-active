@@ -1,8 +1,9 @@
 /**
- * Drag-and-drop wiring on the conversation surface (`usePendingAttachments`, A2).
+ * Drag-and-drop wiring on the conversation surface (A2).
  *
- * THIS WAS ONE HALF OF A PAIR. Two pages shared the hook and only the planning one had
- * coverage, so this file was written to cover the other against a different child set — a
+ * THIS WAS ONE HALF OF A PAIR. Two pages shared a hand-rolled `usePendingAttachments` hook — since
+ * replaced by the library composer's staged-attachment adapter and deleted — and only the planning
+ * one had coverage, so this file was written to cover the other against a different child set — a
  * pending-attachment preview row sharing a wrapper with a banners block, a switcher and a
  * composer-gate note. There is ONE surface now and one child set; the sibling suite went with
  * its page. The coverage is worth keeping, but it is no longer "the other half" of anything.
@@ -15,8 +16,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, fireEvent, createEvent, cleanup } from '@testing-library/react'
 
 const h = vi.hoisted(() => ({
-  loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
-  deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
+  loadBuilds: vi.fn(), getBuild: vi.fn(),
+  listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
   resolvePlanOptions: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(), relaunchPreview: vi.fn(),
@@ -26,8 +27,7 @@ const h = vi.hoisted(() => ({
 
 vi.mock('../../utils/usage', () => ({ notifyUsageChanged: h.notifyUsageChanged }))
 vi.mock('../../utils/builderHistory', () => ({
-  loadBuilds: h.loadBuilds, newBuild: h.newBuild, createBuild: h.createBuild,
-  getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t) => (t || '').slice(0, 40),
+  loadBuilds: h.loadBuilds, getBuild: h.getBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
@@ -56,8 +56,6 @@ beforeEach(() => {
   Element.prototype.scrollIntoView = vi.fn()
   primeClient(h)
   primeTurn(h)
-  h.newBuild.mockReturnValue('build-Y')
-  h.createBuild.mockResolvedValue({ ok: true })
   h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])

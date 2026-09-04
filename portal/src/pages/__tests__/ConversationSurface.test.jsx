@@ -27,8 +27,8 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 
 const h = vi.hoisted(() => ({
-  loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
-  deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
+  loadBuilds: vi.fn(), getBuild: vi.fn(),
+  listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), stopTurn: vi.fn(),
   resolvePlanOptions: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(), relaunchPreview: vi.fn(),
@@ -36,8 +36,7 @@ const h = vi.hoisted(() => ({
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
-  loadBuilds: h.loadBuilds, newBuild: h.newBuild, createBuild: h.createBuild,
-  getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t) => (t || '').slice(0, 40),
+  loadBuilds: h.loadBuilds, getBuild: h.getBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 vi.mock('../../utils/conversationApi', async (orig) => ({
   ...(await orig()),
@@ -81,8 +80,6 @@ beforeEach(() => {
   sessionStorage.clear()
   primeClient(h)
   primeTurn(h)
-  h.newBuild.mockReturnValue('build-Y')
-  h.createBuild.mockResolvedValue({ ok: true })
   h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])

@@ -37,10 +37,7 @@ const previewState = (state, restorable = null) => ({
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(),
-  newBuild: vi.fn(),
-  createBuild: vi.fn(),
   getBuild: vi.fn(),
-  deleteBuild: vi.fn(),
   listProjectConversations: vi.fn(),
   buildUserParts: vi.fn(),
   startTurn: vi.fn(),
@@ -58,10 +55,7 @@ const h = vi.hoisted(() => ({
 
 vi.mock('../../utils/builderHistory', () => ({
   loadBuilds: h.loadBuilds,
-  newBuild: h.newBuild,
-  createBuild: h.createBuild,
   getBuild: h.getBuild,
-  deleteBuild: h.deleteBuild,
   deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 // SPREAD THE ORIGINAL — `handleBuildIt` mints the new build chat's id through the shared
@@ -172,9 +166,6 @@ beforeEach(() => {
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
   primeClient(h)
-  h.newBuild.mockReturnValue('build-Y')
-  h.createBuild.mockResolvedValue({ ok: true })
-  h.deleteBuild.mockResolvedValue(true)
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([{ id: 'build-X', kind: 'build', title: 'My build', updatedAt: new Date().toISOString() }])

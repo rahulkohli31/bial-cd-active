@@ -47,12 +47,12 @@ import WorkspaceShell from '../../components/workspace/WorkspaceShell'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), appendBuilderMessage: vi.fn(), getBuild: vi.fn(),
-  deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
+  listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
   loadBuilds: h.loadBuilds, appendBuilderMessage: h.appendBuilderMessage,
-  getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t) => (t || '').slice(0, 40),
+  getBuild: h.getBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
