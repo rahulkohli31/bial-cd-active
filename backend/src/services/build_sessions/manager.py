@@ -1381,7 +1381,63 @@ class SessionManager:
                 await asyncio.shield(comp)
             raise
 
-    async def _claim_the_one_build_slot(self, user_id: uuid.UUID) -> None:
+    async def _slot_conflict_for(
+        self,
+        user_id: uuid.UUID,
+        blocking: BuildSession | None,
+        blocking_id: uuid.UUID | None,
+        db: AsyncSession | None,
+        requested_project_id: uuid.UUID | None,
+    ) -> Exception:
+        """WHICH refusal a held slot has earned (#189).
+
+        Two truths are available when the slot is taken and they are not equally useful.
+        `BuildSessionConflictError` becomes `409 build_session_already_active`, which the client
+        reads as "nothing you can do but wait" (`utils/turnStreamApi.ts`) and renders as "That
+        message did not send - try again" - advice that stays wrong for as long as the other
+        build runs. When the holder is a DIFFERENT project, the citizen has a remedy: stop it.
+        `SandboxReclaimBlockedError` is how that remedy is offered, and `ReclaimWorkspaceDialog`
+        already carries the copy and the stop-it-first handler for the `building` arm - it was
+        simply unreachable, because this guard answered first with the poorer truth.
+
+        SAME PROJECT KEEPS THE BARE CONFLICT, and that is the honest answer there: a genuine
+        double-send has no incumbent to release and nothing to offer but waiting.
+
+        Falls back to the bare conflict whenever the richer one cannot be told truthfully - no
+        `db` to name the project with, no session to read, or a project row that has gone. A
+        dialog naming the wrong project is worse than a plain refusal (`_occupying_project`).
+        """
+        if blocking is None or db is None or requested_project_id is None:
+            return BuildSessionConflictError(blocking_id)
+        if blocking.project_id == requested_project_id:
+            return BuildSessionConflictError(blocking_id)
+        name = await db.scalar(
+            sa.select(Project.name).where(
+                Project.id == blocking.project_id, Project.user_id == user_id
+            )
+        )
+        if name is None:
+            return BuildSessionConflictError(blocking_id)
+        # The SAME predicates `_refuse_if_reclaim_would_destroy_work` uses, so the two refusals
+        # never disagree about what is happening in there. `dirty` is deliberately NOT probed:
+        # `SandboxReclaimBlockedError` states why - a `git status` taken while the agent writes
+        # is true for no instant the citizen cares about.
+        return SandboxReclaimBlockedError(
+            project_id=blocking.project_id,
+            project_name=name,
+            app_id=blocking.app_id,
+            dirty=None,
+            building=self._writing_session_holds(user_id, blocking.app_id),
+            agent_working=self._live_session_holds(user_id, blocking.app_id),
+        )
+
+    async def _claim_the_one_build_slot(
+        self,
+        user_id: uuid.UUID,
+        *,
+        db: AsyncSession | None = None,
+        requested_project_id: uuid.UUID | None = None,
+    ) -> None:
         """Fail closed if this user already holds the one-per-user slot — the pre-check every
         allocating path runs BEFORE reconcile/acquire. Returns normally when the slot is free
         (or freed itself while we waited); raises `BuildSessionConflictError` otherwise.
@@ -1408,7 +1464,9 @@ class SessionManager:
         blocking = self._sessions.get(blocking_id) if blocking_id is not None else None
         finalize = blocking.finalize_task if blocking is not None else None
         if blocking is None or not blocking.terminal_committed or finalize is None:
-            raise BuildSessionConflictError(blocking_id)
+            raise await self._slot_conflict_for(
+                user_id, blocking, blocking_id, db, requested_project_id
+            )
         # The blocking session has already COMMITTED its terminal — it is ended but still
         # finalizing (a refine sent right on the heels of natural completion). Wait (bounded)
         # for the shielded end sequence instead of 409ing the user's own finished build, then
@@ -1416,7 +1474,9 @@ class SessionManager:
         try:
             await asyncio.wait_for(asyncio.shield(finalize), timeout=_FINALIZE_GRACE_SECONDS)
         except Exception:
-            raise BuildSessionConflictError(blocking_id) from None
+            raise await self._slot_conflict_for(
+                user_id, blocking, blocking_id, db, requested_project_id
+            ) from None
 
     # --- start ---------------------------------------------------------------
 
@@ -2610,7 +2670,19 @@ class SessionManager:
             redis = get_redis()
             user_id = user.id
             if user_id in self._active_by_user:
-                raise BuildSessionConflictError(self._active_by_user.get(user_id))
+                # #189 — the SAME choice `_claim_the_one_build_slot` makes, and relaunch is the
+                # door the citizen actually walks through: the rail composer preflights this
+                # route before it opens a chat, so this is the refusal that reaches the screen
+                # first. A different project holding the slot earns the hand-over dialog, not
+                # "try again" advice that cannot come true while that build runs.
+                blocking_id = self._active_by_user.get(user_id)
+                raise await self._slot_conflict_for(
+                    user_id,
+                    self._sessions.get(blocking_id) if blocking_id is not None else None,
+                    blocking_id,
+                    db,
+                    project_id,
+                )
             # WHICH container would satisfy this relaunch? Read-only on purpose, and computed
             # out here because it has to be: `app_id` is not bound until inside the lock, and
             # `resolve_app_for_project` is an UPSERT that mints a DRAFT row — so it can never
@@ -2947,7 +3019,7 @@ class SessionManager:
     ) -> BuildSession:
         redis = get_redis()
         user_id = user.id
-        await self._claim_the_one_build_slot(user_id)
+        await self._claim_the_one_build_slot(user_id, db=db, requested_project_id=project_id)
         # Not live: reconcile the user's OWN stale state before acquiring (KTD-3 — closes the
         # crashed-tab lockout at the exact moment it matters), then run the provision steps
         # compensated: any failure — a cancelled request included — tears down any container
@@ -3113,7 +3185,7 @@ class SessionManager:
         async with self._start_lock_for(user.id):
             redis = get_redis()
             user_id = user.id
-            await self._claim_the_one_build_slot(user_id)
+            await self._claim_the_one_build_slot(user_id, db=db, requested_project_id=project_id)
             # WHICH container would satisfy this turn? Read-only on purpose — `resolve_app_for
             # _project` below MINTS, and minting out here would leave an app row behind for a
             # turn that then gets refused. No app row yet means nothing live can be ours, which
