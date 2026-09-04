@@ -87,6 +87,24 @@ _EMPTY: Final = -1
 
 # The synthesized result stitched under a dangling tool call at load (see
 # `repair_dangling_tool_calls`). Plain factual prose — the model reads this as history.
+#
+# KNOWN ISSUE, DELIBERATELY ACCEPTED (#189) — READ THIS BEFORE SHIPPING CHAT HISTORY.
+# A stop lands wherever the turn happens to be, which is routinely AFTER a tool call has been
+# issued and BEFORE its result is recorded. This line is what makes that replayable at all: it
+# keeps the history wire-valid, so a stopped turn never wedges the conversation.
+#
+# What it does NOT do is tell the truth when the tool actually RAN. "Treat it as not executed"
+# is a guess, and on the wrong side of it the model is told a file was never written when it
+# was — so it writes it again, or reasons forward from a state that never existed.
+#
+# THE DECISION (2026-09-04): accept it while a transcript is only ever replayed by the run that
+# produced it. The window is one turn wide, the citizen is watching, and a wrong guess is
+# visible immediately. WHEN REOPENING PAST CONVERSATIONS / CHAT HISTORY GOES LIVE THAT STOPS
+# HOLDING: an old transcript gets replayed by a run that was not there, nobody is left who saw
+# what happened, and this sentence becomes the ONLY account of it. The fix at that point is to
+# land the stop on a tool-call/tool-result boundary — let the in-flight tool finish and record
+# its result, then unwind — so nothing dangles and nothing has to be guessed. The stop itself
+# is `BuildSessionManager._stop_the_held_session`.
 _INTERRUPTED_RESULT: Final = (
     "This tool call was interrupted before a result was recorded (the run was cut short). "
     "Treat it as not executed."

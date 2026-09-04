@@ -2157,7 +2157,13 @@ class SessionManager:
         `run_build` task and the whole terminal-commit machinery; `ensure_sandbox` registers a
         Write turn's workspace with no task at all, because the work is running in the turn
         engine instead. From the container's point of view an agent is working either way, so
-        the caller should not have to know which — the branch is here."""
+        the caller should not have to know which — the branch is here.
+
+        WHERE THE DANGLING TOOL CALL COMES FROM (#189, known and accepted). Both branches cut
+        the run wherever it stands, which is routinely between a tool call and its result. The
+        replay is kept valid by `_INTERRUPTED_RESULT` in `messages/store.py` — read the decision
+        recorded beside it before shipping chat history, because landing this stop on a
+        tool-result boundary is what has to change once a past conversation can be reopened."""
         if not self._live_session_holds(user_id, app_id):
             return StopOutcome.NOTHING_WAS_RUNNING
         session_id = self._active_by_user.get(user_id)
