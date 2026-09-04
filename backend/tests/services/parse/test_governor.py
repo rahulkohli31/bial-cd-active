@@ -1,10 +1,12 @@
-"""Parse governor + parser logic (U7, R26): killable subprocess (timeout/OOM → 413),
-the four bounds, and structured-row parsing (merged-banner skip, merged-cell anchor,
-range-clamp, date/number coercion)."""
+"""Parse governor (U7, R26): the killable subprocess (timeout/OOM → 413) and the bounds
+the dispatch runs around the chat office→Markdown extract — zip-bomb pre-filter, OPC
+structural gate, and the refusal of kinds the dispatch does not serve.
+
+The extraction itself is covered by `tests/services/extract/test_office.py`; what is pinned
+here is that the governor contains it and that the bounds are wired in front of it."""
 
 from __future__ import annotations
 
-import datetime
 import io
 import struct
 import zipfile
@@ -13,19 +15,16 @@ import openpyxl
 import pytest
 
 from src.services.extract.zip_safety import FileParseError
-from src.services.parse import parsers
 from src.services.parse.governor import run_parse
 from src.services.parse.parsers import parse_dispatch
 
 
-def _xlsx(rows: list[list[object]], merges: list[str] | None = None) -> bytes:
+def _xlsx(rows: list[list[object]]) -> bytes:
     wb = openpyxl.Workbook()
     ws = wb.active
     assert ws is not None
     for row in rows:
         ws.append(row)
-    for merge in merges or []:
-        ws.merge_cells(merge)
     buffer = io.BytesIO()
     wb.save(buffer)
     return buffer.getvalue()
@@ -46,65 +45,16 @@ def _lying_zip(entries: dict[str, bytes], declared_uncompressed: int) -> bytes:
     return raw[: cdh + 24] + struct.pack("<I", declared_uncompressed) + raw[cdh + 28 :]
 
 
-# --- parser logic (in-process) -------------------------------------------------
+# --- dispatch bounds (in-process) ---------------------------------------------
 
 
-def test_spreadsheet_parses_to_rows() -> None:
-    data = _xlsx([["Name", "Age"], ["Alice", 30], ["Bob", 25]])
-    result = parse_dispatch(data, "xlsx", "x.xlsx", None)
-    assert result["kind"] == "spreadsheet"
-    assert result["columns"] == ["Name", "Age"]
-    assert result["rows"] == [{"Name": "Alice", "Age": 30}, {"Name": "Bob", "Age": 25}]
-    assert result["totalRows"] == 2
-
-
-def test_full_width_banner_row_skipped() -> None:
-    # A leading full-width merged title must not become the column names.
-    data = _xlsx([["Sales Q1"], ["Name", "Age"], ["Alice", 30]], merges=["A1:B1"])
-    result = parse_dispatch(data, "xlsx", "x.xlsx", None)
-    assert result["columns"] == ["Name", "Age"]
-    assert result["rows"] == [{"Name": "Alice", "Age": 30}]
-
-
-def test_merged_cell_resolves_to_anchor_value() -> None:
-    # A horizontal merge fills every covered column with the anchor value.
-    data = _xlsx([["Name", "A", "B"], ["Alice", "shared", ""]], merges=["B2:C2"])
-    result = parse_dispatch(data, "xlsx", "x.xlsx", None)
-    assert result["rows"][0]["A"] == "shared"
-    assert result["rows"][0]["B"] == "shared"
-
-
-def test_dates_are_iso_and_numbers_numeric() -> None:
-    data = _xlsx([["When", "Count"], [datetime.datetime(2026, 7, 6, 12, 0), 42]])
-    row = parse_dispatch(data, "xlsx", "x.xlsx", None)["rows"][0]
-    assert row["When"].startswith("2026-07-06T12:00")
-    assert row["Count"] == 42 and isinstance(row["Count"], int)
-
-
-def test_row_clamp_before_iteration(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(parsers, "MAX_PARSE_ROWS", 2)
-    data = _xlsx([["N"], [1], [2], [3], [4], [5]])
-    result = parse_dispatch(data, "xlsx", "x.xlsx", None)
-    assert result["rowCount"] == 2
-    assert result["totalRows"] == 5
-    assert result["truncated"] is True
-
-
-def test_csv_type_inference() -> None:
-    data = b"name,age\nAlice,30\nBob,25\n"
-    result = parse_dispatch(data, "csv", "x.csv", None)
-    assert result["rows"] == [{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}]
-
-
-def test_duplicate_columns_deduped() -> None:
-    data = _xlsx([["N", "N"], ["a", "b"]])
-    result = parse_dispatch(data, "xlsx", "x.xlsx", None)
-    assert result["columns"] == ["N", "N (1)"]
-
-
-def test_unsupported_kind_is_415() -> None:
+@pytest.mark.parametrize("kind", ["xlsx", "xls", "csv", "word", "pdf"])
+def test_retired_and_unknown_kinds_are_415(kind: str) -> None:
+    # The structured-row kinds went with the per-app parse endpoint (#37). The dispatch must
+    # REFUSE them, not fall through to something that half-works: re-adding a branch for any
+    # of them turns this red rather than quietly reviving a surface with no consumer.
     with pytest.raises(FileParseError) as exc:
-        parse_dispatch(b"data", "pdf", "x.pdf", None)
+        parse_dispatch(b"data", kind, "x.bin", None)
     assert exc.value.status == 415
     assert exc.value.code == "UNSUPPORTED_TYPE"
 
