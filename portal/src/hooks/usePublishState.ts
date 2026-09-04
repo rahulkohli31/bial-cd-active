@@ -24,15 +24,20 @@
  * leaves the document that dispatched it — it exists to reconcile two mounts on ONE screen,
  * which is what the retired publish card and review status card were: two inches apart,
  * where nothing is ever re-entered and a withdrawal in one left the other saying "waiting
- * for review". There is now one chip, and its two mount sites (the project page and the
- * builder's pane toolbar) are SIBLING ROUTES under one Outlet — so at most one is live and
- * the nudge currently has nobody to notify.
+ * for review".
  *
- * IT IS KEPT ANYWAY, deliberately, and this is the whole reason: it is three lines and a
- * listener, it costs nothing while it has no second mount, and the moment anything puts two
- * publish surfaces in one document again it is the difference between them agreeing and
- * them contradicting each other. Deleting it would be re-learning that lesson later. Its
- * test renders two hooks explicitly and so still pins the contract.
+ * THE NUDGE IS LOAD-BEARING AGAIN, and this paragraph replaces one that said the opposite.
+ * It used to record that the chip's two mount sites were SIBLING ROUTES under one Outlet, so
+ * at most one could be live and the nudge had nobody to notify — kept only against a future
+ * that might bring a second surface back. That future arrived: two DIFFERENT consumers now
+ * hold separate reads and mount together on the workspace screen, the chip in
+ * `WorkspaceToolbar` and `AppStatusPanel` in `WorkspaceRail`. `AppStatusPanel`'s own docblock
+ * quotes the very sentence this one used to end on and answers it — "That moment is now."
+ * So the nudge is what keeps them agreeing, not three spare lines waiting for a use.
+ *
+ * Its test renders two hooks explicitly and pins that contract. Anyone reading this as dead
+ * code and deleting it would be reintroducing the withdrawal-in-one-surface bug, on a screen
+ * where both surfaces are visible at once.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
