@@ -6,7 +6,7 @@
  * predicates into one is caught there and nowhere else — every other cell in the table passes
  * under the merged version.
  *
- * The page-level counterpart is `pages/__tests__/BuilderPage-previewaddress.test.tsx`, which pins
+ * The page-level counterpart is `pages/__tests__/ConversationSurface-previewaddress.test.tsx`, which pins
  * the same asymmetry through the real iframe. This file is where the combinations live, because
  * driving sixteen of them through a page would be sixteen builds.
  */

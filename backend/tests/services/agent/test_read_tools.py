@@ -30,7 +30,6 @@ from src.core.redaction import (
 from src.db.models.conversation import ChatKind
 from src.services.agent import read_tools
 from src.services.agent.read_tools import (
-    EmptyProjectWorkspace,
     ExtractedSnapshotWorkspace,
     WorkspacePathError,
     check_the_guest_list,
@@ -566,22 +565,6 @@ async def test_run_command_tool_output_is_redacted(
     tool_feed = captured["incoming"][1]
     assert "sup3rs3cretpw" not in tool_feed
     assert "***" in tool_feed
-
-
-async def test_no_app_yet_is_a_truthful_normal_result(
-    workspace: ExtractedSnapshotWorkspace,
-) -> None:
-    captured: dict[str, Any] = {}
-    model = _capturing_model([tool_turn("list_files", {}), text_turn("told the user")], captured)
-    result = await _agent().run(
-        "what files are there?",
-        deps=_deps(EmptyProjectWorkspace(app_id=uuid.uuid4())),
-        model=model,
-        toolsets=toolsets_for_kind(ChatKind.PLAN, workspace_from_read_deps).toolsets,
-    )
-    # A NORMAL tool result (the run completes without retries), truthful in content.
-    assert result.output == "told the user"
-    assert "No app exists yet" in captured["incoming"][1]
 
 
 async def test_search_files_tool_rejects_a_bad_regex_with_teaching(

@@ -21,7 +21,7 @@
  * in the one case that matters most (the citizen watching their build in a chat whose project the
  * page's session was never stamped with), and it lets one project's build frame into another
  * project's pane. `previewAddress.test.ts` has a scenario for each half, and
- * `BuilderPage-previewaddress.test.tsx` has the same asymmetry at the page level.
+ * `ConversationSurface-previewaddress.test.tsx` has the same asymmetry at the page level.
  *
  * ═══ THREE SCOPES, AND ONLY TWO OF THEM LIVE HERE ═══
  *

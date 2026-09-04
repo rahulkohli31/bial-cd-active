@@ -1,19 +1,29 @@
-"""Server-side snapshot extraction for Ask/Plan reads (U8 / plan 2026-07-22-002).
+"""Server-side extraction of an app's SAVED snapshot, on the control plane's own disk.
 
-Ask and Plan read the app WITHOUT a sandbox: the existing git bundle (written by
-`build_sessions/snapshot.py`, HEAD-only, stored at `snapshot_key(app_id)`) is extracted
-into a local cache directory keyed by the bundle's HEAD SHA, and the read tools operate
-on that directory. The SHA comes from `parse_bundle_head_sha` — the same validated header
-parse submit trusts — so a cache entry is immutable by construction: a new build writes a
-new bundle with a new HEAD, which lands in a NEW extraction directory. The extraction is
-resolved ONCE per turn and pinned (the caller holds the `ExtractedSnapshot` for the whole
-turn — no mid-turn version drift when a build completes concurrently).
+NOT A CHAT PATH ANY MORE. This was written for Ask/Plan reads (U8 / plan 2026-07-22-002),
+which answered questions about a git checkout of the saved bundle while a build worked in a
+container nobody could see. That arm is gone — `turns/engine._pin_workspace` has ONE arm and
+every turn of both kinds reads the project's LIVE container — so nothing here is on a turn.
+The two live consumers both need the saved tree rather than the working one, which is exactly
+why they still extract:
+
+* `services/classification/service.py` — the admin review scans what was SAVED and submitted.
+* `services/deploy/service.py` — publishing ships the saved commit, never the in-flight edits.
+
+The mechanism is unchanged. The bundle (written by `build_sessions/snapshot.py`, HEAD-only,
+stored at `snapshot_key(app_id)`) is extracted into a local cache directory keyed by the
+bundle's HEAD SHA. The SHA comes from `parse_bundle_head_sha` — the same validated header parse
+submit trusts — so a cache entry is immutable by construction: a new build writes a new bundle
+with a new HEAD, which lands in a NEW extraction directory. Each caller resolves an extraction
+once and holds the `ExtractedSnapshot` for the whole review or deploy, so a build completing
+concurrently cannot move the tree underneath it.
 
 "No snapshot" is a NORMAL outcome, not an error: a project whose app has never been built
-returns `NoAppYet`, and the read tools answer with a truthful "no app exists yet" result
-(the inverse of the #9 lesson — never guess at an app that isn't there). A snapshot that
-EXISTS but fails header validation is the opposite: corrupt platform state, raised loudly
-as `BundleValidationError` (fail-first), never silently treated as absent.
+returns `NoAppYet`. It no longer becomes a truthful "no app exists yet" answer to a citizen —
+there is no read tool on this path — so each consumer maps it onto its own terminal failure
+code instead (`FAIL_NO_APP` for a review, `FAIL_NO_SNAPSHOT` for a deploy), both of which say
+so plainly. A snapshot that EXISTS but fails header validation is the opposite: corrupt
+platform state, raised loudly as `BundleValidationError` (fail-first), never silently absent.
 
 Extraction clones from the bundle file with an EMPTY environment allowlist and
 `--template=` (no hook templates, nothing inherited from the server process env — the

@@ -981,10 +981,3 @@ def get_classification_review_service() -> ClassificationReviewService:
             model_factory=_default_model_factory,
         )
     return _service
-
-
-def set_classification_review_service_for_tests(
-    service: ClassificationReviewService | None,
-) -> None:
-    global _service
-    _service = service

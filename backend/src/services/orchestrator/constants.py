@@ -118,8 +118,9 @@ WORKSPACE_NOTE_MAX_POLLS = 5
 
 MUCH SHORTER THAN `READINESS_MAX_POLLS`, because it is a different question asked at a different
 moment. The verify budget decides whether a build may claim it finished and can afford to wait 30
-seconds for a slow app; this one runs at the START of every turn in every mode — including a
-one-line Ask question — and only has to tell the model what the user is looking at.
+seconds for a slow app; this one runs at the START of every turn in BOTH chat kinds — including a
+one-line Plan question, which is the cheapest turn the platform serves and the one this budget is
+sized against — and only has to tell the model what the user is looking at.
 
 Its whole safety comes from the third answer: a budget that runs out here is `STILL_TRYING`, which
 the note reports as "could not tell", never as "the app is down". So the cost of choosing five is

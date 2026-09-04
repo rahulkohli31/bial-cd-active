@@ -34,10 +34,13 @@ other one lets it propagate raw, and that is a decision, not an omission:
   guard. **They do not — resist the temptation, it has already been tried once.** Two
   independent reasons, and each alone is sufficient:
     1. REDUNDANT where a guard is genuinely wanted. Every caller that needs one already has
-       it, at the call site, per `_do_finalize`'s log-and-continue pattern:
-       `manager.py:365` (`_compensate_lock_and_container`), `manager.py:1046`
-       (`_do_finalize`), `manager.py:873` (the in-build renew/heartbeat loop). An
-       in-primitive guard would make those unreachable and misleading.
+       it, at the call site, per `_do_finalize`'s log-and-continue pattern. Named rather than
+       cited by line, because the three line numbers this list used to carry (365 / 1046 / 873)
+       were every one of them wrong after `manager.py` grew past four thousand lines:
+       `SessionManager._compensate_lock_and_container`, `SessionManager._do_finalize` (and
+       `_pardon_the_container` beside it), and `SessionManager.on_progress`, which renews the
+       lock and re-seeds the heartbeat on every non-terminal progress envelope. An in-primitive
+       guard would make all of those unreachable and misleading.
     2. ACTIVELY HARMFUL where there is no call-site guard, because there the raise IS the
        mechanism. At the `_holding_user_lock` clean exit and at BOTH heartbeat seeds —
        relaunch's AND start's, each now placed inside the block BEFORE `scope.adopt()` — the
@@ -163,8 +166,9 @@ async def release_lock_as_holder(redis: aioredis.Redis, user_uuid: uuid.UUID, to
     token is a no-op. Released LAST in the C4 / reaper ordering.
 
     BARE — see the REDIS-ERROR POLICY in the module docstring. It LOOKS like a compensation
-    path that wants a guard, and it is not: every caller that needs one already has it, and
-    at `manager.py:398` the raise is the very mechanism that triggers teardown."""
+    path that wants a guard, and it is not: every caller that needs one already has it, and at
+    `_holding_user_lock`'s clean exit the raise is the very mechanism that triggers teardown —
+    that call sits inside the block whose `except BaseException` spawns the compensation."""
     deleted = await redis.eval(_CAS_DELETE_LUA, 1, lock_key(user_uuid), token)
     return bool(deleted)
 
@@ -197,7 +201,8 @@ async def write_heartbeat(redis: aioredis.Redis, user_uuid: uuid.UUID) -> dateti
     session idle.
 
     BARE for the same reason as `release_lock_as_holder` — see the REDIS-ERROR POLICY in the
-    module docstring. The in-build renew loop already guards its own call, while at BOTH the
+    module docstring. The in-build renewal (`SessionManager.on_progress`, once per non-terminal
+    progress envelope — not a timer loop) already guards its own call, while at BOTH the
     relaunch and start heartbeat seeds the raise is what tears the container down — each seed
     sits inside `_holding_user_lock`'s compensated region, before the scope adopts the lock."""
     now = datetime.now(UTC)

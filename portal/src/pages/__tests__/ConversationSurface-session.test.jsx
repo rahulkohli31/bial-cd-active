@@ -37,10 +37,7 @@ const previewState = (state, restorable = null) => ({
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(),
-  newBuild: vi.fn(),
-  createBuild: vi.fn(),
   getBuild: vi.fn(),
-  deleteBuild: vi.fn(),
   listProjectConversations: vi.fn(),
   buildUserParts: vi.fn(),
   startTurn: vi.fn(),
@@ -48,7 +45,6 @@ const h = vi.hoisted(() => ({
   buildFromPlan: vi.fn(),
   stopTurn: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  start: vi.fn(),
   relaunchPreview: vi.fn(),
   stop: vi.fn(),
   getStatus: vi.fn(),
@@ -58,10 +54,7 @@ const h = vi.hoisted(() => ({
 
 vi.mock('../../utils/builderHistory', () => ({
   loadBuilds: h.loadBuilds,
-  newBuild: h.newBuild,
-  createBuild: h.createBuild,
   getBuild: h.getBuild,
-  deleteBuild: h.deleteBuild,
   deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 // SPREAD THE ORIGINAL — `handleBuildIt` mints the new build chat's id through the shared
@@ -158,7 +151,7 @@ function scriptedBuild(options) {
  *  own docstring: "emit the first frame BEFORE any model byte — the snapshot serves that role"),
  *  carrying the `turnId` `handleStopTurn` reads out of `liveTurnIdRef` — `scriptBuildTurn`'s
  *  default `opening` (just a `workspace` frame) predates that contract, so a test that presses
- *  Stop has to supply one itself. Mirrors `BuilderPage-outcome.test.jsx`'s helper of the same name
+ *  Stop has to supply one itself. Mirrors `ConversationSurface-outcome.test.jsx`'s helper of the same name
  *  and purpose. */
 const T_SNAPSHOT = (turnId, seq = 1) => ({
   type: 'snapshot', seq, turnId, turnStatus: 'running', items: [], parts: [], working: false,
@@ -172,9 +165,6 @@ beforeEach(() => {
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
   primeClient(h)
-  h.newBuild.mockReturnValue('build-Y')
-  h.createBuild.mockResolvedValue({ ok: true })
-  h.deleteBuild.mockResolvedValue(true)
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([{ id: 'build-X', kind: 'build', title: 'My build', updatedAt: new Date().toISOString() }])
@@ -198,12 +188,14 @@ describe('BuilderPage — the build-turn flow (ORIG-§3-d/f)', () => {
 
     // The build starts through the ATOMIC TRANSITION — a SECOND, brand-new build chat, created,
     // seeded with the plan, and started, server-side (U5/U12) — and the page NAVIGATES there and
-    // subscribes to the TURN the handoff returns. Neither C3 door is opened: `start` was already
-    // not a client concern, and now `getStatus` isn't either — there is no session to join at all.
+    // subscribes to the TURN the handoff returns. The C3 door stays shut: `getStatus` is never
+    // called, so there is no session to join at all. (`start` was asserted here too until the
+    // client wrapper was deleted; a mock wired to nothing proves nothing, and what took its place
+    // is the member-set guard in `utils/__tests__/buildSessionApi.test.ts`, which fails if a start
+    // wrapper reappears on the client at all.)
     // Third arg is the client-minted id of that new chat (a real `uuidv7()`, so only its shape is
     // pinned, not its value).
     expect(h.buildFromPlan).toHaveBeenCalledWith('build-X', PLAN_CARD_ID, expect.any(String))
-    expect(h.start).not.toHaveBeenCalled()
     expect(h.getStatus).not.toHaveBeenCalled()
     // Cursor 0 deliberately: the build may have been running for seconds before this subscribe
     // landed, and the consolidating snapshot is what recovers the frames it missed. The
@@ -467,10 +459,10 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     //
     // THE TOAST'S WORDING IS THE GENERIC ONE, not "your app is being built". `buildActiveHere`
     // (the branch that would say that) only ever fires for a LEGACY session reattach now — this
-    // page's own send path never starts one (`session.start()` is not called anywhere in it) — so
+    // page's own send path cannot start one (`session.start()` has been deleted from the hook) — so
     // an ARRIVED, ALREADY-STREAMING build turn reads as an ordinary in-flight reply once you are
     // on the chat it runs in. "Building your app…" still appears, but only for the click-time
-    // round-trip (`buildStarting`), pinned separately in `BuilderPage-composer.test.jsx`.
+    // round-trip (`buildStarting`), pinned separately in `ConversationSurface-composer.test.jsx`.
     fireEvent.change(textarea, { target: { value: 'make it dark mode' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
     expect(await screen.findByText(/send unlocks when it is done/i)).toBeTruthy()
@@ -537,7 +529,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     expect(screen.queryByRole('button', { name: /^Mode:/ })).toBeNull()
 
     // A row with a stray legacy `mode` — if a re-read were reintroduced, this is what it would see.
-    h.getBuild.mockResolvedValue({ id: LIVE_CHAT_ID, kind: 'build', mode: 'plan', messages: [] })
+    h.getBuild.mockResolvedValue({ id: LIVE_CHAT_ID, kind: 'build', messages: [] })
     await turn.frame(T_BUILD_END())
     await turn.end()
 
@@ -657,7 +649,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     // every other term of the gate has to be scoped the same way or it reintroduces the leak.
     // BUILD-IT IS A HANDOFF (U5/U12): pressing it in `chat-A` creates a SECOND, brand-new build
     // chat and navigates there — this render has no `<Routes>` for that real `navigate()` to
-    // resolve against (a `chatId` PROP, matching `BuilderPage-composer.test.jsx`'s `renderAt`
+    // resolve against (a `chatId` PROP, matching `ConversationSurface-composer.test.jsx`'s `renderAt`
     // idiom), so arriving is simulated the same way every sibling-chat guard in this file already
     // simulates a chat switch: a `chatId` prop swap on the SAME instance.
     const CHAT_A_LIVE = 'chat-A-live'

@@ -6,8 +6,9 @@ import { fileURLToPath } from 'node:url'
 const dirname = path.dirname(fileURLToPath(import.meta.url))
 
 // e2e config lives in .env.e2e (E2E_QA_EMAIL, and E2E_STORAGE_STATE — the path to a
-// session minted by .mythos/fastapi-e2e/scripts/auth/mint_session.py, which is what
-// makes a spec run against a REAL backend session rather than a mocked /auth/me).
+// Playwright storage-state JSON holding a real control-plane session, which is what
+// makes a spec run against a REAL backend session rather than a mocked /auth/me; see
+// `e2e/auth.setup.ts` for both modes and what each one actually proves).
 // portal/.env is loaded as a fallback. dotenv never overrides an already-set
 // process.env var, so anything the caller exports (E2E_BASE_URL) wins.
 loadEnv({ path: path.join(dirname, '.env.e2e') })
@@ -54,7 +55,8 @@ export default defineConfig({
     trace: CAPTURE ? 'on' : 'retain-on-failure',
     screenshot: CAPTURE ? 'on' : 'only-on-failure',
     video: CAPTURE ? 'on' : 'retain-on-failure',
-    // Deck conversion (LibreOffice) is the slow action — give clicks room.
+    // The opt-in real-infrastructure specs press controls whose handlers wait on a
+    // provisioning container, so a single click can legitimately take tens of seconds.
     actionTimeout: 45_000,
   },
   projects: [

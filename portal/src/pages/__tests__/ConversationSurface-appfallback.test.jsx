@@ -9,14 +9,14 @@ import { screen, waitFor, cleanup } from '@testing-library/react'
 import { FakeEventSource, makeClient, primeClient, renderBuilder } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
-  loadBuilds: vi.fn(), newBuild: vi.fn(), appendBuilderMessage: vi.fn(), getBuild: vi.fn(),
-  deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
-  start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
+  loadBuilds: vi.fn(), appendBuilderMessage: vi.fn(), getBuild: vi.fn(),
+  listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
+  stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
-  loadBuilds: h.loadBuilds, newBuild: h.newBuild, appendBuilderMessage: h.appendBuilderMessage,
-  getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t) => (t || '').slice(0, 40),
+  loadBuilds: h.loadBuilds, appendBuilderMessage: h.appendBuilderMessage,
+  getBuild: h.getBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
@@ -32,7 +32,7 @@ beforeEach(() => {
   Element.prototype.scrollIntoView = vi.fn()
   primeClient(h)
   h.loadBuilds.mockResolvedValue([])
-  h.listProjectConversations.mockResolvedValue([{ id: 'build-X', kind: 'builder', title: 'My build', updatedAt: new Date().toISOString() }])
+  h.listProjectConversations.mockResolvedValue([{ id: 'build-X', kind: 'build', title: 'My build', updatedAt: new Date().toISOString() }])
 })
 afterEach(() => cleanup())
 

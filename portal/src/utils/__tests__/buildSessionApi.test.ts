@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import {
-  start,
   relaunchPreview,
   stop,
   getStatus,
@@ -51,65 +50,29 @@ function headerOf(m: ReturnType<typeof jsonFetch>, name: string, call = 0): stri
 // The frozen `buildSessionClient` member set — the portal's mirror of the backend's
 // `test_abstractmethod_set_equals_the_c2_contract` (`test_base.py`). A drifted mock bag is
 // what this guards: the client interface trimmed to five members here, but one call site
-// (`BuilderPage-memo.test.jsx`) went on mocking `acquireLock` / `renewLock` / `releaseLock` /
+// (`ConversationSurface-memo.test.jsx`) went on mocking `acquireLock` / `renewLock` / `releaseLock` /
 // `heartbeat` anyway, because nothing forced its stale keys to be read against the real
 // surface. This test fails LOUDLY the moment `buildSessionClient` gains or loses a member,
 // so the next removal cannot leave the same kind of residue behind unnoticed.
-const _CLIENT_MEMBERS = new Set(['start', 'relaunchPreview', 'stop', 'getStatus', 'forceEnd'])
+const _CLIENT_MEMBERS = new Set(['relaunchPreview', 'stop', 'getStatus', 'forceEnd'])
 
 describe('buildSessionApi — buildSessionClient member set (inertness guard)', () => {
-  it('exposes exactly the five surviving C3 client operations', () => {
+  it('exposes exactly the four surviving C3 client operations', () => {
     expect(new Set(Object.keys(buildSessionClient))).toEqual(_CLIENT_MEMBERS)
   })
 })
 
 describe('buildSessionApi — control operations (C3 §2)', () => {
-  it('start: 201 maps {sessionId, projectId, appId, status:provisioning, previewUrl:null, createdAt} (C3 §2.1)', async () => {
-    const fetchImpl = jsonFetch(201, {
-      sessionId: 's1',
-      projectId: 'p1',
-      appId: 'a1',
-      status: 'provisioning',
-      previewUrl: null,
-      createdAt: '2026-07-14T00:00:00Z',
-    })
-    const out = await start({ projectId: 'p1', prompt: 'build a CRUD app' }, { fetchImpl })
-
-    expect(out).toEqual({
-      sessionId: 's1',
-      projectId: 'p1',
-      appId: 'a1',
-      status: 'provisioning',
-      previewUrl: null,
-      createdAt: '2026-07-14T00:00:00Z',
-    })
-    // The mutating POST carries the CSRF header (C3 §3, KTD-2) and the JSON body.
-    expect(headerOf(fetchImpl, 'X-CSRF-Token')).toBe(CSRF)
-    expect(JSON.parse(optsOf(fetchImpl).body as string)).toEqual({ projectId: 'p1', prompt: 'build a CRUD app' })
-    expect(optsOf(fetchImpl).method).toBe('POST')
-    expect(fetchImpl.mock.calls[0][0]).toBe('/api/build-sessions')
-  })
-
-  it('start: sends conversationId when supplied, so the server can ground the build in the thread\'s attachments (R3)', async () => {
-    const fetchImpl = jsonFetch(201, { sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'provisioning', previewUrl: null, createdAt: '2026-07-14T00:00:00Z' })
-
-    await start({ projectId: 'p1', prompt: 'build a dashboard', conversationId: 'c9' }, { fetchImpl })
-
-    expect(JSON.parse(optsOf(fetchImpl).body as string)).toEqual({ projectId: 'p1', prompt: 'build a dashboard', conversationId: 'c9' })
-  })
-
-  it('start: OMITS conversationId entirely when absent — the field is an additive amendment to the frozen C3 body (R3)', async () => {
-    const fetchImpl = jsonFetch(201, { sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'provisioning', previewUrl: null, createdAt: '2026-07-14T00:00:00Z' })
-
-    await start({ projectId: 'p1', prompt: 'x' }, { fetchImpl })
-
-    const body = JSON.parse(optsOf(fetchImpl).body as string)
-    expect('conversationId' in body).toBe(false) // not even as an explicit null
-  })
-
-  it('start: a 409 build_session_already_active surfaces the existing sessionId as a typed error (C3 §2.1/§6)', async () => {
+  // ─── THE 409 MAPPING, RE-POINTED OFF THE DELETED `start` (`postJson`, shared) ──────────────
+  //
+  // `start` is gone — a composer send is a TURN, so the wrapper had no caller — and these two
+  // cases rode it as a VEHICLE: what they actually pin lives in `postJson`, which every mutating
+  // call in this module goes through. Deleting them with the wrapper would have taken the typed
+  // 409 with them, so they are re-pointed onto `relaunchPreview`, which is live (`StartAppControl`
+  // and `RailComposer` call it directly) and is now the only caller that can raise this error.
+  it('a 409 build_session_already_active surfaces the existing sessionId as a typed error (C3 §2.1/§6)', async () => {
     const fetchImpl = jsonFetch(409, { error: { code: 'build_session_already_active', message: 'You already have a build running.' }, sessionId: 'existing-9' })
-    const err = await start({ projectId: 'p1', prompt: 'x' }, { fetchImpl }).catch((e: unknown) => e)
+    const err = await relaunchPreview({ projectId: 'p1' }, { fetchImpl }).catch((e: unknown) => e)
 
     expect(err).toBeInstanceOf(BuildSessionAlreadyActiveError)
     expect(err).toBeInstanceOf(ApiError)
@@ -119,9 +82,9 @@ describe('buildSessionApi — control operations (C3 §2)', () => {
     expect(active.existingSessionId).toBe('existing-9')
   })
 
-  it('start: reads the existing sessionId whether it sits at top-level or under error{}', async () => {
+  it('reads the existing sessionId whether it sits at top-level or under error{}', async () => {
     const fetchImpl = jsonFetch(409, { error: { code: 'build_session_already_active', message: 'busy', sessionId: 'nested-42' } })
-    const err = await start({ projectId: 'p1', prompt: 'x' }, { fetchImpl }).catch((e: unknown) => e)
+    const err = await relaunchPreview({ projectId: 'p1' }, { fetchImpl }).catch((e: unknown) => e)
     expect((err as BuildSessionAlreadyActiveError).existingSessionId).toBe('nested-42')
   })
 
@@ -283,17 +246,13 @@ describe('buildSessionApi — lock ops + fail-closed errors (C3 §3)', () => {
   })
 
   it('a session body with NO projectId fails at the boundary — it drives the 409 reattach/block routing (finding #31)', async () => {
-    // getStatus: the projectId comparison is the reattach-vs-block gate.
+    // getStatus is the ONE reader of this guard now: the projectId comparison is the
+    // reattach-vs-block gate, and `start` — which used to anchor the same routing on the created
+    // session — is gone with its wrapper.
     const statusImpl = jsonFetch(200, { sessionId: 's1', appId: 'a1', status: 'ready', previewUrl: null, lastSeq: 1, createdAt: 'c', updatedAt: 'u' })
     const statusErr = await getStatus('s1', { fetchImpl: statusImpl }).catch((e: unknown) => e)
     expect(statusErr).toBeInstanceOf(ApiError)
     expect((statusErr as ApiError).status).toBe(500)
-
-    // start: the created session's projectId anchors the same routing on later turns.
-    const startImpl = jsonFetch(201, { sessionId: 's1', appId: 'a1', status: 'provisioning', previewUrl: null, createdAt: 'c' })
-    const startErr = await start({ projectId: 'p1', prompt: 'x' }, { fetchImpl: startImpl }).catch((e: unknown) => e)
-    expect(startErr).toBeInstanceOf(ApiError)
-    expect((startErr as ApiError).status).toBe(500)
   })
 })
 

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import * as approvalApi from '../approvalApi'
-import { getApprovalStatus, withdrawSubmission } from '../approvalApi'
+import { withdrawSubmission } from '../approvalApi'
 import { ApiError } from '../apiError'
 
 // A real WHATWG Response so `res.ok` / `res.status` / `res.json()` behave exactly as
@@ -16,63 +16,6 @@ const fetchReturning = (status: number, body: unknown) =>
 // authFetch deps injection — no real token/network. getToken returns null: the
 // cookie-session model carries no client bearer token.
 const deps = (fetchImpl: typeof fetch) => ({ fetchImpl, getToken: () => null, refresh: async () => false })
-
-const SHA = 'a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0'
-
-const validStatus = {
-  appId: 'app-1',
-  status: 'pending',
-  rejectionNote: null,
-  submissionId: 'sub-1',
-  commitSha: SHA,
-  submittedAt: '2026-07-16T10:00:00Z',
-  deployedAt: null,
-  deployedUrl: null,
-}
-
-describe('getApprovalStatus', () => {
-  it('GETs /api/apps/:id/status (URL-encoded) and returns the narrowed status', async () => {
-    const fetchImpl = fetchReturning(200, validStatus)
-    const result = await getApprovalStatus('app-1', deps(fetchImpl))
-    expect(fetchImpl.mock.calls[0][0]).toBe('/api/apps/app-1/status')
-    expect(fetchImpl.mock.calls[0][1]?.method).toBeUndefined() // a plain GET
-    expect(result).toEqual(validStatus)
-  })
-
-  it('narrows the deploy marker (R5), collapsing an absent URL to null', async () => {
-    const live = 'https://apps.bial.example.com/gate-ops'
-    const deployed = fetchReturning(200, {
-      ...validStatus,
-      status: 'approved',
-      deployedAt: '2026-07-16T12:00:00Z',
-      deployedUrl: live,
-    })
-    const result = await getApprovalStatus('app-1', deps(deployed))
-    expect(result.deployedUrl).toBe(live)
-    expect(result.deployedAt).toBe('2026-07-16T12:00:00Z')
-
-    // A pre-R5 server (no such keys) and an empty string both mean "no Live link" —
-    // the control renders on `deployedUrl !== null`, so neither may become `''`.
-    const legacy = fetchReturning(200, { ...validStatus, deployedUrl: '', deployedAt: undefined })
-    const narrowed = await getApprovalStatus('app-1', deps(legacy))
-    expect(narrowed.deployedUrl).toBeNull()
-    expect(narrowed.deployedAt).toBeNull()
-  })
-
-  it('URL-encodes an appId with unsafe characters', async () => {
-    const fetchImpl = fetchReturning(200, { ...validStatus, appId: 'a/b' })
-    await getApprovalStatus('a/b', deps(fetchImpl))
-    expect(fetchImpl.mock.calls[0][0]).toBe('/api/apps/a%2Fb/status')
-  })
-
-  it('throws an ApiError carrying status + server message on a non-2xx', async () => {
-    const fetchImpl = fetchReturning(404, { error: { message: 'App not found.' } })
-    const err = await getApprovalStatus('missing', deps(fetchImpl)).catch((e: unknown) => e)
-    expect(err).toBeInstanceOf(ApiError)
-    expect((err as ApiError).status).toBe(404)
-    expect((err as ApiError).message).toBe('App not found.')
-  })
-})
 
 // --- the retired submit verb ---------------------------------------------------------
 
@@ -149,39 +92,26 @@ describe('withdrawSubmission', () => {
   })
 })
 
-describe('response narrowing (parse, do not validate)', () => {
-  it('throws rather than trust an unknown status literal (toAppStatus)', async () => {
-    const fetchImpl = fetchReturning(200, { ...validStatus, status: 'exploded' })
-    const err = await getApprovalStatus('app-1', deps(fetchImpl)).catch((e: unknown) => e)
-    expect(err).toBeInstanceOf(ApiError)
-    expect((err as ApiError).status).toBe(500)
-    expect((err as ApiError).message).toMatch(/status/i)
-  })
-
-  it('throws on a non-record body (toApprovalStatus)', async () => {
-    const fetchImpl = fetchReturning(200, 'not an object')
-    const err = await getApprovalStatus('app-1', deps(fetchImpl)).catch((e: unknown) => e)
-    expect(err).toBeInstanceOf(ApiError)
-    expect((err as ApiError).status).toBe(500)
-  })
-
-  it('throws on a missing appId rather than coerce it to "" (toApprovalStatus)', async () => {
-    const { appId: _dropped, ...noAppId } = validStatus
-    const fetchImpl = fetchReturning(200, noAppId)
-    const err = await getApprovalStatus('app-1', deps(fetchImpl)).catch((e: unknown) => e)
-    expect(err).toBeInstanceOf(ApiError)
-    expect((err as ApiError).message).toMatch(/could not read/i)
-  })
-
-  it('collapses an empty-string rejectionNote to null, and passes a real note through', async () => {
-    const emptyNote = fetchReturning(200, { ...validStatus, status: 'rejected', rejectionNote: '' })
-    expect((await getApprovalStatus('app-1', deps(emptyNote))).rejectionNote).toBeNull()
-
-    const realNote = fetchReturning(200, {
-      ...validStatus,
-      status: 'rejected',
-      rejectionNote: 'Remove the sample data.',
-    })
-    expect((await getApprovalStatus('app-1', deps(realNote))).rejectionNote).toBe('Remove the sample data.')
+describe('the app-scoped status read is gone', () => {
+  /**
+   * A GUARD, not deleted coverage (plan 001, unit 6). `getApprovalStatus` was the typed client
+   * for `GET /apps/:id/status`, written for the approval card at the foot of the chat — the
+   * canvas's `Removals` board took that card out, and nothing reached the getter, its
+   * `AppApprovalStatus` interface or its narrower afterwards. The publish and review surfaces
+   * read the lifecycle off the PROJECT-scoped deploy status instead, so both share one poll
+   * lifetime and cannot end up telling the citizen two different things; re-adding a second,
+   * app-scoped poll here is precisely what would break that. The SERVER route is untouched.
+   *
+   * `toAppStatus`'s unknown-literal refusal and the non-record / missing-appId refusals are the
+   * only narrowing this file lost a caller for, and all three are still exercised — through
+   * `withdrawSubmission`, in the block above. What went with the getter was
+   * `nonEmptyStringOrNull`, which had no other caller.
+   */
+  it('exports no app-scoped status read — the lifecycle comes off the deploy poll', () => {
+    expect('getApprovalStatus' in approvalApi).toBe(false)
+    expect((approvalApi as Record<string, unknown>).getApprovalStatus).toBeUndefined()
+    // Paired with a liveness assertion so the absences above cannot false-green on an
+    // empty module namespace.
+    expect(typeof (approvalApi as Record<string, unknown>).withdrawSubmission).toBe('function')
   })
 })

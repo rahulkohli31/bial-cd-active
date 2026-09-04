@@ -360,6 +360,40 @@ describe('startTurn', () => {
     })
   })
 
+  it("binds a new chat's KIND into the create block on a first message", async () => {
+    // RELOCATED HERE (plan 001, unit 6) from the retired `createConversation` / `createBuild`
+    // wrappers' own tests. Those made a `POST /conversations` round trip of their own and pinned
+    // that the chat's kind reached the wire; the round trip is gone — the server writes the row
+    // inside the turn's transaction, after every side-effect-free refusal — and its arguments
+    // moved onto THIS request. So the contract is pinned where it now travels. The test above is
+    // the other half: with no parentage, the body carries no `create` key at all.
+    const fetchFn = vi.fn(async () =>
+      new Response(JSON.stringify({ turnId: 't1' }), { status: 202 })
+    )
+    await startTurn(
+      'c1',
+      { text: 'build me a gate roster' },
+      { fetchImpl: fetchFn },
+      { projectId: 'p1', kind: 'build', title: 'Gate roster' }
+    )
+    const [, init] = fetchFn.mock.calls[0] as unknown as [string, RequestInit]
+    expect(JSON.parse(init.body as string)).toEqual({
+      message: { text: 'build me a gate roster', attachmentTexts: [], attachmentIds: [] },
+      create: { projectId: 'p1', kind: 'build', title: 'Gate roster' },
+    })
+
+    // The kind is CARRIED, not defaulted: a plan chat's first message says so on the wire.
+    const planFetch = vi.fn(async () =>
+      new Response(JSON.stringify({ turnId: 't2' }), { status: 202 })
+    )
+    await startTurn('c2', { text: 'help me scope this' }, { fetchImpl: planFetch }, {
+      projectId: 'p1',
+      kind: 'plan',
+    })
+    const [, planInit] = planFetch.mock.calls[0] as unknown as [string, RequestInit]
+    expect(JSON.parse(planInit.body as string).create).toEqual({ projectId: 'p1', kind: 'plan' })
+  })
+
   it('maps an error envelope to a typed TurnStartError', async () => {
     const fetchFn = vi.fn(async () =>
       new Response(JSON.stringify({ error: { message: 'A turn is already running.' } }), {

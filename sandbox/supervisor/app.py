@@ -1340,7 +1340,10 @@ def served() -> dict[str, Any]:
     talking, only by being used.
 
     A missing log file is `served: 0`, not an error: it is what a container that has never served
-    a request looks like, and that is exactly the container this signal exists to identify."""
+    a request looks like, and that is exactly the container this signal exists to identify.
+
+    AUDIT-2026-09-03 · verified-alive: intentionally retained pending verification — see the
+    audit record."""
     try:
         size = _SERVED_LOG.stat().st_size
         with _SERVED_LOG.open("r", encoding="utf-8", errors="replace") as fh:

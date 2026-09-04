@@ -89,9 +89,11 @@ export default function AppPaneHost({ device, reloadNonce, leaving }: AppPaneHos
   //                  iframe — leaving a build chat right after the build SUCCEEDS, which is the
   //                  most common moment to leave one, destroys an app the server is still serving.
   //
-  // These are the only two. Every other pane field that reaches the frame chain — `relaunching`,
-  // `reconnecting`, `previewState` — defaults to the permissive value, so losing it cannot unmount
-  // anything. Adding a restrictive-by-default field to `PaneView` means adding it here too.
+  // These are the only two. Every other pane field that reaches the frame chain — `reconnecting`,
+  // `previewState`, `compileState` — defaults to the permissive value, so losing it cannot unmount
+  // anything. (`relaunching` was a third such field and the one genuine counter-example: it
+  // defaulted permissively too, but only because it was never read. It is gone with the rest of the
+  // relaunch chain.) Adding a restrictive-by-default field to `PaneView` means adding it here too.
   //
   // Holding the last published value keeps the leave side inert. The RETURN side still re-frames
   // where it should, and that is correct and unchanged: a remounted surface publishes its own pane

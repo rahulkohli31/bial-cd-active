@@ -54,9 +54,11 @@ export default function Navbar() {
   // the ask failed — never rendered as a number, and never asked for at all unless this
   // user is a superadmin (see the effect below).
   const [waiting, setWaiting] = useState<number | null>(null)
-  // The cookie-session /auth/me profile is { id, email, display_name } — no
-  // name/username/role/isAdmin (RBAC deferred this phase). Derive the display bits
-  // from what's actually present.
+  // The /auth/me profile carries { id, email, display_name, is_admin, limits, chat_kinds } —
+  // this comment used to say it had no role or isAdmin and that RBAC was deferred, which is
+  // contradicted three lines of this same component later: `isAdmin` gates the waiting-count
+  // fetch and the admin link. Only the DISPLAY bits are derived, and only because the profile
+  // has no separate name/username field.
   const user = getStoredUser()
   const displayName = user?.display_name || user?.email || 'User'
   const secondaryLine = user?.display_name ? user?.email || '' : ''

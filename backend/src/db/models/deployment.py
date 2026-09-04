@@ -242,8 +242,9 @@ class Deployment(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base):
     # THEN awaits the revision, so a row that settles FAILED at step 6 can name a container
     # that exists, is externally addressable, holds the app's database URL and Blob SAS, and
     # bills. The kill-switch therefore resolves the row to stamp through
-    # `store.latest_for_app`, never `last_successful`, and a stamp on a FAILED row means
-    # exactly what it says: THIS is the attempt whose container was torn down.
+    # `store.latest_for_app` — the newest row, never the newest SUCCEEDED one — and a stamp on
+    # a FAILED row means exactly what it says: THIS is the attempt whose container was torn
+    # down.
     #
     # READ IT OFF THE NEWEST ROW. An older row keeps whatever value it had when it was
     # current and is not maintained afterwards — "is this app live?" is a question about the

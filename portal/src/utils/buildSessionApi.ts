@@ -9,7 +9,7 @@
  * never `any`. Every non-2xx becomes an `ApiError` (via `readApiError`) so callers
  * branch on `.status` / `.code` (409 / 403) instead of re-parsing envelopes.
  *
- * CSRF (KTD-2): `start` / `stop` / `forceEnd` are mutating POSTs and carry the
+ * CSRF (KTD-2): `relaunchPreview` / `stop` / `forceEnd` are mutating POSTs and carry the
  * signed double-submit token (`X-CSRF-Token`, reusing `auth.js` `getCsrfToken()`);
  * `getStatus` GET and the SSE GET (a separate transport, `buildSessionEvents.ts`)
  * are safe methods and carry NO token. This is net-new: no prior business route in
@@ -26,8 +26,6 @@ import type {
   ForceEndResponse,
   RelaunchPreviewRequest,
   RelaunchPreviewResponse,
-  StartBuildRequest,
-  StartBuildResponse,
   StopBuildRequest,
   StopBuildResponse,
 } from './buildSessionTypes'
@@ -39,15 +37,11 @@ import type {
  */
 export type AuthFetchDeps = NonNullable<Parameters<typeof authFetch>[2]>
 
-// ─── Frozen TTL + cadence constants (mirror C3 §3) ───────────────────────────
-// Re-exported here so U4's lifecycle hook keeps ONE source of truth and never
-// invents its own intervals.
-
-/** Lock auto-expires if not renewed (15 min) — a crashed session can't hold the sandbox forever. */
-export const LOCK_TTL_SECONDS = 900
-/** Heartbeat key TTL (3× cadence) — tolerate two missed beats before the reaper treats the session as idle. */
-export const HEARTBEAT_TTL_SECONDS = 90
-
+// THE TWO MIRRORED TTLs ARE GONE TOO (`LOCK_TTL_SECONDS`, `HEARTBEAT_TTL_SECONDS`). Their header
+// said they lived here so the lifecycle hook kept one source of truth — and that hook was deleted,
+// so the mirror had no reader and only a schema to disagree with. The backend schema is the real
+// source of truth and is pinned by its own tests, so nothing knowable was lost with them.
+//
 // THE TWO CLIENT CADENCES ARE GONE, along with `renewLock` and `heartbeat` themselves. U13
 // deleted the blind keep-alive loop that was their only caller, and a client function with no
 // caller is not neutral: it reads as a supported way to keep a session alive, and the next
@@ -62,10 +56,12 @@ const BASE = '/api/build-sessions'
 const JSON_HEADERS = { 'Content-Type': 'application/json' }
 
 /**
- * Thrown by `start` (and `relaunchPreview`) on a `409 build_session_already_active`,
- * carrying the EXISTING session's id so the caller can `getStatus` it and decide,
- * by comparing projectIds, between re-attach (same project) and block (cross-project)
- * — the `409` alone is not a self-describing discriminator (U5 identity model).
+ * Thrown by `relaunchPreview` on a `409 build_session_already_active`, carrying the EXISTING
+ * session's id — the `409` alone is not a self-describing discriminator (U5 identity model).
+ *
+ * Its one live handler is `StartAppControl`, which reports "a build is already running in this
+ * project" through the workspace state. The session hook's block banner, which used to render this
+ * with a force-end button, is gone: it hung off a pane callback nobody consumed.
  */
 export class BuildSessionAlreadyActiveError extends ApiError {
   readonly existingSessionId: string | null
@@ -123,18 +119,6 @@ function requireProjectId(value: Record<string, unknown>): string {
     throw new ApiError('The server returned a build session we could not read.', 500)
   }
   return value.projectId
-}
-
-function toStartBuildResponse(value: unknown): StartBuildResponse {
-  if (!isRecord(value)) throw new ApiError('The server returned a build session we could not read.', 500)
-  return {
-    sessionId: requireSessionId(value),
-    projectId: requireProjectId(value),
-    appId: asString(value.appId),
-    status: toBuildSessionStatus(value.status),
-    previewUrl: asStringOrNull(value.previewUrl),
-    createdAt: asString(value.createdAt),
-  }
 }
 
 function toRelaunchPreviewResponse(value: unknown): RelaunchPreviewResponse {
@@ -249,20 +233,10 @@ async function postJson(url: string, body: unknown, fallback: string, deps: Auth
 
 // ─── control operations (C3 §2) ─────────────────────────────────────────────
 
-/**
- * `start` — create a build session for a project. 409 → `BuildSessionAlreadyActiveError` (carries
- * the existing id).
- *
- * `conversationId` is sent ONLY when supplied (mirroring `stop`'s optional `reason`): the field is
- * an additive, optional amendment to the frozen C3 body, so omitting it must produce the exact
- * pre-R3 request. When sent, the server grounds the build in that thread's attachments.
- */
-export async function start(args: StartBuildRequest, deps: AuthFetchDeps = {}): Promise<StartBuildResponse> {
-  const payload: Record<string, string> = { projectId: args.projectId, prompt: args.prompt }
-  if (args.conversationId !== undefined) payload.conversationId = args.conversationId
-  const body = await postJson(BASE, payload, 'Failed to start build session', deps)
-  return toStartBuildResponse(body)
-}
+// `start` IS GONE. It POSTed `BASE` to provision a C3 build session, and nothing had called it
+// since row creation and the build itself moved inside the turn's own transaction — a composer
+// send is a TURN. Its 409 fed the block banner, which this unit deletes with it. The ROUTE stays:
+// deleting a browser client says nothing about the surface it spoke to.
 
 /**
  * `relaunch` — restore a project's saved app into a fresh, ready sandbox and get its live URL (#43).
@@ -296,8 +270,13 @@ export async function getStatus(sessionId: string, deps: AuthFetchDeps = {}): Pr
 //
 // `acquireLock` and `releaseLock` are GONE (U28): nothing called them — the portal's blind
 // keep-alive loop that was their only caller was itself deleted back in U13, same as
-// `renewLock` and `heartbeat` before them (see the note above). `forceEnd` is the one lock
-// op still reachable from the UI, fed by relaunch's 409.
+// `renewLock` and `heartbeat` before them (see the note above).
+//
+// `forceEnd` HAS NO UI LEFT EITHER, and is kept anyway. Its one control was the block banner's
+// Force-end button, deleted with the banner. It stays because it is the owner-only kill switch for
+// the case the whole lock op exists for — a session stuck mid-`building` that never emits a
+// terminal `ended` (C3 §3.4) — and retiring the portal's only client for that route is the stop
+// lineage's call to make, not this sweep's.
 
 /** `force-end` — the owner-only kill switch (`kill_switch()`), regardless of in-flight state. A non-owner → `403 build_session_forbidden`. */
 export async function forceEnd(sessionId: string, deps: AuthFetchDeps = {}): Promise<ForceEndResponse> {
@@ -312,7 +291,6 @@ export async function forceEnd(sessionId: string, deps: AuthFetchDeps = {}): Pro
  * `EventSource` factory (`buildSessionEvents.ts`).
  */
 export interface BuildSessionClient {
-  start: typeof start
   relaunchPreview: typeof relaunchPreview
   stop: typeof stop
   getStatus: typeof getStatus
@@ -321,7 +299,6 @@ export interface BuildSessionClient {
 
 /** The real, wired-by-default client (this track merges after SESSION-API, so no swap is needed at merge — KTD-6). */
 export const buildSessionClient: BuildSessionClient = {
-  start,
   relaunchPreview,
   stop,
   getStatus,

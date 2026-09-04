@@ -1,35 +1,56 @@
 import { test, expect, type Page } from '@playwright/test'
 
 /**
- * Open a composer and return its hidden file input.
- *
- * Two things moved under this spec's feet and it never noticed, because the suite could not
- * run at all (playwright.config imported an undeclared `dotenv`):
- *
- *  1. `goto('/chat')` — project-first deleted the bare route; a chat lives inside a project.
- *  2. `getByTestId('chat-file-input')` / `assistant-message` — both lived on BialChatPage.jsx,
- *     which the same change deleted. Nothing re-added them, so we address the composer's
- *     file input directly rather than re-introduce a test-only attribute into product code.
+ * Open a composer on a fresh project's chat, ready to stage a file.
  *
  * Nothing is ever sent here, so no conversation row is created and no model turn is spent.
  */
-async function openComposer(page: Page) {
+async function openComposer(page: Page): Promise<void> {
   const res = await page.request.post('/api/projects', {
     data: { name: `E2E Deck ${Date.now()}` },
   })
   const projectId = (await res.json()).id as string
   await page.goto(`/chat/${crypto.randomUUID()}?projectId=${projectId}&kind=builder`)
 
-  const input = page.locator('input[type=file]').first()
-  await expect(input).toBeAttached()
-  return input
+  await expect(page.getByTestId('composer-attach')).toBeVisible()
 }
 
-/** A rejected attachment must never reach the model. Watch the wire, not a removed testid. */
+/**
+ * Stage a file the way a citizen does — through the paperclip's own file chooser.
+ *
+ * THERE IS NO PERSISTENT `input[type=file]` TO ADDRESS. The composer is the library's, and its
+ * add-attachment control opens a chooser on press rather than sitting over a hidden input in the
+ * DOM — so `locator('input[type=file]')` matched nothing and this helper waited for an element
+ * that is only ever created for the duration of a click. Arm the wait BEFORE the press: the
+ * chooser event fires during the click, so a wait armed afterwards has already missed it.
+ */
+async function attachFile(
+  page: Page,
+  file: { name: string; mimeType: string; buffer: Buffer },
+): Promise<void> {
+  const chooser = page.waitForEvent('filechooser')
+  await page.getByTestId('composer-attach').click()
+  await (await chooser).setFiles(file)
+}
+
+/**
+ * The one thing this spec exists for: a rejected attachment must never reach the model. Watch the
+ * wire, not a removed testid.
+ *
+ * THE TURN-SEND ENDPOINT, not the retired `/api/claude` relay. A message reaches the model through
+ * `POST /api/conversations/{id}/turns` (`src/utils/turnStreamApi.ts`), and that route is the only
+ * thing that starts a turn — so counting `/api/claude` counted a request the portal has not made
+ * since the relay was retired, and the headline assertion below was vacuously true.
+ *
+ * MATCHED ON THE PATH'S SHAPE, not on a substring: the sibling `…/turns/{turnId}/stop` is also a
+ * POST whose URL contains `/turns`, and counting it would make a Stop press read as a send.
+ */
+const TURN_SEND = /^\/api\/conversations\/[^/]+\/turns$/
+
 function watchModelCalls(page: Page): { count: () => number } {
   let n = 0
   page.on('request', (req) => {
-    if (req.method() === 'POST' && req.url().includes('/api/claude')) n += 1
+    if (req.method() === 'POST' && TURN_SEND.test(new URL(req.url()).pathname)) n += 1
   })
   return { count: () => n }
 }
@@ -45,9 +66,9 @@ function watchModelCalls(page: Page): { count: () => number } {
 test.describe('deck attachment rejections (client-side)', () => {
   test('legacy .ppt gets the generic unsupported-type message, not advice it cannot follow', async ({ page }) => {
     const model = watchModelCalls(page)
-    const input = await openComposer(page)
+    await openComposer(page)
 
-    await input.setInputFiles({
+    await attachFile(page, {
       name: 'legacy.ppt',
       mimeType: 'application/vnd.ms-powerpoint',
       buffer: Buffer.from('legacy-binary-ppt'),
@@ -70,13 +91,13 @@ test.describe('deck attachment rejections (client-side)', () => {
 
   test('an oversize attachment (> 4 MB) is rejected and generates no assistant turn', async ({ page }) => {
     const model = watchModelCalls(page)
-    const input = await openComposer(page)
+    await openComposer(page)
 
     // A PDF, not the .pptx this used to use: with decks off the allowlist check fires
     // BEFORE the size check, so an oversize .pptx never reaches the 4 MB cap and this test
     // silently stopped exercising it. A PDF is accepted at any flag setting, so the cap is
     // genuinely the thing being tested again.
-    await input.setInputFiles({
+    await attachFile(page, {
       name: 'oversize.pdf',
       mimeType: 'application/pdf',
       buffer: Buffer.alloc(4 * 1024 * 1024 + 128 * 1024), // ~4.1 MB > 4 MB cap

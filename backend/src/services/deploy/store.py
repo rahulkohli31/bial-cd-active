@@ -317,23 +317,6 @@ async def latest_for_app(db: AsyncSession, *, app_id: uuid.UUID) -> Deployment |
     return row
 
 
-async def last_successful(db: AsyncSession, *, app_id: uuid.UUID) -> Deployment | None:
-    """The app's last known-good deploy — the rollback source. Its `image_digest` names an
-    image that already exists in the registry, so rolling back is one ARM call rather than
-    a rebuild."""
-    row: Deployment | None = await db.scalar(
-        sa.select(Deployment)
-        .where(
-            Deployment.app_id == app_id,
-            Deployment.status == DeploymentStatus.SUCCEEDED,
-            Deployment.image_digest.is_not(None),
-        )
-        .order_by(Deployment.id.desc())
-        .limit(1)
-    )
-    return row
-
-
 async def in_flight(db: AsyncSession, *, app_id: uuid.UUID) -> uuid.UUID | None:
     """The running deployment id for this app, if any. Used to block unpublish while a
     deploy is in progress (#113) — letting it through would race the in-flight pipeline's

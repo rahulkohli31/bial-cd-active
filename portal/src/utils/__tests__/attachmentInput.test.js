@@ -5,7 +5,6 @@ import {
   resolveMediaType,
   textAttachmentBytes,
   fileToBase64,
-  toAttachmentRef,
   ACCEPT_ATTR,
   MAX_FILE_SIZE,
   MAX_TEXT_FILE_SIZE,
@@ -144,14 +143,6 @@ describe('validateConversationAttachmentCap', () => {
     const res = validateConversationAttachmentCap(MAX_ATTACHMENTS_PER_CONVERSATION, 1)
     expect(res.error).toMatch(/this conversation/i)
     expect(res.error).not.toMatch(/per message/i)
-  })
-})
-
-describe('toAttachmentRef', () => {
-  it('strips the transient base64 down to the persisted ref', () => {
-    expect(
-      toAttachmentRef({ id: 'x', name: 'a.png', mediaType: 'image/png', size: 12, base64: 'SECRETBYTES' }),
-    ).toEqual({ id: 'x', name: 'a.png', mediaType: 'image/png', size: 12 })
   })
 })
 

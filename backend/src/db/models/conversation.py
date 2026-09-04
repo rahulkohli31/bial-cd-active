@@ -1,10 +1,16 @@
 """The `conversations` table — one chat, keyed by a CLIENT-MINTED id, with a fixed kind.
 
-A conversation is minted by the SPA (`crypto.randomUUID`) and its id is externally
-meaningful: a *builder* conversation's id IS the deployed `appId` (Plan B's
-`app_registry.conversation_id` soft-links to it), so the id must be PRESERVED across the
-migration (R4) — the SPA supplies it on the first append, never the server. The
-`UUIDv7PrimaryKeyMixin` default only covers a hypothetical server-minted row.
+A conversation is minted by the SPA (`crypto.randomUUID`) and supplies its own id on the first
+append, never the server; the `UUIDv7PrimaryKeyMixin` default only covers a hypothetical
+server-minted row.
+
+THE ID IS NO LONGER THE APP'S ID. This said "a *builder* conversation's id IS the deployed
+`appId`" — that 1:1 identity is retired and `app_registry.py` says so at both ends: an app is
+PROJECT-scoped with its own id (`uq_app_registry_project`, one app per project), and
+`app_registry.conversation_id` was repurposed into a soft HEAD POINTER at the last build session
+that touched the app. Many conversations build against one app over its life, so an id read as an
+`appId` names the wrong thing. The id still must not be reassigned — it is what the SPA routes on
+and what `conversation_id` points at — but preserving it is no longer preserving an app identity.
 
 `kind` is a native PG enum (ADR-0008) and it is the WHOLE classification: `plan` or `build`,
 chosen at creation and never changed, because no route mutates it (R14/R15). Tool gating
@@ -93,6 +99,13 @@ class Conversation(UUIDv7PrimaryKeyMixin, TimestampMixin, OwnedByUserMixin, Base
     # Derived client-side from the first message; mutable via PATCH. TEXT (short in
     # practice — the SPA caps it ~40 chars — but unbounded here).
     title: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
-    # Opaque builder-generation settings ({theme, uploadedFiles, dataSchema, …}) — stored
-    # verbatim, never inspected by the server.
+    # An opaque SPA-owned bag: stored verbatim, never inspected by the server, and settable
+    # through `POST /conversations` and the header PATCH.
+    #
+    # NOTHING WRITES IT TODAY, AND IT IS KEPT ANYWAY. It carried the Express-POC builder's
+    # generation settings; `theme` went with the Select Theme control (#157 B1) and
+    # `uploadedFiles` never had a producer, so the last live round trip through it was dead and
+    # has been removed. Production rows still hold POC-era payloads no code can reconstruct, so
+    # the column stays and a `DROP COLUMN` is a separate, staged decision — not a dead-code
+    # sweep. The read path is untouched: a row's stored value is still served on the header.
     context: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)

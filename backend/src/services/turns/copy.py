@@ -2,9 +2,12 @@
 
 ONE FILE, FOR TWO REASONS THAT ARE BOTH ABOUT KEEPING A PROMISE. The plan commits that no message
 it introduces contains a file path, a command, a library name or a framework term — and a promise
-about a class of text can only be tested if the class has an address. `test_no_jargon_reaches_the_
-citizen` iterates over this module; a sentence written inline at its call site would be outside
-that guard by construction, and nobody would notice until a user read it.
+about a class of text can only be tested if the class has an address.
+`test_write_turn.py::test_no_sentence_this_plan_shows_a_citizen_carries_developer_jargon` iterates
+`vars()` of this module; a sentence written inline at its call site would be outside that guard by
+construction, and nobody would notice until a user read it. (This paragraph named the guard
+`test_no_jargon_reaches_the_citizen`, which is not a test anywhere in the tree — so a reader
+checking the promise found nothing and had every reason to conclude the guard was gone.)
 
 The second reason is precedence. The plan's message surface allows AT MOST ONE banner on screen at
 a time, newest wins, and deciding that is only possible when the whole set is visible together.
@@ -261,7 +264,9 @@ address, so the sentence ends in a dead end. `{contact}` is a single configured 
 (`ApiSettings.SUPPORT_CONTACT_EMAIL`), and it is a plain address rather than a `mailto:` URI on
 purpose: the banner above the composer renders text, and a URI scheme printed mid-sentence is
 exactly the register this module exists to keep out. Making it clickable is the renderer's job —
-`BuildProgress` turns the address in this sentence into a real `mailto:` link.
+`portal/src/components/chat/TurnBanner.tsx` finds the address in this sentence and wraps it in a
+real `mailto:` anchor. It was `BuildProgress.tsx`, which the two-page era's removal deleted; the
+behaviour moved to `TurnBanner` with it.
 
 "After midnight" rather than a clock time: the reset is the next IST midnight, this is a
 single-tenant deployment in one timezone, and a rendered timestamp would invite the reader to

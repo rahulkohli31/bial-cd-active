@@ -6,15 +6,20 @@
  *
  * Resolution order, and why each arm exists:
  *
- *  1. The conversation exists → its `kind` picks the page and its `projectId` is
- *     authoritative. The SERVER wins over `?kind=`: a stale or hand-edited query
- *     must never render a builder over a planning transcript.
+ *  1. The conversation exists → its `kind` and its `projectId` are authoritative. The
+ *     SERVER wins over `?kind=`: a stale or hand-edited query must never render a build
+ *     chat over a planning transcript. The kind no longer picks a PAGE — one surface
+ *     renders both kinds, and what the kind decides is a single declaration inside it
+ *     (see `ConversationSlot`'s own note). It is still resolved here because the surface
+ *     needs it, not because it routes.
  *  2. It 404s but the URL carries `?projectId=` → this is a brand-new chat whose row
- *     does not exist yet. There is no header-only create endpoint; the row appears on
- *     the first `appendMessage`. So a new chat opens at
- *     `/chat/{clientMintedId}?projectId={pid}&kind={plan|build}` and the page
- *     rewrites to the bare `/chat/{id}` once that first append lands. This is what
- *     lets a flat path survive a reload and a cold open.
+ *     does not exist yet. Not because no create endpoint exists — `POST /v1/conversations`
+ *     is still served, deliberately, with no client caller — but because the row is now
+ *     written inside the FIRST TURN's own transaction, so there is no separate round trip
+ *     to make it appear. So a new chat opens at
+ *     `/chat/{clientMintedId}?projectId={pid}&kind={plan|build}` and the page rewrites to
+ *     the bare `/chat/{id}` once that first turn commits. This is what lets a flat path
+ *     survive a reload and a cold open.
  *  3. It 404s with no query → the chat is gone (or was never real). Back to /projects.
  *
  * The breadcrumb's project name is resolved separately and never gates rendering: a
@@ -25,7 +30,7 @@
  * would mean restructuring both pages' hydration effects, which this phase defers.
  *
  * The ONE request we do skip is the one that cannot succeed: a chat this session just
- * minted has no row yet (U7 defers creation to the send path), so its GET is a
+ * minted has no row yet (creation happens in the send path's transaction), so its GET is a
  * guaranteed 404 — doubled by the two hydration fetches and doubled again by StrictMode
  * in dev. See `freshlyMinted` below for why the skip is keyed on router state and not on
  * the query.

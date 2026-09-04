@@ -21,10 +21,15 @@
  * expires without one. A lock that never clears is worse than no lock.
  *
  * DEMOTED TO ADVISORY (Phase-2, ORIG-§3-g / KTD-7). The AUTHORITATIVE one-build-per-user
- * barrier now lives server-side: C3 `start` returns `409 build_session_already_active` (carrying
- * the existing sessionId), and the cockpit renders the block + force-end UI from that. This
- * module keeps only the FAST LOCAL UX role — `blockedBy` is the instant cross-tab "another chat
- * is building" pre-check (a toast before the network round-trip). `acquire`/`release` are advisory
+ * barrier lives server-side, and still does: the C3 routes answer `409 build_session_already_active`
+ * carrying the existing sessionId. WHAT CHANGED IS WHO RENDERS IT. This used to say "the cockpit
+ * renders the block + force-end UI from that"; there is no such UI any more — the banner and its
+ * Force-end button went with the browser's `start` client, and the 409 now reaches two live
+ * surfaces instead, each answering in its own sentence: `relaunchPreview` throws
+ * `BuildSessionAlreadyActiveError` (`buildSessionApi.ts`) and the turn stream carries the same
+ * code (`turnStreamApi.ts`). This module keeps only the FAST LOCAL UX role — `blockedBy` is the
+ * instant cross-tab "another chat is building" pre-check (`ConversationSurface.tsx` calls it
+ * before the network round-trip). `acquire`/`release` are advisory
  * mirrors: a stale or lost local claim never blocks the authoritative C3 start, and the server's
  * 409 is the real gate. This mirrors the daily-vs-context seam — the client mirror is advisory,
  * the server is the enforcement boundary ([[per-user-limits-daily-vs-context-propagation-2026-07-09]]).

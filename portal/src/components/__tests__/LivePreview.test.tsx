@@ -345,16 +345,17 @@ describe('LivePreview — one persistent status region announces every state', (
     expect(region?.textContent).toBe('')
   })
 
-  it('routes the RESTORE through the labelled wait, announced — not through a terminal card', async () => {
-    // AE9's "behind a labelled wait, and at no point is an error shown". The labelled wait
-    // already existed (`showRestoring`); what it never had was a voice — it carried
-    // `aria-busy`, which announces nothing at all.
-    const { container } = render(
-      <LivePreview previewUrl={null} status="ended" relaunching hasSavedBuild onRelaunch={vi.fn()} />,
-    )
+  it('routes a RESTORE through the labelled wait, announced — not through a terminal card', async () => {
+    // AE9's "behind a labelled wait, and at no point is an error shown", RE-POINTED. The wait it
+    // used to drive was `showRestoring`, keyed off a `relaunching` prop nothing could set — the
+    // pane accepted `onRelaunch` and never read it, so no restore could ever have raised it. The
+    // restore a citizen can actually run comes back as a `previewUrl`, and the wait that labels it
+    // is the frame's own load gate. AE9's claim is the same; the wait it is asserted against is
+    // the one a restore reaches.
+    const { container } = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" hasSavedBuild />)
 
-    expect(container.textContent).toMatch(/restoring your app/i)
-    expect(screen.getByRole('status').textContent).toMatch(/restoring your app/i)
+    expect(container.textContent).toMatch(/starting your app/i)
+    expect(screen.getByRole('status').textContent).toMatch(/starting your app/i)
     expect(container.querySelector('[data-testid="preview-ended-card"]')).toBeNull()
     expect(screen.queryByRole('alert')).toBeNull()
   })

@@ -276,7 +276,10 @@ async def patch_conversation(
     """Update the mutable header fields the SPA owns: `title` and `context`. The legacy `code`
     snapshot is gone with its column (0024) — code truth lives in `app_registry.current_code`
     and the build snapshots; a body that still sends `code` gets a 400 naming the retirement,
-    not a silent ignore."""
+    not a silent ignore.
+
+    AUDIT-2026-09-03 · verified-alive: intentionally retained pending verification — see the
+    audit record."""
     if not _ID_RE.match(conversation_id):
         raise AppApiError(400, "Invalid conversation id.")
     body = await _json_object_body(request)

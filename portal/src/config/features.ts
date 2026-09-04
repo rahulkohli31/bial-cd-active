@@ -20,5 +20,7 @@
 // publish swap or roll it back without a redeploy. That is exactly why the
 // three retired controls' 48 test cases were walked before they were deleted:
 // the parity pass is the only safety net that exists here.
+//
+// AUDIT-2026-09-03 · verified-alive: intentionally retained pending verification — see the audit record.
 
 

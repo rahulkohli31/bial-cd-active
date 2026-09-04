@@ -95,8 +95,10 @@ export default function App() {
             them.
 
             NOTE: `/apps/:appId` is deliberately NOT a route here, and deliberately not part of
-            this layout — nginx proxies /apps/ to the backend runner, and the Vite dev proxy does
-            not, so an SPA route there would work locally and 404 in the deployed container. */}
+            this layout. BOTH edges send `/apps/` to the control plane — nginx (`portal/nginx.conf`)
+            and the Vite dev proxy (`vite.config.js`) — so a route declared here would be shadowed
+            before React Router ever saw it, in dev and in the container alike. A deployed app is
+            reached on the apps hostname at `/a/<key>/` (nginx SITE 2), never from here. */}
         <Route element={<RequireAuth><WorkspaceShell /></RequireAuth>}>
           <Route path="/projects/:projectId" element={<ProjectPage />} />
           {/* One flat chat URL for both kinds, and ONE surface behind it: `ChatRoute` renders

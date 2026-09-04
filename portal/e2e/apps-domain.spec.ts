@@ -73,34 +73,25 @@ test.describe.serial('generated apps on the shared apps hostname (opt-in, E2E_AP
 
     await createProject(page, `Apps Domain E2E ${Date.now()}`)
 
-    // Plan is the sticky default and would open an interview instead of building. Switch to Write
-    // the way a citizen does — through the mode pill — because this suite is about the address a
-    // built app is served at, not about interview behaviour.
-    await page.getByRole('button', { name: /Mode: .*Switch mode/i }).click()
-    await page.getByRole('menuitemradio', { name: /Write/i }).click()
+    // A chat's kind is fixed when it is created, so it is chosen HERE, before the first message,
+    // through the rail's picker — the way a citizen does. Build is the rail's default, but this
+    // suite is about the address a built app is served at, so the kind is pressed explicitly
+    // rather than inherited from a default that is free to change.
+    await page.getByRole('radio', { name: 'Build' }).click()
 
-    await page.getByPlaceholder(/Describe the app you want built/i).fill(
+    await page.getByPlaceholder(/describe the change you need/i).fill(
       'Build a simple visitor log: a form to add a visitor name and their host, and a table listing all visitors.',
     )
-    await page.getByRole('button', { name: /start chat/i }).click()
+    await page.getByTestId('composer-send').click()
     await expect(page).toHaveURL(/\/chat\/[0-9a-f-]{36}$/)
     chatUrl = page.url()
     console.log(`CHAT: ${chatUrl}`)
 
-    // Whether the harness proposes a brief first or goes straight to building is a MODEL decision,
-    // not a UI contract — asserting either one specifically makes this test flaky for a reason
-    // that has nothing to do with the address it exists to check. Accept whichever arrives.
-    const card = page.getByTestId('build-brief-card')
+    // NOTHING TO PRESS BETWEEN THE SEND AND THE BUILD. This used to accept either a proposed brief
+    // card or a live preview, because which one arrived was a MODEL decision — a Build chat makes
+    // no such proposal any more: the send pins a container and the agent writes into it. So the
+    // only outcome to wait for is the preview address, which the next assertion already waits for.
     const iframe = page.locator('iframe[title="App Preview"]')
-    const deadline = Date.now() + 6 * 60_000
-    let outcome = ''
-    while (Date.now() < deadline && outcome === '') {
-      if (await card.isVisible().catch(() => false)) outcome = 'brief'
-      else if (/\/a\/sbx-/.test((await iframe.getAttribute('src').catch(() => null)) ?? '')) outcome = 'preview'
-      else await page.waitForTimeout(2_000)
-    }
-    expect(outcome, 'neither a build brief nor a live preview appeared').not.toBe('')
-    if (outcome === 'brief') await card.getByRole('button', { name: /build this/i }).click()
 
     // THE CONTRACT: the shared origin, `/a/`, and an `sbx-` key. Explicitly NOT a per-app
     // `*.azurecontainerapps.io` address — that is the shape this change replaced, and asserting
@@ -198,12 +189,16 @@ test.describe.serial('generated apps on the shared apps hostname (opt-in, E2E_AP
     // finished — the app is served as soon as it boots, and the agent keeps writing files behind
     // it. Saving during that window genuinely works (the POST lands) but the workspace is dirty
     // again moments later, so the button cycles Save -> Saving… -> Save forever and the run reads
-    // like a broken save. The composer's mode pill is disabled for exactly as long as the agent
-    // holds the thread, which makes it the honest "it is my turn now" signal.
+    // like a broken save.
+    //
+    // THE GATE NOTE IS THE HONEST "it is my turn now" SIGNAL, now that the mode pill this used to
+    // watch is gone. The composer is never `disabled` in any state, so there is no control whose
+    // enabled-ness says this; what the composer does instead is state the one reason Send is
+    // waiting, in that note, for exactly as long as something holds the thread. No note, no hold.
     await expect(
-      page.getByRole('button', { name: /Mode: .*Switch mode/i }),
+      page.getByTestId('composer-gate-note'),
       'the build agent never released the conversation',
-    ).toBeEnabled({ timeout: 20 * 60_000 })
+    ).toHaveCount(0, { timeout: 20 * 60_000 })
 
     // RETRIED, because a Save can be REFUSED and say nothing. `POST …/save` answers 409 while the
     // build session still holds the workspace lock — which outlives the composer being re-enabled
@@ -223,7 +218,13 @@ test.describe.serial('generated apps on the shared apps hostname (opt-in, E2E_AP
     }
     expect(saved, 'the workspace never reached a saved state (POST /save keeps answering 409)').toBe(true)
 
-    await page.getByTestId('publish-button').click()
+    // The single publish button is gone: publishing now lives behind the status chip, so the
+    // action is two presses — open the popover, then press the one action it offers (there is
+    // AT MOST one, and a state with nothing to do renders none). `publish-url` below is inside
+    // that same popover, so this spec needed the chip open regardless.
+    await page.getByTestId('publish-chip').click()
+    await expect(page.getByTestId('publish-popover')).toBeVisible({ timeout: 30_000 })
+    await page.getByTestId('publish-action').click()
     await expect(page.getByTestId('data-classification-modal')).toBeVisible({ timeout: 30_000 })
 
     // Declare nothing sensitive, so the server auto-publishes instead of routing to a human

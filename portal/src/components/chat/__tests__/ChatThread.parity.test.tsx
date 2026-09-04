@@ -2,10 +2,11 @@
  * THE PARITY CHECKLIST, ASKED OF THE NEW HOST (R52).
  *
  * `MessageContent.test.tsx` is the checklist R52 asks someone to write and it was already written —
- * 21 cases, 44 assertions. It still passes UNCHANGED, because `MessageContent` is re-hosted rather
- * than replaced: not one line of its sanitisation pipeline moved. That file is the guarantee; this
- * file is the mirror question L5 insists on afterwards — what does the NEW host do that the old
- * one could not?
+ * 20 cases, 43 assertions. Not one line of its sanitisation pipeline has moved through the port;
+ * the one case it has lost is `compact`, whose prop went when one surface absorbed the two pages
+ * that used to size their rails differently, recorded as an amendment in that file's own docblock.
+ * That file is the guarantee; this file is the mirror question L5 insists on afterwards — what
+ * does the NEW host do that the old one could not?
  *
  * Three answers, each asserted below rather than reasoned about:
  *   - a model-authored `<img>` still cannot reach the DOM (there is no `img-src` CSP anywhere in

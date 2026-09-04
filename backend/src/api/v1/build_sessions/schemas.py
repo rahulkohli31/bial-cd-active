@@ -69,8 +69,16 @@ class BuildSessionStatus(enum.StrEnum):
 # is the only renewer now, in-process, via `locks.py`/`manager.py`/`reaper.py`.
 
 LOCK_TTL_SECONDS = 900  # 15 min — lock auto-expires if not renewed (C5 reaper reconciles).
-LOCK_RENEW_CADENCE_SECONDS = 300  # 5 min — client renews at ⅓ TTL (two renews of head-room).
-HEARTBEAT_CADENCE_SECONDS = 30  # portal heartbeats every 30 s while the tab is open.
+# THE TWO CADENCES BELOW HAVE NO RUNTIME READER LEFT, and saying so is the point: they were
+# written for the browser that renewed on a timer, and that caller is gone. What renews now is
+# `manager.on_progress`, which calls `renew_lock` + `write_heartbeat` on every non-terminal
+# progress envelope — so a build in flight renews as fast as it produces frames, not on a clock.
+# They stay as the C3-frozen HEAD-ROOM RATIOS the live TTLs are sized against — each is ⅓ of
+# the TTL beside it, so two renewals may be missed before anything lapses. `test_locks.py::
+# test_lock_ttl_has_renew_headroom` pins the lock half of that inequality; the seconds
+# themselves are pinned by `test_schemas.py::test_cadence_constants_are_the_frozen_c3_values`.
+LOCK_RENEW_CADENCE_SECONDS = 300  # 5 min — ⅓ TTL, i.e. two renews of head-room.
+HEARTBEAT_CADENCE_SECONDS = 30  # ⅓ of the heartbeat TTL below, on the same ratio.
 HEARTBEAT_TTL_SECONDS = 90  # 3× cadence → tolerate 2 missed beats before idle-teardown.
 # A relaunched preview (#43) holds no lock and renews no heartbeat, so it gets an
 # explicit STAY OF EXECUTION instead: 30 min. Long enough to actually look at the

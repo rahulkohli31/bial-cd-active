@@ -79,13 +79,6 @@ class _RecordingDeployService:
         return StartedDeploy(deployment_id=uuid.uuid4(), app_id=app_id)
 
 
-class _CleanSaveState:
-    dirty = False
-    # The version already saved IS the version that ships — the same commit the store's
-    # stamp names, which the route cross-checks before it decides anything (U10).
-    saved_head = _SHA
-
-
 def _answers(**yes: object) -> dict[str, object]:
     body: dict[str, object] = {
         "credentialsSecrets": False,

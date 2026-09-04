@@ -38,11 +38,12 @@ additionally rendered into the Write prompt's generated `TOOL SURFACE` block
 SENTENCE as the line you want in the prompt.
 
 Refusals are teaching `ModelRetry`s in the U1 sentinel's voice — they say WHY and what to
-do instead, so the model self-corrects rather than retrying blind. "No app exists yet" is
-NOT a refusal: `EmptyProjectWorkspace` makes every tool answer it as a truthful normal
-result (the inverse of the #9 lesson) — but note it is reachable ONLY when no sandbox
-service is configured (`turns/engine._workspace_for`), which is why the Ask segment stopped
-promising the model an emptiness signal (U20).
+do instead, so the model self-corrects rather than retrying blind. There is no "no app
+exists yet" answer here any more: the workspace a turn is given comes from one arm
+(`turns/engine._pin_workspace`, which always resolves the project's live container), so the
+emptiness signal never arrives and the workspace that used to produce it is gone — which is
+why no segment promises the model one (U20; pinned by
+`test_no_segment_promises_an_emptiness_signal_that_never_arrives`).
 
 `psql` is never on this allowlist (plan, locked).
 """
@@ -53,7 +54,6 @@ import asyncio
 import os
 import re
 import time
-import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -154,11 +154,6 @@ class WorkspacePathError(Exception):
     model-facing and teaching — the tool layer wraps it in `ModelRetry`."""
 
 
-class NoAppYetError(Exception):
-    """Raised by `EmptyProjectWorkspace` for every operation; the tool layer converts it
-    into the truthful 'no app exists yet' NORMAL result (not an error)."""
-
-
 @dataclass(frozen=True)
 class ReadExecResult:
     exit: int
@@ -174,9 +169,9 @@ class SearchHit:
 
 
 class ReadOnlyWorkspace(Protocol):
-    """WHERE reads happen. Three implementations — the snapshot extraction, the
-    supervisor-routed live sandbox, and the truthful empty one — so the SAME toolset follows
-    whichever workspace the run attached. Implementations enforce their own jail, to whatever
+    """WHERE reads happen. Two implementations — the snapshot extraction and the
+    supervisor-routed live sandbox — so the SAME toolset follows whichever workspace the run
+    attached. Implementations enforce their own jail, to whatever
     strength their side of the boundary allows; the tool layer enforces the command policy,
     bounds, and redaction — those hold regardless of pairing."""
 
@@ -200,31 +195,6 @@ class ReadOnlyWorkspace(Protocol):
     async def exec_readonly(self, argv: Sequence[str]) -> ReadExecResult:
         """Run an ALREADY-POLICY-CHECKED argv jailed in the workspace."""
         ...
-
-
-@dataclass(frozen=True)
-class EmptyProjectWorkspace:
-    """The no-snapshot workspace: every read answers `NoAppYetError`, which the tool layer
-    renders as the truthful typed result. Keeps 'no app yet' out of every tool's control
-    flow — the toolset is identical whether or not an app exists."""
-
-    app_id: uuid.UUID
-
-    @property
-    def label(self) -> str:
-        return "this project (no app built yet)"
-
-    async def read_file(self, rel_path: str) -> str:
-        raise NoAppYetError
-
-    async def list_files(self) -> list[str]:
-        raise NoAppYetError
-
-    async def search_files(self, pattern: re.Pattern[str], subdir: str | None) -> list[SearchHit]:
-        raise NoAppYetError
-
-    async def exec_readonly(self, argv: Sequence[str]) -> ReadExecResult:
-        raise NoAppYetError
 
 
 @dataclass(frozen=True)
@@ -389,15 +359,6 @@ _LIVE_READ_TIMEOUT_S = int(READ_EXEC_TIMEOUT_S)
 budget as the local twin: with the heavy dirs pruned, walking or grepping an app's own source is
 metadata-cheap — longer means wedged, not working."""
 
-_LIVE_WRONG_TOOL = (
-    "The live workspace only answers `list_files` and `search_files`. To read a file or run a "
-    "command, use the sandbox's own `read_file` / `run_command` — they see this exact same tree."
-)
-"""What `read_file`/`exec_readonly` teach when something reaches them on the live workspace.
-Unreachable in a Build chat (the registry allowlists the two structured reads and gives Build
-the sandbox-routed `read_file`/`run_command`), so this fires only if a composition slips —
-and then it points the model at the tool that works rather than failing it blind."""
-
 
 def _strip_the_dot_slash(path: str) -> str:
     """`find .` and `grep -r .` prefix every path with `./`; the tools speak plain
@@ -454,8 +415,9 @@ class LiveSandboxWorkspace:
 
     Only `list_files` and `search_files` ever run here: `toolsets._WRITE_STRUCTURED_READS`
     allowlists exactly those two, and Write gets the sandbox-routed `read_file`/`run_command`
-    for everything else. The other two are implemented because the Protocol is a contract, not a
-    convention — they refuse with a teaching message instead of existing as a hole.
+    for everything else. The other two are implemented anyway because the Protocol is a
+    contract, not a convention — they do the real read through the same transport rather than
+    existing as a hole.
 
     THE CONTAINMENT GUARD IS LEXICAL ONLY, and that is worth being plain about.
     `ExtractedSnapshotWorkspace`'s resolution jail cannot be reused: `Path.resolve()` answers
@@ -991,13 +953,6 @@ def _cap_redact_cap(text: str, *, budget: int, handle: str | None = None) -> str
     return _render_output(_redacted_lines(text), budget=budget, handle=handle)
 
 
-_NO_APP_YET_RESULT = (
-    "No app exists yet for this project — nothing has been built, so there are no files "
-    "to read. Once a build has run, the app's code will be readable here. Answer the "
-    "user from that fact; do not guess at code that does not exist."
-)
-
-
 # ---------------------------------------------------------------------------------------
 # The toolset factory
 # ---------------------------------------------------------------------------------------
@@ -1025,8 +980,6 @@ def read_only_toolset[DepsT](
         workspace = workspace_of(ctx)
         try:
             text = await workspace.read_file(path)
-        except NoAppYetError:
-            return _NO_APP_YET_RESULT
         except WorkspacePathError as exc:
             raise ModelRetry(str(exc)) from exc
         lines = text.splitlines()
@@ -1049,10 +1002,7 @@ def read_only_toolset[DepsT](
         """List every file in the app (relative paths; heavy dirs like node_modules
         excluded)."""
         workspace = workspace_of(ctx)
-        try:
-            entries = await workspace.list_files()
-        except NoAppYetError:
-            return _NO_APP_YET_RESULT
+        entries = await workspace.list_files()
         if not entries:
             return f"No files found in {workspace.label}."
         shown = entries[:LIST_MAX_ENTRIES]
@@ -1074,8 +1024,6 @@ def read_only_toolset[DepsT](
             ) from exc
         try:
             hits = await workspace.search_files(compiled, path)
-        except NoAppYetError:
-            return _NO_APP_YET_RESULT
         except WorkspacePathError as exc:
             raise ModelRetry(str(exc)) from exc
         if not hits:
@@ -1096,8 +1044,6 @@ def read_only_toolset[DepsT](
             raise ModelRetry(refusal)
         try:
             result = await workspace.exec_readonly(command)
-        except NoAppYetError:
-            return _NO_APP_YET_RESULT
         except WorkspacePathError as exc:
             # A symlink or path token that resolves out of the jail (the escape lexical vetting
             # cannot see) — teach the model back toward the app's own files.

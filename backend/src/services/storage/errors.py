@@ -56,9 +56,3 @@ class StorageSignError(StorageError):
     """A signed-URL request was rejected — most commonly `expires_in` over the
     `MAX_SIGNED_URL_TTL` ceiling, which the ABC rejects fail-closed before any
     backend runs."""
-
-
-class UnsupportedCapabilityError(StorageError):
-    """A capability outside the lowest-common-denominator interface was invoked
-    on a backend that does not support it. Reserved for future provider-specific
-    extensions reached via downcast."""

@@ -1,8 +1,16 @@
 /**
  * MessageContent renders assistant text via Streamdown (react-markdown's replacement, A2) —
- * shared by ChatPage and BuilderPage (PR #112). Covers markdown rendering, the link-safety /
- * img-blocking XSS defenses, isStreaming/compact, and (below) Streamdown-specific coverage
- * upstream didn't need: code-block/Shiki chrome, and react-markdown's removal from package.json.
+ * now hosted by the one conversation surface. Covers markdown rendering, the link-safety /
+ * img-blocking XSS defenses, isStreaming, and (below) Streamdown-specific coverage upstream
+ * didn't need: code-block/Shiki chrome, and react-markdown's removal from package.json.
+ *
+ * AMENDMENT TO THE PARITY CHECKLIST, STATED RATHER THAN MADE QUIETLY. Plan 004 names two of the
+ * 21 cases as exposed to open decisions and forbids editing either without saying so: `:98`
+ * (`isStreaming`) and the `compact` case that used to sit below it. `compact` sized the two-page
+ * era's narrow rail and had no caller once one surface absorbed both pages, so the prop and its
+ * case went together — 21 cases became 20, 44 assertions became 43. `isStreaming` did NOT go: its
+ * decision is still parked under plan 004's *Deferred to Implementation*, to be settled with a
+ * measurement on a long reply rather than from principle.
  */
 import { describe, it, expect, afterEach } from 'vitest'
 import { readFileSync } from 'node:fs'
@@ -98,12 +106,6 @@ describe('MessageContent — markdown rendering', () => {
     const { container } = render(<MessageContent parts={textPart('**bold**')} isStreaming />)
     expect(container.querySelector('strong')).toBeNull()
     expect(screen.getByText('**bold**')).toBeTruthy()
-  })
-
-  it('compact appends the smaller prose typography classes', () => {
-    const { container } = render(<MessageContent parts={textPart('hello')} compact />)
-    const wrapper = container.querySelector('.prose')
-    expect(wrapper?.className).toContain('prose-p:text-xs')
   })
 
   it('raw HTML in assistant text is escaped, not rendered as an element', () => {

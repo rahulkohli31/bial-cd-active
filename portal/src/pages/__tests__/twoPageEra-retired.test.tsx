@@ -27,7 +27,7 @@
  * WHERE THE BEHAVIOUR THEY DESCRIBED IS PINNED NOW, so this is a redistribution rather than a
  * loss — and so a reader can check the claim:
  *
- *   the send discipline        → `BuilderPage-projectfirst`, `-composer`, `-persistence`
+ *   the send discipline        → `ConversationSurface-projectfirst`, `-composer`, `-persistence`
  *                                (persist-before-stream, the N8 both-bubble rollback, the gate)
  *   drag-and-drop + the draft  → `components/chat/__tests__/Composer.test.tsx`
  *   the per-MESSAGE length cap → `utils/__tests__/composerCap.test.ts`

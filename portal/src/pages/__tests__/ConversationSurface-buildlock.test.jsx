@@ -2,7 +2,7 @@
  * The advisory build lock, seen from the page (KTD-7).
  *
  * `buildLock` is the FAST cross-tab UX pre-check only — the authoritative one-build-per-user
- * barrier is the server's 409 (tested in BuilderPage-session.test.jsx). Here we pin that
+ * barrier is the server's 409 (tested in ConversationSurface-session.test.jsx). Here we pin that
  * BuilderPage still CLAIMS the project when a build starts and consults `blockedBy` before it
  * starts another (a second builder chat in the same project is warned before it costs a round
  * trip), that a different project is not blocked, that the claim is released when the build ends,
@@ -28,7 +28,7 @@
  * chat id, registers it as the project's `listProjectConversations` would, and gives it a running
  * `activeTurn` so the SAME BuilderPage instance — now displaying the new chat, having navigated
  * there — reattaches and renders the live narrative (`build-progress`/`build-outcome`) exactly as
- * a reload mid-build already does (BuilderPage-thread.test.jsx's R8 suite).
+ * a reload mid-build already does (ConversationSurface-thread.test.jsx's R8 suite).
  *
  * The pre-check hangs off the BRIEF CARD's confirmation, not off Send (003-U4). A send is just a
  * chat turn, and refusing to let someone TALK to the assistant because another tab is building
@@ -45,12 +45,11 @@ import {
 } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
-  sendMessage: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), stopTurn: vi.fn(),
   resolvePlanOptions: vi.fn(), uuidv7: vi.fn(),
-  loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
-  deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
-  start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
+  loadBuilds: vi.fn(), getBuild: vi.fn(),
+  listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
+  stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
 }))
 
 // THE LEGACY RELAY MOCK IS GONE WITH THE HOOK (Plan D U17). Both kinds of chat run on the turn
@@ -65,8 +64,7 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
   resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
 vi.mock('../../utils/builderHistory', () => ({
-  loadBuilds: h.loadBuilds, newBuild: h.newBuild, createBuild: h.createBuild,
-  getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t) => (t || '').slice(0, 40),
+  loadBuilds: h.loadBuilds, getBuild: h.getBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 vi.mock('../../utils/conversationApi', () => ({
   listProjectConversations: h.listProjectConversations,
@@ -166,8 +164,6 @@ beforeEach(() => {
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
   primeClient(h)
-  h.newBuild.mockReturnValue('build-N')
-  h.createBuild.mockResolvedValue({ ok: true })
   h.loadBuilds.mockResolvedValue([])
   liveTurnByChat = new Map()
   h.getBuild.mockImplementation(async (id) => ({
@@ -243,7 +239,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     // End A's first build — its claim on 'new-A' retracts once `endGenerating` runs at the
     // reattach's settle point (BuilderPage.tsx's `endGenerating` docblock: "the one point every
     // turn path settles through"). NOT `findByTestId('build-outcome')`: that card is a confirmed,
-    // separately-tracked gap (BuilderPage-outcome.test.jsx's diagnostic note) — `showBuildOutcome`
+    // separately-tracked gap (ConversationSurface-outcome.test.jsx's diagnostic note) — `showBuildOutcome`
     // has no call site on the turn-based path any more, so a live build's end currently clears the
     // narrative bubble and shows NOTHING until a reload. Waiting for the live bubble to clear is
     // the honest proxy: it is the one DOM change this page actually makes when the turn ends.
@@ -261,9 +257,10 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     mintBuild('new-A2', 'First build (refined)')
     await buildFrom(a.container, 'make it dark mode')
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledTimes(2))
-    // This page never provisions a C3 session any more (`session.start()` is dead in
-    // BuilderPage.tsx — see its own docblock); `h.stop` pins that the retired stop-a-live-session
-    // arm is never reached on this path, not that a candidate was found and skipped.
+    // This page never provisions a C3 session any more — `session.start()` is not merely unused,
+    // it is deleted, along with the client wrapper under it (see `ConversationSurface.tsx`'s
+    // docblock). `h.stop` pins that the retired stop-a-live-session arm is never reached on this
+    // path, not that a candidate was found and skipped.
     expect(h.stop).not.toHaveBeenCalled()
     await within(a.container).findByTestId('stop-turn')
 
@@ -316,7 +313,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     // A's build ends → its advisory claim retracts once `endGenerating` runs at the reattach's
     // settle point. NOT `findByTestId('build-outcome')` — see the matching comment in "a second
     // build RE-ACQUIRES the claim" above: that card has no call site on this path yet
-    // (BuilderPage-outcome.test.jsx), so the live bubble clearing is the honest signal that the
+    // (ConversationSurface-outcome.test.jsx), so the live bubble clearing is the honest signal that the
     // turn actually ended.
     await turn.frame(T_BUILD_END())
     await turn.end()

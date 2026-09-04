@@ -534,8 +534,3 @@ async def aclose_published_apps() -> None:
     client, _published_apps = _published_apps, None
     if client is not None:
         await client.aclose()
-
-
-def set_published_apps_for_tests(client: AcaPublishedApps | None) -> None:
-    global _published_apps
-    _published_apps = client

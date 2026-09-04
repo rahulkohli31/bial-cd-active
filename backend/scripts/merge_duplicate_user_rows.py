@@ -31,6 +31,9 @@ default; the `.mythos/walkthrough-e2e/backups/` dump is the rollback.
   EXECUTE:            uv run python -m scripts.merge_duplicate_user_rows --confirm-env dev \
                         --i-am-the-account-owner --keep-limit <default|real|synth> \
                         --refresh-tokens <delete|reassign> --execute
+
+AUDIT-2026-09-03 · verified-alive: intentionally retained pending verification — see the
+audit record.
 """
 
 from __future__ import annotations

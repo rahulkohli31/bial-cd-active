@@ -20,7 +20,6 @@
  * Bodies arrive as `unknown` (untrusted network input) and are narrowed with type
  * guards at the boundary — never cast, never `any` (`.claude/rules/fail-first-typescript.md`).
  */
-import { assertNever } from './assertNever'
 
 // ─── C3: the control-plane status enum (camelCase surface) ───────────────────
 
@@ -38,35 +37,12 @@ export function isActiveBuildStatus(status: BuildSessionStatus | null): boolean 
   return status === 'provisioning' || status === 'building' || status === 'ready'
 }
 
-// ─── C3: control operations — start / stop / status (§2) ─────────────────────
-
-/** `POST /v1/build-sessions` body. `projectId` is REQUIRED — project-first, no lazy Default (never reintroduce). */
-export interface StartBuildRequest {
-  projectId: string
-  prompt: string
-  /**
-   * OPTIONAL (C3 §2.1) — the thread whose attachments ground this build. When present the
-   * server reads that conversation's persisted file parts and materializes them into the build
-   * agent's prompt (images/PDF as vision content, office/csv as extracted text); when absent the
-   * build is text-only. The parts are already persisted by the time `start` fires (the composer
-   * appends the user turn BEFORE starting), so the bytes never travel on this request.
-   *
-   * The conversation must belong to `projectId` and to the caller — otherwise the server returns
-   * a non-leaking 404. An attachment the server cannot use fails the start with a 422 naming the
-   * file, rather than silently building without it.
-   */
-  conversationId?: string
-}
-
-/** `POST /v1/build-sessions` → 201. `previewUrl` is always null here (the dev server is not up yet). */
-export interface StartBuildResponse {
-  sessionId: string
-  projectId: string
-  appId: string
-  status: BuildSessionStatus
-  previewUrl: string | null
-  createdAt: string
-}
+// ─── C3: control operations — relaunch / stop / status (§2) ──────────────────
+//
+// `StartBuildRequest` / `StartBuildResponse` are GONE with the client `start` wrapper they typed.
+// A composer send is a TURN, not a C3 build session: nothing in the portal has provisioned one
+// since the turn transaction took the job over, so the wrapper had no caller and these had no
+// other reader. The ROUTE is untouched — deleting a browser client says nothing about it.
 
 /** `POST …/relaunch` body — restore a project's saved app into a fresh, ready sandbox (#43). */
 export interface RelaunchPreviewRequest {
@@ -96,38 +72,6 @@ export interface RelaunchPreviewResponse {
    * replied once the dev server was up).
    */
   ready: boolean
-}
-
-/**
- * Why a relaunch failed, discriminated for the U6 response matrix. A 409 (a build is running) is
- * deliberately NOT a member: it already has a first-class state — `blocked` (with the existing
- * session id + its own banner/force-end affordance) — and re-encoding it here would give one
- * failure two competing renderings.
- *
- *   - `not_found`   → 404: the project has no saved build — hide the Relaunch affordance.
- *   - `unavailable` → 503: transient (snapshot/sandbox) — retry copy, affordance restored.
- *   - `failed`      → anything else — "relaunch failed", affordance restored.
- */
-export type RelaunchErrorKind = 'not_found' | 'unavailable' | 'failed'
-
-export interface RelaunchError {
-  kind: RelaunchErrorKind
-  /** User-facing copy — the server's own message where it sent one (it is the approved wording). */
-  message: string
-}
-
-/** Whether the Relaunch affordance comes back after this failure (only a definite 404 hides it). */
-export function relaunchRetryable(kind: RelaunchErrorKind): boolean {
-  switch (kind) {
-    case 'not_found':
-      return false
-    case 'unavailable':
-      return true
-    case 'failed':
-      return true
-    default:
-      return assertNever(kind)
-  }
 }
 
 /** `POST …/stop` body — an optional free-text reason for the audit / activity feed. */

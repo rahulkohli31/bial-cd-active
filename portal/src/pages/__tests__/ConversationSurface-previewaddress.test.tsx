@@ -21,12 +21,12 @@
  *
  * WHAT IS DELIBERATELY NOT RE-PINNED HERE, because it is already pinned once and two assertions of
  * one fact drift apart:
- *  - the composer draft across a panel hide/show — `BuilderPage-panel.test.jsx:57`;
+ *  - the composer draft across a panel hide/show — `ConversationSurface-panel.test.jsx:57`;
  *  - the scroll position across the same cycle — `:86`, the one that actually discriminates a
  *    CSS-hide from an unmount;
- *  - a send refused while a turn runs — `BuilderPage-composer.test.jsx:179`,
- *    `BuilderPage-session.test.jsx:316,338`;
- *  - cross-project isolation of the build gate — `BuilderPage-session.test.jsx:543`;
+ *  - a send refused while a turn runs — `ConversationSurface-composer.test.jsx:179`,
+ *    `ConversationSurface-session.test.jsx:316,338`;
+ *  - cross-project isolation of the build gate — `ConversationSurface-session.test.jsx:543`;
  *  - the reload nonce's two legitimate bumps, a turn ending over a live preview and the manual
  *    Reload — `components/__tests__/LivePreview.test.jsx:355` and `:375`.
  *
@@ -50,11 +50,11 @@ const TURN_URL = 'https://turn-app.example.azurecontainerapps.io/'
 const RELAUNCH_URL = 'https://relaunched-app.example.azurecontainerapps.io/'
 
 const h = vi.hoisted(() => ({
-  loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
-  deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
+  loadBuilds: vi.fn(), getBuild: vi.fn(),
+  listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), stopTurn: vi.fn(),
-  switchMode: vi.fn(), resolvePlanOptions: vi.fn(),
-  start: vi.fn(), relaunchPreview: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
+  resolvePlanOptions: vi.fn(),
+  relaunchPreview: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
   fetchPreviewState: vi.fn(), fetchSaveState: vi.fn(),
 }))
 
@@ -62,8 +62,7 @@ const h = vi.hoisted(() => ({
 const paneProps: Record<string, unknown>[] = []
 
 vi.mock('../../utils/builderHistory', () => ({
-  loadBuilds: h.loadBuilds, newBuild: h.newBuild, createBuild: h.createBuild,
-  getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t: string) => (t || '').slice(0, 40),
+  loadBuilds: h.loadBuilds, getBuild: h.getBuild, deriveTitle: (t: string) => (t || '').slice(0, 40),
 }))
 vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
@@ -84,12 +83,16 @@ vi.mock('../../utils/attachmentStore', async (orig) => ({
   ...(await orig<typeof import('../../utils/attachmentStore')>()),
   buildUserParts: h.buildUserParts,
 }))
+// `switchMode` is GONE — a chat's kind is fixed at creation, so there is no per-thread
+// setting left to switch, and a factory that still listed it would be mocking an export the
+// real module no longer has. This file was the last of ten still carrying the key; the other
+// nine already said so here. `resolvePlanOptions` is a real export, kept mocked only because
+// the surface reaches for it when a plan offer is answered — never exercised here.
 vi.mock('../../utils/turnStreamApi', async (orig) => ({
   ...(await orig<typeof import('../../utils/turnStreamApi')>()),
   startTurn: (...a: unknown[]) => h.startTurn(...a),
   readTurnStream: (...a: unknown[]) => h.readTurnStream(...a),
   buildFromPlan: (...a: unknown[]) => h.buildFromPlan(...a),
-  switchMode: (...a: unknown[]) => h.switchMode(...a),
   resolvePlanOptions: (...a: unknown[]) => h.resolvePlanOptions(...a),
   stopTurn: (...a: unknown[]) => h.stopTurn(...a),
 }))
@@ -124,7 +127,6 @@ beforeEach(() => {
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
-  h.createBuild.mockResolvedValue({ ok: true })
   h.buildUserParts.mockImplementation(async (t: string) => [{ type: 'text', text: t }])
   h.relaunchPreview.mockResolvedValue({
     appId: 'a1', previewUrl: RELAUNCH_URL, status: 'ready', restoredFromFailedBuild: false,
@@ -142,10 +144,10 @@ afterEach(() => cleanup())
  *
  * RE-POINTED (Plan F, U3/U4). The old vehicle clicked a "Relaunch" button `LivePreview` rendered
  * inside its own terminal placeholder, fed by `handleRelaunch` — which stamped `sessionProjectRef`
- * as a side effect of the click itself. Both are gone: `RelaunchAffordance` and its four render
- * sites are retired, and `handleRelaunch` has had no caller since — `onRelaunch` is still threaded
- * onto the pane's props for typing continuity, but nothing in `LivePreview`'s JSX reads it any
- * more (confirmed by reading the file: it is destructured and never invoked). The one control left
+ * as a side effect of the click itself. All of it is gone now: `RelaunchAffordance` and its four
+ * render sites went first, `handleRelaunch` had no caller after that because `onRelaunch` was a
+ * pane prop nothing read, and the whole chain — callback, flag, error and hook function — has since
+ * been deleted rather than left threaded for typing continuity. The one control left
  * is `StartAppControl`, and getting it a chance to press is the whole of what changed here —
  * `primeStandbyReattach` stamps the ref `StartAppControl`'s OWN click path never touches, and
  * `findStartAppControl` presses whichever label the map is currently showing (both call the exact

@@ -21,7 +21,7 @@ function isSignoutWarningState(value: unknown): value is SignoutWarningState {
 }
 
 // The app's authenticated landing route — the primary RequireAuth-wrapped page in
-// App.jsx (`/` and any unknown path both redirect to `/login`; `/dashboard` is the
+// App.tsx (`/` and any unknown path both redirect to `/login`; `/dashboard` is the
 // first real signed-in screen). A signed-in visitor is forwarded here.
 const HOME_ROUTE = '/dashboard'
 

@@ -22,7 +22,9 @@ reference doc, patterns cited by number below):
   model still reads the real files first.
 - Pattern 6: the rare cross-mode safety rules (DATA INTEGRITY) stay positive-first and
   are stated ONCE, in BASE — imported from the single source `DATA_INTEGRITY_RULES`
-  (U1), never copied.
+  (U1), never copied. The RULES are cross-kind; two clauses that ride with them are not,
+  and BASE now drops those two for Plan (see `_base`). Still one source: the Plan form is
+  the same constant minus two clauses, not a second wording.
 
 There is no downgrade clarification any more and there is nothing for one to say: a chat's
 kind is fixed at creation, so a conversation's history can never contradict the toolset it is
@@ -41,6 +43,7 @@ from src.core.prompt_blocks import (
     BUILD_WORKING_RULES_HEAD,
     BUILD_WORKING_RULES_TAIL,
     DATA_INTEGRITY_RULES,
+    DATA_INTEGRITY_RULES_WITHOUT_THE_WRITE_MACHINERY,
     FIRST_SLICE_RULE,
     KEEP_PLANNING_LABEL,
     NARRATION_VOICE,
@@ -61,10 +64,19 @@ class PromptContext:
     project_description: str | None = None
 
 
-def _base(context: PromptContext) -> str:
+def _base(context: PromptContext, kind: ChatKind) -> str:
     """BASE — identity, project grounding, the truthful portal self-description (R5), and the
-    one cross-mode safety block. Shared by every mode so each wording exists exactly once
-    (pattern 6; U1's and R5's single sources)."""
+    one cross-mode safety block. Shared by every kind so each wording exists exactly once
+    (pattern 6; U1's and R5's single sources).
+
+    THE ONE THING BASE VARIES BY KIND, and it is not a second wording — it is the SAME
+    `DATA_INTEGRITY_RULES` string with two clauses dropped. Both clauses describe Build-only
+    machinery (the destructive-SQL sentinel on Build's `run_command`, and the DATABASE block's
+    migration channel), and a Plan prompt carries neither the machinery nor the section the
+    second one cross-references. `prompt_blocks.DATA_INTEGRITY_RULES_WITHOUT_THE_WRITE_MACHINERY`
+    is where the split and its reasoning live; the rules themselves are byte-identical in both.
+    This is why `_base` takes a kind at all — it was invariant until the false half of a
+    cross-mode block turned out to be the mode-specific half."""
     described = f" — {context.project_description}" if context.project_description else ""
     identity = (
         f"You are the Citizen Developer assistant for BIAL, working with "
@@ -75,8 +87,13 @@ def _base(context: PromptContext) -> str:
     # R5: the walkthrough caught the model inventing portal features. The relay had this
     # clause and the mode system did not, so R5 would have regressed the moment the relay
     # retired — it belongs in BASE, where every mode carries it.
+    integrity = (
+        DATA_INTEGRITY_RULES
+        if kind is ChatKind.BUILD
+        else DATA_INTEGRITY_RULES_WITHOUT_THE_WRITE_MACHINERY
+    )
     return (
-        f"{identity}\n\n{PORTAL_SURFACES}\n\n{DATA_INTEGRITY_RULES}\n\n"
+        f"{identity}\n\n{PORTAL_SURFACES}\n\n{integrity}\n\n"
         f"{NARRATION_VOICE}\n\n{FIRST_SLICE_RULE}"
     )
 
@@ -261,12 +278,13 @@ def workspace_note(*, serving: bool | None, still_the_template: bool | None) -> 
 def compose_kind_prompt(kind: ChatKind, context: PromptContext) -> str:
     """BASE + exactly one segment, for both kinds.
 
-    `_base` is invariant across kinds and always has been; only the segment varies. Which
+    The segment varies, and so does exactly one clause-pair inside BASE — see `_base`. Which
     segment a run gets follows from what it can DO, so this selection sits one file away from
-    the toolset registry that decides that."""
+    the toolset registry that decides that, and BASE's one variation follows the same rule: the
+    two dropped clauses describe tools a Plan run is not handed."""
     match kind:
         case ChatKind.PLAN:
             segment = _PLAN_SEGMENT
         case ChatKind.BUILD:
             segment = _WRITE_SEGMENT
-    return f"{_base(context)}\n\n{segment}"
+    return f"{_base(context, kind)}\n\n{segment}"

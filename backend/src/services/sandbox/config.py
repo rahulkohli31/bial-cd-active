@@ -91,7 +91,8 @@ class SandboxConfig(BaseModel):
     #
     # So: on by default, because a port must not change behaviour. It remains a real kill switch
     # for an operator who needs to stop the timer, and it gates the CLOCK only — reconcile-on-
-    # start and `POST /v1/internal/reap` are unaffected.
+    # start and `POST /v1/build-sessions/internal/reap` are unaffected. (That path used to be
+    # written `/v1/internal/reap` here, which 404s: the route is on the build-sessions router.)
     sweep_enabled: bool = True
     # The fleet size at which a pass raises the cost alarm (R20). Not a limit — nothing is refused
     # at this number; it is the point at which a human should be told the fleet is larger than

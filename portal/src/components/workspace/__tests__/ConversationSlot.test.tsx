@@ -9,7 +9,7 @@
  *  - the shared draft, and its behaviour across a reload and a sibling round trip —
  *    `components/chat/__tests__/Composer.test.tsx`, which is where the one composer now lives;
  *  - the draft surviving a hide/show cycle on the builder surface —
- *    `pages/__tests__/BuilderPage-panel.test.jsx:57`, and the scroll position at `:86`, which is
+ *    `pages/__tests__/ConversationSurface-panel.test.jsx:57`, and the scroll position at `:86`, which is
  *    the assertion that actually discriminates a CSS hide from an unmount;
  *  - that a route change still unmounts the conversation. It does, deliberately: the router owns
  *    which conversation is mounted and the slot keeps no stack of visited ones alive. What survives

@@ -623,24 +623,27 @@ class _TurnState:
     # frame lives only in the ring, so a subscriber whose cursor fell past it (or who arrives
     # after) would otherwise read `turn_status="failed"` with no reason attached.
     error_message: str | None = None
-    # The Write turn's newest workspace/preview facts, for the same reason: a `preview` frame
+    # The turn's newest workspace/preview facts, for the same reason: a `preview` frame
     # that fired before the client connected is gone from the ring by the time a mid-build
     # reconnect asks, so the snapshot carries them instead of a second REST round-trip. None
-    # on a chat turn — there is no workspace to describe.
+    # only until `_attach_sandbox` runs, or after it failed.
     workspace_state: Literal["preparing", "ready", "unavailable"] | None = None
     preview_url: str | None = None
     preview_state: Literal["ready", "reconnecting"] | None = None
-    # WRITE only. `sandbox` is what the six tools act through; `write_session` is the
-    # manager's registry entry, kept so the terminal can hand it back (the P0 save). Both
-    # None on a chat turn. `preview_task` is the per-turn dev-server watcher — cancelled and
-    # AWAITED before the terminal frame, or a late preview frame lands after `[DONE]`.
+    # SET ON EVERY TURN OF BOTH KINDS — `_pin_workspace` has one arm and both kinds attach the
+    # project's live container (its docstring carries the two-workspace history this block used to
+    # restate). `sandbox` is that container session — Build's eight sandbox-routed tools call it
+    # and Plan's read tools reach the same session through `LiveSandboxWorkspace`. `write_session`
+    # is the manager's registry entry, kept so the terminal can hand it back (the P0 save).
+    # `preview_task` is the per-turn dev-server watcher — cancelled and AWAITED before the
+    # terminal frame, or a late preview frame lands after `[DONE]`. All three are None only on a
+    # turn whose attach never completed.
     sandbox: SandboxSession | None = None
     write_session: BuildSession | None = None
     preview_task: asyncio.Task[None] | None = None
     # The R10 liveness lease renewal (C5 family 4). Started where the container is attached,
-    # released after it is handed back. `None` on a turn that never took a container — an Ask
-    # or Plan turn with nothing to keep alive must not stamp a lease over whoever does hold
-    # the user's slot.
+    # released after it is handed back. `None` on a turn that never took a container — a turn
+    # with nothing to keep alive must not stamp a lease over whoever does hold the user's slot.
     lease_task: asyncio.Task[None] | None = None
     # Why a non-completed turn ended, in the vocabulary `TurnEndedFrame.reason` publishes.
     end_reason: str | None = None
@@ -831,12 +834,15 @@ class TurnEngine:
         detached run, return the turn id. Raises `ConversationBusyError` (guard) or whatever
         `persist_user_turn` raises — with the claim released.
 
-        WRITE no longer refuses here (U5). A Write turn is an ordinary turn with more tools,
-        so it needs two extra things the read modes never do: `manager` + `sandbox_client` to
-        attach a live sandbox, and `project_id` to resolve which app that sandbox serves.
-        `sandbox_client` stays optional because a deployment without a configured sandbox is
-        a supported state for Ask/Plan — the Write path fails loudly on None rather than
-        making every read turn 503 on a dependency it does not use.
+        WRITE no longer refuses here (U5). A Write turn is an ordinary turn with more tools, and
+        `manager` + `sandbox_client` + `project_id` are what attach a live sandbox and resolve
+        which app it serves. THOSE ARE NO LONGER WRITE-ONLY NEEDS: `_pin_workspace` has one arm
+        and both kinds take the project's live container, so this paragraph's old reason for
+        keeping `sandbox_client` optional — "a deployment without a configured sandbox is a
+        supported state for Ask/Plan" — describes neither a live kind nor a live behaviour.
+        It stays optional only as a signature shape: the send route refuses a `None` sandbox
+        service outright, ahead of any claim or write (`api/v1/conversations/turns.py`'s R98
+        503), and `_attach_sandbox` fails loudly if one ever reaches it anyway.
 
         `expects_mutation` is the Build-it caller's declaration that this turn OWES the user
         a file change. It defaults False so every conversational turn keeps its existing
@@ -1314,11 +1320,11 @@ class TurnEngine:
             # `_finish` above set the status. Writing it from the arms instead would mean five
             # call sites and a turn that could leave two rows.
             await self._write_turn_terminal(state, session_factory)
-            # The watcher dies FIRST, on every terminal arm and for EVERY mode. The Write
-            # loop already stops its own on the way out, but Ask and Plan attach the same
+            # The watcher dies FIRST, on every terminal arm and in BOTH kinds. The Build
+            # loop already stops its own on the way out, but a Plan turn attaches the same
             # live container — `_attach_sandbox` starts the watcher for whoever attaches —
-            # and had no loop of their own to stop it, so every read-mode turn leaked a
-            # polling task that could land a preview frame after the transport sent [DONE].
+            # and has no loop of its own to stop it, so every Plan turn leaked a polling task
+            # that could land a preview frame after the transport sent [DONE].
             # Idempotent by construction: the Write path's stop leaves `preview_task` None
             # and this backstop finds nothing to do.
             await self._stop_preview_watcher(state)
@@ -1353,8 +1359,8 @@ class TurnEngine:
                             manager.finish_turn_sandbox(
                                 state.write_session,
                                 sandbox_client,
-                                # Only a turn that MUTATED the tree is worth bundling. An Ask or
-                                # Plan turn holds no tool that could set this, so it releases the
+                                # Only a turn that MUTATED the tree is worth bundling. A Plan
+                                # turn holds no tool that could set this, so it releases the
                                 # sandbox without paying for an upload of a tree it only read.
                                 touched=(
                                     state.sandbox is not None and state.sandbox.workspace_touched
@@ -1390,8 +1396,12 @@ class TurnEngine:
         manager: SessionManager,
         sandbox_client: SandboxClient | None,
     ) -> ReadOnlyWorkspace:
-        """Resolve the turn-pinned read surface ONCE, for EVERY mode: the project's live
+        """Resolve the turn-pinned read surface ONCE, for BOTH KINDS: the project's live
         container.
+
+        (`api/v1/conversations/turns.py` quotes that first sentence — keep the two in sync. The
+        paragraphs below stay in the old Ask/Plan/Write vocabulary on purpose: they are HISTORY,
+        and what they explain is why there is one arm here at all.)
 
         Ask and Plan used to read a different thing entirely — a git checkout of the app's
         saved bundle, unpacked onto the control-plane server's own disk. Two problems with
@@ -1418,7 +1428,15 @@ class TurnEngine:
         the pin bought is paid for better and for more cases: the instruction to follow the
         code's reality where it differs from what the plan assumed lives in the Build chat's
         own prompt, which works for a plan built weeks later rather than only when two snapshot
-        heads happen to differ."""
+        heads happen to differ.
+
+        AUDIT-2026-09-03 · canvas-divergence: the Removals board removes "the sandbox in
+        planning", saying a Plan chat reads the latest copy of the app instead and stops
+        holding a container — this method resolves the project's LIVE container for both
+        kinds, with one arm and no branch — redrawing that board row to match what ships
+        settles it and retires this marker with the guard in
+        `tests/services/turns/test_pin_workspace_one_arm.py`, which fails if the branch the
+        board describes is ever put back."""
         attach = partial(
             self._attach_sandbox,
             state,
@@ -2105,8 +2123,8 @@ class TurnEngine:
                     # and the first persist would skip the run's first ModelResponse: the
                     # row whose orphaned tool answers brick the conversation on every later
                     # turn. `new_message_index` is the same post-clean accounting
-                    # `result.new_messages()` is built on — the one that keeps Ask/Plan
-                    # immune. One shared expression, N readers.
+                    # `result.new_messages()` is built on — the one that keeps the Plan arm's
+                    # single `chat_agent.run` immune. One shared expression, N readers.
                     persisted_from = run.ctx.deps.new_message_index
             result = run.result
             if result is not None:
@@ -2370,8 +2388,8 @@ class TurnEngine:
         """What this app's workspace is doing RIGHT NOW, as a private note for the model (U8/R14).
 
         THE CHEAP HALF OF THE HEALTH VERDICT, and cheap is a requirement rather than a preference:
-        this runs on every turn in every mode, including a one-line Ask question, so it must not
-        cost what `verify` costs. A bounded readiness poll plus one exec — no `tsc`, no full
+        this runs on every turn in BOTH chat kinds, including a one-line Plan question, so it must
+        not cost what `verify` costs. A bounded readiness poll plus one exec — no `tsc`, no full
         readiness budget, and no serving GET that would block on a cold first-route compile.
 
         "STILL STARTING UP" IS REPORTED AS "COULD NOT TELL", NOT AS "DOWN". `dev_start` fires at
@@ -2383,7 +2401,10 @@ class TurnEngine:
         difference is what each one is FOR: the verdict decides whether to block a completion
         claim, where accusing an unbuilt app of showing the template would be a false positive;
         the note tells the model what the user is looking at, where "there is no app on the home
-        page yet" is true, useful, and exactly what Ask mode's own segment asks it to say.
+        page yet" is true, useful, and exactly what the note itself goes on to say — that is
+        `mode_prompts._WORKSPACE_STILL_TEMPLATE`, which is kind-blind and rides both composed
+        prompts. This used to credit "Ask mode's own segment"; there is no Ask kind, and no
+        per-kind segment says this at all — the note is the single statement of it.
 
         NEVER RAISES. A note that could fail would take the turn down with it, and every failure
         already has a value: not knowing."""
@@ -2802,11 +2823,13 @@ class TurnEngine:
     ) -> Callable[[RunContext[ChatDeps], AsyncIterable[AgentStreamEvent]], Awaitable[None]]:
         """The pydantic-ai event_stream_handler: model/tool events → typed frames.
 
-        ASK/PLAN ONLY — Write drives its own node loop (`_run_write_once`) and calls
-        `_on_event` directly. There is nothing to reconcile at the end of an iteration any
-        more: pydantic-ai invokes this handler once per NODE, and a response's text and its
-        tool calls arrive from two different nodes, text first — which is exactly the order
-        the citizen reads them in, so each event goes straight out as it lands.
+        PLAN ONLY — it is passed at the single `chat_agent.run` the Plan arm makes, and Build
+        drives its own node loop (`_run_write_once`) and calls `_on_event` directly. It used to
+        read ASK/PLAN; there is one read kind now, not two. There is nothing to reconcile at the
+        end of an iteration any more: pydantic-ai invokes this handler once per NODE, and a
+        response's text and its tool calls arrive from two different nodes, text first — which
+        is exactly the order the citizen reads them in, so each event goes straight out as it
+        lands.
         """
 
         async def handle(

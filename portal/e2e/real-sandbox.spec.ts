@@ -2,13 +2,13 @@ import { test, expect, type Page } from '@playwright/test'
 
 /**
  * A build against a REAL Azure Container Apps sandbox — no route stubbing anywhere in this
- * file. This is the "manual E2E round" `thread-lifecycle.spec.ts` refers to (its build session
- * and relay are both scripted; this one is deliberately not).
+ * file. It is the only spec in this directory that provisions a genuine container and spends real
+ * model tokens rather than scripting the wire.
  *
  * OPT-IN ONLY. This needs the full real substrate wired into the backend's .env: SANDBOX__* (ACA
  * env + ACR), REDIS__* (build-session locks/heartbeat), OBJECT_STORE__* (per-app blob), and
- * FOUNDRY__* (the model that actually writes the app — without it the relay never returns a
- * brief and no build ever starts). None of that exists in a normal CI run, so this spec no-ops
+ * FOUNDRY__* (the model that actually writes the app — without it the turn never gets past its
+ * first call and nothing is ever built). None of that exists in a normal CI run, so this spec no-ops
  * unless E2E_REAL_SANDBOX=1 is set — mirroring the opt-in shape of E2E_REQUIRE_REAL_SESSION here
  * and the `integration` pytest marker on the backend side, rather than inventing a new pattern.
  *
@@ -35,8 +35,6 @@ const REAL_SANDBOX = process.env.E2E_REAL_SANDBOX === '1'
  */
 const PREVIEW_ADDRESS = /^https?:\/\/[^/]+\/a\/sbx-[0-9a-f]{28}\/?$/
 
-const composer = (page: Page) => page.getByPlaceholder(/describe what you need/i)
-
 async function createProject(page: Page, name: string): Promise<string> {
   await page.goto('/projects')
   await page.getByRole('button', { name: /new project/i }).first().click()
@@ -59,32 +57,22 @@ test.describe('real Azure sandbox (opt-in, E2E_REAL_SANDBOX=1)', () => {
 
     const projectId = await createProject(page, `E2E Real Sandbox ${Date.now()}`)
 
-    // A CONCRETE prompt on purpose — the interview protocol is a real, stochastic model call
-    // here (unlike thread-lifecycle.spec.ts's scripted two-turn relay), and a vague prompt could
-    // legitimately ask a clarifying question instead of proposing a brief on the first turn. A
-    // fully-specified request keeps this test about the sandbox, not about interview behaviour.
-    await page.getByPlaceholder(/Describe the app you want to build/i).fill(
+    // THE RAIL'S COMPOSER, and its placeholder follows the picked kind. Build is the rail's
+    // default, which is why no kind is pressed here.
+    //
+    // A CONCRETE prompt on purpose — a vague one is a legitimate reason for the model to ask a
+    // clarifying question instead of getting on with the app, and this test is about the sandbox,
+    // not about interview behaviour.
+    await page.getByPlaceholder(/describe the change you need/i).fill(
       'Build a simple visitor log: a form to add a visitor name and their host, and a table listing all visitors.',
     )
-    await page.getByRole('button', { name: /generate app/i }).click()
+    await page.getByTestId('composer-send').click()
     await expect(page).toHaveURL(/\/chat\/[0-9a-f-]{36}$/)
 
-    // The model may ask a clarifying question before proposing a brief on the FIRST turn — but we
-    // cannot know which until that first reply actually lands, and the handed-off prompt's own
-    // send is still in flight right after navigation. Checking isVisible() immediately here (no
-    // wait) raced the handoff's own fireRelayTurn and fired a second, concurrent turn into the
-    // same thread — sending "no further requirements" before the handoff prompt had even been
-    // answered. Wait properly for the FIRST outcome instead; only send the clarifying follow-up
-    // if that wait genuinely times out (i.e., a question, not a brief, came back).
-    const card = page.getByTestId('build-brief-card')
-    try {
-      await expect(card).toBeVisible({ timeout: 45_000 })
-    } catch {
-      await composer(page).fill('No further requirements — build it as described.')
-      await composer(page).press('Enter')
-      await expect(card).toBeVisible({ timeout: 45_000 })
-    }
-    await card.getByRole('button', { name: /build this/i }).click()
+    // NOTHING TO PRESS BETWEEN THE SEND AND THE BUILD. This used to wait on a brief card and click
+    // its "Build this" — a proposal a Build chat no longer makes, because the send itself pins a
+    // container and the agent starts writing into it. The iframe-src wait below is now the whole
+    // gate, and it is the stronger one anyway: it needs a real `preview_ready` envelope.
 
     // Deliberately NOT asserting on the "Building your app" status line here (it was here once,
     // dropped 2026-07-30). Its own justification claimed it proved the C7 SSE feed was live, but
@@ -114,10 +102,9 @@ test.describe('real Azure sandbox (opt-in, E2E_REAL_SANDBOX=1)', () => {
       timeout: 12 * 60_000,
     })
 
-    // Drive INTO the framed app — this is the assertion `projects.spec.ts`'s PORTAL-PREVIEW TODO
-    // defers and thread-lifecycle.spec.ts cannot make at all (its iframe src is a scripted
-    // string, not a real document). A real page title proves the cross-origin frame actually
-    // hydrated a real Next.js app, not just that the iframe's src attribute got set.
+    // Drive INTO the framed app — the assertion no spec with a scripted iframe src can make, since
+    // there is no real document behind one. A real page title proves the cross-origin frame
+    // actually hydrated a real Next.js app, not just that the iframe's src attribute got set.
     const frame = page.frameLocator('iframe[title="App Preview"]')
     await expect(frame.locator('body')).toBeVisible({ timeout: 60_000 })
     await expect(frame.locator('html')).not.toBeEmpty()
@@ -169,16 +156,18 @@ test.describe('real Azure sandbox (opt-in, E2E_REAL_SANDBOX=1)', () => {
     // stop/relaunch assertions below — they were written and verified against that width.
     await page.setViewportSize({ width: 1280, height: 720 })
 
-    // The compact ended-state card (#42 F3) + a working relaunch, against the real backend: stop
-    // the real session, confirm the terminal card renders small (not the old full-pane dead
-    // state), and that relaunch genuinely restores a fresh live preview from the real snapshot.
+    // The compact ended-state card (#42 F3) against the real backend: stop the real session and
+    // confirm the terminal card renders small, not the old full-pane dead state.
     await page.getByRole('button', { name: /^stop$/i }).click()
     const endedCard = page.getByTestId('preview-ended-card')
     await expect(endedCard).toBeVisible({ timeout: 60_000 })
-    await endedCard.getByRole('button', { name: /relaunch/i }).click()
-    await expect(iframe).toHaveAttribute('src', PREVIEW_ADDRESS, {
-      timeout: 3 * 60_000,
-    })
+
+    // STILL UNCOVERED IN A BROWSER: that pressing the one start control after a stop genuinely
+    // restores a live preview from the real snapshot. The card's own Relaunch button was deleted
+    // with `RelaunchAffordance` (LivePreview.tsx) — R3 leaves exactly one control that starts an
+    // app, `StartAppControl`, and it renders from `AppPane`, not inside this card. Repointing at
+    // it blind would swap a locator that is obviously dead for one that only looks right, so the
+    // claim is named here and left for a run that can actually watch the container come back.
 
     void projectId // kept for readability at the call site above; no further assertion needs it
   })

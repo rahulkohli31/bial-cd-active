@@ -1,28 +1,16 @@
-import { test, expect, type Page, type Request } from '@playwright/test'
+import { test, expect, type Page } from '@playwright/test'
 
 /**
  * The project-first journey, against a REAL control-plane.
  *
- * These are the claims that mocked-module unit tests structurally cannot make:
- *
- *  - code continuity across two conversations (the seed is injected server-side),
- *  - the project's app is minted once, however many chats build in it.
+ * These are the claims that mocked-module unit tests structurally cannot make: a delete cascade
+ * counted and named against real rows, and that `/apps/{appId}` genuinely leaves the SPA rather
+ * than matching a client route.
  *
  * Only `/auth/me` is mocked (no live Entra tenant in CI, KD-9); everything else is driven.
  * Run through the portal on :5173, never the backend on :8000 — the refresh cookie is
  * Path-scoped to /api/v1/auth/refresh and will not be sent otherwise.
  */
-
-const PROMPT = 'Build a gate equipment maintenance log with a status table.'
-
-/** Every /api request the page made, in order, so we can assert call ORDERING. */
-function recordApiCalls(page: Page): Request[] {
-  const calls: Request[] = []
-  page.on('request', (req) => {
-    if (req.url().includes('/api/')) calls.push(req)
-  })
-  return calls
-}
 
 async function createProject(page: Page, name: string) {
   await page.goto('/projects')
@@ -34,116 +22,26 @@ async function createProject(page: Page, name: string) {
   return projectId
 }
 
-async function sendBuildTurn(page: Page, text: string) {
-  const composer = page.getByPlaceholder(/Type instructions/i)
-  await composer.fill(text)
-  await composer.press('Enter')
-}
-
 test.describe('project-first journey', () => {
-  // Every test here drives at least one REAL model turn, and two of them drive two. A turn
-  // takes 30-60s on a small app and grows with the artifact, so the suite-wide 90s budget
-  // (written when /auth/me was mocked and no turn ever actually ran) cannot fit them.
+  // The delete test drives a REAL model turn. A turn takes 30-60s on a small app and grows with
+  // the artifact, so the suite-wide 90s budget (written when /auth/me was mocked and no turn ever
+  // actually ran) cannot fit it.
   test.describe.configure({ timeout: 420_000 })
 
-  // ROTTED — these two encode the retired per-send build-chat model and have been red since well
-  // before plan 003 touched them: both drive a "New build chat" button that no longer exists
-  // (`ProjectPage.test.tsx` asserts its absence), and both wait on a `PATCH /api/conversations/`
-  // code write that no production code path makes any more (`patchBuildCode` has zero callers).
-  // Neither failure is reachable past the first click, so neither has been proving anything.
-  //
-  // The journey they were written for — build from the project composer, land in a chat, iterate —
-  // is now `thread-lifecycle.spec.ts`, against the canonical thread. What they uniquely covered and
-  // it does NOT is that a build mints the project's app exactly once; restoring that needs a
-  // rewrite onto the thread model plus a decision about `current_code`'s dead writer, which is
-  // follow-up work, not a rename. Marked rather than deleted so that stays visible.
-  //
-  // U6 NOTE: the client-side `POST /api/apps/provision` these two once ordered against no longer
-  // exists — the app row is minted SERVER-SIDE inside the build session, so there is no browser
-  // request to count or order. The claim that survives is the observable one: reading the project
-  // shows exactly one app, the same one across chats.
-  test.fixme('a first build mints the project app, which then appears on the project', async ({ page }) => {
-    const calls = recordApiCalls(page)
-    const projectId = await createProject(page, `E2E Gate Log ${Date.now()}`)
-
-    await page.getByRole('button', { name: /new build chat/i }).click()
-    // A brand-new chat carries its project in a transient query — the row does not exist yet.
-    await expect(page).toHaveURL(/\/chat\/[0-9a-f-]{36}\?projectId=/)
-
-    await sendBuildTurn(page, PROMPT)
-
-    // Once the first append creates the row, conversation.projectId is authoritative and
-    // the query is dropped: the address the user copies is the flat one.
-    await expect(page).toHaveURL(/\/chat\/[0-9a-f-]{36}$/, { timeout: 90_000 })
-
-    // The URL flattens on the APPEND — the server-side mint and the code PATCH are still in
-    // flight. Wait for the code write before reading the project, or we race it.
-    await page.waitForRequest(
-      (req) => req.method() === 'PATCH' && req.url().includes('/api/conversations/'),
-      { timeout: 180_000 },
-    )
-    // The browser never provisions: the app row is minted inside the build session (U6).
-    expect(calls.filter((c) => c.url().includes('/api/apps/provision'))).toHaveLength(0)
-
-    // The app is now discoverable by READING the project.
-    await page.goto(`/projects/${projectId}`)
-    await expect(page.getByText(/no app yet/i)).toHaveCount(0)
-  })
-
-  test.fixme('a SECOND chat in the project mints no new app and continues from the existing code', async ({ page }) => {
-    const projectId = await createProject(page, `E2E Continuity ${Date.now()}`)
-
-    // Exactly one first-build turn. The PATCH-before-provision bug loses only the FIRST
-    // write, so a multi-turn setup would mask it.
-    await page.getByRole('button', { name: /new build chat/i }).click()
-    await sendBuildTurn(page, PROMPT)
-    await expect(page).toHaveURL(/\/chat\/[0-9a-f-]{36}$/, { timeout: 90_000 })
-    // The flat URL means the APPEND landed; the mint and the code write are still in flight.
-    await page.waitForRequest(
-      (req) => req.method() === 'PATCH' && req.url().includes('/api/conversations/'),
-      { timeout: 180_000 },
-    )
-
-    // The app the FIRST chat's build session minted.
-    const appIdBefore = (await (await page.request.get(`/api/projects/${projectId}`)).json()).appId
-    expect(appIdBefore).toBeTruthy()
-
-    // Second chat, same project.
-    const calls = recordApiCalls(page)
-    await page.goto(`/projects/${projectId}`)
-    await page.getByRole('button', { name: /new build chat/i }).click()
-    await sendBuildTurn(page, 'Add a column for the last inspection date.')
-    await expect(page).toHaveURL(/\/chat\/[0-9a-f-]{36}$/, { timeout: 90_000 })
-    await page.waitForRequest(
-      (req) => req.method() === 'PATCH' && req.url().includes('/api/conversations/'),
-      { timeout: 180_000 },
-    )
-
-    // The browser never provisions (U6); idempotence is proven by the appId below, unchanged.
-    expect(calls.filter((c) => c.url().includes('/api/apps/provision'))).toHaveLength(0)
-
-    // R6/R21: the second chat continued from the project's current code rather than a blank
-    // slate. NOTE: the builder live-preview is knowingly DARK on release/phase2 — U9 retired
-    // the same-origin /preview shell, and the per-session cross-origin sandbox preview lands
-    // with the Wave-1 PORTAL-PREVIEW track (C8). So the iframe-src assertion is DEFERRED until
-    // then; what still holds and matters here is that the project owns exactly the one app the
-    // first chat's build minted, whose code the second chat seeds from.
-    // TODO(PORTAL-PREVIEW): restore once the cross-origin sandbox preview lands —
-    //   await expect(page.locator('iframe')).toHaveAttribute('src', <sandbox-FQDN pattern>)
-    const appIdAfter = (await (await page.request.get(`/api/projects/${projectId}`)).json()).appId
-    expect(appIdAfter).toBe(appIdBefore)
-  })
+  // STILL UNCOVERED IN A BROWSER: that a first build mints the project's app exactly once, and that
+  // every later chat in the project builds into that same one. Restoring it is a rewrite, not a rename.
 
   test('deleting the project names the cascade and sends a bookmarked chat URL back to /projects', async ({ page }) => {
     const name = `E2E Delete ${Date.now()}`
     await createProject(page, name)
 
-    // A planning chat is minted from the project composer's Plan mode — the standalone
-    // "new plan chat" button this used to click was removed with the project-first consolidation.
-    // (Planning still mints per send; only BUILD sends route into the canonical thread.)
-    await page.getByRole('button', { name: /plan with ai/i }).click()
-    await page.getByPlaceholder(/I'll help you plan it out/i).fill('What should this tool do?')
-    await page.getByRole('button', { name: /start planning/i }).click()
+    // A planning chat is minted from the rail composer: pick the kind, describe it, send. The
+    // kind picker is a radio group ("Plan" / "Build", named by the bootstrap catalogue), the
+    // placeholder follows the picked kind, and the send control is the composer's own — there is
+    // no separate "start planning" button and no per-kind composer any more.
+    await page.getByRole('radio', { name: 'Plan' }).click()
+    await page.getByPlaceholder(/describe what you have in mind/i).fill('What should this tool do?')
+    await page.getByTestId('composer-send').click()
     await expect(page).toHaveURL(/\/chat\/[0-9a-f-]{36}\?projectId=/)
 
     // The first append creates the row and the transient query drops — that is what proves the

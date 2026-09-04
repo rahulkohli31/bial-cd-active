@@ -86,7 +86,6 @@ const region = () => screen.getByTestId('app-pane-region')
 /** What a mounted surface publishes for the pane's chrome — every field at its resting value. */
 const PANE_VIEW = {
   iterating: false, reconnecting: false,
-  relaunching: false, relaunchError: null, lastBuildFailed: false,
   restoredFromFailedBuild: false, completedLive: true, hasSavedBuild: null,
   previewState: null, occupyingProjectName: null, turnRunning: false,
   compileState: null, workspaceLost: false,

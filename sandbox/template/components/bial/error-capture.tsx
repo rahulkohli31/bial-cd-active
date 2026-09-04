@@ -19,9 +19,19 @@
  *      C8 §3). Portal origin comes from the injected config (falling back to document.referrer's
  *      origin); if neither is known we DO NOT post (fail closed).
  *
- * Stage-0 status: the capture side is authored now but consumed by NOBODY. The receiving legs —
- * the portal postMessage relay and the browser→SESSION-API client-error ingest POST → BRAIN
- * self-heal — are Wave-1 additions (C3/C7 defer the ingest POST). Emit; expect no reply.
+ * THE RECEIVING LEGS ARE ALL BUILT NOW (U13). This block said "the capture side is authored now
+ * but consumed by NOBODY … Wave-1 additions", which stopped being true when the ingest shipped
+ * and would tell a reader that deleting the relay costs nothing. The whole chain:
+ *   1. this shim posts `bial:client-error` to the framing parent;
+ *   2. `portal/src/utils/clientErrorRelay.ts` validates the origin and POSTs it to
+ *      `/api/build-sessions/projects/{projectId}/client-error` (mounted on the portal frame by
+ *      `components/chat/ConversationSurface.tsx`);
+ *   3. the control plane serves that at `POST /v1/build-sessions/projects/{project_id}/client-error`
+ *      and parks the report against the app (`services/orchestrator/client_errors.park_client_error`);
+ *   4. the next verify drains it into the self-heal diagnostic
+ *      (`selfheal.the_call_is_coming_from_inside_the_house`) — the class of failure where every
+ *      server-side check is green and the app is dead in the browser anyway.
+ * Emit; a reply is still not part of the contract — the report travels one way.
  */
 
 import { useEffect } from "react";

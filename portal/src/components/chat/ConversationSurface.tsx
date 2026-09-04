@@ -142,8 +142,9 @@ function outcomeSummary({ status, reason }: Pick<BuildPartLive, 'status' | 'reas
  * path — not from here.
  *
  * "Existing refine semantics" now means: a live LEGACY build session in this project is stopped
- * (`session.stop()`) before the handoff fires. `session.start()` is no longer called anywhere in
- * this file — the session half only reattaches (reload-mid-build) or stops.
+ * (`session.stop()`) before the handoff fires. `session.start()` and `session.relaunch()` are gone
+ * from the hook entirely — this file was the last place that named either, and neither name had a
+ * live caller — so the session half only reattaches (reload-mid-build) or stops.
  *
  * THREE DISTINCT IDENTITIES (unchanged from the single-file era, KTD-8):
  *   conversationId — the thread      (`/chat/{id}`, PATCH /conversations/{id})
@@ -400,14 +401,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   const params = useParams()
   const buildId = chatIdProp ?? params.chatId
   const initialPrompt = location.state?.prompt || ''
-  // `theme` used to ride in here from the builder's Select Theme control. Nothing
-  // downstream ever read it — not the prompt, not the sandbox, not the generated app —
-  // so the control and this key went together (#157 B1). Rows written before that keep an
-  // orphan `theme` in their stored context; harmless, and no migration is needed because
-  // nothing reads it.
-  const contextRef = useRef<{ uploadedFiles: unknown[] }>({
-    uploadedFiles: location.state?.uploadedFiles || [],
-  })
   const dropTransientQuery = useDropTransientQuery()
 
   // The one build-session owner (feed + preview + status + keep-alive timers). Tests
@@ -770,8 +763,8 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // `gateCheck` is what the render reads, and this is only the argument that goes with it.
   const gateRetryRef = useRef<{ activeId: string; sessionId: string } | null>(null)
   // The session's surfaces render only while viewing a chat of ITS project (it is project-scoped).
-  // `blocked`/`error` come from attempts that FAILED to start (start()'s reset leaves sessionId
-  // null), so they gate on the project stamp alone; the live surfaces also require a sessionId.
+  // `error` comes from an attempt that FAILED (the reset leaves sessionId null), so it gates on the
+  // project stamp alone; the live surfaces also require a sessionId.
   //
   // Derived HERE, above every handler, and not down beside the JSX where the rest of the render
   // derivations live: `handleSend` reads `buildActive`, and a gate that depends on declaration
@@ -965,8 +958,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
           return
         }
         loadedBuildRef.current = buildId
-        // UNCHECKED (matches pre-migration behavior): the stored context's shape is asserted.
-        if (saved?.context) contextRef.current = saved.context as { uploadedFiles: unknown[] }
         const restored = saved?.messages ?? []
         if (restored.length > 0) {
           // Seed the next seq from the highest PERSISTED seq, not the array length: a transcript
@@ -1046,9 +1037,11 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   /**
    * RE-ATTACH to a BUILD that is still running (the reload-mid-build clause).
    *
-   * `buildActive` is derived from `sessionProjectRef`, which only `handleBuildIt` /
-   * `handleRelaunch` stamp — so on a fresh mount NOTHING knows a build is in flight and the one
-   * gate is simply absent, exactly in the window it matters most. The transcript knows: the
+   * `buildActive` is derived from `sessionProjectRef`, which nothing stamps until this surface
+   * adopts a session or the pane's start control reports one (`onStarted`, below) — so on a fresh
+   * mount NOTHING knows a build is in flight and the one gate is simply absent, exactly in the
+   * window it matters most. (`handleRelaunch` was a third stamper until it went with the relaunch
+   * chain; it could not have fired, being wired to a pane callback nobody reads.) The transcript knows: the
    * projection emits a `build_in_progress` part (carrying its session id) for a build that began
    * and whose outcome never landed. Stamp the session's chat/project from it and let
    * `session.reattach` settle the three cases it already handles — still live (subscribe +
@@ -1456,7 +1449,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
    * silently guess at a vague prompt.
    *
    * Create-before-stream is load-bearing: the stateless relay 404s an unknown conversation,
-   * and the row is what carries the project parentage + context that ground the first turn.
+   * and the row is what carries the project parentage that grounds the first turn.
    *
    * ══ `onSent` IS THE MOMENT THE COMPOSER MAY EMPTY, AND IT IS NOT THE END OF THE TURN ══
    *
@@ -1523,8 +1516,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
             projectId,
             kind,
             title: derivedTitle ?? '',
-            // `context` is whatever this surface was seeded with; it travels unchanged.
-            context: contextRef.current,
           }
         : undefined
     // OPTIMISTIC, AND DELIBERATELY SO. The row is created inside the turn's own transaction and a
@@ -2059,19 +2050,11 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     return null
   }, [messages, livePlanOptions, applyPlanOverride])
 
-  // Reset the terminal banners so the operator can start fresh (Start-again / Dismiss).
-  const handleStartAgain = () => {
-    session.reset()
-    sessionChatRef.current = null
-    sessionProjectRef.current = null
-  }
-
   // The #43 "come back later" journey: after a reload there is no live session, but a persisted
-  // BuildOutcome part proves a build once ran — so the preview pane must offer the terminal
-  // placeholder (with its Relaunch action), not the idle "submit a prompt" empty state. The
-  // NEWEST outcome also drives the "Relaunch last saved version" label when that build failed
-  // (paired with the server's restoredFromFailedBuild flag). Derived from the transcript so it
-  // survives a reload; a live/reattached session (showSession) always wins below.
+  // BuildOutcome part proves a build once ran — so the preview pane must show the terminal
+  // placeholder, not the idle "submit a prompt" empty state, and the address resolver must know a
+  // build happened here. Derived from the transcript so it survives a reload; a live/reattached
+  // session (showSession) always wins below.
   const newestOutcome = useMemo(() => {
     for (let i = messages.length - 1; i >= 0; i -= 1) {
       const part = (messages[i].parts || []).find((p) => p?.type === 'build')
@@ -2249,16 +2232,16 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     turnPreviewUrl: turnPreview.url,
     turnStatus: turnBuildStatus,
     narratingChatIsOpenChat: turnNarrativeIsThisChat,
-    // TWO PRODUCERS FOR ONE ARM, and the newer one wins. `session.relaunchedPreviewUrl` comes from
-    // this surface's own relaunch path; `startedPreviewUrl` from the workspace's start control,
-    // which calls the same endpoint directly. Neither can be dropped: the first still fires from
-    // the build-session hook, and the second is the only producer the pane's own control has.
+    // ONE PRODUCER NOW. This arm used to take `session.relaunchedPreviewUrl` first — the hook's own
+    // relaunch result — with `startedPreviewUrl` (the workspace start control, which calls the same
+    // endpoint directly) as the newer alternative. The hook's half is gone: its `relaunch()` was
+    // reachable only through a pane callback nothing reads, so it never produced a URL to rank.
     //
     // THE RELAUNCHED ARM, NOT THE PROJECT ONE. They are gated identically, so the choice is about
     // RANKING: a restore the citizen just asked for outranks the session's own URL, which describes
     // the build before it. Demoting it to the project arm — ranked last — puts a stale session URL
     // in front of the app they pressed a button to bring up.
-    relaunchedUrl: startedPreviewUrl ?? session.relaunchedPreviewUrl,
+    relaunchedUrl: startedPreviewUrl,
     projectPreviewUrl: null,
     sessionUrl: session.previewUrl,
     sessionStatus: session.status,
@@ -2267,12 +2250,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     transcriptHasBuildOutcome: newestOutcome !== null,
   })
   const framedPreviewUrl = address.url
-  // NOT an address derivation, and deliberately left here: `restoredFromFailedBuild` below asks
-  // whether a restore happened in this project, which is a different question from which arm won
-  // the precedence — a live turn can outrank the relaunch while the restore remains the reason
-  // the app on screen is the last saved one.
-  const relaunchedUrl = sessionProjectMatches ? session.relaunchedPreviewUrl : null
-
   // The receiving end of the app's own error reporter (see `clientErrorRelayRef` above). Declared
   // HERE rather than beside the ref because it reads `framedPreviewUrl`, which is derived further
   // down the render.
@@ -2382,15 +2359,15 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // other cross-surface read on this page: a sibling chat's build says nothing about this
   // project's container.
   //
-  // `previewProbeEpoch` is the fourth input and it is not derived from anything: the Relaunch
-  // CLICK is a synchronous fact, and the state it moves (`relaunching` true→false around an
-  // awaited POST) can be collapsed into a single commit by React's batching, so an
-  // invalidation that could only be spelled as "relaunching changed" is one a fast enough
-  // server erases. A counter cannot be batched away — the value the effect sees is always
-  // different from the one before it.
+  // `previewProbeEpoch` is the third input and it is not derived from anything: a start CLICK is a
+  // synchronous fact, and an in-flight flag around an awaited POST can be collapsed into a single
+  // commit by React's batching, so an invalidation that could only be spelled as "the flag changed"
+  // is one a fast enough server erases. A counter cannot be batched away — the value the effect
+  // sees is always different from the one before it. (There was a fourth input, `restoreInFlight`,
+  // reading the session hook's `relaunching`; it went with that flag, which had no producer. The
+  // counter is what actually carried this, and it is bumped from every press that starts an app.)
   const workspaceSignal = turnNarrativeIsThisChat ? (turnWorkspace?.state ?? null) : null
   const previewSignal = turnNarrativeIsThisChat ? turnPreview.state : null
-  const restoreInFlight = sessionProjectMatches && session.relaunching
   const [previewProbeEpoch, setPreviewProbeEpoch] = useState(0)
   useEffect(() => {
     // IT ASKS WITH NO FRAME NOW, and that is a deliberate widening (Plan F, U4).
@@ -2529,7 +2506,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       window.removeEventListener('focus', onVisible)
       stopAsking()
     }
-  }, [projectId, framedPreviewUrl, workspaceSignal, previewSignal, restoreInFlight, previewProbeEpoch])
+  }, [projectId, framedPreviewUrl, workspaceSignal, previewSignal, previewProbeEpoch])
 
   // R18 — CAN THE SERVER PUT THIS APP BACK? Three sources, newest-and-most-certain first:
   //
@@ -2640,25 +2617,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     ),
   )
 
-  const handleRelaunch = () => {
-    if (!projectId) return
-    // Stamp the project so the relaunch surfaces (Restoring…, the framed URL, its errors) render:
-    // on a fresh mount no session originated here, so the ref is unset and every
-    // sessionProjectMatches gate would otherwise drop the relaunch state on the floor (#43).
-    sessionProjectRef.current = projectId
-    // U22 — a restore is starting, so whatever the poll last decided about this workspace is
-    // now history. Bumped HERE, on the click, rather than left to the `relaunching` flag: the
-    // restored container comes back on the SAME url, so nothing else in the effect's inputs is
-    // guaranteed to move, and a relaunch that resolves inside one commit moves the flag from
-    // true back to false without any render in between (see the effect's dependency note).
-    setPreviewProbeEpoch((n) => n + 1)
-    // The hook re-throws ONLY the #83 refusal (everything else it discriminates into
-    // `relaunchError`), so this catch is that one case and must not swallow anything else.
-    void session.relaunch(projectId).catch((err) => {
-      if (!captureReclaim(err, () => session.relaunch(projectId))) throw err
-    })
-  }
-
   // `chatNeedsAttention` — the badge on the retired chat-panel toggle below — is gone with it.
   // Nothing else read it: SessionBanners and TurnBanner already render these same conditions
   // in-flow a few lines below, on a rail that is always reachable once R13's single collapse is
@@ -2755,11 +2713,14 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
        toolbar row beside the chat title, from the same computed state, so there is one mount for
        both screens rather than two that happen never to be live at once. */
     iterating: showSession && session.iterating,
-    onRelaunch: handleRelaunch,
-    relaunching: sessionProjectMatches && session.relaunching,
-    relaunchError: sessionProjectMatches ? session.relaunchError : null,
-    lastBuildFailed: newestOutcome?.status === 'failed',
-    restoredFromFailedBuild: relaunchedUrl != null && session.relaunchedFromFailedBuild,
+    /* NO PRODUCER ON THIS SURFACE ANY MORE, and that is a gap rather than residue. The server does
+       still answer `restoredFromFailedBuild` on every relaunch (`RelaunchPreviewResponse`, parsed
+       and tested in `buildSessionApi`) — it is the two live callers, `StartAppControl` and
+       `RailComposer`, that read `previewUrl` and `ready` off that response and drop this third
+       field. The value used to arrive through the session hook's own `relaunch()`, which went with
+       the rest of the chain. Re-wiring it is a behaviour change and belongs to whoever owns that
+       label, not to a deletion sweep. */
+    restoredFromFailedBuild: false,
     completedLive,
     hasSavedBuild,
     previewState: previewState?.state ?? null,
@@ -2980,12 +2941,9 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
 
         {/* Session lifecycle banners (U15) — right where the operator is looking. */}
         <SessionBanners
-          blocked={sessionProjectMatches ? session.blocked : null}
           feedDisconnected={showSession && session.feedDisconnected}
           quota={showSession ? session.quota : null}
-          onForceEnd={(sid) => session.forceEnd(sid)}
           onReconnect={() => session.reconnect()}
-          onStartAgain={handleStartAgain}
         />
 
         {/* The one banner slot: the state the app is in NOW, newest wins. A workspace sentence

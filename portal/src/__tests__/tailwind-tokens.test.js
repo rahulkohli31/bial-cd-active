@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import path from 'node:path'
+import { stripComments } from './_stripComments'
 
 /**
  * An invented Tailwind token renders INVISIBLY, and no test that reads text content will ever
@@ -42,20 +43,6 @@ function sourceFiles(dir) {
 
 /** Repo-relative, POSIX-separated, so an assertion message reads the same on Windows. */
 const rel = (file) => path.relative(ROOT, file).split(path.sep).join('/')
-
-/**
- * Comments are not source, and here that distinction has teeth rather than being tidiness.
- * `ui/pagination.tsx`'s docblock QUOTES the v4 tokens it deliberately avoided
- * (`border-primary!`, `bg-transparent!`) so the next author knows why the file is written the
- * way it is — and the first run of the trailing-`!` rule flagged exactly that prose. Reporting
- * it would push someone to delete the one comment in the tree that explains the trap.
- *
- * `//` is only treated as a comment when it is not part of a `://` scheme, so the font `@import`
- * URL and every https link survive.
- */
-function stripComments(text) {
-  return text.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
-}
 
 describe('tailwind custom tokens', () => {
   it('every bial-* class used in src/ actually exists in the config', () => {

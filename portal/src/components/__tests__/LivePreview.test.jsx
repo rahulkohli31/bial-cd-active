@@ -237,12 +237,18 @@ describe('LivePreview — the pardoned preview: completed builds stay framed (#1
     expect(container.textContent).toMatch(/no longer running/i)
   })
 
-  it('a relaunch in flight takes precedence over the kept frame (Restoring… busy state)', () => {
+  it('RETIREMENT GUARD: nothing pre-empts the kept frame any more — the Restoring state that did is gone', () => {
+    // This asserted the opposite: `relaunching` unmounted the pardoned frame in favour of a
+    // "Restoring…" card. The flag had no producer — `relaunch()` was reachable only through
+    // `LivePreview`'s own `onRelaunch`, which this component accepts and never reads — so the one
+    // thing that could take an iframe down over a container the server is still serving could
+    // never actually be set. Both are deleted; what is pinned now is the state that ships.
     const { container } = render(
       <LivePreview previewUrl={SANDBOX_URL} status="ended" completedLive relaunching />,
     )
-    expect(container.querySelector('iframe')).toBeNull()
-    expect(container.textContent).toMatch(/restoring/i)
+    expect(container.querySelector('iframe')).toBeTruthy() // liveness: still framed, still serving
+    expect(container.textContent).not.toMatch(/restoring/i)
+    expect(container.textContent).not.toMatch(/no longer running/i)
   })
 
   // ★ U18 — THE RETRACTION REGRESSION, and the reason it belongs to this unit rather than to
@@ -329,53 +335,29 @@ describe('LivePreview — relaunch a torn-down preview (#43)', () => {
     expect(container.textContent).toMatch(/start a new build/i)
   })
 
-  it('while relaunching, shows the "Restoring…" busy state and hides the button (no double-click)', () => {
-    const onRelaunch = vi.fn()
-    const { container } = render(<LivePreview previewUrl={null} status="ended" onRelaunch={onRelaunch} hasSavedBuild relaunching />)
-    expect(container.textContent).toMatch(/restoring your app/i)
-    expect(screen.queryByRole('button', { name: /relaunch preview/i })).toBeNull()
-    expect(container.querySelector('[aria-busy="true"]')).toBeTruthy()
-  })
-
-  it('labels a SLOW relaunch after 20s instead of spinning silently (SL-20)', () => {
-    // The frame-load stall cap is armed off `showFrame`, and `frameContext` excludes
-    // `relaunching` — so the one wait that can legitimately run for minutes was the one wait
-    // with no label. SL-20 watched two full minutes of bare "Restoring your app…" end in
-    // "Sandbox unavailable". Same 20s cap as the framed wait, deliberately the same sentence.
+  // THE "RESTORING…" WAIT AND ITS SLOW LABEL ARE GONE, and the three tests that drove them with
+  // them. They rendered `relaunching`, a prop no production caller could set: it came from the
+  // session hook's `relaunch()`, whose only caller hung off `onRelaunch` — accepted here and never
+  // read. So the wait could never appear, and a 20-second label on a wait that cannot start is not
+  // coverage of anything.
+  //
+  // SL-20's FINDING SURVIVES, which is why this is a note and not a silent deletion: "the one wait
+  // that can legitimately run for minutes must label itself" is enforced on the wait a citizen
+  // actually reaches — the frame's own load cap — in "a frame that never loads still degrades to a
+  // LABELLED state" and "the capped state keeps the frame MOUNTED" below. The shared sentence is
+  // the same one, for the reason SL-20 gave.
+  it('RETIREMENT GUARD: no prop this pane accepts renders a Restoring wait any more', () => {
     vi.useFakeTimers()
     try {
       const { container } = render(
         <LivePreview previewUrl={null} status="ended" onRelaunch={vi.fn()} hasSavedBuild relaunching />,
       )
-      expect(container.textContent).toMatch(/restoring your app/i)
+      // LIVENESS: the terminal placeholder is what renders instead, and it still explains itself.
+      expect(container.textContent).toMatch(/no longer running/i)
+      expect(container.textContent).not.toMatch(/restoring your app/i)
+      act(() => vi.advanceTimersByTime(20_000))
       expect(container.textContent).not.toMatch(/taking longer than usual/i)
-
-      act(() => vi.advanceTimersByTime(20_000))
-
-      expect(container.textContent).toMatch(/taking longer than usual/i)
-      // …and it says the thing a citizen mid-relaunch actually needs to hear.
-      expect(container.textContent).toMatch(/your work is safe/i)
-      // The busy state is still a busy state — this labels the wait, it does not end it.
-      expect(container.querySelector('[aria-busy="true"]')).toBeTruthy()
-    } finally {
-      vi.useRealTimers()
-    }
-  })
-
-  it('drops the slow-relaunch label as soon as the relaunch settles', () => {
-    // Guards the cleanup arm: a stale "taking longer than usual" outliving its relaunch is the
-    // same class of lie as a stale reveal verdict.
-    vi.useFakeTimers()
-    try {
-      const view = render(
-        <LivePreview previewUrl={null} status="ended" onRelaunch={vi.fn()} hasSavedBuild relaunching />,
-      )
-      act(() => vi.advanceTimersByTime(20_000))
-      expect(view.container.textContent).toMatch(/taking longer than usual/i)
-
-      view.rerender(<LivePreview previewUrl={SANDBOX_URL_2} status="ready" onRelaunch={vi.fn()} hasSavedBuild />)
-
-      expect(view.container.textContent).not.toMatch(/taking longer than usual/i)
+      expect(container.textContent).not.toMatch(/your work is safe/i)
     } finally {
       vi.useRealTimers()
     }
@@ -475,17 +457,26 @@ describe('LivePreview — the no-previewUrl/no-status combination (formerly "rel
 })
 
 describe('LivePreview — the U6 relaunch response matrix (#43)', () => {
-  it('404 not_found HIDES the affordance and says there is nothing to relaunch', () => {
+  // THE `not_found` ARM WENT WITH THE PROP. It was the last of the three `relaunchError` reads to
+  // survive U4's sweep, and it selected a `role="alert"` sentence on three placeholders. Its
+  // producer was the session hook's `relaunch()` — unreachable — so the alert could not fire; what
+  // a citizen sees today is the `hasSavedBuild` sentence the placeholder resolves on its own, and
+  // the live 404 ("nothing saved to bring back") is answered by `StartAppControl`'s own outcome
+  // handling instead (`StartAppControl.test.tsx`).
+  it('RETIREMENT GUARD: a not_found relaunch error selects nothing — the placeholder answers from hasSavedBuild alone', () => {
     const { container } = render(
       <LivePreview
         previewUrl={null}
         status="ended"
         onRelaunch={vi.fn()}
+        hasSavedBuild={false}
         relaunchError={{ kind: 'not_found', message: 'No saved build to relaunch. Build the app first.' }}
       />,
     )
+    // LIVENESS: the placeholder rendered, and it makes the tri-state's own confirmed-false claim.
+    expect(container.textContent).toMatch(/nothing to relaunch yet/i)
+    expect(screen.queryByRole('alert')).toBeNull() // …but not as an alert the dead prop selected
     expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
-    expect(container.textContent).toMatch(/nothing to relaunch/i)
   })
 
   // U4 (Plan F) — INERTNESS GUARD, AND A DOCUMENTED FINDING, NOT JUST A RE-POINT. This test used
@@ -1042,17 +1033,17 @@ describe('LivePreview — the preview only claims a build that exists (R5)', () 
     }
   })
 
-  it('a 404 after the click renders the not-found message inside a role="alert" in the terminal branch', () => {
-    render(
-      <LivePreview
-        previewUrl={null}
-        status="ended"
-        onRelaunch={vi.fn()}
-        hasSavedBuild
-        relaunchError={{ kind: 'not_found', message: 'No saved build to relaunch. Build the app first.' }}
-      />,
+  it('RETIREMENT GUARD: the terminal branch has no not-found alert left — its selector was a dead prop', () => {
+    // "A 404 after the click is said out loud, never a silently vanished button" was the R5
+    // discipline this pinned, and it still holds where a click can happen: the pane's one start
+    // control reports its own 404 (`StartAppControl.test.tsx`). What went is this branch's copy of
+    // it, which only `relaunchError` could select and only `relaunch()` could produce.
+    const { container } = render(
+      <LivePreview previewUrl={null} status="ended" hasSavedBuild
+        relaunchError={{ kind: 'not_found', message: 'No saved build to relaunch. Build the app first.' }} />,
     )
-    expect(screen.getByRole('alert').textContent).toMatch(/nothing to relaunch yet/i)
+    expect(container.textContent).toMatch(/your saved app is still there/i) // liveness
+    expect(screen.queryByRole('alert')).toBeNull()
     expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
   })
 })
@@ -1388,10 +1379,14 @@ describe('LivePreview — the cover (R16/R18): the framework error screen is nev
     expect(container.querySelector('iframe')).toBeTruthy()
   })
 
-  it('loses to a restore in flight — the restoring card wins and no cover is drawn', () => {
-    const { container } = setup({ turnRunning: true,  compileState: 'failed', relaunching: true })
-    expect(screen.getAllByText(/Restoring your app/i).length).toBeGreaterThan(0) // liveness for the winner
-    expect(coverEl(container)).toBeFalsy()
+  // The restore that used to outrank the cover is gone (`relaunching` had no producer), so this
+  // precedence row has no contender left. What still has to hold is the rest of the chain — a
+  // terminal session and a container that is not serving both take the frame away, and the cover
+  // only ever exists over a frame — and that is the row below, which is unaffected.
+  it('RETIREMENT GUARD: a restore can no longer pre-empt the cover, because nothing can raise one', () => {
+    const { container } = setup({ turnRunning: true, compileState: 'failed', relaunching: true })
+    expect(coverEl(container)).toBeTruthy() // liveness: the cover is drawn, and now nothing takes it
+    expect(container.textContent).not.toMatch(/restoring your app/i)
   })
 
   it('loses to a terminal session and to a container that is not serving', () => {

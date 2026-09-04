@@ -18,7 +18,6 @@ the same ADR-0004 property is now asserted against the surviving send path in
 
 from __future__ import annotations
 
-from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 from sqlalchemy import select
 
@@ -39,16 +38,6 @@ def _cookie(jwt: str) -> dict[str, str]:
 async def _auth(db_session):
     user = await UserFactory.create(db_session)
     return _cookie(mint_session_jwt(user.id, user.token_version, _TTL)), user
-
-
-def _capturing_stream_model():
-    captured: dict[str, str] = {}
-
-    async def _stream(messages, info):
-        captured["instructions"] = info.instructions or ""
-        yield "streamed"
-
-    return FunctionModel(stream_function=_stream), captured
 
 
 async def _builder_conv(db_session, user_id, project_id):

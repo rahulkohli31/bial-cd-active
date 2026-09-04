@@ -40,11 +40,6 @@ async def execute_on(dsn: str, sql: str, **params: Any) -> None:
         await engine.dispose()
 
 
-def app_dsn(record: ProjectDatabase) -> str:
-    """The app role's own DSN, in the driver form the control plane can connect with."""
-    return control_plane_dsn(record)
-
-
 def control_plane_identity_dsn(db_name: str) -> str:
     """The CONTROL PLANE's own credentials pointed at `db_name`.
 

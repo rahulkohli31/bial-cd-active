@@ -15,10 +15,10 @@
  *  - THE AUTH WRAPPER GOES ABOVE THE SHELL, not inside each child. `RequireAuth` is a component
  *    re-run per `location.key`, not a route; wrapping each child would give one instance per
  *    address and re-run the guard's effect on every move between them.
- *  - `/apps/:appId` CANNOT JOIN. nginx proxies `/apps/` to the backend runner and the Vite dev
- *    proxy does not, so an SPA route there would work locally and 404 in the deployed container.
- *    The route table's own comment says this; it is repeated here because this is the file that
- *    would make adding it look natural.
+ *  - `/apps/:appId` CANNOT JOIN. `/apps/` goes to the control plane at BOTH edges — nginx in the
+ *    container, the dev proxy under vite — so a route declared here is shadowed before React
+ *    Router sees it, locally and deployed alike. The route table's own comment says this; it is
+ *    repeated here because this is the file that would make adding it look natural.
  *
  * The URLs do NOT nest. `/projects/:projectId` and `/chat/:chatId` keep the flat addressing they
  * have — a chat has one stable address for its whole life and the project is a breadcrumb resolved

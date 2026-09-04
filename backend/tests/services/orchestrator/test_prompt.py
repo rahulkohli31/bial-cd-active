@@ -16,7 +16,10 @@ from typing import Any
 
 import pytest
 from pydantic_ai import RunContext
+from pydantic_ai.messages import ModelMessage, ModelResponse
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.toolsets.function import FunctionToolset
+from pydantic_ai.usage import RunUsage
 
 from src.api.v1.build_sessions.schemas import BuildError, ErrorSource
 from src.core.prompt_blocks import APPLY_SCHEMA_CHANGE_TOOL, WRITE_TOOL_SURFACE
@@ -26,9 +29,19 @@ from src.services.agent.toolsets import (
     registered_tool_definitions,
     render_tool_surface,
 )
+from src.services.orchestrator.agent import build_agent
 from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.prompt import BUILD_SYSTEM_PROMPT, build_repair_prompt
 from src.services.orchestrator.tools import sandbox_toolset
+
+
+def _the_guard_never_calls_a_model(
+    _messages: list[ModelMessage], _info: AgentInfo
+) -> ModelResponse:
+    """`RunContext` needs a model; `get_tools` never reads it. Same shape as
+    `toolsets._the_renderer_never_calls_a_model` — a model that raises if it is ever asked."""
+    raise AssertionError("the divergence guard enumerates registrations; it runs nothing")
+
 
 _THE_SANDBOX_FACTORY = "src.services.agent.toolsets.sandbox_toolset"
 """The name `toolsets_for_kind` reaches the sandbox six through — the seam the two
@@ -719,6 +732,53 @@ async def test_the_tool_surface_is_generated_from_the_tools_the_write_arm_regist
     """★ The snapshot half. Counted in the composed prompt as well, because a block that reached
     zero composition sites would satisfy the equality assertion perfectly well."""
     await _the_drift_check()
+    assert BUILD_SYSTEM_PROMPT.count(WRITE_TOOL_SURFACE) == 1
+
+
+_THE_FOUR_THE_HARNESS_CANNOT_CALL = frozenset(
+    {"list_files", "search_files", "tell_the_user", "propose_first_slice"}
+)
+"""What `WRITE_TOOL_SURFACE` names that `build_agent` does not register. Not a wish list — the
+guard below derives the real divergence and asserts it EQUALS this, so the set cannot grow
+quietly."""
+
+
+async def test_the_harness_arm_is_told_about_four_tools_it_does_not_register() -> None:
+    """★ A DIVERGENCE GUARD, not a passing property — it pins a defect so it cannot get worse.
+
+    `BUILD_WORKING_RULES_TAIL` carries one `TOOL SURFACE` snapshot into TWO prompts, and only one
+    of them is what the snapshot was generated from:
+
+    * the chat Build arm registers `toolsets_for_kind(BUILD)` — all twelve. The drift check above
+      is about that arm and is correct about it.
+    * `build_agent` is constructed `toolsets=[sandbox_toolset(_sandbox_of)]` and nothing else
+      (`orchestrator/agent.py`), so a `/v1/build-sessions` run is handed eight — and told about
+      twelve on every request. The four extra get the runtime's unknown-tool rejection if called.
+
+    WHY THIS IS A TEST AND NOT A FIX. Both fixes are behaviour changes to a live agent, and the
+    harness plus its route are already scheduled for deletion (plan 009, unit 1). So the
+    divergence is recorded where it will be tripped over: this goes RED when the harness is
+    deleted, when it gains the missing toolsets, or when the prompt learns to render a
+    harness-specific surface — each of which is someone deliberately settling it.
+
+    Derived on both sides rather than hard-coded: the prompt side is parsed out of the shipped
+    block, the agent side is read off `build_agent.toolsets`. A tool added to either moves the
+    difference and fails here.
+    """
+    named_in_the_prompt = set(re.findall(r"^- `(\w+)`", WRITE_TOOL_SURFACE, re.M))
+    assert named_in_the_prompt, "the shipped TOOL SURFACE block names no tools"
+
+    ctx: RunContext[Any] = RunContext(
+        deps=None, model=FunctionModel(_the_guard_never_calls_a_model), usage=RunUsage()
+    )
+    registered_by_the_harness: set[str] = set()
+    for toolset in build_agent.toolsets:
+        registered_by_the_harness |= set((await toolset.get_tools(ctx)).keys())
+
+    assert registered_by_the_harness < named_in_the_prompt
+    assert named_in_the_prompt - registered_by_the_harness == _THE_FOUR_THE_HARNESS_CANNOT_CALL
+    # And the block IS in the harness prompt — a zero-composition-site version of this defect
+    # would pass every assertion above.
     assert BUILD_SYSTEM_PROMPT.count(WRITE_TOOL_SURFACE) == 1
 
 

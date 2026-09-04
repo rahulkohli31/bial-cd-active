@@ -22,19 +22,18 @@ import { render, screen, fireEvent, waitFor, act, cleanup, within } from '@testi
 import { MemoryRouter } from 'react-router-dom'
 
 const h = vi.hoisted(() => ({
-  loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
-  deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
+  loadBuilds: vi.fn(), getBuild: vi.fn(),
+  listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(), relaunchPreview: vi.fn(),
+  stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(), relaunchPreview: vi.fn(),
   notifyUsageChanged: vi.fn(),
 }))
 
 vi.mock('../../utils/usage', () => ({ notifyUsageChanged: h.notifyUsageChanged }))
 
 vi.mock('../../utils/builderHistory', () => ({
-  loadBuilds: h.loadBuilds, newBuild: h.newBuild, createBuild: h.createBuild,
-  getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t) => (t || '').slice(0, 40),
+  loadBuilds: h.loadBuilds, getBuild: h.getBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 // SPREAD THE ORIGINAL — `handleBuildIt` mints the new build chat's id through the shared
 // `uuidv7` (ADR-0006), and a factory naming only `listProjectConversations` leaves every other
@@ -101,8 +100,6 @@ beforeEach(() => {
   Element.prototype.scrollIntoView = vi.fn()
   primeClient(h)
   primeTurn(h)
-  h.newBuild.mockReturnValue('build-Y')
-  h.createBuild.mockResolvedValue({ ok: true })
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
@@ -144,7 +141,8 @@ describe('the gate withholds SENDING, not typing (N10)', () => {
     // HONEST LIMIT: jsdom does not implement blur-on-disable, so the `activeElement` assertions
     // below cannot by themselves catch a reintroduced `disabled` — they pin the no-focus-grab half.
     // The mechanism itself is pinned by asserting the attribute, here and in the sibling test
-    // above; only a real browser reproduces the blur (`.mythos` scenarios cover that).
+    // above; only a real browser reproduces the blur, so that half is covered by a browser run
+    // rather than here.
     h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
     // Hold the turn OPEN across the assertion. With a stream that settles in the same tick the
     // composer is already re-enabled by the time focus is read, and the blur goes unseen — the

@@ -16,7 +16,11 @@ addressed no longer exists, and an app's data now lives in its own PostgreSQL da
 reached through `BIAL_DATABASE_URL` (see `appdb_env.py`). The `app_key` COLUMN survives —
 `GET /apps/{id}/status` still returns it — it is simply no longer injected.
 
-Both names survive the C1 child-env scrub allowlist (`_BIAL_INJECTED_KEYS`, D5/C6).
+The two names this builder DOES produce — `BIAL_APP_ID` and `BIAL_PORTAL_ORIGIN` — are both on
+the C1 child-env scrub allowlist (`_INJECTED_ENV` → `_BIAL_INJECTED_KEYS`, D5/C6), so both reach
+`next dev`. (This line read "Both names survive …" directly under the paragraph about the two
+RETIRED vars, which reads as a claim that the retired pair still gets through. They do not: the
+allowlist is built from `_INJECTED_ENV` and neither name is in it.)
 
 WHAT IS *NOT* HERE, AND MUST NOT BE. `BIAL_BASE_PATH` and `BIAL_APPS_HOSTNAME` — the address a
 generated app is served at — are injected by `sandbox/client._provision_container`, not by this

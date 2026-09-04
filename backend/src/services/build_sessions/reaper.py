@@ -1,15 +1,19 @@
 """The reaper: reconcile-on-start + the full sweep (C5, KTD-3).
 
-Two entry points, plus a background sweeper added in 1.6.5 (`main.py`'s lifespan runs
-`_reap_abandoned_sandboxes` on a `SWEEP_INTERVAL_SECONDS` timer — this docstring used to say no
-such thing existed, which stopped being true when abandoned-sandbox reclamation shipped):
+Two entry points, plus a scheduled sweeper that arrived in 1.6.5 and MOVED OUT OF THIS PROCESS
+in U15: `src/workers/sandbox_reap.py` runs `sweep_all` on the Taskiq worker every five minutes
+(`SANDBOX_REAP_CRON`). It was a `while True` in `main.py`'s lifespan until then, and this
+docstring said no such thing existed before that — both statements were false in their turn, so
+read `main.py`'s own "there are no `while True` loops left in this lifespan" paragraph as the
+authority on WHERE the timer lives:
 
 * `reconcile_user` runs at the top of every `start`, reaping the requesting user's OWN
   stale lock/registry/heartbeat before acquiring — this closes the "crashed tab → can
   never start again" lockout at the exact moment it matters.
 * `sweep_all` reconciles EVERY registered user; it is idempotent + concurrency-safe
-  (teardown idempotent, value-guarded reaper release), so an operator can trigger it on
-  a timer via the `internal/reap` endpoint.
+  (teardown idempotent, value-guarded reaper release), so the scheduled worker task above runs
+  it unattended and an operator can also trigger it by hand at
+  `POST /v1/build-sessions/internal/reap`.
 * `reap_the_container_we_judged` is the janitor's, and it is keyed by CONTAINER NAME rather
   than by user — because the reclamation pass judges a container, and a user's record can name
   a different one (or none) by the time the delete lands. See its docstring for both ways that
@@ -21,7 +25,7 @@ A sandbox whose registry entry is gone
 — a flushed or replaced Redis, a container older than the registry, a teardown that failed after
 `delete_registry` — is invisible here FOREVER and bills until a human notices; one did, for
 twelve days. The Azure-side view that closes that gap is `inventory.take_sandbox_inventory`,
-surfaced at `POST /v1/admin/reconcile-sandboxes`, and it REPORTS rather than deletes.
+surfaced at `POST /v1/admin/apps/reconcile-sandboxes`, and it REPORTS rather than deletes.
 
 Reaper ordering for one stale user (C5): mark-ending → teardown → clear registry →
 release lock (LAST). The reaper reclaims a possibly-drifted lock via the value-guarded
@@ -49,10 +53,11 @@ startup assertion — and the per-replica rate-limit store is the other blocker 
 
 Corrected 2026-08-11 (ADR-0029): the sentence removed here read "There is no in-process
 background sweeper by design" — which flatly contradicted this docstring's OWN opening
-paragraph 26 lines above, added when the 1.6.5 sweeper shipped. Both statements lived in one
-file for months and the false one is the one people quoted. ADR-0011 is now Accepted, and the
-lease that was promised as R10 has since landed (U12) — see the constraint note above for what
-it did and did not unblock.
+paragraph, added when the 1.6.5 sweeper shipped. Both statements lived in one file for months
+and the false one is the one people quoted. ADR-0011 is now Accepted, and the lease that was
+promised as R10 has since landed (U12) — see the constraint note above for what it did and did
+not unblock. Corrected again on 2026-09-04: that same opening paragraph then outlived the
+lifespan loop it described, which U15 moved onto the worker.
 """
 
 from __future__ import annotations

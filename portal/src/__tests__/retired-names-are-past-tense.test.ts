@@ -20,9 +20,11 @@
  * slips through; that is a miss, not a false alarm. A guard that cried wolf would be deleted
  * within a month and the next wholesale deletion would leave this link undone again.
  *
- * PRODUCTION FILES ONLY. Test files legitimately name what they retired — `twoPageEra-retired`
- * exists to — and seventeen suites in `pages/__tests__` are still NAMED after the page they no
- * longer render.
+ * PRODUCTION FILES ONLY. Test files legitimately name what they retired: `twoPageEra-retired`
+ * and `relaunch-chain-retired` exist to pin that something is GONE, so a retirement guard's own
+ * filename and prose would trip every marker in the list below. (This used to add "and seventeen
+ * suites in `pages/__tests__` are still named after the page they no longer render" — that was
+ * true until the rename sweep in this same branch made it zero.)
  */
 import { describe, it, expect } from 'vitest'
 import { readdirSync, readFileSync, statSync } from 'node:fs'

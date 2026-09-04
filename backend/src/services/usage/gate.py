@@ -347,10 +347,15 @@ async def at_limit_ending(
     safety net would turn a budget message into a crash. Both halves of that trade are what
     `RECOVERY_WRITE_DID_NOT_LAND_EVENT` exists for.
 
-    `workspace` is `None` for a turn that never took a container — an Ask or Plan turn can reach
-    the cap too, and it has nothing to secure. That is the one case where the reassurance is
-    withheld without anything having gone wrong, which is why the wording of
-    `COULD_NOT_KEEP_A_COPY` asks the reader to save rather than announcing a fault.
+    `workspace` is `None` for a turn that never took a container, and it has nothing to secure.
+    That is the one case where the reassurance is withheld without anything having gone wrong,
+    which is why the wording of `COULD_NOT_KEEP_A_COPY` asks the reader to save rather than
+    announcing a fault. It USED to say "an Ask or Plan turn can reach the cap too", and both
+    halves of that stopped being true: Ask is not a chat kind any more, and a Plan turn pins the
+    live container exactly as a Build turn does (`engine._pin_workspace` has ONE ARM for both
+    kinds). Today the `None` arm is the defensive one — this function's only callers are on the
+    Build path, which always attaches — so it is a shape this signature keeps rather than a
+    traffic pattern, pinned by `test_at_limit.py`'s two `at_limit_ending(None)` cases.
 
     ★ TWO ENDINGS, ONE SECURING PATH, AND THAT IS WHY `sentence` IS A PARAMETER (U13/R91). The
     per-run spend bound has to end a turn exactly the way the daily budget does — copy taken
@@ -383,8 +388,10 @@ async def at_limit_ending(
                 # A PLAIN ADDRESS, not a `mailto:` URI. This sentence is read as text in the
                 # banner above the composer, and a URI scheme printed mid-sentence is the exact
                 # register `services/turns/copy.py` exists to keep out. The clickable link is
-                # the renderer's job — `BuildProgress` finds the address in this sentence and
-                # wraps it in a real `mailto:` anchor.
+                # the renderer's job — `portal/src/components/chat/TurnBanner.tsx` finds the
+                # address in this sentence and wraps it in a real `mailto:` anchor. (It was
+                # `BuildProgress.tsx`; that file went with the two-page era and the behaviour
+                # moved to `TurnBanner`.)
                 contact=settings.SUPPORT_CONTACT_EMAIL,
             ),
             work_is_secured=secured,

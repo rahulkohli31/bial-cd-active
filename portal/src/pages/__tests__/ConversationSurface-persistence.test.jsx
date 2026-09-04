@@ -12,8 +12,9 @@
  *     (C3 §2.1). R-18/U13 (plan 006) retired the separate `createBuild` round trip this used to
  *     go through: the row's parentage now rides the turn's own `POST .../turns` request as a
  *     `create` block, so the server can check the workspace BEFORE creating anything — see
- *     `fireRelayTurn`'s R-18 comment in `ConversationSurface.tsx`. `h.createBuild` stays mocked
- *     below for the harness's sake but is never called; nothing in this file asserts on it.
+ *     `fireRelayTurn`'s R-18 comment in `ConversationSurface.tsx`. The `createBuild`
+ *     wrapper itself is now deleted (plan 001, unit 6) along with the mock key that stood in
+ *     for it, so there is nothing left in this file to assert its absence against.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
@@ -21,17 +22,15 @@ import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import { FakeEventSource, makeClient, primeClient, PLAN_CARD_ID, primeTurn, waitForGateOpen } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
-  loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
-  deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
-  sendMessage: vi.fn(),
+  loadBuilds: vi.fn(), getBuild: vi.fn(),
+  listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
+  stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
-  loadBuilds: h.loadBuilds, newBuild: h.newBuild, createBuild: h.createBuild,
-  getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t) => (t || '').slice(0, 40),
+  loadBuilds: h.loadBuilds, getBuild: h.getBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 // SPREAD THE ORIGINAL — `handleBuildIt` mints the new build chat's id through the shared
 // `uuidv7` (ADR-0006), and a factory naming only `listProjectConversations` leaves every other
@@ -91,8 +90,6 @@ beforeEach(() => {
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
   primeClient(h)
-  h.newBuild.mockReturnValue('build-X')
-  h.createBuild.mockResolvedValue({ ok: true })
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])

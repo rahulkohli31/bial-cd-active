@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="BIAL Citizen Developer Portal">
+  <!-- Brand teal #0D7377: `primary.DEFAULT` in tailwind.config.js, the colour the UX canvas gives
+       every primary action. Deliberately NOT the brand gold, which the boards declare once and
+       paint nowhere. Drawn as shapes rather than as a text element so the mark stays crisp at
+       16px on a host that has none of the portal's webfonts. The glyph is the prompt a citizen
+       types into: a caret and the line it writes on. -->
+  <rect width="32" height="32" rx="7" fill="#0D7377"/>
+  <g fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="9.5,10.5 15,16 9.5,21.5"/>
+    <line x1="18" y1="21.5" x2="23" y2="21.5"/>
+  </g>
+</svg>

@@ -1,6 +1,11 @@
-"""Super-admin app-registry governance (R27, R29, R9) — the lifecycle state machine,
-danger ops, and the durable clear-data confirm token, all `requires_superadmin`-gated
-and audited. Ported from Express `admin/apps-routes.js`, but gated by Plan A's env
+"""Super-admin app-registry governance (R27, R29, R9) — the lifecycle state machine and the
+danger ops, all `requires_superadmin`-gated and audited. This opener also advertised "the
+durable clear-data confirm token"; there is no clear-data route, no token and no minting code
+anywhere in this package — the only surviving trace of that vocabulary is `db/models/audit.py`
+naming "clear-data" as an EXAMPLE of the open action set. The nearest live thing is a plain
+`confirm_all: bool` request flag on the bulk-limits route, which is a body field, not a token.
+
+Ported from Express `admin/apps-routes.js`, but gated by Plan A's env
 allowlist (`requires_superadmin`), NOT Express's `role==='admin'` claim. Approval
 pins an immutable git-bundle SUBMISSION (APPROVAL D5): approve carries the reviewed
 submission id, verifies the artifact exists (R11), and the guarded UPDATE refuses a
@@ -173,7 +178,8 @@ router = APIRouter(prefix="/admin/apps", tags=["admin"])
 # The tuple itself now lives in `src/schemas/responses.py` beside `AUTH_401`, because
 # `deploy/router.py`'s `unpublish` (#113) is gated by the same dependency and a second
 # copy would be free to drift. Aliased under the module-private name the routes below
-# already spread, so the shared definition costs no churn at 24 call sites.
+# already spread, so the shared definition costs no churn at any of the call sites in this file.
+# (A count stood here and had drifted from 24 to 26; a number in a comment cannot go red.)
 _ADMIN_AUTH = ADMIN_AUTH
 
 # How many registry rows one listing returns. Pagination is deliberately deferred, so the
@@ -1640,8 +1646,11 @@ async def reconcile_deploys(admin: CurrentSuperadmin, db: DbSession) -> DeployRe
     must still be able to settle a wedged deploy by hand, and a lever that the kill switch also
     kills is not a recovery lever.
 
-    SAFE TO PRESS AT ANY TIME, including while both the scheduled pass and the in-process loop
-    are running. Staleness is measured from `heartbeat_at`, so a live pipeline is never in the
+    SAFE TO PRESS AT ANY TIME, including alongside the other two things that reconcile: the
+    scheduled pass on the worker (`src/workers/deploy_reconcile.py`) and the API's boot one-shot
+    (`main._reconcile_interrupted_deploys`). It used to name "the in-process loop" as the second
+    of those — U15 deleted that `while True` from the lifespan, and `main.py`'s own docstring is
+    the authority. Staleness is measured from `heartbeat_at`, so a live pipeline is never in the
     work list at all, and every terminal write is guarded on `status = 'running'` — of two racing
     reconcilers exactly one settles a given row and the other learns it lost.
 
