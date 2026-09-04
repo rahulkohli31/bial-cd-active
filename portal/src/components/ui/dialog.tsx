@@ -4,13 +4,29 @@ import { X } from "lucide-react"
 
 import { cn } from "@/lib/utils"
 
+/**
+ * shadcn/ui `dialog`, copied in from the registry, with the alias set trimmed to the five names
+ * this portal actually mounts — recorded here because the next `npx shadcn@latest add` of
+ * anything listing `dialog` in its registryDependencies will restore the rest as an unexplained
+ * diff, exactly the way `button.tsx` beside it records its own departures.
+ *
+ * WHAT WENT AND WHY IT WAS NOT AN OVERSIGHT. The trigger, the close alias and the footer were
+ * vendored whole and never reached. Both consumers — `chat/AttachmentPreview.tsx` and
+ * `__tests__/test-setup.test.tsx` — drive the dialog from `open`/`onOpenChange` state rather than
+ * from a trigger, and dismiss it through the corner control `DialogContent` already renders, so a
+ * footer had nothing to hold.
+ *
+ * THE PORTAL AND THE OVERLAY ARE STILL HERE, only unexported: `DialogContent` composes both, and
+ * deleting either would take the backdrop and the layer with it.
+ *
+ * A FUTURE CONSUMER IS EXPECTED. `workspace/UnsavedWorkGuard.tsx` names this file as the upgrade
+ * path for its focus trap. Re-adding a trigger together with a caller is the right move; re-adding
+ * one on spec is what this note exists to stop.
+ */
+
 const Dialog = DialogPrimitive.Root
 
-const DialogTrigger = DialogPrimitive.Trigger
-
 const DialogPortal = DialogPrimitive.Portal
-
-const DialogClose = DialogPrimitive.Close
 
 const DialogOverlay = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Overlay>,
@@ -65,20 +81,6 @@ const DialogHeader = ({
 )
 DialogHeader.displayName = "DialogHeader"
 
-const DialogFooter = ({
-  className,
-  ...props
-}: React.HTMLAttributes<HTMLDivElement>) => (
-  <div
-    className={cn(
-      "flex flex-col-reverse sm:flex-row sm:justify-end sm:space-x-2",
-      className
-    )}
-    {...props}
-  />
-)
-DialogFooter.displayName = "DialogFooter"
-
 const DialogTitle = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Title>,
   React.ComponentPropsWithoutRef<typeof DialogPrimitive.Title>
@@ -108,13 +110,8 @@ DialogDescription.displayName = DialogPrimitive.Description.displayName
 
 export {
   Dialog,
-  DialogPortal,
-  DialogOverlay,
-  DialogTrigger,
-  DialogClose,
   DialogContent,
   DialogHeader,
-  DialogFooter,
   DialogTitle,
   DialogDescription,
 }

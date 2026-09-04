@@ -7,7 +7,8 @@ import { cn } from "@/lib/utils"
  * Hand-authored shadcn `new-york` popover primitive, matching `dropdown-menu.tsx` in this
  * folder rather than the current registry.
  *
- * THREE THINGS TO KNOW BEFORE EDITING, all about this build rather than the component:
+ * FOUR THINGS TO KNOW BEFORE EDITING, the first three about this build rather than the
+ * component:
  *
  * 1. THE CLASSES ARE THE OLDER (Tailwind-3) REGISTRY GENERATION. The current registry
  *    popover uses Tailwind-v4-era syntax, and this portal is on Tailwind 3.4.17, where a
@@ -28,15 +29,17 @@ import { cn } from "@/lib/utils"
  * 3. `@radix-ui/react-popover` IS NOW A DIRECT DEPENDENCY. It was already on disk as a
  *    transitive of `@assistant-ui/react` → `radix-ui`, so importing it would have
  *    resolved — and silently broken on any future install that reshaped that graph.
+ *
+ * 4. THE ALIAS SET IS TRIMMED TO THE THREE THE CHIP USES. `PopoverAnchor` and `PopoverClose`
+ *    were vendored with the file and reached nothing — `PublishStatusChip.tsx` anchors on its own
+ *    trigger and closes on outside-press. They are named here because `@shadcn/popover` is still
+ *    listed in the unlanded vendoring batch, so a re-add would restore them AND clobber the
+ *    custom `align`/`sideOffset` defaults below with no trace of why they were chosen.
  */
 
 const Popover = PopoverPrimitive.Root
 
 const PopoverTrigger = PopoverPrimitive.Trigger
-
-const PopoverAnchor = PopoverPrimitive.Anchor
-
-const PopoverClose = PopoverPrimitive.Close
 
 const PopoverContent = React.forwardRef<
   React.ElementRef<typeof PopoverPrimitive.Content>,
@@ -57,4 +60,4 @@ const PopoverContent = React.forwardRef<
 ))
 PopoverContent.displayName = PopoverPrimitive.Content.displayName
 
-export { Popover, PopoverTrigger, PopoverAnchor, PopoverClose, PopoverContent }
+export { Popover, PopoverTrigger, PopoverContent }

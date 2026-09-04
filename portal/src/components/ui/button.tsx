@@ -5,8 +5,8 @@ import { cva, type VariantProps } from "class-variance-authority"
 import { cn } from "@/lib/utils"
 
 /**
- * shadcn/ui `button`, copied in from the registry, with two deliberate departures from the
- * copied source — both recorded here because the next person to re-copy the registry will
+ * shadcn/ui `button`, copied in from the registry, with three deliberate departures from the
+ * copied source — all recorded here because the next person to re-copy the registry will
  * reintroduce them.
  *
  * 1. THERE IS NO `secondary` VARIANT. The registry's resolves to `bg-secondary`, which in this
@@ -20,6 +20,13 @@ import { cn } from "@/lib/utils"
  *    specifies exactly one hover in 41 boards — a link going teal-dark — and no orange surface
  *    anywhere. `accent` keeps its two real board roles (the token-meter fill and the 6px
  *    unsaved dot) and stops being a hover.
+ * 3. THE VARIANT TABLE IS ONLY WHAT IS ACTUALLY MOUNTED. `destructive`, `link` and the `sm` and
+ *    `lg` sizes went the way `secondary` went, and for the same reason: the one production call
+ *    site is `assistant-ui/thread.tsx`'s copy control, which asks for `variant="ghost"
+ *    size="icon"`, and the portal contains no `variant={…}`/`size={…}` expression, so nothing can
+ *    select a key at run time. `outline` STAYS even though only `__tests__/smoke.test.tsx`
+ *    reaches it: that case is the sole coverage of the `asChild`/Slot branch below, which is live
+ *    code merely riding the variant as a vehicle.
  */
 const buttonVariants = cva(
   "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0",
@@ -28,17 +35,12 @@ const buttonVariants = cva(
       variant: {
         default:
           "bg-primary text-primary-foreground shadow hover:bg-primary/90",
-        destructive:
-          "bg-destructive text-destructive-foreground shadow-sm hover:bg-destructive/90",
         outline:
           "border border-input bg-background shadow-sm hover:bg-surface-muted hover:text-foreground",
         ghost: "hover:bg-surface-muted hover:text-foreground",
-        link: "text-primary underline-offset-4 hover:underline",
       },
       size: {
         default: "h-9 px-4 py-2",
-        sm: "h-8 rounded-md px-3 text-xs",
-        lg: "h-10 rounded-md px-8",
         icon: "h-9 w-9",
       },
     },

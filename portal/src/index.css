@@ -82,10 +82,6 @@ body {
   width: 100%;
 }
 
-.scrollbar-thin::-webkit-scrollbar { width: 4px; }
-.scrollbar-thin::-webkit-scrollbar-track { background: #f1f5f9; }
-.scrollbar-thin::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 2px; }
-
 /* ── The shimmer, hand-written, because `tw-shimmer` is Tailwind v4 only ──────────────
    The assistant-ui `tool-group` source labels a running group with `ShimmerLabel`, which
    comes from the npm package `tw-shimmer`. That package declares

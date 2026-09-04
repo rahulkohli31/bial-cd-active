@@ -70,7 +70,7 @@ export default tseslint.config(
   {
     // Tailwind's config is loaded by Tailwind's own CJS-era loader, where `require()` for a
     // plugin is the documented form — not a lapse to migrate away from.
-    files: ['tailwind.config.js', 'postcss.config.js'],
+    files: ['tailwind.config.js'],
     rules: { '@typescript-eslint/no-require-imports': 'off' },
   },
   {

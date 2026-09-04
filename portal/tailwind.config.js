@@ -102,7 +102,6 @@ export default {
           surface: '#FFFFFF',
           border: '#E2E8F0',
         },
-        success: '#22C55E',
         warning: '#EAB308',
         danger: '#EF4444',
         /**
