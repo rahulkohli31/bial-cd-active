@@ -13,6 +13,7 @@ from typing import Annotated, Any
 
 from pydantic import AfterValidator, AnyUrl, Field, UrlConstraints
 
+from src.api.v1.pagination import DEFAULT_PAGE_SIZE
 from src.db.models.app_registry import MAX_DEPLOYED_URL, ApprovalRoute, AppStatus
 from src.schemas import CamelModel
 
@@ -668,7 +669,45 @@ class HarnessCountersResponse(CamelModel):
     since: datetime
 
 
-# --- deleted projects (`/admin/deleted-projects`) -------------------------------
+# --- deleted projects (`/admin/deleted-projects/*`) -----------------------------
+
+
+class DeletedProjectsQuery(CamelModel):
+    """The search body for `POST /admin/deleted-projects/search`.
+
+    A BODY RATHER THAN QUERY PARAMS, and the method is the point rather than the ergonomics.
+    The route commits an audit row — its own comment says "A READ THAT WRITES" — but
+    `main.py`'s `refuse_cross_origin_writes` only guards POST/PUT/PATCH/DELETE, precisely
+    because a GET is not supposed to mutate. As a GET this route sat outside that guard with
+    a `SameSite=Lax` session cookie and generated apps served same-site, so app code written
+    by a model from a citizen's prompt could drive an admin's session into writing audit rows
+    under their identity. POST puts it back inside the guard, picks up `RequireCsrf`'s
+    double-submit token, and forces a preflight a same-site app cannot satisfy.
+
+    It also takes the search term out of the URL, and so out of uvicorn's `access_log` and
+    the gateway's `requestUri` — two audiences wider than `superadmin_emails`, holding a
+    citizen's words for a retention this repo does not control.
+
+    EVERY FIELD IS A BARE TYPE, deliberately, and this is load-bearing rather than lazy.
+    `pagination.py` argues that this platform answers a bad page argument with one
+    `{"error": {"message"}}` 422; a Pydantic constraint (`ge=`, `le=`) or a `datetime`
+    coercion failure emits FastAPI's native `{"detail": [...]}` instead, putting two
+    different 422 bodies on one endpoint that `error_responses(...)` cannot both document.
+    So the validating stays in the handler, on `parse_cursor` / `clean_limit` /
+    `clean_search` / `parse_deleted_at_bound`, exactly as it did when these were query
+    params.
+    """
+
+    cursor: str | None = None
+    limit: int = DEFAULT_PAGE_SIZE
+    q: str | None = None
+    # The date range #176 asked for ("filters worth having: by owner, and by date range").
+    # ISO-8601 strings, parsed in the handler for the reason the class docstring gives — a
+    # `datetime` annotation here would hand a malformed date to Pydantic and produce the
+    # wrong 422 shape. Inclusive on both ends: an administrator asking for a day means that
+    # whole day, and a half-open upper bound silently drops the last row of it.
+    deleted_from: str | None = None
+    deleted_to: str | None = None
 
 
 class DeletedProjectOut(CamelModel):

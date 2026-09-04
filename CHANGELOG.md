@@ -20,14 +20,23 @@ Administrators can read why a project was deleted. (#176)
   since the previous release — five to fifty words, and the Delete button stays dead without
   one — but nothing could retrieve what people wrote. Every deletion now appears here, newest
   first: the project, who deleted it, when, what went with it, and the reason in their own
-  words. Searchable by any of those, including the reason itself.
+  words. Search by project, by person, or by the wording of the reason itself, and narrow to a
+  date range.
+
+- **A record of who has read the log, readable in the same place.** Reading why somebody deleted
+  their own work is itself worth recording, so every search is logged — and that record is now
+  something an administrator can actually open, rather than a row only direct database access
+  could reach. The search wording is kept as a one-way digest rather than in full: enough to
+  confirm a term somebody suspects, never a second copy of what a citizen wrote.
 
 ### Changed
 
-- **The delete dialog says an administrator can see the reason again.** It was softened to
-  "Kept with the deletion record." for exactly as long as that was the honest thing to say.
-  Someone writing what feels like a private note deserves to know it is not, and now that
-  there is somewhere to read it, the dialog says so.
+- **The delete dialog says an administrator can search and read the reason.** It was softened
+  to "Kept with the deletion record." for exactly as long as that was the honest thing to say.
+  Someone writing what feels like a private note deserves to know it is not — and to know which
+  kind of not: "an administrator can see this" is read as "if they go looking at my project",
+  while the tab is searchable across every reason ever written. Somebody can arrive at those
+  words without ever having heard of the project.
 
 ## [1.7.0-beta.7] - 2026-09-03
 

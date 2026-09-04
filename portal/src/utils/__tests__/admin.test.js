@@ -1,5 +1,13 @@
 import { describe, it, expect, vi } from 'vitest'
-import { fetchUsers, updateUserLimits, bulkUpdateUserLimits, deactivateUser, reactivateUser } from '../admin'
+import {
+  fetchUsers,
+  updateUserLimits,
+  bulkUpdateUserLimits,
+  deactivateUser,
+  reactivateUser,
+  fetchDeletedProjects,
+  fetchDeletionsAudit,
+} from '../admin'
 import { ApiError } from '../apiError'
 
 // Inject authFetch's deps so no real token/localStorage/network is touched.
@@ -170,5 +178,92 @@ describe('deactivateUser / reactivateUser', () => {
     )
     const err = await reactivateUser('u1', deps(fetchImpl)).catch((e) => e)
     expect(err.status).toBe(409)
+  })
+})
+
+describe('fetchDeletedProjects', () => {
+  // NOTHING pinned the request shape before this: the panel test mocks the whole module, and
+  // this file had no coverage of the deletions client at all. So the GET the route used to be
+  // could have stayed a GET on the client while the server moved, and every test stayed green.
+  const payload = { deletions: [], nextCursor: null, hasMore: false }
+  const okFetch = () =>
+    vi.fn(async () => res({ ok: true, status: 200, json: async () => payload }))
+
+  it('POSTs to the search route, so the cross-origin write guard covers it', async () => {
+    // THE SECURITY PROPERTY, asserted rather than assumed. The route commits an audit row on
+    // every call, but the backend's guard fires only on POST/PUT/PATCH/DELETE — as a GET, an
+    // audited admin endpoint sat outside it with a SameSite=Lax cookie while generated apps are
+    // served same-site. The method IS the fix, so it is the thing this test pins.
+    //
+    // It also means `authFetch` attaches X-CSRF-Token, which it does for every non-GET.
+    const fetchImpl = okFetch()
+    await fetchDeletedProjects({ q: 'gate' }, deps(fetchImpl))
+
+    expect(fetchImpl.mock.calls[0][0]).toBe('/api/admin/deleted-projects/search')
+    expect(fetchImpl.mock.calls[0][1].method).toBe('POST')
+  })
+
+  it('carries the filters in the BODY, never the URL', async () => {
+    // A query string is logged verbatim by uvicorn's access log and the gateway's requestUri —
+    // audiences far wider than the super-admins this screen is gated to, with a retention this
+    // repo does not control. The citizen's words must not travel there.
+    const fetchImpl = okFetch()
+    await fetchDeletedProjects(
+      { cursor: 'c1', limit: 25, q: 'ground operations', deletedFrom: '2026-08-01' },
+      deps(fetchImpl),
+    )
+
+    const [url, opts] = fetchImpl.mock.calls[0]
+    expect(url).not.toContain('?')
+    expect(url).not.toContain('ground')
+    expect(JSON.parse(opts.body)).toEqual({
+      cursor: 'c1',
+      limit: 25,
+      q: 'ground operations',
+      deletedFrom: '2026-08-01',
+      deletedTo: null,
+    })
+  })
+
+  it('sends nulls rather than blanks when nothing is filtered', async () => {
+    const fetchImpl = okFetch()
+    await fetchDeletedProjects({}, deps(fetchImpl))
+
+    expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({
+      cursor: null,
+      limit: null,
+      q: null,
+      deletedFrom: null,
+      deletedTo: null,
+    })
+  })
+
+  it('surfaces a failure as an ApiError rather than an empty page', async () => {
+    const fetchImpl = vi.fn(async () =>
+      res({ ok: false, status: 500, json: async () => ({ error: { message: 'boom' } }) }),
+    )
+
+    await expect(fetchDeletedProjects({}, deps(fetchImpl))).rejects.toBeInstanceOf(ApiError)
+  })
+})
+
+describe('fetchDeletionsAudit', () => {
+  it('GETs the audit route — it writes nothing, so it is not a POST', async () => {
+    // The asymmetry with its sibling is the point: that one is a POST BECAUSE it writes.
+    const fetchImpl = vi.fn(async () =>
+      res({ ok: true, status: 200, json: async () => ({ events: [{ id: 'a1' }] }) }),
+    )
+
+    const events = await fetchDeletionsAudit({}, deps(fetchImpl))
+
+    expect(fetchImpl.mock.calls[0][0]).toBe('/api/admin/deleted-projects/audit')
+    expect(fetchImpl.mock.calls[0][1].method).toBeUndefined()
+    expect(events).toEqual([{ id: 'a1' }])
+  })
+
+  it('returns an empty list when the envelope has no events key', async () => {
+    const fetchImpl = vi.fn(async () => res({ ok: true, status: 200, json: async () => ({}) }))
+
+    expect(await fetchDeletionsAudit({}, deps(fetchImpl))).toEqual([])
   })
 })

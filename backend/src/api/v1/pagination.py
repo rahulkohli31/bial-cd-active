@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import Query
@@ -87,6 +88,35 @@ def clean_search(q: str | None) -> str | None:
     if "\x00" in q:
         raise AppApiError(422, "q contains an unsupported character.")
     return q
+
+
+def parse_when(value: str | None, *, field: str) -> datetime | None:
+    """Parse an ISO-8601 date or datetime filter bound, or 422 in this module's own shape.
+
+    HERE RATHER THAN AS A PYDANTIC `datetime` FIELD, for the reason lines 42-46 give about
+    `limit`: a coercion failure inside a request model emits FastAPI's native
+    `{"detail": [...]}`, and a route documenting `ErrorEnvelope` for 422 would then have two
+    different bodies on one status that `error_responses(...)` cannot both describe.
+
+    A BARE DATE MEANS THE WHOLE DAY IN UTC. `date.fromisoformat` gives midnight, which is
+    what a caller filtering "from the 3rd" wants for a lower bound; callers wanting the
+    upper bound to include the 3rd pass the end of it, and `list_deleted_projects` documents
+    that it does exactly that rather than leaving a silently half-open range.
+
+    NAIVE INPUT IS TREATED AS UTC rather than rejected. `deleted_at` is `timezone=True`, and
+    comparing it against a naive datetime raises inside asyncpg — a 500 on an authenticated
+    endpoint for what is really a malformed argument.
+    """
+    if value is None:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise AppApiError(422, f"{field} must be an ISO-8601 date or timestamp.") from None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def split_keyset[T](

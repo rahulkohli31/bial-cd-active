@@ -127,10 +127,15 @@ describe('ProjectDeleteDialog — confirm gating', () => {
     // returning before the screen did. The admin console's Deletions tab is that screen, so
     // the promise is true and the assertion flips back. §13.2: someone writing what feels
     // like a private note deserves to know it is not.
+    //
+    // "SEARCH AND READ", not "see": the tab is full-text searchable across every reason ever
+    // written, so somebody can reach these words without ever having heard of this project.
+    // "An administrator can see this" is read as "if they go looking at my project" — accurate
+    // about the mechanism, misleading about the exposure.
     h.listProjectConversations.mockResolvedValue([])
     render(<ProjectDeleteDialog project={project} onClose={() => {}} onConfirm={vi.fn()} />)
 
-    expect(screen.getByText(/an administrator can see this/i)).toBeTruthy()
+    expect(screen.getByText(/an administrator can search and read this/i)).toBeTruthy()
   })
 
   it('arms at EXACTLY the bounds, and disarms one word outside either', async () => {

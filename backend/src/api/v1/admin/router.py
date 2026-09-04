@@ -30,6 +30,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from typing import Annotated, Any, cast
 
 import sqlalchemy as sa
@@ -41,6 +42,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
 
 from src.api.deps import ContainerStore, DbSession, OptionalStorage, Storage
+from src.api.deps_csrf import RequireCsrf
 from src.api.deps_rbac import CurrentSuperadmin
 from src.api.v1.admin.schemas import (
     MAX_DAILY_TOKEN_LIMIT,
@@ -60,6 +62,7 @@ from src.api.v1.admin.schemas import (
     DatabaseReconcileCounts,
     DatabaseReconcileResponse,
     DeletedProjectOut,
+    DeletedProjectsQuery,
     DeletedProjectsResponse,
     DeployCredentialResponse,
     DeployReconcileResponse,
@@ -94,6 +97,7 @@ from src.api.v1.pagination import (
     clean_limit,
     clean_search,
     parse_cursor,
+    parse_when,
     split_keyset,
 )
 from src.config import settings
@@ -184,6 +188,13 @@ router = APIRouter(prefix="/admin/apps", tags=["admin"])
 # already spread, so the shared definition costs no churn at any of the call sites in this file.
 # (A count stood here and had drifted from 24 to 26; a number in a comment cannot go red.)
 _ADMIN_AUTH = ADMIN_AUTH
+
+# The `resource_id` every deletions-log read is filed under. A CONSTANT rather than a row id,
+# because the act being recorded is a SEARCH — it has no single subject, and naming one of the
+# returned rows would make the audit blob a copy of the table it audits. It exists so the rows
+# are addressable at all: `audit_logs` indexes `(resource_type, resource_id)`, and a NULL
+# `resource_id` (what this route wrote before) matches no reader's predicate.
+_DELETIONS_AUDIT_RESOURCE = "deleted-projects"
 
 # How many registry rows one listing returns. Pagination is deliberately deferred, so the
 # cap is REPORTED rather than hidden: `AppListResponse.truncated` says when it bit, and the
@@ -2330,18 +2341,22 @@ async def harness_counters(
     )
 
 
-@users_router.get(
-    "/deleted-projects",
+@users_router.post(
+    "/deleted-projects/search",
+    dependencies=[RequireCsrf],
     responses=error_responses(
-        (422, ErrorEnvelope, "Invalid pagination cursor or over-long q"), *_ADMIN_AUTH
+        AUTH_401,
+        # The RBAC gate's own 403 is the `DetailBody` shape; `RequireCsrf`'s refusal is the
+        # envelope. OpenAPI allows one schema per status, so the envelope is documented —
+        # the same resolution `deactivate_user` reached for the same collision.
+        (403, ErrorEnvelope, "Super-admin privileges required, or CSRF check failed"),
+        (422, ErrorEnvelope, "Invalid cursor, limit, q, or date bound"),
     ),
 )
-async def list_deleted_projects(
+async def search_deleted_projects(
+    body: DeletedProjectsQuery,
     admin: CurrentSuperadmin,
     db: DbSession,
-    cursor: CursorQuery = None,
-    limit: LimitQuery = DEFAULT_PAGE_SIZE,
-    q: SearchQuery = None,
 ) -> DeletedProjectsResponse:
     """Deletions, newest first — the reader `deleted_projects` did not have (#176).
 
@@ -2362,16 +2377,36 @@ async def list_deleted_projects(
     across owners, and the question this surface answers — what has been deleted, and why — is
     not answerable from one person's rows.
 
+    `q` IS A CASE-INSENSITIVE SUBSTRING over four columns — the project's name, the owner's
+    email, the name of whoever deleted it, and the reason itself — named here because the
+    `list_users` sibling names its own two, and a search box whose reach is undocumented gets
+    used as though it reached further.
+
+    `deletedFrom` / `deletedTo` bound `deleted_at`, INCLUSIVE AT BOTH ENDS. #176 asks for a
+    date range; a half-open upper bound would drop the last day of any range an administrator
+    typed, which is the one they are most likely to have meant.
+
     THE READ IS AUDITED, which is unusual and intended. Most reads are not, but a few are:
     `db:reveal` and `harness:parked:list` are both audited reads, on the same reasoning —
     seeing something privileged is itself an act worth recording. Reading the reason a citizen
-    gave for destroying their own work belongs in that category.
+    gave for destroying their own work belongs in that category. `read_deletions_audit` below
+    is what makes that record retrievable; an audit row nobody can read is not a control.
+
+    A POST, THOUGH IT READS. See `DeletedProjectsQuery` for the whole argument: the audit
+    write made this a mutation in every sense except the method name, and the method name is
+    what `refuse_cross_origin_writes` dispatches on.
     """
-    after = parse_cursor(cursor)
-    search = clean_search(q)
-    limit = clean_limit(limit)
+    after = parse_cursor(body.cursor)
+    search = clean_search(body.q)
+    limit = clean_limit(body.limit)
+    deleted_from = parse_when(body.deleted_from, field="deletedFrom")
+    deleted_to = parse_when(body.deleted_to, field="deletedTo")
 
     query = sa.select(DeletedProject)
+    if deleted_from is not None:
+        query = query.where(DeletedProject.deleted_at >= deleted_from)
+    if deleted_to is not None:
+        query = query.where(DeletedProject.deleted_at <= deleted_to)
     if search is not None:
         # `autoescape` is not optional: without it a `%` or `_` in the query becomes a
         # wildcard and the "search" silently matches far more than the admin typed.
@@ -2398,12 +2433,37 @@ async def list_deleted_projects(
     # The detail records the QUERY, never the rows. Logging what was returned would grow the
     # audit table a second copy of the table it is auditing, and would put the citizen's own
     # words in two places instead of one.
+    #
+    # THE QUERY IS HASHED RATHER THAN STORED, because `audit.py`'s own contract is "record WHO
+    # did WHAT to WHICH resource — never the record CONTENTS", and a 200-character free-text
+    # search term is contents. An investigation starts from a candidate term, so a digest keeps
+    # nearly all of the forensic value: hash the term you suspect and compare. What it drops is
+    # the ability to READ an admin's searches back out of a table that has no retention and
+    # whose only access path is direct SQL — a wider audience than `superadmin_emails`.
+    # `_fingerprint` in the storage backend hashes credentials for the same reason.
+    #
+    # THE CURSOR IS RECORDED because it is an opaque UUIDv7 primary key, so the objection to
+    # storing `q` does not apply to it — and without it forty walks down the whole table are
+    # byte-identical to forty reloads of page one. Whether one deletion was read or a thousand
+    # is exactly the question this row exists to answer.
+    #
+    # `resource_id` IS STAMPED so the row is reachable. `read_deletions_audit` reads it back by
+    # `(resource_type, resource_id)`, which is the composite index `audit_logs` already
+    # carries. It was previously NULL, which put these rows where no reader could match them.
     await append_audit(
         db,
         actor_id=admin.id,
         action="admin:deletions:list",
         resource_type="deleted_project",
-        detail={"q": search, "count": len(page)},
+        resource_id=_DELETIONS_AUDIT_RESOURCE,
+        detail={
+            "filtered": search is not None,
+            "qHash": sha256(search.encode()).hexdigest()[:16] if search else None,
+            "cursor": body.cursor,
+            "deletedFrom": body.deleted_from,
+            "deletedTo": body.deleted_to,
+            "count": len(page),
+        },
     )
     await db.commit()
 
@@ -2427,4 +2487,64 @@ async def list_deleted_projects(
         ],
         next_cursor=next_cursor,
         has_more=has_more,
+    )
+
+
+@users_router.get("/deleted-projects/audit", responses=error_responses(*_ADMIN_AUTH))
+async def read_deletions_audit(admin: CurrentSuperadmin, db: DbSession) -> AuditListResponse:
+    """Who has read the deletions log, newest first — the reader the audit rows lacked.
+
+    WITHOUT THIS THE AUDIT WRITE IS A CLAIM RATHER THAN A CONTROL. `search_deleted_projects`
+    reads across every owner, and the argument for allowing that is precisely that the read is
+    recorded. But `read_audit` — the only other audit surface — filters
+    `resource_id == <app id> OR detail["appId"] == <app id>`, and a search of the deletions log
+    has no app, so no value of `resource_id` could ever have matched it there. The rows existed
+    and nothing in the product could retrieve them: the same write-only shape #176 was raised
+    to close, reproduced one layer up in the table that exists to prevent it.
+
+    NOT ITSELF AUDITED, and that is a decision rather than an oversight: auditing the reading of
+    an audit log regresses without a fixed point, and `read_audit` — the precedent — is not
+    audited either. The gate is `CurrentSuperadmin`, the same one guarding what it reports on.
+
+    A PLAIN GET, unlike its sibling. This route writes nothing, so it is not the shape
+    `refuse_cross_origin_writes` exists to catch and it needs no CSRF token. The asymmetry
+    between the two routes is the point: the sibling is a POST BECAUSE it writes.
+
+    Bounded at 200 rows like `read_audit`, and unpaged for the same reason — this is a
+    "who has been here lately" strip, not a second list to walk.
+    """
+    rows = (
+        await db.execute(
+            sa.select(AuditLog, User.email)
+            .outerjoin(User, AuditLog.actor_id == User.id)
+            .where(
+                AuditLog.resource_type == "deleted_project",
+                AuditLog.resource_id == _DELETIONS_AUDIT_RESOURCE,
+            )
+            # BY THE UUIDv7 KEY, not by `created_at` as `read_audit` does — and the deviation is
+            # a correctness fix rather than a preference. `created_at` is `server_default=now()`,
+            # which in Postgres is TRANSACTION START: two rows written in one transaction carry
+            # the same value, so `ORDER BY created_at DESC` is a tie the planner breaks however
+            # it likes. `id` is UUIDv7 assigned at flush, so it is strictly increasing and
+            # "newest first" actually means it. A test writing two reads in one transaction is
+            # what surfaced this; concurrent requests can tie the same way in production.
+            .order_by(AuditLog.id.desc())
+            .limit(200)
+        )
+    ).all()
+    return AuditListResponse(
+        events=[
+            AuditEventOut(
+                id=row.id,
+                actor_id=row.actor_id,
+                username=email,
+                action=row.action,
+                resource_type=row.resource_type,
+                resource_id=row.resource_id,
+                detail=row.detail,
+                count=row.detail.get("count") if isinstance(row.detail, dict) else None,
+                created_at=row.created_at,
+            )
+            for row, email in rows
+        ]
     )

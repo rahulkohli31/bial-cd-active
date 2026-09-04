@@ -212,10 +212,18 @@ export default function ProjectDeleteDialog({
                 could retrieve one — a promise about who reads a person's words is a promise
                 to that person, not an internal TODO. The admin console's Deletions tab is
                 that reader now, so the stronger claim is restored. §13.2 asks for it:
-                someone writing what feels like a private note deserves to know it is not. */}
+                someone writing what feels like a private note deserves to know it is not.
+
+                "SEARCH AND READ", not "see". The two are not the same promise, and the
+                difference is the one the writer actually cares about: "an administrator can
+                see this" is read as "if they go looking at my project", while the Deletions
+                tab is full-text searchable across every reason ever written. Somebody can
+                arrive at these words without ever having heard of this project, by searching
+                for a phrase in them. Telling the writer only the weaker half would be
+                accurate about the mechanism and misleading about the exposure. */}
             <span className="text-[11px] text-neutral">
               Between {MIN_DELETE_REASON_WORDS} and {MAX_DELETE_REASON_WORDS} words. An
-              administrator can see this.
+              administrator can search and read this.
             </span>
             <span
               className={`text-[11px] tabular-nums ${

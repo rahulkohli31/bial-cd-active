@@ -283,23 +283,63 @@ export interface DeletedProjectsPage {
 }
 
 /**
- * GET a keyset page of deletions, newest first, optionally filtered by `q` (project name,
- * owner email, who deleted it, or the reason itself).
+ * Search the deletions log: a keyset page, newest first, optionally filtered by `q` (project
+ * name, owner email, who deleted it, or the reason itself) and by a `deletedFrom`/`deletedTo`
+ * range over when the deletion happened.
+ *
+ * A POST, THOUGH IT READS, and the method is the security property rather than an ergonomic
+ * one. The route commits an audit row on every call — its own comment says "A READ THAT
+ * WRITES" — but the backend's cross-origin guard fires only on POST/PUT/PATCH/DELETE,
+ * precisely because a GET is not supposed to mutate. As a GET, an audited admin-only endpoint
+ * sat outside that guard with a `SameSite=Lax` session cookie, and generated apps are served
+ * same-site: app code written by a model from a citizen's prompt could drive a super-admin's
+ * session into writing audit rows under their identity. POST puts it back inside the guard and
+ * picks up the `X-CSRF-Token` `authFetch` attaches to every non-GET.
+ *
+ * It also keeps the search term out of the URL — a query string is logged verbatim by uvicorn's
+ * access log and by the gateway's `requestUri`, two audiences wider than the super-admins this
+ * screen is gated to, with a retention this repo does not control.
  *
  * KEYSET, unlike `/api/projects`, and the difference is deliberate rather than an
  * inconsistency: that list needs a `total` for `Showing 1-8 of 12`, and this one does not.
  * The table is append-only with a time-sortable key, so the cursor is just the last row's id.
  */
 export async function fetchDeletedProjects(
-  { cursor, limit, q, signal }: { cursor?: string | null; limit?: number; q?: string; signal?: AbortSignal } = {},
+  {
+    cursor,
+    limit,
+    q,
+    deletedFrom,
+    deletedTo,
+    signal,
+  }: {
+    cursor?: string | null
+    limit?: number
+    q?: string
+    deletedFrom?: string | null
+    deletedTo?: string | null
+    signal?: AbortSignal
+  } = {},
   deps: AuthFetchDeps = {},
 ): Promise<DeletedProjectsPage> {
-  const params = new URLSearchParams()
-  if (cursor) params.set('cursor', cursor)
-  if (limit != null) params.set('limit', String(limit))
-  if (q) params.set('q', q)
-  const query = params.toString()
-  const res = await authFetch(`/api/admin/deleted-projects${query ? `?${query}` : ''}`, { signal }, deps)
+  const res = await authFetch(
+    '/api/admin/deleted-projects/search',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // Empty values are sent as null rather than omitted: the server reads absent and blank
+      // identically, and one shape on the wire keeps the request easy to read in a har file.
+      body: JSON.stringify({
+        cursor: cursor || null,
+        limit: limit ?? null,
+        q: q || null,
+        deletedFrom: deletedFrom || null,
+        deletedTo: deletedTo || null,
+      }),
+      signal,
+    },
+    deps,
+  )
   if (!res.ok) throw await readApiError(res, 'Failed to load deletions')
   const body: unknown = await res.json()
   const data = body as Partial<DeletedProjectsPage>
@@ -308,4 +348,35 @@ export async function fetchDeletedProjects(
     nextCursor: data.nextCursor ?? null,
     hasMore: data.hasMore ?? false,
   }
+}
+
+/** One recorded read of the deletions log, as the "who has read this" strip shows it. */
+export interface DeletionsAuditEvent {
+  id: string
+  action: string
+  username: string | null
+  createdAt: string
+  detail: { filtered?: boolean; count?: number; cursor?: string | null } | null
+  count: number | null
+}
+
+/**
+ * Who has read the deletions log, newest first.
+ *
+ * The reason cross-owner reading is defensible on this screen is that reading is itself
+ * recorded — and until this existed nothing could retrieve the record. The other audit surface
+ * matches on an app id, and a search of the deletions log has no app, so those rows sat where
+ * no reader could ever find them: the same write-only shape #176 was raised to close, one layer
+ * up, in the table whose entire job is accountability.
+ *
+ * A plain GET, unlike its sibling above, because this one genuinely writes nothing.
+ */
+export async function fetchDeletionsAudit(
+  { signal }: { signal?: AbortSignal } = {},
+  deps: AuthFetchDeps = {},
+): Promise<DeletionsAuditEvent[]> {
+  const res = await authFetch('/api/admin/deleted-projects/audit', { signal }, deps)
+  if (!res.ok) throw await readApiError(res, 'Failed to load the read log')
+  const body: unknown = await res.json()
+  return (body as { events?: DeletionsAuditEvent[] }).events || []
 }
