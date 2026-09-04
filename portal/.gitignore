@@ -4,7 +4,9 @@ dist-ssr
 *.local
 .env
 .env.local
-# Real e2e secrets (Foundry key, JWT_SECRET, QA password). Only the template
+# The real e2e config. Its one secret is now E2E_STORAGE_STATE — the path to a minted
+# session's cookies; there is no QA password, because sign-in is Azure SSO only, and the
+# Foundry key and JWT_SECRET are the backend's, not this package's. Only the template
 # .env.e2e.example is committed.
 .env.e2e
 .DS_Store

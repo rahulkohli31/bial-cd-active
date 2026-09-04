@@ -26,14 +26,21 @@ export default defineConfig({
     },
   },
   server: {
-    // Disable vite's own dev-server CORS. The builder live-preview runs in a
-    // sandboxed, opaque-origin iframe (Origin: null) and calls the Data Service at
-    // /api/apps/:id/records cross-origin. Vite 6's built-in CORS middleware answers
-    // the OPTIONS preflight ITSELF — without an Access-Control-Allow-Origin for the
-    // null origin — so the browser blocks the request ("Failed to fetch"). Turning
-    // it off lets the preflight proxy through to the FastAPI control-plane, whose
-    // cors.py reflects Origin: null on ^/v1/apps/.../(records|files|parse) — the
-    // path the /api→/v1 rewrite below produces (matching production, no vite).
+    // Disable vite's own dev-server CORS. EVERY REASON THIS LINE ORIGINALLY HAD IS NOW
+    // FALSE, and it is kept on a different one — recorded here so the next reader does not
+    // delete it as residue. It was added for the shared data plane: an opaque-origin
+    // (Origin: null) preview iframe called /api/apps/:id/records, and vite's built-in CORS
+    // middleware answered the preflight itself, without an Access-Control-Allow-Origin for
+    // null, so the browser blocked it. Turning it off let the preflight proxy through to the
+    // control-plane's null-reflecting branch. That branch is gone with that plane
+    // (services/cors/middleware.py says so), the records routes with it, and a generated app
+    // now reaches its own database rather than a shared endpoint.
+    //
+    // WHY IT STAYS. Vite's default is to answer cross-origin requests for any origin, so a
+    // page on any site can read what this dev server serves while a developer has it running.
+    // Off is the safe default and costs nothing: the SPA is same-origin with vite at :5173,
+    // so no /api call preflights, and the one CORS layer that matters is the control-plane's,
+    // which reflects FRONTEND_URL alone.
     cors: false,
     // Dev parity for the portal's document CSP (prod sets this via nginx envsubst; C8 §2, KTD-3).
     // A concrete, non-empty value so a dev-server load exercises the SAME framing constraint the
