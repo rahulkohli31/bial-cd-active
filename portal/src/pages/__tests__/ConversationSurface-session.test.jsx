@@ -151,7 +151,7 @@ function scriptedBuild(options) {
  *  own docstring: "emit the first frame BEFORE any model byte — the snapshot serves that role"),
  *  carrying the `turnId` `handleStopTurn` reads out of `liveTurnIdRef` — `scriptBuildTurn`'s
  *  default `opening` (just a `workspace` frame) predates that contract, so a test that presses
- *  Stop has to supply one itself. Mirrors `BuilderPage-outcome.test.jsx`'s helper of the same name
+ *  Stop has to supply one itself. Mirrors `ConversationSurface-outcome.test.jsx`'s helper of the same name
  *  and purpose. */
 const T_SNAPSHOT = (turnId, seq = 1) => ({
   type: 'snapshot', seq, turnId, turnStatus: 'running', items: [], parts: [], working: false,
@@ -462,7 +462,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     // page's own send path cannot start one (`session.start()` has been deleted from the hook) — so
     // an ARRIVED, ALREADY-STREAMING build turn reads as an ordinary in-flight reply once you are
     // on the chat it runs in. "Building your app…" still appears, but only for the click-time
-    // round-trip (`buildStarting`), pinned separately in `BuilderPage-composer.test.jsx`.
+    // round-trip (`buildStarting`), pinned separately in `ConversationSurface-composer.test.jsx`.
     fireEvent.change(textarea, { target: { value: 'make it dark mode' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
     expect(await screen.findByText(/send unlocks when it is done/i)).toBeTruthy()
@@ -649,7 +649,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     // every other term of the gate has to be scoped the same way or it reintroduces the leak.
     // BUILD-IT IS A HANDOFF (U5/U12): pressing it in `chat-A` creates a SECOND, brand-new build
     // chat and navigates there — this render has no `<Routes>` for that real `navigate()` to
-    // resolve against (a `chatId` PROP, matching `BuilderPage-composer.test.jsx`'s `renderAt`
+    // resolve against (a `chatId` PROP, matching `ConversationSurface-composer.test.jsx`'s `renderAt`
     // idiom), so arriving is simulated the same way every sibling-chat guard in this file already
     // simulates a chat switch: a `chatId` prop swap on the SAME instance.
     const CHAT_A_LIVE = 'chat-A-live'

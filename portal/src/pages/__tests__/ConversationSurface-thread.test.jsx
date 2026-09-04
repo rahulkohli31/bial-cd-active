@@ -26,7 +26,7 @@ import { ApiError } from '../../utils/apiError'
 // minted via `uuidv7`, then echoed back by the server as `BuildFromPlanOutcome.chatId` — the
 // mock below mirrors that echo). One fixed id is enough here because no single test in this
 // file presses Build it twice — a second, distinguishable mint only matters for the cross-tab
-// lock suite (BuilderPage-buildlock.test.jsx), which needs to tell several handoffs apart.
+// lock suite (ConversationSurface-buildlock.test.jsx), which needs to tell several handoffs apart.
 const MINTED_BUILD_CHAT_ID = 'minted-build-chat-1'
 
 const h = vi.hoisted(() => ({

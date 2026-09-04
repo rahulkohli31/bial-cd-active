@@ -21,12 +21,12 @@
  *
  * WHAT IS DELIBERATELY NOT RE-PINNED HERE, because it is already pinned once and two assertions of
  * one fact drift apart:
- *  - the composer draft across a panel hide/show — `BuilderPage-panel.test.jsx:57`;
+ *  - the composer draft across a panel hide/show — `ConversationSurface-panel.test.jsx:57`;
  *  - the scroll position across the same cycle — `:86`, the one that actually discriminates a
  *    CSS-hide from an unmount;
- *  - a send refused while a turn runs — `BuilderPage-composer.test.jsx:179`,
- *    `BuilderPage-session.test.jsx:316,338`;
- *  - cross-project isolation of the build gate — `BuilderPage-session.test.jsx:543`;
+ *  - a send refused while a turn runs — `ConversationSurface-composer.test.jsx:179`,
+ *    `ConversationSurface-session.test.jsx:316,338`;
+ *  - cross-project isolation of the build gate — `ConversationSurface-session.test.jsx:543`;
  *  - the reload nonce's two legitimate bumps, a turn ending over a live preview and the manual
  *    Reload — `components/__tests__/LivePreview.test.jsx:355` and `:375`.
  *

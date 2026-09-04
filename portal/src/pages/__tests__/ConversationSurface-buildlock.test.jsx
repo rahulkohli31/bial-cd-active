@@ -2,7 +2,7 @@
  * The advisory build lock, seen from the page (KTD-7).
  *
  * `buildLock` is the FAST cross-tab UX pre-check only — the authoritative one-build-per-user
- * barrier is the server's 409 (tested in BuilderPage-session.test.jsx). Here we pin that
+ * barrier is the server's 409 (tested in ConversationSurface-session.test.jsx). Here we pin that
  * BuilderPage still CLAIMS the project when a build starts and consults `blockedBy` before it
  * starts another (a second builder chat in the same project is warned before it costs a round
  * trip), that a different project is not blocked, that the claim is released when the build ends,
@@ -28,7 +28,7 @@
  * chat id, registers it as the project's `listProjectConversations` would, and gives it a running
  * `activeTurn` so the SAME BuilderPage instance — now displaying the new chat, having navigated
  * there — reattaches and renders the live narrative (`build-progress`/`build-outcome`) exactly as
- * a reload mid-build already does (BuilderPage-thread.test.jsx's R8 suite).
+ * a reload mid-build already does (ConversationSurface-thread.test.jsx's R8 suite).
  *
  * The pre-check hangs off the BRIEF CARD's confirmation, not off Send (003-U4). A send is just a
  * chat turn, and refusing to let someone TALK to the assistant because another tab is building
@@ -239,7 +239,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     // End A's first build — its claim on 'new-A' retracts once `endGenerating` runs at the
     // reattach's settle point (BuilderPage.tsx's `endGenerating` docblock: "the one point every
     // turn path settles through"). NOT `findByTestId('build-outcome')`: that card is a confirmed,
-    // separately-tracked gap (BuilderPage-outcome.test.jsx's diagnostic note) — `showBuildOutcome`
+    // separately-tracked gap (ConversationSurface-outcome.test.jsx's diagnostic note) — `showBuildOutcome`
     // has no call site on the turn-based path any more, so a live build's end currently clears the
     // narrative bubble and shows NOTHING until a reload. Waiting for the live bubble to clear is
     // the honest proxy: it is the one DOM change this page actually makes when the turn ends.
@@ -313,7 +313,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     // A's build ends → its advisory claim retracts once `endGenerating` runs at the reattach's
     // settle point. NOT `findByTestId('build-outcome')` — see the matching comment in "a second
     // build RE-ACQUIRES the claim" above: that card has no call site on this path yet
-    // (BuilderPage-outcome.test.jsx), so the live bubble clearing is the honest signal that the
+    // (ConversationSurface-outcome.test.jsx), so the live bubble clearing is the honest signal that the
     // turn actually ended.
     await turn.frame(T_BUILD_END())
     await turn.end()

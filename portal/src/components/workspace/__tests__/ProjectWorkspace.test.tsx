@@ -423,7 +423,7 @@ describe('the channel is left as the next surface needs to find it', () => {
  * WHAT THE SHELL DOES FOR A CHAT THAT WANTS NO PANE (plan 002, U6).
  *
  * The SURFACE half — that the panel fills the rail, that a plan chat centres its column, that the
- * board's footer line appears on one kind and not the other — is `BuilderPage-panel.test.tsx`'s,
+ * board's footer line appears on one kind and not the other — is `ConversationSurface-panel.test.tsx`'s,
  * where the real conversation surface renders. What is only visible HERE, through the real shell,
  * is the relationship between the two columns: who gets the width, and whether the frame survives.
  */

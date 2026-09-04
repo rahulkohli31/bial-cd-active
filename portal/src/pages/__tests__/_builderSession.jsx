@@ -270,7 +270,7 @@ export const findStartAppControl = () =>
  * lands whether or not that round trip ever settles. A round trip that DOES settle hands the
  * session hook a real `status`, and a `status` alone — with no URL at all — is enough to keep
  * `AppPane` showing `AppPaneHost`'s own now-buttonless terminal card instead of `NoFrame` (the
- * OTHER finding this investigation turned up: see `BuilderPage-session.test.jsx`'s "come back
+ * OTHER finding this investigation turned up: see `ConversationSurface-session.test.jsx`'s "come back
  * later" suite). Leaving the round trip pending sidesteps that trap entirely: the ref is stamped,
  * nothing else about "the session" is ever true, and `NoFrame`/`StartAppControl` is reachable the
  * moment the map has anything to say.

@@ -50,7 +50,7 @@ function headerOf(m: ReturnType<typeof jsonFetch>, name: string, call = 0): stri
 // The frozen `buildSessionClient` member set — the portal's mirror of the backend's
 // `test_abstractmethod_set_equals_the_c2_contract` (`test_base.py`). A drifted mock bag is
 // what this guards: the client interface trimmed to five members here, but one call site
-// (`BuilderPage-memo.test.jsx`) went on mocking `acquireLock` / `renewLock` / `releaseLock` /
+// (`ConversationSurface-memo.test.jsx`) went on mocking `acquireLock` / `renewLock` / `releaseLock` /
 // `heartbeat` anyway, because nothing forced its stale keys to be read against the real
 // surface. This test fails LOUDLY the moment `buildSessionClient` gains or loses a member,
 // so the next removal cannot leave the same kind of residue behind unnoticed.
