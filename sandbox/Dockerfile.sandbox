@@ -43,7 +43,10 @@ RUN npm install -g npm@12.0.2 --cache /tmp/npm-self-cache --loglevel=error \
     && rm -rf /tmp/npm-self-cache /root/.npm
 
 # System deps: git (snapshot/restore, Track SANDBOX), python (supervisor), curl (fetch
-# Caddy), procps (ps), ca-certificates (TLS to the data-service + npm registry).
+# Caddy), procps (ps), ca-certificates (TLS out of the container: the npm registry at runtime,
+# the app's own PostgreSQL over `BIAL_DATABASE_URL`, and Azure Blob over `BIAL_BLOB_SAS`).
+# It said "the data-service" — the shared platform data plane was deleted with the per-app
+# database (ADR-0028) and nothing in this image talks to it.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         git ca-certificates curl python3 python3-pip procps \

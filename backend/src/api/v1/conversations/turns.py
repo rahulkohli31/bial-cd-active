@@ -123,11 +123,13 @@ class NewConversation(CamelModel):
     Present only on a chat's FIRST message. The id rides the path exactly as it does for every
     other turn, so this carries what a row cannot be built without and nothing else.
 
-    WHY IT LIVES ON THE TURN REQUEST AT ALL. The row used to be created by a separate
-    `POST /conversations` a round trip earlier, whose only workspace awareness was a
+    WHY IT LIVES ON THE TURN REQUEST AT ALL. The BROWSER used to create the row with a separate
+    `POST /v1/conversations` a round trip earlier, whose only workspace awareness was a
     project-ownership check — so a message the workspace then refused left a real, titled,
-    empty conversation in the project's list, named after the text that was refused. Folding
-    the creation into this request lets every side-effect-free refusal already above it roll
+    empty conversation in the project's list, named after the text that was refused. (That route
+    is still MOUNTED and still works — only its client went. Do not read this paragraph as a
+    retirement notice and delete the handler.) Folding the creation into this request lets every
+    side-effect-free refusal already above it roll
     the row back with it, because nothing is committed until the turn's own commit.
     """
 
@@ -314,8 +316,9 @@ async def start_turn(
     project_id: uuid.UUID
     if existing is not None:
         # A `create` block on a conversation that already exists is a retry or a second tab. The
-        # existing row wins; the block is ignored rather than refused, which keeps the idempotency
-        # the separate create route used to provide. Clearing `staged` is what makes that true —
+        # existing row wins; the block is ignored rather than refused, matching the idempotency
+        # `POST /v1/conversations` gives on the same id (it answers 200 with the existing header
+        # rather than 409ing a retry). Clearing `staged` is what makes that true —
         # it is the sole guard on the row-creating branch far below.
         staged = None
         conversation, project_id = existing, existing.project_id
@@ -327,9 +330,11 @@ async def start_turn(
         # conversation was already read under this user's scope.
         await owned_project_or_404(db, user.id, project_id)
     else:
-        # Unchanged for every turn after the first: conversations are created with their first
-        # message, so an unknown id with no parentage to build one from is a client bug — and a
-        # cross-user id is indistinguishable from it, which is one non-leaking 404 (ADR-0004).
+        # Unchanged for every turn after the first: THIS route creates a conversation only from a
+        # `create` block, so an unknown id with no parentage to build one from is a client bug —
+        # and a cross-user id is indistinguishable from it, which is one non-leaking 404
+        # (ADR-0004). Not a claim that a row can be born no other way: `POST /v1/conversations`
+        # still creates one outright, with no message, and is deliberately retained.
         raise AppApiError(404, "Conversation not found.")
 
     # Daily-token gate BEFORE anything persists — a capped user's message is refused

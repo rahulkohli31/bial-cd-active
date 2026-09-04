@@ -1,9 +1,15 @@
 """One-click deploy — the citizen-facing control surface, plus the admin kill-switch (#113).
 
-`POST /v1/projects/{id}/deploy` starts a deploy and returns **202 immediately**. That is not
-a style choice: a deploy runs for minutes and the edge gateway times out at twenty seconds,
-so anything that waits for the result is a guaranteed 504 on a deploy that is in fact going
-fine. The work is detached; the client polls `GET /v1/projects/{id}/deployment`.
+`POST /v1/projects/{id}/deploy` answers with one of TWO statuses, and the difference is the
+whole point of the gate below: **202** when a deploy actually started — the work is detached
+and the client polls `GET /v1/projects/{id}/deployment` — and **200** when the request was
+ROUTED into the admin queue instead, where nothing was started and there is nothing to poll
+(`_route_to_review` sets it). This paragraph named only the 202, which reads as a promise the
+route does not make on every path.
+
+The 202 is not a style choice: a deploy runs for minutes and the edge gateway times out at
+twenty seconds, so anything that waits for the result is a guaranteed 504 on a deploy that is
+in fact going fine.
 
 THE PUBLISH GATE IS A PRECEDENCE LADDER, AND THIS IS WHERE THE TWO LINEAGES JOIN (U9).
 An earlier revision of this docstring said "no admin approval to start a deploy" and that
@@ -11,7 +17,9 @@ the `submit`/`approve`/`reject` surface "is simply not what `deploy_project` cal
 became false here, on purpose. `deploy_project` now resolves the shipping commit, reads
 the platform's own stored review of it, merges that with the citizen's declaration
 (stricter-of per question), and lands on exactly one of four outcomes, in precedence
-order (see `_LADDER` on the route): refuse (disabled / already waiting), PUBLISH (an
+order. The ladder is PROSE plus `# --- rule N ---` markers in `deploy_project`'s body —
+this line used to point at a constant called `_LADDER`, which exists nowhere. The four:
+refuse (disabled / already waiting), PUBLISH (an
 administrator approved exactly this version for self-publishing — R17 — or nothing
 weighted merged Yes — R14), DEFER to the pipeline's own re-check (this request saved
 first, R13), or ROUTE the app into the admin approve queue through the approvals submit
@@ -133,7 +141,8 @@ router = APIRouter(prefix="/projects", tags=["deploy"])
 # Keeping the code out of admin/router.py avoids a merge conflict; that was never a reason
 # to change the URL, and an earlier revision of this router mistakenly carried both. Every
 # superadmin-gated app lever in this codebase answers on `/v1/admin/apps/{app_id}/...`
-# (admin/router.py:148), while `/v1/apps/*` is the citizen surface (apps/router.py:51),
+# (`admin/router.py`'s `APIRouter(prefix="/admin/apps", ...)`), while `/v1/apps/*` is the
+# citizen surface (`apps/router.py`'s `APIRouter(prefix="/apps", ...)`),
 # where every route is `user_id`-scoped and a cross-user id is a non-leaking 404. Mounting
 # an admin lever there would give that prefix two different authorization contracts, hide
 # it from any gateway/WAF/log filter keyed on `/v1/admin`, and split it off in OpenAPI —
@@ -893,7 +902,8 @@ async def _saved_version_for_publish_state(
     """U15's one object-store read for the publish-state chip: the same metadata `head()`
     `_shipping_head` above and `classification/router.py`'s `_saved_version` already
     take, copied deliberately and NOT the whole-bundle read
-    `build_sessions/manager.py:683-695` uses to answer the same question — that
+    `build_sessions/manager._saved_head` uses to answer the same question (it `get`s the whole
+    snapshot and parses its header) — that
     distinction (a small header vs. the app's entire git bundle pulled through the API
     process, on a route a client polls on mount, on focus and after every publish) is
     the unit's whole cost argument.
@@ -1118,9 +1128,12 @@ async def unpublish(
                                 the sweep, so two admins racing the same incident leave two
                                 rows, correctly attributed, which is the point.
       `unpublish:unconfirmed` — the sweep came back empty, so this request never observed the
-                                container go away. Written after the attempt row, mirroring
-                                `deploy_refused_classification` above: audit the outcome,
-                                commit, then raise. NOT `:failed` — see the sweep branch.
+                                container go away. Written after the attempt row, mirroring the
+                                two `publish_gate` refusals at the top of `deploy_project`
+                                (`rule="disabled"` and `rule="pending"`): audit the outcome,
+                                commit, then raise. That is the shape being copied — the name
+                                `deploy_refused_classification` stood here and matches no audit
+                                action in the tree. NOT `:failed` — see the sweep branch.
     A successful unpublish therefore writes ONE row, not two: the pre-ARM row already carries
     the whole ADR-0005 payload (who, what, which, when), and "it worked" is already durable in
     `unpublished_at` and the `app_unpublished` log line. One `unpublish` row with no

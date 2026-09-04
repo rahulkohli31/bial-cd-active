@@ -61,10 +61,12 @@ def _off_duty_because() -> str | None:
     # than at module scope so a deployment with reclamation off still pays for nothing — and
     # checked LAST so the two ordinary off states answer before the import happens at all.
     #
-    # This gates the SCHEDULED sweep only. `POST /v1/internal/reap` still runs `sweep_all`
-    # anywhere: it is superadmin-authenticated, audited, and has a human behind it who can see
-    # what they asked for. Reconcile-on-start is likewise untouched, so a developer's own stale
-    # sandbox is still collected the moment they start their next build.
+    # This gates the SCHEDULED sweep only. `POST /v1/build-sessions/internal/reap` still runs
+    # `sweep_all` anywhere: it is superadmin-authenticated, audited, and has a human behind it who
+    # can see what they asked for. (Written `/v1/internal/reap` until now, which 404s — the route
+    # is mounted on the build-sessions router, and this line is one an operator pastes.)
+    # Reconcile-on-start is likewise untouched, so a developer's own stale sandbox is still
+    # collected the moment they start their next build.
     from src.services.build_sessions.destroy import may_destroy_on_this_control_plane
 
     if not may_destroy_on_this_control_plane(str(settings.ENVIRONMENT)):

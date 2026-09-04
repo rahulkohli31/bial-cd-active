@@ -1,7 +1,19 @@
 # syntax=docker/dockerfile:1
-# BACKEND image of the split: the FastAPI control-plane — API only (/v1, /apps,
-# /preview). No SPA, no Node. The SPA is a SEPARATE image (portal/Dockerfile) whose
-# nginx proxies /api,/apps,/preview here.
+# BACKEND image of the split: the FastAPI control-plane. It mounts exactly ONE router
+# prefix, `/v1` (main.py's `app.include_router(v1_router)`), and no Node.
+#
+# THIS HEADER USED TO READ "API only (/v1, /apps, /preview). No SPA" and all three halves of
+# that had gone stale:
+#   * `/apps` is not mounted here. The bare-/apps JSX runner was retired — deployed apps are
+#     served from the sandbox's own Caddy — and `main._RESERVED_ROOTS` is now `{"v1", "api"}`
+#     precisely because `/apps` no longer needs reserving.
+#   * `/preview` was never a top-level prefix and is not one now; the only preview surface is
+#     `/v1/build-sessions/projects/{project_id}/preview-state`.
+#   * "No SPA" is a deployment choice, not a property of the image. `_mount_spa` serves the
+#     built React/Vite shell plus a history fallback whenever `SPA_DIST_DIR` is set, and
+#     refuses to boot when it is set at a directory with no `index.html`. The portal image
+#     (portal/Dockerfile) is the OTHER way to serve it; its nginx proxies `/api/` and `/apps/`
+#     to this container, and `/apps/` reaches the generated-app hosts, not a route here.
 #
 # Build context = backend/ :
 #   az acr build --image bial-backend:latest --file backend/Dockerfile backend
@@ -24,8 +36,10 @@ FROM python:3.14-alpine@sha256:05b2b8b732ecd268fee8727a369f936f022d1321b59befd13
 
 # RUNTIME git — not a build convenience. The control plane SHELLS OUT to git to restore an
 # app's snapshot (`services/storage/snapshot_read.py` runs `git clone` over the bundle), and
-# that path is on both the Plan-mode read and the whole publish pipeline
-# (`services/deploy/service.py`). `python:3.14-slim` ships none — there is no `/usr/bin/git`
+# that path carries the whole publish pipeline (`services/deploy/service.py`) and the admin
+# classification review (`services/classification/service.py`). It used to say "the Plan-mode
+# read" instead of the review; a Plan turn reads the LIVE container now and never extracts.
+# `python:3.14-slim` ships none — there is no `/usr/bin/git`
 # and no `/usr/lib/git-core` — so publish was broken in any environment running this image.
 #
 # It must land on the PATH `_git_env` pins for the subprocess (`/usr/local/bin:/usr/bin:/bin`);

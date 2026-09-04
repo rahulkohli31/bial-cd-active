@@ -16,7 +16,12 @@
  * A migration that did not apply is still a real problem — it is just one the app should report
  * as a query error at runtime, not as a mysterious startup failure.
  *
- * Run it directly with `npm run db:migrate` after `npx drizzle-kit generate`.
+ * Running it BY HAND is not the sanctioned channel. `npm run db:migrate` after
+ * `npx drizzle-kit generate` is the two-step sequence `apply_schema_change` replaced: both halves
+ * can print a failure and still exit 0 (this file is the reason the second one does), so run
+ * separately they look like they worked. Edit `db/schema.ts` and call
+ * `apply_schema_change(what_changed="…")` instead — see `db/schema.ts`'s header. Nothing refuses
+ * a hand-run; it is simply the version that cannot tell you it failed.
  */
 
 import path from "node:path";

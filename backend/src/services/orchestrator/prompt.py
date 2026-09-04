@@ -60,9 +60,19 @@ paragraph that used to be typed out here is imported, so the two cannot drift wh
 
 IT NAMES `NARRATION_VOICE` ITSELF, and that line is load-bearing (U5/R79). The audience contract
 is shared by both chat kinds now, so it moved into `mode_prompts._base()` — which THIS prompt
-cannot call, because `_base(context)` needs a `PromptContext` the standalone harness has no source
-for. Lifting the block out of `BUILD_WORKING_RULES_TAIL` without this line would have deleted the
-audience contract from a live prompt and reinstated the 2026-08-18 defect that produced it."""
+cannot call, because `_base(context, kind)` needs a `PromptContext` the standalone harness has no
+source for. Lifting the block out of `BUILD_WORKING_RULES_TAIL` without this line would have
+deleted the audience contract from a live prompt and reinstated the 2026-08-18 defect that
+produced it.
+
+IT ALSO OVER-STATES ITS OWN TOOL SURFACE, and that is known rather than accidental. `TAIL` carries
+`WRITE_TOOL_SURFACE`, a snapshot of what the CHAT Build arm registers (twelve tools), while
+`build_agent` is constructed with `sandbox_toolset` alone (eight). So this prompt names
+`list_files`, `search_files`, `tell_the_user` and `propose_first_slice` to an agent that cannot
+call any of them. See `prompt_blocks.WRITE_TOOL_SURFACE`'s docstring for why it is recorded rather
+than fixed, and `test_prompt.py`'s
+`test_the_harness_arm_is_told_about_four_tools_it_does_not_register` for the guard that goes red
+when it is."""
 
 
 def build_repair_prompt(error: BuildError) -> str:

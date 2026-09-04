@@ -35,6 +35,7 @@ from pydantic_ai.tools import ToolDefinition
 
 from src.core.prompt_blocks import (
     BUILD_THIS_PLAN_LABEL,
+    DATA_INTEGRITY_RULES_WITHOUT_THE_WRITE_MACHINERY,
     KEEP_PLANNING_LABEL,
     NARRATION_VOICE,
     PORTAL_SURFACES,
@@ -79,7 +80,17 @@ def test_composition_is_base_plus_exactly_its_own_segment(kind: ChatKind) -> Non
     assert "Citizen Developer assistant for BIAL" in composed
     assert "Asha" in composed and "Visitor Log" in composed
     assert "Tracks visitors at the airport office." in composed
-    assert DATA_INTEGRITY_RULES in composed
+    # The data-safety block, verbatim, in the ONE form this kind is supposed to get. Build takes
+    # the whole constant; Plan takes the same string minus the two Build-machinery clauses, which
+    # is why this is a per-kind lookup and not a shared substring — the dropped sentinel clause
+    # sits mid-sentence, so neither form contains the other. WHY the two differ, and that the
+    # rules themselves are identical, is
+    # `test_the_sql_sentinel_and_the_migration_channel_are_named_to_build_alone` below.
+    expected_integrity = {
+        ChatKind.PLAN: DATA_INTEGRITY_RULES_WITHOUT_THE_WRITE_MACHINERY,
+        ChatKind.BUILD: DATA_INTEGRITY_RULES,
+    }[kind]
+    assert expected_integrity in composed
     # Exactly this kind's segment, not the other's (mutation-checked: swapping a segment in
     # `compose_kind_prompt` turns this red). Parametrized over the WHOLE enum rather than a
     # hand-kept list, so a third kind added without a segment fails here.
@@ -152,6 +163,57 @@ def test_write_states_the_data_integrity_rules_exactly_once() -> None:
     the whole block twice in every Write prompt — burning context and reading as a stutter."""
     composed = compose_kind_prompt(ChatKind.BUILD, _CONTEXT)
     assert composed.count(DATA_INTEGRITY_RULES) == 1
+
+
+_SQL_SENTINEL_SENTENCE = "a destructive-SQL sentinel enforces this on `run_command`"
+_MIGRATION_CHANNEL_SENTENCE = "Schema changes go through generated migrations (see DATABASE)"
+
+
+def test_the_sql_sentinel_and_the_migration_channel_are_named_to_build_alone() -> None:
+    """The two DATA INTEGRITY clauses that were FALSE in a Plan prompt, and only there.
+
+    This is a behaviour assertion, not a wording one: both clauses describe machinery the
+    registry does not hand a Plan run, so a Plan prompt asserting them is the prompt telling the
+    model something about its own tools that is not so.
+
+    * THE SENTINEL. `orchestrator/sql_guard.you_shall_not_pass` is wired into BUILD's
+      `run_command` (`orchestrator/tools.py`). A Plan run's `run_command` is
+      `agent/read_tools`' allowlist, which admits ls/cat/head/tail/grep/wc/find/sed and no
+      shell — so no SQL can be issued and no sentinel is installed to catch one. Pinned below
+      against the live registry rather than against a list kept by hand.
+    * THE MIGRATION CHANNEL. "(see DATABASE)" points at a section of
+      `BUILD_WORKING_RULES_HEAD` that a Plan prompt does not carry, and the sentence it opens
+      ends "your done-summary must say so plainly" — a Plan run has no `declare_done` and
+      writes no done-summary.
+
+    THE RULES THEMSELVES ARE UNCHANGED IN BOTH, which is the half that must not regress: the
+    never-mutate rule and the no-invented-rows rule are asserted present in each. A change that
+    dropped the rule along with its enforcement clause passes neither of the last two asserts.
+
+    Mutation check: make `_base` ignore its `kind` and this goes red on the Plan arm.
+    """
+    plan = compose_kind_prompt(ChatKind.PLAN, _CONTEXT)
+    build = compose_kind_prompt(ChatKind.BUILD, _CONTEXT)
+
+    assert _SQL_SENTINEL_SENTENCE in build
+    assert _SQL_SENTINEL_SENTENCE not in plan
+    assert _MIGRATION_CHANNEL_SENTENCE in build
+    assert _MIGRATION_CHANNEL_SENTENCE not in plan
+
+    # …because the tools it describes are Build's. Read off the registry, so a Plan run that
+    # ever gains a write or schema tool fails HERE rather than shipping a prompt that lies the
+    # other way round.
+    plan_tools = asyncio.run(registered_tool_definitions(ChatKind.PLAN))
+    build_tools = asyncio.run(registered_tool_definitions(ChatKind.BUILD))
+    assert "apply_schema_change" in build_tools
+    assert "apply_schema_change" not in plan_tools
+    assert "declare_done" in build_tools
+    assert "declare_done" not in plan_tools
+
+    # The rules survive intact in both — this is a removal of two claims, not of a safety rule.
+    for composed in (plan, build):
+        assert "Never INSERT, UPDATE, DELETE, or TRUNCATE data" in composed
+        assert "Never hardcode, seed, or generate dummy" in composed
 
 
 def test_write_speaks_to_the_person_who_asked_for_the_app() -> None:

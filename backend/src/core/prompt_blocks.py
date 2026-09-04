@@ -166,22 +166,54 @@ right pane is the APP and nothing else (R10).
 The surface list is verified against `portal/src/App.jsx`'s actual routes — extend it when the
 portal grows a surface, never before."""
 
-DATA_INTEGRITY_RULES = """\
+_DATA_INTEGRITY_RULE = """\
 DATA INTEGRITY — the app is backed by a REAL database that may already hold the user's records: \
 zero rows or thousands, either is correct, and the app must show exactly what is there. Never \
 INSERT, UPDATE, DELETE, or TRUNCATE data to test, demo, or clean up — verify your work by \
-type-checking and rendering, never by mutating records (a destructive-SQL sentinel enforces \
-this on `run_command`). Never hardcode, seed, or generate dummy, sample, fake, mock, or \
+type-checking and rendering, never by mutating records"""
+
+_SQL_SENTINEL_CLAUSE = " (a destructive-SQL sentinel enforces this on `run_command`)"
+
+_NO_INVENTED_ROWS_RULE = """\
+. Never hardcode, seed, or generate dummy, sample, fake, mock, or \
 placeholder records, and never pre-populate a store or a list with invented rows to "show what \
 it looks like". Real data arrives one of two ways only: the user uploads it, or the user \
 enters it. Build the honest states instead — a clean empty state that tells the user how to \
 add the first record, a loading state while data is in flight, and an error state when it \
-fails. Schema changes go through generated migrations (see DATABASE); dropping a table or a \
+fails."""
+
+_SCHEMA_CHANGE_RULE = """\
+ Schema changes go through generated migrations (see DATABASE); dropping a table or a \
 column is legitimate ONLY when the user's requirements remove that feature — the data it holds \
 goes with it, and your done-summary must say so plainly."""
+
+DATA_INTEGRITY_RULES = (
+    _DATA_INTEGRITY_RULE + _SQL_SENTINEL_CLAUSE + _NO_INVENTED_ROWS_RULE + _SCHEMA_CHANGE_RULE
+)
 """The single source of the data-safety wording (U1 → reused by the U9 mode-prompt BASE): the
 truthful may-hold-records claim, the never-mutate rule, the no-invented-rows rule, and the
-migrations-are-the-channel rule for feature-removing schema changes."""
+migrations-are-the-channel rule for feature-removing schema changes. BYTE-IDENTICAL to the one
+literal this used to be — the Build prompt did not move."""
+
+DATA_INTEGRITY_RULES_WITHOUT_THE_WRITE_MACHINERY = _DATA_INTEGRITY_RULE + _NO_INVENTED_ROWS_RULE
+"""The SAME rules, minus the two clauses that describe machinery a Plan chat cannot reach.
+
+THE RULES ARE NOT WEAKENED — the never-mutate rule and the no-invented-rows rule are the same
+string in both. What is dropped is the two claims that were false in a Plan prompt and only
+there, and each was false in the way a prompt is worst at: confidently, on every turn.
+
+* The SQL sentinel is on the BUILD `run_command` (`orchestrator/sql_guard`). A Plan chat's
+  `run_command` is `agent/read_tools`' allowlist — ls/cat/head/tail/grep/wc/find/sed, no shell,
+  no `psql` — so there is nothing for a sentinel to catch and none is installed. Telling a Plan
+  agent a guard enforces the rule invites it to treat the guard as the boundary rather than the
+  rule.
+* "see DATABASE" points at `BUILD_WORKING_RULES_HEAD`'s DATABASE block, which a Plan prompt does
+  not carry: a cross-reference to a section that is not in the document. The sentence after it
+  ends "your done-summary must say so plainly", and a Plan chat has no `declare_done` and writes
+  no done-summary — so the whole clause instructs a kind that cannot act on it. The plan segment
+  already forbids naming the way data is stored underneath, so nothing is lost by dropping it.
+
+`compose_kind_prompt` chooses; `test_mode_prompts.py` asserts what each kind gets."""
 
 NARRATION_VOICE = """\
 TALKING TO THE USER — your messages are read by the person who asked for this app and is going \
@@ -360,6 +392,26 @@ It is pasted here rather than computed because THIS MODULE IS A LEAF (see the fi
 is enforced by test instead — `test_prompt.py`'s drift check recomputes it and fails on any
 difference, including one that is only in the WORDING. Regenerate and re-paste with the one-liner
 in `toolsets.py`'s U20 comment.
+
+★ IT IS ACCURATE FOR THE CHAT ARM AND OVER-PROMISES ON THE HARNESS ARM, and the drift check
+cannot see that, because it compares this snapshot against the REGISTRY rather than against
+either agent. `BUILD_WORKING_RULES_TAIL` carries this block into two prompts:
+
+* `mode_prompts._WRITE_SEGMENT` → `chat_agent.iter(..., toolsets=toolsets_for_kind(BUILD))`,
+  which registers all twelve tools named above. Correct.
+* `orchestrator/prompt.BUILD_SYSTEM_PROMPT` → `build_agent`, which is constructed with
+  `toolsets=[sandbox_toolset(_sandbox_of)]` and NOTHING else (`orchestrator/agent.py`) — eight
+  tools. So a `/v1/build-sessions` run is told on every request that it has `list_files`,
+  `search_files`, `tell_the_user` and `propose_first_slice`, and calling any of them gets the
+  runtime's unknown-tool rejection.
+
+NOT FIXED HERE, ON PURPOSE. Both candidate fixes are behaviour changes to a live agent — render
+the harness its own eight-line surface, or give `build_agent` the four missing toolsets — and the
+harness is already scheduled for deletion with its route
+(`docs/plans/2026-09-01-009-fix-the-stop-a-citizen-can-trust-plan.md`, unit 1), so a fix here
+would be work thrown away or a second live prompt to keep in step. What this comment buys instead
+is a guard that goes red when the situation changes:
+`test_prompt.py::test_the_harness_arm_is_told_about_four_tools_it_does_not_register`.
 
 WHY IT HAD TO STOP BEING PROSE. The hand-written block named six tools while the Write arm handed
 the model eight — `list_files` and `search_files` were absent from the prompt for their whole

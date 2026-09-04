@@ -36,6 +36,15 @@ sandbox/**/*.otf        binary
 # These files are COPIED VERBATIM into every generated app's Docker build context, and they
 # ship inside the backend image — which is itself built on the Windows VM. A CRLF checkout
 # would bake `\r` into the app Dockerfile and the production migrator, breaking the build for
-# every citizen at once. The extensions here (.ts, .mjs, and the extensionless `Dockerfile`,
-# `dockerignore`, `gitkeep`) are NOT covered by any rule above, so this is not redundant.
+# every citizen at once.
+#
+# WHAT THIS RULE ACTUALLY ADDS is `next.config.ts`, `copy-runtime-deps.mjs`, `db-migrate.mjs`,
+# `dockerignore` and `gitkeep` — nothing above matches any of them. The `Dockerfile` in that
+# directory is ALREADY covered: a gitattributes pattern with no `/` matches a basename at ANY
+# depth, so `Dockerfile*` at the top of this file reaches
+# `backend/src/services/deploy/assets/Dockerfile` on its own. This paragraph used to name that
+# file among the things "NOT covered by any rule above", which is the opposite of true and is
+# checkable in one command: `git check-attr -a -- backend/src/services/deploy/assets/Dockerfile`
+# answers `text: set` / `eol: lf` with this line deleted. The rule stays anyway — it is the one
+# that covers the other five, and the overlap on `Dockerfile` is free.
 backend/src/services/deploy/assets/**   text eol=lf

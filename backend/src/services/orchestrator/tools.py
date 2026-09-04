@@ -47,6 +47,14 @@ They are built as a `FunctionToolset` FACTORY over a `sandbox_of` accessor — m
 `agent/read_tools.read_only_toolset` — rather than `@build_agent.tool` decorators. ONE tool body,
 two consumers: the legacy `/build-sessions` harness (`BuildDeps.sandbox`) and a Write chat turn.
 The accessor closure is the only thing that knows the run's deps type.
+
+THE TWO CONSUMERS DO NOT COMPOSE THE SAME SURFACE, and the generated prompt block does not say
+so. `build_agent` takes THIS toolset and nothing else — eight tools. A Write chat turn takes it
+plus `list_files`/`search_files` off `read_only_toolset` and the two `CONVERSATION_TOOLSET` tools
+— twelve. `WRITE_TOOL_SURFACE` is a snapshot of the twelve and ships in BOTH prompts, so the
+harness is told about four tools it cannot call. Recorded, not fixed, at
+`core/prompt_blocks.WRITE_TOOL_SURFACE`; guarded by
+`test_prompt.py::test_the_harness_arm_is_told_about_four_tools_it_does_not_register`.
 """
 
 from __future__ import annotations

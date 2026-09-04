@@ -34,8 +34,10 @@ def magic_matches(data: bytes, magic: bytes) -> bool:
 
 def bytes_match_declared(media_type: str, data: bytes) -> bool:
     """True iff `media_type` is allowlisted AND `data` opens with its magic prefix (+ the WebP
-    form-type at offset 8). The relay uses this to DROP a block whose declared type is not allowed
-    or whose bytes belie it — never forwarding unvalidated content to the model."""
+    form-type at offset 8). Its two callers — `messages/store.py`'s rehydrator and
+    `build_sessions/attachments.py` — DROP a block whose declared type is not allowed or whose
+    bytes belie it, so unvalidated content never reaches the model. (This said "the relay uses
+    this"; the relay was retired, and the module docstring above already records that.)"""
     magic = ALLOWED_MEDIA.get(media_type)
     if magic is None or not magic_matches(data, magic):
         return False
