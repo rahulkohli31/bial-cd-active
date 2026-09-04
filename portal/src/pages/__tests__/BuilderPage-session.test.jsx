@@ -537,7 +537,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     expect(screen.queryByRole('button', { name: /^Mode:/ })).toBeNull()
 
     // A row with a stray legacy `mode` — if a re-read were reintroduced, this is what it would see.
-    h.getBuild.mockResolvedValue({ id: LIVE_CHAT_ID, kind: 'build', mode: 'plan', messages: [] })
+    h.getBuild.mockResolvedValue({ id: LIVE_CHAT_ID, kind: 'build', messages: [] })
     await turn.frame(T_BUILD_END())
     await turn.end()
 

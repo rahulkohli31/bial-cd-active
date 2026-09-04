@@ -149,7 +149,6 @@ describe('a restored thread re-renders every card from its STORED state', () => 
   it('an older card renders expired; the newest pending card is the only armed one', async () => {
     h.getBuild.mockResolvedValue({
       id: 'thread-1',
-      mode: 'plan',
       messages: [
         { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'plan a visitors app' }] },
         storedCard(1, 'opt-old', 'pending'),
@@ -179,7 +178,6 @@ describe('a restored thread re-renders every card from its STORED state', () => 
   it('settled cards render settled — refine and build states carry no buttons', async () => {
     h.getBuild.mockResolvedValue({
       id: 'thread-1',
-      mode: 'write',
       messages: [
         storedCard(1, 'opt-a', 'refine'),
         storedCard(2, 'opt-b', 'build'),
@@ -282,7 +280,6 @@ describe('the reload half of the build narrative (U15)', () => {
   it('renders stored friendly steps and the in-progress truth line from the projection', async () => {
     h.getBuild.mockResolvedValue({
       id: 'thread-1',
-      mode: 'write',
       messages: [
         { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'build it' }] },
         {
@@ -324,7 +321,6 @@ describe('the reload half of the build narrative (U15)', () => {
   it('groups a RUN of consecutive stored steps into ONE collapsed dropdown, and starts a new group after an interruption', async () => {
     h.getBuild.mockResolvedValue({
       id: 'thread-1',
-      mode: 'write',
       messages: [
         { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'build it' }] },
         { id: 's1', role: 'assistant', seq: 1, parts: [{ type: 'step', step: { tool: 'write_file', label: 'Step one', state: 'ok' } }] },
@@ -368,6 +364,9 @@ describe('the U13 header', () => {
     // leftover `mode` key (a pre-migration record, or a stale server response) is simply
     // ignored — never read into any control — rather than the page tripping over an unexpected
     // field.
+    // KEPT DELIBERATELY when the sweep dropped `mode` from this file's other eight fixtures:
+    // here the retired key IS the subject, not residue. Removing it would leave this test's
+    // name intact and its assertion vacuous.
     h.getBuild.mockResolvedValue({ id: 'thread-1', mode: 'ask', messages: [] })
     renderThread()
 
@@ -386,7 +385,6 @@ describe('R8 live clause — a reload MID-TURN re-attaches to the running reply'
     // send 409'd against a turn this tab had forgotten.
     h.getBuild.mockResolvedValue({
       id: 'thread-1',
-      mode: 'ask',
       activeTurn: { turnId: 't-live', lastSeq: 4 },
       messages: [{ id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'what does this app do?' }] }],
     })
@@ -423,7 +421,6 @@ describe('R8 live clause — a reload MID-TURN re-attaches to the running reply'
     // minutes later, permanently. Asserting mid-stream could never see that.
     h.getBuild.mockResolvedValue({
       id: 'thread-1',
-      mode: 'ask',
       activeTurn: { turnId: 't-live', lastSeq: 3 },
       messages: [
         { id: 'srv_1_u_0', role: 'user', seq: 1, parts: [{ type: 'text', text: 'add a page' }] },
@@ -482,7 +479,6 @@ describe('R8 live clause — a reload MID-TURN re-attaches to the running reply'
     // until the burst ended. Asserted on ORDER, because presence passes either way.
     h.getBuild.mockResolvedValue({
       id: 'thread-1',
-      mode: 'ask',
       activeTurn: { turnId: 't-live', lastSeq: 0 },
       messages: [{ id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'build it' }] }],
     })
@@ -511,7 +507,6 @@ describe('R8 live clause — a reload MID-TURN re-attaches to the running reply'
     // send a new message underneath a status line still claiming the last one was in progress.
     h.getBuild.mockResolvedValue({
       id: 'thread-1',
-      mode: 'ask',
       activeTurn: { turnId: 't-live', lastSeq: 1 },
       messages: [{ id: 'srv_1_u_0', role: 'user', seq: 1, parts: [{ type: 'text', text: 'add a page' }] }],
     })

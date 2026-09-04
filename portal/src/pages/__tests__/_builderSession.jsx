@@ -290,7 +290,7 @@ export function primeStandbyReattach(h, { chatId = 'chat-A', projectId = 'p1', s
     id === chatId
       ? {
           id,
-          kind: 'builder',
+          kind: 'build',
           messages: [
             { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'a visitor app' }] },
             { id: 'srv_1_g', role: 'assistant', seq: 1, parts: [{ type: 'build_in_progress', sessionId }] },
@@ -374,8 +374,7 @@ export function renderBuilder({ deps, projectId = 'p1', hasSavedBuild = null, in
  */
 export const withLiveBuildAnchor = (sessionId = 'live-7', over = {}) => ({
   id: 'build-X',
-  kind: 'builder',
-  mode: 'plan',
+  kind: 'build',
   messages: [
     { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'a visitor app' }] },
     { id: 'srv_1_g', role: 'assistant', seq: 1, parts: [{ type: 'build_in_progress', sessionId }] },

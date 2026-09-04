@@ -58,7 +58,7 @@ beforeEach(() => {
   primeTurn(h)
   h.newBuild.mockReturnValue('build-Y')
   h.createBuild.mockResolvedValue({ ok: true })
-  h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'builder', mode: 'plan', messages: [] })
+  h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
   h.buildUserParts.mockImplementation(async (t) => [{ type: 'text', text: t }])

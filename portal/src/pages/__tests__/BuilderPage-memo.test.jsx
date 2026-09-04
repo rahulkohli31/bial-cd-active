@@ -105,8 +105,7 @@ describe('typing never re-renders history', () => {
   it('typing in the composer does not re-render an unrelated historical bubble', async () => {
     h.getBuild.mockResolvedValue({
       id: 'build-X',
-      kind: 'builder',
-      mode: 'plan',
+      kind: 'build',
       messages: [
         { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'first message' }] },
         { id: 'm1', role: 'assistant', seq: 1, parts: [{ type: 'text', text: 'first reply, unrelated to anything typed next' }] },
