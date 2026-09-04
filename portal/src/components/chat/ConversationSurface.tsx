@@ -225,7 +225,7 @@ interface TurnSink {
    *
    *  IT IS NOT A PART, because the server never sends one and never will: reasoning text is
    *  stored for the provider's next turn and is never framed. The flag is turned INTO a
-   *  content-free reasoning part at the head of the streaming message by `streamingParts`,
+   *  content-free reasoning part at the TAIL of the streaming message by `streamingParts`,
    *  because the library's status renderer is reached only when a message actually carries a
    *  part of that kind — a boolean riding the turn renders nothing at all on its own. */
   working: boolean
@@ -448,6 +448,37 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // remount — so the boolean form gated chat B's send on chat A's turn. Same per-chat scoping
   // `buildActiveHere` already applies to the build half.
   const [generatingChatId, setGeneratingChatId] = useState<string | null>(null)
+  /**
+   * WHERE THE RE-TOLD TURN BEGINS — the seq of the user message a mid-turn re-attach re-told
+   * from, and `null` when nothing on screen is re-telling a stored turn.
+   *
+   * It exists for ONE case, and only the reattach path can produce it. A reload landing
+   * mid-build re-subscribes (`reattachToTurn`) and re-tells the turn so far into a fresh
+   * assistant message, while the transcript it just hydrated ALREADY holds that same turn's
+   * persisted prose and step rows. Without a boundary both are drawn and the citizen reads
+   * every sentence of the build twice.
+   *
+   * THE TURN BOUNDARY IS THE USER MESSAGE, not the anchor row this replaced. The old rule keyed
+   * on a `build_in_progress` part belonging to the attached legacy SESSION — a narrower question
+   * that could not see a turn-stream build at all, and one whose own comment records it going
+   * wrong in both directions (suppressing a whole history it then failed to re-tell). A user
+   * message is where a turn starts by definition, on both transports and for both kinds.
+   *
+   * LATCHED WHEN THE RE-TELLING STARTS, NEVER DERIVED FROM `generatingChatId`. It used to be
+   * computed from "a turn is streaming in this chat", which reads the CONDITION (a live
+   * re-telling is on screen) off its TRIGGER (a turn is in flight) — and those two do not end
+   * together. `endGenerating` clears the flag the instant the stream settles, while the re-told
+   * message stays exactly where it is with the whole turn in it, and nothing re-fetches the
+   * transcript afterwards. So at the moment the build finished, every stored row the boundary
+   * had been suppressing came back beside its own re-telling: the citizen watched the reply
+   * arrive, and then read the opening of it a second time for the rest of the page session.
+   * The latch is dropped only when the re-told message is retired (the empty-turn cleanup in
+   * `reattachToTurn`) or when the chat switches and the transcript is hydrated afresh.
+   *
+   * An ordinary send sets none of it: nothing is re-telling anything there, so there is nothing
+   * to suppress — and no stored row of the turn being sent can be hidden by mistake.
+   */
+  const [reToldFromSeq, setReToldFromSeq] = useState<number | null>(null)
   // Has the adopt round-trip settled the question "is a build still running in this chat?" (G1).
   //
   //   'checking'    — the mount/adopt is still in flight. The honest opening state: the page
@@ -889,6 +920,11 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     // (G3), so a leaked draft cannot send into the wrong chat and this effect has one fewer thing
     // it can forget.
     setMessages([])
+    // …AND THE BOUNDARY THAT NAMED A ROW IN IT. `reToldFromSeq` is a seq in the transcript the
+    // line above just emptied, so carrying it into the next chat would suppress whichever of ITS
+    // rows happened to sit past that number — a transcript with a hole in it, in a chat nothing
+    // was ever re-telling.
+    setReToldFromSeq(null)
     // The merged-run cache is keyed by the ids of the messages that went into it, so nothing in it
     // can be looked up again once the transcript above is emptied. Without this it is the one thing
     // on the surface that only ever grows: the component does not remount across chats, so every
@@ -964,7 +1000,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
         // prompt just fired — that path owns the socket, and two subscribers would abort each
         // other over one shared controller.
         if (!handedOff && saved?.activeTurn?.turnId) {
-          void reattachToTurn(buildId, saved.activeTurn, () => alive)
+          void reattachToTurn(buildId, saved.activeTurn, restored, () => alive)
         } else if (!handedOff) {
           // NOTHING IS RUNNING HERE, so nothing will settle and retract the claim. This is the
           // handoff's own narrow window: the press announced a claim for a chat whose turn had
@@ -1146,6 +1182,25 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     },
     [releaseBuildClaim, settleSaveState],
   )
+
+  /**
+   * THE STATUS ROW DIES WITH THE READER, not only at the turn's terminal.
+   *
+   * `streamingParts` synthesises "Working on your app" from `sink.working`, and the only arm
+   * that clears the flag is the `turn_ended` frame — the fast path, and it stays. The two
+   * non-terminal ways out of a reader have no such frame: a stall, and a second truncation
+   * after the one resume. Both then call `endGenerating`, so the composer re-opens and the
+   * banner says the connection dropped — while the transcript above it went on saying the agent
+   * was working, on a turn nobody was watching any more. Nothing re-reads the transcript after
+   * that, so it kept saying so until the citizen reloaded the page.
+   */
+  const settleWorking = useCallback((assistantId: string, sink: TurnSink) => {
+    if (!sink.working) return
+    sink.working = false
+    setMessages((prev) =>
+      prev.map((m) => (m.id === assistantId ? { ...m, parts: streamingParts(sink) } : m)),
+    )
+  }, [])
 
   /** Arm (d)'s way out: re-run the same adopt round-trip that could not be completed. */
   const retryGateCheck = () => {
@@ -1332,13 +1387,24 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
    * whose ordered `parts` are exactly the turn so far — prose and steps in the order they were
    * produced, so a reattached citizen reads the same turn as one who never left.
    */
-  const reattachToTurn = async (activeId: string, activeTurn: { turnId: string; lastSeq: number }, isAlive: () => boolean) => {
+  const reattachToTurn = async (activeId: string, activeTurn: { turnId: string; lastSeq: number }, prior: ChatMessage[], isAlive: () => boolean) => {
     const stillHere = () => isAlive() && buildIdRef.current === activeId
     const assistantSeq = seqRef.current
     seqRef.current += 1
     const assistantId = `local_${Date.now()}_r`
     const sink = newSink()
     setGeneratingChatId(activeId)
+    // THE BOUNDARY IS LATCHED HERE, from the transcript this re-telling is about to sit on top of
+    // (see `reToldFromSeq`). Read off `prior` rather than the `messages` state: this runs inside
+    // the hydration that has just set it, so the state in this closure is still the chat we left.
+    let reToldFrom: number | null = null
+    for (let i = prior.length - 1; i >= 0; i -= 1) {
+      if (prior[i].role === 'user') {
+        reToldFrom = prior[i].seq ?? null
+        break
+      }
+    }
+    setReToldFromSeq(reToldFrom)
     setTurnError(null)
     resetTurnNarrative()
     setMessages((prev) => [...prev, { id: assistantId, role: 'assistant', parts: [{ type: 'text', text: '' }], seq: assistantSeq, createdAt: new Date().toISOString() }])
@@ -1364,11 +1430,15 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     }
     endGenerating(activeId)
     if (!stillHere()) return
+    settleWorking(assistantId, sink)
     if (outcome === 'stalled') setTurnError('The reply stalled. Reload to catch up.')
     else if (outcome === 'truncated' && !sink.terminal) setTurnError('The connection dropped. Reload to catch up.')
     if (sink.terminal !== 'completed' && sink.parts.length === 0) {
       setMessages((prev) => prev.filter((m) => m.id !== assistantId))
       seqRef.current = assistantSeq
+      // AND THE RE-TELLING GOES WITH IT, so the stored rows are the only account of this turn
+      // left and the boundary must stop hiding them.
+      setReToldFromSeq(null)
     }
     markInterrupted(assistantId, sink.terminal)
     announceTerminal(sink)
@@ -1482,6 +1552,9 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     // persisted and the reply runs detached regardless of what this tab does next — so the
     // catch below must split on it: everything after the accept is subscription plumbing.
     let posted = false
+    // DECLARED OUT HERE, as the re-attach path declares its own, because what the reader ended as
+    // is read below — after the guard that decides whether anything may be painted at all.
+    let outcome: StreamOutcome
     try {
       await startTurn(
         activeId,
@@ -1510,15 +1583,13 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       const controller = new AbortController()
       streamAbortRef.current = controller
       const onFrame = turnFrameHandler(activeId, assistantId, sink)
-      let outcome = await readTurnStream({ conversationId: activeId, signal: controller.signal, onFrame })
+      outcome = await readTurnStream({ conversationId: activeId, signal: controller.signal, onFrame })
       if (outcome === 'truncated' && !sink.terminal && !controller.signal.aborted) {
         // A dropped socket before the terminal: one resubscribe consolidates the turn so far
         // via the server snapshot then tails to the end (resume-once). A second truncation is
         // a real drop — reload is the honest fallback.
         outcome = await readTurnStream({ conversationId: activeId, signal: controller.signal, onFrame })
       }
-      if (outcome === 'stalled') setTurnError('The reply stalled. Reload to catch up.')
-      else if (outcome === 'truncated' && !sink.terminal) setTurnError('The connection dropped. Reload to catch up.')
     } catch (err) {
       // Whether the reclaim DIALOG has taken ownership of settling the composer's promise: its
       // retry closure carries the same `onSent`/`onAbort`, so settling here as well would reject a
@@ -1581,17 +1652,29 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     }
     endGenerating(activeId)
 
-    if (stillHere()) {
-      if (sink.terminal !== 'completed' && sink.parts.length === 0) {
-        // Failed/stopped with nothing streamed — drop the empty bubble; the error banner
-        // (or the stopped state) is the feedback.
-        setMessages((prev) => prev.filter((m) => m.id !== assistantId))
-        seqRef.current = assistantSeq
-      }
-      markInterrupted(assistantId, sink.terminal)
-      announceTerminal(sink)
-      refreshBuilds()
+    // EVERYTHING THAT PAINTS IS BEHIND ONE GUARD, in the same order and the same shape the
+    // re-attach path uses — the reader above it ends the same way, line for line, and a reader
+    // that has to be compared against its twin should not have to be un-nested first.
+    //
+    // The status row and the two banners used to be written inside the `try`, unguarded, while
+    // the three below were not — so a reader that ended after the citizen had opened a sibling
+    // chat wrote "The reply stalled" and "The connection dropped" onto THAT chat's screen, about
+    // a turn in a conversation they had left. `settleWorking` went the same way, repainting a
+    // transcript belonging to somebody else's chat. Both paths now say the same thing once:
+    // a reply is only ever told to the chat it belongs to.
+    if (!stillHere()) return
+    settleWorking(assistantId, sink)
+    if (outcome === 'stalled') setTurnError('The reply stalled. Reload to catch up.')
+    else if (outcome === 'truncated' && !sink.terminal) setTurnError('The connection dropped. Reload to catch up.')
+    if (sink.terminal !== 'completed' && sink.parts.length === 0) {
+      // Failed/stopped with nothing streamed — drop the empty bubble; the error banner
+      // (or the stopped state) is the feedback.
+      setMessages((prev) => prev.filter((m) => m.id !== assistantId))
+      seqRef.current = assistantSeq
     }
+    markInterrupted(assistantId, sink.terminal)
+    announceTerminal(sink)
+    refreshBuilds()
   }
 
   /**
@@ -2022,32 +2105,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       : null
   }, [newestOutcome])
   /**
-   * WHERE THE TURN IN FLIGHT BEGINS — the seq of the newest user message while a turn is
-   * streaming here, and `null` otherwise.
-   *
-   * It exists for ONE case, and only the reattach path can produce it. A reload landing
-   * mid-build re-subscribes (`reattachToTurn`) and re-tells the turn so far into a fresh
-   * assistant message, while the transcript it just hydrated ALREADY holds that same turn's
-   * persisted step rows. Without a boundary both are drawn and every step appears twice.
-   *
-   * THE TURN BOUNDARY IS THE USER MESSAGE, not the anchor row this replaced. The old rule keyed
-   * on a `build_in_progress` part belonging to the attached legacy SESSION — a narrower question
-   * that could not see a turn-stream build at all, and one whose own comment records it going
-   * wrong in both directions (suppressing a whole history it then failed to re-tell). A user
-   * message is where a turn starts by definition, on both transports and for both kinds.
-   *
-   * An ordinary send needs none of this: the server has persisted no steps for a turn that has
-   * only just started, so the rule finds nothing to drop and costs nothing.
-   */
-  const liveTurnFromSeq = useMemo(() => {
-    if (generatingChatId !== buildId) return null
-    for (let i = messages.length - 1; i >= 0; i -= 1) {
-      if (messages[i].role === 'user') return messages[i].seq ?? null
-    }
-    return null
-  }, [generatingChatId, buildId, messages])
-
-  /**
    * Append one stored step row to the run it continues, PRESERVING OBJECT IDENTITY when nothing
    * about that run has changed.
    *
@@ -2089,7 +2146,11 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
    *     (`hasUpcomingMessage`), so dropping it hands identity for the whole turn to the library.
    *     An empty text part renders no element anyway, so keeping it costs nothing on screen.
    *
-   *  2. THE TURN IN FLIGHT IS TOLD ONCE. See `liveTurnFromSeq`.
+   *  2. A RE-TOLD TURN IS TOLD ONCE, AND GOES ON BEING TOLD ONCE. The boundary is latched when
+   *     the re-telling starts and deliberately OUTLIVES the stream that made it, because the
+   *     re-told message outlives it too: deriving it from "a turn is in flight here" switched the
+   *     suppression off at the terminal and every stored row came back beside its own re-telling,
+   *     for the rest of the page session. See `reToldFromSeq`.
    */
   const transcript = useMemo(() => {
     const kept: ChatMessage[] = []
@@ -2097,10 +2158,17 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       const parts = msg.parts ?? []
       // THE WHOLE RE-TOLD TURN, not just its steps. The live message is the authority for the
       // turn in flight — the snapshot's ordered `parts` were built to make that true — so every
-      // STORED row it is re-telling has to go, prose included. It used to be steps alone, and
-      // that was sufficient only while the projection dropped a response's prose whenever the
-      // response also called a tool. That drop is gone, so a citizen who reloads mid-build now
-      // has each of those sentences on disk AND in the re-told turn, and read them twice.
+      // STORED row of the AGENT's it is re-telling has to go, prose included. It used to be steps
+      // alone, and that was sufficient only while the projection dropped a response's prose
+      // whenever the response also called a tool. That drop is gone, so a citizen who reloads
+      // mid-build now has each of those sentences on disk AND in the re-told turn, and read them
+      // twice.
+      //
+      // WITH ONE EXCEPTION, AND IT IS NOT A DEFENSIVE ONE: the citizen's own message. The
+      // snapshot re-tells the agent's prose and steps and never the prompt, so a user row inside
+      // the boundary has no second copy to be de-duplicated against — deleting it is pure loss,
+      // and the reply then arrives with nothing above it saying what was asked. The `role` guard
+      // below is where that exception lives, with the account of how it was found.
       //
       // `srv_` IS WHAT KEEPS THE LIVE MESSAGE ALIVE. Only `messagesFromProjection` mints that
       // prefix, so it names a STORED row exactly; the streaming message carries the local id
@@ -2108,10 +2176,19 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       // written on seq and parts alone would delete the very message it is protecting.
       const stepOnly = parts.length > 0 && parts.every((p) => p?.type === 'step')
       const reTold =
+        // NEVER THE CITIZEN'S OWN MESSAGE, and the guard is not defensive. The boundary IS the
+        // user row's seq, and a stored user row is `srv_` plus a single text part — so it
+        // matched this rule exactly and `>=` deleted it. A citizen who reloaded mid-build
+        // watched their own words disappear and the reply arrive with nothing above it saying
+        // what had been asked. Nothing put them back either: the snapshot re-tells the
+        // assistant's prose and steps and never the prompt, so this was loss, not
+        // de-duplication. (It was invisible while the rule was steps-only; widening it to
+        // prose is what let a text row through.)
+        msg.role !== 'user' &&
         msg.id.startsWith('srv_') &&
         parts.length > 0 &&
         parts.every((p) => p?.type === 'step' || p?.type === 'text')
-      if (reTold && liveTurnFromSeq !== null && (msg.seq ?? 0) >= liveTurnFromSeq) continue
+      if (reTold && reToldFromSeq !== null && (msg.seq ?? 0) >= reToldFromSeq) continue
 
       // ── 2. THE ANCHOR ROW BECOMES ITS OWN SENTENCE, when nothing is re-telling it ────────────
       //
@@ -2150,7 +2227,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       kept.push(msg)
     }
     return kept
-  }, [messages, liveTurnFromSeq, mergeStepRun, buildActiveHere, generatingChatId, buildId])
+  }, [messages, reToldFromSeq, mergeStepRun, buildActiveHere, generatingChatId, buildId])
   // WHAT GETS FRAMED, and what the pane says about it — resolved in `utils/previewAddress.ts` and
   // nowhere else (Plan A, U2). The precedence and its two scoping predicates used to be spelled
   // out inline at each of the framing sites, which is why they could not be asked from ABOVE the

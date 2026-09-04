@@ -530,6 +530,19 @@ async def start_turn(
             await db.refresh(user)
             await db.refresh(project)
             conversation = await _conversation_or_none(db, user.id, conversation_id)
+            if conversation is not None and conversation.project_id != project_id:
+                # THE WINNER'S ROW IS THE AUTHORITY ON WHICH PROJECT THIS CHAT BELONGS TO, the
+                # same rule the `existing` arm applies five branches up. The staged body is the
+                # LOSER's, and if the two asks named different projects then everything below
+                # that still reads the staged id — which app the turn pins, and whose project
+                # name goes into the prompt — would describe a different project from the one
+                # `start_conversation_turn` is handed off `conversation.project_id`. One turn
+                # cannot belong to two projects; the row that exists decides.
+                project_id = conversation.project_id
+                winner = await db.get(Project, project_id)
+                if winner is None:  # the winner's project vanished under us
+                    raise AppApiError(404, "Conversation not found.")
+                project = winner
         else:
             # The refresh is not optional: server-default timestamps on a fresh row raise
             # `MissingGreenlet` when projected without one. It belongs to the winning arm only —

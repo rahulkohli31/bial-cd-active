@@ -16,7 +16,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup } from '@testing-library/react'
-import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
+import { MemoryRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom'
 import RailComposer from '../RailComposer'
 
 // The words a citizen reads come from the bootstrap catalogue, not from this file — so a suite that
@@ -71,7 +71,12 @@ beforeEach(() => {
   Element.prototype.scrollIntoView = vi.fn()
 })
 
-afterEach(() => cleanup())
+afterEach(() => {
+  cleanup()
+  // The draft store is `sessionStorage`, so a test that types leaves a draft behind for the next
+  // one — which would hydrate a box some other assertion expects to be empty.
+  sessionStorage.clear()
+})
 
 describe('the mint-and-navigate protocol, carried through the deletion', () => {
   it('mints a UUIDv7, not a v4 — this id becomes a primary key', () => {
@@ -132,6 +137,72 @@ describe('the mint-and-navigate protocol, carried through the deletion', () => {
 
     expect(screen.queryByTestId('path')).toBeNull()
     expect(screen.getByRole('dialog', { name: /prompt blocked/i })).toBeTruthy()
+  })
+})
+
+describe('the cold return leg — a draft that outlives the trip to a chat (plan 002, U3)', () => {
+  /** The two moves a citizen makes with the rail: into a chat, and back to the project. */
+  function Trip() {
+    const navigate = useNavigate()
+    return (
+      <>
+        <button type="button" data-testid="to-chat" onClick={() => navigate('/chat/c-1')}>
+          open a chat
+        </button>
+        <button type="button" data-testid="to-project" onClick={() => navigate('/projects/p1')}>
+          back to the project
+        </button>
+      </>
+    )
+  }
+
+  const roundTrip = () =>
+    render(
+      <MemoryRouter initialEntries={['/projects/p1']}>
+        <Trip />
+        <Routes>
+          <Route path="/projects/:projectId" element={<RailComposer projectId="p1" />} />
+          <Route path="/chat/:chatId" element={<div data-testid="a-chat" />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+
+  it('★ gives back the half-written description after a chat and back', () => {
+    // THE LONGEST MESSAGE ANYBODY WRITES lives in this box — the one describing the whole app —
+    // and the project surface is an Outlet child, so every move to a chat address unmounts it.
+    // The text is kept in the runtime this component creates per mount, so without the draft
+    // store behind it a citizen who stepped into a chat and came back found an empty box and
+    // nothing to tell them why.
+    roundTrip()
+    fireEvent.change(composer(), { target: { value: 'a visitor log with an out-time column' } })
+
+    fireEvent.click(screen.getByTestId('to-chat'))
+    // The composer really did go away — so the restore below is a restore, not a box that never
+    // unmounted.
+    expect(screen.queryByTestId('composer-input')).toBeNull()
+    expect(screen.getByTestId('a-chat')).toBeTruthy()
+
+    fireEvent.click(screen.getByTestId('to-project'))
+
+    expect((composer() as HTMLTextAreaElement).value).toBe('a visitor log with an out-time column')
+  })
+
+  it('keeps each project’s draft to itself', () => {
+    // The store is keyed by conversation, and this surface stamps the PROJECT as that key. A
+    // shared key would hand one project's description to another project's rail.
+    roundTrip()
+    fireEvent.change(composer(), { target: { value: 'a visitor log' } })
+    cleanup()
+
+    render(
+      <MemoryRouter initialEntries={['/projects/p2']}>
+        <Routes>
+          <Route path="/projects/:projectId" element={<RailComposer projectId="p2" />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+
+    expect((composer() as HTMLTextAreaElement).value).toBe('')
   })
 })
 

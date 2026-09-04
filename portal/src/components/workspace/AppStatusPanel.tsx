@@ -25,6 +25,15 @@
  * cost is one extra read per project screen: the poll runs only while a publish is in flight, so
  * a settled app costs one request per mount and nothing after it.
  *
+ * THE NUDGE RECONCILES THE READ, NOT THE OUTSTANDING QUESTION, and the difference is the whole of
+ * why this unit retires one. The server's unsaved-work question is per-mount state that no read
+ * returns and the nudge does not carry, so a question raised HERE is invisible to the chip. Hide
+ * details keeps this panel mounted and merely invisible — see `hiddenSubtree.ts` — which left the
+ * question alive behind a rail nobody could see while the chip, mounted fresh, offered "Send for
+ * review" as though nothing were pending. It is retired when the rail closes: the citizen loses a
+ * declaration they have to re-enter, which is the smaller cost than two surfaces contradicting
+ * each other and a stale question with a live button waiting when the rail reopens.
+ *
  * ═══ THE SAVED ROW IS WHY THIS UNIT NEEDED A SERVER FIELD ═══
  *
  * Every other row comes from a column the status read already selects. The citizen's own last
@@ -34,10 +43,11 @@
  * render on a project whose workspace is stopped, which is precisely where `save-state` — which
  * attaches to a container first — has nothing to say.
  */
-import { useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { ExternalLink } from 'lucide-react'
 import DataClassificationModal from '../DataClassificationModal'
 import { usePublishState } from '../../hooks/usePublishState'
+import { useRailSlot } from './workspaceChannel'
 import { shortSha } from '../../utils/shortSha'
 import {
   ACTION_LABEL,
@@ -121,9 +131,29 @@ function Row({ row }: { row: ProvenanceRow }) {
 }
 
 export default function AppStatusPanel({ projectId, label }: AppStatusPanelProps) {
-  const { deployment, approval, loadError, refresh, onConfirm, saveAndPublish, unsaved, saving, withdraw, withdrawing } =
-    usePublishState(projectId)
+  const {
+    deployment,
+    approval,
+    loadError,
+    refresh,
+    onConfirm,
+    saveAndPublish,
+    unsaved,
+    saving,
+    withdraw,
+    withdrawing,
+    withdrawError,
+    dismissUnsaved,
+  } = usePublishState(projectId)
   const [showModal, setShowModal] = useState(false)
+  const { collapsed } = useRailSlot()
+
+  // NOTHING MAY BE LEFT PENDING BEHIND A HIDDEN RAIL — see the note at the top of this module.
+  // `NO_RAIL` is `collapsed: false`, so a panel mounted outside a workspace never retires
+  // anything.
+  useEffect(() => {
+    if (collapsed && unsaved !== null) dismissUnsaved()
+  }, [collapsed, unsaved, dismissUnsaved])
 
   const state = deployment?.publishState ?? null
   const presentation = useMemo(() => (state === null ? null : presentationFor(state)), [state])
@@ -210,6 +240,21 @@ export default function AppStatusPanel({ projectId, label }: AppStatusPanelProps
         >
           {withdrawing ? 'Taking it back…' : ACTION_LABEL[presentation.action]}
         </button>
+      )}
+
+      {/* A REFUSED WITHDRAWAL HAS TO BE SPOKEN, because nothing else on this panel changes when
+          one happens. `withdraw` swallows its failure into this message and does NOT re-read — so
+          without this the pill, the rows and the button all stay exactly as they were and the
+          press looks like it did nothing, which is how a citizen ends up pressing it repeatedly.
+          The ordinary case is an administrator reaching the submission first. */}
+      {withdrawError !== null && (
+        <p
+          data-testid="status-withdraw-error"
+          role="alert"
+          className="mt-2.5 text-[11.5px] leading-relaxed text-danger"
+        >
+          {withdrawError}
+        </p>
       )}
 
       {/* THE SAME QUESTION THE CHIP ASKS, because the server asks it of both: a workspace ahead

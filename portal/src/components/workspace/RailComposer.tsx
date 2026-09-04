@@ -49,6 +49,7 @@ import type { PromptViolation } from '../../utils/promptGuardrails'
 import { uuidv7 } from '../../utils/conversationApi'
 import { chatKindFor } from '../../utils/chatKind'
 import { asReclaimBlocked, relaunchPreview } from '../../utils/buildSessionApi'
+import { ApiError } from '../../utils/apiError'
 import { useWorkspaceReport } from './workspaceChannel'
 import Composer from '../chat/Composer'
 import { type ComposerSubmission } from '../chat/ComposerBox'
@@ -204,6 +205,28 @@ function RailComposerBody({ projectId }: RailComposerProps) {
             // guardrail above: the dialog is the explanation, and a line under the composer
             // repeating it in weaker words is noise over the top of it.
             throw new SendRefusal('the workspace is held by another project', { silent: true })
+          }
+          // NOTHING SAVED TO BRING BACK IS NOT A FAILED SEND (review #1). Asking for the workspace
+          // is how this surface poses the one-workspace question, but a project that has never been
+          // built has nothing to restore: the server's snapshot gate answers 404 by design — there
+          // is no blank-template arm — and the first message is the very thing that provisions one,
+          // through the turn's own `ensure_sandbox`. Rethrowing it made onboarding a dead end: a
+          // citizen who created a project, described their app and pressed Send read "That message
+          // did not send" and got no chat, on every attempt.
+          //
+          // ON THE CODE, NOT THE STATUS. This endpoint answers 404 for a second, unrelated reason
+          // — a project that is deleted or is not this citizen's — and a bare status match opened
+          // a chat onto it too, which then failed a beat later with nothing left to blame. Only
+          // the snapshot gate carries `no_saved_build`; every other 404 is a real failure and is
+          // reported as one.
+          //
+          // THE QUESTION IS STILL ASKED FIRST, which is why this is a mapping and not a skipped
+          // preflight. The server refuses a held workspace ABOVE the snapshot gate, so a brand-new
+          // project's first message still meets the dialog before any address changes — and issue
+          // #161's own reproduction is a submit in a project with nothing built yet.
+          if (err instanceof ApiError && err.status === 404 && err.code === 'no_saved_build') {
+            open()
+            return
           }
           throw err
         } finally {

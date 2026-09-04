@@ -21,7 +21,7 @@ import type { CompileState } from '../utils/compileState'
 // because the switcher that picks a width lives in the shell's toolbar row. This component still
 // reads the widths, so it imports the one table rather than keeping a second copy that could
 // disagree about what "Tablet" means.
-import { DEVICES, type DeviceName } from './workspace/WorkspaceToolbar'
+import { DEVICES, type DeviceName } from './workspace/devices'
 
 // U5 — bound the wait for the framed document's own `load`. The reveal itself is gated on that
 // event and nothing else (see `loadedUrl` below); this cap exists only so a frame that NEVER
@@ -408,9 +408,6 @@ export default function LivePreview({
   turnRunning = false,
   workspaceLost = false,
   occupyingProjectName = null,
-  // The save model (KTD-5e). `saveDirty` is TRI-STATE: true = unsaved work, false = saved,
-  // null = UNKNOWN (no live workspace, or the server could not compare). Unknown must not
-  // render as saved — that tells the user their work is safe when nothing checked.
   device = 'Desktop',
   reloadNonce: externalReloadNonce = 0,
   onRevealed,

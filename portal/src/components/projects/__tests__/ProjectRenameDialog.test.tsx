@@ -83,4 +83,56 @@ describe('renaming a project', () => {
     renderDialog()
     for (const el of screen.getAllByRole('button')) expect(el.hasAttribute('disabled')).toBe(false)
   })
+
+  describe('a second press while the first rename is still in flight', () => {
+    /** A request that never settles, so the whole test happens inside the busy window. */
+    const pending = () => h.patchProject.mockReturnValue(new Promise<never>(() => {}))
+
+    it('★ presses the button twice and sends ONE request', async () => {
+      // `aria-disabled` announces the control as inert; it does not make it so, and this codebase
+      // forbids the real `disabled` attribute because it throws focus to the document body. So the
+      // handler is the only thing standing between a double-click and two concurrent renames.
+      pending()
+      const { input } = renderDialog()
+      fireEvent.change(input, { target: { value: 'Renamed' } })
+      const save = screen.getByRole('button', { name: 'Save' })
+
+      fireEvent.click(save)
+      await waitFor(() => expect(save.getAttribute('aria-disabled')).toBe('true'))
+      fireEvent.click(save)
+      fireEvent.click(save)
+
+      expect(h.patchProject).toHaveBeenCalledTimes(1)
+      // LIVENESS: the dialog is still mounted and still saying it is busy, so the single call
+      // above is a guarded second press rather than a component that fell over after the first.
+      expect(save.textContent).toBe('Saving…')
+    })
+
+    it('★ and Enter behaves the same as the button', async () => {
+      pending()
+      const { input } = renderDialog()
+      fireEvent.change(input, { target: { value: 'Renamed' } })
+
+      // Held before the press: the label becomes "Saving…" while busy, and the node is the same one.
+      const save = screen.getByRole('button', { name: 'Save' })
+
+      fireEvent.keyDown(input, { key: 'Enter' })
+      await waitFor(() => expect(save.getAttribute('aria-disabled')).toBe('true'))
+      fireEvent.keyDown(input, { key: 'Enter' })
+
+      expect(h.patchProject).toHaveBeenCalledTimes(1)
+      expect(screen.getByRole('textbox', { name: /project name/i })).toHaveProperty('value', 'Renamed')
+    })
+
+    it('★ does not close twice, so the screen behind it is not asked to unmount the dialog twice', async () => {
+      const { onClose, input } = renderDialog()
+      fireEvent.change(input, { target: { value: 'Renamed' } })
+      const save = screen.getByRole('button', { name: 'Save' })
+      fireEvent.click(save)
+      fireEvent.click(save)
+
+      await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1))
+      expect(h.patchProject).toHaveBeenCalledTimes(1)
+    })
+  })
 })

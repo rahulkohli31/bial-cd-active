@@ -21,7 +21,6 @@ vi.mock('../../PublishStatusChip', () => ({
 vi.mock('../../projects/ProjectDescriptionEditor', () => ({
   default: () => <div data-testid="description-editor" />,
 }))
-vi.mock('../../../utils/chatHistory', () => ({ relativeTime: () => '1h ago' }))
 vi.mock('../../../utils/auth', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../utils/auth')>()),
   getStoredUser: () => ({

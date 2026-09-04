@@ -9,11 +9,13 @@
  * at all, which would satisfy R3's "exactly one control starts it" with zero. So every no-frame
  * state that used to carry one is asserted here for the affordance's PRESENCE, not its absence.
  */
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup } from '@testing-library/react'
+import { act, render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import AppPane from '../AppPane'
-import { WORKSPACE_RAIL_ID } from '../WorkspaceShell'
+import { WORKSPACE_RAIL_ID } from '../railId'
 import {
   WorkspaceChannelProvider,
   createWorkspaceChannel,
@@ -205,6 +207,40 @@ describe('one author for every pane sentence', () => {
     expect(empty.textContent).toContain('It stays running while you work, so you only do this once.')
   })
 
+  it('★ draws the board\'s mark above the headline on the three states that have one', () => {
+    // `NothingBuilt`, `PreviewOff` and `PreviewStarting` each put a 30px #9AA5B1 glyph directly
+    // above the headline, and it is the only thing that makes a blank half-screen read as a
+    // deliberate state rather than as a page that failed to load. The card and the "YOUR APP"
+    // label landed; its contents were still headline + sentence + button.
+    const withGlyph: [string, PreviewState][] = [
+      ['never-built', reading({ state: 'never_built', restorable: false })],
+      ['not-running', reading({ state: 'asleep', restorable: true })],
+      ['starting', reading({ state: 'starting' })],
+    ]
+
+    for (const [name, preview] of withGlyph) {
+      const { unmount } = renderPane((c) => c.workspace.set(reportFor(preview)))
+      const glyph = screen.getByTestId('app-pane-glyph')
+      expect(screen.getByTestId('app-pane-empty').getAttribute('data-workspace-state'), name).toBe(name)
+      expect(glyph.getAttribute('width')).toBe('30')
+      // Decorative: the headline underneath already says it in words.
+      expect(glyph.getAttribute('aria-hidden')).toBe('true')
+      unmount()
+    }
+  })
+
+  it('★ and draws none for a state no board has a mark for', () => {
+    // Seven of the ten states are hand-overs, read failures and start outcomes that the canvas has
+    // never drawn. Borrowing one of the three marks for them would be this file inventing the
+    // design; saying nothing is the honest answer, and the sentence still carries the state.
+    renderPane((c) => c.workspace.set(reportFor(reading({ state: 'unknown' }))))
+
+    expect(screen.queryByTestId('app-pane-glyph')).toBeNull()
+    // LIVENESS: the card is there and speaking, so this is a deliberate absence rather than a
+    // pane that rendered nothing.
+    expect(screen.getByTestId('app-pane-empty').textContent?.length).toBeGreaterThan(10)
+  })
+
   it('never says what the app is NOT (R-16)', () => {
     for (const preview of [
       reading({ state: 'asleep', restorable: true }),
@@ -365,5 +401,132 @@ describe('the column a plan chat does not get (plan 002, U6)', () => {
 
     expect(paneClasses(container)).toContain('flex-1')
     expect(paneClasses(container)).not.toContain('w-0')
+  })
+})
+
+describe('the movement between the two layouts (plan 002, U6)', () => {
+  const paneClasses = (container: HTMLElement) =>
+    (container.querySelector('[data-testid="app-pane-region"]')?.className ?? '').split(/\s+/)
+
+  /** A build chat with a running app framed: the state a citizen actually leaves FROM. */
+  const framed = (c: WorkspaceChannel) => {
+    c.workspace.set(reportFor(reading({ state: 'alive', alive: true })))
+    c.address.set({ url: 'https://app.example/', status: 'ready', projectId: 'p1' })
+    c.project.set('p1')
+    c.pane.set(PANE_VIEW)
+  }
+
+  it('★ slides out at full width and only then collapses', async () => {
+    // `T2Sliding` is a whole artboard of this one moment — "the app card is sliding out to the
+    // right and fading as it goes … a moment later the app is gone" — and until now the keyframe
+    // existed, was suppressed under reduced motion, and was applied to nothing. Applying it to the
+    // collapsed arm would have changed nothing either: an element at `w-0 invisible` cannot be
+    // watched fading, which is why the column holds its size for the length of the animation.
+    const { container, channel } = renderPane(framed, true)
+    expect(paneClasses(container)).not.toContain('animate-pane-leave')
+
+    act(() => channel.visible.set(false))
+
+    expect(paneClasses(container)).toContain('animate-pane-leave')
+    expect(paneClasses(container)).toContain('flex-1')
+    expect(paneClasses(container)).not.toContain('w-0')
+    // Gone to a reader immediately, even while it is still on screen for the eye.
+    expect(screen.getByTestId('app-pane-region').getAttribute('aria-hidden')).toBe('true')
+
+    await waitFor(() => expect(paneClasses(container)).toContain('w-0'))
+    expect(paneClasses(container)).not.toContain('animate-pane-leave')
+    // AND THE APP WAS NEVER TOUCHED BY ANY OF IT — "nothing about the app is stopped or reloaded,
+    // it is only taken off the screen." This is also the liveness half: every class assertion
+    // above would pass just as happily against a host that unmounted the frame.
+    expect(container.querySelector('iframe')).toBeTruthy()
+  })
+
+  it('★ stays out of the keyboard’s reach for the WHOLE leave, not only once it has gone', async () => {
+    // THE GAP THIS IS WRITTEN AGAINST. The column holds its size for the length of the animation so
+    // the card can be watched leaving, which means `visibility:hidden` — the thing that takes a
+    // subtree out of the tab order — cannot land yet. For those 240ms the pane was announced as
+    // gone and still one Tab away: a keyboard could land on the skip control, or inside the frame
+    // of an app that was no longer on the screen. `hiddenSubtree.ts` names that pairing a WCAG
+    // 4.1.2 violation, and this is the applier where what is hidden is a whole application.
+    //
+    // ASSERTED AS THE ATTRIBUTE, and honestly: jsdom implements no part of `inert` — it neither
+    // reflects the property nor refuses a `focus()` inside one — so a focus simulation here would
+    // be inventing a browser rather than testing one. The attribute IS the mechanism a browser
+    // obeys, which is the same bargain the `aria-hidden` assertions in this file already make.
+    const { container, channel } = renderPane(framed, true)
+    // A pane somebody is looking at is reachable, or the assertion below proves nothing.
+    expect(region().hasAttribute('inert')).toBe(false)
+
+    act(() => channel.visible.set(false))
+
+    // MID-LEAVE: still sized, still animating, still framing the app — and unreachable.
+    expect(paneClasses(container)).toContain('animate-pane-leave')
+    expect(paneClasses(container)).not.toContain('invisible')
+    expect(region().hasAttribute('inert')).toBe(true)
+    // LIVENESS, and the reason a subtree attribute is the right shape: the two focusable things
+    // inside the region are the skip control and the frame itself, and both are covered by one
+    // attribute rather than by a list this test would have to keep up with.
+    expect(container.querySelector('iframe')?.closest('[inert]')).toBe(region())
+    expect(region().querySelector('button')?.textContent).toMatch(/skip past your app/i)
+
+    // AND IT IS STILL UNREACHABLE ONCE THE HOLD ENDS, where `visibility:hidden` takes over.
+    await waitFor(() => expect(paneClasses(container)).toContain('w-0'))
+    expect(region().hasAttribute('inert')).toBe(true)
+  })
+
+  it('★ becomes reachable again the moment the pane is back', async () => {
+    // The other direction, and the one that would turn this fix into a worse bug than the one it
+    // fixes: an `inert` that never lifted would leave a citizen looking at their app unable to
+    // reach anything in it, with nothing on the screen to explain why.
+    const { container, channel } = renderPane(framed, true)
+
+    act(() => channel.visible.set(false))
+    await waitFor(() => expect(paneClasses(container)).toContain('w-0'))
+    act(() => channel.visible.set(true))
+
+    expect(region().hasAttribute('inert')).toBe(false)
+    expect(container.querySelector('iframe')?.closest('[inert]')).toBeNull()
+  })
+
+  it('★ carries the return half of the pair when the pane comes back', async () => {
+    const { container, channel } = renderPane(framed, true)
+    expect(container.querySelector('[data-testid="app-pane"]')?.className).toMatch(/animate-pane-return/)
+
+    act(() => channel.visible.set(false))
+    await waitFor(() => expect(paneClasses(container)).toContain('w-0'))
+    act(() => channel.visible.set(true))
+
+    // The return interrupts a departure rather than queueing behind it.
+    expect(paneClasses(container)).not.toContain('animate-pane-leave')
+    expect(container.querySelector('[data-testid="app-pane"]')?.className).toMatch(/animate-pane-return/)
+  })
+
+  it('★ a pane that was never on screen does not animate its way to nothing', () => {
+    // Every plan chat opened cold, and the project screen before anything is built. There is no
+    // departure to draw, so there is no hold either — the column is at rest on its first frame.
+    const { container } = renderPane(framed, false)
+
+    expect(paneClasses(container)).toContain('w-0')
+    expect(paneClasses(container)).not.toContain('animate-pane-leave')
+  })
+
+  it('★ both halves are suppressed for a reader who asked for less motion', () => {
+    // Asserted against the STYLESHEET because that is where the suppression lives, and jsdom
+    // loads no stylesheet: nothing else in the suite would notice the media block being deleted.
+    // A citizen sets this preference because motion makes them ill, so it is not decoration.
+    // Resolved from the vitest root (`portal/`), not from `import.meta.url`: under vite the
+    // module's own URL is not a `file:` one, so `new URL(…, import.meta.url)` cannot be read.
+    const css = readFileSync(resolve(process.cwd(), 'src/index.css'), 'utf8')
+    const reduced = css.slice(css.indexOf('@media (prefers-reduced-motion: reduce)'))
+    expect(reduced.length).toBeGreaterThan(0)
+
+    const rule = reduced.match(/\.animate-pane-leave\s*,\s*\.animate-pane-return\s*\{([^}]*)\}/)
+    expect(rule?.[1]).toMatch(/animation:\s*none/)
+    // LIVENESS: the two utilities the block suppresses are the two the components apply, so the
+    // rule cannot go on matching class names nothing renders.
+    const column = readFileSync(resolve(process.cwd(), 'src/components/workspace/AppPane.tsx'), 'utf8')
+    const host = readFileSync(resolve(process.cwd(), 'src/components/workspace/AppPaneHost.tsx'), 'utf8')
+    expect(column).toContain('animate-pane-leave')
+    expect(host).toContain('animate-pane-return')
   })
 })

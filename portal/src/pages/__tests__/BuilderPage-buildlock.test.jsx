@@ -50,8 +50,6 @@ const h = vi.hoisted(() => ({
   resolvePlanOptions: vi.fn(), uuidv7: vi.fn(),
   loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
-  planLoadHistory: vi.fn(), planNewConversation: vi.fn(), planCreateConversation: vi.fn(),
-  planGetConversation: vi.fn(), planDeleteConversation: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
 }))
 
@@ -73,11 +71,6 @@ vi.mock('../../utils/builderHistory', () => ({
 vi.mock('../../utils/conversationApi', () => ({
   listProjectConversations: h.listProjectConversations,
   uuidv7: (...a) => h.uuidv7(...a),
-}))
-vi.mock('../../utils/chatHistory', () => ({
-  relativeTime: () => 'now', deriveTitle: (t) => (t || '').slice(0, 40),
-  loadHistory: h.planLoadHistory, newConversation: h.planNewConversation,
-  createConversation: h.planCreateConversation, getConversation: h.planGetConversation, deleteConversation: h.planDeleteConversation,
 }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../components/LivePreview', () => ({ default: () => null }))
@@ -184,10 +177,6 @@ beforeEach(() => {
     activeTurn: liveTurnByChat.get(id) ?? null,
   }))
   h.buildUserParts.mockImplementation(async (text) => [{ type: 'text', text }])
-  h.planLoadHistory.mockResolvedValue([])
-  h.planGetConversation.mockResolvedValue(null)
-  h.planCreateConversation.mockResolvedValue({ ok: true })
-  h.planNewConversation.mockReturnValue('plan-N')
   projectBuilds = []
   h.listProjectConversations.mockImplementation(async () => projectBuilds)
   // Every interview turn answers with a ready-to-build brief, so these suites reach the lock

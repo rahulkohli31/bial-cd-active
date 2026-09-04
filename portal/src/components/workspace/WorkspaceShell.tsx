@@ -50,7 +50,8 @@ import AppPane from './AppPane'
 import RailResizeHandle from './RailResizeHandle'
 import WorkspaceToolbar from './WorkspaceToolbar'
 import { clampRailWidth, openingWidth, readRailWidth, writeRailWidth } from './railWidth'
-import type { DeviceName } from './WorkspaceToolbar'
+import type { DeviceName } from './devices'
+import { WORKSPACE_RAIL_ID } from './railId'
 import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
 import { WorkspaceExitProvider, useUnsavedWorkGuard } from './UnsavedWorkGuard'
 import {
@@ -64,14 +65,6 @@ import {
   useWorkspaceReport,
   useWorkspaceSaveState,
 } from './workspaceChannel'
-
-/**
- * THE ID THE COLLAPSE CONTROL POINTS AT. The control that hides the rail is published into the
- * pane's toolbar — it has to be, because a collapsed rail is invisible and untabbable and a toggle
- * inside it would be a one-way door — so `aria-controls` is the only thing tying the two together
- * for anyone reading the markup or navigating it. One constant so the two ends cannot drift.
- */
-export const WORKSPACE_RAIL_ID = 'workspace-rail'
 
 /**
  * WHICH RAIL IS SHOWING, DERIVED FROM THE ADDRESS AND FROM NOTHING ELSE (Plan F, U1).
@@ -316,9 +309,14 @@ function ShellFrame() {
   // through the guard first, and this is the other one.
   const navigate = useNavigate()
   const back = useCallback(() => {
-    const to = heading.chatKind !== null && heading.projectId ? `/projects/${heading.projectId}` : '/projects'
+    // THE CHAT'S OWN PROJECT WHENEVER THERE IS ONE TO GO TO. Keyed on the rail mode rather than on
+    // the heading's kind: the kind comes from the conversation fetch, so for the length of a cold
+    // chat open this control used to send a citizen who pressed back out to the projects list —
+    // out of the project they were working in — and the row's label said "Back to projects" while
+    // it did. The mode is derived from the pathname, so it is right from the first frame.
+    const to = mode === 'conversation' && heading.projectId ? `/projects/${heading.projectId}` : '/projects'
     guard(() => navigate(to))
-  }, [guard, navigate, heading.chatKind, heading.projectId])
+  }, [guard, navigate, mode, heading.projectId])
 
   return (
     <WorkspaceExitProvider value={guard}>

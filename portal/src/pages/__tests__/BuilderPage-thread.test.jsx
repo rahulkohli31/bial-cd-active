@@ -13,7 +13,7 @@
  *    below, under "the U13 header".
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, cleanup, within } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, cleanup, within, act } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import {
   FakeEventSource, makeClient, primeClient, BRIEF, PLAN_CARD_ID, primeTurn,
@@ -46,7 +46,6 @@ vi.mock('../../utils/conversationApi', () => ({
   listProjectConversations: h.listProjectConversations,
   uuidv7: (...a) => h.uuidv7(...a),
 }))
-vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../components/LivePreview', () => ({ default: () => null }))
 vi.mock('../../components/AttachmentChips', () => ({ default: () => null }))
@@ -412,17 +411,27 @@ describe('R8 live clause — a reload MID-TURN re-attaches to the running reply'
     expect(args.cursor).toBe(0)
   })
 
-  it('tells the re-attached turn ONCE, prose included', async () => {
+  it('tells the re-attached turn ONCE, prose included — and still does after it ENDS', async () => {
     // The reload hydrates the turn's persisted rows AND re-tells the same turn into a fresh
     // streaming message. Prose written beside a tool call is stored now — the projection stopped
     // dropping it — so the stored copy and the re-told copy are both on screen unless the
     // in-flight suppression covers text as well as steps. The citizen read every sentence twice.
+    //
+    // ★ THE TURN IS RUN TO ITS TERMINAL HERE, and that is the whole point of the fixture. The
+    // suppression used to be derived from "a turn is streaming in this chat", so it switched off
+    // at `turn_ended` while the re-told message stayed — and the second copy came back a few
+    // minutes later, permanently. Asserting mid-stream could never see that.
     h.getBuild.mockResolvedValue({
       id: 'thread-1',
       mode: 'ask',
       activeTurn: { turnId: 't-live', lastSeq: 3 },
       messages: [
         { id: 'srv_1_u_0', role: 'user', seq: 1, parts: [{ type: 'text', text: 'add a page' }] },
+        // ★ THE EQUAL CASE, and the only row in this fixture that exercises it. The boundary IS
+        // the user row's seq, so every other stored row of the turn sits STRICTLY above it and
+        // `>` and `>=` cannot be told apart by them. A stored agent row sharing that seq is the
+        // one row the difference decides, and it belongs to the turn just as much as the rest.
+        { id: 'srv_1_a_0', role: 'assistant', seq: 1, parts: [{ type: 'text', text: 'Reading the page first.' }] },
         { id: 'srv_2_a_0', role: 'assistant', seq: 2, parts: [{ type: 'text', text: 'Let me look at the page.' }] },
       ],
     })
@@ -433,18 +442,37 @@ describe('R8 live clause — a reload MID-TURN re-attaches to the running reply'
           seq: 3,
           turnId: 't-live',
           turnStatus: 'running',
-          parts: [{ type: 'text', text: 'Let me look at the page.' }],
+          parts: [
+            { type: 'text', text: 'Reading the page first.' },
+            { type: 'text', text: 'Let me look at the page.' },
+          ],
           working: false,
           items: [],
         },
+        // The tail exists ONLY in the re-telling, so waiting for it is what makes the count
+        // below deterministic: it cannot be on screen until the whole stream has been read and
+        // the turn has settled. `findAllByText` alone resolves on the FIRST match — the stored
+        // copy — which is why this assertion used to pass or fail depending on what else ran.
+        { type: 'text_delta', seq: 4, text: ' Adding it now.', newBlock: false },
+        { type: 'turn_ended', seq: 5, turnId: 't-live', status: 'completed' },
       ]),
     )
     renderThread()
 
-    // Once, not twice — and `findAllByText` rather than `findByText` so the assertion is about
-    // the COUNT: `findByText` throws on multiple matches, which reads as a broken query.
-    const drawn = await screen.findAllByText(/Let me look at the page\./)
-    expect(drawn).toHaveLength(1)
+    await screen.findByText(/Let me look at the page\. Adding it now\./)
+    // Once, not twice — and `getAllByText` rather than `getByText` so the assertion is about the
+    // COUNT: `getByText` throws on multiple matches, which reads as a broken query.
+    expect(screen.getAllByText(/Let me look at the page\./)).toHaveLength(1)
+    // ★ INCLUDING THE ROW AT EXACTLY THE BOUNDARY. The re-telling carries this sentence too, so
+    // the stored copy sitting AT the boundary seq is a second copy like any other — and a
+    // boundary drawn as `>` rather than `>=` would leave it on screen beside its own re-telling.
+    // Nothing else in this fixture can fail that way.
+    expect(screen.getAllByText(/Reading the page first\./)).toHaveLength(1)
+    // ★ AND THE CITIZEN'S OWN MESSAGE SURVIVED IT. The stored user row is `srv_` plus one text
+    // part, sitting at exactly the seq the boundary is drawn from, so the suppression deleted it
+    // — the reply arrived with nothing above it saying what had been asked. Nothing re-tells a
+    // prompt, so this is the assertion that tells de-duplication apart from loss.
+    expect(screen.getByText('add a page')).toBeTruthy()
   })
 
   it('draws the working status BELOW prose already on screen, not above it', async () => {
@@ -458,13 +486,12 @@ describe('R8 live clause — a reload MID-TURN re-attaches to the running reply'
       activeTurn: { turnId: 't-live', lastSeq: 0 },
       messages: [{ id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'build it' }] }],
     })
-    h.readTurnStream.mockImplementation(
-      turnStreaming([
-        { type: 'snapshot', seq: 1, turnId: 't-live', turnStatus: 'running', parts: [], working: false, items: [] },
-        { type: 'text_delta', seq: 2, text: 'Let me look at the page.', newBlock: true },
-        { type: 'working', seq: 3, working: true },
-      ]),
-    )
+    h.readTurnStream.mockImplementation(async ({ onFrame }) => {
+      onFrame({ type: 'snapshot', seq: 1, turnId: 't-live', turnStatus: 'running', parts: [], working: false, items: [] })
+      onFrame({ type: 'text_delta', seq: 2, text: 'Let me look at the page.', newBlock: true })
+      onFrame({ type: 'working', seq: 3, working: true })
+      return new Promise(() => {})
+    })
     const { container } = renderThread()
 
     await screen.findByText(/Let me look at the page\./)
@@ -473,6 +500,49 @@ describe('R8 live clause — a reload MID-TURN re-attaches to the running reply'
       container.querySelectorAll('[data-testid="assistant-message"] p, [data-testid="working-status"]'),
     ).map((node) => node.getAttribute('data-testid') ?? node.textContent)
     expect(rendered).toEqual(['Let me look at the page.', 'working-status'])
+  })
+
+  it('stops saying the agent is working when the stream dies without a terminal', async () => {
+    // Pull the network during a reasoning burst and the reader gives up without a `turn_ended`
+    // frame — the one arm that ever cleared the status. `endGenerating` runs, the composer
+    // re-opens, the banner says the reply stalled — and "Working on your app" stayed on the
+    // transcript above it, describing a turn nothing was watching any more. Nothing re-reads the
+    // transcript afterwards, so it said so until the citizen reloaded the page, and they could
+    // send a new message underneath a status line still claiming the last one was in progress.
+    h.getBuild.mockResolvedValue({
+      id: 'thread-1',
+      mode: 'ask',
+      activeTurn: { turnId: 't-live', lastSeq: 1 },
+      messages: [{ id: 'srv_1_u_0', role: 'user', seq: 1, parts: [{ type: 'text', text: 'add a page' }] }],
+    })
+    // HELD OPEN, then dropped — not scripted and resolved. The turn has to be genuinely mid-burst
+    // when the connection dies, because the flag is only stale if it was set while the reader was
+    // alive; a stream that ends before the assertions could never tell the two apart.
+    let dropTheConnection
+    h.readTurnStream.mockImplementation(async ({ onFrame }) => {
+      onFrame({ type: 'snapshot', seq: 2, turnId: 't-live', turnStatus: 'running', parts: [{ type: 'text', text: 'Let me look at the page.' }], working: false, items: [] })
+      onFrame({ type: 'working', seq: 3, working: true })
+      await new Promise((resolve) => { dropTheConnection = resolve })
+      // …and it dies there: no `turn_ended`, no reason, nothing more to read.
+      return 'stalled'
+    })
+    renderThread()
+
+    // The turn is on screen and VISIBLY thinking before anything is asserted about how it ends —
+    // otherwise the absence below would also pass on a surface that never drew the status at all.
+    await screen.findByText(/Let me look at the page\./)
+    await screen.findByTestId('working-status')
+    await act(async () => dropTheConnection())
+
+    // ASSERTED ON THE SETTLED SHAPE, synchronously after that flush. The banner is written on the
+    // very exit that now clears the status, so having it on screen is the proof that everything
+    // the reader's ending scheduled has already been committed — including the repaint that would
+    // have drawn the stale status row.
+    expect(screen.getByText(/The reply stalled\. Reload to catch up\./)).toBeTruthy()
+    expect(screen.queryByTestId('working-status')).toBeNull()
+    // LIVENESS, because an empty transcript would also have no status row: what the turn DID say
+    // is still on screen under the banner.
+    expect(screen.getByText(/Let me look at the page\./)).toBeTruthy()
   })
 
   it('does not re-subscribe when no turn is running', async () => {

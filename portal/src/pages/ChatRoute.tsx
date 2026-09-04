@@ -30,13 +30,14 @@
  * in dev. See `freshlyMinted` below for why the skip is keyed on router state and not on
  * the query.
  */
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Navigate, useLocation, useParams, useSearchParams } from 'react-router-dom'
 import ConversationSlot from '../components/workspace/ConversationSlot'
 import { usePublishHeading } from '../components/workspace/workspaceChannel'
 import { getConversation } from '../utils/conversationApi'
 import { getProject } from '../utils/projectApi'
 import { markChatOpened } from '../utils/observe'
+import { recallChatProject, rememberChatProject } from '../utils/chatProjectMemory'
 import type { Project } from '../utils/projectApi'
 
 export type ChatKind = 'plan' | 'build'
@@ -109,6 +110,13 @@ export default function ChatRoute() {
       // included — which is precisely the case `markChatOpened` refuses, because a project this
       // load never opened has no denominator to be the numerator of.
       markChatOpened(projectId)
+      // AND REMEMBERED FOR THE NEXT LOAD WINDOW, at the same one seam and for the same reason it
+      // is the right seam: every arm passes through here knowing the chat's project, and this is
+      // the only place that is true. A reload of this chat arrives as a bare `/chat/{id}` — the
+      // query is rewritten away the moment the first message lands — so without this the row
+      // spends the whole of the next `GET` with no project to name and a back control pointed out
+      // of the project the citizen is working in.
+      rememberChatProject(chatId, projectId)
       setResolution({ status: 'ready', chatId, kind, projectId, title })
     }
 
@@ -161,16 +169,38 @@ export default function ChatRoute() {
   // whether the project already has an app (`project.appId`) without firing a mutating
   // provision call to find out. A 404 here means the project was deleted out from under
   // an open chat — show the transcript anyway, unnamed. Never redirect on this.
-  const projectId = resolution.status === 'ready' ? resolution.projectId : null
+  //
+  // WHILE THE CONVERSATION IS STILL RESOLVING, the URL's own `?projectId=` stands in. It is right
+  // whenever it is present: a chat that has not saved its first message yet carries it, and the
+  // resolution replaces it the moment the server answers.
+  //
+  // AND WHEN THE URL CARRIES NOTHING — which is the ORDINARY case, because the query is rewritten
+  // away the instant the first message lands, so every reload, bookmark and shared link into an
+  // existing chat is a bare `/chat/{id}` — what this tab was told last time stands in instead.
+  // Without it the row spent the whole fetch with no project to name and its back control sent a
+  // citizen out to the projects list, out of the project they were working in, while the label
+  // said so. A chat this browser has never seen still has neither, and keeps the neutral shape:
+  // this is a memory, never a guess.
+  const remembered = useMemo(() => recallChatProject(chatId), [chatId])
+  const projectId =
+    resolution.status === 'ready'
+      ? resolution.projectId
+      : (queryRef.current.projectId ?? remembered)
 
   // WHAT THE TOOLBAR ROW NAMES (plan 002, U2). Published from the ROUTE rather than from the
   // surface below it, because this component is mounted for the whole life of the address —
   // including the loading branch, where neither the conversation nor the project has resolved and
   // the row still has to render at full height with a working back control.
   //
-  // THE KIND IS WHAT MAKES IT A CHAT HEADING, not the title: a chat this session just minted has
-  // no row and so no title, and the row must still draw it as a chat rather than falling back to
-  // the project screen's shape for the seconds before the first message lands.
+  // WHAT MAKES THE ROW DRAW A CHAT is the ADDRESS, which the shell reads off the pathname — not
+  // anything published here. Every field below is an ANSWER from a fetch, and each may legitimately
+  // be `null` on its own: a chat this session just minted has no row and so no title, and a chat
+  // whose project was deleted has no name. None of them decides the shape.
+  //
+  // THE KIND IS NOT GUESSED FROM THE QUERY the way the project is. `?kind=` is user-controllable
+  // and a saved chat's URL can legitimately still carry a stale one, so publishing it would let a
+  // hand-edited link flash the wrong pill over a real conversation. `null` costs the row its kind
+  // pill for one fetch and nothing else — the row's SHAPE comes from the address, not from here.
   usePublishHeading({
     projectId,
     projectName: project !== null && project.id === projectId ? project.name : null,

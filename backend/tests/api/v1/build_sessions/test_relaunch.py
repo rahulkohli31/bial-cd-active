@@ -151,6 +151,11 @@ async def test_relaunch_without_snapshot_is_404(
         headers=auth_headers(user),
     )
     assert resp.status_code == 404
+    # CODED, because this route answers 404 twice over. The rail treats "nothing saved to bring
+    # back" as an ordinary first message and opens the chat anyway; the owner-scoping 404 below
+    # carries no code, so that arm cannot swallow it. Both halves are asserted so a code added
+    # here without one there — or dropped from here — is caught.
+    assert resp.json()["error"]["code"] == "no_saved_build"
     assert wire.sbx.provisioned == []  # never a blank template
     # F17: the 404 path must not mint a phantom DRAFT app row. The speculative upsert was
     # never committed; production `get_db` rolls it back on the error response — mirror that
@@ -209,6 +214,10 @@ async def test_relaunch_another_users_project_is_404(
         headers=auth_headers(intruder),
     )
     assert resp.status_code == 404
+    # AND IT IS NOT `no_saved_build`. Same status as the snapshot gate, different situation: the
+    # client's "open the chat anyway" arm keys on the code, so this one must stay uncoded or a
+    # stranger's project id would open a chat that dies a beat later.
+    assert resp.json()["error"].get("code") is None
 
 
 async def test_relaunch_without_csrf_is_403(

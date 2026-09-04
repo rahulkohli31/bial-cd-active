@@ -70,6 +70,20 @@ describe('chatKindFor', () => {
     expect(second.pill).toBe(first.pill)
   })
 
+  it('★ gives the pill the glyph its own board draws — which for BUILD is none', () => {
+    // The boards disagree on purpose, and the code used to draw a wrench in the BUILD pill that
+    // no board has. `PlanChat` puts an 11px message-square inside its PLAN pill; `BuildChat`,
+    // `NewBuildChat`, `PlainAnswer` and `ChatStarting` all draw BUILD as the word alone. The
+    // picker's `Icon` is a separate question and both kinds still answer it.
+    withCatalogue(MOCK_CATALOGUE)
+    expect(chatKindFor('build').pillIcon).toBeNull()
+    expect(UNKNOWN_CHAT_KIND.pillIcon).toBeNull()
+    // LIVENESS, both halves: the kind that DOES draw one still has it, and the picker's icon is
+    // untouched for the kind whose pill has none.
+    expect(chatKindFor('plan').pillIcon).toBe(chatKindFor('plan').Icon)
+    expect(chatKindFor('build').Icon).toBeTruthy()
+  })
+
   it('paints each kind the pill colours the canvas draws, and neither as an action', () => {
     // The boards give the kind a LABEL pill — BUILD #8C5D1E on #FFF4E0, PLAN #0A5C5F on
     // #E0F5F6 — which is the one role the gold family legitimately keeps. What must never come

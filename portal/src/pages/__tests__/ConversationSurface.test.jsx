@@ -32,7 +32,7 @@ const h = vi.hoisted(() => ({
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), stopTurn: vi.fn(),
   resolvePlanOptions: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(), relaunchPreview: vi.fn(),
-  fetchSaveState: vi.fn(),
+  fetchSaveState: vi.fn(), fetchPreviewState: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
@@ -43,7 +43,6 @@ vi.mock('../../utils/conversationApi', async (orig) => ({
   ...(await orig()),
   listProjectConversations: h.listProjectConversations,
 }))
-vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
 vi.mock('../../utils/turnStreamApi', async (orig) => ({
@@ -59,12 +58,18 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
 vi.mock('../../utils/buildSessionApi', async (orig) => ({
   ...(await orig()),
   fetchSaveState: (...a) => h.fetchSaveState(...a),
+  // The workspace read, and the start `StartAppControl` imports DIRECTLY from this module rather
+  // than through the injected client — both are what the failed-launch scenario at the bottom
+  // drives, and leaving either real would put this suite on the network.
+  fetchPreviewState: (...a) => h.fetchPreviewState(...a),
+  relaunchPreview: (...a) => h.relaunchPreview(...a),
 }))
 
 import {
   FakeEventSource, makeClient, primeClient, primeTurn, renderBuilder, send, waitForGateOpen,
-  planReply, turnStreaming, PLAN_CARD_ID,
+  planReply, turnStreaming, PLAN_CARD_ID, findStartAppControl,
 } from './_builderSession.jsx'
+import { ApiError } from '../../utils/apiError'
 
 const deps = () => {
   const fake = new FakeEventSource('x')
@@ -83,6 +88,13 @@ beforeEach(() => {
   h.listProjectConversations.mockResolvedValue([])
   h.buildUserParts.mockImplementation(async (t) => [{ type: 'text', text: t }])
   h.fetchSaveState.mockResolvedValue({ dirty: false })
+  // Neither the workspace read nor the start is this file's subject by default: answered so
+  // nothing reaches a real `fetch`, and re-primed by the two scenarios that are about them.
+  h.fetchPreviewState.mockResolvedValue({
+    state: 'unknown', alive: false, previewUrl: null,
+    occupyingProjectName: null, occupyingProjectId: null, restorable: null,
+  })
+  h.relaunchPreview.mockResolvedValue({ appId: 'a1', previewUrl: 'https://app/', status: 'ready', ready: true, restoredFromFailedBuild: false })
 })
 afterEach(cleanup)
 
@@ -269,5 +281,61 @@ describe('the per-conversation guardrail reaches the composer', () => {
     await waitForGateOpen()
     expect(screen.getByTestId('composer-input')).toBeTruthy()
     expect(screen.queryByTestId('composer-context-warning')).toBeNull()
+  })
+})
+
+describe('U9 — the offer\'s Build reaches the SAME hand-over dialog as the composer', () => {
+  it('opens the shell\'s dialog naming both projects, in citizen language', async () => {
+    // THE THIRD DOOR. Three presses can be refused because another project holds the one
+    // workspace — a rail send, the pane's start control, and this one — and the plan asks that
+    // they be proven identical rather than correct on the one that was tested. This is the one
+    // with no test: it once shipped rendering the refusal as plain red text with no way to act,
+    // and a regression there would look exactly like that again while every suite stayed green.
+    h.readTurnStream.mockImplementation(turnStreaming(planReply('Here is the plan.', PLAN_CARD_ID)))
+    h.buildFromPlan.mockRejectedValue(
+      Object.assign(new Error('“Car pool” is still open.'), {
+        code: 'sandbox_reclaim_blocked',
+        details: { projectId: 'pA', projectName: 'Car pool', dirty: false, building: false },
+      }),
+    )
+    renderBuilder({ deps: deps().deps })
+    await send('plan me a thing')
+
+    fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
+
+    const dialog = await screen.findByRole('dialog')
+    const text = dialog.textContent ?? ''
+    // The SAME two names the rail's own scenario asserts (HandoverAtSubmit.test.tsx): the app
+    // being started leads, and the one in the way is named so the choice is about something.
+    expect(text).toContain('VIP Movement')
+    expect(text).toContain('Car pool')
+    for (const word of [/container/i, /sandbox/i, /workspace slot/i, /session/i, /409/]) {
+      expect(text, String(word)).not.toMatch(word)
+    }
+  })
+})
+
+describe('U11 — a failed launch INSIDE a chat says why', () => {
+  it('puts the server\'s reason on the pane, not just a stopped spinner', async () => {
+    // The press used to report nothing at all here: the spinner stopped, the same sentence came
+    // back, and pressing again did the same thing — because this surface handed the shared map a
+    // hardcoded `null` for the outcome on the grounds that it had a relaunch path of its own.
+    // That path belongs to a different control. Nothing rendered the pane's own failure, and
+    // nothing went red when it did not.
+    h.fetchPreviewState.mockResolvedValue({
+      state: 'asleep', alive: false, previewUrl: null,
+      occupyingProjectName: null, occupyingProjectId: null, restorable: true,
+    })
+    h.relaunchPreview.mockRejectedValue(
+      new ApiError('Your app could not be brought back just now.', 503),
+    )
+    renderBuilder({ deps: deps().deps })
+
+    fireEvent.click(await findStartAppControl())
+
+    expect(await screen.findByText('We could not start your app.')).toBeTruthy()
+    // THE SERVER'S OWN WORDS, carried verbatim — the specific half, and the only thing that tells
+    // the citizen what to do differently.
+    expect(screen.getByText('Your app could not be brought back just now.')).toBeTruthy()
   })
 })

@@ -41,8 +41,12 @@
  * itself, and clears ONLY once the server has accepted. A refused send leaves everything exactly
  * where it was, and there is therefore no restore path to race with — the whole class of defect
  * stops existing rather than being guarded.
+ *
+ * AND ONLY OVER THE CHAT IT WAS SENT IN. This box is not remounted per conversation, so an
+ * accepted send can land while a sibling chat is on screen; what it clears is then decided
+ * against the chat being typed into rather than the one it belongs to. See `liveConversation`.
  */
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ComposerPrimitive, useAui, useAuiState } from '@assistant-ui/react'
 import { Paperclip, Send, X } from 'lucide-react'
 
@@ -75,9 +79,39 @@ export interface ComposerBoxProps {
    * only sending — so this is the box's whole notion of unavailability.
    */
   unavailableReason: string | null
+  /**
+   * THE BOX IS WAITING ON AN ANSWER THAT IS NOT A MESSAGE, and the board draws that as a whole
+   * treatment rather than as a greyed send circle: the input row on a pale ground, the paperclip
+   * dimmed, and the reason sitting where the placeholder was (`PlanReady`, `PlanRevised`).
+   *
+   * IT IS A SEPARATE FLAG FROM `unavailableReason` BECAUSE IT IS A DIFFERENT CLAIM. Send waits for
+   * four reasons and three of them — the text is too long, a reply is arriving, a build is running
+   * — leave the box white on every board that draws them. Only a pending question locks it, so
+   * only a pending question wears the lock.
+   */
+  locked?: boolean
+  /**
+   * WHAT THE BOX ACTUALLY KEPT FOR THAT CHAT, once an accepted send has been reconciled — the
+   * conversation the send was stamped with, and the text still standing in its box afterwards.
+   *
+   * IT EXISTS BECAUSE THE BOX DOES NOT ALWAYS EMPTY. A citizen who rewrites the box while the
+   * request is out gets their words left alone (see `doSend`), and a caller that clears its own
+   * copy of the draft on every accepted send would then be deleting text still on screen. Anyone
+   * keeping a second copy has to be told what survived rather than assuming nothing did.
+   *
+   * IT IS EMPTY WHENEVER THE CITIZEN HAS MOVED ON, and that is an answer rather than a shrug:
+   * nothing on screen belongs to the chat that was sent in any more, so nothing of its box
+   * survived. The caller stores exactly what it is told either way and needs no second opinion
+   * about which chat is showing.
+   */
+  onAccepted?: (conversationId: string, remainingText: string) => void
   /** Rendered inside the box, above the input: the offer strip's locked treatment, and nothing else. */
   header?: React.ReactNode
-  /** Rendered under the box: the cap counter, the context warning, the kind description. */
+  /**
+   * Rendered under the box: the cap counter, the context warning, the kind description. It sits
+   * INSIDE the dropzone, because a drop that lands on it must be claimed rather than falling
+   * through to the browser.
+   */
   footer?: React.ReactNode
   /** Said out loud when a file is refused, and when a send is. */
   onUrgent: (message: string) => void
@@ -88,6 +122,8 @@ export default function ComposerBox({
   placeholder,
   onSubmit,
   unavailableReason,
+  locked = false,
+  onAccepted,
   header,
   footer,
   onUrgent,
@@ -95,6 +131,22 @@ export default function ComposerBox({
   const aui = useAui()
   const [preview, setPreview] = useState<PreviewTarget | null>(null)
   const [sending, setSending] = useState(false)
+
+  /**
+   * WHICH CHAT IS ON SCREEN NOW, as opposed to the one Send was pressed in — the whole of what
+   * makes the reconciliation below safe.
+   *
+   * THIS BOX IS ONE LONG-LIVED INSTANCE. Flat routing swaps `conversationId` rather than
+   * remounting, so a send still out when the citizen steps to a sibling finishes over somebody
+   * else's composing. `doSend` runs entirely from its press-time closure, so the `conversationId`
+   * beside it is the one the send belongs to and this ref is the one being typed into.
+   *
+   * WRITTEN DURING RENDER rather than in an effect, as `Composer` and `LivePreview` write theirs:
+   * an accepted send resolves in a microtask, which can run before a passive effect has flushed,
+   * and a ref one render behind is the same bug with more steps.
+   */
+  const liveConversation = useRef(conversationId)
+  liveConversation.current = conversationId
 
   // READ THROUGH THE STORE, so the control re-renders when the citizen types or attaches. The
   // VALUES are read again at press time from `getState()` — a render-scoped copy would be one
@@ -148,16 +200,42 @@ export default function ComposerBox({
     try {
       await onSubmit({ text: sentText, attachments, conversationId })
       accepted = true
+
+      // THE CHAT MOVED ON WHILE THE REQUEST WAS OUT, and then there is nothing here to reconcile:
+      // the box on screen belongs to a sibling, and every rule below would be applied to somebody
+      // else's composing. The prefix slice is the one that bites — send "hi" here, step next
+      // door, type "hi there", and the tail rule would cut the sibling's line down to " there",
+      // because it reads as an append to a message that was never typed in this chat.
+      //
+      // THE FILES ARE THE SAME QUESTION. `clearAttachments()` empties the whole composer, so
+      // tidying up after this send would take the sibling's staged files with it and then put
+      // them back through a second decode — a chip that blinks out and returns, in a chat that
+      // sent nothing.
+      //
+      // THE SEND ITSELF STILL SUCCEEDED, and is reported as such: `accepted` is already true, so
+      // nothing downstream says a message failed, and the chat it was sent in is told its box
+      // kept nothing — because nothing on screen is its any more.
+      if (liveConversation.current !== conversationId) {
+        onAccepted?.(conversationId, '')
+        return
+      }
+
       // CLEARED ONLY ON SUCCESS, AND ONLY WHAT WAS SENT. Nothing is optimistically emptied, so a
       // failed send leaves everything exactly where it was and there is no restore path to race
       // with; and anything added since the press survives, because it was never sent.
       const after = aui.composer.getState()
       // ONE BRANCH, NOT TWO. `startsWith` is true when the two are equal and the slice is then
       // empty, so an `after.text === sentText` arm ahead of this would be the same statement twice.
-      if (after.text.startsWith(sentText)) await aui.composer.setText(after.text.slice(sentText.length))
+      //
       // Anything else is an edit we cannot reconcile — the citizen rewrote the box while the
       // request was out. Leaving their words alone is the only safe answer; a stale copy of a
       // sent line is a nuisance, a deleted paragraph is the bug.
+      const kept = after.text.startsWith(sentText) ? after.text.slice(sentText.length) : after.text
+      if (kept !== after.text) await aui.composer.setText(kept)
+      // SAID OUT LOUD, because a caller holding a second copy of this text cannot see which of the
+      // two branches ran. Reported before the attachment tidying below, which can throw: the words
+      // are safe either way, and the draft is about the words.
+      onAccepted?.(conversationId, kept)
 
       // THE FILES, SAME RULE. `clearAttachments()` is all-or-nothing and the composer exposes no
       // per-file removal, so anything staged during the send is cleared with the rest and then put
@@ -170,9 +248,9 @@ export default function ComposerBox({
       // calls — may lack it. Everything reaching here is a `PendingAttachment` and carries its
       // file. A bare `if (a.file)` would drop one SILENTLY on the day that stops being true, which
       // is the exact loss the rest of this function exists to prevent.
-      const kept = after.attachments.filter((a) => !sentIds.has(a.id))
+      const keptFiles = after.attachments.filter((a) => !sentIds.has(a.id))
       await aui.composer.clearAttachments()
-      for (const a of kept) {
+      for (const a of keptFiles) {
         if (!a.file) throw new Error(`Staged attachment ${a.id} has no file to restore after a send.`)
         await aui.composer.addAttachment(a.file)
       }
@@ -197,7 +275,7 @@ export default function ComposerBox({
     } finally {
       setSending(false)
     }
-  }, [aui, conversationId, onSubmit, onUrgent, sending, unavailableReason])
+  }, [aui, conversationId, onAccepted, onSubmit, onUrgent, sending, unavailableReason])
 
   const attachmentComponents = useMemo(
     () => ({ Attachment: () => <AttachmentChip onPreview={setPreview} /> }),
@@ -236,11 +314,20 @@ export default function ComposerBox({
 
   return (
     <>
-      {/* THE DROPZONE IS THE WHOLE BOX, not the input row. The chips and the strip above the row
-          are visually "the composer" too, and a drop landing on them would otherwise fall through
-          to the browser's default handler — which navigates the tab away and discards both the
-          draft and the staged files. */}
-      <ComposerPrimitive.AttachmentDropzone data-testid="composer-dropzone">
+      {/* THE DROPZONE IS EVERYTHING THAT READS AS THE COMPOSER, not the bordered box.
+          The chips, the strip above the row and — the part this had wrong — the FOOTER under the
+          box are all visually "the composer" to the person aiming at it. The footer is the gate
+          note, the context warning, the plan chat's standing line and the character counter: on a
+          running turn there is always a live strip of text there, and a drop landing a few pixels
+          low fell through to the browser's default handler, which navigates the tab to the file
+          and takes every staged attachment with it. The library only prevents that inside its own
+          element, so the footer has to be inside it. */}
+      <ComposerPrimitive.AttachmentDropzone
+        data-testid="composer-dropzone"
+        // The column and its gap were the frame's; they move here with the footer so the box, the
+        // notes and the counter still stack exactly as they did.
+        className="flex w-full flex-col gap-1.5"
+      >
         <ComposerPrimitive.Root
           data-testid="composer"
           onSubmit={(event) => {
@@ -250,9 +337,13 @@ export default function ComposerBox({
           // THE BORDER ANSWERS TO THE HEADER. `PlanReady` draws the box `#CDE9EA` while the offer
           // strip is fixed to its top, so the strip and the box read as one card rather than as a
           // banner sitting on an unrelated control. The header slot's only occupant is that strip.
-          className={`flex w-full flex-col gap-2.5 rounded-[14px] border bg-white px-3 py-[11px] ${
-            header ? 'border-canvas-offeredge' : 'border-bial-border'
-          }`}
+          //
+          // THE GROUND ANSWERS TO THE LOCK, which is a narrower question — a spent offer keeps the
+          // teal border and gets its box back. `#F8FAFC` is the board's, and it is a ground rather
+          // than an opacity so the box still reads as a control rather than as a ghost.
+          className={`flex w-full flex-col gap-2.5 rounded-[14px] border px-3 py-[11px] ${
+            locked ? 'bg-canvas-offerlock' : 'bg-white'
+          } ${header ? 'border-canvas-offeredge' : 'border-bial-border'}`}
         >
           {header}
 
@@ -274,7 +365,11 @@ export default function ComposerBox({
               derived from `thread.isDisabled`, which this project never sets, so the attribute is
               absent rather than false; the guard test asserts the absence directly. */}
           <ComposerPrimitive.Input
-            placeholder={placeholder}
+            // THE REASON GOES WHERE THE PLACEHOLDER WAS while the box is locked, because that is
+            // where both boards draw it — inside the box, at the point the citizen is aiming at
+            // when they try to type. A hint to describe a change is not the true thing to say to
+            // someone who cannot send one.
+            placeholder={locked && unavailableReason ? unavailableReason : placeholder}
             data-testid="composer-input"
             rows={1}
             // NO maxLength. Issue #156 forbids it by name and a test asserts its absence.
@@ -294,7 +389,9 @@ export default function ComposerBox({
               data-testid="composer-attach"
               aria-label="Attach a file"
               title="Attach images, PDFs or text files (CSV, TXT), or drop them anywhere in the composer"
-              className="ms-auto inline-flex text-neutral transition hover:text-primary"
+              // DIMMED WITH THE BOX, never unavailable. The board draws it at 40% while an offer
+              // waits, and it stays pressable at 40%: staging a file is composing, not answering.
+              className={`ms-auto inline-flex text-neutral transition hover:text-primary${locked ? ' opacity-40' : ''}`}
             >
               <Paperclip size={16} />
             </ComposerPrimitive.AddAttachment>
@@ -319,9 +416,9 @@ export default function ComposerBox({
             </button>
           </div>
         </ComposerPrimitive.Root>
-      </ComposerPrimitive.AttachmentDropzone>
 
-      {footer}
+        {footer}
+      </ComposerPrimitive.AttachmentDropzone>
 
       <AttachmentPreview target={preview} onClose={() => setPreview(null)} />
     </>

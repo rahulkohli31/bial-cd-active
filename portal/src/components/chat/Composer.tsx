@@ -50,16 +50,18 @@
  *   lands late lands on the send it belongs to.
  * R57 — THE CAP BYPASS. The adapter validates against what is ALREADY staged, read live off the
  *   runtime — see `stagedAttachments.tsx` for why that is a ref rather than a closure.
- * R60 — CROSS-CHAT LEAKAGE is guarded by the send path stamping the conversation at press time
- *   and the surface comparing it on completion.
+ * R60 — CROSS-CHAT LEAKAGE is guarded in ONE place, `ComposerBox`: the send stamps its
+ *   conversation at press time and, on completion, compares it against the chat that is on screen
+ *   THEN — read through a ref, because the callback itself is press-time too. A send whose chat
+ *   the citizen has left touches neither the box nor the chips nor this file's stored draft.
  */
-import { useCallback, useEffect, useMemo, useRef, type FC, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, type FC, type ReactNode } from 'react'
 import { useAui, useAuiState } from '@assistant-ui/react'
 
 import { capState, MAX_COMPOSER_CHARS } from '../../utils/composerCap'
-import { clearDraft, readDraft, writeDraft } from '../../utils/composerDraft'
+import { readDraft, writeDraft } from '../../utils/composerDraft'
 import ComposerBox, { type ComposerSubmission } from './ComposerBox'
-import OfferStrip, { OFFER_GATE_NOTE, type OfferStripProps } from './OfferStrip'
+import OfferStrip, { OFFER_GATE_NOTE, OFFER_LOCKED_NOTE, type OfferStripProps } from './OfferStrip'
 import StopTurnControl, { type StopTurnControlProps } from './StopTurnControl'
 
 export type { ComposerSubmission } from './ComposerBox'
@@ -183,29 +185,28 @@ const Composer: FC<ComposerProps> = ({
    * Why Send is unavailable — one sentence, always stated, with a distinct reason per cause.
    * Plain language: a citizen reading this asked for an app and is watching it get made.
    */
-  const unavailableReason = useMemo<string | null>(() => {
+  const unavailable = useMemo<{ reason: string; fromOffer: boolean } | null>(() => {
     // THE ORDER IS BY IMMEDIACY, and the offer is LAST on purpose. All four block Send, but the
     // first three describe something happening right now — the citizen's own text is too long, a
     // reply is arriving, their app is being built — while a pending offer describes a question
     // still waiting. The offer also stays pending for the whole of the round trip its own Build
     // press starts, so putting it first told a citizen to "choose one of the two above" while the
     // build they had just chosen was starting.
-    if (cap.over) return cap.message
-    if (isRunning) return 'Replying — keep typing if you like; send unlocks when it is done.'
-    if (gate?.blocked) return gate.reason
-    if (offerPending) return OFFER_GATE_NOTE
+    //
+    // WHICH ARM WON IS PART OF THE ANSWER, not a detail of it. The offer's arm is the only one the
+    // boards draw as a locked box, and it can be true at the same time as the three above it — so
+    // "an offer is pending" is not the same question as "the offer is why Send is waiting", and it
+    // is the second one the treatment answers to.
+    // `capState` sets `message` exactly when `over`, and naming both is how that is said without a
+    // cast: a cap with nothing to say about itself is not a reason anyone could act on.
+    if (cap.over && cap.message) return { reason: cap.message, fromOffer: false }
+    if (isRunning) return { reason: 'Replying — keep typing if you like; send unlocks when it is done.', fromOffer: false }
+    if (gate?.blocked) return { reason: gate.reason, fromOffer: false }
+    if (offerPending) return { reason: OFFER_GATE_NOTE, fromOffer: true }
     return null
   }, [offerPending, cap.over, cap.message, isRunning, gate])
-
-  const handleSubmit = useCallback(
-    async (submission: ComposerSubmission) => {
-      await onSubmit(submission)
-      // The draft's own clear. The BOX clears the runtime's text and attachments on the same
-      // acceptance; this clears the copy in `sessionStorage`, which the box knows nothing about.
-      clearDraft(submission.conversationId)
-    },
-    [onSubmit],
-  )
+  const unavailableReason = unavailable?.reason ?? null
+  const offerLocked = unavailable?.fromOffer ?? false
 
   return (
     // NO RULE ABOVE THE BOX. Every board that draws a composer — BuildChat, PlanChat, PlainAnswer,
@@ -225,8 +226,27 @@ const Composer: FC<ComposerProps> = ({
       <ComposerBox
         conversationId={conversationId}
         placeholder={placeholder}
-        onSubmit={handleSubmit}
+        onSubmit={onSubmit}
         unavailableReason={unavailableReason}
+        locked={offerLocked}
+        /* THE DRAFT FOLLOWS THE BOX, IT DOES NOT ASSUME IT EMPTIED — which is why this is the
+           box's report and not a clear.
+
+           Clearing the stored draft on every accepted send used to be the rule. But the box does
+           not always empty: a citizen who rewrites it while the request is out keeps their words,
+           deliberately. The two then disagreed — the composer showed text that was no longer
+           stored anywhere, and because the mirror above only fires when `text` CHANGES, nothing
+           ever wrote it back. A reload, or a step to another chat, silently destroyed words still
+           on the screen.
+
+           So the box says which chat it reconciled and what survived in it, and that is what is
+           stored, verbatim. `writeDraft` with an empty string removes the key, which covers the
+           ordinary send and the send whose chat the citizen has since left — the box reports
+           nothing kept for that one, because by then nothing on screen is its. Deciding that here
+           as well is the second opinion that made this wrong before: the callback is built in the
+           same render as the `conversationId` beside it, so comparing the two compared a value
+           with itself and the sibling arm never ran. */
+        onAccepted={writeDraft}
         onUrgent={onUrgent}
         header={
           offer ? (
@@ -237,9 +257,23 @@ const Composer: FC<ComposerProps> = ({
         }
         footer={
           <>
+            {/* THE LINE UNDER THE BOX, AND WHICH LINE IT IS. For the three immediate reasons it is
+                the reason itself, small and grey, sitting where a status note belongs. While an
+                offer waits the reason has moved INTO the box (see `locked`), and the boards put a
+                second sentence here instead: centred, in the strip's teal, saying that neither
+                answer is the wrong one. Repeating the in-box sentence here would be the composer
+                saying the same thing twice and the reassurance not at all. */}
             {unavailableReason && (
-              <p data-testid="composer-gate-note" role="status" className="text-xs text-neutral">
-                {unavailableReason}
+              <p
+                data-testid="composer-gate-note"
+                role="status"
+                className={
+                  offerLocked
+                    ? 'text-center text-[11px] leading-relaxed text-canvas-offerink'
+                    : 'text-xs text-neutral'
+                }
+              >
+                {offerLocked ? OFFER_LOCKED_NOTE : unavailableReason}
               </p>
             )}
 

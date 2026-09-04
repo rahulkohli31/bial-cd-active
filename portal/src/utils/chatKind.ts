@@ -61,6 +61,20 @@ export interface ChatKindPresentation {
   description: string
   Icon: LucideIcon
   /**
+   * THE GLYPH THE KIND PILL DRAWS — a different question from `Icon`, and the boards answer the
+   * two differently.
+   *
+   * `PlanChat` draws an 11px message-square inside its PLAN pill. `BuildChat`, `NewBuildChat`,
+   * `PlainAnswer` and `ChatStarting` — every primary board that draws a build chat — draw BUILD as
+   * the word alone. (The two transition boards, `T5BuildOpens` and `T6BuildDone`, do draw a glyph
+   * in a build pill, but a wand on a different palette entirely; the primary boards outrank them,
+   * which is how the rest of this branch treats them.)
+   *
+   * `Icon` still answers "what mark stands for this kind" for the rail's kind picker, where both
+   * kinds carry one. `null` here is a real answer, not a missing value: this kind's pill is a word.
+   */
+  pillIcon: LucideIcon | null
+  /**
    * The kind PILL's own colours — a text/ground pair, applied to the caps pill the canvas draws
    * beside a chat's title. LOCAL: the server has no opinion on Tailwind classes.
    *
@@ -98,18 +112,21 @@ export interface ChatKindPresentation {
  */
 const CHAT_KIND_LOOKS: Readonly<
   Partial<
-    Record<string, Pick<ChatKindPresentation, 'completion' | 'Icon' | 'pill' | 'composerPlaceholder'>>
+    Record<string, Pick<ChatKindPresentation, 'completion' | 'Icon' | 'pillIcon' | 'pill' | 'composerPlaceholder'>>
   >
 > = {
   build: {
     completion: ' chat',
     Icon: Wrench,
+    // The word alone — see `pillIcon`. The wrench belongs to the picker, not to the pill.
+    pillIcon: null,
     pill: 'bg-accent-light text-secondary-800',
     composerPlaceholder: 'Describe the change you need…',
   },
   plan: {
     completion: ' chat',
     Icon: MessageSquare,
+    pillIcon: MessageSquare,
     pill: 'bg-primary-50 text-primary-dark',
     // Names no change, because a Plan chat makes none — the line above this box says so.
     composerPlaceholder: 'Describe what you have in mind…',
@@ -126,6 +143,8 @@ export const UNKNOWN_CHAT_KIND: ChatKindPresentation = {
   completion: '',
   description: '',
   Icon: MessageSquare,
+  // A kind we cannot name gets no mark either: the pill's whole content is the honest word "Chat".
+  pillIcon: null,
   pill: 'bg-status-grey-bg text-status-grey-fg',
   // The kind is unknown, so the hint claims nothing about what sending will do.
   composerPlaceholder: 'Describe what you need…',
@@ -159,6 +178,7 @@ export function chatKindFor(kind: string): ChatKindPresentation {
     completion: look.completion,
     description: entry.description,
     Icon: look.Icon,
+    pillIcon: look.pillIcon,
     pill: look.pill,
     composerPlaceholder: look.composerPlaceholder,
   }

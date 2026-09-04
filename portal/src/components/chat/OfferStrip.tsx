@@ -85,8 +85,21 @@ export interface OfferStripProps {
 
 export const BUILD_LABEL = 'Build this plan'
 export const KEEP_PLANNING_LABEL = 'Keep planning'
-/** The canvas's wording for why sending waits. */
+/** The canvas's wording for why sending waits. It sits INSIDE the box, where the placeholder would
+ *  be — which is where `PlanReady` and `PlanRevised` both draw it. */
 export const OFFER_GATE_NOTE = 'Choose one of the two above to carry on…'
+/**
+ * THE LINE UNDER THE BOX WHILE THE OFFER WAITS, verbatim from `PlanReady` and `PlanRevised`.
+ *
+ * The boards draw TWO sentences, not one. The gate note above sits in the box and says the box is
+ * not where the answer goes; this one sits under it, centred and in the strip's own teal, and says
+ * that neither answer is the wrong answer. Only the first of the two had been written, as a small
+ * grey note below the box, which put the "you cannot type here" half where the reassurance goes
+ * and left the reassurance out — and reassurance is the half someone just handed a decision
+ * actually needs.
+ */
+export const OFFER_LOCKED_NOTE =
+  'The box is locked until you pick one. Either answer is fine — one opens a Build chat, the other hands the conversation back to you.'
 /**
  * WHAT THE STRIP SAYS BEFORE ANYBODY PRESSES ANYTHING, verbatim from `PlanReady`.
  *

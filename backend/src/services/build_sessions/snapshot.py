@@ -90,7 +90,12 @@ _BUNDLE_PREFIX = "/tmp/bial-snapshot"
 # hold the user's one-per-user build slot and their conversation guard for the better part of an
 # hour against a container that merely stopped answering. Sized like the liveness collector's
 # 60 s: enough for a large tree over `/exec`, nowhere near enough to strand a session.
-_SNAPSHOT_EXEC_TIMEOUT_SECONDS: Final = 120
+SNAPSHOT_EXEC_TIMEOUT_SECONDS: Final = 120
+
+SNAPSHOT_EXECS: Final = 4
+"""How many bounded execs one `write_snapshot` runs: commit, bundle, base64, and the cleanup in
+the `finally`. Named beside the per-exec bound so the product of the two is a number a caller can
+derive rather than count by reading this file."""
 
 # One serialization lock per app, plus a holder+waiter count so the entry can be dropped when it
 # is provably idle. Unique bundle names above already make a concurrent pair non-destructive; this
@@ -416,7 +421,7 @@ async def _bundle_the_tree(sandbox_client: SandboxClient, handle: SandboxHandle)
     # commit or bundle must abort HERE, never fall through to base64-ing whatever happens to be
     # on disk and uploading it as "latest".
     commit = await run_command(
-        handle, ["sh", "-c", _COMMIT_SCRIPT], timeout_s=_SNAPSHOT_EXEC_TIMEOUT_SECONDS
+        handle, ["sh", "-c", _COMMIT_SCRIPT], timeout_s=SNAPSHOT_EXEC_TIMEOUT_SECONDS
     )
     if commit.exit != 0:
         raise SandboxError(f"snapshot commit failed (exit {commit.exit})")
@@ -426,12 +431,12 @@ async def _bundle_the_tree(sandbox_client: SandboxClient, handle: SandboxHandle)
         bundle = await run_command(
             handle,
             ["git", "bundle", "create", bundle_name, "HEAD"],
-            timeout_s=_SNAPSHOT_EXEC_TIMEOUT_SECONDS,
+            timeout_s=SNAPSHOT_EXEC_TIMEOUT_SECONDS,
         )
         if bundle.exit != 0:
             raise SandboxError(f"snapshot bundle failed (exit {bundle.exit})")
         result = await run_command(
-            handle, ["base64", bundle_name], timeout_s=_SNAPSHOT_EXEC_TIMEOUT_SECONDS
+            handle, ["base64", bundle_name], timeout_s=SNAPSHOT_EXEC_TIMEOUT_SECONDS
         )
         if result.exit != 0:
             raise SandboxError(f"snapshot bundle read failed (exit {result.exit})")
@@ -447,7 +452,7 @@ async def _bundle_the_tree(sandbox_client: SandboxClient, handle: SandboxHandle)
         # .gitignore is the backstop for a call killed before it reaches here; this is the fix.
         with suppress(SandboxError):
             await run_command(
-                handle, ["rm", "-f", bundle_name], timeout_s=_SNAPSHOT_EXEC_TIMEOUT_SECONDS
+                handle, ["rm", "-f", bundle_name], timeout_s=SNAPSHOT_EXEC_TIMEOUT_SECONDS
             )
 
 

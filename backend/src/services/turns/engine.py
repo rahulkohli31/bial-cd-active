@@ -124,6 +124,7 @@ from src.services.build_sessions.manager import (
 from src.services.build_sessions.outcome import STOPPED_BY_USER
 from src.services.messages.projection import (
     PLAN_OPTIONS_TOOL,
+    PLATFORM_TEXT_KIND,
     PROPOSE_SLICE_TOOL,
     TELL_THE_USER_TOOL,
     TURN_TERMINAL_KIND,
@@ -213,20 +214,6 @@ ENDED_TURN_TTL_S = 300.0
 _STEPS_CAP = 256
 
 TurnStatus = Literal["running", "completed", "failed", "stopped"]
-
-PLATFORM_TEXT_KIND: Final = "platform_text"
-"""The row meta that says a sentence in the transcript is the PLATFORM's, not the model's.
-
-WHAT IT BUYS TODAY is the record: the row is a `SYSTEM_EVENT` carrying the platform's own
-words, so nothing downstream — a reader, an operator, an audit — has to infer authorship from
-a sentence that looks exactly like a reply. It renders to the citizen exactly as it did
-before, through the projection's arm for a visible system row with text, which exists so a
-lifecycle entry degrades to prose rather than vanishing.
-
-WHAT IT IS FOR NEXT is plan 009, which is building the durable, typed home for platform
-speech on the turn-terminal row. This is the marker that row adopts. Naming it here rather
-than inventing a second rendering now is deliberate: two homes would show the citizen the
-same sentence twice."""
 
 # What a turn failure tells the subscriber. Internal detail stays in the server log.
 _TURN_FAILED_MESSAGE = "The assistant hit a problem and this turn was stopped."
@@ -605,6 +592,13 @@ class _TurnState:
     # of both meant it reached nobody. Cleared by the first real step, which is what "replaced by
     # the first real step" has to mean on a transport where the ring frame is unreachable.
     acknowledgement: StepItem | None = None
+    # The "Writing up the plan…" status's call id, tracked for exactly the reason the ack above
+    # is: it is a PLATFORM-owned status with no durable counterpart, so the only thing that can
+    # ever take it off a watching tab is this engine deciding to. The offer arm withdraws it when
+    # the plan lands; a Plan turn that fails or is stopped in the window between the block opening
+    # and the argument completing never reaches that arm, and without this the terminal has no way
+    # to name the step it must withdraw. `None` on every turn that never opened one.
+    plan_status_tool_call_id: str | None = None
     #: Is the model REASONING right now — the only thing reasoning is allowed to become.
     #:
     #: A boolean, never the text. The blocks are stored so the next turn can replay them and
@@ -1187,26 +1181,6 @@ class TurnEngine:
                     batches: list[
                         tuple[list[ModelMessage], dict[str, Any] | None, MessageEntryKind]
                     ] = [(persistable, self._pending_meta(deferred), MessageEntryKind.TURN)]
-                    if platform_text is not None:
-                        # ITS OWN ROW, AND NOT IN THE MODEL'S NAME. This sentence is the
-                        # platform's — it explains a refusal the platform made — and it used to
-                        # be appended to the run's own messages as a `ModelResponse`, which
-                        # stored it as something the model had written. It renders to the
-                        # citizen exactly as it did: a visible system row carrying text already
-                        # projects as assistant prose, which is the arm that exists so a
-                        # lifecycle entry degrades to prose rather than vanishing.
-                        #
-                        # NO SECOND LIVE HOME. Plan 009 is building the durable, typed home for
-                        # platform speech on the turn-terminal row; when it lands this is the
-                        # row it adopts. Routing the sentence to a live-only banner in the
-                        # meantime would give the citizen the same words twice.
-                        batches.append(
-                            (
-                                [ModelResponse(parts=[TextPart(content=platform_text)])],
-                                {"kind": PLATFORM_TEXT_KIND, "turnId": str(state.turn_id)},
-                                MessageEntryKind.SYSTEM_EVENT,
-                            )
-                        )
 
                     # NO SECOND MODEL REQUEST IS ISSUED HERE, and none is issued anywhere as a
                     # consequence of what the model wrote. The forced retry that used to sit at
@@ -1232,6 +1206,41 @@ class TurnEngine:
                                     kind=state.kind,
                                     meta=meta,
                                 )
+                        if platform_text is not None:
+                            # ITS OWN ROW, IN NOBODY'S NAME BUT THE PLATFORM'S. This sentence
+                            # explains a refusal the platform made. It used to be appended to
+                            # the run's own messages as a `ModelResponse`, which stored it as
+                            # something the model had written — and `load_history` flattens
+                            # every row's payload, so the next turn handed the model its own
+                            # explanation back as a paragraph it had authored and could build
+                            # on or repeat.
+                            #
+                            # AN EMPTY PAYLOAD, WITH THE WORDS IN `meta`, which is the pattern
+                            # the turn-terminal row already uses and the one `load_history`'s
+                            # docstring names: hiddenness is a render predicate and was never a
+                            # statement about what the model may see, so a row that must not
+                            # reach the model carries no messages at all. The projection reads
+                            # the sentence straight out of `meta` and renders it exactly as it
+                            # did before — the citizen's transcript is unchanged; only the
+                            # model's copy is gone.
+                            #
+                            # NO SECOND LIVE HOME. Plan 009 is building the durable, typed home
+                            # for platform speech on the turn-terminal row; when it lands this
+                            # is the row it adopts. Routing the sentence to a live-only banner
+                            # in the meantime would give the citizen the same words twice.
+                            await append_batch(
+                                db,
+                                user_id=state.user_id,
+                                conversation_id=state.conversation_id,
+                                messages=[],
+                                entry_kind=MessageEntryKind.SYSTEM_EVENT,
+                                kind=state.kind,
+                                meta={
+                                    "kind": PLATFORM_TEXT_KIND,
+                                    "turnId": str(state.turn_id),
+                                    "text": platform_text,
+                                },
+                            )
                         await db.commit()
                     except Exception as exc:
                         raise _PersistFailedError from exc
@@ -2759,7 +2768,12 @@ class TurnEngine:
         IT HAS NO DURABLE COUNTERPART, and that is deliberate rather than an omission: a status
         that exists only while a turn is streaming has nothing to say on a reloaded transcript,
         which shows the plan and the offer and never the moment before them. Same reasoning as
-        the turn's opening acknowledgement, which is also never persisted."""
+        the turn's opening acknowledgement, which is also never persisted.
+
+        REMEMBERED ON THE STATE, so the terminal can withdraw it. Nothing else in `state.steps`
+        is the platform's to retract — every other entry is a real tool step whose row is
+        authoritative — so `_finish` cannot find this one by looking, and a Plan turn that fails
+        or is stopped mid-argument would otherwise leave it spinning under a turn that is over."""
         item = StepItem(
             seq=0,  # transient: no row, so no row seq
             tool=PLAN_OPTIONS_TOOL,
@@ -2767,6 +2781,7 @@ class TurnEngine:
             state="pending",
             hidden=False,
         )
+        state.plan_status_tool_call_id = tool_call_id
         self._open_step(state, tool_call_id, item)
 
     def _emit_plan_options(self, state: _TurnState, tool_call_id: str) -> None:
@@ -2857,7 +2872,7 @@ class TurnEngine:
                     # result), so there is no 'finished' counterpart to wait for. It REPLACES
                     # the status on the same tool_call_id rather than stacking beside it.
                     self._emit_plan_options(state, event.part.tool_call_id)
-                state.drop_step(event.part.tool_call_id)
+                self._retract_step(state, event.part.tool_call_id)
                 return
             if event.part.tool_name == TELL_THE_USER_TOOL:
                 # THE WORDS, AND NOT A STEP. Rendered here at the CALL event rather than at
@@ -3049,15 +3064,53 @@ class TurnEngine:
             ),
         )
 
+    def _retract_step(self, state: _TurnState, tool_call_id: str) -> None:
+        """Withdraw a step from the snapshot AND from the feed a tab is already watching.
+
+        `drop_step` alone is only half of a withdrawal, and it is the half a LATE subscriber
+        sees: the catch-up snapshot is built from `state.steps`, so removing the entry is
+        enough for a client that had not subscribed yet. A client that was already connected
+        received the started frame and has no way to learn the step is over — it sits in that
+        turn's activity group as a step that never resolves, which is a group that never
+        seals. That is the acknowledgement's defect exactly, and this is the same answer:
+        re-emit the same id `finished` and hidden, which replaces the row in place and takes
+        it off the screen on a path both emitters already filter.
+
+        NOT USED BY THE EVICTION at the steps cap: an evicted step is a REAL step that ran and
+        whose row is authoritative — trimming the snapshot to bound memory must not tell a
+        watching tab that the work never happened.
+
+        IDEMPOTENT, and the plan status's own bookkeeping is cleared here so it stays that way:
+        the offer arm withdraws the status when the plan lands, and the terminal must then find
+        nothing left to withdraw rather than emit a second hidden frame for the same id."""
+        item = state.steps.get(tool_call_id)
+        state.drop_step(tool_call_id)
+        if state.plan_status_tool_call_id == tool_call_id:
+            state.plan_status_tool_call_id = None
+        if item is None:
+            return
+        self._emit(
+            state,
+            lambda seq: StepFrame(
+                seq=seq,
+                tool_call_id=tool_call_id,
+                phase="finished",
+                item=item.model_copy(update={"hidden": True}),
+            ),
+        )
+
     def _set_working(self, state: _TurnState, working: bool) -> None:
         """Turn the working status on or off, and frame the CHANGE only.
 
         THE FLAG RIDES THE TURN, NOT A MESSAGE, and that is the seam an earlier draft of this
         got wrong. The browser's status renderer is reached only when a message actually
         carries a part of the reasoning kind, so a boolean alone renders nothing — what the
-        chat surface does with this is synthesise a CONTENT-FREE reasoning part at the head of
-        the streaming message while it is true. Content-free is the point: the part carries no
-        text, so "status only, never the reasoning" is structural rather than a promise.
+        chat surface does with this is synthesise a CONTENT-FREE reasoning part at the TAIL of
+        the streaming message while it is true — the model is thinking at the end of what it has
+        written so far, and pinning the part to the head put "Working on your app" above
+        paragraphs the citizen had already read, which made the whole turn appear to jump down
+        the screen. Content-free is the point: the part carries no text, so "status only, never
+        the reasoning" is structural rather than a promise.
 
         EDGE-TRIGGERED. Reasoning arrives as a stream of deltas, and a frame per delta would
         put thousands of identical frames through a ring sized for a turn's whole narrative."""
@@ -3210,6 +3263,15 @@ class TurnEngine:
         # with "Getting started on that…" still spinning under a turn that is over. Idempotent,
         # so the ordinary turn that already retired it emits nothing here.
         self._retire_acknowledgement(state)
+        # NOR BY THE PLAN'S OWN STATUS, for the same reason. "Writing up the plan…" opens the
+        # moment the tool's block does and is withdrawn when the argument lands, but a turn that
+        # fails or is stopped in the thousands of tokens between those two moments never reaches
+        # the offer arm — so a watching tab kept a spinning row under a turn that had ended, and
+        # only a reload cleared it. Nothing else in `state.steps` is retracted here: every other
+        # entry is a real tool step whose row is authoritative, and telling a tab that work it
+        # watched happen never happened is the opposite defect.
+        if state.plan_status_tool_call_id is not None:
+            self._retract_step(state, state.plan_status_tool_call_id)
         # THE STATUS CANNOT OUTLIVE THE TURN. A turn that ended while the last thing it did was
         # think — a failure mid-reasoning, a stop — would otherwise leave "Working on your app"
         # under a turn that is over.

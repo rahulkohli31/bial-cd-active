@@ -41,31 +41,45 @@ interface DrawOptions {
   onSubmit?: (submission: ComposerSubmission) => Promise<void>
   unavailableReason?: string | null
   onUrgent?: (message: string) => void
+  /** What the box reports it KEPT once an accepted send has been reconciled. */
+  onAccepted?: (conversationId: string, keptText: string) => void
+  locked?: boolean
 }
 
-function draw({ onSubmit, unavailableReason = null, onUrgent = vi.fn() }: DrawOptions = {}) {
+function draw({ onSubmit, unavailableReason = null, onUrgent = vi.fn(), onAccepted, locked = false }: DrawOptions = {}) {
   const submit = onSubmit ?? vi.fn().mockResolvedValue(undefined)
-  const view = render(
+  const mount = (conversationId: string) => (
     <ComposerHarness>
       <ComposerBox
-        conversationId="chat-1"
+        conversationId={conversationId}
         placeholder="Describe the change you need…"
         onSubmit={submit}
         unavailableReason={unavailableReason}
+        locked={locked}
         onUrgent={onUrgent}
+        {...(onAccepted ? { onAccepted } : {})}
       />
-    </ComposerHarness>,
+    </ComposerHarness>
   )
-  return { ...view, submit, onUrgent }
+  const view = render(mount('chat-1'))
+  /** Step to a sibling chat. A PROP CHANGE, not a remount — flat routing keeps one box for every
+   *  conversation, which is the whole reason a send can outlive the chat it was pressed in. */
+  const switchTo = (conversationId: string) => view.rerender(mount(conversationId))
+  return { ...view, switchTo, submit, onUrgent }
 }
 
 const box = () => screen.getByTestId('composer-input') as HTMLTextAreaElement
 const send = () => screen.getByTestId('composer-send')
 const type = (value: string) => fireEvent.change(box(), { target: { value } })
-const drop = (file: File) =>
+const drop = (file: File) => dropAll(file)
+/** ONE gesture carrying several files — a multi-select in the OS picker, or a handful dragged in
+ *  together. The library adds every one of them concurrently, which is the shape that matters. */
+const dropAll = (...files: File[]) =>
   fireEvent.drop(screen.getByTestId('composer-dropzone'), {
-    dataTransfer: { types: ['Files'], files: [file] },
+    dataTransfer: { types: ['Files'], files },
   })
+/** The staged chips, counted by the one control each chip owns. */
+const chips = () => screen.queryAllByLabelText(/^Remove /)
 
 describe('the board\'s shape: one box, both controls inside it', () => {
   it('puts the attachment control and the send control INSIDE the box, not beside it', () => {
@@ -127,6 +141,37 @@ describe('★ the pale send circle means LOCKED, not "you have not typed yet"', 
     expect(send().getAttribute('aria-disabled')).toBe('true')
     fireEvent.click(send())
     expect(onSubmit).not.toHaveBeenCalled()
+  })
+})
+
+describe('★ the board\'s locked box, while an offer waits for an answer', () => {
+  // `PlanReady` and `PlanRevised` draw the whole box locked, not just its send circle: the input
+  // row on `#F8FAFC`, the paperclip at 40%, and the sentence sitting INSIDE the box where the
+  // placeholder was. Only the send circle carried it, so a citizen read a composer that still
+  // looked writable while a tool call waited on an answer — the exact confusion the board's own
+  // annotation exists to remove.
+
+  it('puts the reason where the placeholder was, on the board\'s ground, with the paperclip dimmed', () => {
+    const { container } = draw({ unavailableReason: 'Choose one of the two above to carry on…', locked: true })
+
+    expect(box().getAttribute('placeholder')).toBe('Choose one of the two above to carry on…')
+    expect(screen.getByTestId('composer').className).toMatch(/bg-canvas-offerlock/)
+    expect(screen.getByTestId('composer-attach').className).toMatch(/opacity-40/)
+    // AND STILL NOTHING IS `disabled`. The box is locked to the eye and to Send; the paperclip is
+    // dimmed and still pressable, because staging a file is composing rather than answering.
+    expect(container.querySelectorAll('[disabled]')).toHaveLength(0)
+    fireEvent.change(box(), { target: { value: 'typed anyway' } })
+    expect(box().value).toBe('typed anyway')
+  })
+
+  it('leaves a merely-WAITING box white, with its own hint — which is what every other board draws', () => {
+    // The lock is the answer to a question, not the look of a busy composer. Keying it off
+    // `unavailableReason` instead would put it on every running turn, on fourteen boards that
+    // draw the box white throughout.
+    draw({ unavailableReason: 'Replying — keep typing if you like; send unlocks when it is done.' })
+    expect(box().getAttribute('placeholder')).toBe('Describe the change you need…')
+    expect(screen.getByTestId('composer').className).toMatch(/bg-white/)
+    expect(screen.getByTestId('composer-attach').className).not.toMatch(/opacity-40/)
   })
 })
 
@@ -213,6 +258,82 @@ describe('★ the box clears ONLY once the server has accepted', () => {
     await waitFor(() => expect(box().value).toBe(' and a second thought'))
     // The sent text was the snapshot, not what the box held when the promise settled.
     expect(onSubmit.mock.calls[0]?.[0]?.text).toBe('first message')
+  })
+
+  it('★ leaves a REWRITTEN box alone — an edit it cannot reconcile is not a licence to cut', async () => {
+    // THE THIRD OUTCOME OF THE RECONCILIATION, and the one nothing drove. An exact match clears
+    // the box and an appended tail is kept (both above); anything else — the citizen selected all
+    // and started again while the request was out — is an edit that cannot be reconciled, and the
+    // code deliberately does nothing. Mutation receipt: weaken the `startsWith` guard to an
+    // unconditional slice and this goes red with the first twenty characters chopped off a
+    // sentence the citizen can still see.
+    let release = () => {}
+    const gate = new Promise<void>((r) => { release = r })
+    const onSubmit = vi.fn().mockReturnValue(gate)
+    // The box's own report of what it kept is the settled signal — waiting on the text would be
+    // waiting for a value the box already holds, which is no wait at all.
+    const onAccepted = vi.fn()
+    draw({ onSubmit, onAccepted })
+
+    type('make the header blue')
+    fireEvent.click(send())
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+
+    type('actually make it red')
+    release()
+
+    await waitFor(() => expect(onAccepted).toHaveBeenCalledTimes(1))
+    expect(onAccepted).toHaveBeenCalledWith('chat-1', 'actually make it red')
+    expect(box().value).toBe('actually make it red')
+    // …and what went to the server was the snapshot, which is the other half of the rule.
+    expect(onSubmit.mock.calls[0]?.[0]?.text).toBe('make the header blue')
+  })
+
+  it('★ leaves a SIBLING chat alone when the send it outlived finally lands', async () => {
+    // THE RECONCILIATION IS ABOUT ONE CHAT, AND THIS BOX SERVES ALL OF THEM. Flat routing swaps
+    // the conversation rather than remounting the composer, so an accepted send can land while
+    // the citizen is writing next door — and every rule the two tests above establish would then
+    // be applied to the sibling's box.
+    //
+    // THE TAIL RULE IS THE ONE THAT BITES, and it bites hardest on the shortest messages: send
+    // "hi" here, step next door, type "hi there", and the slice reads the sibling's line as an
+    // append to a message that chat never saw, leaving them looking at " there".
+    //
+    // Mutation receipt: drop the `liveConversation` guard in `doSend` and this goes red three
+    // times over — the box reads " there", the sibling's file is decoded a second time to put it
+    // back after a clear it never asked for, and the chat that sent is told it kept " there".
+    const decodes = vi.spyOn(FileReader.prototype, 'readAsDataURL')
+    let release = () => {}
+    const gate = new Promise<void>((r) => { release = r })
+    const onSubmit = vi.fn().mockReturnValue(gate)
+    const onAccepted = vi.fn()
+    const { switchTo, onUrgent } = draw({ onSubmit, onAccepted })
+
+    type('hi')
+    fireEvent.click(send())
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+
+    switchTo('chat-2')
+    type('hi there')
+    drop(new File(['id,name'], 'sibling.csv', { type: 'text/csv' }))
+    await waitFor(() => expect(screen.getByTestId('composer-chips').textContent).toContain('sibling.csv'))
+    expect(decodes).toHaveBeenCalledTimes(1)
+
+    release()
+    // THE WHOLE SEND HAS TO SETTLE, tidying and all, before any of this can be read: Send comes
+    // back only in the `finally`, which is after everything the guard is there to skip.
+    await waitFor(() => expect(send().getAttribute('aria-disabled')).toBe('false'))
+
+    expect(box().value).toBe('hi there')
+    expect(screen.getByTestId('composer-chips').textContent).toContain('sibling.csv')
+    // ONE decode, so the chip is the file the citizen staged rather than a copy put back after a
+    // clear — the attachment half of the same guard.
+    expect(decodes).toHaveBeenCalledTimes(1)
+    // The chat that DID send is told its box kept nothing, because nothing on screen is its.
+    expect(onAccepted).toHaveBeenCalledWith('chat-1', '')
+    // …and the send SUCCEEDED, so nothing says otherwise.
+    expect(onUrgent).not.toHaveBeenCalled()
+    decodes.mockRestore()
   })
 
   it('★ keeps a file ATTACHED while the send was in flight — the other half of the same rule', async () => {
@@ -359,6 +480,85 @@ describe('★ the attachment pipeline stays ours', () => {
     drop(new File(['x'], 'slides.pptx', { type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' }))
     await waitFor(() => expect(onUrgent).toHaveBeenCalledTimes(1))
     expect(onUrgent.mock.calls[0]?.[0]).toMatch(/isn't supported|is not supported/i)
+  })
+
+  it('★ holds the cap when EIGHT files arrive in ONE gesture, which is how the library adds them', async () => {
+    // THE REGRESSION THIS IS WRITTEN AGAINST. The dropzone, the OS picker and the paste handler
+    // all fan out with `Promise.all(files.map(…))`, so every file in one drop starts its `add`
+    // before any of them finishes. Validating against `staged()` alone therefore validated all
+    // eight against an empty list, and all eight were staged with nothing said — 5 is the cap.
+    // Mutation receipt: drop the adapter's claim list and this goes red at eight chips.
+    const onUrgent = vi.fn()
+    draw({ onUrgent })
+
+    dropAll(...Array.from({ length: 8 }, (_, i) => new File(['x'], `f${i}.png`, { type: 'image/png' })))
+
+    // WAIT FOR THE WHOLE GESTURE TO SETTLE, not for a count to pass through 5 on its way to 8:
+    // every one of the eight files ends as either a chip or a refusal, so their sum is the one
+    // condition that is true exactly once and only at the end.
+    await waitFor(() => expect(chips().length + onUrgent.mock.calls.length).toBe(8))
+    expect(chips()).toHaveLength(5)
+    expect(onUrgent.mock.calls.at(-1)?.[0]).toMatch(/at most 5 files/i)
+  })
+
+  it('★ holds the 512 KB text budget inside one gesture too — the other cap the same gap opened', async () => {
+    // Inline text rides in every turn of the conversation, so the budget is cumulative. Three
+    // 250 KB spreadsheets dropped together are 750 KB; two fit and the third is refused, and
+    // saying so is the difference between a bounded prompt and a silently doubled one.
+    const onUrgent = vi.fn()
+    draw({ onUrgent })
+    const sheet = (name: string) => new File([new Uint8Array(250 * 1024)], name, { type: 'text/csv' })
+
+    dropAll(sheet('jan.csv'), sheet('feb.csv'), sheet('mar.csv'))
+
+    await waitFor(() => expect(chips().length + onUrgent.mock.calls.length).toBe(3))
+    expect(chips()).toHaveLength(2)
+    expect(onUrgent.mock.calls.at(-1)?.[0]).toMatch(/512 KB total limit/i)
+  })
+
+  it('★ holds the cap across two gestures a MICROTASK apart, not only inside one', async () => {
+    // THE HOLE THE FIRST FIX LEFT. The claim list was dropped at the end of the tick that made it,
+    // on the reasoning that a later gesture is a later task by which time everything that landed
+    // has been published. Nothing is published until `fileToBase64` resolves, and `FileReader`
+    // resolves on a TASK — so a second gesture one microtask later saw an empty staged list AND an
+    // empty claim list, and a sixth file went in past a cap of five with nothing said.
+    //
+    // A FAST REPEATED PASTE OF A LARGE IMAGE IS EXACTLY THIS. The bigger the file, the longer the
+    // read, and the wider the window — so the failure got MORE likely as the cap mattered more.
+    const onUrgent = vi.fn()
+    draw({ onUrgent })
+
+    dropAll(...Array.from({ length: 5 }, (_, i) => new File(['x'], `first-${i}.png`, { type: 'image/png' })))
+    // ONE MICROTASK, which is the whole point: the five reads are still out (jsdom's FileReader
+    // resolves on a task, exactly as a browser's does), so nothing has been staged yet either.
+    await Promise.resolve()
+    expect(chips()).toHaveLength(0)
+    drop(new File(['x'], 'sixth.png', { type: 'image/png' }))
+
+    await waitFor(() => expect(chips().length + onUrgent.mock.calls.length).toBe(6))
+    expect(chips()).toHaveLength(5)
+    expect(onUrgent.mock.calls.at(-1)?.[0]).toMatch(/at most 5 files/i)
+    expect(screen.getByTestId('composer-chips').textContent).not.toContain('sixth.png')
+  })
+
+  it('★ and gives the slot back when the read that claimed it never lands', async () => {
+    // THE OTHER HALF OF THE SAME RULE, and the failure a longer-lived claim invites: a claim that
+    // outlived its file would sit in the cap for ever, and a citizen who cleared the composer
+    // would find they could attach nothing. Five files are staged and then cleared by a send;
+    // five more must be attachable afterwards.
+    const onUrgent = vi.fn()
+    const submit = vi.fn().mockResolvedValue(undefined)
+    draw({ onUrgent, onSubmit: submit })
+    dropAll(...Array.from({ length: 5 }, (_, i) => new File(['x'], `a${i}.png`, { type: 'image/png' })))
+    await waitFor(() => expect(chips()).toHaveLength(5))
+
+    type('send them')
+    fireEvent.click(send())
+    await waitFor(() => expect(chips()).toHaveLength(0))
+
+    dropAll(...Array.from({ length: 5 }, (_, i) => new File(['x'], `b${i}.png`, { type: 'image/png' })))
+    await waitFor(() => expect(chips()).toHaveLength(5))
+    expect(onUrgent).not.toHaveBeenCalled()
   })
 
   it('★ counts against the per-message cap across a batch, not one file at a time', async () => {

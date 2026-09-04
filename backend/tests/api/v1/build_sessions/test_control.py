@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import uuid
 
+from fastapi import FastAPI
 from httpx import AsyncClient
 from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.deps import run_build_dependency
 from src.services.build_sessions.locks import lock_is_held
+from src.services.build_sessions.manager import StopOutcome
 from src.services.redis import BUILD_COORDINATION_UNAVAILABLE_MSG
 from src.services.storage import StorageError
 from tests.api.v1.build_sessions.conftest import (
@@ -446,10 +450,48 @@ async def test_stop_active_build_settles_a_live_build_so_release_can_proceed(
     await drain(wire.manager, sid)
 
 
+def test_the_published_api_names_the_stop_states_the_wire_actually_sends(app: FastAPI) -> None:
+    """★ WHAT AN INTEGRATOR READS AT `/docs` MUST BE WHAT THEY CAN BRANCH ON.
+
+    FastAPI publishes a route's docstring as its OpenAPI description, so prose here is API
+    surface. `CamelModel` camelizes FIELD names and nothing else — `StopOutcome` is a plain
+    string enum whose values go out verbatim — so a docstring saying `nothingWasRunning` tells a
+    reader to branch on a value the wire never sends. A client written from it falls through its
+    own guard and, on the shape the portal uses, reads every answer as "still running": a
+    hand-over that can never complete.
+
+    SPELLING-BLIND rather than a list of the three known wrong spellings: any backticked token
+    that is one of the state names with its separators or casing changed is a token no client can
+    match, whichever way someone rewrites it later. The Python MEMBER names (`STILL_RUNNING`) are
+    allowed beside the values, because prose that names the enum member is talking about the
+    symbol and a reader can tell the two apart — `stillRunning` is neither.
+
+    Mutation check: put `nothingWasRunning` back in any of the stop docstrings and this goes
+    red."""
+    published = json.dumps(app.openapi())
+    spellings = {outcome.value for outcome in StopOutcome} | {
+        outcome.name for outcome in StopOutcome
+    }
+    flattened = {outcome.value.replace("_", ""): outcome.value for outcome in StopOutcome}
+    named = {
+        token
+        for token in re.findall(r"`([A-Za-z_]+)`", published)
+        if token.lower().replace("_", "") in flattened
+    }
+    # LIVENESS: the states ARE documented. An empty set satisfies the loop below trivially, and
+    # would also be what a schema that failed to render its descriptions produces.
+    assert named, "no stop state is named anywhere in the published schema"
+    for token in sorted(named):
+        assert token in spellings, (
+            f"the published API tells a client to branch on `{token}`; the wire sends "
+            f"`{flattened[token.lower().replace('_', '')]}`"
+        )
+
+
 async def test_stopping_a_settled_project_says_nothing_was_running_not_an_error(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
 ) -> None:
-    """`nothingWasRunning` is the answer, not a 409. The caller wants "settled" and it already is
+    """`nothing_was_running` is the answer, not a 409. The caller wants "settled" and it already is
     — and the common path is exactly this, because the build usually finishes while the user
     is still reading the dialog.
 

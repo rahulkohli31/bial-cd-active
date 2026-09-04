@@ -23,22 +23,32 @@ import {
 } from '../publishPresentation'
 import type { ApprovalState, DeploymentView, PublishState } from '../deployApi'
 
-/** Every value the union can hold. Adding one to `PublishState` and not here is a type error. */
-const EVERY_STATE: readonly PublishState[] = [
-  'nothing_built',
-  'draft',
-  'in_review',
-  'changes_requested',
-  'approved_ready_to_publish',
-  'approved_needs_review_again',
-  'starting_up',
-  'live_current',
-  'live_newer_work',
-  'live_drift_unknown',
-  'taken_offline',
-  'switched_off',
-  'did_not_start',
-]
+/**
+ * Every value the union can hold — as a RECORD KEYED BY THE UNION, which is what makes the claim
+ * true. It was an array annotated `readonly PublishState[]`, and TypeScript satisfies that with
+ * ANY subset: a state added to `PublishState` and not written here compiled cleanly and simply
+ * dropped out of the totality loop, the drift loop and the empty-rows loop below, with every test
+ * still green. A record literal missing a key is an error on the literal itself.
+ *
+ * `Object.keys` is the one place the key type is lost, and the assertion below restates exactly
+ * what this record's own annotation already guarantees.
+ */
+const ALL_STATES: Record<PublishState, null> = {
+  nothing_built: null,
+  draft: null,
+  in_review: null,
+  changes_requested: null,
+  approved_ready_to_publish: null,
+  approved_needs_review_again: null,
+  starting_up: null,
+  live_current: null,
+  live_newer_work: null,
+  live_drift_unknown: null,
+  taken_offline: null,
+  switched_off: null,
+  did_not_start: null,
+}
+const EVERY_STATE = Object.keys(ALL_STATES) as readonly PublishState[]
 
 const view = (over: Partial<DeploymentView> = {}): DeploymentView =>
   ({ publishState: 'draft', savedHead: null, savedAt: null, ...over }) as DeploymentView
@@ -76,6 +86,40 @@ describe('the decision is total over every state the server can send', () => {
       provenanceRows(state, view(), approval()).some((row) => row.tone === 'drift'),
     )
     expect(drifted).toEqual(['live_newer_work'])
+  })
+
+  it('★ claims no approval for a live app that no administrator ever approved', () => {
+    // Ladder rule 7 publishes unattended, and `approved_commit_sha` is NULL for every one of
+    // those — the common case, not the exotic one. The row was printed regardless, so the panel
+    // headed it APPROVED and filled it with "We could not tell", which reads as an approval that
+    // happened and was then lost. An approval that never happened gets no row.
+    for (const state of ['live_current', 'live_newer_work', 'live_drift_unknown'] as const) {
+      const keys = provenanceRows(state, view({ publishState: state }), approval()).map((row) => row.key)
+      expect(keys, state).toEqual(['published', 'saved'])
+    }
+
+    // Liveness, and the other half of the rule: a version an administrator DID approve still
+    // says so, and either half of the stamp is enough to know that it happened.
+    const withBoth = approval({ approvedAt: '2026-08-19T00:00:00Z', approvedCommitSha: 'abc' })
+    expect(provenanceRows('live_current', view(), withBoth).map((row) => row.key)).toEqual([
+      'published',
+      'approved',
+      'saved',
+    ])
+    const dateOnly = approval({ approvedAt: '2026-08-19T00:00:00Z', approvedCommitSha: null })
+    expect(provenanceRows('live_current', view(), dateOnly).map((row) => row.key)).toContain('approved')
+  })
+
+  it('★ still says "we could not tell" where the state itself asserts an approval', () => {
+    // The counterweight to the rule above. `approved_ready_to_publish` MEANS an administrator
+    // approved this version, so a missing stamp there is a genuine gap in the record and the row
+    // has to stay and say so — dropping it would hide the one case the "cannot tell" rendering
+    // exists for.
+    for (const state of ['approved_ready_to_publish', 'approved_needs_review_again'] as const) {
+      const row = provenanceRows(state, view(), approval()).find((r) => r.key === 'approved')
+      expect(row, state).toBeTruthy()
+      expect(row?.stamp ?? null, state).toBeNull()
+    }
   })
 
   it('★ shows no version row for a state that has no version to date', () => {

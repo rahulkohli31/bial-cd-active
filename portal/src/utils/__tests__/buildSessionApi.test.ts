@@ -11,6 +11,8 @@ import {
   releaseProject,
   fetchPreviewState,
   handOverWorkspace,
+  STOP_CEILING_MS,
+  STOP_POLL_MS,
 } from '../buildSessionApi'
 import { ApiError } from '../apiError'
 
@@ -576,6 +578,142 @@ describe('handOverWorkspace — the stop → save → release ordering (#83)', (
     const steps: string[] = []
     await handOverWorkspace('p-1', true, { fetchImpl }, (step) => steps.push(step))
     expect(steps).toEqual(['stopping', 'saving', 'releasing'])
+  })
+
+  /**
+   * THE POLL'S OWN FAILURE MODES (review #38, review #74).
+   *
+   * `awaitStopSettled` retries a read that failed and abandons one that hangs, and both are
+   * documented as load-bearing for the dialog not hanging forever — but every fetch above
+   * resolves, so deleting either left the suite green. What it must NOT retry is an answer a
+   * repeat cannot change: a hundred 401s in two minutes is a hundred token refreshes ending in a
+   * sentence about the other project's turn that has nothing to do with what failed.
+   */
+  /** Answers the three routes, with the stop-state read scripted per attempt. */
+  function pollingFetch(read: (attempt: number, opts?: RequestInit) => Promise<Response>) {
+    const seen: string[] = []
+    let attempt = 0
+    const fetchImpl = vi.fn<FetchImpl>(async (url: string, opts?: RequestInit) => {
+      const path = new URL(url, 'http://x').pathname
+      seen.push(path)
+      if (path.endsWith('/stop-active-build')) return res(200, { state: 'still_running' })
+      if (path.endsWith('/stop-state')) {
+        attempt += 1
+        return read(attempt, opts)
+      }
+      return res(200, { released: true })
+    })
+    const reads = () => seen.filter((path) => path.endsWith('/stop-state')).length
+    return { seen, fetchImpl, reads }
+  }
+
+  it('★ a read that DROPPED is asked again — losing the network says nothing about their turn', async () => {
+    const { seen, fetchImpl, reads } = pollingFetch(async (attempt) => {
+      if (attempt === 1) throw new TypeError('Failed to fetch')
+      return res(200, { state: 'stopped' })
+    })
+
+    await handOverWorkspace('p-1', false, { fetchImpl }, undefined, fastClock())
+
+    expect(reads()).toBe(2)
+    // …and the hand-over went through on the read that landed.
+    expect(seen.some((path) => path.endsWith('/release'))).toBe(true)
+  })
+
+  it('★ a read that HANGS is abandoned on its own deadline, and the next one settles it', async () => {
+    // `authFetch` sets no timeout: a connection that opens and then stalls never settles, the
+    // loop never re-evaluates, and the two-minute ceiling silently becomes forever — under a
+    // modal holding Escape. The per-read AbortController is what bounds it, and only a read that
+    // actually hangs can prove the timer is still wired to it.
+    vi.useFakeTimers()
+    try {
+      const { fetchImpl, reads, seen } = pollingFetch(async (attempt, opts) => {
+        if (attempt > 1) return res(200, { state: 'stopped' })
+        return new Promise<Response>((_resolve, reject) => {
+          opts?.signal?.addEventListener('abort', () =>
+            reject(new DOMException('The operation was aborted.', 'AbortError')),
+          )
+        })
+      })
+
+      const settled = handOverWorkspace('p-1', false, { fetchImpl }, undefined, fastClock())
+      // Past the per-read deadline, which is a REAL timer rather than the injected clock's.
+      await vi.advanceTimersByTimeAsync(20_000)
+      await settled
+
+      expect(reads()).toBe(2)
+      expect(seen.some((path) => path.endsWith('/release'))).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('★ a session that expired mid-hand-over says so AT ONCE, rather than polling for two minutes', async () => {
+    // Every retry of a 401 re-attempts a token refresh, so the old behaviour was ~100 reads and
+    // ~100 refreshes across two minutes, ending in the ceiling's sentence about the other app
+    // still saving its work — a sentence about somebody else's app, for an expired session.
+    const { fetchImpl, reads, seen } = pollingFetch(async () =>
+      res(401, { error: { message: 'Not authenticated' } }),
+    )
+
+    const err = await handOverWorkspace('p-1', false, { fetchImpl }, undefined, fastClock()).catch(
+      (e: unknown) => e,
+    )
+
+    expect(err).toBeInstanceOf(ApiError)
+    expect((err as ApiError).status).toBe(401)
+    expect((err as ApiError).message).not.toMatch(/still saving its work/i)
+    expect(reads()).toBe(1)
+    // Nothing was taken from the other project on the way out.
+    expect(seen.some((path) => path.endsWith('/release'))).toBe(false)
+  })
+
+  it('a 5xx is still a blip, not a verdict — the stop is running behind it', async () => {
+    // The narrow list is 401/403/404. A server that fell over mid-stop may well answer the next
+    // read, and the stop it was asked for is still unwinding server-side.
+    const { fetchImpl, reads, seen } = pollingFetch(async (attempt) =>
+      attempt === 1 ? res(503, { error: { message: 'unavailable' } }) : res(200, { state: 'stopped' }),
+    )
+
+    await handOverWorkspace('p-1', false, { fetchImpl }, undefined, fastClock())
+
+    expect(reads()).toBe(2)
+    expect(seen.some((path) => path.endsWith('/release'))).toBe(true)
+  })
+
+  it('★ at the ceiling it says the other app is still saving, not that anything failed', async () => {
+    // THE OWNER'S DECISION ON REVIEW #45, pinned as copy. The server's stop budget is now a little
+    // over eight minutes — its derivation covers the snapshot a build's unwind writes — while the
+    // browser's wait deliberately stays at two, because nobody should be held in front of a modal
+    // for eight. That makes arriving here ORDINARY rather than alarming: the likeliest cause is a
+    // large app being packed away exactly as it should be, and the stop is still running behind
+    // the sentence. So the one line the citizen reads must not read as a failure in the other
+    // project, and it must point at the remedy, which is only to ask again.
+    const { fetchImpl, reads } = pollingFetch(async () => res(200, { state: 'still_running' }))
+
+    const err = await handOverWorkspace('p-1', false, { fetchImpl }, undefined, fastClock()).catch(
+      (e: unknown) => e,
+    )
+
+    expect((err as ApiError).message).toBe(
+      'The other app is still saving its work. Nothing has changed — give it a moment and try again.',
+    )
+    // NOT A WORD OF BLAME, and not one word a citizen could not act on.
+    expect((err as ApiError).message).not.toMatch(
+      /fail|could not|did not|timed out|container|sandbox|server|api/i,
+    )
+    // AND IT IS THE TWO-MINUTE WAIT THAT PRODUCED IT — two assertions, because those are two
+    // separate decisions and only one of them is this test's business to hold.
+    //
+    // HOW LONG A CITIZEN IS HELD is the owner's decision, and the one worth a fixed number:
+    // raising the ceiling to the server's eight-minute budget is exactly the change that must not
+    // pass, and it fails here by name rather than through an arithmetic nobody would read.
+    expect(STOP_CEILING_MS).toBe(2 * 60 * 1000)
+    // HOW OFTEN IT ASKS is a decision about traffic, and it must be free to move without this
+    // going red for a reason that has nothing to do with the citizen. So the count is derived
+    // rather than written out as 100: `Math.ceil`, because the loop checks the deadline BEFORE
+    // each read, so a poll that does not divide the ceiling evenly still gets its last one in.
+    expect(reads()).toBe(Math.ceil(STOP_CEILING_MS / STOP_POLL_MS))
   })
 
   it('carries a reclaim refusal out to the caller rather than swallowing it', async () => {

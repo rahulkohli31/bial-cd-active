@@ -33,7 +33,6 @@ vi.mock('../../utils/builderHistory', () => ({
   loadBuilds: h.loadBuilds, newBuild: h.newBuild, createBuild: h.createBuild,
   getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
-vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
 // SPREAD THE ORIGINAL — `handleBuildIt` mints the new build chat's id through the shared
 // `uuidv7` (ADR-0006), and a factory naming only `listProjectConversations` leaves every other
 // export (including that one) undefined; Vitest now warns the moment a real caller reaches for

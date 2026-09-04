@@ -45,7 +45,24 @@ export default function RailResizeHandle({ width, onResize, onCommit, controls }
   const latest = useRef(width)
   latest.current = width
 
+  /**
+   * THE GESTURE IN FLIGHT, AND WHETHER IT EVER MOVED — the difference between a drag and a click.
+   *
+   * A remembered width replaces BOTH opening widths (see `railWidth.ts`), so committing on every
+   * `pointerup` meant one stray click on the 9px divider inside a chat pinned every project screen
+   * at the chat's 520px, without the citizen ever having dragged anything. A gesture that produced
+   * no movement expressed no preference, and writing one is inventing an answer.
+   *
+   * It is also what makes the commit happen ONCE. Three events land in `end` — `pointerup`,
+   * `pointercancel`, `lostpointercapture` — and releasing capture inside `end` queues a
+   * `lostpointercapture` that re-enters it. Clearing the gesture first makes the echo a no-op,
+   * while a capture genuinely lost mid-drag still arrives with the gesture intact and still
+   * commits, which is the case the release below cannot cover.
+   */
+  const gesture = useRef<{ moved: boolean } | null>(null)
+
   const onPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    gesture.current = { moved: false }
     // POINTER CAPTURE, so a drag that leaves the 9px strip — which every drag does — keeps
     // receiving moves. Without it the boundary stops following the pointer the instant it crosses
     // into the pane, which reads as the handle being broken rather than bounded.
@@ -56,6 +73,7 @@ export default function RailResizeHandle({ width, onResize, onCommit, controls }
   const onPointerMove = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
       if (!event.currentTarget.hasPointerCapture(event.pointerId)) return
+      if (gesture.current) gesture.current.moved = true
       // THE POINTER'S OWN X IS THE WIDTH. The rail starts at the viewport's left edge, under a
       // navbar and a toolbar row that take no horizontal space from it — so there is nothing to
       // measure and nothing that can go stale. A `getBoundingClientRect` here would be a
@@ -67,9 +85,17 @@ export default function RailResizeHandle({ width, onResize, onCommit, controls }
 
   const end = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
+      const ended = gesture.current
+      // Already ended: the `lostpointercapture` this handler's own release queued, or an event
+      // arriving outside a gesture this handle started.
+      if (!ended) return
+      gesture.current = null
       if (event.currentTarget.hasPointerCapture(event.pointerId)) {
         event.currentTarget.releasePointerCapture(event.pointerId)
       }
+      // A PRESS THAT NEVER MOVED IS NOT A PREFERENCE. Nothing is written, and the rail keeps
+      // whatever width it opened at.
+      if (!ended.moved) return
       // LOSING CAPTURE MID-DRAG LANDS HERE TOO, which is why the commit reads the ref: whatever
       // the last move produced is a valid width, and the rail is left at it rather than snapped
       // back to where the drag started.

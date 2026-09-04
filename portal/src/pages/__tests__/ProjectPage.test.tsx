@@ -97,7 +97,6 @@ vi.mock('../../utils/buildSessionApi', async (importOriginal) => ({
   checkWorkspace: vi.fn(async () => { throw new Error('a container exec on the project screen') }),
   relaunchPreview: h.relaunchPreview,
 }))
-vi.mock('../../utils/chatHistory.js', () => ({ relativeTime: () => '1h ago' }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 // ProjectPage no longer mounts LivePreview (the passive View-app preview is hidden, U6).
 // A null stub keeps the `queryByTestId('live-preview')` inertness assertions meaningful.

@@ -40,10 +40,10 @@
  * quiet line beneath it naming what is happening right now. Nothing expands on its own.
  *
  * PRESSING IT IS A GLANCE, NOT A NEW RESTING STATE. Opening shows the rows; pressing again closes
- * them; and a group opened WHILE RUNNING returns to collapsed by itself when it seals, because the
- * turn it belonged to is over and the peek was about watching it. A group that was ALREADY sealed
- * when the reader opened it stays open until they close it — there is no later event to hang a
- * self-close on, and snapping shut under someone reading a finished receipt would be hostile
+ * them; and a group opened WHILE RUNNING returns to collapsed by itself WHEN THE TURN ENDS, because
+ * the turn it belonged to is over and the peek was about watching it. A group that was ALREADY
+ * sealed when the reader opened it stays open until they close it — there is no later event to hang
+ * a self-close on, and snapping shut under someone reading a finished receipt would be hostile
  * rather than tidy. Both halves are deliberate; the second is the honest limit of the first.
  *
  * R34's FAIL-OPEN IS THE ONE THING THAT OPENS ITSELF, and it fires only once the group is
@@ -220,6 +220,15 @@ export function stepIconFor(label: string): LucideIcon {
 const ActivityGroup: FC<PropsWithChildren<{ group: ThreadGroupPart }>> = ({ group, children }) => {
   const messageId = useAuiState((s) => s.message.id)
   const parts = useAuiState((s) => s.message.content)
+  /**
+   * IS THIS THE MESSAGE THE TURN IS STILL WRITING?
+   *
+   * The library's own message status, which is `running` only while the thread is running AND this
+   * is the last message — so it is a fact about the TURN, which is what the peek below needs and
+   * what nothing inside a group can supply. It is read here rather than plumbed as a prop because
+   * the surface already owns it: it hands `isRunning` to the runtime, and the runtime derives this.
+   */
+  const streaming = useAuiState((s) => s.message.status?.type === 'running')
   const interruptedIds = useContext(InterruptedMessagesContext)
   const interrupted = messageId ? interruptedIds.has(messageId) : false
 
@@ -252,10 +261,18 @@ const ActivityGroup: FC<PropsWithChildren<{ group: ThreadGroupPart }>> = ({ grou
   /**
    * A GLANCE INSIDE A RUNNING GROUP IS TEMPORARY (owner ruling, 2026-09-02).
    *
-   * Opening one while it runs is about watching it, so when it seals the peek is over and the
+   * Opening one while it runs is about watching it, so when the turn ends the peek is over and the
    * group returns to its resting state — collapsed. Cleared to `null` rather than to `false`, so
    * a group that also FAILED still opens itself: the reader has stopped deciding, which is exactly
    * what `null` means here.
+   *
+   * IT ARMS PER GROUP AND FIRES PER TURN, and the two halves are different facts on purpose.
+   * `facts.running` is "some step in HERE is pending", which is what makes the glance a glance at
+   * something live — so it is the right thing to arm on. It is the WRONG thing to fire on:
+   * between one tool call returning and the next one starting the model thinks again, seconds at
+   * a time with adaptive reasoning on, and every step emitted so far reads as settled. Firing on
+   * that gap snapped the group shut under a reader who had just pressed it open, over and over,
+   * for the whole build. `streaming` is the turn-level fact, and it stays true across the gap.
    *
    * ONLY FOR A GROUP THE READER OPENED WHILE IT WAS RUNNING. One that was already sealed when they
    * opened it has no later event to hang a self-close on, and snapping shut under someone reading
@@ -265,10 +282,10 @@ const ActivityGroup: FC<PropsWithChildren<{ group: ThreadGroupPart }>> = ({ grou
   const openedWhileRunning = useRef(false)
   if (facts.running && readerOpen === true) openedWhileRunning.current = true
   useEffect(() => {
-    if (facts.running || !openedWhileRunning.current) return
+    if (streaming || !openedWhileRunning.current) return
     openedWhileRunning.current = false
     setReaderOpen(null)
-  }, [facts.running])
+  }, [streaming])
 
   // Expanding must not throw the reader somewhere else. The library's own lock is what the
   // registry's component uses and it is exported, so it comes across without the port.

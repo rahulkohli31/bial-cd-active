@@ -30,6 +30,7 @@ import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-li
 
 import type { ApprovalState, DeploymentView, PublishState } from '../../utils/deployApi'
 import type { UsePublishState } from '../../hooks/usePublishState'
+import { lookFor, presentationFor } from '../../utils/publishPresentation'
 
 const h = vi.hoisted(() => ({
   usePublishState: vi.fn(),
@@ -122,24 +123,33 @@ const openChip = async (): Promise<HTMLElement> => {
   return screen.findByTestId('publish-popover')
 }
 
+/**
+ * A TABLE THAT HAS TO ANSWER FOR EVERY STATE. Written as a record keyed by the union and turned
+ * into rows here, so a value added to `PublishState` and not to the table is a type error on the
+ * literal — an array annotated `readonly PublishState[]` is satisfied by any subset, which would
+ * let a new state drop silently out of every walk below with the suite still green.
+ */
+const rowsFor = <T,>(table: Record<PublishState, T>): ReadonlyArray<readonly [PublishState, T]> =>
+  Object.entries(table) as ReadonlyArray<readonly [PublishState, T]>
+
 /** Every value the server can send, and the words this chip answers with. Written out
  *  rather than derived, so a label that changes has to change HERE too — a table that
  *  computed itself from the component would pin nothing. */
-const LABELS: ReadonlyArray<readonly [PublishState, string]> = [
-  ['nothing_built', 'Nothing built yet'],
-  ['draft', 'Draft'],
-  ['in_review', 'In review'],
-  ['changes_requested', 'Changes requested'],
-  ['approved_ready_to_publish', 'Approved'],
-  ['approved_needs_review_again', 'Approved'],
-  ['starting_up', 'Starting up'],
-  ['live_current', 'Live'],
-  ['live_newer_work', 'Live · newer work saved'],
-  ['live_drift_unknown', "Live · couldn't check"],
-  ['taken_offline', 'Taken offline'],
-  ['switched_off', 'Switched off'],
-  ['did_not_start', "Didn't start"],
-]
+const LABELS = rowsFor({
+  nothing_built: 'Nothing built yet',
+  draft: 'Draft',
+  in_review: 'In review',
+  changes_requested: 'Changes requested',
+  approved_ready_to_publish: 'Approved',
+  approved_needs_review_again: 'Approved',
+  starting_up: 'Starting up',
+  live_current: 'Live',
+  live_newer_work: 'Live · newer work saved',
+  live_drift_unknown: "Live · couldn't check",
+  taken_offline: 'Taken offline',
+  switched_off: 'Switched off',
+  did_not_start: "Didn't start",
+})
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -159,21 +169,21 @@ afterEach(cleanup)
  * assertion cannot tell amber from grey here, which is the same reason `tailwind-tokens.test.js`
  * exists at all. What can be checked is which token each state resolves to.
  */
-const EXPECTED_LOOK: ReadonlyArray<readonly [PublishState, string]> = [
-  ['nothing_built', 'faint'],
-  ['draft', 'grey'],
-  ['in_review', 'amber'],
-  ['changes_requested', 'red'],
-  ['did_not_start', 'red'],
-  ['approved_ready_to_publish', 'green'],
-  ['approved_needs_review_again', 'green'],
-  ['starting_up', 'green'],
-  ['live_current', 'green'],
-  ['live_newer_work', 'green'],
-  ['live_drift_unknown', 'green'],
-  ['taken_offline', 'off'],
-  ['switched_off', 'off'],
-]
+const EXPECTED_LOOK = rowsFor({
+  nothing_built: 'faint',
+  draft: 'grey',
+  in_review: 'amber',
+  changes_requested: 'red',
+  did_not_start: 'red',
+  approved_ready_to_publish: 'green',
+  approved_needs_review_again: 'green',
+  starting_up: 'green',
+  live_current: 'green',
+  live_newer_work: 'green',
+  live_drift_unknown: 'green',
+  taken_offline: 'off',
+  switched_off: 'off',
+})
 
 describe('the chip is coloured by its state, with a leading dot', () => {
   it('gives each state the board\'s own colour pair', () => {
@@ -190,19 +200,30 @@ describe('the chip is coloured by its state, with a leading dot', () => {
 
   it('★ no two states that mean different things share a colour AND a word', () => {
     // The defect in one assertion. Thirteen states, one grey — so the only thing telling a
-    // citizen apart "Changes requested" from "Live" was reading. Mutation receipt: return one
-    // shared look from `lookFor` and this goes red.
+    // citizen apart "Changes requested" from "Live" was reading.
+    //
+    // READ OFF THE MODULE THAT DECIDES IT, not off the tables above. This walked `EXPECTED_LOOK`
+    // and `LABELS`, both literals declared in this file, so it compared the fixtures with
+    // themselves: collapsing every state to one colour in production left it green, and the
+    // receipt it printed in this comment was false. Mutation receipt, now true: return one shared
+    // look from `lookFor` and the family count below goes red.
     const seen = new Map<string, string>()
-    for (const [state, family] of EXPECTED_LOOK) {
-      const label = LABELS.find(([s]) => s === state)?.[1] ?? state
-      const key = `${family}|${label}`
+    const families = new Set<string>()
+    for (const [state] of LABELS) {
+      const { pill } = lookFor(state)
+      const family = /bg-status-([a-z]+)-bg/.exec(pill)?.[1] ?? pill
+      families.add(family)
+      const key = `${family}|${presentationFor(state).label}`
       const clash = seen.get(key)
       // The two `Approved` states DO share both, deliberately — they are the same state to a
       // citizen and the difference is on the button (R38). Nothing else may.
       if (clash) expect([clash, state].sort()).toEqual(['approved_needs_review_again', 'approved_ready_to_publish'])
       seen.set(key, state)
     }
-    expect(new Set(EXPECTED_LOOK.map(([, f]) => f)).size).toBeGreaterThan(4)
+    // Thirteen states, twelve distinct colour-and-word pairs: the one collapse is the Approved
+    // pair the branch above allows.
+    expect(seen.size).toBe(LABELS.length - 1)
+    expect(families.size).toBeGreaterThan(4)
   })
 
   it('is a 999px pill, not the rounded-md box it used to be', () => {

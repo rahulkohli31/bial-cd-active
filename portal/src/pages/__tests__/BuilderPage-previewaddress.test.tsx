@@ -66,7 +66,6 @@ vi.mock('../../utils/builderHistory', () => ({
   getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t: string) => (t || '').slice(0, 40),
 }))
 vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
-vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 // A RECORDING WRAPPER, not a stub: the real pane still renders (so the iframe and its element
 // identity are observable) and the props are captured on the way through (so the app-scoped ones

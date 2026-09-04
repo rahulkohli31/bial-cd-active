@@ -39,6 +39,7 @@ from src.services.agent import toolsets as toolsets_module
 from src.services.agent.mode_prompts import PromptContext
 from src.services.build_sessions.manager import SessionManager
 from src.services.messages.projection import (
+    PLATFORM_TEXT_KIND,
     AssistantTextItem,
     PlanOptionsItem,
     StepItem,
@@ -65,7 +66,7 @@ from src.services.turns.plan_options import (
 )
 from tests.factories import ConversationFactory, UserFactory
 from tests.fakes import FakeSandboxClient
-from tests.transcript import rendered_text
+from tests.transcript import live_shape, reload_shape, rendered_text
 
 _CTX = PromptContext(user_name="Ada", project_name="Visitors", project_description=None)
 
@@ -271,6 +272,69 @@ async def test_the_plan_argument_is_the_happy_path_live_and_on_reload(
     assert len(options) == 1 and options[0].state == "pending"
 
 
+async def test_the_writing_up_status_leaves_the_screen_when_the_plan_arrives(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    """★ A WATCHING TAB AND A RELOADED ONE READ THE SAME THING, on the turn that has a status
+    line to withdraw.
+
+    "Writing up the plan…" is announced the moment the tool's block opens, because the plan
+    rides the argument and thousands of tokens stream before the call resolves. It has no
+    durable counterpart — a reloaded transcript shows the plan and the offer and never the
+    moment before them — so the status has to LEAVE the feed when the call lands. Dropping it
+    from the turn's own memory only settles what a LATE subscriber gets; a tab that was already
+    connected received the started frame, and unless the withdrawal reaches the wire too it
+    keeps a spinning row labelled "Writing up the plan…" above the finished plan for the rest
+    of the session, and only a reload clears it.
+
+    Compared as SHAPES rather than as two separate absence checks: an assertion that the live
+    feed holds no visible step passes just as well if the whole turn produced nothing, and the
+    plan text on both sides is the liveness half that says it did not.
+
+    Mutation check: put `state.drop_step(...)` back in place of `_retract_step(...)` in the
+    engine's offer arm and the live shape grows a `step:present_plan_options` the reloaded one
+    does not have."""
+
+    async def _stream(messages, info: AgentInfo):
+        # The provider's own two-part shape: the tool NAME with an empty argument first, which
+        # is what opens the status, then the plan.
+        yield DeltaToolCalls(
+            {0: DeltaToolCall(name="present_plan_options", json_args="", tool_call_id="opt-1")}
+        )
+        yield DeltaToolCalls(
+            {0: DeltaToolCall(json_args=json.dumps({"plan": _PLAN_TEXT}), tool_call_id="opt-1")}
+        )
+
+    user, conv = await _plan_conversation(db_session)
+    state = await _run_turn(
+        _fresh_engine,
+        db_session,
+        session_factory,
+        FunctionModel(stream_function=_stream),
+        user,
+        conv,
+    )
+    assert state.status == "completed"
+
+    rows = await load_rows(
+        db_session, user_id=user.id, conversation_id=conv.id, include_hidden=True
+    )
+    assert live_shape(state) == [f"text:{_PLAN_TEXT}"] == reload_shape(project_rows(list(rows)))
+
+    # The withdrawal is a FRAME, not just an absence from the snapshot: the connected tab is
+    # told, on the same call id, and the item it is told with is hidden.
+    withdrawals = [
+        f
+        for f in state.ring
+        if f.type == "step" and f.tool_call_id == "opt-1" and f.phase == "finished"
+    ]
+    assert len(withdrawals) == 1 and withdrawals[0].item.hidden is True
+
+    # And the card the status was making way for is still there — the retraction takes the
+    # status off the screen and nothing else with it.
+    assert [f.item.tool_call_id for f in state.ring if f.type == "plan_options"] == ["opt-1"]
+
+
 async def test_an_offer_survives_unrelated_turns_and_still_names_its_own_plan(
     _fresh_engine, db_session, session_factory
 ) -> None:
@@ -365,7 +429,17 @@ async def test_a_run_cut_off_mid_argument_records_no_offer_and_no_partial_plan(
     """Covers AE32, and the closely related edge case: a run stopped after the started status
     but before the argument completes leaves the status out of the reload too. `content_block_
     start` puts the tool's NAME on the wire before any argument arrives (U5), so a stop that
-    lands in that window must not leave a half-written plan anywhere — live, or durable."""
+    lands in that window must not leave a half-written plan anywhere — live, or durable.
+
+    ★ AND THE STATUS ITSELF CANNOT OUTLIVE THE TURN, which is the half the absence checks below
+    cannot see. "Writing up the plan…" is withdrawn by the OFFER arm when the argument lands,
+    and a turn that ends in this window never reaches that arm — so a tab that was already
+    connected had the started frame and nothing after it, and kept a spinning row under a turn
+    that was over for the rest of the session. Only a reload cleared it. The terminal withdraws
+    it instead, which is what the shape comparison and the hidden frame at the end assert.
+
+    Mutation check: drop the `plan_status_tool_call_id` retraction from `_finish` and the live
+    shape grows a `step:present_plan_options` the reloaded transcript does not have."""
     engine = _fresh_engine
     gate = asyncio.Event()
 
@@ -421,6 +495,21 @@ async def test_a_run_cut_off_mid_argument_records_no_offer_and_no_partial_plan(
     assert rows[0].payload == []
     assert rows[0].meta is not None and rows[0].meta["status"] == "stopped"
 
+    # AND THE WATCHING TAB IS TOLD, which the assertions above cannot see: they read the
+    # snapshot and the durable rows, and the started frame went out on the wire before either
+    # existed. Reduced as shapes, so what is compared is what each surface still SHOWS.
+    assert live_shape(state) == [] == reload_shape(project_rows(list(rows)))
+
+    # The withdrawal is a FRAME on the status's own call id, and the item it carries is hidden —
+    # the only way a tab that was already connected can learn the status is over. Exactly one, so
+    # the terminal cannot double up with the offer arm on a turn that reached both.
+    withdrawals = [
+        f
+        for f in state.ring
+        if f.type == "step" and f.tool_call_id == "opt-cut" and f.phase == "finished"
+    ]
+    assert len(withdrawals) == 1 and withdrawals[0].item.hidden is True
+
 
 async def test_an_empty_plan_argument_records_no_offer_and_says_so_once(
     _fresh_engine, db_session, session_factory
@@ -464,27 +553,39 @@ async def test_an_empty_plan_argument_records_no_offer_and_says_so_once(
     # explains a refusal the PLATFORM made, and it used to be appended to the run's own batch as
     # a `ModelResponse` — stored, replayed and read back as something the model had written. It
     # now rides one visible `SYSTEM_EVENT` row of its own, stamped with the platform-text kind
-    # and the turn it belongs to, and reaches the citizen through the projection's arm for a
-    # visible system row of an unknown kind. What they read is unchanged; the record has stopped
-    # attributing it to the model.
+    # and the turn it belongs to, carrying the words in `meta` and NO payload at all, and it
+    # reaches the citizen through the projection's arm for that kind. What they read is
+    # unchanged; the record has stopped attributing it to the model.
     platform_rows = [
         row
         for row in rows
-        if isinstance(row.meta, dict) and row.meta.get("kind") == engine_module.PLATFORM_TEXT_KIND
+        if isinstance(row.meta, dict) and row.meta.get("kind") == PLATFORM_TEXT_KIND
     ]
     assert len(platform_rows) == 1
     assert platform_rows[0].entry_kind is MessageEntryKind.SYSTEM_EVENT
     assert platform_rows[0].meta == {
-        "kind": engine_module.PLATFORM_TEXT_KIND,
+        "kind": PLATFORM_TEXT_KIND,
         "turnId": str(state.turn_id),
+        "text": PLAN_NOT_KEPT_TEXT,
     }
-    # …AND NOWHERE ELSE. Exactly one row in the whole transcript carries the sentence, which is
-    # the assertion that goes red if it is ever written into the model's batch as well — a
-    # regression the rendered text above could not see, because the citizen would still read it
-    # once while the model's own history carried a reply it never made.
-    assert [row.id for row in rows if PLAN_NOT_KEPT_TEXT in str(row.payload)] == [
-        platform_rows[0].id
-    ]
+    # ★ AND THE MODEL IS NEVER TOLD IT SAID THIS. `load_history` flattens every row's payload —
+    # hidden ones included, and with no filter by kind or entry kind — so a sentence stored in a
+    # payload is a sentence the NEXT turn hands the model as a paragraph it wrote itself, to
+    # build on or repeat. The empty payload is what keeps it out, the same way the turn-terminal
+    # row stays out, and it is asserted DIRECTLY rather than only through the reader: the reader
+    # returns nothing at all for this turn (the refused call was stripped, which left the run
+    # with no persistable message of its own), so an absence read off it alone would hold just as
+    # well against a row that still carried the sentence in a payload nobody happened to load.
+    assert platform_rows[0].payload == []
+    assert not any(PLAN_NOT_KEPT_TEXT in str(row.payload) for row in rows)
+
+    async def _noop_rehydrate(_attachment_ids):
+        raise AssertionError("no attachments in this history")
+
+    history = await load_history(
+        db_session, user_id=user.id, conversation_id=conv.id, rehydrate=_noop_rehydrate
+    )
+    assert not any(PLAN_NOT_KEPT_TEXT in str(message) for message in history)
     for row in rows:
         for message in row.payload:
             assert "present_plan_options" not in str(message.get("parts", []))
@@ -528,7 +629,7 @@ async def test_an_over_ceiling_plan_argument_records_no_offer_and_is_not_truncat
     assert [
         row.entry_kind
         for row in rows
-        if isinstance(row.meta, dict) and row.meta.get("kind") == engine_module.PLATFORM_TEXT_KIND
+        if isinstance(row.meta, dict) and row.meta.get("kind") == PLATFORM_TEXT_KIND
     ] == [MessageEntryKind.SYSTEM_EVENT]
 
 
@@ -898,7 +999,7 @@ async def test_a_turn_that_only_used_a_tool_leaves_no_words_behind(
     assert not [
         row
         for row in rows
-        if isinstance(row.meta, dict) and row.meta.get("kind") == engine_module.PLATFORM_TEXT_KIND
+        if isinstance(row.meta, dict) and row.meta.get("kind") == PLATFORM_TEXT_KIND
     ]
     items = project_rows(list(rows))
     assert not [i for i in items if isinstance(i, AssistantTextItem)]

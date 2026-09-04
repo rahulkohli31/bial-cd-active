@@ -44,8 +44,13 @@ vi.mock('../../utils/projectApi', () => ({ getProject: h.getProject }))
 vi.mock('../../components/workspace/ConversationSlot', () => ({
   default: function ConversationSlotStub({
     conversation,
+    onTitleDerived,
   }: {
     conversation: { chatId: string; kind: string; projectId: string | null; projectName: string | null }
+    // The surface derives a title from the first message of a chat whose row had none, and hands
+    // it BACK to this route — see `onTitleDerived` in `ChatRoute`. Accepted here so the merge is
+    // reachable from a test at all; the stub used to drop it silently.
+    onTitleDerived?: (title: string) => void
   }) {
     const navigate = useNavigate()
     const { chatId, kind, projectId, projectName } = conversation
@@ -54,14 +59,33 @@ vi.mock('../../components/workspace/ConversationSlot', () => ({
         {`${kind}|${chatId}|${projectId}|${projectName}`}
         <button onClick={() => navigate(`/chat/${chatId}`, { replace: true })}>drop query</button>
         <button onClick={() => navigate('/chat/c2')}>go to c2</button>
+        <button onClick={() => onTitleDerived?.('Add an out-time column')}>derive a title</button>
       </div>
     )
   },
 }))
 
 import ChatRoute from '../ChatRoute'
+import {
+  WorkspaceChannelProvider,
+  createWorkspaceChannel,
+  useWorkspaceHeading,
+} from '../../components/workspace/workspaceChannel'
 import { beaconsFrom } from './_observeBeacons'
 import { markProjectOpened } from '../../utils/observe'
+
+/**
+ * WHAT THE TOOLBAR ROW WOULD NAME, read straight off the channel (plan 002, U2).
+ *
+ * The row itself is the shell's and has its own suite; what is only observable HERE is the value
+ * this route PUBLISHES, which every one of those scenarios takes as a given. Rendered as one
+ * string so a single assertion covers all four fields and a wrong one cannot hide behind a right
+ * one.
+ */
+function HeadingProbe() {
+  const { projectId, projectName, chatKind, chatTitle } = useWorkspaceHeading()
+  return <span data-testid="heading">{`${projectId}|${projectName}|${chatKind}|${chatTitle}`}</span>
+}
 
 
 /**
@@ -71,15 +95,22 @@ import { markProjectOpened } from '../../utils/observe'
 function renderRoute(entry: string, state?: unknown) {
   const [pathname, search = ''] = entry.split('?')
   const initial = state === undefined ? entry : { pathname, search: search ? `?${search}` : '', state }
+  // UNDER A REAL CHANNEL, so the heading this route publishes is observable. The publishers all
+  // no-op without one, which is exactly how this route's heading went untested.
   return render(
-    <MemoryRouter initialEntries={[initial]}>
-      <Routes>
-        <Route path="/chat/:chatId" element={<ChatRoute />} />
-        <Route path="/projects" element={<div data-testid="projects-index">projects</div>} />
-      </Routes>
-    </MemoryRouter>,
+    <WorkspaceChannelProvider value={createWorkspaceChannel()}>
+      <MemoryRouter initialEntries={[initial]}>
+        <HeadingProbe />
+        <Routes>
+          <Route path="/chat/:chatId" element={<ChatRoute />} />
+          <Route path="/projects" element={<div data-testid="projects-index">projects</div>} />
+        </Routes>
+      </MemoryRouter>
+    </WorkspaceChannelProvider>,
   )
 }
+
+const heading = () => screen.getByTestId('heading').textContent
 
 const conversation = (over: Record<string, unknown> = {}) => ({
   id: 'c1',
@@ -92,6 +123,10 @@ const conversation = (over: Record<string, unknown> = {}) => ({
 
 beforeEach(() => {
   vi.clearAllMocks()
+  // EACH TEST IS A FRESH PAGE LOAD. The route remembers a chat's project per tab so the toolbar
+  // row has a back target during the next load window, and a memory left behind by the test
+  // above would make "a chat this browser has never seen" quietly untrue.
+  sessionStorage.clear()
   h.authFetch.mockResolvedValue({ ok: true } as Response)
   h.getProject.mockResolvedValue({ id: 'p1', name: 'VIP Movement', description: null, appId: null, appStatus: null, createdAt: '', updatedAt: '' })
 })
@@ -226,6 +261,131 @@ describe('ChatRoute — the project breadcrumb', () => {
     h.getConversation.mockResolvedValue(conversation({ projectId: undefined }))
     renderRoute('/chat/c1?projectId=p9')
     await waitFor(() => expect(screen.getByTestId('conversation-slot').textContent).toContain('|p9|'))
+  })
+})
+
+/**
+ * WHAT THE ROW IS TOLD TO NAME (plan 002, U2), and the merge that fills in its title.
+ *
+ * The row's own rendering is covered in `WorkspaceToolbar.test.tsx`, but every scenario there
+ * publishes a SYNTHETIC heading. This is the component that publishes the real one in production,
+ * and nothing was asserting it — so the loading branch, the stale-project guard and the title merge
+ * could all regress with the whole suite green and the row quietly naming the wrong project.
+ */
+describe('ChatRoute — what it publishes for the toolbar row', () => {
+  it('names the project, the kind and the title once the conversation resolves', async () => {
+    h.getConversation.mockResolvedValue(conversation({ kind: 'build', title: 'Add an out-time column' }))
+    renderRoute('/chat/c1')
+
+    await waitFor(() => expect(heading()).toBe('p1|VIP Movement|build|Add an out-time column'))
+  })
+
+  it('★ names the URL\'s project while the conversation is still resolving, and no kind', async () => {
+    // The whole `GET /conversations/{id}` window. The kind is the SERVER's to answer, so nothing is
+    // claimed about it; the project is the URL's own and is right whenever it is there, which is
+    // what gives the row a breadcrumb and a back target from the first frame.
+    let land: ((value: unknown) => void) | undefined
+    h.getConversation.mockImplementation(() => new Promise((res) => { land = res }))
+
+    renderRoute('/chat/c1?projectId=p1&kind=build')
+
+    await waitFor(() => expect(heading()).toBe('p1|null|null|null'))
+    // LIVENESS: the same render goes on to publish the server's answer, so the state above is a
+    // load window rather than a route that never resolved.
+    land?.(conversation({ kind: 'build', title: 'Add an out-time column' }))
+    await waitFor(() => expect(heading()).toBe('p1|VIP Movement|build|Add an out-time column'))
+  })
+
+  it('★ names the project this tab already learned, on a reload that carries no query', async () => {
+    // THE ORDINARY CASE, and the one the URL fallback above cannot reach. A chat's address is
+    // rewritten to the bare `/chat/{id}` the instant its first message lands, so every reload,
+    // bookmark and shared link into an existing chat arrives with nothing in the query — and for
+    // the whole of the next `GET` the row had no project to name and a back control aimed at the
+    // projects list, out of the project the citizen was working in.
+    //
+    // The memory is EARNED here rather than seeded: the first render is the visit that learns the
+    // project, and the second is the reload that reads it back. Seeding storage directly would
+    // pass even if nothing ever wrote to it.
+    h.getConversation.mockResolvedValue(conversation({ kind: 'build', title: 'Add an out-time column' }))
+    renderRoute('/chat/c1')
+    await waitFor(() => expect(heading()).toBe('p1|VIP Movement|build|Add an out-time column'))
+    cleanup()
+
+    let land: ((value: unknown) => void) | undefined
+    h.getConversation.mockImplementation(() => new Promise((res) => { land = res }))
+
+    renderRoute('/chat/c1') // the reload: no ?projectId=, no ?kind=
+
+    await waitFor(() => expect(heading()).toBe('p1|null|null|null'))
+    // LIVENESS: the same render goes on to publish the server's answer, so the state above is a
+    // load window and not a route that never resolved.
+    land?.(conversation({ kind: 'build', title: 'Add an out-time column' }))
+    await waitFor(() => expect(heading()).toBe('p1|VIP Movement|build|Add an out-time column'))
+  })
+
+  it('★ and claims nothing for a chat this browser has never seen', async () => {
+    // The memory is a memory, never a guess. This tab HAS learned a project — from a different
+    // chat — so the neutral shape here is a real answer rather than an empty store: it says the
+    // memory is per chat, and a chat nobody has opened inherits nothing from the one beside it.
+    // Mutation receipt: drop the chat id from the storage key and this goes red while the reload
+    // scenario above stays green.
+    h.getConversation.mockResolvedValue(conversation())
+    renderRoute('/chat/c1')
+    await waitFor(() => expect(heading()).toBe('p1|VIP Movement|plan|T'))
+    cleanup()
+
+    let land: ((value: unknown) => void) | undefined
+    h.getConversation.mockImplementation(() => new Promise((res) => { land = res }))
+
+    renderRoute('/chat/never-seen')
+
+    await waitFor(() => expect(screen.getByRole('status', { name: /loading chat/i })).toBeTruthy())
+    expect(heading()).toBe('null|null|null|null')
+    // LIVENESS: this chat does resolve, so the neutral shape above is a load window and not a
+    // route that never answered.
+    land?.(conversation({ id: 'never-seen' }))
+    await waitFor(() => expect(heading()).toBe('p1|VIP Movement|plan|T'))
+  })
+
+  it('★ withholds a project NAME that belongs to a different project', async () => {
+    // This route stays mounted across chat navigations, so a `project` read for the previous chat
+    // outlives the chat it was read for. Naming it would put another project's name on this row.
+    h.getConversation.mockResolvedValue(conversation({ projectId: 'p-other' }))
+    h.getProject.mockResolvedValue({ id: 'p1', name: 'VIP Movement' })
+
+    renderRoute('/chat/c1')
+
+    await screen.findByTestId('conversation-slot')
+    await waitFor(() => expect(h.getProject).toHaveBeenCalledWith('p-other'))
+    expect(heading()).toBe('p-other|null|plan|T')
+  })
+
+  it('★ takes the title back from the surface when the chat had none', async () => {
+    // A chat's row is created by its first send and its title is derived from that message, so a
+    // freshly minted chat legitimately has none until the surface works one out. Without the merge
+    // the row goes on naming the kind for the whole life of the chat.
+    h.getConversation.mockResolvedValue(conversation({ title: '' }))
+    renderRoute('/chat/c1')
+    await waitFor(() => expect(heading()).toBe('p1|VIP Movement|plan|null'))
+
+    fireEvent.click(screen.getByText('derive a title'))
+
+    await waitFor(() => expect(heading()).toBe('p1|VIP Movement|plan|Add an out-time column'))
+  })
+
+  it('★ and never lets a derived title overwrite the stored one', async () => {
+    // The stored title is the one a citizen may have seen before; a surface re-deriving one from
+    // the first message must not rename the chat under them.
+    h.getConversation.mockResolvedValue(conversation({ title: 'What the row already says' }))
+    renderRoute('/chat/c1')
+    await waitFor(() => expect(heading()).toBe('p1|VIP Movement|plan|What the row already says'))
+
+    fireEvent.click(screen.getByText('derive a title'))
+
+    // Awaited on the FINAL shape rather than sampled once, so this cannot pass by reading the
+    // heading before a merge that was going to happen anyway.
+    await waitFor(() => expect(screen.getByTestId('conversation-slot')).toBeTruthy())
+    expect(heading()).toBe('p1|VIP Movement|plan|What the row already says')
   })
 })
 

@@ -521,6 +521,45 @@ async def test_a_read_only_command_is_a_visible_step_and_housekeeping_is_not(
             assert leaked not in step.label
 
 
+async def test_housekeeping_that_fails_is_drawn_rather_than_hidden(
+    sink: CollectingSink,
+) -> None:
+    """★ NOTHING IS HIDDEN WHEN SOMETHING WENT WRONG, on this emitter too.
+
+    The turn engine's `_resolve_step` clears `hidden` on a failed step and the reload projection
+    does the same, and `classify_command`'s docstring states that parity for this emitter by
+    name — while this feed passed the classifier's flag straight through, so a `mkdir` that
+    failed was a problem counted in the group's total with no row anyone could open. A citizen
+    reading "1 problem" and finding nothing that says what it was is the failure the whole
+    hidden/failed rule exists to prevent.
+
+    THE PAIR IS THE TEST. The same command succeeding stays hidden — the flag is narrowed by
+    state, not deleted — which is what makes the visible arm mean something.
+
+    Mutation check: pass `hidden=hidden` through `_step` again and the failed arm goes red while
+    the succeeding one stays green."""
+    fake = FakeSandbox()
+    fake.queue_commands(
+        ExecResult(stdout="", stderr="", exit=0),
+        ExecResult(stdout="", stderr="mkdir: permission denied", exit=1),
+    )
+    await _run(
+        fake,
+        sink,
+        [
+            tool_turn("run_command", {"command": ["mkdir", "-p", "app/visitors"]}),
+            tool_turn("run_command", {"command": ["mkdir", "-p", "app/reports"]}),
+            text_turn(),
+        ],
+    )
+    worked, failed = (e for e in _steps(sink) if e.name == "run_command")
+    assert worked.state == "ok" and worked.hidden is True
+    assert failed.state == "failed" and failed.hidden is False
+    # Still no raw command on screen on the way out of hiding.
+    for leaked in ("mkdir", "-p", "permission denied", "$ "):
+        assert leaked not in failed.label
+
+
 # --- run_command (U1 / U4 / R1 / R3 / R11) -----------------------------------
 
 

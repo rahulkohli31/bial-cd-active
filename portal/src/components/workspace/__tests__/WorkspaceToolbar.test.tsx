@@ -22,6 +22,7 @@
  * with the markup" cannot be how any of them stops being checked.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { useState } from 'react'
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, Link, useLocation } from 'react-router-dom'
 import WorkspaceShell from '../WorkspaceShell'
@@ -40,10 +41,21 @@ import {
 } from '../workspaceChannel'
 
 vi.mock('../../layout/Navbar', () => ({ default: () => <div data-testid="navbar" /> }))
+/**
+ * THE ROW'S RENDER COUNTER, and it has to be inside the row rather than around it.
+ *
+ * The chip is an ordinary child of the row's own JSX with no memo between them, so React renders
+ * it exactly once per render of the row — which makes this stub a count of the row's renders that
+ * a wrapper around `WorkspaceToolbar` could not produce (a wrapper only sees the renders its own
+ * parent causes, and misses the ones the row's own cell subscriptions cause, which are precisely
+ * the ones "the row does not wake with the composer" is about).
+ */
+const h = vi.hoisted(() => ({ rowRenders: 0 }))
 vi.mock('../../PublishStatusChip', () => ({
-  default: ({ projectId }: { projectId: string }) => (
-    <span data-testid="publish-chip-stub" data-project={projectId} />
-  ),
+  default: function PublishStatusChipStub({ projectId }: { projectId: string }) {
+    h.rowRenders += 1
+    return <span data-testid="publish-chip-stub" data-project={projectId} />
+  },
 }))
 vi.mock('../../LivePreview', () => ({
   default: () => <div data-testid="live-preview" />,
@@ -104,7 +116,9 @@ function Surface({
   useWorkspaceProject(heading.projectId)
   usePublishHeading(heading)
   usePublishAddress({ url: appUrl, status: appUrl ? 'ready' : null }, heading.projectId)
-  usePublishPaneView(EMPTY_PANE)
+  // A FRESH OBJECT PER RENDER, which is what the real conversation surface publishes — the pane
+  // cell is identity-compared, so this is what makes a keystroke reach the channel at all.
+  usePublishPaneView({ ...EMPTY_PANE })
   usePublishSave(save, actions)
   usePublishSaveState(save.dirty)
   useAppPaneVisible(paneVisible)
@@ -179,6 +193,23 @@ describe('what the row names on each address', () => {
     expect(screen.getByTestId('publish-chip-stub')).toBeTruthy()
   })
 
+  it('★ draws the BUILD pill as the word alone, and the PLAN pill with the glyph its board has', () => {
+    // The row shipped a Lucide wrench inside the BUILD pill that no BuildChat-family board draws.
+    // The two kinds genuinely differ here — PLAN carries an 11px message-square, BUILD is the word
+    // — so the assertion is a pair: the absence on one kind, the presence on the other, in the
+    // same row. An absence alone would pass against a pill that stopped rendering at all.
+    render(<Workspace entry="/chat/c1" />)
+    const build = screen.getByTestId('toolbar-chat-kind')
+    expect(build.textContent).toContain('Build')
+    expect(build.querySelector('svg')).toBeNull()
+
+    cleanup()
+    render(<Workspace entry="/chat/c1" chat={{ heading: { ...CHAT_HEADING, chatKind: 'plan' } }} />)
+    const plan = screen.getByTestId('toolbar-chat-kind')
+    expect(plan.textContent).toContain('Plan')
+    expect(plan.querySelector('svg')).toBeTruthy()
+  })
+
   it('a freshly created chat, whose title is not yet known, names its kind rather than nothing', () => {
     // The ordinary case, not an error: the row is created by the first send and its title is
     // derived from that message. A blank <h1> or a spinner would both be worse than the kind.
@@ -203,6 +234,49 @@ describe('what the row names on each address', () => {
     expect(row().className).toMatch(/h-\[54px\]/)
     expect(row().textContent).toContain('Your project')
     expect(screen.getByRole('button', { name: 'Back to project' })).toBeTruthy()
+  })
+
+  it('★ a chat still inside its load window is drawn as a CHAT, not as the project screen', () => {
+    // THE FAILURE THIS IS WRITTEN AGAINST, and it is a whole `GET /conversations/{id}` long: open
+    // a bare `/chat/{id}` — a reload, a bookmark, the hand-over out of a plan chat — and neither
+    // the kind nor the project has arrived. The row used to take that to mean "project screen": a
+    // lone <h1> reading "Your project", no breadcrumb, and a back control labelled and aimed at
+    // the projects list. A citizen who reloaded a build chat and pressed back was thrown out of
+    // the project entirely, and the row re-shaped under them when the fetch landed.
+    //
+    // The scenario above this one keeps `chatKind: 'build'`, so it asserts a state the product
+    // never actually passes through; this is the state it does.
+    render(
+      <Workspace
+        entry="/chat/c1"
+        chat={{ heading: { projectId: null, projectName: null, chatTitle: null, chatKind: null } }}
+      />,
+    )
+
+    // The discriminator between the two shapes: on the project screen "Your project" IS the <h1>;
+    // on a chat it is the breadcrumb beside it and the <h1> is the chat's own slot.
+    expect(row().textContent).toContain('Your project')
+    expect(title().textContent).toBe('')
+    // Rename belongs to the project screen; nothing on a chat address may offer it.
+    expect(screen.queryByRole('button', { name: /rename/i })).toBeNull()
+    // And the way out says where it actually goes: with no project resolved there is none to
+    // return to, so it is the list, and it says the list.
+    expect(screen.getByRole('button', { name: 'Back to projects' })).toBeTruthy()
+    // LIVENESS: the row is drawn at full height throughout, which is the property that stops the
+    // layout shifting when the fetch lands.
+    expect(row().className).toMatch(/h-\[54px\]/)
+  })
+
+  it('★ and its back control reaches the project the moment the URL names one, kind or no kind', () => {
+    render(
+      <Workspace
+        entry="/chat/c1"
+        chat={{ heading: { projectId: 'pA', projectName: null, chatTitle: null, chatKind: null } }}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Back to project' }))
+    expect(screen.getByTestId('where').textContent).toBe('/projects/pA')
   })
 
   it('★ when the project fetch FAILED the row still names something and back still works', () => {
@@ -502,16 +576,64 @@ describe('the back control and the rename', () => {
 })
 
 describe('the row does not wake with the composer', () => {
+  /**
+   * A chat surface with a composer in it, republishing its pane view on every keystroke exactly as
+   * the real one does — plus one control that changes something the row DOES read, which is what
+   * makes the counter's silence meaningful.
+   */
+  function Typist() {
+    const [text, setText] = useState('')
+    const [chatTitle, setChatTitle] = useState('Add an out-time column')
+    return (
+      <>
+        <input aria-label="composer" value={text} onChange={(e) => setText(e.target.value)} />
+        <button type="button" onClick={() => setChatTitle('Add an out-time and an in-time')}>
+          rename the chat
+        </button>
+        <Surface heading={{ ...CHAT_HEADING, chatTitle }} />
+      </>
+    )
+  }
+
+  const typing = () =>
+    render(
+      <MemoryRouter initialEntries={['/chat/c1']}>
+        <Routes>
+          <Route element={<WorkspaceShell />}>
+            <Route path="/chat/:chatId" element={<Typist />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    )
+
   it('★ a publish that changes nothing the row shows does not re-render it', async () => {
     // The reason the row reads its own value-compared cells rather than the pane cell, which is
-    // republished per character typed and holds handlers that cannot be compared. Asserted on the
-    // ELEMENT's identity: a re-render of the shell that produced a new node would fail the
-    // route-change scenario above too, so this pins the cheaper half — the row's DOM is stable
-    // while a surface republishes an unchanged heading and save state.
-    const { rerender } = render(<Workspace />)
-    const before = row()
-    for (let i = 0; i < 5; i += 1) rerender(<Workspace />)
-    await waitFor(() => expect(row()).toBe(before))
-    expect(title().textContent).toBe('Visitor Log — Airport Office')
+    // republished per character typed and holds handlers that cannot be compared.
+    //
+    // COUNTED, NOT COMPARED BY NODE. The version of this scenario that shipped asserted `row()` was
+    // the same ELEMENT after five re-renders — which React guarantees whether the row re-rendered
+    // five times or none, so it stayed green for the very property it was written for. Point the
+    // row at the pane cell and this one goes red; that one did not.
+    typing()
+    await waitFor(() => expect(screen.getByTestId('publish-chip-stub')).toBeTruthy())
+    const node = row()
+    const before = h.rowRenders
+
+    for (const value of ['a', 'ad', 'add', 'add ', 'add a']) {
+      fireEvent.change(screen.getByLabelText('composer'), { target: { value } })
+    }
+
+    expect(h.rowRenders).toBe(before)
+    // …and the row is still the same element with the same contents, which is the half the
+    // earlier version of this test could see.
+    expect(row()).toBe(node)
+    expect(title().textContent).toBe('Add an out-time column')
+
+    // LIVENESS: the counter is genuinely wired to the row. Something the row DOES read — the chat's
+    // own title — wakes it, so the five silent keystrokes above are a subscription that ignores the
+    // composer rather than a probe that never counts anything.
+    fireEvent.click(screen.getByRole('button', { name: 'rename the chat' }))
+    expect(h.rowRenders).toBeGreaterThan(before)
+    expect(title().textContent).toBe('Add an out-time and an in-time')
   })
 })

@@ -451,7 +451,7 @@ export function deriveTitle(text: string): string {
 
 /**
  * Build an async store for one conversation `kind` (plan | build),
- * preserving the names the pages import from chatHistory/builderHistory.
+ * preserving the names `builderHistory` re-exports.
  * `newConversation` stays SYNCHRONOUS — it mints a UUID with no network; U7 moves
  * row creation to an explicit `createConversation` call the send path makes BEFORE
  * the first turn (the legacy appears-on-first-append upsert died with the message

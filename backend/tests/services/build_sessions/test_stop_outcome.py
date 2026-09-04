@@ -37,13 +37,19 @@ import pytest
 import redis.asyncio as aioredis
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from src.config import settings
 from src.db.models.user import User
+from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions.manager import (
     BuildSessionConflictError,
     SessionManager,
     StopOutcome,
+)
+from src.services.build_sessions.snapshot import (
+    SNAPSHOT_EXEC_TIMEOUT_SECONDS,
+    SNAPSHOT_EXECS,
 )
 from src.services.sandbox import ExecResult
 from src.services.sandbox.config import SandboxConfig
@@ -135,6 +141,36 @@ async def _the_slot_is_free(manager: SessionManager, user_id: uuid.UUID) -> None
             return
         await asyncio.sleep(0.001)
     raise AssertionError("the stop never settled within the barrier's budget")
+
+
+# --- the budget, derived rather than chosen -------------------------------------------
+
+
+def test_the_stop_budget_sits_above_the_unwind_each_branch_actually_runs() -> None:
+    """★ THE RULE THE NUMBER IS SUPPOSED TO OBEY, checked against the parts rather than trusted.
+
+    A budget BELOW the unwind's own bounds reports a healthy stop as one that did not finish —
+    which is what the retired 30 s did, and what the first attempt at deriving it did again for
+    the branch it was written to fix: it counted the build's 10 s record and missed the snapshot
+    `_do_finalize` writes first, an unbounded call whose parts are four execs of two minutes.
+
+    COMPUTED FROM THE PRIMITIVES, not from the intermediate the module derives, so it is a check
+    and not a restatement: if the per-exec bound or the number of execs moves, this recomputes
+    the branch's real cost and the budget has to keep up.
+
+    Mutation check: make the budget the sum of the recovery autosave and the record again and the
+    build-branch assertion goes red while the write-branch one stays green."""
+    build_branch = (
+        SNAPSHOT_EXECS * SNAPSHOT_EXEC_TIMEOUT_SECONDS
+        + manager_module._OUTCOME_WRITE_TIMEOUT_SECONDS
+    )
+    write_branch = (
+        manager_module._RECOVERY_SNAPSHOT_TIMEOUT_SECONDS
+        + manager_module._OUTCOME_WRITE_TIMEOUT_SECONDS
+    )
+    assert build_branch > 0 and write_branch > 0  # liveness: both parts are real numbers
+    assert manager_module._STOP_ACTIVE_WORK_TIMEOUT_SECONDS >= build_branch
+    assert manager_module._STOP_ACTIVE_WORK_TIMEOUT_SECONDS >= write_branch
 
 
 # --- the status read -----------------------------------------------------------------
@@ -352,14 +388,41 @@ async def test_a_dropped_connection_mid_stop_loses_no_work_and_takes_no_containe
 
 
 async def test_two_racing_transfers_for_one_citizen_end_with_one_container(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Two tabs, one workspace, one stop.
 
     The hazard is the scope split: whoever asks is no longer whoever watches, so two asks could
     easily become two stops — a second `task.cancel()` landing inside a cleanup already under way,
     which is how a terminal frame gets eaten, and two teardowns of one container. One record per
-    project is what prevents it, and both callers are told the same true thing."""
+    project is what prevents it, and both callers are told the same true thing.
+
+    ★ THE RACE HAS TO BE MADE REAL, AND THE COUNT HAS TO BE OF TASKS. Two tabs are two requests,
+    and the only suspension point in the ask is the app-id read — but both asks here share one
+    connection, whose driver serialises them end to end, so a bare `gather` runs the second ask
+    only after the first has finished its whole critical section and no interleave ever happens.
+    Yielding BEFORE that read does not help either: the second tab still cannot get past the
+    connection until the first is done with it, so the two are serialised exactly as before and
+    a mutation that opens a gap between the check and the write is never observed.
+
+    SO THE BARRIER SITS AFTER THE READ AND BEFORE THE CHECK, which is the only place a test can
+    hold both tabs without touching production code. `_existing_app_id` does its real round trip
+    — releasing the connection — and only then parks, and the ask has no further await, so when
+    the barrier releases both tabs are provably past every suspension point the ask has, with
+    neither having claimed the project. Whichever resumes first must therefore run the check,
+    the create and the store as one uninterrupted step; the other finds the record and joins.
+
+    WHAT IS COUNTED IS `_stop_the_held_session` ENTRIES, not records: `len(_stop_records)` counts
+    KEYS, and both tabs write the same key, so it reads `1` whether one stop was started or two
+    with the second silently replacing the first.
+
+    Mutation receipt: put `await asyncio.sleep(0)` between reading `in_flight` and storing the
+    record in `request_stop_of_active_work` and the second tab resumes inside that gap, starts a
+    second stop, and `stops_started` grows to two while every other assertion here stays green.
+    (Verified by injecting it and watching this test — and only this test — go red.)"""
     user, project_a = await _mk(db_session, "stop7@rvaiglobal.com")
     manager = SessionManager()
     client = _bundles_to(FakeSandboxClient(), "6" * 40)
@@ -370,13 +433,42 @@ async def test_two_racing_transfers_for_one_citizen_end_with_one_container(
     )
     await brain.stepped.wait()
 
+    real_app_id = manager_module._existing_app_id
+    # Two parties, and only the first two asks are held: the sequential third ask further down
+    # must not wait for a partner that is never coming.
+    at_the_check = asyncio.Barrier(2)
+    parked: list[int] = []
+
+    async def _holds_both_tabs_at_the_check(db, user_id, project_id):
+        app_id = await real_app_id(db, user_id, project_id)
+        # The read is DONE and the connection is free, so the other tab can take it, finish its
+        # own read, and arrive here too. Nothing suspends between this return and the record
+        # write, which is exactly why both tabs being here is a real race and not a staged one.
+        if len(parked) < 2:
+            parked.append(1)
+            # BOUNDED, so a change that lets either ask return before it reaches the barrier
+            # FAILS this test instead of hanging the suite on a wait nothing can release.
+            await asyncio.wait_for(at_the_check.wait(), timeout=10)
+        return app_id
+
+    monkeypatch.setattr(manager_module, "_existing_app_id", _holds_both_tabs_at_the_check)
+
+    stops_started: list[uuid.UUID] = []
+    real_stop = manager._stop_the_held_session
+
+    async def _counting_stop(user_id, app_id, **kwargs):
+        stops_started.append(app_id)
+        return await real_stop(user_id, app_id, **kwargs)
+
+    monkeypatch.setattr(manager, "_stop_the_held_session", _counting_stop)
+
     both = await asyncio.gather(
         manager.request_stop_of_active_work(db_session, user, project_a, sandbox_client=client),
         manager.request_stop_of_active_work(db_session, user, project_a, sandbox_client=client),
     )
 
     assert list(both) == [StopOutcome.STILL_RUNNING, StopOutcome.STILL_RUNNING]
-    assert len(manager._stop_records) == 1  # one stop, not one per tab
+    assert len(manager._stop_records) == 1  # one KEY…
     record = manager._stop_records[(user.id, project_a)]
 
     # A THIRD ask, sequentially, JOINS the same stop rather than starting another — the identity
@@ -391,8 +483,15 @@ async def test_two_racing_transfers_for_one_citizen_end_with_one_container(
     )
     assert manager._stop_records[(user.id, project_a)].task is record.task
 
+    # THE BARRIER FIRST, THEN THE COUNT — the rule this whole file runs on. A second stop task
+    # would be parked inside the same unwind, and asking about it before letting the brain go
+    # would leave this test hanging on its own failure instead of reporting it.
     brain.let_go.set()
     assert await asyncio.wait_for(record.task, timeout=10) is StopOutcome.STOPPED
+
+    # …and ONE STOP was ever started behind that one key. The second tab joined the first rather
+    # than firing a second cancel into a cleanup already under way.
+    assert stops_started == [record.app_id]
 
     # ONE container destroyed, and only the one that was provisioned.
     assert len(client.provisioned) == 1
@@ -400,6 +499,73 @@ async def test_two_racing_transfers_for_one_citizen_end_with_one_container(
     assert await manager.stop_state_of_active_work(db_session, user, project_a) is (
         StopOutcome.STOPPED
     )
+
+
+async def test_a_stop_that_breaks_is_logged_against_the_citizen_it_broke_for(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A detached stop that raises names WHO it failed for, not just that something failed.
+
+    The callback exists because an un-retrieved task exception surfaces only as a warning at
+    collection time, attached to nothing anyone is looking at. A line with no keys is barely
+    better: nothing in this service binds structlog contextvars, so a detached task inherits no
+    request scope, and an operator watching "stop of active work failed" repeat cannot tell
+    which citizen is stuck or which container is still holding a workspace.
+
+    Mutation check: drop the identifiers from the `_log.error` call and the key assertions go red
+    while the message assertion stays green."""
+    user, project_a = await _mk(db_session, "stop8@rvaiglobal.com")
+    manager = SessionManager()
+    client = _bundles_to(FakeSandboxClient(), "7" * 40)
+    brain = _HoldsItsOwnUnwind()
+
+    await manager.start(
+        db_session, user, project_a, "build it", run_build=brain, sandbox_client=client
+    )
+    await brain.stepped.wait()
+    session = manager.active_session_for(user.id)
+    assert session is not None
+    app_id = session.app_id
+
+    real_stop = manager._stop_the_held_session
+
+    async def _breaks(_user_id, _app_id, **_kwargs):
+        raise RuntimeError("the stop itself broke")
+
+    monkeypatch.setattr(manager, "_stop_the_held_session", _breaks)
+    with capture_logs() as logs:
+        assert (
+            await manager.request_stop_of_active_work(
+                db_session, user, project_a, sandbox_client=client
+            )
+            is StopOutcome.STILL_RUNNING
+        )
+        record = manager._stop_records[(user.id, project_a)]
+        with pytest.raises(RuntimeError):
+            await asyncio.wait_for(record.task, timeout=5)
+        await asyncio.sleep(0)  # the done-callback runs on the next loop pass
+
+    failures = [line for line in logs if line["event"] == "stop of active work failed"]
+    assert len(failures) == 1
+    assert failures[0]["user_id"] == str(user.id)
+    assert failures[0]["project_id"] == str(project_a)
+    assert failures[0]["app_id"] == str(app_id)
+
+    # AND THE MANAGER IS NOT WEDGED BY IT: a broken stop leaves the record settled rather than
+    # in flight, so the next ask starts a real one and the container is still given up.
+    monkeypatch.setattr(manager, "_stop_the_held_session", real_stop)
+    assert (
+        await manager.request_stop_of_active_work(
+            db_session, user, project_a, sandbox_client=client
+        )
+        is StopOutcome.STILL_RUNNING
+    )
+    brain.let_go.set()
+    retry = manager._stop_records[(user.id, project_a)]
+    assert await asyncio.wait_for(retry.task, timeout=10) is StopOutcome.STOPPED
 
 
 # --- the two predicates, held apart --------------------------------------------------

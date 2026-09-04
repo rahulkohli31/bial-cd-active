@@ -252,7 +252,13 @@ export default function PublishStatusChip({
   // ── The first read has not answered yet ───────────────────────────────────────────
   // Holds the space beside the project name so nothing jumps, and claims no state. Not a
   // button: there is nothing yet to explain, and the live region has nothing to say.
-  if (presentation === null) {
+  //
+  // ONE CONDITION, NOT TWO. The words and the colour pair come out of the same `state === null`
+  // test a line apart, so they are null together and never apart; the second operand is here to
+  // say that to the compiler, not to guard a divergence that can happen. It was a separate
+  // `if (look === null) return <>{liveRegion}</>` below this line — a branch that could never
+  // run, reading as though the two could come apart.
+  if (presentation === null || look === null) {
     return (
       <>
         {liveRegion}
@@ -265,8 +271,6 @@ export default function PublishStatusChip({
       </>
     )
   }
-
-  if (look === null) return <>{liveRegion}</>
 
   return (
     <>

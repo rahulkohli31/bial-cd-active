@@ -1,6 +1,7 @@
 /**
- * Builder-session store, server-backed (kind 'build'). Mirrors chatHistory.js
- * via the shared async factory. U7: the server persists turns itself — the page
+ * Builder-session store, server-backed (kind 'build'), built on the shared async factory. The
+ * plan-kind sibling that used to sit beside it is gone (plan 002, U3): the plan chat reaches
+ * `conversationApi` directly, so there was a module left holding nothing but re-exports. U7: the server persists turns itself — the page
  * creates the row before the first turn (`createBuild`) and reloads via the
  * projection read (`getBuild` → derived display messages). The legacy `code`
  * header snapshot died with its column (migration 0024); code truth lives in the

@@ -25,7 +25,7 @@ import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/re
 
 import { ComposerHarness } from './_composerHarness'
 import Composer, { type ComposerProps } from '../Composer'
-import { OFFER_GATE_NOTE } from '../OfferStrip'
+import { OFFER_GATE_NOTE, OFFER_LOCKED_NOTE } from '../OfferStrip'
 import { readDraft, writeDraft } from '../../../utils/composerDraft'
 
 afterEach(() => {
@@ -192,6 +192,34 @@ describe('the draft is held until the server confirms (R58/R59)', () => {
     expect(readDraft('chat-1')).toBe('do not lose me')
   })
 
+  it('★ stores what the box KEPT when the citizen rewrote it mid-send, rather than clearing it', async () => {
+    // THE DIVERGENCE THIS IS WRITTEN AGAINST. The box deliberately leaves a rewritten message
+    // alone, but the draft was cleared on every accepted send — so the composer showed words that
+    // were no longer stored anywhere, and because the mirror only fires when the text CHANGES
+    // nothing ever wrote them back. A reload, or a step to a sibling chat, destroyed them.
+    let release = () => {}
+    const gate = new Promise<void>((r) => { release = r })
+    const onSubmit = vi.fn().mockReturnValue(gate)
+    draw({ onSubmit })
+
+    type('make the header blue')
+    fireEvent.keyDown(box(), { key: 'Enter' })
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    expect(send().getAttribute('aria-disabled')).toBe('true') // the send is out
+
+    // While the request is out they select all and start again.
+    type('actually make it red')
+    release()
+
+    // WAIT FOR THE SEND TO SETTLE, not for the draft to hold a value it holds already: the store
+    // is written the moment they type, so an assertion polled from the press would pass before
+    // the clearing this test is about had even had its chance to run.
+    await waitFor(() => expect(send().getAttribute('aria-disabled')).toBe('false'))
+    expect(readDraft('chat-1')).toBe('actually make it red')
+    // …and the box and the store agree, which is the property.
+    expect(box().value).toBe('actually make it red')
+  })
+
   it('stamps the conversation at PRESS time, so a mid-send switch cannot misfile it (R60)', async () => {
     const onSubmit = vi.fn().mockResolvedValue(undefined)
     draw({ onSubmit })
@@ -221,6 +249,36 @@ describe('the draft follows its own chat', () => {
     writeDraft('chat-9', 'typed before the reload')
     draw({ conversationId: 'chat-9' })
     expect(box().value).toBe('typed before the reload')
+  })
+
+  it('★ a send that lands after a switch clears ITS chat, not the sibling’s live words', async () => {
+    // THE LEAK THIS IS WRITTEN AGAINST, and it is a leak the first attempt at the guard could not
+    // catch: the box performs a send from its PRESS-TIME closure, so the completion callback and
+    // the conversation it compared itself against came from the same render. The comparison was a
+    // value against itself, always true, and chat-1's accepted send therefore wrote whatever stood
+    // in the box — chat-2's half-typed sentence — over chat-1's stored draft.
+    let release = () => {}
+    const gate = new Promise<void>((r) => { release = r })
+    const onSubmit = vi.fn().mockReturnValue(gate)
+    const { rerender, props } = draw({ onSubmit })
+
+    type('for chat one')
+    fireEvent.keyDown(box(), { key: 'Enter' })
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+
+    // They step to a sibling while the request is still out, and start writing there.
+    rerender(<ComposerHarness><Composer {...props} conversationId="chat-2" /></ComposerHarness>)
+    expect(box().value).toBe('')
+    type('a sentence that belongs to chat two')
+
+    release()
+    await waitFor(() => expect(send().getAttribute('aria-disabled')).toBe('false'))
+
+    // chat-1's own message went, so chat-1's draft goes with it…
+    expect(readDraft('chat-1')).toBe('')
+    // …and the sibling keeps every word it was given, which is the half that was destroyed.
+    expect(readDraft('chat-2')).toBe('a sentence that belongs to chat two')
+    expect(box().value).toBe('a sentence that belongs to chat two')
   })
 })
 
@@ -275,6 +333,29 @@ describe('attachments', () => {
     noRealDisabled(container)
   })
 
+  it('★ claims a drop on the NOTE UNDER the box, which is where a mis-aimed one lands', async () => {
+    // THE STRIP UNDER THE BOX IS PART OF THE COMPOSER TO WHOEVER IS AIMING AT IT — the gate note,
+    // the context warning, the standing caption and the counter — and on a running turn there is
+    // always text there. Left outside the drop target, a drop a few pixels low fell through to the
+    // browser's default handler, which navigates the tab to the file and takes every staged
+    // attachment with it.
+    draw({ isRunning: true })
+    const note = screen.getByTestId('composer-gate-note')
+
+    const notCancelled = fireEvent.drop(note, {
+      dataTransfer: {
+        types: ['Files'],
+        files: [new File(['id,name\n1,Priya'], 'payroll.csv', { type: 'text/csv' })],
+      },
+    })
+
+    // `dispatchEvent` returns false exactly when something called `preventDefault` — which is the
+    // difference between the composer taking the file and the browser leaving the page.
+    expect(notCancelled).toBe(false)
+    // …and the file was actually staged, so the drop was claimed rather than merely swallowed.
+    await waitFor(() => expect(screen.getByTestId('composer-chips').textContent).toContain('payroll.csv'))
+  })
+
   it('attach never goes unavailable — staging a file is composing, not sending', () => {
     draw({ isRunning: true })
     const attach = screen.getByLabelText('Attach a file')
@@ -307,6 +388,24 @@ describe('attachments', () => {
     // LIVENESS — the composer is still mounted and usable in the sibling, so the chip's absence is
     // the switch clearing it rather than a component that failed to render.
     expect(box()).toBeTruthy()
+  })
+})
+
+describe('★ an offer waiting, drawn the way the boards draw it', () => {
+  it('★ draws the board\'s locked box, and its teal line beneath, while an offer waits', () => {
+    // `PlanReady` draws the locked composer as a whole: the input row on `#F8FAFC`, the paperclip
+    // at 40%, the sentence INSIDE the box where the placeholder was, and a centred teal line under
+    // it. Only the send circle carried any of it, and the in-box sentence had been relocated to a
+    // small grey note below — so the box still looked writable while a tool call waited.
+    draw({ offer: { toolCallId: 'c1', conversationId: 'chat-1', spent: false, onBuild: vi.fn(), onKeepPlanning: vi.fn() } })
+
+    expect(box().getAttribute('placeholder')).toBe(OFFER_GATE_NOTE)
+    expect(screen.getByTestId('composer').className).toMatch(/bg-canvas-offerlock/)
+    expect(screen.getByLabelText('Attach a file').className).toMatch(/opacity-40/)
+    const note = gateNote()
+    expect(note?.textContent).toBe(OFFER_LOCKED_NOTE)
+    expect(note?.className).toMatch(/text-center/)
+    expect(note?.className).toMatch(/text-canvas-offerink/)
   })
 })
 
@@ -367,7 +466,21 @@ describe('the send-unavailable cascade, with more than one arm true', () => {
   it('the offer speaks only when nothing more immediate is true', () => {
     draw({ isRunning: false, offer })
     type('short enough')
-    expect(gateNote()?.textContent).toBe(OFFER_GATE_NOTE)
+    // WHEN THE OFFER IS THE REASON, IT SPEAKS FROM INSIDE THE BOX — which is where both boards
+    // draw it — and the line under the box becomes the board's other sentence.
+    expect(box().getAttribute('placeholder')).toBe(OFFER_GATE_NOTE)
+    expect(gateNote()?.textContent).toBe(OFFER_LOCKED_NOTE)
+  })
+
+  it('★ and a more immediate reason takes the box back: white, its own hint, its own line', () => {
+    // The offer is still pending here. Only the reason that WON drives the treatment, so a build
+    // running under a waiting offer must not leave the box wearing the lock while the note under
+    // it talks about something else.
+    draw({ isRunning: false, gate, offer })
+    type('short enough')
+    expect(box().getAttribute('placeholder')).toBe('Ask for another change…')
+    expect(screen.getByTestId('composer').className).toMatch(/bg-white/)
+    expect(gateNote()?.textContent).toMatch(/Building your app/i)
   })
 
   it('says exactly ONE of them, however many are true', () => {

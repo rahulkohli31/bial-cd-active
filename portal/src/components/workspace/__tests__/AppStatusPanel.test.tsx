@@ -13,9 +13,10 @@
  * that a state with nothing to do gets no button rather than a dead one.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/react'
 import type { ApprovalState, DeploymentView, PublishState } from '../../../utils/deployApi'
 import type { UsePublishState } from '../../../hooks/usePublishState'
+import { WorkspaceChannelProvider, createWorkspaceChannel } from '../workspaceChannel'
 
 const h = vi.hoisted(() => ({ usePublishState: vi.fn() }))
 vi.mock('../../../hooks/usePublishState', () => ({ usePublishState: h.usePublishState }))
@@ -269,6 +270,34 @@ describe('the action', () => {
     expect(screen.getByTestId('data-classification-modal')).toBeTruthy()
   })
 
+  it('★ says so when the withdrawal is refused, rather than looking like nothing happened', () => {
+    // `withdraw` swallows its failure into `withdrawError` and does NOT re-read, so the pill, the
+    // rows and the button are all identical after a refusal. Both origins land here as one
+    // message: a 409 carries the server's own sentence (an administrator reached the submission
+    // first), anything else carries the hook's. Neither may be silent.
+    for (const message of [
+      'Only a submission still waiting for review can be taken back.',
+      'Could not withdraw this submission. Try again.',
+    ]) {
+      wire({ deployment: view('in_review'), approval: approval({ status: 'pending' }), withdrawError: message })
+      mount()
+      const alert = screen.getByRole('alert')
+      expect(alert.textContent, message).toBe(message)
+      // Liveness: the panel is still offering the action, so this is a refusal shown in place
+      // rather than a panel that has replaced itself with an error.
+      expect(screen.getByTestId('status-action').textContent, message).toContain('Take it back')
+      cleanup()
+    }
+  })
+
+  it('says nothing about a withdrawal that has not failed', () => {
+    // Pairs with the case above: the alert must not be a permanent fixture of the state.
+    wire({ deployment: view('in_review'), approval: approval({ status: 'pending' }) })
+    mount()
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.getByTestId('status-action').textContent).toContain('Take it back')
+  })
+
   it('renders no control with a real disabled attribute', () => {
     wire({ deployment: view('draft'), saving: true })
     mount()
@@ -310,5 +339,31 @@ describe('the unsaved-work question', () => {
     expect(screen.getByTestId('status-unsaved').textContent).toMatch(/not saved yet/i)
     fireEvent.click(screen.getByTestId('status-save-and-publish'))
     await waitFor(() => expect(saveAndPublish).toHaveBeenCalledTimes(1))
+  })
+
+  it('★ retires the question when the details are hidden, rather than leaving it pending unseen', () => {
+    // Hide details keeps this panel MOUNTED and merely invisible, and the question is per-mount
+    // state the chip's own hook instance knows nothing about — so the question and its live
+    // button sat behind a rail nobody could see while the chip beside the project name offered
+    // "Send for review" as though nothing were outstanding.
+    const dismissUnsaved = vi.fn()
+    const channel = createWorkspaceChannel()
+    wire({
+      deployment: view('draft'),
+      unsaved: 'Your workspace has changes that are not saved yet.',
+      dismissUnsaved,
+    })
+    render(
+      <WorkspaceChannelProvider value={channel}>
+        <AppStatusPanel projectId="p1" label={<h2>APP STATUS</h2>} />
+      </WorkspaceChannelProvider>,
+    )
+
+    // Open, the question stands and nothing is retired.
+    expect(screen.getByTestId('status-unsaved')).toBeTruthy()
+    expect(dismissUnsaved).not.toHaveBeenCalled()
+
+    act(() => channel.rail.set({ mode: 'details', stacked: false, collapsed: true }))
+    expect(dismissUnsaved).toHaveBeenCalledTimes(1)
   })
 })

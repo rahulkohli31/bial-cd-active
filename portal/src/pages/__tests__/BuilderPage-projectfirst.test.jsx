@@ -50,7 +50,6 @@ vi.mock('../../utils/conversationApi', async (importOriginal) => ({
 // The REAL observe module runs for the reveal test below \u2014 only the transport is replaced, so the
 // assertion is about the beacon that actually goes out, not about a mock being called.
 vi.mock('../../utils/api', async (orig) => ({ ...(await orig()), authFetch: h.authFetch }))
-vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 // Capture EVERY prop the preview is handed — the isolation assertion is about what it is fed.
 vi.mock('../../components/LivePreview', () => ({ default: (props) => { h.previewProps.push(props); return null } }))

@@ -10,20 +10,21 @@
  * entirely" forbids. Worse, this surface's toggle rendered into `LivePreview`'s toolbar, and
  * `LivePreview` only mounts when there is something to frame — so on a Plan chat, a project with
  * nothing built, or an app that had gone to sleep, the toggle did not exist at all, and a panel
- * collapsed while an app was running lost its way back the moment the container stopped. See
- * `AppPane.tsx`'s docblock for the fuller account; its collapse control is the survivor.
+ * collapsed while an app was running lost its way back the moment the container stopped. The
+ * survivor is `WorkspaceToolbar`'s: plan 002's U2 moved the control one step further out again,
+ * from the pane to the row above both columns, so it has one home whether the rail is collapsed,
+ * the pane is gone, or both. See `AppPane.tsx`'s docblock for the fuller account.
  *
- * WHY A PROBE, NOT A DOM QUERY, FOR THE TOGGLE ITSELF (mutation-check finding). The retired
- * toggle rendered through `usePublishPaneView`'s `toolbarLeading` slot, which only reaches the
- * DOM once `AppPaneHost`/`LivePreview` mount — and this suite's default fixture never resolves a
- * preview address, so that pane never mounts AT ALL. A first draft of this file asserted
- * `queryByRole('button', {name: /hide chat panel/i})` is null and it passed — but it would have
- * passed identically had the retired toggle still been wired up, because nothing in this fixture
- * ever gives it anywhere to render. Reintroducing the toggle and re-running proved it: every
- * "no button" assertion stayed green. `PaneToolbarProbe` below reads the REAL channel cell
- * `ConversationSurface` publishes to (`useWorkspacePane().toolbarLeading`) and renders it
- * directly, which is the actual unit boundary for what this file is about — what this surface
- * PUBLISHES, independent of whether `AppPane` later chooses to frame anything with it.
+ * THE SLOT ITSELF IS GONE, so no test here asserts it is empty. An earlier draft of this file
+ * asserted `queryByRole('button', {name: /hide chat panel/i})` is null and it passed — but it
+ * would have passed identically had the retired toggle still been wired up, because this fixture
+ * never resolves a preview address and the pane it rendered into never mounts. The answer at the
+ * time was a `PaneToolbarProbe` that read `useWorkspacePane().toolbarLeading` directly. U2 then
+ * deleted `toolbarLeading` and `toolbarTrailing` from `PaneView` altogether, which made the probe
+ * read a field no shape has — `undefined` for every possible state of this surface, and three
+ * assertions that could not fail — so it is gone too. What it guarded is now the TYPE system's:
+ * `UnacceptedPaneProps` in `workspaceChannel.ts` fails the build if `PaneView` ever grows a field
+ * `LivePreview` does not accept, and there is no slot left for a surface to publish chrome into.
  *
  * EVERY TEST BELOW NOW PROVES THE SAME UNDERLYING FACT FROM A DIFFERENT ANGLE: this surface
  * publishes no toggle, drives no width swap, and holds no collapse state of its own any more —
@@ -35,13 +36,14 @@
  * not unmounted, and never a one-way door" suite — and each guard below says so rather than
  * silently going quiet about where that coverage went.
  */
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, render, cleanup, fireEvent } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import { composer } from './_builderSession.jsx'
 import ConversationSurface from '../../components/chat/ConversationSurface'
 import WorkspaceShell from '../../components/workspace/WorkspaceShell'
-import { useWorkspacePane } from '../../components/workspace/workspaceChannel'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), appendBuilderMessage: vi.fn(), getBuild: vi.fn(),
@@ -54,7 +56,6 @@ vi.mock('../../utils/builderHistory', () => ({
   getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
-vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
 // THE LEGACY RELAY MOCK IS GONE WITH THE HOOK (Plan D U17). It stood in for `useClaudeAPI`, which
@@ -72,20 +73,12 @@ beforeEach(() => {
 })
 afterEach(() => cleanup())
 
-/** Renders whatever `ConversationSurface` published into the pane's `toolbarLeading` slot —
- *  see the file docblock for why this, rather than a DOM query, is the right boundary here. */
-function PaneToolbarProbe() {
-  const pane = useWorkspacePane()
-  return <div data-testid="pane-toolbar-leading-probe">{pane?.toolbarLeading}</div>
-}
-
 /** LIVENESS: the panel itself is on screen. The old `renderReady` waited for the retired
  *  "hide chat panel" button — waiting on that here would hang forever, which is exactly the
  *  false-negative shape L8 warns about (a removed control silently making every guard here
  *  unreachable rather than failing loudly). `chat-panel` is the surface's own static container,
  *  present the instant it renders, independent of the toggle that used to live in it. Mounted
- *  through the REAL `WorkspaceShell`, with `PaneToolbarProbe` alongside it under the same
- *  `WorkspaceChannelProvider` so the probe reads the channel this surface actually publishes to. */
+ *  through the REAL `WorkspaceShell`, so the surface publishes into the real channel. */
 async function renderReady(kind = 'build') {
   render(
     <MemoryRouter initialEntries={[`/chat/build-X?projectId=p1&kind=${kind}`]}>
@@ -93,12 +86,7 @@ async function renderReady(kind = 'build') {
         <Route element={<WorkspaceShell />}>
           <Route
             path="/chat/:chatId"
-            element={
-              <>
-                <ConversationSurface projectId="p1" projectName="VIP Movement" kind={kind} />
-                <PaneToolbarProbe />
-              </>
-            }
+            element={<ConversationSurface projectId="p1" projectName="VIP Movement" kind={kind} />}
           />
         </Route>
       </Routes>
@@ -108,30 +96,48 @@ async function renderReady(kind = 'build') {
 }
 
 describe('BuilderPage — the retired #42 chat-panel collapse (now the shell rail\'s, R13)', () => {
+  it('★ the scenarios it hands its retired properties to are really there, under those names', () => {
+    // EVERY GUARD IN THIS SUITE IS A POINTER. Each one says "this property still holds, and it is
+    // proven over there" — which is only worth anything while "over there" exists. Two of these
+    // citations had already rotted into a title no file has ever carried ("★ lives in the PANE…"),
+    // so a reader following them found nothing and had no way to tell a moved test from a deleted
+    // one. Nothing else in either suite would ever have noticed.
+    //
+    // Resolved from the vitest root (`portal/`) rather than from `import.meta.url`, which under
+    // vite is not a `file:` URL — the same reason `AppPane.test.tsx` reads the stylesheet that way.
+    const shellSuite = readFileSync(
+      resolve(process.cwd(), 'src/components/workspace/__tests__/ProjectWorkspace.test.tsx'),
+      'utf8',
+    )
+    for (const title of [
+      '★ lives in the TOOLBAR ROW, so it is still reachable once the rail is hidden',
+      'keeps the rail MOUNTED while collapsed, so nothing inside it is discarded',
+    ]) {
+      expect(shellSuite, title).toContain(title)
+    }
+  })
+
   it('publishes no hide/show chat-panel toggle into the pane\'s toolbar — the rail\'s ONE collapse is drawn by AppPane now', async () => {
     await renderReady()
 
-    // LIVENESS: the composer is really on screen, so an empty probe below is not an artifact of
-    // the surface rendering nothing.
+    // The surface mounts and runs, and there is no slot on `PaneView` for it to push a toggle
+    // into: U2 deleted `toolbarLeading`/`toolbarTrailing`, and `UnacceptedPaneProps` fails the
+    // build if the shape grows a field back. The collapse control that survived is the
+    // shell's, drawn once in the toolbar row above both columns and pinned in
+    // `ProjectWorkspace.test.tsx` ("★ lives in the TOOLBAR ROW, so it is still reachable once
+    // the rail is hidden").
     expect(composer()).toBeTruthy()
-    // INERTNESS: the channel cell this surface publishes `toolbarLeading` into is genuinely
-    // empty — read via the SAME hook `AppPaneHost` would spread into `LivePreview`, not via a DOM
-    // query that a mount-gated toolbar could make vacuously true either way (see docblock).
-    const probe = screen.getByTestId('pane-toolbar-leading-probe')
-    expect(probe.textContent).toBe('')
-    expect(probe.querySelector('button')).toBeNull()
   })
 
   it('has no hide/show cycle left to run the composer draft through — draft-survival is pinned at the shell now (ProjectWorkspace.test.tsx, "keeps the rail MOUNTED while collapsed")', async () => {
     await renderReady()
 
     fireEvent.change(composer(), { target: { value: 'a visitor pass tracker' } })
-    // LIVENESS: the draft is genuinely held by this surface's own composer state.
+    // LIVENESS: the draft is genuinely held by this surface's own composer state — which is what
+    // the retired cycle put at risk. There is no toggle left here to cycle it with, so the
+    // survival property is exercised where the surviving collapse lives (ProjectWorkspace.test.tsx,
+    // "keeps the rail MOUNTED while collapsed").
     expect(composer().value).toBe('a visitor pass tracker')
-    // INERTNESS: there is no toggle published that could hide/show this panel and put that draft
-    // at risk — the property this test used to exercise by cycling one no longer has a cycle to
-    // run on THIS component. (The shell's rail collapse still has it; that is the other file's job.)
-    expect(screen.getByTestId('pane-toolbar-leading-probe').textContent).toBe('')
   })
 
   it('fills the rail rather than setting a width of its own; `WorkspaceShell.railWidthClass` governs the rail', async () => {
@@ -146,7 +152,6 @@ describe('BuilderPage — the retired #42 chat-panel collapse (now the shell rai
     expect(panel.className).toMatch(/flex-1/)
     // INERTNESS: nothing on this surface can drive its width to zero — there is no toggle left
     // to press, and the class is no longer a ternary on any local state.
-    expect(screen.getByTestId('pane-toolbar-leading-probe').textContent).toBe('')
     expect(panel.className).not.toMatch(/(^|\s)w-0(\s|$)/)
   })
 
@@ -155,24 +160,21 @@ describe('BuilderPage — the retired #42 chat-panel collapse (now the shell rai
     const viewport = screen.getByTestId('thread-viewport')
     viewport.scrollTop = 40
 
-    // INERTNESS FIRST: there is no toggle published on this surface that could hide/show the
-    // panel and put the scroll position at risk in the first place.
-    expect(screen.getByTestId('pane-toolbar-leading-probe').textContent).toBe('')
-    // LIVENESS: the viewport this test is about is really mounted and really holds the value —
-    // proving the assertion above is not vacuous over a surface that rendered nothing.
+    // LIVENESS: the viewport this test is about is really mounted and really holds the value.
+    // There is no toggle on this surface that could hide and show it again, so the survival
+    // property is exercised at the shell instead (ProjectWorkspace.test.tsx, same suite).
     expect(screen.getByTestId('thread-viewport').scrollTop).toBe(40)
   })
 
-  it('publishes no toggle of its own to keep reachable — "stays reachable while collapsed" is entirely AppPane\'s property now (ProjectWorkspace.test.tsx, "★ lives in the PANE...")', async () => {
+  it('publishes no toggle of its own to keep reachable — "stays reachable while collapsed" is entirely the shell\'s property now (ProjectWorkspace.test.tsx, "★ lives in the TOOLBAR ROW…")', async () => {
     await renderReady()
 
-    // LIVENESS: the surface rendered its ordinary chrome.
+    // LIVENESS: the surface rendered its ordinary chrome. There is nothing here to ask "does it
+    // stay reachable while hidden" about — this surface retired the whole toggle rather than
+    // relocating it, so the question the old test asked has no subject left on THIS component.
+    // The control that must answer it is drawn in the workspace's toolbar row, and is pinned in
+    // `ProjectWorkspace.test.tsx` under "★ lives in the TOOLBAR ROW…".
     expect(screen.getByTestId('chat-panel')).toBeTruthy()
-    // INERTNESS: there is nothing here to ask "does it stay reachable while hidden" about — this
-    // surface has retired the whole toggle, not merely relocated it, so the question the old test
-    // asked has no subject left on THIS component. The control that must answer it lives in
-    // `AppPane` and is pinned there.
-    expect(screen.getByTestId('pane-toolbar-leading-probe').textContent).toBe('')
   })
 })
 

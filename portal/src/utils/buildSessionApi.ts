@@ -464,12 +464,22 @@ export async function readStopStateOf(
  * number constrains anything: the read is cheap, nothing is held open, and the ceiling only
  * decides when the dialog stops saying "closing…" and starts saying it could not.
  *
- * The ceiling is deliberately above the server's own stop budget, which is itself derived from
- * the recovery autosave inside the finish path — so an ordinary healthy turn finishes well inside
- * it, and reaching it means something is genuinely wrong rather than merely slow.
+ * THE CEILING IS DELIBERATELY BELOW THE SERVER'S OWN STOP BUDGET, which is the opposite of what
+ * this said when the two were closer together. That budget is derived from the work a stop
+ * actually waits on, and the derivation now includes the snapshot a build's unwind writes — four
+ * bounded steps of two minutes each — which puts it a little over eight minutes. Nobody should be
+ * held in front of a modal for eight minutes to learn whether they may switch projects, so the
+ * browser stops WAITING first, at two.
+ *
+ * WHICH COSTS NOTHING, BECAUSE EXPIRING HERE IS NOT A VERDICT. The stop runs as a detached task
+ * server-side; the state read is the authority and is idempotent; and the hand-over proceeds on
+ * nothing but a settled answer. So reaching this ceiling ends the WAIT, not the stop, and a
+ * second press picks it up wherever it has got to. What must not be said at this point is that
+ * anything failed — the likeliest reason for passing two minutes is a large app being packed up
+ * exactly as it should be, which is why the sentence in `handOverWorkspace` says so.
  */
-const STOP_POLL_MS = 1200
-const STOP_CEILING_MS = 120_000
+export const STOP_POLL_MS = 1200
+export const STOP_CEILING_MS = 120_000
 /**
  * HOW LONG ONE READ MAY HANG BEFORE IT IS ABANDONED — and why this is a REAL timer and not the
  * injected clock's.
@@ -499,6 +509,16 @@ const STOP_READ_TIMEOUT_MS = 15_000
  * than treated as "still running for ever" — the browser losing the network is not evidence about
  * the other project's turn — and the caller can simply ask again afterwards, because the stop
  * itself is running server-side and the state read is idempotent.
+ *
+ * BUT A DECIDED ANSWER IS NOT A BLIP, AND RETRYING ONE IS ITS OWN DEFECT (review #38). A session
+ * that expired mid-hand-over answers 401 to every read; `authFetch` attempts a refresh on each of
+ * them, so the dialog sat on "Closing the other app…" for two minutes issuing a hundred reads and
+ * a hundred refresh attempts — the very traffic the refresh path documents as tripping
+ * reuse-detection — and then answered with the ceiling's own sentence, which describes the other
+ * project still packing its work away and had nothing to do with what actually failed. A
+ * 403 (or a 404 from a project deleted in another tab) behaved the same way. Those statuses are
+ * answers the poll cannot change, so they travel straight out to the dialog, which says the true
+ * thing immediately. Everything else — an abort, a dropped socket, a 5xx — is still a blip.
  */
 export interface StopWaitClock {
   now: () => number
@@ -511,6 +531,15 @@ export const REAL_CLOCK: StopWaitClock = {
   now: () => Date.now(),
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 }
+
+/**
+ * The statuses a repeat of the same read can only answer the same way: the session is gone, this
+ * user may not ask, or there is no such project. Deliberately NOT 5xx — a server that fell over
+ * mid-stop may well be up on the next tick, and the stop is still running behind it.
+ */
+const DECIDED_STATUSES: ReadonlySet<number> = new Set([401, 403, 404])
+
+const isDecided = (err: unknown): boolean => err instanceof ApiError && DECIDED_STATUSES.has(err.status)
 
 export async function awaitStopSettled(
   projectId: string,
@@ -526,7 +555,8 @@ export async function awaitStopSettled(
     try {
       last = await readStopStateOf(projectId, deps, abandon.signal)
       if (stopSettled(last)) return last
-    } catch {
+    } catch (err) {
+      if (isDecided(err)) throw err
       // Retried below. See the docblock: a read that failed — or was abandoned — decided nothing.
     } finally {
       clearTimeout(bell)
@@ -575,7 +605,12 @@ export async function handOverWorkspace(
     // NOT AN ERROR OF OURS, AND NOT A REASON TO TAKE THE CONTAINER. Everything the citizen has is
     // still where it was; what failed is the wait, and asking again is the remedy.
     throw new ApiError(
-      'The other project has not finished what it was doing yet. Nothing has changed — try again in a moment.',
+      // THE TRUE THING AT TWO MINUTES, which is not "that project failed" (review #45). The
+      // browser's ceiling is under the server's on purpose — see `STOP_CEILING_MS` — so arriving
+      // here almost always means the other app is still putting its work away, and the wait is
+      // what ran out rather than the stop. Nothing has been taken from either project, and asking
+      // again resumes the same stop instead of starting a second one.
+      'The other app is still saving its work. Nothing has changed — give it a moment and try again.',
       409,
       'stop_did_not_settle',
     )
@@ -588,8 +623,17 @@ export async function handOverWorkspace(
   await releaseProject(projectId, deps)
 }
 
-/** What a hand-over is doing right now, so the dialog can say it rather than spin. */
-export type HandoverStep = 'stopping' | 'saving' | 'releasing' | 'starting' | 'opening'
+/**
+ * What a hand-over is doing right now, so the dialog can say it rather than spin.
+ *
+ * IT STOPS AT `starting`, AND THAT IS THE WHOLE SEQUENCE (review #39/#82). There was an `opening`
+ * member here for the chat being opened, with copy already written for it, and nothing could ever
+ * produce it: the retry's last act is a navigate, which unmounts the surface publishing the dialog
+ * in the very commit that would have carried the new step, so no render can reach it. The wait it
+ * was meant to describe is the destination's own — the chat surface and the app pane both narrate
+ * themselves as they come up — and a member no writer can set is dead code with copy attached.
+ */
+export type HandoverStep = 'stopping' | 'saving' | 'releasing' | 'starting'
 
 /** The project standing in the way, read off a `sandbox_reclaim_blocked` 409. */
 export interface ReclaimBlocked {
