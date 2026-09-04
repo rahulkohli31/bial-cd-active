@@ -182,9 +182,6 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
       // outrank a terminal status, and an app reached from the project screen is exactly that.
       iterating: false,
       reconnecting: false,
-      relaunching: false,
-      relaunchError: null,
-      lastBuildFailed: false,
       restoredFromFailedBuild: false,
       completedLive: true,
       turnRunning: false,

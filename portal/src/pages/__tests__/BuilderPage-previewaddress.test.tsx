@@ -54,7 +54,7 @@ const h = vi.hoisted(() => ({
   listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), stopTurn: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  start: vi.fn(), relaunchPreview: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
+  relaunchPreview: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
   fetchPreviewState: vi.fn(), fetchSaveState: vi.fn(),
 }))
 
@@ -144,10 +144,10 @@ afterEach(() => cleanup())
  *
  * RE-POINTED (Plan F, U3/U4). The old vehicle clicked a "Relaunch" button `LivePreview` rendered
  * inside its own terminal placeholder, fed by `handleRelaunch` — which stamped `sessionProjectRef`
- * as a side effect of the click itself. Both are gone: `RelaunchAffordance` and its four render
- * sites are retired, and `handleRelaunch` has had no caller since — `onRelaunch` is still threaded
- * onto the pane's props for typing continuity, but nothing in `LivePreview`'s JSX reads it any
- * more (confirmed by reading the file: it is destructured and never invoked). The one control left
+ * as a side effect of the click itself. All of it is gone now: `RelaunchAffordance` and its four
+ * render sites went first, `handleRelaunch` had no caller after that because `onRelaunch` was a
+ * pane prop nothing read, and the whole chain — callback, flag, error and hook function — has since
+ * been deleted rather than left threaded for typing continuity. The one control left
  * is `StartAppControl`, and getting it a chance to press is the whole of what changed here —
  * `primeStandbyReattach` stamps the ref `StartAppControl`'s OWN click path never touches, and
  * `findStartAppControl` presses whichever label the map is currently showing (both call the exact

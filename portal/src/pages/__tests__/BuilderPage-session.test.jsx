@@ -45,7 +45,6 @@ const h = vi.hoisted(() => ({
   buildFromPlan: vi.fn(),
   stopTurn: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  start: vi.fn(),
   relaunchPreview: vi.fn(),
   stop: vi.fn(),
   getStatus: vi.fn(),
@@ -189,12 +188,14 @@ describe('BuilderPage — the build-turn flow (ORIG-§3-d/f)', () => {
 
     // The build starts through the ATOMIC TRANSITION — a SECOND, brand-new build chat, created,
     // seeded with the plan, and started, server-side (U5/U12) — and the page NAVIGATES there and
-    // subscribes to the TURN the handoff returns. Neither C3 door is opened: `start` was already
-    // not a client concern, and now `getStatus` isn't either — there is no session to join at all.
+    // subscribes to the TURN the handoff returns. The C3 door stays shut: `getStatus` is never
+    // called, so there is no session to join at all. (`start` was asserted here too until the
+    // client wrapper was deleted; a mock wired to nothing proves nothing, and what took its place
+    // is the member-set guard in `utils/__tests__/buildSessionApi.test.ts`, which fails if a start
+    // wrapper reappears on the client at all.)
     // Third arg is the client-minted id of that new chat (a real `uuidv7()`, so only its shape is
     // pinned, not its value).
     expect(h.buildFromPlan).toHaveBeenCalledWith('build-X', PLAN_CARD_ID, expect.any(String))
-    expect(h.start).not.toHaveBeenCalled()
     expect(h.getStatus).not.toHaveBeenCalled()
     // Cursor 0 deliberately: the build may have been running for seconds before this subscribe
     // landed, and the consolidating snapshot is what recovers the frames it missed. The
@@ -458,7 +459,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     //
     // THE TOAST'S WORDING IS THE GENERIC ONE, not "your app is being built". `buildActiveHere`
     // (the branch that would say that) only ever fires for a LEGACY session reattach now — this
-    // page's own send path never starts one (`session.start()` is not called anywhere in it) — so
+    // page's own send path cannot start one (`session.start()` has been deleted from the hook) — so
     // an ARRIVED, ALREADY-STREAMING build turn reads as an ordinary in-flight reply once you are
     // on the chat it runs in. "Building your app…" still appears, but only for the click-time
     // round-trip (`buildStarting`), pinned separately in `BuilderPage-composer.test.jsx`.

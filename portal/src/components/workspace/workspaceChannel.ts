@@ -64,7 +64,6 @@ import type LivePreview from '../LivePreview'
 import type { PreviewAddress } from '../../utils/previewAddress'
 import type { CompileState } from '../../utils/compileState'
 import type { HandoverStep, PreviewLifeState, ReclaimBlocked } from '../../utils/buildSessionApi'
-import type { RelaunchError } from '../../utils/buildSessionTypes'
 import { sameWorkspaceState } from './workspaceState'
 import type { StartOutcome, WorkspaceState } from './workspaceState'
 
@@ -136,11 +135,12 @@ export interface PaneView {
   /** Chat-scoped: this conversation's own turn. */
   iterating: boolean
   reconnecting: boolean
+  /* THE RELAUNCH FOUR ARE GONE — `onRelaunch`, `relaunching`, `relaunchError`, `lastBuildFailed`.
+     `LivePreview` accepted the callback and never read it, so `ConversationSurface.handleRelaunch`
+     could never fire and the session state above it could never move: three of the four were
+     published as constants on both surfaces already. `lastBuildFailed` had to leave here and there
+     in ONE change, which is exactly what `UnacceptedPaneProps` below exists to force. */
   /** Project-scoped: the project's one workspace and its restore path. */
-  onRelaunch?: () => void
-  relaunching: boolean
-  relaunchError: RelaunchError | null
-  lastBuildFailed: boolean
   restoredFromFailedBuild: boolean
   completedLive: boolean
   hasSavedBuild: boolean | null

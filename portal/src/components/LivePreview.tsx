@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import type { ReactNode } from 'react'
 import { Loader2, Moon, PowerOff, RotateCcw, WifiOff } from 'lucide-react'
-import type { RelaunchError, BuildSessionStatus } from '../utils/buildSessionTypes'
+import type { BuildSessionStatus } from '../utils/buildSessionTypes'
 import type { PreviewLifeState } from '../utils/buildSessionApi'
 import type { CompileState } from '../utils/compileState'
 
@@ -67,9 +67,11 @@ const LOADING_TEXT: Partial<Record<BuildSessionStatus, string>> = {
 // is stale by then (the build is done) and silence is the blank white card this unit exists to
 // kill — so the wait gets its own honest line.
 const FRAMING_TEXT = 'Starting your app…'
-// The one sentence both slow waits use. Deliberately shared: the citizen is in ONE situation
-// ("my app has not opened yet") and naming it twice depending on which internal timer happens
-// to be running is the pane talking about itself instead of to them.
+// The frame-load wait's escalated sentence, said in both places it belongs (the card and the live
+// region). It was shared with a second, relaunch-side wait that has since gone with its flag; the
+// reason it is one string rather than two survives that — the citizen is in ONE situation ("my app
+// has not opened yet"), and naming it twice depending on which internal timer happens to be running
+// is the pane talking about itself instead of to them.
 const SLOW_TEXT = 'Your app is taking longer than usual to open'
 
 // R16/R18 — THE COVER. What the citizen sees instead of the framework's full-screen compile-error
@@ -195,8 +197,11 @@ function goneBody(
  * the person's word is their app.
  *
  * The COPY around them stayed where it was: these placeholders still explain what happened. What
- * left is the button, and the `onRelaunch` / `relaunchError` props that fed it now only reach the
- * arms that still describe a state — `LivePreview.test.jsx` carries the inertness guards.
+ * left is the button — and, with this sweep, the whole prop chain that fed it. `onRelaunch`,
+ * `relaunching`, `relaunchError` and `lastBuildFailed` are gone from this component, from
+ * `PaneView`, and from the session hook that produced them: the first was accepted and never read,
+ * so nothing above it could ever fire. The placeholders keep their sentences; what they no longer
+ * carry is a not-found arm that only a dead `relaunchError` could select.
  */
 
 /**
@@ -260,16 +265,8 @@ function BouncingWait({ children, className = '' }: { children: ReactNode; class
  *                    rig with its OWN inline origin guard: it never renders this component, so it
  *                    neither exercises nor regression-catches the gate written here.
  *
- *   - `onRelaunch` — when set, the terminal (ended/failed) placeholder offers a "Relaunch preview"
- *                    button (#43): restore the torn-down app from its snapshot into a fresh sandbox.
- *   - `relaunching` — true while that restore is in flight; the pane shows a "Restoring…" affordance
- *                    (and hides the button) so a second click can't fire a self-conflicting request.
- *   - `relaunchError` — the discriminated relaunch failure (U6 response matrix): `not_found` hides
- *                    the affordance ("nothing to relaunch"); `unavailable`/`failed` show their copy
- *                    with the button restored for a retry. 409 renders via the block banner, not here.
- *   - `lastBuildFailed` — the newest recorded build outcome FAILED, so a relaunch restores the last
- *                    SAVED version — the button says so instead of promising that build's result.
- *   - `restoredFromFailedBuild` — the framed preview IS such a restore (server-confirmed); a small
+ *   - `restoredFromFailedBuild` — a restore of the last SAVED version, because the newest build
+ *                    FAILED (server-confirmed); a small
  *                    overlay says so, so older code is never presented as the latest build.
  *   - `completedLive` — the session ended as a SUCCESS and the server pardoned its container
  *                    (#13/R2: it stays up under an idle lease), so `ended` + `previewUrl` means
@@ -301,10 +298,6 @@ export interface LivePreviewProps {
   status?: BuildSessionStatus | null
   iterating?: boolean
   onFrameMessage?: (data: unknown) => void
-  onRelaunch?: () => void
-  relaunching?: boolean
-  relaunchError?: RelaunchError | null
-  lastBuildFailed?: boolean
   restoredFromFailedBuild?: boolean
   completedLive?: boolean
   hasSavedBuild?: boolean | null
@@ -373,20 +366,6 @@ export default function LivePreview({
   status = null,
   iterating = false,
   onFrameMessage,
-  // ACCEPTED AND DELIBERATELY UNREAD, like `lastBuildFailed` above. It gated the copy that named
-  // the retired start button; the button is `AppPane`'s now and the copy no longer directs anybody
-  // at it. The prop stays because `PaneView` still carries it and `UnacceptedPaneProps` pins that
-  // every field there is a real prop of this component — removing it here without removing it
-  // there would turn that guard red for the wrong reason.
-  onRelaunch: _onRelaunch,
-  relaunching = false,
-  relaunchError = null,
-  // ACCEPTED AND DELIBERATELY UNREAD. It chose between two labels on the start button this unit
-  // retired ("Relaunch preview" vs "Relaunch last saved version"). The prop stays because the
-  // pane view still carries it and `UnacceptedPaneProps` pins that every field here is a real
-  // prop; the distinction it drew now belongs to `restoredFromFailedBuild` below, which says the
-  // same thing where a citizen can act on it.
-  lastBuildFailed: _lastBuildFailed = false,
   restoredFromFailedBuild = false,
   completedLive = false,
   // Absent means UNKNOWN, never "confirmed there is not" — a default of false would let a
@@ -440,7 +419,7 @@ export default function LivePreview({
   // regression, not a simplification.
   //
   // FAILS CLOSED, DELIBERATELY STRUCTURALLY. The frame is conditionally mounted and keyed, so the
-  // ref is legitimately null while the pane is reconnecting/terminal/relaunching and across every
+  // ref is legitimately null while the pane is reconnecting or terminal, and across every
   // reload-nonce remount; messages arriving then are dropped, where origin alone used to forward
   // them. That is accepted knowingly — in those states the app document is gone, so nothing can be
   // posting. `frameWindow` is bound and null-guarded rather than compared inline because
@@ -480,13 +459,16 @@ export default function LivePreview({
   // with a URL, though — a completed build whose preview never came up still gets the
   // placeholder rather than a blank pane.
   const keepFramed = completedLive && !!previewUrl
-  // Precedence: a relaunch in flight shows "Restoring…" over everything; then a terminal session
-  // collapses to a defined placeholder even if a `previewUrl` is still around (post-ready teardown
-  // must NOT keep displaying a now-dead URL) — UNLESS the pardon says the URL is genuinely live.
-  // Otherwise a live `previewUrl` frames the app; else we are still provisioning/building
-  // (loading) or idle (empty).
-  const showRestoring = relaunching
-  const showTerminal = isTerminal && !relaunching && !keepFramed
+  // Precedence: a terminal session collapses to a defined placeholder even if a `previewUrl` is
+  // still around (post-ready teardown must NOT keep displaying a now-dead URL) — UNLESS the pardon
+  // says the URL is genuinely live. Otherwise a live `previewUrl` frames the app; else we are still
+  // provisioning/building (loading) or idle (empty).
+  //
+  // A "Restoring…" state used to sit above all of this, keyed off `relaunching`. It is gone with
+  // the flag: nothing could set it, so it could only ever have unmounted the frame for a restore
+  // that never started. The restore a citizen can actually run is `StartAppControl`'s, and the
+  // frame's own load-gated wait is what labels it.
+  const showTerminal = isTerminal && !keepFramed
   // The three states that mean "no container is serving this project". `unknown` is POINTEDLY
   // not one of them: the server could not ask, so the pane changes nothing — which is the
   // entire behavioural difference between this and the boolean it replaced.
@@ -500,7 +482,7 @@ export default function LivePreview({
   const notServing = goneState !== null
   // The pane WOULD frame the app here (live preview or pardoned completed build). A dev-process
   // crash (`reconnecting`) pre-empts the live frame with the reconnecting/unavailable states.
-  const frameContext = !relaunching && !!previewUrl && (!isTerminal || keepFramed)
+  const frameContext = !!previewUrl && (!isTerminal || keepFramed)
   const showReconnecting = frameContext && reconnecting && !notServing && !reconnectExpired
   const showUnavailable = frameContext && (notServing || (reconnecting && reconnectExpired))
   const showFrame = frameContext && !reconnecting && !notServing
@@ -576,9 +558,9 @@ export default function LivePreview({
   }, [previewUrl, compileState])
 
   // The cover only exists over a frame. Everything above it in the precedence chain
-  // (restoring / terminal / reconnecting / unavailable) already replaces the frame entirely, and
-  // `showFrame` is false in every one of those states — so this single conjunction expresses the
-  // whole of `showRestoring > showTerminal > showReconnecting > showUnavailable > cover`.
+  // (terminal / reconnecting / unavailable) already replaces the frame entirely, and `showFrame`
+  // is false in every one of those states — so this single conjunction expresses the whole of
+  // `showTerminal > showReconnecting > showUnavailable > cover`.
   //
   // U4 — AND A CONFIRMED REVERSION COVERS UNCONDITIONALLY. Every other reason to cover is a fact
   // about a COMPILE, so it is right that they defer to a compile signal that says clean. This one
@@ -666,21 +648,10 @@ export default function LivePreview({
   // `load`. It used to be destroyed the instant `previewUrl` arrived, which is precisely when the
   // 5-7s first-route compile begins: the spinner vanished and left an unlabelled blank white card
   // at the exact moment the citizen had been told their app was ready.
-  // …and the same honest wait for a RELAUNCH, which had none. The cap above is armed off
-  // `showFrame`, but `frameContext` excludes `relaunching`, so the frame is unmounted for the whole
-  // restore — meaning the ONE wait that can legitimately run for minutes was the one wait that
-  // could never label itself. SL-20 watched a citizen sit on a bare "Restoring your app…" for two
-  // solid minutes and then get told the sandbox was unavailable. Same cap as the frame's, so both
-  // waits start speaking at the same moment rather than inventing a second timing vocabulary.
-  const [relaunchSlow, setRelaunchSlow] = useState(false)
-  useEffect(() => {
-    if (!relaunching) {
-      setRelaunchSlow(false)
-      return
-    }
-    const t = setTimeout(() => setRelaunchSlow(true), FRAME_LOAD_CAP_MS)
-    return () => clearTimeout(t)
-  }, [relaunching])
+  // (A second copy of this wait once ran for a RELAUNCH, off `relaunching`. SL-20's finding —
+  // that the one wait which can legitimately run for minutes must label itself — is not lost: the
+  // restore a citizen can run today comes back as a `previewUrl` and is waited on by the frame's
+  // own cap above, which is where SL-20's shared vocabulary was the point.)
 
   // R16/R18 — THE COVER'S STATE, and the whole safety property is in which signals move it.
   //
@@ -748,24 +719,20 @@ export default function LivePreview({
   }, [revealed, workspaceLost, frameKey, onRevealed])
   const framePending = showFrame && !frameLoaded && !frameStalled
   const showLoading =
-    framePending || (!isTerminal && !relaunching && !previewUrl && (status === 'provisioning' || status === 'building'))
+    framePending || (!isTerminal && !previewUrl && (status === 'provisioning' || status === 'building'))
   // `showEmpty` is GONE with the empty state it gated — see the note at its old render site.
 
   // ONE announcement for the whole pane, read out of a region that is ALWAYS mounted (below).
   // The pane now has four preview states on top of its four waits, and before this the only
-  // thing carrying `aria-live` was the reconnecting box; `showRestoring` and the loading
-  // overlay carried `aria-busy`, which announces exactly nothing. Mounting a live region
+  // thing carrying `aria-live` was the reconnecting box; the loading overlay carried
+  // `aria-busy`, which announces exactly nothing. Mounting a live region
   // together with its text announces inconsistently across screen readers, so the region is
   // permanent and only this string changes.
   //
   // Ordered by what is actually on screen, most specific first. `polite` throughout — none of
-  // these is an error, and `assertive` is reserved for the ones that are (the relaunch failure
-  // and the save failure keep their own `role="alert"`).
-  const announcement = showRestoring
-    ? relaunchSlow
-      ? SLOW_TEXT
-      : 'Restoring your app…'
-    : showReconnecting
+  // these is an error, and `assertive` is reserved for the ones that are (the save failure keeps
+  // its own `role="alert"`).
+  const announcement = showReconnecting
       ? 'Reconnecting to your preview…'
       : showCover
         ? coverText
@@ -818,35 +785,6 @@ export default function LivePreview({
               reads when there is nothing to frame is `AppPane`'s, drawn from the one computed
               workspace state, so a pane sentence has exactly one author. */}
 
-          {showRestoring && (
-            <div className="flex-1 flex flex-col items-center justify-center gap-4" aria-busy="true">
-              <div className="flex gap-2">
-                {[0, 1, 2].map((i) => (
-                  <div
-                    key={i}
-                    className="w-3 h-3 bg-primary rounded-full animate-bounce"
-                    style={{ animationDelay: `${i * 0.2}s` }}
-                  />
-                ))}
-              </div>
-              <p className="text-sm text-neutral font-medium">Restoring your app…</p>
-              {/* Deliberately the SAME sentence the frame-load stall uses. The citizen is in one
-                  situation — "my app has not opened yet" — and giving that situation two different
-                  names depending on which internal wait happens to be running is the pane talking
-                  about itself instead of to them. The second line says the part that is specific to
-                  a relaunch: nothing is lost while this runs. */}
-              {relaunchSlow && (
-                <div className="flex flex-col items-center gap-1 text-center max-w-xs">
-                  <p className="text-sm font-semibold text-neutral">{SLOW_TEXT}</p>
-                  <p className="text-xs text-neutral leading-relaxed">
-                    This usually means the app&rsquo;s first page is slow to load. Your work is safe
-                    — nothing is discarded while this runs.
-                  </p>
-                </div>
-              )}
-            </div>
-          )}
-
           {/* F8/U5 — the dev-server PROCESS crashed after framing. A DISTINCT visual from the
               "Building…" blue bouncing dots (a spinning glyph + warning tint) so a dead frame never
               reads as "still building". Self-heals when the server restarts (a fresh preview_ready). */}
@@ -892,25 +830,16 @@ export default function LivePreview({
                   {goneState ? GONE_TITLE[goneState] : 'Preview unavailable'}
                 </p>
                 {/* R5: the saved-app promise is made ONLY when the server confirmed a saved build
-                    (strict === true — null is "store unreachable", which claims nothing). A 404
-                    after the click is said out loud, like the empty branch's, never a silently
-                    vanished button. */}
-                {relaunchError?.kind === 'not_found' ? (
-                  <p role="alert" className="text-xs text-danger leading-relaxed mb-3">
-                    There&rsquo;s nothing to relaunch yet — this project has no saved build. Build
-                    the app first.
-                  </p>
-                ) : (
-                  <p className="text-xs text-neutral/60 leading-relaxed mb-3">
-                    {goneState
-                      ? goneBody(goneState, occupyingProjectName, hasSavedBuild)
-                      : hasSavedBuild === false
-                        ? 'There’s nothing to relaunch yet — this project has no saved build. Build the app first.'
-                        : hasSavedBuild === true
-                          ? 'The preview server stopped and didn’t come back. Your saved app is still there.'
-                          : 'The preview server stopped and didn’t come back. Start a new build to bring the live preview back.'}
-                  </p>
-                )}
+                    (strict === true — null is "store unreachable", which claims nothing). */}
+                <p className="text-xs text-neutral/60 leading-relaxed mb-3">
+                  {goneState
+                    ? goneBody(goneState, occupyingProjectName, hasSavedBuild)
+                    : hasSavedBuild === false
+                      ? 'There’s nothing to relaunch yet — this project has no saved build. Build the app first.'
+                      : hasSavedBuild === true
+                        ? 'The preview server stopped and didn’t come back. Your saved app is still there.'
+                        : 'The preview server stopped and didn’t come back. Start a new build to bring the live preview back.'}
+                </p>
                 {/* The button is a SHORTCUT, never the only way back: a prompt restores the
                     workspace too, behind the labelled wait. Offered on the same confirmed-true
                     gate as everywhere else on this pane. */}
@@ -931,22 +860,14 @@ export default function LivePreview({
                 </div>
                 <p className="text-sm font-semibold text-neutral mb-1">The preview is no longer running</p>
                 {/* R5, same discipline as the empty branch: the saved-app claim needs the server's
-                    confirmed === true (null claims nothing in either direction), and the 404
-                    not-found is an announced role="alert", never an unexplained missing button. */}
-                {relaunchError?.kind === 'not_found' ? (
-                  <p role="alert" className="text-xs text-danger leading-relaxed mb-3">
-                    There&rsquo;s nothing to relaunch yet — this project has no saved build. Build
-                    the app first.
-                  </p>
-                ) : (
-                  <p className="text-xs text-neutral/60 leading-relaxed mb-3">
-                    {hasSavedBuild === false
-                      ? 'There’s nothing to relaunch yet — this project has no saved build. Build the app first.'
-                      : hasSavedBuild === true
-                        ? 'This build session has ended. Your saved app is still there.'
-                        : 'This build session has ended. Start a new build to bring the live preview back.'}
-                  </p>
-                )}
+                    confirmed === true (null claims nothing in either direction). */}
+                <p className="text-xs text-neutral/60 leading-relaxed mb-3">
+                  {hasSavedBuild === false
+                    ? 'There’s nothing to relaunch yet — this project has no saved build. Build the app first.'
+                    : hasSavedBuild === true
+                      ? 'This build session has ended. Your saved app is still there.'
+                      : 'This build session has ended. Start a new build to bring the live preview back.'}
+                </p>
               </div>
             </div>
           )}
@@ -1090,19 +1011,10 @@ export default function LivePreview({
                 placeholders used to end with "relaunch it" / "relaunch the preview to start it
                 fresh" beside a button that sat right below them; the button moved to `AppPane`,
                 where R3's one start control lives, and an instruction pointing at nothing is worse
-                than no instruction. Each sentence keeps its FACT and drops the direction. The
-                `not_found` arm below stays exactly as it is — it announces a saved build that has
-                genuinely vanished, which is a statement rather than an instruction. */}
-            {relaunchError?.kind === 'not_found' ? (
-              <p role="alert" className="text-xs text-danger max-w-xs leading-relaxed mb-4">
-                That saved build is no longer available, so there is nothing to relaunch. The
-                preview will still appear here if it finishes loading.
-              </p>
-            ) : (
-              <p className="text-xs text-neutral/60 max-w-xs leading-relaxed mb-4">
-                {'It will appear here the moment it loads.'}
-              </p>
-            )}
+                than no instruction. Each sentence keeps its FACT and drops the direction. */}
+            <p className="text-xs text-neutral/60 max-w-xs leading-relaxed mb-4">
+              {'It will appear here the moment it loads.'}
+            </p>
           </div>
         )}
 
@@ -1111,9 +1023,8 @@ export default function LivePreview({
             inconsistently (some readers miss it entirely), so the element outlives every state
             and only its text changes. Visually hidden because every state above already SAYS
             what it is on screen; this exists for the reader that cannot see the moon icon go
-            up. `polite`, never `assertive` — none of these states is an error, and the two
-            that genuinely are (a failed relaunch, a failed save) keep their own `role="alert"`
-            so they still cut in. */}
+            up. `polite`, never `assertive` — none of these states is an error, and the one
+            that genuinely is (a failed save) keeps its own `role="alert"` so it still cuts in. */}
         <p role="status" aria-live="polite" className="sr-only">
           {announcement}
         </p>

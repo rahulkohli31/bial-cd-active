@@ -56,18 +56,23 @@ export { FakeEventSource } from '../../utils/buildSessionMock'
 export const PREVIEW_URL = 'https://app-xyz.example.azurecontainerapps.io/'
 
 // C3 response builders (camelCase). `over` lets a test tweak one field.
-export const startResp = (over = {}) => ({ sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'provisioning', previewUrl: null, createdAt: 'c', ...over })
+// `startResp` is GONE with the `start` it answered: the client wrapper had no caller once the
+// build moved inside the turn's own transaction, so nothing on this harness can post one.
 export const statusResp = (over = {}) => ({ sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'provisioning', previewUrl: null, lastSeq: null, createdAt: 'c', updatedAt: 'u', ...over })
 export const ENDED_RESP = { sessionId: 's1', status: 'ended' }
 
 /** Assemble a BuildSessionClient from a per-file `h` bag of vi.fn()s.
  *
- *  `acquireLock` / `releaseLock` are GONE (U28): nothing called them — the portal's keep-alive
- *  loop that was their only caller was itself deleted back in U13. `forceEnd` is the one lock
- *  op still reachable from the UI. */
+ *  FOUR MEMBERS NOW. `acquireLock` / `releaseLock` went in U28 with the keep-alive loop that was
+ *  their only caller, and `start` has gone the same way: the build lives inside the turn's own
+ *  transaction, so nothing provisions a C3 session from the browser. `forceEnd` has no control on
+ *  any surface either — the block banner's button went with the banner — but it stays, because it
+ *  is the only thing that settles a session stuck mid-`building`.
+ *
+ *  `utils/__tests__/buildSessionApi.test.ts` pins this member set against the real client, so a
+ *  bag that drifts out of step with it is caught rather than silently mocking nothing. */
 export function makeClient(h) {
   return {
-    start: h.start,
     relaunchPreview: h.relaunchPreview,
     stop: h.stop,
     getStatus: h.getStatus,
@@ -77,7 +82,6 @@ export function makeClient(h) {
 
 /** Give the per-file `h` bag its default happy resolutions (call inside beforeEach). */
 export function primeClient(h) {
-  h.start.mockResolvedValue(startResp())
   h.stop.mockResolvedValue(ENDED_RESP)
   h.getStatus.mockResolvedValue(statusResp())
   h.forceEnd.mockResolvedValue(ENDED_RESP)
@@ -252,8 +256,9 @@ export const findStartAppControl = () =>
  * `relaunchedUrl` arm — but that arm (like the session arm below it) is gated by
  * `sessionBelongsToOpenProject`, wired to `sessionProjectMatches` = `sessionProjectRef.current ===
  * projectId`. NOTHING in `StartAppControl`'s own click path ever stamps that ref: only a session
- * REATTACH (`attachToLiveSession`, for a `build_in_progress` anchor) or the now-dead
- * `handleRelaunch` do (`ConversationSurface.tsx`). A fresh chat that has never reattached to
+ * REATTACH (`attachToLiveSession`, for a `build_in_progress` anchor) does, now that the surface's
+ * `handleRelaunch` — which stamped it too, and could never fire — has been deleted
+ * (`ConversationSurface.tsx`). A fresh chat that has never reattached to
  * anything therefore has `sessionProjectMatches === false` forever, and pressing the one true
  * start control silently changes nothing on screen — confirmed empirically while diagnosing this
  * suite, and reported as a real product bug rather than papered over here.

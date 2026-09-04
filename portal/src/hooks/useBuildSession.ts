@@ -1,8 +1,15 @@
 /**
- * The single owner of a build session's lifecycle: it starts / re-attaches / stops /
- * force-ends a C3 session, subscribes to its C7 SSE feed, derives the
- * `BuildSessionStatus`, and runs the frozen keep-alive timers. Every cockpit surface
- * (LivePreview, the conversation surface's banners) reads from here.
+ * The single owner of a build session's lifecycle: it RE-ATTACHES to a C3 session, stops or
+ * force-ends it, subscribes to its C7 SSE feed and derives the `BuildSessionStatus`. Every cockpit
+ * surface (LivePreview, the conversation surface's banners) reads from here.
+ *
+ * IT NO LONGER STARTS ONE, AND IT NO LONGER RELAUNCHES ONE. `start()` went with the client wrapper
+ * it called: a composer send is a TURN, and the build lives inside the turn's own transaction.
+ * `relaunch()` went because its only caller was wired to `LivePreview`'s `onRelaunch`, a prop the
+ * pane accepts and never reads — the live restore path is `relaunchPreview` called directly by
+ * `StartAppControl` / `RailComposer`. Both took the `blocked` state with them: it had two producers
+ * (each function's own 409) and no reachable one, so the banner it fed and that banner's force-end
+ * button are gone too. `reattach` is the surviving entry point.
  *
  * KEY BEHAVIOURS (the plan's load-bearing decisions):
  *
@@ -32,27 +39,14 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError } from '../utils/apiError'
-import { asReclaimBlocked } from '../utils/buildSessionApi'
-import { BuildSessionAlreadyActiveError, buildSessionClient } from '../utils/buildSessionApi'
+import { buildSessionClient } from '../utils/buildSessionApi'
 import type { BuildSessionClient } from '../utils/buildSessionApi'
 import { subscribeBuildFeed } from '../utils/buildSessionEvents'
 import type { BuildFeedError, BuildFeedSubscription, EventSourceFactory } from '../utils/buildSessionEvents'
-import type { BuildSessionStatus, FeedEnvelope, ProgressEnvelope, RelaunchError } from '../utils/buildSessionTypes'
+import type { BuildSessionStatus, FeedEnvelope, ProgressEnvelope } from '../utils/buildSessionTypes'
 
 /** How long a live `ready` preview may go quiet before the "still working" overlay clears (KTD-8b). */
 const ITERATION_QUIET_MS = 4000
-
-/**
- * How many CONSECUTIVE non-authoritative keep-alive failures (network / 5xx / timeout) to
- * tolerate before reclaiming. An authoritative rejection (404 gone / 409 lock lost) reclaims
- * immediately; a transient blip lets the next tick retry — one flaky heartbeat must not kill
- * a healthy 20-minute build (finding #22).
- */
-
-/** The 409-block state: the caller already holds a live session (carries its id for the reattach/force-end decision). */
-export interface BlockedState {
-  existingSessionId: string | null
-}
 
 /** The graceful-quota terminal surfaced to the banner ("resets at midnight IST"). */
 export interface QuotaState {
@@ -60,12 +54,6 @@ export interface QuotaState {
   used: number
   resetsAt: string
 }
-
-/** What `start` resolved to — U5 branches on this (started / blocked→reattach-or-block / error). */
-export type StartOutcome =
-  | { kind: 'started'; sessionId: string }
-  | { kind: 'blocked'; existingSessionId: string | null }
-  | { kind: 'error'; message: string }
 
 export interface UseBuildSessionDeps {
   client?: BuildSessionClient
@@ -90,7 +78,6 @@ export interface UseBuildSessionResult {
   iterating: boolean
   /** A graceful stop is in flight — the Stop control shows a pending state until terminal. */
   stopping: boolean
-  blocked: BlockedState | null
   feedDisconnected: boolean
   /**
    * F8/U5 — the dev-server PROCESS crashed after the preview was framed (a `preview_reconnecting`
@@ -104,42 +91,18 @@ export interface UseBuildSessionResult {
   error: string | null
   /** ms epoch the current session started, for elapsed-time display in the force-end confirm. */
   startedAt: number | null
-  /** A relaunched preview's live URL (#43), framed independently of the (ended) build session. */
-  relaunchedPreviewUrl: string | null
-  /** True while a relaunch is restoring the app into a fresh sandbox — drives the "Restoring…" state. */
-  relaunching: boolean
-  /** Why the last relaunch failed, discriminated for the U6 response matrix; null when none/succeeded. */
-  relaunchError: RelaunchError | null
-  /** The relaunched preview restored the LAST SAVED state because the newest build FAILED (U6 labelling). */
-  relaunchedFromFailedBuild: boolean
-  /**
-   * Start a build. `conversationId` (optional) grounds the build in that thread's persisted
-   * attachments — the server materializes them into the agent's prompt (R3).
-   */
-  start: (projectId: string, prompt: string, conversationId?: string) => Promise<StartOutcome>
-  /** Relaunch a torn-down app's preview from its snapshot (#43). User-initiated; never auto-fired. */
-  relaunch: (projectId: string) => Promise<void>
   reattach: (sessionId: string) => Promise<void>
   /** Graceful stop. Resolves `false` when the stop FAILED and the session is still live (the caller must not start over it). */
   stop: () => Promise<boolean>
+  /**
+   * The owner-only kill switch (C3 §3.4), and it has no control on any surface since the block
+   * banner's Force-end button went. Kept because it is the only thing that can settle a session
+   * stuck mid-`building` that never emits a terminal `ended`, which is the whole reason the lock op
+   * exists; retiring the portal's client for it belongs to the stop lineage, not to this sweep.
+   */
   forceEnd: (targetSessionId?: string) => Promise<void>
   reconnect: () => void
   reset: () => void
-}
-
-/**
- * Map a relaunch failure onto the discriminated U6 shape: 404 = no saved build (the affordance
- * hides), 503 = transient (retry copy, affordance back), anything else = failed (affordance back).
- * A 409 never reaches this — it surfaces as `blocked`, its existing first-class state. The
- * server's message is the approved user-facing copy where present.
- */
-function toRelaunchError(e: unknown): RelaunchError {
-  if (e instanceof ApiError) {
-    if (e.status === 404) return { kind: 'not_found', message: e.message }
-    if (e.status === 503) return { kind: 'unavailable', message: e.message }
-    return { kind: 'failed', message: e.message }
-  }
-  return { kind: 'failed', message: 'Could not relaunch the preview.' }
 }
 
 /** Upsert an envelope into the feed store by `seq` (duplicate replaces, never appends) and keep it ordered. */
@@ -161,19 +124,11 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
   const [envelopes, setEnvelopes] = useState<FeedEnvelope[]>([])
   const [iterating, setIterating] = useState(false)
   const [stopping, setStopping] = useState(false)
-  const [blocked, setBlocked] = useState<BlockedState | null>(null)
   const [feedDisconnected, setFeedDisconnected] = useState(false)
   const [reconnecting, setReconnecting] = useState(false)
   const [quota, setQuota] = useState<QuotaState | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [startedAt, setStartedAt] = useState<number | null>(null)
-  // A relaunched preview (#43) is a framed URL with NO build lifecycle (Decision 6): it is held
-  // SEPARATELY from the build `previewUrl`/`status` so framing it never lights up build-active
-  // controls (Stop / delete-gate), which key off `isActiveBuildStatus(status)`.
-  const [relaunchedPreviewUrl, setRelaunchedPreviewUrl] = useState<string | null>(null)
-  const [relaunching, setRelaunching] = useState(false)
-  const [relaunchError, setRelaunchError] = useState<RelaunchError | null>(null)
-  const [relaunchedFromFailedBuild, setRelaunchedFromFailedBuild] = useState(false)
 
   // Refs mirror the state that async callbacks (timers, SSE handlers) must read WITHOUT a stale
   // closure. `statusRef` is the source of truth for lifecycle transitions; `settledRef` guards the
@@ -188,17 +143,6 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
   const settledRef = useRef(false)
   const subRef = useRef<BuildFeedSubscription | null>(null)
   const quietRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  // Consecutive non-authoritative keep-alive failures (shared across heartbeat + renew);
-  // any success resets it (finding #22).
-  // Guards a double-click on Relaunch: the second POST would hit the first's freshly-held lock
-  // and 409. A ref (not `relaunching` state) so the guard reads the CURRENT value synchronously.
-  const relaunchingRef = useRef(false)
-  // Bumped by every reset() (a new build via start() calls reset() FIRST). A relaunch captures it
-  // and refuses to write its result if it changed mid-flight — otherwise an in-flight relaunch
-  // resolving AFTER a new build started would resurrect the stale relaunchedPreviewUrl that reset()
-  // just cleared, masking the running build's preview. `mountedRef` alone can't catch this: the
-  // page stays mounted across the reset.
-  const relaunchGenRef = useRef(0)
 
   const setPhase = useCallback((next: BuildSessionStatus) => {
     statusRef.current = next
@@ -340,48 +284,12 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     setEnvelopes([])
     setIterating(false)
     setStopping(false)
-    setBlocked(null)
     setFeedDisconnected(false)
     setReconnecting(false)
     setQuota(null)
     setError(null)
     setStartedAt(null)
-    relaunchingRef.current = false
-    relaunchGenRef.current += 1 // supersede any in-flight relaunch so it can't resurrect its URL
-    setRelaunchedPreviewUrl(null)
-    setRelaunching(false)
-    setRelaunchError(null)
-    setRelaunchedFromFailedBuild(false)
   }, [teardownTimers, closeFeed])
-
-  const start = useCallback(
-    async (projectId: string, prompt: string, conversationId?: string): Promise<StartOutcome> => {
-      reset()
-      try {
-        const session = await client.start({ projectId, prompt, conversationId })
-        // Unmounted mid-flight: the cleanup already ran, so don't wire a feed/timers we can never tear
-        // down. The un-heartbeated server session is reaped by TTL (FIX 1).
-        if (!mountedRef.current) return { kind: 'started', sessionId: session.sessionId }
-        settledRef.current = false
-        sessionIdRef.current = session.sessionId
-        setSessionId(session.sessionId)
-        setPhase(session.status)
-        setPreviewUrl(session.previewUrl)
-        setStartedAt(Date.now())
-        subscribe(session.sessionId)
-        return { kind: 'started', sessionId: session.sessionId }
-      } catch (e) {
-        if (e instanceof BuildSessionAlreadyActiveError) {
-          setBlocked({ existingSessionId: e.existingSessionId })
-          return { kind: 'blocked', existingSessionId: e.existingSessionId }
-        }
-        const message = e instanceof ApiError ? e.message : 'Could not start the build.'
-        setError(message)
-        return { kind: 'error', message }
-      }
-    },
-    [client, reset, setPhase, subscribe],
-  )
 
   const reattach = useCallback(
     async (sid: string): Promise<void> => {
@@ -407,51 +315,6 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
       subscribe(sid)
     },
     [client, reset, setPhase, subscribe],
-  )
-
-  const relaunch = useCallback(
-    async (projectId: string): Promise<void> => {
-      // Restore a torn-down app from its snapshot into a fresh, ready sandbox (#43). NOT a build:
-      // no feed, no keep-alive, no lock held — the server returns the live URL synchronously. Seed
-      // ONLY `relaunchedPreviewUrl`; leave the ended session's `sessionId`/`status` untouched so no
-      // build-active control (Stop / delete-gate) lights up on a preview that has no lifecycle.
-      if (relaunchingRef.current) return // a click already in flight — a second POST self-409s
-      relaunchingRef.current = true
-      // Capture the generation: if a reset()/new build supersedes this relaunch while its POST is
-      // in flight, `relaunchGenRef` changes and we drop the (now-stale) result instead of writing it.
-      const gen = relaunchGenRef.current
-      setRelaunching(true)
-      setError(null)
-      setBlocked(null)
-      setRelaunchError(null)
-      try {
-        const res = await client.relaunchPreview({ projectId })
-        if (!mountedRef.current || relaunchGenRef.current !== gen) return
-        setRelaunchedPreviewUrl(res.previewUrl)
-        setRelaunchedFromFailedBuild(res.restoredFromFailedBuild)
-      } catch (e) {
-        if (!mountedRef.current || relaunchGenRef.current !== gen) return
-        if (asReclaimBlocked(e)) {
-          // #83 — another project holds the one workspace and has unsaved work. Deliberately
-          // NOT swallowed into `relaunchError`: unlike every other failure here this one has a
-          // remedy, and the page owns it so the SAME dialog serves relaunch and the Write-turn
-          // path. `finally` below still clears `relaunching`, so re-throwing costs no state.
-          throw e
-        }
-        if (e instanceof BuildSessionAlreadyActiveError) {
-          // A build is running — relaunch never pre-empts it. Surface the same block banner as start.
-          setBlocked({ existingSessionId: e.existingSessionId })
-        } else {
-          // Discriminated for the U6 response matrix (404 hides the affordance; 503/5xx restore
-          // it with distinct copy) — rendered by the preview pane, not the generic error banner.
-          setRelaunchError(toRelaunchError(e))
-        }
-      } finally {
-        relaunchingRef.current = false
-        if (mountedRef.current) setRelaunching(false)
-      }
-    },
-    [client],
   )
 
   const stop = useCallback(async (): Promise<boolean> => {
@@ -480,15 +343,10 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
       if (sid === own && settledRef.current) return // own session already terminal — no redundant call
       try {
         const res = await client.forceEnd(sid)
-        if (sid === own) {
-          // The kill switch's terminal comes from the CONTROL-PLANE response, overriding any
-          // envelope-derived status (a stuck build may never emit `ended`) — C3 §3.4.
-          finishSession(res.status)
-        } else {
-          // Force-ended the OTHER (blocking) session from the 409 banner — clear the block so the
-          // user can start again.
-          setBlocked(null)
-        }
+        // The kill switch's terminal comes from the CONTROL-PLANE response, overriding any
+        // envelope-derived status (a stuck build may never emit `ended`) — C3 §3.4. A caller may
+        // still name ANOTHER session by id, in which case there is nothing local to settle.
+        if (sid === own) finishSession(res.status)
       } catch (e) {
         if (sid === own && settledRef.current) return // our own session was concurrently settled — no stale error
         // 403 build_session_forbidden (non-owner) is surfaced fail-closed, never swallowed. A failed
@@ -548,18 +406,11 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     envelopes,
     iterating,
     stopping,
-    blocked,
     feedDisconnected,
     reconnecting,
     quota,
     error,
     startedAt,
-    relaunchedPreviewUrl,
-    relaunching,
-    relaunchError,
-    relaunchedFromFailedBuild,
-    start,
-    relaunch,
     reattach,
     stop,
     forceEnd,

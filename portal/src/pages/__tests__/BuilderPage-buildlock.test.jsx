@@ -49,7 +49,7 @@ const h = vi.hoisted(() => ({
   resolvePlanOptions: vi.fn(), uuidv7: vi.fn(),
   loadBuilds: vi.fn(), getBuild: vi.fn(),
   listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
-  start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
+  stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
 }))
 
 // THE LEGACY RELAY MOCK IS GONE WITH THE HOOK (Plan D U17). Both kinds of chat run on the turn
@@ -257,9 +257,10 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     mintBuild('new-A2', 'First build (refined)')
     await buildFrom(a.container, 'make it dark mode')
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledTimes(2))
-    // This page never provisions a C3 session any more (`session.start()` is dead in
-    // BuilderPage.tsx — see its own docblock); `h.stop` pins that the retired stop-a-live-session
-    // arm is never reached on this path, not that a candidate was found and skipped.
+    // This page never provisions a C3 session any more — `session.start()` is not merely unused,
+    // it is deleted, along with the client wrapper under it (see `ConversationSurface.tsx`'s
+    // docblock). `h.stop` pins that the retired stop-a-live-session arm is never reached on this
+    // path, not that a candidate was found and skipped.
     expect(h.stop).not.toHaveBeenCalled()
     await within(a.container).findByTestId('stop-turn')
 
