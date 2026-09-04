@@ -176,7 +176,8 @@ describe('ChatRoute — a conversation whose row does not exist yet', () => {
   it('takes the kind from ?kind= when the id 404s but a ?projectId= is present', async () => {
     h.getConversation.mockResolvedValue(null)
     renderRoute('/chat/new-uuid?projectId=p1&kind=build')
-    // The row appears on the first appendMessage; until then only the query knows the project.
+    // The row is written inside the first TURN's transaction; until then only the query knows
+    // the project. (`appendMessage` was the old separate round trip and no longer exists.)
     const slot = await screen.findByTestId('conversation-slot')
     expect(slot.getAttribute('data-kind')).toBe('build')
     expect(slot.textContent).toContain('|new-uuid|p1|')

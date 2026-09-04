@@ -68,8 +68,8 @@ export const FAQS = [
     a: 'Sign in with your BIAL Microsoft account — the only sign-in the portal offers. Access is limited to the BIAL organisation. No programming experience is required.',
   },
   {
-    q: 'What happens when I click "Start Chat"?',
-    a: 'That depends on the mode you picked. The composer has three modes and defaults to Plan. In Ask, it opens a chat that answers questions about your app and changes nothing. In Plan, it works out an approach with you and waits for your confirmation before anything is built. In Write, it starts the multi-minute build straight away, with no plan step — so from Plan you reach a build by approving the plan first, and from Write you are already in one. Changes stay in your workspace until you save them.',
+    q: 'What happens when I send my first message?',
+    a: 'That depends on which of the two kinds of chat you picked, and a chat\u2019s kind is fixed when you start it. A Plan chat talks through what you want and shapes it into a plan, without changing your app yet; when the plan looks right, you turn it into a build. A Build chat is where your live app actually changes \u2014 you ask for changes and watch it update as you go. Either way your app opens beside the conversation, and changes stay in your workspace until you save them.',
   },
   {
     q: 'Can I edit the app after it is generated?',
@@ -85,7 +85,7 @@ export const FAQS = [
   },
   {
     q: 'Is there a limit to how many apps I can build?',
-    a: 'There is no limit on how many apps you can create. There is a daily limit on how much AI work you can use across all of them: the token counter in the header shows what you have left and turns amber once you have used 80% of it. When the allowance runs out it stops every AI action, not just builds — Ask and Plan included — until it resets at midnight IST.',
+    a: 'There is no limit on how many apps you can create. There is a daily limit on how much AI work you can use across all of them: the token counter in the header shows what you have left and turns amber once you have used 80% of it. When the allowance runs out it stops every AI action, not just builds — planning included — until it resets at midnight IST.',
   },
   {
     q: 'Who do I contact for help?',
