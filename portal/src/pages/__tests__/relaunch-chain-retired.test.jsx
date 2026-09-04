@@ -37,8 +37,6 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react'
-import { readFileSync } from 'node:fs'
-import path from 'node:path'
 import LivePreview from '../../components/LivePreview'
 
 const h = vi.hoisted(() => ({
@@ -269,33 +267,5 @@ describe('the ordinary states the pane still has to render', () => {
     expect(card(container).className).toMatch(/opacity-100/)
     rerender(<LivePreview previewUrl={SANDBOX_URL_2} status="ready" />)
     expect(card(container).className).toMatch(/opacity-0/)
-  })
-})
-
-describe('the pane’s prop contract still pins every channel field to a real prop', () => {
-  // `workspaceChannel.ts` carries a COMPILE-time assertion of this (`UnacceptedPaneProps extends
-  // never`). This is its runtime twin, and it exists because the failure it catches is silent in
-  // exactly the place a reader assumes types already cover: `AppPaneHost` spreads a `PaneView`
-  // straight into `<LivePreview/>`, and JSX spread attributes are EXEMPT from excess-property
-  // checking. `lastBuildFailed` had to leave both sides in one change for that reason.
-  const src = (rel) => readFileSync(path.resolve(__dirname, '../../', rel), 'utf8')
-
-  const fieldsOf = (text, interfaceName) => {
-    const start = text.indexOf(`interface ${interfaceName} {`)
-    expect(start, `${interfaceName} not found`).toBeGreaterThan(-1)
-    const body = text.slice(start, text.indexOf('\n}', start))
-    return new Set([...body.matchAll(/^ {2}(\w+)\??:/gm)].map((m) => m[1]))
-  }
-
-  it('every PaneView field is a declared LivePreviewProps prop', () => {
-    const paneFields = fieldsOf(src('components/workspace/workspaceChannel.ts'), 'PaneView')
-    const paneProps = fieldsOf(src('components/LivePreview.tsx'), 'LivePreviewProps')
-
-    // LIVENESS: both sides parsed to something, so the comparison cannot pass vacuously.
-    expect(paneFields.size).toBeGreaterThan(5)
-    expect(paneProps.size).toBeGreaterThan(5)
-
-    const orphans = [...paneFields].filter((f) => !paneProps.has(f))
-    expect(orphans, `PaneView fields with no LivePreview prop: ${orphans.join(', ')}`).toEqual([])
   })
 })

@@ -25,14 +25,12 @@
  * grows is the thing it was written to prevent. A list of what ONE sweep removed cannot rot that
  * way: it is either still true or it is red.
  *
- * MUTATION-CHECKED, BECAUSE A SOURCE-SCANNING RULE THAT MATCHES NOTHING PASSES FOR EVER. Each
- * rule is asserted twice — once against the real file, and once against the exact text that was
- * deleted from it, which it must still flag.
- *
- * COMMENTS ARE NOT SOURCE. `dialog.tsx`, `popover.tsx` and `button.tsx` each record what they
- * dropped and why, naming the removed identifiers so the next re-copy is recognised for what it
- * is. Those sentences are the point of the removal, not a violation of it — same treatment, and
- * the same `://` guard, as `tailwind-tokens.test.js`.
+ * EVERY RULE CARRIES ITS OWN LIVENESS PROBE, BECAUSE A SOURCE-SCANNING RULE THAT MATCHES NOTHING
+ * PASSES FOR EVER. `forbidden.test(file) === false` is an ABSENCE check: a regex that had drifted
+ * into matching nothing would satisfy it on every file, for ever, silently. So each rule also
+ * carries the text the sweep actually deleted and must still flag it — not to catch a typo in the
+ * transcription, but to prove the rule can fire at all. Without that half the whole file is
+ * green-by-construction.
  *
  * WHAT THIS DOES NOT COVER, STATED RATHER THAN IMPLIED. The plan behind this sweep also asked
  * for a rule that no CSS rule anywhere emits `animate-pane-leave`. That was true at the audited
@@ -45,14 +43,10 @@
 import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
+import { stripComments } from './_stripComments'
 
 // vitest runs with cwd = the portal root (where the vitest config lives).
 const ROOT = process.cwd()
-
-/** `//` is only a comment when it is not part of a `://` scheme — `index.css` opens on a font URL. */
-function stripComments(text: string): string {
-  return text.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
-}
 
 /** The trailing `export { … }` block only — a name may live on as an unexported local. */
 function exportBlock(source: string): string {
@@ -138,7 +132,8 @@ describe('vendored and hand-written residue', () => {
       if (rule.scope === 'exports') expect(scoped, `${rule.file} has no export block`).not.toBe('')
       if (rule.forbidden.test(scoped)) back.push(`${rule.file} → ${rule.what}`)
 
-      // The teeth: the same rule, against the exact text that was deleted.
+      // The liveness half: the same rule, against the exact text the sweep deleted. See the
+      // docblock — this is what stops `forbidden.test(scoped) === false` passing vacuously.
       const fixture = rule.scope === 'exports' ? exportBlock(rule.deleted) : rule.deleted
       expect(
         rule.forbidden.test(fixture),

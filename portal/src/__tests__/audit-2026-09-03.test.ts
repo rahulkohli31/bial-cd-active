@@ -35,7 +35,7 @@
  * marker, never a false alarm, which is the direction a guard has to fail in to survive.
  */
 import { describe, it, expect } from 'vitest'
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 
 // vitest runs with cwd = the portal root; the markers live across the whole repository.
@@ -65,7 +65,11 @@ function walk(dir: string): string[] {
   return readdirSync(dir).flatMap((entry) => {
     if (SKIP_DIRS.has(entry)) return []
     const full = path.join(dir, entry)
-    const stat = statSync(full)
+    // `lstat`, not `stat`: a symlinked directory would otherwise be descended into, and a link
+    // that pointed at an ancestor would recurse until the stack gave out. A link reads as a
+    // non-directory here and then fails the extension filter, which is the right answer for a
+    // scan whose subject is checked-in source.
+    const stat = lstatSync(full)
     if (stat.isDirectory()) return walk(full)
     if (stat.size > MAX_BYTES) return []
     const named = /^(Dockerfile|Caddyfile)/.test(entry)

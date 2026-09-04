@@ -631,9 +631,8 @@ class _TurnState:
     preview_url: str | None = None
     preview_state: Literal["ready", "reconnecting"] | None = None
     # SET ON EVERY TURN OF BOTH KINDS — `_pin_workspace` has one arm and both kinds attach the
-    # project's live container. This block used to say "WRITE only … both None on a chat turn",
-    # which was the two-workspace era: a Plan turn read a git checkout and took no container.
-    # `sandbox` is that container session — Build's eight sandbox-routed tools call it directly
+    # project's live container (its docstring carries the two-workspace history this block used to
+    # restate). `sandbox` is that container session — Build's eight sandbox-routed tools call it
     # and Plan's read tools reach the same session through `LiveSandboxWorkspace`. `write_session`
     # is the manager's registry entry, kept so the terminal can hand it back (the P0 save).
     # `preview_task` is the per-turn dev-server watcher — cancelled and AWAITED before the
@@ -1400,10 +1399,9 @@ class TurnEngine:
         """Resolve the turn-pinned read surface ONCE, for BOTH KINDS: the project's live
         container.
 
-        (This first line said "for EVERY mode". The kinds replaced the modes, and
-        `api/v1/conversations/turns.py` quotes this sentence — so the two now agree. The
-        paragraphs below are deliberately left in the old vocabulary: they are HISTORY, and
-        what they explain is why there is one arm here at all.)
+        (`api/v1/conversations/turns.py` quotes that first sentence — keep the two in sync. The
+        paragraphs below stay in the old Ask/Plan/Write vocabulary on purpose: they are HISTORY,
+        and what they explain is why there is one arm here at all.)
 
         Ask and Plan used to read a different thing entirely — a git checkout of the app's
         saved bundle, unpacked onto the control-plane server's own disk. Two problems with
