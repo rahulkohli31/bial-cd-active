@@ -183,13 +183,16 @@ class AppRegistry(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base)
         app_status_enum, server_default=AppStatus.DRAFT.value, nullable=False
     )
 
-    # The project's LIVE source of truth for code continuity (KD-9, R21). Same shape as
-    # `conversations.code`'s `{current: {source, entry, ...}}`. A builder session SEEDS
-    # its working code from this on open and WRITES the new code back on a successful
-    # build, so a later session in the project continues from the last stage rather than
-    # a blank slate. `conversations.code` is demoted to a per-session working buffer;
-    # THIS is authoritative. NULL until the first build. Scope: code continuity only —
-    # versioning/branching/history stay deferred to the file-system + sandbox phase.
+    # Code continuity's original store (KD-9, R21) — same shape as the retired
+    # `conversations.code`'s `{current: {source, entry, ...}}`. IT HAS NO WRITER ANY MORE:
+    # the seed-on-open / write-back-on-build pair this was built for died with the
+    # `conversations.code` column (0024), and code truth moved to the sandbox's file tree
+    # and the build snapshots. `tests/api/v1/projects/test_code_continuity.py` pins the
+    # inertness — submit deliberately does not backstop it either.
+    #
+    # It is READ, which is why the column stays: `services/projects/describe.py` pulls the
+    # source out of it for the project-description generator, which 409s on a NULL. So a
+    # project that predates the move still describes itself, and one that does not, cannot.
     #
     # AUDIT-2026-09-03 · verified-alive: intentionally retained pending verification — see
     # the audit record.

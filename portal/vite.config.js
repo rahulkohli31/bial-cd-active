@@ -90,7 +90,7 @@ export default defineConfig({
         rewrite: (p) => p.replace(/^\/api/, '/v1'),
       },
       // The deployed-app runner. `/apps/:appId` is deliberately NOT an SPA route
-      // (App.jsx) — in production nginx sends it to the control-plane. Without this,
+      // (App.tsx) — in production nginx sends it to the control-plane. Without this,
       // dev serves index.html for it, React Router matches nothing, and the shareable
       // app URL bounces to /login. Note the ordering: the more specific '/api' rule
       // above already claimed /api/apps/*, so this only catches the runner paths.
