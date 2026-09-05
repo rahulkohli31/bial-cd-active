@@ -10,6 +10,30 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 > `1.7.0` section is added above them and tagged `v1.7.0`; the betas stay as the record of how it
 > got there. A version number marks a build, not a merge.
 
+## [1.7.0-beta.8] - 2026-09-05
+
+A busy workspace hands over, and an image can be built where the registry refuses to.
+
+### Added
+
+- **A second way to build an app's image, for subscriptions that refuse the registry's own
+  builder.** Some Azure subscriptions answer every registry build with `TasksOperationsNotAllowed`,
+  which makes the entire publish half of the product impossible to exercise. A development-only
+  builder that uses the local Docker daemon can be selected with `DEPLOY__IMAGE_BUILDER`. The
+  shipping path is untouched and is still the default, and the control plane refuses to start in
+  production with anything else set, because a BIAL host quietly shelling out to Docker is a worse
+  outcome than a failed publish.
+
+### Fixed
+
+- **A busy workspace offers to hand over, instead of telling you to try again.** With another
+  project holding the one workspace, a message sent to a second project was refused with "That
+  message did not send — try again", which stayed wrong for as long as the other build ran. It now
+  names the project that is holding the workspace and offers to stop it — the dialog that was
+  already built for exactly this, and was simply unreachable behind the poorer answer. A genuine
+  double-send on the same project still just asks you to wait, because there is nothing there to
+  hand over.
+
 ## [1.7.0-beta.7] - 2026-09-03
 
 The project list becomes the landing screen: three numbers, two views, and a delete that asks
@@ -31,13 +55,6 @@ why. (#158)
   administrator saying yes is not the same as the app running.
 - **A description too long for its row shows in full on hover**, and one that already fits shows
   nothing — no tooltip on text you can already read.
-- **A second way to build an app's image, for subscriptions that refuse the registry's own
-  builder.** Some Azure subscriptions answer every registry build with `TasksOperationsNotAllowed`,
-  which makes the entire publish half of the product impossible to exercise. A development-only
-  builder that uses the local Docker daemon can be selected with `DEPLOY__IMAGE_BUILDER`. The
-  shipping path is untouched and is still the default, and the control plane refuses to start in
-  production with anything else set, because a BIAL host quietly shelling out to Docker is a worse
-  outcome than a failed publish.
 
 ### Changed
 
@@ -97,13 +114,6 @@ why. (#158)
   every accepted send, including the case where the box deliberately keeps text you rewrote while
   the message was in flight, and a late send whose text began the same way as a sibling chat's
   typing could slice that chat's box.
-- **A busy workspace offers to hand over, instead of telling you to try again.** With another
-  project holding the one workspace, a message sent to a second project was refused with "That
-  message did not send — try again", which stayed wrong for as long as the other build ran. It now
-  names the project that is holding the workspace and offers to stop it — the dialog that was
-  already built for exactly this, and was simply unreachable behind the poorer answer. A genuine
-  double-send on the same project still just asks you to wait, because there is nothing there to
-  hand over.
 
 ### Notes
 
