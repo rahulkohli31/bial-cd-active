@@ -81,6 +81,15 @@ class DeployConfig(BaseModel):
     acr_username: str
     acr_password: SecretStr
 
+    # WHICH BUILDER runs. `acr_tasks` is the shipping path (`images.py`): the registry's own
+    # agent builds and pushes, so the control plane needs no docker daemon. `local_docker`
+    # (`local_images.py`) exists for one reason — a subscription that answers every
+    # `scheduleRun` with `TasksOperationsNotAllowed`, which makes the entire publish half of
+    # the product untestable. It defaults to the shipping path and is refused in production
+    # (`settings/api.py`), because a BIAL host quietly shelling out to docker would be a
+    # worse outcome than a failed publish.
+    image_builder: Literal["acr_tasks", "local_docker"] = "acr_tasks"
+
     # --- ACA: where the app runs ------------------------------------------------------
     subscription_id: str
     resource_group: str
