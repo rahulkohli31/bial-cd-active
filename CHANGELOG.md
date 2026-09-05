@@ -31,6 +31,13 @@ why. (#158)
   administrator saying yes is not the same as the app running.
 - **A description too long for its row shows in full on hover**, and one that already fits shows
   nothing — no tooltip on text you can already read.
+- **A second way to build an app's image, for subscriptions that refuse the registry's own
+  builder.** Some Azure subscriptions answer every registry build with `TasksOperationsNotAllowed`,
+  which makes the entire publish half of the product impossible to exercise. A development-only
+  builder that uses the local Docker daemon can be selected with `DEPLOY__IMAGE_BUILDER`. The
+  shipping path is untouched and is still the default, and the control plane refuses to start in
+  production with anything else set, because a BIAL host quietly shelling out to Docker is a worse
+  outcome than a failed publish.
 
 ### Changed
 
@@ -61,6 +68,57 @@ why. (#158)
 
 - The BIAL logo sat a few pixels high in the header and could be squeezed at narrow widths; it
   now renders identically on every screen.
+- **A brand-new project's first message opens its chat.** Sending from the project screen asked
+  the server first whether there was a saved app to bring back — and a project with nothing built
+  yet has none, so the answer was "no saved build", the send was reported as failed, and the very
+  first thing anyone does on a new project could not be done at all. Nothing to bring back now
+  opens the chat instead. A project that has gone, or was never yours, is still reported as a
+  failed send.
+- **A reload in the middle of a build no longer doubles the reply once the build ends.** The
+  earlier fix held only while the stream was still open; the moment the turn finished, the stored
+  writing and the re-told live turn were both drawn again.
+- **Your own message stays on screen when you reload mid-turn.** It was removed from the
+  transcript until the turn finished, so you watched the agent answer a question that was no
+  longer written anywhere.
+- **Five files dropped at once are counted as five.** A single multi-file drop, paste or picker
+  selection slipped past the five-file limit and the text budget without a word, because each file
+  was checked against a list the others had not been added to yet.
+- **A plan that has been written stops saying it is still being written.** "Writing up the plan…"
+  was never retracted, so a tab that stayed open kept a spinner running under a plan you had
+  already finished reading — including when the turn was stopped or failed.
+- **"Take it back" says so when it does not work.** A refusal from the server or a network failure
+  was stored and never shown, so a withdrawal that had not happened looked exactly like nothing
+  happening.
+- **An app that published without an administrator no longer prints "We could not tell" beside
+  Approved.**
+- **An activity group you opened stays open between two steps**, instead of snapping shut in the
+  pause before the next one starts.
+- **A send no longer damages what you are typing in another chat.** The draft store was cleared on
+  every accepted send, including the case where the box deliberately keeps text you rewrote while
+  the message was in flight, and a late send whose text began the same way as a sibling chat's
+  typing could slice that chat's box.
+- **A busy workspace offers to hand over, instead of telling you to try again.** With another
+  project holding the one workspace, a message sent to a second project was refused with "That
+  message did not send — try again", which stayed wrong for as long as the other build ran. It now
+  names the project that is holding the workspace and offers to stop it — the dialog that was
+  already built for exactly this, and was simply unreachable behind the poorer answer. A genuine
+  double-send on the same project still just asks you to wait, because there is nothing there to
+  hand over.
+
+### Notes
+
+- A review of the two waves before this one — the agent's whole voice, and the workspace the
+  canvas draws — upheld sixty-five defects. This build carries the one that stopped a new project
+  being used at all, every one of the next two grades, and forty of the remainder; each fix was
+  checked by an independent reader before it was kept. What stays open is written down with its
+  reason, and the largest of them is a ten-second wait between a model failing and the turn
+  saying so.
+- The residue of the two-page era was deleted rather than left to rot: six hundred and fifty-seven
+  lines of source, the tests that only covered it, and the comments that described mechanisms this
+  branch had already removed. Nothing to see on screen. **Local development must delete
+  `BACKEND_URL=` from `backend/.env` and `backend/.env.test` before starting the API** — the
+  setting is gone, and a leftover line now fails startup rather than being ignored. Containers are
+  unaffected.
 
 ## [1.7.0-beta.6] - 2026-09-02
 
@@ -194,6 +252,30 @@ The agent's whole voice, and the workspace the canvas draws.
   a duplicate "Draft" chip sat beside the project title; the status pill dropped onto its own line
   below its heading; "Take it back" was painted as a primary action; and your own messages were
   grey fills rather than white with a hairline.
+- **The two message boxes really are one control.** They were made to look alike, but the project
+  screen mounted only the shell of the chat's box, so it inherited the border and the controls and
+  none of the behaviour built on them: no character limit and no counter, so forty-five thousand
+  characters were accepted with Send still lit and then refused by the server; and no saved draft,
+  so a half-written description died on a step to another screen — on the screen that carries the
+  longest message anyone writes. It mounts the whole control now: ten thousand characters with the
+  count beside it, and your text kept where you left it. A Plan chat also stops asking for "the
+  change you need" directly under the sentence promising it changes nothing.
+- **A draft survives a plain reload.** Type into a chat, reload, and both the box and the stored
+  text were empty — the first of the three losses the draft store exists to prevent. Saving your
+  text and restoring it are two steps of one render, and the saving step ran first with the
+  outgoing chat's empty box, wiping the incoming chat's draft before anything could read it.
+  Nothing ever reported this, because an empty box where a draft should be looks exactly like
+  never having had one.
+- **A message that already reached the agent no longer tells you it failed.** Tidying the box after
+  a successful send could itself throw, and that throw landed in the same place a refused send
+  does — so you were told to try again for a message that was already being answered.
+- **One reply is one message, so copying gives back the whole answer.** You ask once and are
+  answered once, but a reloaded conversation did not read that way: a reply that mixed writing with
+  steps came back as one message per piece — fourteen, on one real turn. Everything that hangs off
+  a message multiplied with them, the copy control most visibly: forty-one copy buttons on an
+  eight-turn conversation that should offer eight, one of them sitting between an answer's own
+  paragraphs, and none of them copying the answer you had just read. A live reply never had this
+  shape; the reloaded one now matches it.
 
 ### Notes
 
