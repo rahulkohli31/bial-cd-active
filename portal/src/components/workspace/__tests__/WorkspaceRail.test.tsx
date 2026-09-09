@@ -1,10 +1,15 @@
 /**
- * THE RAIL'S CONTENTS — four things, and the one control that must NOT be here.
+ * THE RAIL'S CONTENTS — four sections, and the one control that must NOT be here.
  *
  * This suite is deliberately narrow. Everything about the rail's WIDTH, its collapse and its
  * relationship to the pane is a claim about the shell and lives in `ProjectWorkspace.test.tsx`,
  * which renders through the real one. What is left is what the rail itself is answerable for: that
  * it carries all four, and that it does not carry a second way to start the app.
+ *
+ * THE DATA SECTION IS PRESENT HERE ONLY AS A SECTION. What it says, and the fact that it re-reads
+ * when the Integrations dialog closes over it, are `DataSection.test.tsx` and
+ * `DataSection.integration.test.tsx`. Its read is stubbed to one connector so this file's
+ * assertions stay about the rail's shape rather than about a network call.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, cleanup, within } from '@testing-library/react'
@@ -12,6 +17,21 @@ import { MemoryRouter } from 'react-router-dom'
 import WorkspaceRail from '../WorkspaceRail'
 import type { Project } from '../../../utils/projectApi'
 import type { SaveState } from '../../../utils/buildSessionApi'
+
+vi.mock('../../../utils/connectorApi', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../utils/connectorApi')>()),
+  listProjectConnectors: vi.fn(async () => [
+    {
+      key: 'orbit',
+      displayName: 'ORBIT',
+      state: 'approved' as const,
+      askedAt: null,
+      enabled: false,
+      effectivelyOn: false,
+      window: null,
+    },
+  ]),
+}))
 
 vi.mock('../../PublishStatusChip', () => ({
   default: ({ projectId }: { projectId: string }) => (
@@ -62,11 +82,12 @@ function renderRail(over: { save?: SaveState | null } = {}) {
 afterEach(() => cleanup())
 
 describe("what the rail carries at rest", () => {
-  it('carries the composer with its kind picker, the app status, and the description', () => {
+  it('carries the composer with its kind picker, the data section, the app status, and the description', () => {
     renderRail()
 
     expect(screen.getByPlaceholderText(/Describe what you have in mind/i)).toBeTruthy()
     expect(screen.getByRole('radio', { name: 'Build' })).toBeTruthy()
+    expect(screen.getByTestId('rail-data')).toBeTruthy()
     expect(screen.getByTestId('rail-app-status')).toBeTruthy()
     expect(screen.getByTestId('description-editor')).toBeTruthy()
   })
@@ -214,25 +235,26 @@ describe('the publishing chip and the recents survive the rewrite', () => {
     expect(screen.getByTestId('description-rail')).toBeTruthy()
   })
 
-  it('★ renders exactly three sections, in the board\'s order, with no card borders between them', () => {
-    // THE SHAPE, AND THE FOURTH SECTION THAT IS NOT THERE. A grey rail with four floating white
-    // cards became a white rail with three sections and 1px rules — which is not decoration: it
+  it('★ renders the sections in the board\'s order, with no card borders between them', () => {
+    // THE SHAPE, AND THE SECTION THAT IS NOT THERE. A grey rail with four floating white
+    // cards became a white rail with plain sections and 1px rules — which is not decoration: it
     // gives #E2E8F0 back its role as the divider and #F0F4F8 back its role as the ground behind
-    // the app. The fourth card was the recents list, deleted by the owner's ruling.
+    // the app. The card that went was the recents list, deleted by the owner's ruling; DATA
+    // arrived later, between the composer and the status, and takes the status section's band.
     const { container } = renderRail()
 
     expect(screen.queryByTestId('conversations')).toBeNull()
     expect(screen.queryByText(/no conversations yet/i)).toBeNull()
 
     const labels = Array.from(container.querySelectorAll('h2')).map((h) => h.textContent)
-    // The third section's heading is the description editor's own, which this suite stubs — so
-    // the two the RAIL draws are asserted here, in order, and the stub's presence stands for the
-    // third. `ProjectPage.test.tsx` renders the real editor and sees its heading.
-    expect(labels).toEqual(['START A CHAT', 'APP STATUS'])
+    // The last section's heading is the description editor's own, which this suite stubs — so
+    // the three the RAIL draws are asserted here, in order, and the stub's presence stands for
+    // the fourth. `ProjectPage.test.tsx` renders the real editor and sees its heading.
+    expect(labels).toEqual(['START A CHAT', 'DATA', 'APP STATUS'])
     expect(screen.getByTestId('description-editor')).toBeTruthy()
 
     // No section carries a border, a radius or a fill of its own.
-    for (const testid of ['rail-app-status', 'description-rail']) {
+    for (const testid of ['rail-data', 'rail-app-status', 'description-rail']) {
       const section = screen.getByTestId(testid)
       expect(section.className).not.toMatch(/border-bial-border/)
       expect(section.className).not.toMatch(/rounded-2xl/)
@@ -240,6 +262,6 @@ describe('the publishing chip and the recents survive the rewrite', () => {
     }
     // …and the rail itself is the white surface, with hairlines between the sections.
     expect(container.querySelector('main')?.className).toMatch(/bg-white/)
-    expect(container.querySelectorAll('div.h-px').length).toBe(2)
+    expect(container.querySelectorAll('div.h-px').length).toBe(3)
   })
 })

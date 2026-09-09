@@ -1,14 +1,34 @@
 /**
- * THE RAIL — one white column: start a chat, app status, description, hairlines between.
+ * THE RAIL — one white column: start a chat, data, app status, description, hairlines between.
  *
  * It fills the shell's `<Outlet/>` column and must not draw the app pane as well: an iframe built
  * in here sits inside the content a route change replaces, so it remounts and reloads the running
  * app on the first navigation to a chat. The shell holds the pane as a sibling of the Outlet, and
  * a rail-plus-pane layout nested in here is how that gets undone.
+ *
+ * WHAT DELIBERATELY DOES NOT LIVE HERE: a second control that starts the app (the pane's Start is
+ * the only one — two would race the same endpoint), the project's name, its publish chip and its
+ * rename control (all surrendered to the toolbar row the shell draws above both columns), and the
+ * recents list (deleted by the owner's ruling).
+ *
+ * WHAT DOES, AS OF THE CONNECTOR PASS: the DATA section, between START A CHAT and APP STATUS —
+ * and it is the WHOLE of the connector's presence on this screen. The app pane says nothing about
+ * data access and the composer carries no per-chat data control; both are rulings, and
+ * `DataSection`'s own docblock carries the reasons.
+ *
+ * THE RAIL OWNS THE INTEGRATIONS DIALOG MOUNT, not the section that opens it, because the dialog
+ * opens OVER the rail and its close is what has to drive `DataSection`'s re-read. Everything the
+ * dialog can change — the switch, the chip, the count — is a fact this section fetched before it
+ * opened, and the dialog reports none of it back; there is no query cache in this portal to
+ * invalidate. So `onClose` closes it AND reloads, and dropping that reload is a silent regression
+ * a component test cannot see (`DataSection.integration.test.tsx` is where it goes red).
  */
+import { useState } from 'react'
 import ProjectDescriptionEditor from '../projects/ProjectDescriptionEditor'
 import RailComposer from './RailComposer'
 import AppStatusPanel from './AppStatusPanel'
+import DataSection from './DataSection'
+import IntegrationsDialog from '../connectors/IntegrationsDialog'
 import type { Project } from '../../utils/projectApi'
 import { canBePutBack } from '../../utils/buildSessionApi'
 import type { SaveState } from '../../utils/buildSessionApi'
@@ -70,6 +90,8 @@ function saveSentence(save: SaveState): string {
 }
 
 export default function WorkspaceRail({ project, save, onProjectUpdate }: WorkspaceRailProps) {
+  const [integrationsOpen, setIntegrationsOpen] = useState(false)
+
   return (
     // `min-h-0` is what actually lets this flex child scroll: without it the child's min-content
     // height wins and the overflow never has anywhere to happen. The column is what lets the
@@ -78,6 +100,18 @@ export default function WorkspaceRail({ project, save, onProjectUpdate }: Worksp
       <section className="px-[18px] pb-[15px] pt-4">
         <SectionLabel className="text-primary-900">START A CHAT</SectionLabel>
         <RailComposer projectId={project.id} />
+      </section>
+
+      <div className="h-px flex-shrink-0 bg-bial-border" />
+
+      {/* APP STATUS's padding, not START A CHAT's — the boards give the two lower sections the
+          same 15px band, and the composer's is the one that differs. */}
+      <section data-testid="rail-data" className="px-[18px] py-[15px]">
+        <DataSection
+          projectId={project.id}
+          label={<SectionLabel>DATA</SectionLabel>}
+          onOpenIntegrations={() => setIntegrationsOpen(true)}
+        />
       </section>
 
       <div className="h-px flex-shrink-0 bg-bial-border" />
@@ -113,6 +147,15 @@ export default function WorkspaceRail({ project, save, onProjectUpdate }: Worksp
           onProjectUpdate={onProjectUpdate}
         />
       </section>
+
+      {/* The SAME dialog the profile menu opens (R5) — one component, two doors, no new route.
+          THE RE-READ IS NOT WIRED HERE ANY MORE, deliberately: this door used to call
+          `dataSection.reload()` on close and the profile-menu door called nothing, so entering
+          from the avatar menu — which is on this very screen — left the section describing a
+          project the drill-down had just changed. `IntegrationsDialog` now announces the write
+          itself and `DataSection` subscribes, which covers both doors and any added later. Do
+          not re-add a reload here: it would fire a second, redundant read on this door only. */}
+      {integrationsOpen && <IntegrationsDialog onClose={() => setIntegrationsOpen(false)} />}
     </main>
   )
 }

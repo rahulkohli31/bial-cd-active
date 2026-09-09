@@ -7,6 +7,13 @@ the Pydantic boundary, not the DB column: a `ValueError` in a validator becomes 
 Neither field may be blanked to empty/whitespace any more — that was description's old
 behaviour (normalize to NULL) before #191 made it required; the column itself stays nullable
 regardless, so a project written before #191 with no description is untouched.
+
+ONE FUNCTION HERE IS NOT ABOUT PROJECTS. `clean_stated_reason` is the platform's shared "say
+why" rule, and its callers now reach past this domain — the admin app-delete and the connector
+access request. It stays in this module because this is where it was written, tested and
+shipped, and because every caller reaches it through `src/schemas/__init__.py` rather than
+through this file's path; moving a shipped validator's home is a larger change than widening it
+was, and would buy nothing a reader of the re-export can see.
 """
 
 from __future__ import annotations
@@ -60,7 +67,7 @@ def _clean_description(value: str) -> str:
     way `_clean_name` is — one change covers create and edit both.
 
     A description is required and WORD-bounded — 15 to 120 (#191 R12) — following
-    `clean_deletion_reason`'s shape (char-cap backstop first, then the word-count checks
+    `clean_stated_reason`'s shape (char-cap backstop first, then the word-count checks
     each with their own message), NOT `_clean_name`'s (which only ever checks a maximum).
     The minimum exists because a one-line description embeds into a single vector for
     semantic search (slice 3) and a description too short to say anything embeds to nothing
@@ -151,27 +158,45 @@ class ProjectPatch(CamelModel):
         return None if value is None else _clean_description(value)
 
 
-def clean_deletion_reason(value: str, *, subject: str) -> str:
-    """Why this `subject` is being deleted — 5 to 50 WORDS.
+def clean_stated_reason(value: str, *, say_why: str) -> str:
+    """A reason the platform REQUIRES a person to state, in their own words — 5 to 50 WORDS,
+    with a character paste backstop. `say_why` is the one sentence the caller supplies: what
+    the surface asks for, echoed back when the field is blank.
 
     The same shared rule as the title cap: `count_words` here,
     `portal/src/utils/words.ts` in the browser, both pinned against the same inputs. The
     client keeps the person inside the limit and the server enforces it independently.
 
-    A lower bound is unusual and deliberate. The reason exists so an administrator reading
-    a deletion months later learns something; "no" and "done" satisfy a required field
-    without satisfying that, and a field that can be dismissed in one word is a field that
-    will be.
+    A lower bound is unusual and deliberate. The reason exists so the person reading it
+    later learns something; "no" and "done" satisfy a required field without satisfying
+    that, and a field that can be dismissed in one word is a field that will be.
 
-    ONE RULE, TWO DELETES. The citizen deleting their own project and the administrator
-    destroying somebody else's app answer the same question under the same bounds, and both
-    dialogs share `words.ts`'s counter — so they share the validator too, with `subject`
-    supplying the only word that differs. A second copy of these four checks is how the two
-    surfaces end up disagreeing about what a word is.
+    ONE RULE, THREE SURFACES. The citizen deleting their own project, the administrator
+    destroying somebody else's app, and the citizen asking an administrator for access to a
+    connector all answer the same kind of question under the same bounds, and all three
+    dialogs share `words.ts`'s counter — so they share this validator too. A second copy of
+    these four checks is how two surfaces end up disagreeing about what a word is.
+
+    RENAMED FROM `clean_deletion_reason`, AND WIDENED, on 2026-09-08 (owner decision D1: the
+    connector access request uses the shipped delete-reason rule, not a 20/1000-character
+    note of its own). Three of the four sentences below already read correctly for a request;
+    only the empty-field one named deleting, so it became the `say_why` parameter rather than
+    a `subject` word slotted into a fixed deletion template — "Say what you need the data
+    for." is not `f"Say why you are ...ing this {subject}."` under any wording. The rename
+    came with it: a function called `clean_deletion_reason` that validates an access request
+    misdescribes itself at every call site, and the alternative — keeping the name and
+    explaining it here — asks every future reader to find this paragraph first. The two
+    delete callers pass their previous sentences verbatim, so no message changed on the wire
+    (`tests/api/v1/projects/test_delete_remark.py` passes unedited).
+
+    THE BOUNDS KEEP THEIR DELETE-FLAVOURED CONSTANT NAMES on purpose. `MIN_DELETE_REMARK_*`
+    are the deleted-project table's own numbers, and D1's ruling is precisely "use the rule
+    already shipped for a deletion reason" — a parallel set of aliases would be two names for
+    one number, which is the drift this function exists to prevent.
     """
     value = value.strip()
     if not value:
-        raise ValueError(f"Say why you are deleting this {subject}.")
+        raise ValueError(say_why)
     # The paste backstop, which a person should never meet.
     if len(value) > MAX_DELETE_REMARK_CHARS:
         # The character cap fires on something a WORD cap cannot express: a 40-word paste of
@@ -191,8 +216,9 @@ def clean_deletion_reason(value: str, *, subject: str) -> str:
 
 
 def _clean_delete_remark(value: str) -> str:
-    """The project delete's own binding of the shared rule."""
-    return clean_deletion_reason(value, subject="project")
+    """The project delete's own binding of the shared rule. The sentence is byte-identical to
+    the one this validator used to build from `subject="project"`."""
+    return clean_stated_reason(value, say_why="Say why you are deleting this project.")
 
 
 class ProjectDeleteRequest(CamelModel):

@@ -48,12 +48,18 @@ async def test_suspended_at_set_and_clear_roundtrip(db_session) -> None:
 def test_chain_ends_at_a_single_linear_head() -> None:
     # Pins the exact head, not just the count `test_alembic_single_head.py` already guards, so a
     # rebase that silently re-parents a revision fails here instead of at deploy. The head moved
-    # past 0038_app_previous_status to 0039_drop_current_code (#191 deleted Generate Description,
-    # current_code's one remaining reader, so the column followed it), then to
-    # 0040_description_embedding (#191 slice 3 — the semantic-search vector column; shortened
-    # from 0040_project_description_embedding, which overran alembic_version's VARCHAR(32)),
-    # then to 0041_project_shares (#198 slice 1 — the platform's first junction table).
-    # 0034 had already been re-parented
+    # past 0038_app_previous_status along TWO lines that both branched from it: main's
+    # 0039_drop_current_code (#191 deleted Generate Description, current_code's one remaining
+    # reader, so the column followed it) then 0040_description_embedding (#191 slice 3 — the
+    # semantic-search vector column; shortened from 0040_project_description_embedding, which
+    # overran alembic_version's VARCHAR(32)), and the connector line's 0039_connector_access (the
+    # two connector state machines: `connector_access_requests`, keyed on the PERSON, and
+    # `project_connectors`, carrying each project's switch and the days it reads). They meet at
+    # 0041_merge_connector_heads, a no-op merge — chosen over re-parenting 0039_connector_access
+    # because a database that already ran it keeps a revision alembic still knows, so a plain
+    # `alembic upgrade head` finishes the job. 0041_project_shares (#198 slice 1 — the platform's
+    # first junction table) grew off 0040 alongside it, and 0042_merge_shares_connectors joins the
+    # two the same way. 0034 had already been re-parented
     # TWICE by this assertion: authored as an 0029 off 0028_deployment_unpublished_at, moved
     # to 0033 off 0032_rejection_standing on one rebase, and to 0034 off 0033_harness_counters
     # on the next — each time because main took the ordinal first. Which is exactly the silent
@@ -66,4 +72,4 @@ def test_chain_ends_at_a_single_linear_head() -> None:
     # `down_revision` really is the head you expected to build on.
     config = Config(str(_BACKEND_ROOT / "alembic.ini"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0041_project_shares"]
+    assert heads == ["0042_merge_shares_connectors"]

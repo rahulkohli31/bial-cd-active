@@ -147,6 +147,34 @@ export default {
           offeredge: '#CDE9EA',    // …and the box's own border while the offer is live
           offerink: '#0A5C5F',     // the strip's headline — darker than the action teal, on purpose
           offerlock: '#F8FAFC',    // …and the input row's ground while that offer waits to be answered
+          /**
+           * THE AMBER NOTE'S EDGE, from `DateRange` — the hairline round the date popover's
+           * "N days available while you build" strip. Its GROUND is not here: the board sets it
+           * `#FEF3C7`, which this config already owns as `status-amber-bg`, and a second name for
+           * one hex is the drift the `canvas` docblock above exists to prevent.
+           *
+           * THE PLAN ASKED FOR `#FFFBF0` HERE AND THAT IS A MISREADING OF THE BOARD, recorded so
+           * it is not "fixed" back. `#FFFBF0` appears in `DateRange.dc.html` and `OpenIt.dc.html`
+           * twice each and only ever as the ground of a DASHED ANNOTATION CALLOUT — the
+           * designer's margin notes, which are not screens and are not built. `#F0DFC0` appears
+           * exactly once in the whole board set: this border.
+           */
+          noteedge: '#F0DFC0',     // the date popover's amber note border (its ground is status-amber-bg)
+          /**
+           * THE WAITING QUEUE ROW UNDER THE POINTER, from `AdminQueue`.
+           *
+           * READ THE BOARD, NOT THE PLAN, ON THIS ONE. The plan calls `#F8FCFC` "the waiting
+           * row's ground", which would tint all three of them; the board paints it on the FIRST
+           * waiting row and sets the other two `background:#fff` explicitly, and paints none of
+           * the decided rows at all. One row out of three, on the only table with a control in
+           * it, is a hover drawn onto a screenshot that cannot show one — so it ships as a hover
+           * and not as a ground. (Recorded because the same file already carries one plan
+           * misreading of a board hex, in `noteedge` directly above.)
+           *
+           * NOT A SECOND NAME FOR ONE THE RAMP OWNS: the nearest values in this config are
+           * `savedirty` #F5FCFC and `offer` #F5FBFB, both different hexes on different roles.
+           */
+          queuehover: '#F8FCFC',   // the waiting queue row under the pointer
         },
         /**
          * The nine status states of `StatusCardStates`, as text / ground / dot triples. Six

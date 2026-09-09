@@ -69,9 +69,15 @@ const RULES: Rule[] = [
   },
   {
     file: 'src/components/ui/button.tsx',
-    what: 'the four cva keys no call site selects (`outline` is NOT one of them — it covers the Slot branch)',
+    // `destructive` LEFT THIS LIST ON PURPOSE (owner decision D3): the connector decide dialog's
+    // `Decline` is a real caller, so the key is no longer an orphan and pruning it would delete
+    // live code. What replaced the coverage is the pair below — the smoke suite pins its SHAPE
+    // (the board's outline, never the registry's red fill) and the test under this one pins that
+    // it still has exactly the caller that earns it. `outline` was never on the list either: it
+    // covers the Slot branch.
+    what: 'the three cva keys no call site selects',
     scope: 'source',
-    forbidden: /^\s*(?:destructive|link|sm|lg):/m,
+    forbidden: /^\s*(?:link|sm|lg):/m,
     deleted: '        lg: "h-10 rounded-md px-8",',
   },
   {
@@ -122,5 +128,25 @@ describe('vendored and hand-written residue', () => {
       ).toBe(true)
     }
     expect(back, `removed residue is back:\n${back.join('\n')}`).toEqual([])
+  })
+
+  /**
+   * THE OTHER HALF OF PRUNING: a key that comes BACK has to keep earning its place.
+   *
+   * `destructive` was on the list above until the connector decide dialog needed it. The claim
+   * that makes the whole variant table reviewable — "the table is only what is mounted, and
+   * nothing selects a variant by expression" — is false the moment that one call site goes away
+   * and nobody notices, which is exactly how the key became residue the first time. A literal
+   * match, not a `variant={…}` one, for the same reason `button.tsx`'s docblock insists on it.
+   */
+  it('the destructive variant still has the one literal call site that earns it', () => {
+    const caller = 'src/components/admin/ConnectorReviewDialog.tsx'
+    const source = stripComments(readFileSync(path.join(ROOT, caller), 'utf8'))
+    expect(source, `${caller} no longer selects variant="destructive"`).toContain(
+      'variant="destructive"',
+    )
+    // Selected by LITERAL. A `variant={…}` expression anywhere in this portal would make the
+    // "only what is mounted" list unprovable by reading.
+    expect(source).not.toMatch(/variant=\{/)
   })
 })

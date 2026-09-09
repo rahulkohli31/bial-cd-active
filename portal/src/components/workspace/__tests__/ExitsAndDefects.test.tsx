@@ -127,6 +127,17 @@ afterEach(cleanup)
 
 const guardDialog = () => screen.queryByText(/save your changes before you go/i)
 
+/**
+ * Sign out through the navbar's avatar menu. It is a Radix `DropdownMenu`, so the trigger opens
+ * on POINTERDOWN (a `click` does nothing) and `Sign out` is a `role="menuitem"`, not a button —
+ * `Navbar.test.jsx` carries the full note.
+ */
+const signOutFromTheAvatarMenu = async () => {
+  const trigger = screen.getByText('Asha', { selector: 'p' }).closest('button')
+  fireEvent.pointerDown(trigger as HTMLElement)
+  fireEvent.click(await screen.findByRole('menuitem', { name: 'Sign out' }))
+}
+
 describe('★ no exit discards unsaved work in silence', () => {
   it('SIGNING OUT asks first — the most final button on the screen, and it did not', async () => {
     // Every nav LINK in the bar was routed through the guard and the one control that ends the
@@ -136,8 +147,7 @@ describe('★ no exit discards unsaved work in silence', () => {
     render(<Workspace />)
     await waitFor(() => expect(screen.getByTestId('rail-save-state')).toBeTruthy())
 
-    fireEvent.click(screen.getByText('Asha'))
-    fireEvent.click(screen.getByRole('button', { name: 'Sign out' }))
+    await signOutFromTheAvatarMenu()
 
     await waitFor(() => expect(guardDialog()).toBeTruthy())
     expect(api.logout).not.toHaveBeenCalled()
@@ -150,8 +160,7 @@ describe('★ no exit discards unsaved work in silence', () => {
     render(<Workspace />)
     await waitFor(() => expect(api.fetchPreviewState).toHaveBeenCalled())
 
-    fireEvent.click(screen.getByText('Asha'))
-    fireEvent.click(screen.getByRole('button', { name: 'Sign out' }))
+    await signOutFromTheAvatarMenu()
 
     await waitFor(() => expect(api.logout).toHaveBeenCalledTimes(1))
     await waitFor(() => expect(screen.getByTestId('login')).toBeTruthy())

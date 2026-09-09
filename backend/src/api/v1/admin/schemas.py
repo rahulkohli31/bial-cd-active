@@ -1,8 +1,22 @@
-"""Super-admin governance + user-limits/feedback schemas.
+"""Super-admin governance + user-limits/feedback + connector-access schemas.
 
-All request/response models for the two admin routers (`/admin/apps` governance and
-`/admin` users/limits/feedback), on the shared `CamelModel` base — camelCase over
-the wire, matching the admin SPA panels (`AppRegistryPanel`, `AuditDrawer`, …).
+All request/response models for the THREE admin routers (`/admin/apps` governance,
+`/admin` users/limits/feedback, and `/admin/connector-requests`), on the shared
+`CamelModel` base — camelCase over the wire, matching the admin SPA panels
+(`AppRegistryPanel`, `AuditDrawer`, `IntegrationsPanel`, …).
+
+The third router lives in its own module (`admin/connectors.py`) because `admin/router.py`
+is already ~2,500 lines; its schemas nevertheless stay here, with the other two surfaces'.
+See the section comment above them for why.
+
+THE ONE IMPORT THIS MODULE TAKES FROM ANOTHER v1 SURFACE is `ConsentLine`, off the citizen's
+`api/v1/connectors/schemas.py`. It is not a citizen-specific shape: it is the wire mirror of
+`core.connectors.ConsentLine`, a `lead` and a `body`, and BOTH consent panels — the citizen's
+`WHAT AN APPROVAL GIVES YOU` and the administrator's `WHAT APPROVING GIVES THEM` — cross the
+wire as lists of it. A second, identical Pydantic model here would be two names for one wire
+shape, free to drift the day either side gains a field, which is the exact failure both
+docblocks already exist to prevent. The dependency runs one way and closes no loop: that module
+imports from `db.models`, `schemas` and `services.connectors`, and nothing from `admin`.
 """
 
 from __future__ import annotations
@@ -13,9 +27,11 @@ from typing import Annotated, Any
 
 from pydantic import AfterValidator, AnyUrl, Field, UrlConstraints, field_validator
 
+from src.api.v1.connectors.schemas import ConsentLine
 from src.db.models.app_registry import MAX_DEPLOYED_URL, ApprovalRoute, AppStatus
+from src.db.models.connector_access import ConnectorRequestStatus
 from src.db.models.worker_pass import PassOutcome
-from src.schemas import CamelModel, clean_deletion_reason
+from src.schemas import CamelModel, clean_stated_reason
 
 
 def _fits_the_column(url: AnyUrl) -> AnyUrl:
@@ -260,8 +276,9 @@ RejectionNote = Annotated[
 
 
 def _clean_app_delete_reason(value: str) -> str:
-    """The admin app-delete's binding of the shared 5-50 word deletion rule."""
-    return clean_deletion_reason(value, subject="app")
+    """The admin app-delete's binding of the shared 5-50 word stated-reason rule. The sentence
+    is byte-identical to the one that rule used to build from `subject="app"`."""
+    return clean_stated_reason(value, say_why="Say why you are deleting this app.")
 
 
 class RejectRequest(CamelModel):
@@ -676,3 +693,162 @@ class HarnessCountersResponse(CamelModel):
 
     counters: list[HarnessCounterRow]
     since: datetime
+
+
+# --- connector access requests (`/admin/connector-requests`) --------------------
+#
+# A THIRD ADMIN SURFACE WHOSE ROUTER IS A SEPARATE MODULE (`admin/connectors.py`, because
+# `admin/router.py` is already ~2,500 lines) BUT WHOSE SCHEMAS STAY HERE, with the other two
+# surfaces'. The admin SPA reads one wire vocabulary across its five tabs, and a reviewer
+# comparing this queue's row against the app registry's has both shapes in one file. Splitting
+# the schemas would buy a shorter module and cost that comparison.
+
+
+def _clean_decline_remarks(value: str) -> str:
+    """The administrator's decline remark, on the shared 5-50 word stated-reason rule.
+
+    THE SAME RULE THE CITIZEN'S REQUEST USES (owner decision D1), and deliberately NOT the
+    20-character `RejectionNote` the app registry rejects with. Both connector dialogs count
+    words with `portal/src/utils/words.ts`, so one validator has to answer both sides of this
+    conversation or the browser's counter would let through something the API refuses — and
+    `RejectionNote`'s character floor is a rule that counter cannot express.
+
+    `say_why` is this surface's own sentence. It is what the administrator is asked for when the
+    box is empty, and the words they write are the WHOLE of what a refused person is told:
+    `Ask again` is not built, so a decline has no path back and no second explanation."""
+    return clean_stated_reason(value, say_why="Say why you are declining this request.")
+
+
+class ConnectorDeclineRequest(CamelModel):
+    """The body `POST /v1/admin/connector-requests/{request_id}/decline` requires.
+
+    THERE IS NO APPROVE BODY AT ALL, and that asymmetry is the `AdminReview` board's largest
+    departure (R10). The board draws a permanent `REQUIRED` pill over `YOUR REMARKS` and the
+    sentence `Approving needs a remark as well as declining`; both come off. Approving is a
+    click that stores nothing, because an approval remark would be readable nowhere — the audit
+    row carries ids only, the citizen is never shown it, and `ALREADY DECIDED` has no remarks
+    column and no way to reopen a decided row. A write-only column is worse than no column.
+
+    WHO decided is stamped from the authenticated session and never carried in the body."""
+
+    remarks: str
+
+    _v_remarks = field_validator("remarks")(_clean_decline_remarks)
+
+
+class ConnectorRequestRow(CamelModel):
+    """One `connector_access_requests` row as the administrator's queue sees it: who asked, for
+    what, in whose words, and what was decided.
+
+    ONE SHAPE FOR BOTH TABLES. `AdminQueue` draws `WAITING ON YOU` and `ALREADY DECIDED` with
+    different columns, and the fields outside a row's own status read `null` — the same rule
+    `ConnectorEntry` follows for the citizen. Two schemas would put the person, their email and
+    the connector in two places to save four nulls in each.
+
+    `displayName` IS NEVER NULL, AND IS NOT ALWAYS `users.display_name`. That column is
+    nullable, and this server substitutes the work email exactly as
+    `services/connectors/access.PersonAccess` already does for a decider's name — one fallback,
+    written once, on the server, so no panel writes a second one and no cell can render an empty
+    string beside an authorization decision. The consequence is intended and worth stating: a
+    person with no display name renders their email on both lines of the queue's two-line cell.
+
+    `email` IS THE WORK EMAIL, IN PLACE OF THE BOARD'S `department`. `AdminQueue` draws
+    `Priya Nair` / `Ground operations`; `department` exists nowhere in this product and there is
+    no directory client behind one, so the second line carries the value the platform already
+    verifies about a person.
+
+    `decidedById` RIDES SO THE PORTAL CAN RENDER `you` FOR THE RIGHT ADMINISTRATOR. The board
+    writes `2 Sep · you` on every decided row, which is true only for the administrator it was
+    drawn for; BIAL runs two super-admins, so the console compares this id against
+    `GET /v1/auth/me`'s and falls back to `decidedByName`. Hard-coding `you` server-side would
+    put one administrator's identity on the other's screen."""
+
+    id: uuid.UUID
+    #: The person who asked. The queue is the ONE surface that reads across users, so the
+    #: subject's id is on the row rather than inferred from anything.
+    user_id: uuid.UUID
+    #: `users.display_name`, or their email when that column is null. Never empty.
+    display_name: str
+    email: str
+    #: The stored `connector_key` — stable, lowercase, never rendered.
+    connector_key: str
+    #: The catalogue's name for it, so the `CONNECTOR` column needs no second lookup and no
+    #: component has to know what any connector is called (R18).
+    connector_display_name: str
+    #: `AdminReview`'s `WHAT APPROVING GIVES THEM` panel — the registry's THIRD-PERSON consent
+    #: set, which is a different tuple from the citizen's `consentLinesRequester` and not
+    #: derivable from it (`core.connectors` explains why they are two fields).
+    #:
+    #: ON EVERY ROW, INCLUDING THE DECIDED ONES, AND THAT REDUNDANCY IS THE POINT. The decide
+    #: dialog is handed one row and nothing else, so the row is the only object the copy can
+    #: ride; a component that reconstructed these three sentences would make "add a second
+    #: connector" a component change, which is exactly the claim R18 makes and which
+    #: `1935588e` had to come back and repair on the citizen's side. Narrowing it to `waiting`
+    #: rows would save a few hundred bytes and reintroduce the state-conditional copy field
+    #: `ConnectorEntry`'s docblock argues against.
+    consent_lines_approver: list[ConsentLine]
+    #: The citizen's own words, in full. The queue renders them untruncated (board) and as plain
+    #: text on every surface, never through a markdown component: one user writes this and
+    #: another reads it.
+    requester_remarks: str
+    #: When they asked — the `ASKED` column, which names a time of day, so this is not a date.
+    asked_at: datetime
+    #: `pending`, `approved` or `declined`. A `cancelled` row is not a decision and is not in
+    #: either listing, so that value never crosses this wire.
+    status: ConnectorRequestStatus
+    #: The four decided-only fields. `null` on a waiting row.
+    decided_at: datetime | None = None
+    decided_by_id: uuid.UUID | None = None
+    #: The decider's display name, or their email. `None` when the administrator who decided has
+    #: since been deleted — `decided_by_id` is `ON DELETE SET NULL`, so a decision outlives its
+    #: decider and the row keeps its date with the decider unnamed.
+    decided_by_name: str | None = None
+    #: Written only on a decline (R10). `null` on an approval is correct, not a missing write.
+    decision_remarks: str | None = None
+    #: `USING IT IN` — how many of THIS person's projects have THIS connector switched on.
+    #: `null` on a declined row (the board draws an em dash) and on a waiting one; `0` is a real
+    #: answer meaning an approved person who has not switched it on anywhere yet.
+    using_it_in: int | None = None
+
+
+class ConnectorRequestListResponse(CamelModel):
+    """One page of the administrator's queue, in the order that table is read in.
+
+    `truncated` EXISTS FOR THE SAME REASON `AppListResponse`'S DOES: the read stops at a cap and
+    SAYS so rather than returning a silent prefix. Nothing bounds how many people may ask for a
+    connector, and a queue that quietly hid its tail would let a request wait forever with the
+    console showing a caught-up screen."""
+
+    requests: list[ConnectorRequestRow]
+    truncated: bool = False
+
+
+class ConnectorWaitingCountResponse(CamelModel):
+    """`{ waiting: N }` — the Integrations tab badge's only source.
+
+    ONE NUMBER, AND ONLY THE WAITING ONE. The badge answers "is anybody waiting on me"; a decided
+    count has no badge to render it and would be a field with no reader. A DEDICATED route rather
+    than `len(requests)` off the listing, for the reason `AppCountsResponse` gives: the listing
+    projects up to 200 rows, joins `users` and counts each person's enabled projects, and a badge
+    polling it would pay all of that on a cadence — and pay MORE of it as the queue it reports on
+    grows, which is exactly backwards."""
+
+    waiting: int
+
+
+class ConnectorDecisionResponse(CamelModel):
+    """What approve and decline answer with: the row's new state, in the shape
+    `AdminAppStatusResponse` answers a governance transition with.
+
+    NO DECIDER NAME ON THIS BODY, deliberately. The caller IS the decider, so the console
+    renders `you` for the row it just wrote without being told; the name matters only on the
+    LISTING, where the other administrator's decisions are read, and it rides `ConnectorRequestRow`
+    there. `decidedAt` is here because it is the server's clock, not the browser's."""
+
+    request_id: uuid.UUID
+    #: The person the decision is about — the console reloads its queue by it, and a client that
+    #: kept the row in place needs to know whose row moved.
+    user_id: uuid.UUID
+    connector_key: str
+    status: ConnectorRequestStatus
+    decided_at: datetime
