@@ -34,6 +34,7 @@ from typing import Final
 
 import sqlalchemy as sa
 from fastapi import APIRouter, status
+from redis.exceptions import RedisError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.api.deps import CurrentUser, DbSession
@@ -59,7 +60,14 @@ from src.db.models.connector_access import ConnectorAccessRequest, ConnectorRequ
 from src.db.models.project import Project
 from src.db.models.project_connector import ConnectorWindowKind, ProjectConnector
 from src.schemas import AUTH_401, ErrorEnvelope, error_responses
+from src.services.build_sessions.locks import (
+    liveness_lease_is_held,
+    lock_is_held,
+    read_starting_marker,
+)
 from src.services.connectors import ConnectorPersonState, PersonAccess, current_access
+from src.services.redis import get_redis
+from src.services.redis.client import RedisNotConfiguredError
 
 router = APIRouter(prefix="/connectors", tags=["connectors"])
 
@@ -67,6 +75,29 @@ _NO_SUCH_CONNECTOR = "That connector is not available."
 _ALREADY_ASKED = "You have already asked for access to this. An administrator is looking at it."
 _ALREADY_DECIDED = "An administrator has already answered this request."
 _NOTHING_TO_CANCEL = "There is no waiting request to cancel."
+
+# R11a. A CONTAINER RECEIVES ITS ENVIRONMENT EXACTLY ONCE, AT BIRTH, so a connector switched on
+# while a build or a conversation is running would leave the rail saying "on" over a container
+# that cannot reach anything — and the attach arm, which is the steady state, forwards no
+# environment at all. Rather than reconciling that state, the owner ruled it out of existence:
+# the settings are locked while a session is live. No retrofit, no forced container swap, no
+# half-configured state to test for.
+#
+# THE REFUSAL IS SERVER-SIDE BECAUSE A GREYED-OUT CONTROL IS NOT A GUARD. The message names what
+# the citizen has to do, because they can actually do it — the workspace has a Stop control, and
+# a turn ends on its own.
+_SESSION_IS_LIVE = (
+    "You have a chat or a build running. Finish or stop it, then change what {name} reads — "
+    "an app that is already running keeps the settings it started with."
+)
+
+# The residual, stated once so nobody reads the lock as tighter than it is: this refuses a change
+# while a TURN is live, which is what the platform can observe from another process. A container
+# that is alive but idle between turns still keeps the settings it was born with, so a change made
+# in that window reaches the app on its NEXT birth rather than immediately. That is the same
+# birth-only rule every other injected credential follows, and the rail already tells the truth
+# about what is stored; what the lock prevents is the state where a citizen watches a running
+# build and is told it is reading data it demonstrably cannot reach.
 
 # A state that must have a row behind it arrived without one. Unreachable while `current_access`
 # is the only producer of a `PersonAccess`; raised rather than papered over because the
@@ -383,6 +414,46 @@ def _unsupported_window_message(connector: Connector) -> str:
     return f"Pick one of the ranges {connector.display_name} offers: {listed} days."
 
 
+async def _refuse_while_a_session_is_live(user_id: uuid.UUID, connector: Connector) -> None:
+    """R11a: refuse a settings change while this citizen has a turn in flight.
+
+    THREE SIGNALS, ANY OF WHICH MEANS LIVE, because they cover the whole of a session's shape:
+    the one-per-user LOCK is held for the duration of a turn; the liveness LEASE is the one signal
+    readable from another process and outlives a lock a crashed builder left standing; and the
+    STARTING marker covers the window between "a start was asked for" and "the lock was taken".
+    Reading only the lock would let a change land during a cold start, which is precisely the
+    window in which the container's environment is being assembled.
+
+    FAILS CLOSED. A Redis error refuses the change rather than allowing it — the same posture
+    `acquire_lock` takes, and the consistent one: if the platform cannot tell whether a session is
+    live, it also cannot start one, so refusing here denies nothing that would otherwise work.
+
+    NO REDIS AT ALL means no sandbox coordination, which means no live session to protect. That is
+    a supported dev/test posture and the answer is simply "not live"."""
+    try:
+        redis = get_redis()
+    except RedisNotConfiguredError:
+        return
+    try:
+        live = (
+            await lock_is_held(redis, user_id)
+            or await liveness_lease_is_held(redis, user_id)
+            or await read_starting_marker(redis, user_id) is not None
+        )
+    except RedisError as exc:
+        raise AppApiError(
+            status.HTTP_409_CONFLICT,
+            _SESSION_IS_LIVE.format(name=connector.display_name),
+            code="session_is_live",
+        ) from exc
+    if live:
+        raise AppApiError(
+            status.HTTP_409_CONFLICT,
+            _SESSION_IS_LIVE.format(name=connector.display_name),
+            code="session_is_live",
+        )
+
+
 async def _owned_project_or_404(db: DbSession, project_id: uuid.UUID, user_id: uuid.UUID) -> None:
     """Prove the caller owns this project, or fail closed with the non-leaking 404.
 
@@ -575,6 +646,7 @@ async def list_connector_projects(
         AUTH_401,
         (403, ErrorEnvelope, "CSRF check failed, or your access is not approved"),
         (404, ErrorEnvelope, "No such connector, or no such project"),
+        (409, ErrorEnvelope, "A chat or build is running, so the settings are locked"),
         (422, ErrorEnvelope, "The window is not one this connector offers"),
     ),
 )
@@ -597,7 +669,10 @@ async def set_project_connector(
     Refused with `403 access_not_approved` unless an administrator has approved YOUR access to
     this connector — waiting, declined and never-asked all refuse, and nothing is written.
     Refused with `404 project_not_found` for a project you do not own, and `404
-    unknown_connector` for a connector that is not in the catalogue.
+    unknown_connector` for a connector that is not in the catalogue. Refused with `409
+    session_is_live` while you have a chat or a build running: a container is given its
+    environment once, when it starts, so a change made mid-session would leave the rail
+    promising data the running app cannot reach.
 
     A stored range is never bounds-checked on the way in and never rewritten afterwards: it is
     clamped on every READ instead, so it ages out on its own. Returns this project's connector in
@@ -617,6 +692,11 @@ async def set_project_connector(
             _NEEDS_APPROVAL.format(name=connector.display_name),
             code="access_not_approved",
         )
+
+    # R11a — AFTER the approval check and BEFORE anything is written. Ordered that way on
+    # purpose: an unapproved citizen gets the 403 they would always have got, rather than a
+    # confusing "stop your build" for a setting they were never allowed to change.
+    await _refuse_while_a_session_is_live(user.id, connector)
 
     window = body.window
     if isinstance(window, RelativeWindowChoice) and window.days not in _offered_days(connector):

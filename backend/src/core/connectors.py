@@ -92,7 +92,8 @@ class Connector:
     mutated, and a typo'd attribute assignment should fail loudly rather than land on the entry.
 
     `display_name` and `subtitle` are the two strings every connector row and every admin filter
-    pill renders. `max_window_days` is the connector's own retention cap, read by `resolve_window`.
+    pill renders. `max_window_days` is the connector's own retention cap and `freshness_lag_days`
+    its own staleness — the two numbers `resolve_window` derives every date from.
     The two `consent_lines_*` tuples are the two panels described in the module docblock — see it
     before considering them redundant.
 
@@ -113,6 +114,23 @@ class Connector:
     # it always appears mid-sentence.
     data_noun: str
     max_window_days: int
+    # HOW FAR BEHIND TODAY THIS CONNECTOR'S NEWEST DATA IS, in whole days. The same KIND of fact
+    # `max_window_days` is — a property of the CONNECTED SYSTEM, not of the platform — and it
+    # rides the entry for the same reason: DICE extracts overnight, so its newest complete day is
+    # yesterday, while another system may be live and declare zero. `resolve_window` derives its
+    # ceiling from this, which is what makes today disappear from the picker, from every resolved
+    # window and from the days a generated app may draw against, all from one number.
+    #
+    # NOT A MODULE CONSTANT, and not three of them. A `FRESHNESS_LAG_DAYS = 1` beside this class
+    # is the thing the next reader "corrects" in one of the three places `resolve_window` needs
+    # it, and a lag applied to the presets but not to the ceiling is a picker that greys out
+    # today while `Last 7 days` still ends on it.
+    #
+    # A CEILING, NOT A PROMISE. The code never OFFERS today; it also never assumes yesterday's
+    # file exists. Loads fail and leave stubs and the calendar is sparse, so the newest readable
+    # day is whatever the lake's own listing says — which is why the worked example in the golden
+    # template derives that for itself rather than computing it from a clock.
+    freshness_lag_days: int
     consent_lines_requester: tuple[ConsentLine, ...]
     consent_lines_approver: tuple[ConsentLine, ...]
 
@@ -177,6 +195,8 @@ CONNECTORS: Final[Mapping[str, Connector]] = MappingProxyType(
             ),
             # DICE's retention, not the platform's rule. See the module docblock.
             max_window_days=30,
+            # The extract runs overnight, so the newest complete day in the lake is yesterday.
+            freshness_lag_days=1,
             consent_lines_requester=_DICE_CONSENT_REQUESTER,
             consent_lines_approver=_DICE_CONSENT_APPROVER,
         ),
@@ -259,18 +279,26 @@ def resolve_window(
     and then `today - 29` — an off-by-one waiting to be "corrected" by the next reader who noticed
     the two numbers differ.
 
+    THE CEILING IS NOT TODAY, AND THAT IS THE CONNECTOR'S FACT TOO. `freshness_lag_days` says how
+    far behind the connected system runs; `latest` is `today` minus it, and EVERY end in this
+    function is `latest`. There are four such places, not one — the pair above, the `RELATIVE`
+    arm (the presets, which is the default UI path), and the aged-out arm — and leaving any of
+    them as `today` ships a picker that greys out a day the presets still resolve to. The
+    calendar grid greys its dates against the returned `earliest`/`latest`, so the popover
+    inherits the rule with no change of its own.
+
     TWO HISTORICAL WRONG TURNS, PINNED HERE BECAUSE THE ORDER OF THE CLAMP IS THE WHOLE OF IT:
 
     1. The first draft had NO CEILING AT ALL. A stored 10 August – 31 December resolved to 144 days
        with `clamped` reading false, and the rail announced `Reading 144 days of flight data` for a
-       connector that keeps thirty and holds nothing at all after today.
+       connector that keeps thirty and holds nothing at all after its own ceiling.
     2. The correction introduced a second bug: capping `end` and THEN raising `start` to the floor
        INVERTS THE PAIR for a future-dated window — 1–30 October read on 8 September gives
        `start = 1 October`, `end = 8 September`. Step 2 (pull `start` down to the capped `end`) and
        the `else` arm of step 3 (cap the length against the RESOLVED end, not against the floor
        alone) are what make the order safe. Do not reorder them.
 
-    The aged-out arm resolves to a window OF THE SAME LENGTH ending today, itself capped. An
+    The aged-out arm resolves to a window OF THE SAME LENGTH ending at `latest`, itself capped. An
     earlier "falls back to the floor" silently widened a three-day pick to thirty.
 
     `stored.window_start <= stored.window_end` is the writer's guarantee (U4 validates it) and is
@@ -283,11 +311,20 @@ def resolve_window(
     enforced fail-closed upstream at the auth seam (`src/api/deps.py`), and a second, weaker copy
     of that check here would invite someone to delete the real one."""
     today = ist_today(now)
-    # THE PAIR. Named together and derived from the single `max_window_days` so a reader cannot
-    # take one without the other. `- 1` because the floor is INCLUSIVE of today: thirty calendar
-    # days counting today ends twenty-nine days back, not thirty.
-    earliest = today - timedelta(days=connector.max_window_days - 1)
-    latest = today
+    # THE PAIR, AND `today` IS NOT HALF OF IT. The ceiling is the newest day the connector
+    # actually holds — today minus its own freshness lag — and the floor is measured back from
+    # THAT, not from today, so a thirty-day window is thirty days the lake can answer for rather
+    # than twenty-nine plus a day that does not exist yet.
+    #
+    # `- 1` because the floor is INCLUSIVE of the ceiling: thirty calendar days counting the
+    # ceiling ends twenty-nine days before it, not thirty. Named together and derived from one
+    # field each so a reader cannot take one without the other.
+    #
+    # `today` SURVIVES AS A LOCAL AND IS NEVER AN ANSWER. Every place that used to assign it as
+    # an `end` now assigns `latest`; it exists only as the input the lag is measured from. If a
+    # fifth use ever appears, that is the bug this comment is here to catch.
+    latest = today - timedelta(days=connector.freshness_lag_days)
+    earliest = latest - timedelta(days=connector.max_window_days - 1)
 
     if stored is None:
         return None
@@ -297,17 +334,18 @@ def resolve_window(
     if stored.window_kind is ConnectorWindowKind.RELATIVE:
         if stored.window_days is None:
             raise ValueError(_SHAPE_VIOLATION)
-        # A preset is re-resolved from today on every read, so `Last 7 days` still means the last
-        # seven days a month later. It cannot leave the bounds, so `clamped` is FALSE BY DEFINITION
-        # here, not "false because we checked" — a day count is not a date pair, so "the stored and
-        # the resolved values differ" is not a question that can be asked of it. The portal keys on
-        # that flag (it pre-selects the RESOLVED range in the popover), so do not make it truthy
-        # here to signal something else. The one premise: every preset the write side offers is
+        # A preset is re-resolved from the CEILING on every read, so `Last 7 days` still means the
+        # last seven days the connector holds a month later — and never includes today. It cannot
+        # leave the bounds, so `clamped` is FALSE BY DEFINITION here, not "false because we
+        # checked" — a day count is not a date pair, so "the stored and the resolved values
+        # differ" is not a question that can be asked of it. The portal keys on that flag (it
+        # pre-selects the RESOLVED range in the popover), so do not make it truthy here to signal
+        # something else. The one premise: every preset the write side offers is
         # within the connector's own cap. That holds for `{7, 14, 30}` against DICE's thirty; a
         # connector whose retention is SHORTER than a preset would need the preset set derived from
         # `max_window_days` at the write, which is where the choice is made.
-        start = today - timedelta(days=stored.window_days - 1)
-        end = today
+        start = latest - timedelta(days=stored.window_days - 1)
+        end = latest
         clamped = False
     elif stored.window_kind is ConnectorWindowKind.ABSOLUTE:
         stored_start, stored_end = stored.window_start, stored.window_end
@@ -321,10 +359,10 @@ def resolve_window(
         start = min(stored_start, end)
         if end < earliest:
             # 3a. AGED OUT ENTIRELY — the whole pick is older than the connector keeps. Slide it
-            #     forward to the SAME LENGTH ending today rather than widening it to the cap: a
-            #     three-day pick from June is three days, not thirty.
+            #     forward to the SAME LENGTH ending at the CEILING rather than widening it to the
+            #     cap: a three-day pick from June is three days, not thirty.
             length = min((stored_end - stored_start).days + 1, connector.max_window_days)
-            end = today
+            end = latest
             start = end - timedelta(days=length - 1)
         else:
             # 3b. THE FLOOR, then the length cap — the latter against the RESOLVED `end`, which is

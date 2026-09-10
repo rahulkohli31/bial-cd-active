@@ -65,9 +65,19 @@ class FakeAca(AcaControlPlane):
         self.transient_before_success = 0
         self.get_returns_none = False
         self.fqdn = "app-xyz.westeurope.azurecontainerapps.io"
+        # Which connector identity, if any, each container was born with.
+        self.identities: dict[str, str | None] = {}
 
-    async def create_app(self, *, name: str, env: dict[str, str], tags: dict[str, str]) -> str:
+    async def create_app(
+        self,
+        *,
+        name: str,
+        env: dict[str, str],
+        tags: dict[str, str],
+        identity_resource_id: str | None = None,
+    ) -> str:
         self.create_calls += 1
+        self.identities[name] = identity_resource_id
         if self.transient_before_success > 0:
             self.transient_before_success -= 1
             raise AcaTransientError("simulated transient ACA error")
@@ -568,7 +578,7 @@ def test_the_container_probes_knock_on_the_supervisor_and_never_on_the_app() -> 
     at `/` gets a Caddy 502 forever and the revision never goes healthy), and there MUST be no
     Liveness probe (its restart would hit a sandbox holding the citizen's un-snapshotted work).
     """
-    envelope = _bare_control_plane()._envelope(_app_env(), {})  # noqa: SLF001
+    envelope = _bare_control_plane()._envelope(_app_env(), {}, identity_resource_id=None)  # noqa: SLF001
     container = envelope.template.containers[0]
     probes = container.probes
 
@@ -758,4 +768,84 @@ async def test_attach_agrees_with_provision_about_where_a_person_goes(
     provisioned = await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
     attached = await client.attach_existing(str(USER))
     assert attached.preview_url == provisioned.preview_url
+    await client.aclose()
+
+
+# --- the connector identity, threaded through the REAL client ------------------------------------
+#
+# The published-app path derives its identity INSIDE `_envelope`, which is a pure function with
+# its own tests. The sandbox path deliberately does not: `_provision_container` derives it and
+# passes it to `create_app`, so the decision lives in the caller and the caller is what has to be
+# asserted. `FakeAca.identities` records what ARM would have been sent.
+
+
+async def test_a_sandbox_born_with_connector_coordinates_is_given_the_identity(
+    fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ COORDINATES AND CREDENTIAL ARE ONE FACT. A container told where the lake is and NOT
+    given the identity cannot read anything — and, far worse, one given the identity without the
+    coordinates can read the whole flight container anyway, because the identity is the grant and
+    the URL is only a label. This asserts the real `AcaSandboxClient` wiring, not the derivation
+    helper: dropping the `identity_resource_id=` argument from `_provision_container`'s
+    `create_app` call passes every existing test in this file and fails only this one."""
+    from src.config import settings as app_settings
+    from src.services.lake.config import LakeConfig
+
+    resource_id = (
+        "/subscriptions/80d1bab5-0000-0000-0000-000000000000/resourcegroups/bial-cd-rg"
+        "/providers/Microsoft.ManagedIdentity/userAssignedIdentities/an-identity"
+    )
+    monkeypatch.setattr(
+        app_settings,
+        "connector_lake",
+        LakeConfig(
+            url="https://alakeaccount.blob.core.windows.net/acontainer/AOS/reports/",
+            identity_client_id="52b74947-0621-46e2-a523-a6b466f47c33",
+            identity_resource_id=resource_id,
+        ),
+    )
+    aca = FakeAca()
+    client = _client(aca)
+    granted = _app_env() | {"BIAL_DICE_URL": "https://alakeaccount.blob.core.windows.net/c/p/"}
+
+    await client.provision_new(str(USER), APP_NAME, app_env=granted)
+
+    assert aca.identities[APP_NAME] == resource_id
+    await client.aclose()
+
+
+async def test_a_sandbox_born_without_any_coordinates_is_given_no_identity(
+    fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ THE OTHER HALF, AND THE ONE THAT MATTERS MORE. This is every build on the platform: a
+    project with the connector off, an owner who never asked, an owner declined, or a deployment
+    with no lake at all. Each of those must reach ARM as no identity block whatsoever.
+
+    Paired with the test above rather than written alone, because an implementation that attached
+    the identity unconditionally would pass that one and hand every citizen's build a credential
+    to BIAL's flight data — which is precisely the failure `lake/env.py` exists to make
+    structurally impossible.
+
+    A liveness assertion sits beside the absence one: a container that was never created would
+    satisfy `identities[APP_NAME] is None` vacuously."""
+    from src.config import settings as app_settings
+    from src.services.lake.config import LakeConfig
+
+    monkeypatch.setattr(
+        app_settings,
+        "connector_lake",
+        LakeConfig(
+            url="https://alakeaccount.blob.core.windows.net/acontainer/AOS/reports/",
+            identity_client_id="52b74947-0621-46e2-a523-a6b466f47c33",
+            identity_resource_id="/subscriptions/s/resourcegroups/rg/providers/x/y/z",
+        ),
+    )
+    aca = FakeAca()
+    client = _client(aca)
+
+    # A lake IS configured; this project simply was not granted it, so no `BIAL_DICE_URL`.
+    await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+
+    assert APP_NAME in aca.created, "the container was never created; the assertion below is void"
+    assert aca.identities[APP_NAME] is None
     await client.aclose()

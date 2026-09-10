@@ -928,7 +928,13 @@ class AcaSandboxClient(SandboxClient):
         return True
 
     async def _create_with_retry(
-        self, app_name: str, env: dict[str, str], tags: dict[str, str], *, arm: _BirthArm
+        self,
+        app_name: str,
+        env: dict[str, str],
+        tags: dict[str, str],
+        identity_resource_id: str | None,
+        *,
+        arm: _BirthArm,
     ) -> str:
         """Create the ACA container, retrying the transient failures. `arm` is carried for the
         success notice below and nothing else — the two births are otherwise identical here.
@@ -944,7 +950,12 @@ class AcaSandboxClient(SandboxClient):
         last: Exception | None = None
         for attempt in range(_ACA_MAX_ATTEMPTS):
             try:
-                fqdn = await self._aca.create_app(name=app_name, env=env, tags=tags)
+                fqdn = await self._aca.create_app(
+                    name=app_name,
+                    env=env,
+                    tags=tags,
+                    identity_resource_id=identity_resource_id,
+                )
             except AcaTransientError as exc:
                 last = exc
                 if attempt >= _ACA_MAX_ATTEMPTS - 1:
@@ -1027,7 +1038,22 @@ class AcaSandboxClient(SandboxClient):
             if kind == "shared_sandbox"
             else sandbox_tags(user_id=user_uuid, app_id=app_id)
         )
-        fqdn = await self._create_with_retry(app_name, env, tags, arm=arm)
+        # WHETHER THIS CONTAINER MAY READ A CONNECTOR'S DATA, read back out of the environment
+        # the caller built rather than decided again here. The access question — a lake
+        # configured, the connector switched on for this project, the owner approved — was
+        # answered once by `build_connector_env`, and the presence of its coordinates IS that
+        # answer; deriving it again would be a second place the platform decides who may read
+        # BIAL's flight data. `None` means no identity block at all, so a container that was not
+        # granted anything gets a spec byte-identical to the one this platform sent before
+        # connectors existed.
+        #
+        # Imported lazily for the same reason the three `src.config` imports in this module are:
+        # this file is reached from `src/services/sandbox/__init__.py`, which `src/settings/api.py`
+        # imports, and the connector registry reaches `src/db/models/`.
+        from src.services.lake.env import identity_resource_id_for_env
+
+        identity_resource_id = identity_resource_id_for_env(app_env)
+        fqdn = await self._create_with_retry(app_name, env, tags, identity_resource_id, arm=arm)
         token_ref = self._register_token(token)
         self._app_owners[app_name] = user_uuid
         try:

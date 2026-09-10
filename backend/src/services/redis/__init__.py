@@ -23,6 +23,9 @@ from src.services.redis.client import (
     get_redis as get_redis,
 )
 from src.services.redis.client import (
+    get_redis_bytes as get_redis_bytes,
+)
+from src.services.redis.client import (
     reset_redis_for_tests as reset_redis_for_tests,
 )
 from src.services.redis.config import RedisConfig as RedisConfig

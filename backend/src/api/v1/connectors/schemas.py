@@ -163,13 +163,15 @@ class ConnectorWindow(CamelModel):
 
     EVERY FIELD HERE IS AN ANSWER, NOT AN INPUT. `start`, `end` and `days` are post-clamp, so
     `Reading N days of flight data` and the `1 – 30 Sep` chip beside it are the same numbers
-    from the same emitter; a preset is re-resolved from today on every read, so a project on
-    `Last 7 days` still reads the last seven days a month later.
+    from the same emitter; a preset is re-resolved on every read against the connector's
+    freshness ceiling — NOT against today — so a project on `Last 7 days` still reads the seven
+    most recent READABLE days a month later.
 
     `earliestDate` AND `latestDate` ARE RETURNED BECAUSE THE CALENDAR GREYS AGAINST THEM. A
     browser in Bangalore and a server in UTC are 5½ hours apart, so a grid that computed its own
-    floor would draw a date as selectable that the next read refuses. Both ends travel: the
-    connector holds nothing after today either.
+    floor would draw a date as selectable that the next read refuses. Both ends travel, and the
+    ceiling is the one that surprises: the connector holds nothing after `latestDate`, which is
+    `today - freshnessLagDays`, because a day's flights are loaded the following morning.
 
     `clamped` IS NOT AN ERROR. It says the stored pair aged out of the connector's retention or
     pointed past today and the platform read the nearest honest window instead. It is false by
@@ -182,7 +184,9 @@ class ConnectorWindow(CamelModel):
     #: therefore the number of days the app can actually see.
     days: int
     clamped: bool
-    #: The oldest and newest dates this connector will serve today, inclusive, in `Asia/Kolkata`.
+    #: The oldest and newest dates this connector will serve RIGHT NOW, inclusive, in
+    #: `Asia/Kolkata`. `latestDate` is behind today by the connector's freshness lag — it is the
+    #: newest day the lake has actually loaded, never the current date.
     earliest_date: date
     latest_date: date
     stored: StoredWindow

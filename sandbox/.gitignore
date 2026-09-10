@@ -24,3 +24,17 @@ uv.lock
 # never shadow the tracked, build-critical template/package-lock.json (Dockerfile.sandbox's
 # `npm ci` depends on it).
 node_modules/
+
+# Tool output from the seed workspace (`seed/`), which exists only to VERIFY the golden
+# template's reference file: `seed/flight-data.ts` is typechecked under the template's own
+# `strict` settings and unit-tested there, then rendered into
+# `template/lib/flight-data.reference.ts` by `seed/generate-reference.mjs`. Nothing in `seed/`
+# ships — `Dockerfile.sandbox` never copies or installs it — so nothing it produces is committed.
+# Its install is already covered by `node_modules/` above; these are what tsc and vitest leave.
+#
+# `seed/package-lock.json` is deliberately NOT here. It is tracked, because "verified under
+# strict" is a claim about a specific resolution of four packages, and a year from now that claim
+# is only reproducible from a lockfile (`npm ci`), not from four pinned direct versions whose
+# transitive tree has moved on.
+seed/coverage/
+*.tsbuildinfo

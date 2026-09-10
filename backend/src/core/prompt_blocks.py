@@ -47,6 +47,8 @@ and must be left exactly as they are:
   scripts/db-migrate.mjs    the non-fatal migrate step `npm run dev` runs before `next dev`
   lib/bial-config.ts        the injected-config type + the window.__BIAL_CONFIG declaration
   lib/utils.ts              the cn() class helper
+  lib/flight-data.reference.ts  how to read the connected flight data — the file names, the
+                            date columns, and the traps; all line comments, nothing in it runs
   components/ui/*.tsx        shadcn primitives (button, card, dialog, form, input, label, ...) —
                             editable
   components/bial/error-capture.tsx  runtime-error + config-bootstrap shim — editable

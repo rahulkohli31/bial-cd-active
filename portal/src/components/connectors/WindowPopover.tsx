@@ -21,12 +21,15 @@
  *
  * THE AMBER NOTE NAMES THE CONNECTOR AND THE NUMBER, AND BOTH ARE DATA (R18). The name is
  * `displayName` off the wire; the number is the span between the two bounds, which is the
- * connector's own retention by construction (the resolver sets `earliest = today - (retention -
- * 1)`). Neither is written down here, so a second connector that keeps a week says `a week`
- * without a line of this file changing.
+ * connector's own retention by construction (the resolver sets `earliest = latest - (retention -
+ * 1)`, where `latest` is the connector's freshness ceiling and NOT today — the lake is loaded the
+ * following morning, so the newest readable day runs a day or more behind). Neither is written
+ * down here, so a second connector that keeps a week says `a week` without a line of this file
+ * changing.
  *
  * WHAT THE BOARD'S COPY DOES NOT COVER: the note explains the FLOOR only, and this grid also
- * disables dates after today. The sentence is the board's, verbatim, and is not extended here —
+ * disables dates after `latestDate` — which is the ceiling, a day or more before today, not today
+ * itself. The sentence is the board's, verbatim, and is not extended here —
  * R1 makes that copy binding in substance and an addition is the owner's call, not an
  * implementer's. It is wired as the grid's `aria-describedby` so a screen reader hears the
  * available span rather than only that a date is unavailable.

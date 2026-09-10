@@ -1,0 +1,25 @@
+{
+  // Mirrors sandbox/template/tsconfig.json, minus the four Next-only keys (`jsx`, `plugins`,
+  // `paths`, `incremental`) and its `.next/**` includes. That likeness is the whole point: this
+  // workspace exists to prove `flight-data.ts` compiles under exactly the strictness a citizen's
+  // app applies to it once they uncomment `lib/flight-data.reference.ts`. Loosen anything here
+  // and "verified" stops meaning what the head of the generated file claims it means.
+  //
+  // `types` is deliberately unset, as in the template: every installed @types package is picked
+  // up ambiently, which is how `Buffer` resolves in both places.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["dom", "dom.iterable", "ES2022"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true
+  },
+  "include": ["*.ts"],
+  "exclude": ["node_modules"]
+}

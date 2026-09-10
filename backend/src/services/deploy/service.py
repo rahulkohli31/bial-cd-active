@@ -455,7 +455,7 @@ class DeployService:
         async with self._session_factory() as db:
             try:
                 env, container_url = await build_published_env(
-                    db, app_id=app_id, project_id=project_id
+                    db, app_id=app_id, project_id=project_id, user_id=user_id
                 )
             except PublishedStorageError as exc:
                 raise _DeployFailedError(

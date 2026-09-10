@@ -134,11 +134,16 @@ async def test_the_list_carries_both_calendar_bounds(client, db_session) -> None
 
     window = (await _projects(client, user))["projects"][0]["window"]
 
-    today = ist_today()
-    assert window["latestDate"] == today.isoformat()
+    ceiling = ist_today() - timedelta(days=_CONNECTOR.freshness_lag_days)
+    # Not today, and asserted against today directly: the drill-down feeds the same calendar the
+    # rail does, so a ceiling that drifted back to the reading day here would grey a day the
+    # project view had already refused. See `test_project_connectors.py::_ceiling` for why the
+    # arithmetic lives in the resolver's own unit table rather than being re-derived per surface.
+    assert window["latestDate"] < ist_today().isoformat()
+    assert window["latestDate"] == ceiling.isoformat()
     assert (
         window["earliestDate"]
-        == (today - timedelta(days=_CONNECTOR.max_window_days - 1)).isoformat()
+        == (ceiling - timedelta(days=_CONNECTOR.max_window_days - 1)).isoformat()
     )
 
 
@@ -159,7 +164,9 @@ async def test_an_aged_out_range_reads_clamped_here_too(client, db_session) -> N
     window = (await _projects(client, user))["projects"][0]["window"]
 
     assert window["clamped"] is True
-    assert window["end"] == ist_today().isoformat()
+    assert (
+        window["end"] == (ist_today() - timedelta(days=_CONNECTOR.freshness_lag_days)).isoformat()
+    )
     assert window["stored"] == {"days": None, "start": "2026-01-05", "end": "2026-01-08"}
 
 

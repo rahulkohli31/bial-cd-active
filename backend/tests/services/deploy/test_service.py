@@ -223,7 +223,9 @@ def wire(db_session, monkeypatch, tmp_path):
     monkeypatch.setattr(
         service_module,
         "build_published_env",
-        lambda db, *, app_id, project_id: _immediate(({"BIAL_APP_ID": str(app_id)}, None)),
+        lambda db, *, app_id, project_id, user_id: _immediate(
+            ({"BIAL_APP_ID": str(app_id)}, None)
+        ),
     )
     # A heartbeat every 20s would never fire inside a test; make the absence explicit.
     monkeypatch.setattr(service_module, "_HEARTBEAT_S", 3600.0)

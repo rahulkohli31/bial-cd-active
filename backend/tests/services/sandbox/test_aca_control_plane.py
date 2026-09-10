@@ -254,7 +254,7 @@ def test_envelope_wires_acr_registry_credentials(monkeypatch: pytest.MonkeyPatch
     # container-app spec must carry one — with the ACR password stored as an ACA secret and
     # referenced by name (never inlined on the registry credential in the spec).
     cp = _control_plane(monkeypatch, SimpleNamespace())
-    props = cp._envelope(_ENV, _TAGS).properties
+    props = cp._envelope(_ENV, _TAGS, identity_resource_id=None).properties
     assert props is not None
     config = props.configuration
     assert config is not None
@@ -351,7 +351,7 @@ def test_the_create_envelope_carries_the_identity_tags(monkeypatch: pytest.Monke
     system exists to collect, manufactured by the code meant to prevent it."""
     cp = _control_plane(monkeypatch, SimpleNamespace())
     tags = {"bial-kind": "build-sandbox", "bial-user-id": "u"}
-    envelope = cp._envelope(_ENV, tags)  # noqa: SLF001
+    envelope = cp._envelope(_ENV, tags, identity_resource_id=None)  # noqa: SLF001
 
     assert envelope.tags == tags
 
@@ -360,7 +360,9 @@ def test_the_create_envelope_refuses_an_over_long_tag(monkeypatch: pytest.Monkey
     # Refused at this seam rather than by an ARM 400 in the middle of a provision.
     cp = _control_plane(monkeypatch, SimpleNamespace())
     with pytest.raises(SandboxTagError):
-        cp._envelope(_ENV, {"bial-control-plane": "x" * 257})  # noqa: SLF001
+        cp._envelope(  # noqa: SLF001
+            _ENV, {"bial-control-plane": "x" * 257}, identity_resource_id=None
+        )
 
 
 async def test_stamp_tags_uses_patch_and_never_put(monkeypatch: pytest.MonkeyPatch) -> None:

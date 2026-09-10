@@ -77,9 +77,9 @@ bumping versions.
 
 ## The injected runtime env-vars
 
-The control plane injects **exactly these seven** at provision (and re-injects them on snapshot
+The control plane injects **up to eleven** names at provision (and re-injects them on snapshot
 restore). The list is `_INJECTED_ENV` in `supervisor/app.py`; `template/.env.example` documents
-the same seven for a reader inside the app.
+the `BIAL_*` ones for a reader inside the app.
 
 | Env-var                   | Value                                                                  |
 |---------------------------|------------------------------------------------------------------------|
@@ -90,10 +90,30 @@ the same seven for a reader inside the app.
 | `BIAL_DATABASE_URL`       | the project's own PostgreSQL connection string (secret, server-only)   |
 | `BIAL_BASE_PATH`          | the path this app is served under, e.g. `/a/sbx-<28 hex>` — read by `next.config.ts` |
 | `BIAL_APPS_HOSTNAME`      | the public hostname every generated app is served from (Server Actions origin) |
+| `BIAL_DICE_URL`           | the flight-data lake: account, container and folder in one URL — **only when the connector is approved and switched on for this project** |
+| `BIAL_DICE_CLIENT_ID`     | the managed identity's **client** id, for `ManagedIdentityCredential` — same condition |
+| `IDENTITY_ENDPOINT`       | Azure's own: the token endpoint for the attached managed identity      |
+| `IDENTITY_HEADER`         | Azure's own: the bearer for that endpoint (secret — redacted from output) |
 
-The last two are set by the control plane at the provision seam only
+`BIAL_BASE_PATH` and `BIAL_APPS_HOSTNAME` are set by the control plane at the provision seam only
 (`backend/src/services/sandbox/client.py`), never in `build_app_env` — a base path added there
 would ship an `sbx-` value into a `pub-` published container.
+
+**The last four are conditional, and the condition is a security boundary.** The two `BIAL_DICE_*`
+values, the managed identity itself, and therefore Azure's `IDENTITY_*` pair are attached only
+when a lake is configured **and** the connector is switched on for this project **and** its
+owner's access has been approved by an administrator. Gating the coordinates alone would be
+theatre: the identity is what mints the token, and a container that has one can read the whole
+flight container whether or not it was told where to look. `IDENTITY_ENDPOINT`/`IDENTITY_HEADER`
+are Azure's, injected the moment an identity is attached — they are on the allowlist because the
+child env is built from an empty dict, and without them the credential cannot reach the token
+endpoint at all.
+
+**Their names are generated, not written down.** The backend builds `BIAL_<KEY>_URL` and
+`BIAL_<KEY>_CLIENT_ID` from the connector's registry key, because the connector's own name is not
+allowed to appear in `backend/src/`. This table and `_INJECTED_ENV` hold the literals, and a
+backend test asserts the two agree for every registry entry — they fail closed if they ever
+diverge, since a name the table does not carry simply never reaches the child.
 
 **Why these exact names:** the supervisor's child-env scrub is a fail-closed **allowlist** —
 the child env is built from an empty dict and copies only the names in `_INJECTED_ENV`. A var that
@@ -154,10 +174,11 @@ curl -s localhost:8080/_sup/dev/status -H "Authorization: Bearer $TOK"   # {"run
 curl -sI localhost:8080/ | grep -i 'content-security-policy\|x-frame-options'
 #  → content-security-policy: frame-ancestors http://localhost:5173   (and NO x-frame-options)
 
-# Prove the scrub-survival: the injected BIAL_* names reach next dev (seven when the platform
+# Prove the scrub-survival: the injected names reach next dev (up to eleven when the platform
 # sets them all; this local run sets one), SUPERVISOR_TOKEN does not.
 curl -s -XPOST localhost:8080/_sup/exec -H "Authorization: Bearer $TOK" \
-  -H 'Content-Type: application/json' -d '{"cmd":["printenv"]}' | grep -o 'BIAL_[A-Z_]*\|SUPERVISOR_TOKEN'
+  -H 'Content-Type: application/json' -d '{"cmd":["printenv"]}' \
+  | grep -o 'BIAL_[A-Z_]*\|IDENTITY_[A-Z]*\|SUPERVISOR_TOKEN'
 ```
 
 ## Cross-platform rules (CRLF has burned BIAL twice)

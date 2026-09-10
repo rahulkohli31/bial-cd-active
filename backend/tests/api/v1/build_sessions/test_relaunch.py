@@ -344,9 +344,20 @@ class RecordingAca(AcaControlPlane):
         self.create_calls: list[str] = []
         self.delete_calls: list[str] = []
         self.fqdns: dict[str, str] = {}
+        # Which connector identity, if any, each container was born with. `None` is the answer
+        # for every container on a deployment with no lake — which is every test but the gate's.
+        self.identities: dict[str, str | None] = {}
 
-    async def create_app(self, *, name: str, env: dict[str, str], tags: dict[str, str]) -> str:
+    async def create_app(
+        self,
+        *,
+        name: str,
+        env: dict[str, str],
+        tags: dict[str, str],
+        identity_resource_id: str | None = None,
+    ) -> str:
         self.create_calls.append(name)
+        self.identities[name] = identity_resource_id
         fqdn = f"{name}-r{len(self.create_calls)}.westeurope.azurecontainerapps.io"
         self.created[name] = env
         self.fqdns[name] = fqdn

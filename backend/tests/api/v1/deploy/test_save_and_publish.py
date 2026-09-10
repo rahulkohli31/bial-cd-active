@@ -136,7 +136,11 @@ async def wire(app: FastAPI, db_session, monkeypatch, tmp_path):
     monkeypatch.setattr(
         service_module,
         "build_published_env",
-        lambda db, *, app_id, project_id: _immediate(({"BIAL_APP_ID": str(app_id)}, None)),
+        # `user_id` is accepted and ignored: the real builder needs it to scope its project
+        # lookup, and a double that drops it fails the call rather than the assertion.
+        lambda db, *, app_id, project_id, user_id: _immediate(
+            ({"BIAL_APP_ID": str(app_id)}, None)
+        ),
     )
     monkeypatch.setattr(service_module, "_HEARTBEAT_S", 3600.0)
     monkeypatch.setattr(service_module, "_REVISION_POLL_S", 0.01)

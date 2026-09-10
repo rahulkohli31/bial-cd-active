@@ -1,5 +1,9 @@
 # Keep the build context small and never copy a host node_modules/.next over the baked ones.
 template/node_modules
+# The seed workspace verifies the template's reference file and is never copied into the image
+# (no COPY names it). Excluding it keeps its own installed node_modules — tens of megabytes —
+# out of the build context that the Windows VM uploads to ACR on every `az acr build`.
+seed
 template/.next
 template/out
 **/*.log
