@@ -231,6 +231,38 @@ export function nextProbeCadence(answer: PreviewLifeState, held: ProbeCadence): 
 }
 
 /**
+ * SHOULD THIS READING ASK THE SERVER WHETHER THE APP HAS STOPPED?
+ *
+ * A dev server that dies after its last turn changes nothing in the registry, and `preview-state`
+ * answers from the registry alone — so a stopped app reads as a wait that never ends. Either
+ * `alive` with a frame that never vouches (the pane's slow card), or, once the reaper's probe has
+ * retracted the serving proof, `starting` with nothing ever arriving. Neither has a control. The
+ * workspace check can see the process, and when it finds the app stopped with its work provably
+ * saved it puts the container away, so the next reading is the saved app with its start control.
+ *
+ * `alive` ONLY WITH A STALLED FRAME: a frame still loading, or one that has vouched, is an app the
+ * citizen can see, and asking would spend a container call to hear "yes".
+ *
+ * `starting` ONLY ONCE THE ACCELERATED WINDOW IS SPENT (`held` is the cadence the earlier answers
+ * decided). Inside it the wait is a start being watched, and the window's whole bargain is that
+ * watching costs cheap reads and nothing else — a check there is a container call about a dev
+ * server still booting, on the very read a Launch press triggers. Past {@link STARTING_PROBE_LIMIT}
+ * the start has run longer than the bound any start is given, and nothing in the reading tells a
+ * slow start from a dead one; the server's own guards (a live turn, a start in flight, work not
+ * provably saved) are what keep a real one untouched.
+ *
+ * Each caller also skips accelerated ticks and running turns, for the reasons at its call site.
+ */
+export function mayHaveStopped(
+  reading: PreviewLifeState,
+  frameStalled: boolean,
+  held: ProbeCadence,
+): boolean {
+  if (reading === 'alive') return frameStalled
+  return reading === 'starting' && held.fastReads >= STARTING_PROBE_LIMIT
+}
+
+/**
  * A READ THAT NEVER PRODUCED AN ANSWER — a 500, a dropped connection, an expired session — and what
  * it costs the accelerated window.
  *

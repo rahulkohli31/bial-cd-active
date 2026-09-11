@@ -10,6 +10,24 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 > `1.7.0` section is added above them and tagged `v1.7.0`; the betas stay as the record of how it
 > got there. A version number marks a build, not a merge.
 
+## [Unreleased]
+
+### Fixed
+
+- **An app whose dev server stopped no longer looks like a slow app that never opens.** When the
+  process serving a finished app died between messages — out of memory, crashed, or never brought
+  back after a restart — the preview kept saying "Your app is taking longer than usual to open", or
+  "Getting your app ready" once the platform had noticed, with no button and no end. The only way
+  out was to send a chat message, and nothing said so. Now, once the preview has waited longer than
+  an app ever takes to open, it asks the platform to look at the process itself. If the app has
+  stopped and its work is safely saved, the stopped container is put away and the preview shows
+  "Your app is saved" with **Launch Application**, which brings it back running. Nothing is put
+  away while a build or a start is using the workspace, on a reading that could not be taken, or
+  when the work cannot be proven saved — in those cases the preview waits exactly as before.
+- **Operators can find an app whose dev server keeps dying.** Each time this happens the platform
+  logs `app_stopped_while_idle`, with the supervisor's exit code (`-9` or `137` means the process was
+  killed, most often for running out of memory) and whether the container was put away or spared.
+
 ## [1.7.0-beta.16] - 2026-09-13
 
 Spreadsheets, Word documents and slide decks can be attached to a chat, and the assistant reads the

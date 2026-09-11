@@ -28,9 +28,12 @@ import { readFileSync } from 'node:fs'
 import { resolve as resolvePath } from 'node:path'
 import { describe, it, expect } from 'vitest'
 import {
+  BACKGROUND_CADENCE,
   LAUNCH_LABEL,
+  STARTING_PROBE_LIMIT,
   asDecidedReading,
   isTerminalReading,
+  mayHaveStopped,
   resolveWorkspaceState,
   sameWorkspaceState,
   WORKSPACE_STATE_FIELDS,
@@ -992,6 +995,30 @@ describe('asDecidedReading — the one narrowing, so no caller gets the polarity
     // should keep asking stops.
     for (const state of ['alive', 'starting', 'asleep', 'slot_taken', 'never_built'] as const) {
       expect(asDecidedReading(reading({ state }))?.state, state).toBe(state)
+    }
+  })
+})
+
+describe('mayHaveStopped — when a stuck wait is worth a container call', () => {
+  const insideTheWindow = { ...BACKGROUND_CADENCE, fastReads: 1 }
+  const windowSpent = { ...BACKGROUND_CADENCE, fastReads: STARTING_PROBE_LIMIT }
+
+  it('asks about a running app only when its frame has stalled', () => {
+    expect(mayHaveStopped('alive', true, BACKGROUND_CADENCE)).toBe(true)
+    expect(mayHaveStopped('alive', false, BACKGROUND_CADENCE)).toBe(false)
+  })
+
+  it('★ asks about a start only once the accelerated window is spent', () => {
+    // Inside the window the wait is a start being watched, and watching costs cheap reads only —
+    // including the very first read after a Launch press, whose window has not opened yet.
+    expect(mayHaveStopped('starting', false, BACKGROUND_CADENCE)).toBe(false)
+    expect(mayHaveStopped('starting', false, insideTheWindow)).toBe(false)
+    expect(mayHaveStopped('starting', false, windowSpent)).toBe(true)
+  })
+
+  it('never asks about a settled or an unreadable answer, stalled or not', () => {
+    for (const reading of ['asleep', 'slot_taken', 'never_built', 'unknown'] as const) {
+      expect(mayHaveStopped(reading, true, windowSpent)).toBe(false)
     }
   })
 })

@@ -123,6 +123,30 @@ and the reclamation policy is what wants looking at, not this code."""
 # unrelated lines. Never a token, a DSN, or a DSN's password sub-token.
 
 
+APP_STOPPED_WHILE_IDLE_EVENT: Final = "app_stopped_while_idle"
+"""An idle tab's check found an intact app whose dev server is not running, and acted on it.
+
+A DIFFERENT FAULT FROM `WORKSPACE_LOST_WHILE_IDLE_EVENT`: the files are fine and the process is
+gone — exited, killed, or never brought back after a restart. Nothing else reports it:
+`preview-state` answers from the registry and cannot make a container call, and the integrity
+verdict reads the git tree, which a dead process does not change. The citizen was looking at a wait
+that could not end.
+
+Fields: `app_id`, `app_name`, `exit_code` (the supervisor's post-mortem of its child, when it had
+one) and `put_away` — True when the container was put away, so the next reading offers the saved
+app and its start control; False when the durable-copy gate spared it, and the reaper's "not
+provably preserved" warning beside this line says why.
+
+READING `exit_code`: the supervisor reports `Popen.poll()`, so a signal death is the NEGATIVE
+signal number. `-9` is a SIGKILL that landed on the supervisor's own child; `137` is the same
+SIGKILL reported by a shell in between. Both are the out-of-memory killer's usual signature — and
+an agent's `pkill -9` looks identical, which is why this names no cause.
+
+WHAT TO DO: nothing for a one-off — the citizen presses Launch and the app comes back running.
+Repeats for the same app mean its dev server keeps dying under it: suspect memory first, and the
+app's own build is where to look."""
+
+
 BUILD_WORKSPACE_CLAIMED_EVENT: Final = "build_workspace_claimed"
 """The one-per-user workspace is held and the start-in-flight marker is written.
 

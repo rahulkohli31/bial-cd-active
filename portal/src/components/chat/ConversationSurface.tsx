@@ -48,6 +48,7 @@ import {
   SETTLED_GONE,
   STARTING_PROBE_MS,
   asDecidedReading,
+  mayHaveStopped,
   nextProbeCadence,
   resolveWorkspaceState,
   spendProbeCadence,
@@ -2305,6 +2306,10 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // 45-second timer every time the transcript grew.
   const standingClaimRef = useRef<string | null>(null)
   const workspaceLostRef = useRef(false)
+  // What the pane last said about its frame being stuck, and a way to ask about it NOW. Both are read
+  // by the preview probe below, and both are refs because they change what it asks, never what renders.
+  const frameStalledRef = useRef(false)
+  const probeNowRef = useRef<(() => void) | null>(null)
   standingClaimRef.current = standingClaimId
   workspaceLostRef.current = workspaceLost
   // WHAT MAKES A VERDICT STALE, written as ONE dependency rather than left implicit.
@@ -2506,16 +2511,26 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
         // `!accelerated` for the reason above, with one of its own: an accelerated window is open
         // because THIS surface watched the workspace start, so asking whether somebody else has
         // taken it is a container exec spent to hear "no" about a container we just saw come up.
-        if (
-          !accelerated &&
-          state.state === 'alive' &&
-          liveTurnIdRef.current === null &&
-          standingClaimRef.current !== null &&
-          !workspaceLostRef.current
-        ) {
+        //
+        // …AND HAS THE APP STOPPED? The same check, asked about a stuck wait rather than a claim —
+        // `mayHaveStopped` says which readings ask, and a reading that takes the frame away clears
+        // the pane's last stall first, since no pane is left to clear it. THE SERVER ACTS ON THIS
+        // ONE: a process found dead with the work provably saved has its container put away, and
+        // this reading predates that. So a check asked for this reason is followed at once by one
+        // more probe, made as an accelerated one so it cannot ask again, and this probe leaves its
+        // cadence decision to that one.
+        if (state.state !== 'alive' && state.state !== 'unknown') frameStalledRef.current = false
+        const claimToCheck =
+          state.state === 'alive' && standingClaimRef.current !== null && !workspaceLostRef.current
+        const mayBeStopped = mayHaveStopped(state.state, frameStalledRef.current, cadence)
+        if (!accelerated && liveTurnIdRef.current === null && (claimToCheck || mayBeStopped)) {
           const lost = await checkWorkspace(projectId)
           if (!live || generation !== latestProbe) return
-          if (lost && liveTurnIdRef.current === null) setWorkspaceLost(true)
+          if (lost && claimToCheck && liveTurnIdRef.current === null) setWorkspaceLost(true)
+          if (mayBeStopped) {
+            void probe(true)
+            return
+          }
         }
         // THE RESCHEDULE, MADE FROM THE ANSWER — beside the stopping rule, because both are
         // the same question asked of the same reading: what this answer means for when we ask next.
@@ -2550,15 +2565,27 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     const onVisible = () => void probe()
     document.addEventListener('visibilitychange', onVisible)
     window.addEventListener('focus', onVisible)
+    // THE PANE'S STALL EDGE ASKS THROUGH HERE, NOT THROUGH THE EPOCH. A re-run clears the reading
+    // first, and the framed address follows the reading, so re-arming this effect would unframe the
+    // very app whose stall prompted the question.
+    probeNowRef.current = onVisible
     keepAsking()
     void probe()
     return () => {
       live = false
+      probeNowRef.current = null
       document.removeEventListener('visibilitychange', onVisible)
       window.removeEventListener('focus', onVisible)
       stopAsking()
     }
   }, [projectId, previewProbeEpoch])
+
+  // The pane's stalled-frame edge, into the probe above. A `true` asks at once rather than on the
+  // next tick: somebody is looking at a stuck app now.
+  const handlePreviewStall = useCallback((stalled: boolean) => {
+    frameStalledRef.current = stalled
+    if (stalled) probeNowRef.current?.()
+  }, [])
 
   // CAN THE SERVER PUT THIS APP BACK? Three sources, newest-and-most-certain first:
   //
@@ -2822,6 +2849,9 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
        replaced: without it `project_to_app_visible_ms` stops being produced and
        nothing announces that, which is the one failure a measurement cannot detect. */
     onRevealed: handlePreviewRevealed,
+    /* The stalled-frame edge. A stuck frame is the only sign the pane gets of a stopped app, and this
+       page's probe is what asks the server about it. */
+    onStallChange: handlePreviewStall,
   })
 
 

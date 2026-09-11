@@ -15,12 +15,13 @@
  * so it is called only when the read says `alive`: asking a stopped project whether it has unsaved work is
  * an attach against a dead workspace, which is a start this screen caused, and a screen read must never
  * start a container. The consequence is stated rather than hidden: at rest, a stopped project shows no
- * save state and no commit. `checkWorkspace` stays out of here for its own reasons — it costs a container
- * exec, it can raise an operational alarm, and it is gated on a standing completion claim the project
- * screen does not make. `fetchCompileState` IS asked from this surface: its route short-circuits before
- * any attach when nothing is live, so it cannot start a stopped container. `ProjectWorkspace` asks it
- * beside this read rather than from inside it, because it is gated on THIS hook's `alive` answer and on
- * the resolved address, neither of which this hook holds.
+ * save state and no commit. `checkWorkspace` costs a container exec and can raise an operational alarm,
+ * so it is asked here for ONE reason only: a wait that looks stuck (`mayHaveStopped`), where the server
+ * may find the app stopped and put it away — never about a completion claim, which the project screen
+ * does not make, and never on an accelerated tick. `fetchCompileState` IS asked from this surface: its
+ * route short-circuits before any attach when nothing is live, so it cannot start a stopped container.
+ * `ProjectWorkspace` asks it beside this read rather than from inside it, because it is gated on THIS
+ * hook's `alive` answer and on the resolved address, neither of which this hook holds.
  *
  * `starting`'s successor arrives with no user gesture, so it's polled faster — at
  * {@link STARTING_PROBE_MS} not {@link PREVIEW_PROBE_MS} — the window `nextProbeCadence` owns and bounds.
@@ -40,13 +41,14 @@
  * stay on a plain read would be a new way to hold a container claimed, which nobody has built.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { fetchPreviewState, fetchSaveState, samePreviewState, sameSaveState } from '../../utils/buildSessionApi'
+import { checkWorkspace, fetchPreviewState, fetchSaveState, samePreviewState, sameSaveState } from '../../utils/buildSessionApi'
 import type { PreviewState, SaveState } from '../../utils/buildSessionApi'
 import {
   BACKGROUND_CADENCE,
   STARTING_PROBE_MS,
   asDecidedReading,
   isTerminalReading,
+  mayHaveStopped,
   nextProbeCadence,
   resolveWorkspaceState,
   spendProbeCadence,
@@ -88,6 +90,11 @@ export interface WorkspaceReading {
   reportStartPending: (pending: boolean) => void
   /** Ask again NOW. A deliberate gesture: a start that just finished, or a retry press. */
   refresh: () => void
+  /**
+   * The pane's stalled-frame edge. It decides whether the next read asks the server if the app has
+   * stopped (see `mayHaveStopped`), and a `true` asks again at once.
+   */
+  reportFrameStall: (stalled: boolean) => void
 }
 
 export interface WorkspaceReadOptions {
@@ -117,6 +124,14 @@ export function useWorkspaceState({
   const [readTick, setReadTick] = useState(0)
 
   const refresh = useCallback(() => setEpoch((n) => n + 1), [])
+  // WHAT THE PANE LAST SAID ABOUT ITS FRAME. A ref, not state: it changes what the next read ASKS
+  // and never what anybody renders, and state would re-arm the poll on both edges. Only the `true`
+  // edge asks again now — somebody is looking at a stuck app.
+  const frameStalledRef = useRef(false)
+  const reportFrameStall = useCallback((stalled: boolean) => {
+    frameStalledRef.current = stalled
+    if (stalled) setEpoch((n) => n + 1)
+  }, [])
   const reportStartOutcome = useCallback((outcome: StartOutcome | null) => {
     setStartOutcome(outcome)
   }, [])
@@ -212,7 +227,7 @@ export function useWorkspaceState({
         setReadTick((n) => n + 1)
 
         if (next.state === 'alive') {
-          // THE ONLY CONTAINER CALL THIS HOOK MAKES, and it is gated on a live container for the
+          // THE SAVE READ IS A CONTAINER CALL, and it is gated on a live container for the
           // reason in the docblock. Its failure is silent on purpose: a save state we could not
           // read is `null`, which is the tri-state's "no claim", and every consumer already
           // treats that as "could not tell" rather than as "clean".
@@ -234,6 +249,22 @@ export function useWorkspaceState({
           // state from a container that has since stopped would arm the unsaved-work guard against
           // work that is no longer reachable.
           setSave(null)
+        }
+
+        // HAS THE APP STOPPED? `mayHaveStopped` says which readings ask. A reading that takes the
+        // frame away clears the pane's last stall first, since no pane is left to clear it.
+        //
+        // THE SERVER ACTS ON THE ANSWER — a process found dead with the work provably saved has its
+        // container put away — and this reading predates that. So a check is followed at once by
+        // one more read, made as an accelerated one so it cannot ask again, and this read leaves
+        // its cadence decision to that one. Never on an accelerated tick: that timer is watching a
+        // start land, and a check there is a container call about a dev server still booting.
+        if (next.state !== 'alive' && next.state !== 'unknown') frameStalledRef.current = false
+        if (!accelerated && mayHaveStopped(next.state, frameStalledRef.current, cadence)) {
+          await checkWorkspace(projectId)
+          if (!live || generation !== latest) return
+          void read(true)
+          return
         }
 
         // THE RESCHEDULE, MADE FROM THE ANSWER — see `nextProbeCadence`. It sits here, with
@@ -299,5 +330,6 @@ export function useWorkspaceState({
     reportStartOutcome,
     reportStartPending,
     refresh,
+    reportFrameStall,
   }
 }

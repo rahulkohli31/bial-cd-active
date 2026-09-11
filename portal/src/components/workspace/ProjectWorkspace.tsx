@@ -271,16 +271,18 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
       // `null` and `unknown` both mean "nothing is claimed" and hold whatever cover is showing;
       // only an affirmative `clean` uncovers, and only `failed` names the failure. See the read.
       compileState,
-      // `checkWorkspace` STAYS UNASKED, and the distinction from the line above is the cost. The
-      // compile route short-circuits before any attach when nothing is live; the workspace check is
-      // a container exec that can raise an operational alarm, and it is gated on a STANDING
-      // COMPLETION CLAIM — which this screen, having stopped making one, no longer has.
+      // `workspaceLost` STAYS `false`: it retracts a COMPLETION CLAIM, and this screen, having
+      // stopped making one, has none to retract. The workspace check itself IS asked from here, but
+      // only about a stuck wait (`mayHaveStopped`, in the read) — whether the app has stopped, never
+      // whether a claim still holds.
       workspaceLost: false,
+      // The pane's stalled-frame edge, into the read that decides whether to ask.
+      onStallChange: workspace.reportFrameStall,
     }),
     // `project.hasRelaunchableSnapshot` LEFT THIS LIST WITH `hasSavedBuild`. It still reaches the
     // workspace map above, where the restore question actually gets answered; this view stopped
     // carrying it when the pane stopped writing sentences about the workspace.
-    [workspace.preview, compileState],
+    [workspace.preview, compileState, workspace.reportFrameStall],
   )
 
   useWorkspaceProject(project.id)

@@ -64,6 +64,7 @@ from src.db.models.user import User
 from src.services.build_sessions.alarms import (
     APP_FIRST_SERVE_NOT_OBSERVED_EVENT,
     APP_FIRST_SERVED_EVENT,
+    APP_STOPPED_WHILE_IDLE_EVENT,
     BUILD_WORKSPACE_CLAIMED_EVENT,
     PREVIEW_STATE_REPORTED_UNKNOWN_EVENT,
     RECOVERY_WRITE_DID_NOT_LAND_EVENT,
@@ -94,10 +95,12 @@ from src.services.build_sessions.locks import (
     delete_registry,
     elapsed_ms,
     grant_stay_of_execution,
+    liveness_lease_is_held,
     mark_registry_ending,
     mark_serving,
     read_registry,
     read_registry_and_starting_marker,
+    read_starting_marker,
     reap_lock,
     release_lock_as_holder,
     renew_lock,
@@ -138,6 +141,7 @@ from src.services.sandbox import (
     SANDBOX_NAME_PREFIX,
     SHARED_SANDBOX_NAME_PREFIX,
     CompileState,
+    DevStatus,
     SandboxClient,
     SandboxError,
     SandboxGoneError,
@@ -452,6 +456,31 @@ def reset_idle_checks_for_tests() -> None:
     """Drop the per-app idle-check memo. Process-local, so a remembered answer must not leak into
     the next test and silently make its container call disappear."""
     _idle_checks.clear()
+
+
+# THE PAUSE BEFORE THE SECOND LOOK at a dev server that did not answer. Reporting takes one
+# reading; putting a container away is an action, so it takes two. Nothing restarts a dev server
+# between turns on its own — the supervisor has no restart loop — so the pause is for a blip in the
+# reading, not a recovery in progress, and a couple of seconds is all that needs. Short, because a
+# tab's poll is waiting on this call.
+_SECOND_LOOK_AFTER_S: Final = 2.0
+
+
+async def _stopped_reading(
+    sandbox_client: SandboxClient, handle: SandboxHandle
+) -> DevStatus | None:
+    """The supervisor's reading when it says the app has STOPPED, else `None`.
+
+    BOTH HALVES MUST SAY NO. `running` is the supervisor's own child; `ready` is a request to the
+    app root that succeeded. The open sandbox lets the agent `pkill` that child and `nohup` its own
+    replacement, so `running=False` beside `ready=True` is an app serving perfectly well — the
+    reaper's retraction reads the pair the same way. A reading that FAILED is `None` too: a
+    supervisor that did not answer has not found the process dead."""
+    try:
+        status = await sandbox_client.dev_status(handle)
+    except SandboxError:
+        return None
+    return None if status.running or status.ready else status
 
 
 class _Quarantine(enum.StrEnum):
@@ -1748,14 +1777,20 @@ class SessionManager:
         *,
         sandbox_client: SandboxClient,
     ) -> WorkspaceState:
-        """Is the app the citizen is looking at still the app? — asked by an idle tab: the
-        per-turn integrity check catches drift only between messages, nothing for a citizen
-        reading, in another tab, or at lunch, while the completion claim keeps saying "your
-        app is live". Never folded into `project_preview_state` (frozen at no container call);
-        fires only when the preview already reports alive and a completion claim stands.
-        RATE-LIMITED PER APP on purpose — without it an idle tab is a container exec every 45
-        seconds forever. NEVER restores or destroys, only reports; the restore belongs to the
-        next turn, where the citizen can confirm it."""
+        """Is the app the citizen is looking at still the app — and is anything still running it?
+        Asked by an idle tab: the per-turn integrity check catches drift only between messages,
+        nothing for a citizen reading, in another tab, or at lunch, while the completion claim
+        keeps saying "your app is live". Never folded into `project_preview_state` (frozen at no
+        container call); the client asks under a standing completion claim, or over a wait that
+        looks stuck. RATE-LIMITED PER APP on purpose — without it an idle tab is a container exec
+        every 45 seconds forever.
+
+        IT RESTORES NOTHING: the restore belongs to the next turn, where the citizen can confirm
+        it. IT PUTS ONE THING AWAY — an INTACT app whose dev server has stopped
+        (`_put_away_if_stopped`), because nothing else ends that wait. `preview-state` answers from
+        the registry, so over an exited process it goes on saying `alive`, or `starting` once the
+        reaper retracts the serving proof, and the pane waits for a load that cannot come. Put
+        away, the next reading is `asleep` with the work restorable."""
         app_id = await _existing_app_id(db, user.id, project_id)
         if app_id is None:
             return WorkspaceState.INTACT  # nothing built yet: nothing to have lost
@@ -1787,7 +1822,61 @@ class SessionManager:
                 recovery_copy_available=verdict.durable_copy_exists,
                 verdict=verdict.state.value,
             )
+        if verdict.state is WorkspaceState.INTACT:
+            await self._put_away_if_stopped(user.id, app_id, handle, sandbox_client)
         return verdict.state
+
+    async def _put_away_if_stopped(
+        self,
+        user_id: uuid.UUID,
+        app_id: uuid.UUID,
+        handle: SandboxHandle,
+        sandbox_client: SandboxClient,
+    ) -> None:
+        """Put an INTACT app whose dev server has stopped away, so the wait over it ends on the
+        saved app and its start control instead of on nothing.
+
+        TWO READINGS, `_SECOND_LOOK_AFTER_S` apart: one is enough to report, and this acts.
+
+        NEVER UNDER ANYTHING USING THE CONTAINER. Refused — not waited for — while a start holds
+        this user's start lock: a start brings its own dev server, and the tab asking is polling
+        for the app to arrive. Refused while a turn is live in this process, while the liveness
+        lease or the start-in-flight marker stands, and once the registry names anything but this
+        app READY. The second reading is taken under the lock, after those checks, so nothing can
+        start between the last look and the put-away.
+
+        NEVER AT THE COST OF WORK. The reap passes `app_id`, which runs the durable-copy gate: a
+        copy is taken when the newest change postdates the newest copy, and a container whose work
+        cannot be proven preserved is SPARED — the citizen keeps the slow card, which is where they
+        were before this existed."""
+        if await _stopped_reading(sandbox_client, handle) is None:
+            return
+        await asyncio.sleep(_SECOND_LOOK_AFTER_S)
+        start = self._start_lock_for(user_id)
+        if start.locked():
+            return
+        async with start:
+            redis = get_redis()
+            if (
+                user_id in self._active_by_user
+                or await liveness_lease_is_held(redis, user_id)
+                or await read_starting_marker(redis, user_id) is not None
+                or not await _the_live_sandbox_is_already_the_one_we_want(
+                    redis, user_id, app_name_for(app_id)
+                )
+            ):
+                return
+            stopped = await _stopped_reading(sandbox_client, handle)
+            if stopped is None:
+                return
+            put_away = await reap_user(redis, user_id, sandbox_client, app_id=app_id)
+        _log.error(
+            APP_STOPPED_WHILE_IDLE_EVENT,
+            app_id=str(app_id),
+            app_name=handle.app_name,
+            exit_code=stopped.exit_code,
+            put_away=put_away,
+        )
 
     async def project_save_state(
         self,

@@ -453,6 +453,46 @@ describe('★ the frame-stall card and the loading cover STAY — they watch the
     }
   })
 
+  it('★ tells the caller when the wait is labelled slow, and again when a late beacon takes it down', () => {
+    // A stalled frame is the only sign this pane gets of an app whose dev server has stopped, so the
+    // caller has to hear it — and has to hear it END, or a tab would go on asking the server about
+    // an app the citizen is now looking at. Mutation check: announce once per frame key instead of
+    // on the edge, and the `false` below never arrives.
+    vi.useFakeTimers()
+    try {
+      const onStallChange = vi.fn()
+      const { container } = render(
+        <LivePreview previewUrl={SANDBOX_URL} status="ready" onStallChange={onStallChange} />,
+      )
+      spendVouchWaits(container, VOUCH_RETRY_LIMIT)
+      spendPingsOf(container)
+      // A slow document is not a stall until the budget runs out, so nothing has been said yet.
+      expect(onStallChange).not.toHaveBeenCalled()
+
+      tickVouchWait()
+      expect(seenNotJustSaid(/taking longer than usual to open/i)).toHaveLength(1)
+      expect(onStallChange.mock.calls).toEqual([[true]])
+
+      vouch(container)
+      expect(onStallChange.mock.calls).toEqual([[true], [false]])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('says nothing about a frame that vouches in time', () => {
+    const onStallChange = vi.fn()
+    const { container } = render(
+      <LivePreview previewUrl={SANDBOX_URL} status="ready" onStallChange={onStallChange} />,
+    )
+
+    vouch(container)
+
+    // LIVENESS: the frame really was revealed, so the silence is an answer rather than a crash.
+    expect(deviceCard(container).getAttribute('data-revealed')).toBe('true')
+    expect(onStallChange).not.toHaveBeenCalled()
+  })
+
   it('★ a beacon that lands AFTER the stall still wins — the card says slow, never dead', () => {
     vi.useFakeTimers()
     try {
