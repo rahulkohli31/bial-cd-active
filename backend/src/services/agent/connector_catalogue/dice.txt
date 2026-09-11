@@ -1,0 +1,255 @@
+# GENERATED FILE -- do not hand-edit. Built by backend/scripts/build_connector_catalogue.py
+# from backend/data/connectors/dice/{profile,definitions}.json.
+
+FLIGHT DATA -- one table, tb_flight_fact_report
+
+WHAT THIS IS, AND WHEN IT WAS MEASURED. Everything below was read from 13 daily load files
+covering 1 January 2026 to 7 September 2026. It says what those files held; it is not a promise
+about what the table holds today, and no value list here is a closed set. 131 of the table's 408
+columns are described -- the rest are outside the agreed working set and are not listed.
+
+ONE ROW PER FLIGHT PER LOAD. The same flight is re-stated in later files as its actual times are
+filled in, so ALWAYS collapse to one row per flight by keeping the highest LAST_UPDATE_DATE_TIME
+for each AODB_AFTTAB_PK_URNO. Skip that and you over-report flight counts, and every average over
+those rows is wrong in the same direction.
+
+THE FILE'S DATE IS THE LOAD DATE, NOT THE FLIGHT DATE. These files are stamped 1 January 2026 to 7
+September 2026, and the flights inside them are scheduled between August 2022 and October 2026: a
+load date bounds neither end of the flights in it. To get flights in a date range, read the files
+and then filter ROWS on SIBT_SOBT_TIME, the merged scheduled time, present on arrivals and
+departures alike. Do NOT filter on SCHEDULED_OFF_BLOCK_TIME_SOBT -- it is the DEPARTURE time and
+is null on every arrival row, so it silently drops half the traffic. SCHEDULED_IN_BLOCK_TIME_SIBT
+has the mirror-image problem.
+
+TRIM TEXT BEFORE GROUPING OR COMPARING. Some text columns hold the same value twice, once padded
+with trailing spaces: AIRLINE_NAME carries 'AKASA AIR' and a second, space-padded copy of it as
+two distinct values, so a plain GROUP BY shows that airline twice. 15 values across 6 of the
+columns below are padded like that, and only 2 of those 6 list their values here -- for the rest
+the padding is invisible in this block, so assume it rather than look for it. Some columns also
+use an EMPTY STRING rather than null, which IS NOT NULL does not filter -- FLIGHT_NATURE_TTYP_DESC
+is one, and FLIGHT_TYPE_FTYP holds a single space. Trim, and treat blank as missing.
+
+Column names ending in a four-letter code follow the EUROCONTROL A-CDM convention, where the first
+three letters name the milestone (AIBT in-block, AOBT off-block, ALDT landing, ATOT take-off, TOBT
+target off-block) and the fourth is an attribute of it.
+
+MEASURES -- BIAL's own KPI definitions. Prefer these over inventing arithmetic. When a request
+names one of these, use the formula and the columns given here: they are the airport's
+definitions, not ours. Every one still obeys the rules above -- collapse to one row per flight,
+and filter dates on SIBT_SOBT_TIME.
+
+Turnaround time = next AOBT - AIBT for the same registration; uses ACTUAL_OFF_BLOCK_TIME_AOBT, ACTUAL_IN_BLOCK_TIME_AIBT, AIRCRAFT_REGN; target 90 min wide-body / 45 min narrow-body
+Departure OTP = share of departures where AOBT <= SOBT + 15 min; uses ACTUAL_OFF_BLOCK_TIME_AOBT, SCHEDULED_OFF_BLOCK_TIME_SOBT, FOR_OTP; target > 85%
+Arrival OTP = share of arrivals where AIBT <= SIBT + 15 min; uses ACTUAL_IN_BLOCK_TIME_AIBT, SCHEDULED_IN_BLOCK_TIME_SIBT, FOR_OTP; target > 85%
+Taxi-out time = ATOT - AOBT; uses ACTUAL_TAKEOFF_TIME_ATOT, ACTUAL_OFF_BLOCK_TIME_AOBT; target < 12 min
+Taxi-in time = AIBT - ALDT; uses ACTUAL_IN_BLOCK_TIME_AIBT, ACTUAL_LANDING_TIME_ALDT; target < 10 min
+Average departure delay = AOBT - SOBT; uses ACTUAL_OFF_BLOCK_TIME_AOBT, SCHEDULED_OFF_BLOCK_TIME_SOBT; target < 15 min
+Average arrival delay = AIBT - SIBT; uses ACTUAL_IN_BLOCK_TIME_AIBT, SCHEDULED_IN_BLOCK_TIME_SIBT; target < 15 min
+Gate occupancy / ground time = AOBT - AIBT; uses ACTUAL_OFF_BLOCK_TIME_AOBT, ACTUAL_IN_BLOCK_TIME_AIBT; target minimise
+Total aircraft movements = count of flights with FOR_ATM = 1, deduped on the flight key; uses FOR_ATM, AODB_AFTTAB_PK_URNO; target set daily by BIAL
+Peak hour movements = group by hour of SIBT_SOBT_TIME, count FOR_ATM = 1, take the largest; uses SIBT_SOBT_TIME, FOR_ATM, AODB_AFTTAB_PK_URNO; target stay within declared capacity
+Runway throughput = take-offs + landings per hour; uses ACTUAL_TAKEOFF_TIME_ATOT, ACTUAL_LANDING_TIME_ALDT, RUNWAY; target limited by runway capacity
+Departure queue time = ATOT - AOBT; uses ACTUAL_TAKEOFF_TIME_ATOT, ACTUAL_OFF_BLOCK_TIME_AOBT; target minimise
+Airborne time = ALDT - ATOT; uses ACTUAL_LANDING_TIME_ALDT, ACTUAL_TAKEOFF_TIME_ATOT; target varies by route
+Flights exceeding turnaround SLA = count where turnaround > the target for the body type; uses TAT, AIRCRAFT_BODY_TYPE; target < 5%
+Aircraft waiting for stand = AIBT - ALDT, flagged when unusually long; uses ACTUAL_IN_BLOCK_TIME_AIBT, ACTUAL_LANDING_TIME_ALDT; target minimise
+Passenger throughput = sum of passengers, domestic and international split; uses NO_OF_PAX_PAXT, TOTAL_DOM_PAX, TOTAL_INT_PAX, FOR_PAX; target set daily by BIAL
+
+FOR_ATM, FOR_OTP and FOR_PAX are BIAL's own inclusion flags (0/1, never null). Filter on the
+matching flag when computing movements, punctuality or passenger totals -- a flight with the flag
+at 0 is deliberately outside that KPI's denominator.
+
+TWO ASSUMPTIONS WE MADE, because their formulas name fields the table does not have:
+
+  ATD -> ACTUAL_OFF_BLOCK_TIME_AOBT (their formula says ATD, which does not exist; off-block chosen over take-off)
+  ATA -> ACTUAL_IN_BLOCK_TIME_AIBT (their formula says ATA, which does not exist; in-block chosen over landing)
+
+CANNOT BE ANSWERED from this table -- say so rather than approximating:
+
+  Flight cancellation rate -- the flight-status column held no value in any profiled row
+  Flight diversion rate -- the diversion column held no value in any profiled row
+  Airside operational incidents -- needs an Incident Management System, which is not connected
+  Runway incursions -- needs a Safety System, which is not connected
+  Stand utilisation -- needs 'available stand time', which the table does not carry
+  Contact / remote stand utilisation -- needs the contact-vs-remote classification too
+  Apron congestion index -- needs a count of available stands
+  Stand conflict events -- derivable from stand and times, but the allocation rules are not here
+
+HOW TO READ THE COLUMN LINES. One line per column, grouped by what it is about. A column with no
+type in brackets holds text; otherwise its type is stated -- (timestamp), (integer), (decimal). A
+`--` at the end of a line is what that column means.
+
+A line reading `= 'A', 'B'` lists the values that were present when this metadata was built. THAT
+IS NOT A CLOSED SET: derive filter and dropdown values from the data at runtime rather than
+hard-coding these, or the day a new code appears your app silently drops those rows. A line
+reading `= at least N distinct values observed` means there were too many to list -- read them
+from the data with SELECT DISTINCT at runtime.
+
+## record -- About the record, not the flight
+CREATION_DATE_CDAT (timestamp)
+FLAGS_DATASOURCE_DSSF = at least 110 distinct values observed
+LAST_UPDATE_DATE_TIME (timestamp)
+LSTU -- The AODB last-update marker for the row.
+RKEY (decimal) -- The AODB internal record key.
+USEU = at least 110 distinct values observed -- The user or upstream system that last updated the record (e.g. AFTN, ATCA, an airline desk code).
+yearmonth = '202601', '202602', '202603', '202604', '202605', '202606', '202607', '202608', '202609'
+
+## identity -- Which flight this is
+AIRCRAFT_ID (decimal)
+AIRLINES_ID (decimal)
+AODB_AFTTAB_PK_URNO
+BAG_DELAY_ID (decimal)
+CALL_SIGN_CSGN
+DEST_AIRPORT_ID (decimal)
+FLIGHT_ID (decimal)
+FULL_FLIGHT_NUMBER_FLNO
+NUM_FLIGHT_NUMBER_FLTN
+ORIGIN_AIRPORT_ID (decimal)
+
+## airline -- Who is operating it
+AIRLINE_NAME = at least 72 distinct values observed
+AIRLNS_CODE_ALC2 = at least 68 distinct values observed
+AIRLNS_CODE_ALC3 = at least 63 distinct values observed
+
+## aircraft -- What is flying it
+AIRCRAFT_BODY_TYPE = 'NARROW_BODY', 'WIDE_BODY'
+AIRCRAFT_REGN = at least 2,652 distinct values observed
+AIRCRFT_CODE_ACT5 = at least 125 distinct values observed
+IATA_AIRCRFT_CODE_ACT3 = at least 139 distinct values observed
+NO_OF_SEATS_NOSE (integer)
+
+## route -- Where it is coming from or going to
+DEST_AIRPORT_CODE_DES3 = at least 249 distinct values observed
+DEST_AIRPORT_CODE_DES4 = at least 246 distinct values observed
+FIRST_LAST_AIRPORT_CODE_VIA3 = at least 258 distinct values observed
+ORIGIN_AIRPORT_CODE_ORG3 = at least 261 distinct values observed
+ORIGIN_AIRPORT_CODE_ORG4 = at least 251 distinct values observed
+
+## schedule -- When it was meant to happen
+SCHEDULED_IN_BLOCK_TIME_SIBT (timestamp)
+SCHEDULED_OFF_BLOCK_TIME_SOBT (timestamp)
+SCH_END_TIME_B1ES (timestamp)
+SCH_STA_TIME_B1BS (timestamp)
+SIBT_SOBT_TIME (timestamp)
+
+## actual_times -- When it actually happened (A-CDM milestones)
+ACTUAL_IN_BLOCK_TIME_AIBT (timestamp)
+ACTUAL_LANDING_TIME_ALDT (timestamp)
+ACTUAL_OFF_BLOCK_TIME_AOBT (timestamp)
+ACTUAL_READY_TIME_ARDT (timestamp)
+ACTUAL_TAKEOFF_TIME_ATOT (timestamp)
+AIBT_AOBT_TIME (timestamp)
+ARR_DEP_TIME (timestamp)
+ASAT = free text, not a code list -- Actual Startup Approved Time
+ASRT = free text, not a code list -- Actual Startup Request Time
+FB_TIME (timestamp)
+FPLA = free text, not a code list -- Flight-plan arrival timestamp, written as YYYYMMDDHHMMSS text.
+FPLD = free text, not a code list -- Flight-plan departure timestamp, written as YYYYMMDDHHMMSS text.
+LB_TIME (timestamp)
+TARGET_OFF_BLOCK_TIME_TOBT (timestamp)
+TIME_AIRBORNE_TIME_AIRB (timestamp)
+TLDT = free text, not a code list -- Target Landing Time
+TMOA = free text, not a code list -- A movement-area timestamp, written as YYYYMMDDHHMMSS text.
+TTOT = free text, not a code list -- Target Take-Off Time
+
+## estimates -- What was expected at the time
+BEST_EST_TIME_ETAI (timestamp)
+BEST_EST_TIME_ETDI (timestamp)
+EIBT = free text, not a code list -- Estimated Inblock Time
+ENRC = free text, not a code list -- An en-route timestamp stored as text in TWO different formats, not one: YYYYMMDDHHMMSS and 'YYYY-MM-DD HH:MM:SS' both occur in the same column. Parse both, and never order it as text - '2026-...' sorts before '20260...', so a text sort puts every dashed row before every compact one regardless of date.
+ETOT = free text, not a code list -- Estimated Take-Off Time
+FIDS_ETA_ETOA (timestamp)
+FIDS_ETD_ETOD (timestamp)
+
+## delay -- Why it was late
+FIRST_BAG_DEL_RSN1 = at least 45 distinct values observed
+LAST_BAG_DEL_RSN1 = at least 40 distinct values observed
+
+## stand_gate -- Where it parked and which gate it used
+ARR_GATE1_GTA1 = at least 33 distinct values observed
+BEGIN_GATE1_ARR_GA1B (timestamp)
+BEGIN_GATE1_DEP_GD1B (timestamp)
+BEGIN_GATE1_DEP_GD1X (timestamp)
+DEP_GATE1_GTD1 = at least 64 distinct values observed
+DEP_GATE2_GTD2 = at least 27 distinct values observed
+END_GATE1_ARR_GA1E (timestamp)
+END_GATE1_ARR_GA1Y (timestamp)
+END_GATE1_DEP_GD1E (timestamp)
+END_GATE1_DEP_GD1Y (timestamp)
+PARKING_STAND = at least 162 distinct values observed
+PARKING_STAND_ARR_PSTA = at least 162 distinct values observed
+PARKING_STAND_DEP_PSTD = at least 162 distinct values observed
+
+## terminal -- Which terminal and check-in
+CHECKIN_FROM_CKIF = at least 277 distinct values observed
+CHECKIN_TO_CKIT = at least 616 distinct values observed
+TERMINAL = '1', '2'
+
+## passengers -- How many people were on board
+FOR_PAX (integer)
+NO_OF_PAX_PAXT (integer)
+TOTAL_ADULT_PAX (integer)
+TOTAL_DOM_PAX (integer)
+TOTAL_INFANT_PAX (integer)
+TOTAL_INT_PAX (integer)
+TRANSFER_PAX_COUNT_PAXF (integer)
+TRANSFER_PAX_TOTAL (integer)
+TRANSIT_PAX_COUNT_PAXI (integer)
+
+## baggage -- Bags and belts
+ACT_END_TIME_B1EA (timestamp)
+ACT_STA_TIME_B1BA (timestamp)
+BAGGAGE_BELT1_BLT1 = at least 49 distinct values observed
+BAGGAGE_BELT2_BLT2 = at least 21 distinct values observed
+BAGS = at least 823 distinct values observed -- Number of bags, stored as a decimal string (e.g. '42.00000') rather than a number.
+FIRST_BAG_TIME (integer)
+LAST_BAG_TIME (integer)
+
+## cargo -- Freight and mail
+IS_CARGO (integer)
+
+## boarding -- Boarding and the final call
+BOARDING_CLOSE_TIME_BOAC (timestamp)
+BOARDING_OPEN_TIME_BOAC (timestamp)
+FINAL_CALL_FCAL (timestamp)
+
+## runway -- Which runway it used
+RUNWAY = '09L', '09R', '27L', '27R'
+RWYA = '09L', '09R', '27L', '27R' -- The arrival runway.
+RWYD = '09L', '09R', '27L', '27R' -- The departure runway.
+
+## punctuality -- On-time performance and turnaround
+FB_ONTIME (integer)
+FOR_ATM (integer)
+FOR_OTP (integer)
+LB_ONTIME (integer)
+OTP (integer) -- On-time performance for this flight, against schedule. SIGNED - negative is early, positive is late. The unit is SECONDS, not minutes: every one of the 301 values profiled is a whole multiple of 60, as are both extremes, which a minute-granular column would not be (TAT, a real minutes column, takes values like 9, 11 and 23). Divide by 60 before showing minutes. Observed range is roughly -90,720 to 253,860 - about -25 to +70 hours - so the extremes are data-quality outliers rather than real delays.
+TAT (integer) -- Turnaround time in minutes - the interval between arrival on-stand and departure off-stand for the same aircraft.
+
+## handling -- Ground handling and the operational zone
+ACGT = free text, not a code list -- Start Ground Handling
+ACOR = free text, not a code list -- A ground-handling milestone timestamp, written as YYYYMMDDHHMMSS text rather than a date. Same shape and sparsity as ACGT (Start Ground Handling).
+AEGT = free text, not a code list -- Actual End of Ground Handling
+BAZ1 = at least 24 distinct values observed -- Baggage zone or make-up area identifier.
+GROUND_HANDLER = 'Air India SATS', 'GlobeGround India', 'Indigo ', 'Menzies Aviation India Pvt. Ltd.', 'Menzies Aviation booba bangalore pvt ltd'
+REMP = '0', '1', 'F', 'H', 'N', 'S', 'T', 'V', 'X' -- An operational handling code.
+ZONE_DIR = 'NorthZone', 'OtherZone', 'SouthZone'
+ZONE_TAG = 'Zone0', 'ZoneA', 'ZoneB', 'ZoneC', 'ZoneD', 'ZoneE', 'ZoneF'
+ZONE_VALUE = 'DOM_ABC', 'DOM_DE', 'DOM_F', 'INTL', 'UNSCH'
+
+## classification -- What kind of flight it is
+ARR_DAY_DOOA = '1', '2', '3', '4', '5', '6', '7'
+BOOK_LOAD (integer)
+DEP_DAY_DOOD = '1', '2', '3', '4', '5', '6', '7'
+DOM_INT_OPS = 'DOM', 'INT'
+DOM_INT_REVENUE = 'DOM', 'INT'
+FLIGHT_NATURE_TTYP = at least 27 distinct values observed
+FLIGHT_NATURE_TTYP_DESC = at least 17 distinct values observed
+FLIGHT_SERVICE_STYP = 'A', 'C', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'P', 'T', 'W', 'X', 'Z'
+FLIGHT_SERVICE_STYP_CAT = 'CARGO', 'Others', 'PAX'
+FLIGHT_TYPE_DOM_INT_FLTI = 'Domestic', 'International', 'Mixed', 'Others'
+FLIGHT_TYPE_FTYP = ' ', 'B', 'D', 'N', 'O', 'X', 'Z'
+IS_DOMESTIC (integer)
+IS_INTERNATIONAL (integer)
+IS_MIXED = 'N', 'Y'
+SUFFIX_FLNS = '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'

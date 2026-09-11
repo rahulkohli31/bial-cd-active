@@ -12,6 +12,7 @@ something downstream is trusted to enforce.
 
 from __future__ import annotations
 
+import inspect
 import re
 import uuid
 from pathlib import Path
@@ -32,13 +33,15 @@ from src.services.agent.toolsets import (
     ReadDeps,
     ToolSurface,
     registered_tool_definitions,
+    render_tool_surface,
     toolsets_for_kind,
     workspace_from_read_deps,
 )
+from src.services.messages.projection import CONNECTOR_SCHEMA_TOOL
 from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.progress import ProgressEmitter
 from src.services.orchestrator.tools import sandbox_toolset
-from tests.fakes import ToolDeps
+from tests.fakes import ToolDeps, a_connected_system
 from tests.services.orchestrator.conftest import CollectingSink
 from tests.services.orchestrator.fake_sandbox import FakeSandbox
 from tests.services.orchestrator.model_harness import text_turn, tool_turn
@@ -356,6 +359,117 @@ async def test_the_kinds_differ_by_which_toolsets_they_are_handed_and_by_nothing
 
     # Same name on both lists, different ability underneath, decided by the registry alone.
     assert plan["run_command"].description != build["run_command"].description
+
+
+# --- the SECOND axis: which PROJECT, not only which kind -----------------------
+#
+# WHY THIS SECTION EXISTS AT ALL. `toolsets_for_kind`'s docstring has always claimed that a
+# wrong-kind tool is "absent from the model's tool list AND uncallable ... never a policy check
+# that could be bypassed". The connected-data surface extends that claim to a second axis — the
+# project — and the reason is not thrift. The platform already has a flow whose whole purpose is
+# to say no to a project: an administrator declining the access request, and a revocation that
+# flips `effectively_on` back to false. A tool surface that ignored that answer and refused inside
+# the tool body would be handing every project a way to ask, and spending a round trip on the
+# reply. So the same structural guarantee, proven the same way: in BOTH directions.
+
+
+async def test_a_project_that_reads_no_connected_data_is_offered_none() -> None:
+    """The ordinary project, and the default every existing caller already gets.
+
+    THE EXACT SETS ARE THE ASSERTION. `test_a_plan_chat_gets_the_read_surface_plus_only_the_offer_
+    tool` and `test_a_build_chat_is_the_sandbox_set_plus_exactly_two_structured_reads` both list
+    the surface exactly and both call `toolsets_for_kind` with no connectors, so they are already
+    the guard against this feature widening what every project on the platform carries. This
+    states it once more against the registry itself, because those two are about the KIND."""
+    plan = set(await registered_tool_definitions(ChatKind.PLAN))
+    build = set(await registered_tool_definitions(ChatKind.BUILD))
+    assert CONNECTOR_SCHEMA_TOOL not in plan
+    assert CONNECTOR_SCHEMA_TOOL not in build
+    assert plan == _READ_TOOLS | _SHARED_TOOLS | {"present_plan_options"}
+    assert build == _READ_TOOLS | _SANDBOX_ONLY_TOOLS | _SHARED_TOOLS
+
+
+async def test_a_connected_project_gets_exactly_one_more_tool_on_both_arms() -> None:
+    """R4 says both arms, and both arms is what this asserts — a Plan chat reasons about what can
+    be built from the data and a Build chat writes the code that reads it.
+
+    ONE MORE TOOL, NAMED. Asserted as the off-surface PLUS that name rather than as a fresh list,
+    so a second tool sneaking onto the connected surface fails here rather than being absorbed
+    into a hand-updated set."""
+    connected = (a_connected_system(),)
+    plan = set(await registered_tool_definitions(ChatKind.PLAN, connected_systems=connected))
+    build = set(await registered_tool_definitions(ChatKind.BUILD, connected_systems=connected))
+    assert plan == set(await registered_tool_definitions(ChatKind.PLAN)) | {CONNECTOR_SCHEMA_TOOL}
+    assert build == set(await registered_tool_definitions(ChatKind.BUILD)) | {
+        CONNECTOR_SCHEMA_TOOL
+    }
+
+
+async def test_the_connected_surface_does_not_change_what_a_run_may_write(
+    workspace: ExtractedSnapshotWorkspace,
+) -> None:
+    """`may_write` rides WITH the toolsets and is the flag the sandbox door reads. Reading the
+    connected data is a READ on both arms, so a Plan run that gained the tool must not have gained
+    the ability to change the app along with it."""
+    connected = (a_connected_system(),)
+    plan = toolsets_for_kind(ChatKind.PLAN, workspace_from_read_deps, connected_systems=connected)
+    assert plan.may_write is False
+    # ANNOTATED, not inferred: both accessors are bare lambdas, so `DepsT` has nothing to be
+    # resolved from and the surface would come back over `Never` — the same note the two other
+    # Build surfaces in this file carry.
+    build: ToolSurface[ToolDeps] = toolsets_for_kind(
+        ChatKind.BUILD,
+        lambda _ctx: workspace,
+        lambda ctx: ctx.deps.sandbox,
+        connected_systems=connected,
+    )
+    assert build.may_write is True
+
+
+async def test_a_forged_connector_call_in_an_unconnected_chat_is_structurally_rejected(
+    workspace: ExtractedSnapshotWorkspace,
+) -> None:
+    """★ THE GATE PROVEN THE ONLY WAY THAT COUNTS — by CALLING it, not by reading the list.
+
+    A project whose administrator declined the connector, or whose approval was revoked, has no
+    tool here. A model that tries anyway meets the runtime's unknown-tool rejection, exactly as a
+    Plan chat trying `write_file` does. Asserting the absence from a name list would pass just as
+    happily against an implementation that registered the tool and refused inside its body — and
+    that implementation is the one this design exists not to be."""
+    seen: dict[str, Any] = {}
+    agent: Agent[ReadDeps, str] = Agent(deps_type=ReadDeps)
+    result = await agent.run(
+        "read the connected data schema",
+        deps=_deps(workspace),
+        model=_tool_listing_model(
+            seen,
+            [
+                tool_turn(CONNECTOR_SCHEMA_TOOL, {"system": "DICE"}),
+                text_turn("understood, nothing is connected here"),
+            ],
+        ),
+        toolsets=toolsets_for_kind(ChatKind.PLAN, workspace_from_read_deps).toolsets,
+    )
+    assert result.output == "understood, nothing is connected here"
+    assert CONNECTOR_SCHEMA_TOOL not in seen["tool_names"]
+    rejection_feed = seen["incoming"][1].lower()
+    assert CONNECTOR_SCHEMA_TOOL in rejection_feed
+    assert re.search(r"unknown|not available|unavailable", rejection_feed)
+
+
+async def test_the_default_is_no_connectors_and_that_default_is_the_whole_guard() -> None:
+    """★ THE MUTATION THIS SECTION IS BUILT AROUND, expressed as an executable check.
+
+    The manual form is: make `connected_systems` default to a connected system in
+    `toolsets_for_kind`, and `test_a_project_that_reads_no_connected_data_is_offered_none` goes
+    red. Run it before merging. What is asserted HERE is the property that mutation breaks — the
+    signature's default is empty, in all three functions that take it — because a default that
+    drifted in only one of them would leave `WRITE_TOOL_SURFACE` rendering a tool most projects
+    never get, and only the snapshot drift check standing between that and every citizen's Build
+    prompt."""
+    for function in (toolsets_for_kind, registered_tool_definitions, render_tool_surface):
+        default = inspect.signature(function).parameters["connected_systems"].default
+        assert default == (), f"{function.__name__} defaults to {default!r}"
 
 
 # --- the chat-kind catalogue, beside the registry above ------------------------

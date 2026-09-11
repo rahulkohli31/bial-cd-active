@@ -40,6 +40,7 @@ from src.services.build_sessions.outcome import write_build_outcome
 from src.services.media.lanes import EXCEL_MEDIA_TYPE
 from src.services.media.magic import chip_kind_for
 from src.services.messages.projection import (
+    CONNECTOR_SCHEMA_TOOL,
     PROPOSE_SLICE_TOOL,
     TELL_THE_USER_TOOL,
     TURN_TERMINAL_KIND,
@@ -947,6 +948,39 @@ def test_only_configuration_writes_and_housekeeping_are_hidden_on_the_shared_ent
         assert label.strip(), tool
     assert classify_tool_call("write_file", '{"path": "tsconfig.json"}')[1] is True
     assert classify_tool_call("run_command", '{"command": ["mkdir", "-p", "app/lib"]}')[1] is True
+
+
+def test_the_connected_data_read_is_labelled_by_its_attempt_not_its_outcome() -> None:
+    """★ A REFUSAL IS A *SUCCESSFUL* TOOL CALL as far as this module is concerned — `state` reads
+    "failed" only when the stored result was a retry — so an outcome-shaped label ("Read the
+    flight data schema") would render with a success tick over a call that refused and an agent
+    that then invented column names. "Checking what data is connected" describes the ATTEMPT, so
+    it stays true either way.
+
+    IT IS ALSO CONNECTOR-AGNOSTIC IN ITS OWN WORDING, which is why `projection.py` needs no
+    `data_noun` lookup and no import from the connector registry. And `checking` is already a
+    `stepIconFor` branch in the portal, so this label draws with an existing glyph and no portal
+    file changes for it."""
+    label, hidden = classify_tool_call(CONNECTOR_SCHEMA_TOOL, '{"system": "DICE"}')
+    assert label == "Checking what data is connected"
+    assert hidden is False
+    # NOT the raw-tool-name fallback, which is what an unrecognised tool would draw into a
+    # citizen's feed.
+    assert label != f"Used {CONNECTOR_SCHEMA_TOOL}"
+    # The label says nothing about having READ anything, and names no connected system.
+    lowered = label.lower()
+    for outcome_shaped in ("read", "fetched", "loaded", "got", "dice", "flight", "schema"):
+        assert outcome_shaped not in lowered, f"the label claims {outcome_shaped!r}"
+
+
+def test_the_connected_data_label_survives_arguments_it_cannot_parse() -> None:
+    """The live emitter passes the wire args JSON straight through, and a truncated frame is a
+    string this function has to survive. It degrades to the argless label rather than to the raw
+    tool name, because the label does not read its arguments at all."""
+    for args in ("", "{", '{"system": null}', "[]"):
+        assert classify_tool_call(CONNECTOR_SCHEMA_TOOL, args)[0] == (
+            "Checking what data is connected"
+        )
 
 
 def test_reading_an_attachment_names_the_citizens_own_file() -> None:

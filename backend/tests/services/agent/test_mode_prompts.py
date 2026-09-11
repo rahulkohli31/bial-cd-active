@@ -33,6 +33,7 @@ from src.core.prompt_blocks import (
     BUILD_WORKING_RULES_TAIL,
     DATA_INTEGRITY_RULES,
     DATA_INTEGRITY_RULES_WITHOUT_THE_WRITE_MACHINERY,
+    FIRST_SLICE_RULE,
     KEEP_PLANNING_LABEL,
     NARRATION_VOICE,
     PORTAL_SURFACES,
@@ -43,10 +44,14 @@ from src.services.agent.agent import ChatDeps, chat_agent
 from src.services.agent.mode_prompts import (
     _PLAN_SEGMENT,
     PromptContext,
+    _base,
+    _connected_data_stub,
     compose_kind_prompt,
     workspace_note,
 )
 from src.services.agent.toolsets import registered_tool_definitions
+from src.services.messages.projection import CONNECTOR_SCHEMA_TOOL
+from tests.fakes import a_connected_system
 
 _CONTEXT = PromptContext(
     user_name="Asha",
@@ -108,6 +113,147 @@ def test_every_kind_carries_the_truthful_portal_self_description(
     # The unified chat's right pane is the APP — guards against the retired relay's wording
     # ("a chat beside a live preview") being used to re-describe this layout.
     assert "the right pane shows the app itself" in composed
+
+
+# --- CONNECTED DATA: the one thing BASE varies by PROJECT ----------------------
+#
+# WHY THE STUB IS THIS SHORT, AND WHY THAT IS THE DESIGN. Two earlier versions described the
+# client's data in the prompt: a registry field holding a hand-typed sentence about the table, and
+# its replacement — a generated summary line emitted into the artefact behind a sentinel and
+# pinned to the profile by its own claim test. The second was machinery built to make the first
+# safe, and deleting the claim deleted the machinery. What is left names what is connected and
+# says to call the tool, because the tool call is what places the data.
+#
+# THE STUB IS ALSO A FACT ABOUT THE TURN'S TOOL SURFACE. It renders from the same
+# `connected_systems` value `toolsets_for_kind` gates registration on, so the prompt cannot
+# announce a connected system whose tool was never registered — the one disagreement that would
+# cost a citizen a turn.
+
+_CONNECTED = PromptContext(
+    user_name="Asha",
+    project_name="Stand board",
+    connected_systems=(a_connected_system(),),
+)
+
+
+@pytest.mark.parametrize("kind", list(ChatKind))
+def test_the_connected_data_stub_reaches_both_arms(kind: ChatKind) -> None:
+    """PRESENCE ON BOTH, not byte-identity between them — `_base` is one function, so identity
+    would be a tautology. R4 says both arms and this is what both arms means: a Plan chat reasons
+    about what can be built from the data and a Build chat writes the code that reads it."""
+    composed = compose_kind_prompt(kind, _CONNECTED)
+    assert "CONNECTED DATA" in composed
+    assert f"Call `{CONNECTOR_SCHEMA_TOOL}`" in composed
+    assert "Do not guess column names" in composed
+
+
+@pytest.mark.parametrize("kind", list(ChatKind))
+def test_a_project_with_no_connectors_gets_a_byte_identical_base(kind: ChatKind) -> None:
+    """★ THE ASSERTION THAT KEEPS THIS FEATURE FREE FOR EVERY OTHER PROJECT ON THE PLATFORM.
+
+    Nearly every project reads nothing outside the platform, and for those the composed prompt
+    must be exactly what it was before this feature existed — not merely free of the stub. A
+    stray blank line would be a diff in every prompt the product sends."""
+    without = compose_kind_prompt(kind, _CONTEXT)
+    assert "CONNECTED DATA" not in without
+    assert CONNECTOR_SCHEMA_TOOL not in without
+    # ★ AND NOT ONE STRAY BYTE EITHER. `_CONTEXT` already carries the empty default, so comparing
+    # it against a context built with `connected_systems=()` would be comparing the function with
+    # itself — vacuously true, and green against the obvious mistake here: appending
+    # `f"\n\n{stub}"` unconditionally, which gives every unconnected project's prompt a trailing
+    # blank line. BASE ends at `FIRST_SLICE_RULE`, so that is what is asserted, and the
+    # unconditional append breaks it.
+    # Asserted on `_base` itself rather than on a slice of the composed prompt: the kind segment
+    # contains blank lines of its own, so no partition of the composed string reliably finds
+    # BASE's tail — an earlier attempt at this test split on the LAST blank line and asserted
+    # about the segment instead.
+    assert _base(_CONTEXT, kind).endswith(FIRST_SLICE_RULE), (
+        "BASE no longer ends at FIRST_SLICE_RULE for a project with no connectors — something is "
+        f"being appended: {_base(_CONTEXT, kind)[-80:]!r}"
+    )
+    # And the composed prompt is exactly BASE + one blank line + the kind's segment, so a stray
+    # separator anywhere in BASE's tail moves this comparison too.
+    composed_base = _base(_CONTEXT, kind)
+    assert without.startswith(f"{composed_base}\n\n")
+    assert _SEGMENT_HEADERS[kind] in without[len(composed_base) :]
+
+
+def test_the_stub_names_the_system_exactly_as_the_registry_does() -> None:
+    """`display_name` and `subtitle`, verbatim off the registry entry — no history line, no table
+    name, no counts. An earlier draft printed `dice — BIAL flight operations (AODB)`, which no
+    combination of registry fields produces, so an implementer would have had to invent the
+    rendering rule and the citizen's agent would have read a name the product never shows."""
+    system = a_connected_system()
+    composed = compose_kind_prompt(ChatKind.PLAN, _CONNECTED)
+    assert f"  {system.connector.display_name} — {system.connector.subtitle}" in composed
+    # The key is a stored value, never rendered — the tool accepts either spelling so the agent
+    # can pass back the only one it was shown.
+    assert system.key not in composed
+
+
+def test_the_stub_carries_no_date_no_window_and_no_sample_size() -> None:
+    """★ AN OWNER RULING A LATER READER WOULD OTHERWISE BE TEMPTED TO "FIX", so it is asserted.
+
+    The window is a portal and approval concept: the code an agent writes reads the lake directly,
+    for whatever dates the app's own users pick. Telling the model about a thirty-day sample would
+    describe a constraint that does not exist and that nothing it writes would honour. Where the
+    data actually begins is in the tool's answer, the moment the agent calls it."""
+    system = a_connected_system()
+    # THE BLOCK ITSELF, not a slice of the composed prompt. Slicing on "CONNECTED DATA" hands you
+    # everything after it — which is the whole kind segment, since the stub sits at BASE's tail —
+    # so a leak test written that way passes or fails on the segment's wording instead.
+    stub = _connected_data_stub((system,))
+    for leaked in (
+        str(system.window.start),
+        str(system.window.end),
+        str(system.window.days),
+        str(system.connector.max_window_days),
+        "days of",
+        "history",
+        "sample",
+    ):
+        assert leaked not in stub, f"the stub leaked {leaked!r}"
+
+
+def test_the_stub_describes_nothing_about_the_data_itself() -> None:
+    """The complement of the test above, and the reason the summary line was deleted. After the
+    column cut "131 columns" is false about the client's table and "408 columns" promises 277 the
+    block does not describe; the careful formulation that is true of both costs a sentence and two
+    asserted numbers to say something the agent gets for free the moment it calls the tool."""
+    stub = _connected_data_stub((a_connected_system(),))
+    # NO DIGIT ANYWHERE. Every fact the deleted summary line carried was a number — a column
+    # count, a table row count, a date — so "the stub states no number" is the whole rule in one
+    # assertion, and it cannot be satisfied by rewording. The words "column" and "table" DO
+    # appear, describing what the tool's answer contains; that is the instruction, not a claim
+    # about the client's data.
+    assert not any(character.isdigit() for character in stub), stub
+    for leaked in ("tb_flight", "AODB", "parquet", "lake"):
+        assert leaked.lower() not in stub.lower(), f"the stub described the data: {leaked!r}"
+
+
+async def test_the_stub_names_the_tool_that_is_actually_registered() -> None:
+    """★ THE PROMPT AND THE REGISTRATION ARE ONE STRING, and there is nowhere to write the tool's
+    name down — pydantic-ai registers a function under its `__name__`. So the two are equal only
+    by agreement, and this is the agreement. Read off the REGISTERED definition rather than off
+    `__name__`, because the registered name is the one the model may actually call."""
+    connected = (a_connected_system(),)
+    for kind in ChatKind:
+        registered = await registered_tool_definitions(kind, connected_systems=connected)
+        assert CONNECTOR_SCHEMA_TOOL in registered
+        assert f"Call `{CONNECTOR_SCHEMA_TOOL}`" in compose_kind_prompt(kind, _CONNECTED)
+
+
+def test_the_count_sentence_is_rendered_rather_than_typed() -> None:
+    """`tests/db/test_connector_models.py` pins the registry at one entry, so "one connected
+    system" is what ships — but a literal would go quietly wrong the day that test is deliberately
+    changed, and the sentence is about the tuple in front of it, not about the registry."""
+    two = PromptContext(
+        user_name="Asha",
+        project_name="Stand board",
+        connected_systems=(a_connected_system(), a_connected_system()),
+    )
+    assert "one connected system" in compose_kind_prompt(ChatKind.PLAN, _CONNECTED)
+    assert "2 connected systems" in compose_kind_prompt(ChatKind.PLAN, two)
 
 
 def test_base_survives_an_undescribed_project() -> None:

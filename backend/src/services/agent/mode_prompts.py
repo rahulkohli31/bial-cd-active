@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from src.core.connectors import ConnectedSystem
 from src.core.prompt_blocks import (
     BUILD_THIS_PLAN_LABEL,
     BUILD_WORKING_RULES_HEAD,
@@ -29,17 +30,59 @@ from src.core.prompt_blocks import (
     WRITE_IDENTITY,
 )
 from src.db.models.conversation import ChatKind
+from src.services.messages.projection import CONNECTOR_SCHEMA_TOOL
 
 
 @dataclass(frozen=True)
 class PromptContext:
     """What BASE needs to say who the assistant is working with and on what. Built per
     turn from the conversation's project + owner; `project_description` is the
-    project row's description, absent when the user never wrote/generated one."""
+    project row's description, absent when the user never wrote/generated one.
+
+    `connected_systems` is what this project may actually read from outside the platform,
+    resolved once at the router (`services/connectors/access.connected_systems_for_project`).
+    Empty is the ordinary case. The SAME value decides the turn's tool surface, which is why it
+    rides the prompt context rather than being resolved again wherever it is needed."""
 
     user_name: str
     project_name: str
     project_description: str | None = None
+    connected_systems: tuple[ConnectedSystem, ...] = ()
+
+
+def _connected_data_stub(systems: tuple[ConnectedSystem, ...]) -> str:
+    """The CONNECTED DATA block, or `""` when this project reads nothing outside the platform.
+
+    THE STUB DESCRIBES NOTHING ABOUT THE DATA — owner ruling, 2026-09-11. It names what is
+    connected and says to call the tool; the tool call is what places the data, and a second,
+    smaller copy of that in the prompt is a claim somebody has to keep true. Two earlier designs
+    died here: a registry field holding a hand-typed sentence about the client's table, and its
+    replacement, a generated summary line pinned to the profile by its own claim test. The second
+    was machinery built to make the first safe, and deleting the claim deleted the machinery.
+
+    NO WINDOW, NO DATES, NO SAMPLE SIZE — owner ruling, 2026-09-10. See `ConnectedSystem`.
+
+    The per-system line is `display_name` and `subtitle` verbatim off the registry, which is what
+    keeps this function from knowing what any particular connected system is (R9). It renders no
+    key: the tool matches a name case-insensitively against both, so the citizen's agent passes
+    back what it reads here."""
+    if not systems:
+        return ""
+    # Pluralised rather than hard-coded, even though `tests/db/test_connector_models.py` pins the
+    # registry at one entry: "one connected system" typed as a literal is a sentence that goes
+    # quietly wrong on the day that test is deliberately changed.
+    count = "one connected system" if len(systems) == 1 else f"{len(systems)} connected systems"
+    rows = "\n".join(
+        f"  {system.connector.display_name} — {system.connector.subtitle}" for system in systems
+    )
+    return f"""\
+CONNECTED DATA
+
+This project can read {count}. Call `{CONNECTOR_SCHEMA_TOOL}` before writing any code against \
+it — you get its tables, every column with its type and value set, and the rules that make a \
+query correct. Do not guess column names.
+
+{rows}"""
 
 
 def _base(context: PromptContext, kind: ChatKind) -> str:
@@ -57,7 +100,14 @@ def _base(context: PromptContext, kind: ChatKind) -> str:
     Build-only clauses dropped (the destructive-SQL sentinel, the migration channel) via
     `DATA_INTEGRITY_RULES_WITHOUT_THE_WRITE_MACHINERY` — byte-identical rules otherwise. This
     is why `_base` takes a kind at all: the false half of a cross-mode block turned out to be
-    the mode-specific half."""
+    the mode-specific half.
+
+    THE ONE THING IT VARIES BY PROJECT is the CONNECTED DATA stub, which is appended LAST and is
+    absent — leaving BASE byte-identical to what it was — for every project that reads nothing
+    outside the platform, which is nearly all of them. It goes in `_base` because `_base` is the
+    single function `compose_kind_prompt` calls for BOTH kinds, so one insertion point reaches
+    the Plan arm and the Build arm without a second copy to keep in step. It goes LAST because
+    everything above it is the standing contract and this is a fact about today's project."""
     described = f" — {context.project_description}" if context.project_description else ""
     identity = (
         f"You are the Citizen Developer assistant for BIAL, working with "
@@ -73,9 +123,10 @@ def _base(context: PromptContext, kind: ChatKind) -> str:
         if kind is ChatKind.BUILD
         else DATA_INTEGRITY_RULES_WITHOUT_THE_WRITE_MACHINERY
     )
+    stub = _connected_data_stub(context.connected_systems)
     return (
         f"{NARRATION_EXAMPLES}\n\n{identity}\n\n{PORTAL_SURFACES}\n\n{integrity}\n\n"
-        f"{NARRATION_VOICE}\n\n{FIRST_SLICE_RULE}"
+        f"{NARRATION_VOICE}\n\n{FIRST_SLICE_RULE}" + (f"\n\n{stub}" if stub else "")
     )
 
 

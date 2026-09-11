@@ -35,7 +35,11 @@ from src.api.v1.conversations.schemas import (
     WorkspaceFrame,
 )
 from src.api.v1.conversations.turns import KEEPALIVE_SECONDS
+from src.core.connectors import CONNECTORS
+from src.db.models.connector_access import ConnectorAccessRequest, ConnectorRequestStatus
 from src.db.models.conversation import ChatKind, Conversation
+from src.db.models.project_connector import ConnectorWindowKind, ProjectConnector
+from src.services.messages.projection import CONNECTOR_SCHEMA_TOOL
 from src.services.turns import engine as engine_module
 from src.services.turns.engine import (
     _TURN_FAILED_MESSAGE,
@@ -48,6 +52,9 @@ from tests.transcript import rendered_text
 # Explicit rather than autouse: conftest.py's turn-driving fixtures are shared by four
 # files, but the other files in this directory drive no turns.
 pytestmark = pytest.mark.usefixtures("_fresh_engine", "_override_billing")
+
+
+_CONNECTOR_KEY = next(iter(CONNECTORS))
 
 
 async def _auth_with_conversation(db_session, *, kind=None):
@@ -497,6 +504,169 @@ async def test_plan_kind_model_sees_no_write_tools(
         "tell_the_user",
         "propose_first_slice",
     }
+
+
+# --- the connected-data surface, END TO END through the real route and engine -------------
+#
+# ★ WHY THIS TEST IS THE ONE THAT MATTERS FOR THAT FEATURE. `toolsets_for_kind` takes the
+# connected systems as a keyword argument that DEFAULTS TO NONE, and every registration test in
+# `tests/services/agent/test_toolsets.py` calls it directly. So a version of this feature where
+# the engine forgot to pass the argument — the tool registered for nobody, the block reachable by
+# no citizen — would leave that entire suite green, the type checkers silent, and the feature
+# inert in production. The wiring from router to prompt-context to engine to registry is only
+# provable by driving the route, which is what this does.
+
+
+async def _connect_the_project(db_session, user, conv) -> None:
+    """Approve the owner and switch the connector on for this conversation's project — the two
+    halves of `effectively_on`, written as rows rather than through the routes, so the test states
+    the DATABASE state it needs rather than a sequence of requests that happens to produce it."""
+    db_session.add(
+        ConnectorAccessRequest(
+            user_id=user.id,
+            connector_key=_CONNECTOR_KEY,
+            status=ConnectorRequestStatus.APPROVED,
+            requester_remarks="The stand board needs on-block times.",
+        )
+    )
+    db_session.add(
+        ProjectConnector(
+            project_id=conv.project_id,
+            connector_key=_CONNECTOR_KEY,
+            enabled=True,
+            window_kind=ConnectorWindowKind.RELATIVE,
+            window_days=7,
+        )
+    )
+    await db_session.flush()
+
+
+async def test_a_connected_project_reaches_the_model_with_the_tool_and_the_stub(
+    client, db_session, set_chat_model, _fresh_engine
+) -> None:
+    """Through the REAL route, router, engine and registry: an approved, switched-on project's
+    Plan turn hands the model the connected-data tool AND tells it, in its instructions, to call
+    that tool before writing code against the data.
+
+    BOTH HALVES IN ONE TEST ON PURPOSE. The stub and the tool list are rendered from ONE resolved
+    value, and the failure this guards is them disagreeing — a prompt announcing a connected
+    system whose tool was never registered would cost the citizen a turn discovering an
+    unknown-tool rejection."""
+    seen: dict[str, Any] = {}
+
+    async def _capture(messages: list[ModelMessage], info: AgentInfo):
+        seen["tools"] = {tool.name for tool in info.function_tools}
+        # THE PROMPT ARRIVES AS `ModelRequest.instructions`, NOT AS A SYSTEM-PROMPT PART. The
+        # agent delivers it through `@agent.instructions` — deliberately, so prompts can evolve
+        # without rewriting stored history — and a capture that scanned `parts` for a
+        # `system-prompt` finds an empty string and asserts happily against nothing.
+        seen["instructions"] = "\n".join(
+            text
+            for message in messages
+            for text in [getattr(message, "instructions", None)]
+            if isinstance(text, str)
+        )
+        yield "noted"
+
+    user, conv = await _auth_with_conversation(db_session)
+    await _connect_the_project(db_session, user, conv)
+    set_chat_model(FunctionModel(stream_function=_capture))
+    assert (await _post_turn(client, _headers(user), conv)).status_code == 202
+    await _settle(_fresh_engine, conv.id)
+
+    assert CONNECTOR_SCHEMA_TOOL in seen["tools"]
+    assert "CONNECTED DATA" in seen["instructions"]
+    assert f"Call `{CONNECTOR_SCHEMA_TOOL}`" in seen["instructions"]
+
+
+async def test_the_build_arm_reaches_the_model_with_the_tool_too(
+    client, db_session, set_chat_model, _fresh_engine
+) -> None:
+    """★ THE BUILD CALL SITE, WHICH THE PLAN CALL SITE DOES NOT COVER.
+
+    `engine.py` passes the connector set to `toolsets_for_kind` at TWO places — the Plan run and
+    the Build loop — and the argument defaults to none, so deleting the Build one registers the
+    tool for nobody on the arm that actually writes the app while every registration test stays
+    green (they call `toolsets_for_kind` directly). The stub would still render, because `_base`
+    is one function for both kinds — which is the exact prompt-says-yes / registry-says-no
+    disagreement the design forbids."""
+    seen: dict[str, Any] = {}
+
+    async def _capture(messages: list[ModelMessage], info: AgentInfo):
+        seen["tools"] = {tool.name for tool in info.function_tools}
+        yield "noted"
+
+    user, conv = await _auth_with_conversation(db_session, kind=ChatKind.BUILD)
+    await _connect_the_project(db_session, user, conv)
+    set_chat_model(FunctionModel(stream_function=_capture))
+    assert (await _post_turn(client, _headers(user), conv)).status_code == 202
+    await _settle(_fresh_engine, conv.id)
+
+    assert seen.get("tools"), "the Build turn never reached the model"
+    assert CONNECTOR_SCHEMA_TOOL in seen["tools"]
+    # And it is the BUILD surface, not the Plan one — proving which call site was exercised.
+    assert "write_file" in seen["tools"]
+
+
+async def test_an_ordinary_project_reaches_the_model_with_neither(
+    client, db_session, set_chat_model, _fresh_engine
+) -> None:
+    """The other direction, and the one that keeps this feature free for every other project on
+    the platform. A project with no connector row — nearly all of them — gets exactly the surface
+    it got before this existed, and no CONNECTED DATA block."""
+    seen: dict[str, Any] = {}
+
+    async def _capture(messages: list[ModelMessage], info: AgentInfo):
+        seen["tools"] = {tool.name for tool in info.function_tools}
+        # THE PROMPT ARRIVES AS `ModelRequest.instructions`, NOT AS A SYSTEM-PROMPT PART. The
+        # agent delivers it through `@agent.instructions` — deliberately, so prompts can evolve
+        # without rewriting stored history — and a capture that scanned `parts` for a
+        # `system-prompt` finds an empty string and asserts happily against nothing.
+        seen["instructions"] = "\n".join(
+            text
+            for message in messages
+            for text in [getattr(message, "instructions", None)]
+            if isinstance(text, str)
+        )
+        yield "noted"
+
+    user, conv = await _auth_with_conversation(db_session)
+    set_chat_model(FunctionModel(stream_function=_capture))
+    assert (await _post_turn(client, _headers(user), conv)).status_code == 202
+    await _settle(_fresh_engine, conv.id)
+
+    assert CONNECTOR_SCHEMA_TOOL not in seen["tools"]
+    assert "CONNECTED DATA" not in seen["instructions"]
+
+
+async def test_an_approval_without_a_project_switch_reaches_the_model_with_neither(
+    client, db_session, set_chat_model, _fresh_engine
+) -> None:
+    """★ THE HALF-STATE, driven through the route. The owner is approved for every project they
+    own, and this project was never switched on — so `effectively_on` is false and the tool must
+    be ABSENT rather than present-and-refusing. Asserted here as well as at the helper, because
+    this is the layer where a caller could pass the wrong half of the conjunction."""
+    seen: dict[str, Any] = {}
+
+    async def _capture(messages: list[ModelMessage], info: AgentInfo):
+        seen["tools"] = {tool.name for tool in info.function_tools}
+        yield "noted"
+
+    user, conv = await _auth_with_conversation(db_session)
+    db_session.add(
+        ConnectorAccessRequest(
+            user_id=user.id,
+            connector_key=_CONNECTOR_KEY,
+            status=ConnectorRequestStatus.APPROVED,
+            requester_remarks="Approved, but this project was never switched on.",
+        )
+    )
+    await db_session.flush()
+    set_chat_model(FunctionModel(stream_function=_capture))
+    assert (await _post_turn(client, _headers(user), conv)).status_code == 202
+    await _settle(_fresh_engine, conv.id)
+
+    assert CONNECTOR_SCHEMA_TOOL not in seen["tools"]
 
 
 async def test_write_mode_accepts_a_send_like_every_other_mode(

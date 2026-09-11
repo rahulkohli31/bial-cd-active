@@ -1468,6 +1468,11 @@ class TurnEngine:
                         # tool that writes.
                         sandbox=state.sandbox,
                     )
+                    # THE CONNECTED-DATA SURFACE RIDES THE PROMPT CONTEXT, and passing it is what
+                    # makes the feature exist at all: the argument defaults to none, so a call
+                    # that forgot it would register the tool for nobody while every registration
+                    # test — which calls `toolsets_for_kind` directly — stayed green.
+                    #
                     # THE READER IS OFFERED ONLY WHEN THERE IS SOMETHING TO READ. A tool named
                     # `read_attachment` on a chat with no attachment is an invitation to invent a
                     # path and then explain the failure; `toolsets_for_kind` takes the accessor as
@@ -1476,6 +1481,7 @@ class TurnEngine:
                         state.kind,
                         _workspace_of,
                         reader_of=_reader_of if state.attachments is not None else None,
+                        connected_systems=prompt_context.connected_systems,
                     ).toolsets
                     # UNCONDITIONAL, BECAUSE THE TOOLSET HAS ALREADY DECIDED IT. A run can only
                     # end deferred if a tool that DEFERS was registered on it, and
@@ -2471,7 +2477,14 @@ class TurnEngine:
             deps=deps,
             model=model,
             message_history=messages,
-            toolsets=toolsets_for_kind(ChatKind.BUILD, _workspace_of, _sandbox_of).toolsets,
+            # Same connected-data surface as the Plan arm, off the same one value — see the
+            # note at the Plan call site.
+            toolsets=toolsets_for_kind(
+                ChatKind.BUILD,
+                _workspace_of,
+                _sandbox_of,
+                connected_systems=prompt_context.connected_systems,
+            ).toolsets,
             output_type=str,
             usage_limits=UsageLimits(request_limit=MODEL_TURN_CEILING),
             # Without `max_tokens` pydantic-ai's Anthropic default of 4096 truncates a

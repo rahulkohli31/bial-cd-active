@@ -54,6 +54,7 @@ from src.schemas import AUTH_401, CamelModel, ErrorEnvelope, error_responses
 from src.services.agent.mode_prompts import PromptContext
 from src.services.build_sessions import SandboxReclaimBlockedError
 from src.services.build_sessions.counters import count
+from src.services.connectors.access import connected_systems_for_project
 from src.services.messages.store import load_rows
 from src.services.redis import build_coordination_or_503
 from src.services.turns.copy import (
@@ -303,6 +304,12 @@ async def build_it(
             user_name=user.display_name or user.email,
             project_name=project.name,
             project_description=project.description or None,
+            # The handoff's Build chat gets the same connector facts a typed Build turn does —
+            # resolved at the router for the same reason (`turns.py`), and from the PLAN chat's
+            # project, which is the project the new Build chat is created in two blocks above.
+            connected_systems=await connected_systems_for_project(
+                db, user_id=user.id, project_id=plan_chat.project_id
+            ),
         ),
         app_id=app_id,
         model=model,

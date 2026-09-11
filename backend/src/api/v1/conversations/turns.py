@@ -62,6 +62,7 @@ from src.services.attachments.materialize import (
 from src.services.build_sessions import SandboxReclaimBlockedError
 from src.services.build_sessions.appdata import APP_SWITCHED_OFF, APP_SWITCHED_OFF_CODE
 from src.services.build_sessions.manager import SessionManager
+from src.services.connectors.access import connected_systems_for_project
 from src.services.messages.projection import DisplayItem, project_conversation
 from src.services.messages.store import (
     AttachmentRehydrationError,
@@ -561,6 +562,14 @@ async def start_turn(
         user_name=display_name,
         project_name=project.name,
         project_description=project.description or None,
+        # RESOLVED HERE, ONCE, BECAUSE THIS IS WHERE THE SESSION IS. The turn engine passes a
+        # live session on the Plan arm and `None` on the Build arm (holding a pooled connection
+        # across a minutes-long build would pin it idle-in-transaction), so anything downstream
+        # that needed the database would work on one arm and fail on the other. Resolving at the
+        # router is what lets one value serve the prompt's stub and the turn's tool surface.
+        connected_systems=await connected_systems_for_project(
+            db, user_id=user.id, project_id=project_id
+        ),
     )
     app_id = await _app_id_for_project(db, user.id, project_id)
     sent_ids = set(body.message.attachment_ids)

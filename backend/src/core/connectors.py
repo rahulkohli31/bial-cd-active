@@ -386,3 +386,30 @@ def resolve_window(
         earliest=earliest,
         latest=latest,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectedSystem:
+    """One connector a project may ACTUALLY read, resolved once and carried for the whole turn.
+
+    WHY THE PAIR TRAVELS TOGETHER. The registry entry says what the system is called; the resolved
+    window says whether this project may read it at all (`effectively_on` — the switch AND the
+    owner's approval, see `ResolvedWindow`). Neither half is useful alone: a display name with no
+    permission behind it is a row the citizen should never have been shown, and a permission with
+    no name is something the prompt cannot mention.
+
+    RESOLVED AT THE ROUTER, READ IN TWO PLACES. The turn's prompt names what is connected, and the
+    turn's tool surface registers the schema tool for exactly the same set. They read ONE value,
+    so they cannot disagree about whether this project reads this system — which is the property
+    that makes "the tool is absent, not refused" true rather than aspirational.
+
+    NOTHING HERE REACHES THE MODEL BUT THE TWO NAMES. `window` is carried so a tool can fail
+    first on a system that came back not-effectively-on; its DATES are deliberately never
+    rendered into a prompt (owner ruling, 2026-09-10). The window is a portal and approval
+    concept — the code an agent writes reads the lake directly, for whatever dates the app's own
+    users pick — so telling the model about a thirty-day sample would describe a constraint that
+    does not exist and that nothing it writes would honour."""
+
+    key: str
+    connector: Connector
+    window: ResolvedWindow

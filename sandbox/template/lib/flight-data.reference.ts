@@ -331,9 +331,8 @@
 //   // This loop used to run over `files.filter((f) => f.loadDate >= from - 2 days)`. It emptied any
 //   // window starting more than two days after the newest load — every forward-looking question
 //   // returned `[]` with no error — and for a backward window it dropped a flight whose only
-//   // surviving record lived in an older load. The set is already bounded upstream: the platform
-//   // copies at most one retention window into the workspace, which is the 30 files and ~6.7 s the
-//   // docblock measured. Reading all of them costs seconds; guessing costs a wrong answer silently.
+//   // surviving record lived in an older load. Reading all of them is the honest cost of a right
+//   // answer; guessing costs a wrong one silently.
 //   const rows: T[] = []
 //   for (const file of files) appendAll(rows, await readColumns<T>(file, needed))
 //

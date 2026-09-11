@@ -18,7 +18,7 @@ import base64
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,8 +30,10 @@ from src.api.v1.build_sessions.schemas import (
     ProgressEnvelope,
     StepEvent,
 )
+from src.core.connectors import CONNECTORS, ConnectedSystem, ResolvedWindow
 from src.db.models.conversation import ChatKind
 from src.db.models.message import MessageEntryKind, MessageVisibility
+from src.db.models.project_connector import ConnectorWindowKind
 from src.services.messages.store import SeqContentionError, append_batch
 from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.progress import ProgressEmitter
@@ -600,3 +602,40 @@ async def write_legacy_build_started(
     except SeqContentionError:
         return False
     return True
+
+
+# --- The connected-data surface's one input ---------------------------------------------------
+#
+# `ConnectedSystem` is a pure `core/` dataclass over the registry entry and a resolved window, and
+# building one by hand takes eight lines of dates nobody's test is about. It lives HERE rather
+# than in `factories.py` because it writes no row: it is the shape a router hands the turn, and
+# every consumer of it (the prompt stub, the toolset gate, the tool body) needs one without a
+# database at all.
+
+
+def a_connected_system(*, effectively_on: bool = True) -> ConnectedSystem:
+    """One connector this project may read, resolved.
+
+    THE KEY AND THE ENTRY COME OFF THE REGISTRY, never a literal — the same discipline
+    `test_access_state.py` uses. A test that spelled the key itself would keep passing after the
+    registry renamed it, and would then be asserting about a connector the platform does not have.
+
+    `effectively_on=False` builds the state the router never returns, which is exactly why it is
+    offered: the tool's refusal for a system that is switched off is unreachable through
+    registration, so the only way to assert it is to construct it."""
+    key, connector = next(iter(CONNECTORS.items()))
+    today = date(2026, 9, 10)
+    return ConnectedSystem(
+        key=key,
+        connector=connector,
+        window=ResolvedWindow(
+            effectively_on=effectively_on,
+            kind=ConnectorWindowKind.RELATIVE,
+            start=today - timedelta(days=connector.max_window_days),
+            end=today - timedelta(days=connector.freshness_lag_days),
+            days=connector.max_window_days,
+            clamped=False,
+            earliest=today - timedelta(days=connector.max_window_days),
+            latest=today - timedelta(days=connector.freshness_lag_days),
+        ),
+    )

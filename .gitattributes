@@ -48,3 +48,17 @@ sandbox/**/*.otf        binary
 # answers `text: set` / `eol: lf` with this line deleted. The rule stays anyway — it is the one
 # that covers the other five, and the overlap on `Dockerfile` is free.
 backend/src/services/deploy/assets/**   text eol=lf
+
+# --- the generated connector schema block ----------------------------------------------------
+# `connector_catalogue/*.txt` is a GENERATED artefact: `backend/scripts/build_connector_catalogue.py`
+# renders it and `backend/tests/scripts/test_build_connector_catalogue.py` regenerates it and
+# compares the result BYTE FOR BYTE. A Windows checkout with core.autocrlf=true would rewrite
+# every one of its 255 line endings, so the drift test would fail on the build host and pass here
+# — the worst shape a guard can have. It also ships inside the backend image (`COPY src ./src`)
+# and is sent to the model verbatim.
+#
+# A DIRECTORY GLOB, not a per-file rule, so a second connector's artefact inherits it without
+# anyone remembering. Its generator INPUTS under `backend/data/connectors/` need no rule: they are
+# parsed as JSON, never byte-compared, and Python's universal-newline decoding hides a CRLF
+# checkout from the generator entirely.
+backend/src/services/agent/connector_catalogue/**   text eol=lf
