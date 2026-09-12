@@ -112,6 +112,15 @@ export default function ProjectPage() {
     [navigate],
   )
 
+  // THE SAME INVOLUNTARY-BOUNCE SHAPE AS `bounceGone`, for a recipient who opened this exact
+  // address. It is real — unlike a deleted project, nothing here has gone missing — it is just
+  // the wrong screen for what `access` says they hold, so `replace` and no notice: the sentence
+  // that fits a vanished project would be a lie about one that is very much still there.
+  const bounceToShared = useCallback(
+    (id: string) => navigate(`/shared/${id}`, { replace: true }),
+    [navigate],
+  )
+
   // Load the project. A 404 means it was deleted elsewhere — bounce to the index rather than
   // strand the user on a dead page.
   useEffect(() => {
@@ -125,6 +134,15 @@ export default function ProjectPage() {
       try {
         const loaded = await getProject(projectId)
         if (!active) return
+        // A RECIPIENT NEVER RENDERS THIS SCREEN. This is the owner's full workspace — chat,
+        // build controls, save, publish, rename — none of which requirement 14 permits a
+        // shared recipient to reach, and the resolver's tri-state `access` is exactly the
+        // signal that tells the two apart. `replace` because this bounce is involuntary: the
+        // address they opened is real, it just belongs to the other view of it.
+        if (loaded.access === 'shared') {
+          bounceToShared(projectId)
+          return
+        }
         setProject(loaded)
         setLoadError(null)
         // The chat-open ratio's denominator, and the time-to-app-visible clock's start. Marked
@@ -148,7 +166,7 @@ export default function ProjectPage() {
     return () => {
       active = false
     }
-  }, [projectId, goToProjects, bounceGone])
+  }, [projectId, goToProjects, bounceGone, bounceToShared])
 
   /* THE CHATS READ, ITS ERROR AND THE DELETE HANDLER ARE DELIBERATELY ABSENT. They existed for
      one renderer, the rail's "Conversations · this project" list, which the client asked not to

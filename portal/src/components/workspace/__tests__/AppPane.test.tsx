@@ -953,7 +953,14 @@ describe('★ taking the workspace back', () => {
 
       fireEvent.click(screen.getByRole('button', { name: button }))
 
-      await waitFor(() => expect(api.handOverWorkspace).toHaveBeenCalledWith('pA', save, {}, expect.any(Function)))
+      await waitFor(() =>
+        expect(api.handOverWorkspace).toHaveBeenCalledWith(
+          expect.objectContaining({ projectId: 'pA' }),
+          save,
+          {},
+          expect.any(Function),
+        ),
+      )
       // The relaunch that closes the sequence, and the URL the pane frames.
       await waitFor(() => expect(api.relaunchPreview).toHaveBeenCalledTimes(2))
       expect(report.onStarted).toHaveBeenCalledWith('https://app/')
@@ -964,6 +971,42 @@ describe('★ taking the workspace back', () => {
       await waitFor(() => expect(dialog()).toBeNull())
     })
   }
+
+  // --- the shared-view arm: "closed", never "stopped" (#198 round 3) ------------------------
+
+  it('★ giving up a SHARED view says "closed", never "stopped" — nothing of the colleague`s ever ran here', async () => {
+    api.handOverWorkspace.mockResolvedValue(undefined)
+    const { report } = await askTheQuestion({ isSharedView: true, dirty: false })
+
+    // The clean-stop copy for `dirty: false` offers only this one button, unsuffixed — see
+    // `copyFor`'s own `discard: "Stop ${incumbent}"` on that arm.
+    fireEvent.click(screen.getByRole('button', { name: /^Stop “Car pool”$/ }))
+
+    await waitFor(() => expect(api.relaunchPreview).toHaveBeenCalledTimes(2))
+    expect(report.onStarted).toHaveBeenCalledWith('https://app/')
+    // Never the ordinary-arm sentence — nothing was stopped or saved, only given up.
+    expect(await screen.findByText('You closed your view of “Car pool”. Your app has the workspace now.')).toBeTruthy()
+    expect(screen.queryByText(/was stopped/)).toBeNull()
+  })
+
+  it('★ a rejected give-up on a SHARED view never claims their project was stopped', async () => {
+    // `giveUpSharedView` never stops anything, on either outcome, and `handOverWorkspace`
+    // narrates the shared arm only AFTER it succeeds — so a rejection here must reach the pane
+    // having emitted no narration step at all, the same as a rejection at `stopping` itself.
+    const reason = 'Could not close the other app just now.'
+    api.handOverWorkspace.mockImplementation(async () => {
+      throw new ApiError(reason, 503, 'shared_release_failed')
+    })
+    const { report } = await askTheQuestion({ isSharedView: true, dirty: false })
+
+    fireEvent.click(screen.getByRole('button', { name: /^Stop “Car pool”$/ }))
+
+    await waitFor(() =>
+      expect(report.onStartOutcome).toHaveBeenCalledWith({
+        kind: 'take-back-failed', reason, stoppedHolder: null,
+      }),
+    )
+  })
 
   it('★ ENDING 1 — a stop that failed dismisses the dialog and hands the pane the server`s sentence', async () => {
     // `buildSessionApi.ts` authors the two-minute ceiling sentence. It arrives here verbatim, and

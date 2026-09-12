@@ -48,6 +48,10 @@ from src.services.build_sessions.manager import (
 from src.services.build_sessions.manager import SaveOutcome as SaveOutcome
 from src.services.build_sessions.manager import SaveState as SaveState
 from src.services.build_sessions.manager import SessionManager as SessionManager
+from src.services.build_sessions.manager import SharedPreview as SharedPreview
+from src.services.build_sessions.manager import (
+    SharedProjectHasNoAppError as SharedProjectHasNoAppError,
+)
 from src.services.build_sessions.manager import (
     SnapshotUnavailableError as SnapshotUnavailableError,
 )
@@ -57,6 +61,7 @@ from src.services.build_sessions.manager import get_session_manager as get_sessi
 from src.services.build_sessions.manager import (
     set_session_manager_for_tests as set_session_manager_for_tests,
 )
+from src.services.build_sessions.manager import shr_name_for as shr_name_for
 from src.services.build_sessions.reaper import reap_user as reap_user
 from src.services.build_sessions.reaper import reconcile_user as reconcile_user
 from src.services.build_sessions.reaper import sweep_all as sweep_all

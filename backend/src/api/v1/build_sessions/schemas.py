@@ -144,6 +144,17 @@ SERVED_TRAFFIC_STAY_SECONDS = 900
 # longer stay a prior write turn already bought — see `locks.py`.
 TURN_ENDED_UNCHANGED_STAY_SECONDS = 300  # 5 min
 
+# --- The shared-runtime view's absolute session ceiling (#198) --------------
+# Independent of `DeadlineWriter.APP_SERVED_TRAFFIC`'s renewable stay above, so a wedged or
+# spoofed supervisor report can never buy a shared view immortality: every renewable signal in
+# this file bounds how long a container survives WITHOUT proof of use, and this bounds how long
+# it may survive no matter how much proof arrives. Four hours — the same scale reclaim.py's own
+# `REAL_APP_AGE` uses for "this has run long enough that it is worth a fresh look" — long enough
+# that a colleague reading through a shared app across a working session is never cut off
+# mid-read by a number nobody chose on purpose, short enough that a spoofed or wedged traffic
+# report cannot keep a container alive indefinitely.
+SHARED_PREVIEW_ABSOLUTE_CEILING_SECONDS = 4 * 60 * 60  # 4 hours
+
 
 class PreviewLifeState(enum.StrEnum):
     """What is (or is not) serving a project's preview right now. An **API** StrEnum like
@@ -334,6 +345,24 @@ class RelaunchPreviewResponse(CamelModel):
     # stamp — be the single authority on what is serving. The field itself stays because old
     # clients read it and the backend's own start-success numerator is gated on it.
     ready: bool = True
+
+
+class SharedPreviewResponse(CamelModel):
+    """`POST /v1/build-sessions/projects/{projectId}/shared-launch` and `.../shared-refresh`
+    → 200 (#198). `RelaunchPreviewResponse`'s sibling for a colleague's read-only view of a
+    project shared with them — no `session_id`/`status`/`restored_from_failed_build`: a shared
+    view registers no build session, has no build-outcome history of its own to qualify, and
+    `ready` alone says whether the frame is serving yet."""
+
+    app_id: uuid.UUID
+    preview_url: str
+    ready: bool
+    # When the snapshot NOW BEING SERVED was saved — the answer to "how current is what I'm
+    # looking at", which only matters here: a builder's own relaunch is always their newest
+    # work, but a colleague's view is frozen at whatever the owner last saved, and Refresh's
+    # entire point is moving this forward. `None` only when the store could not be asked for
+    # the timestamp; the restore itself already confirmed the snapshot exists.
+    snapshot_taken_at: datetime | None
 
 
 class StopBuildRequest(CamelModel):

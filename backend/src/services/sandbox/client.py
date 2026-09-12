@@ -40,6 +40,9 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_FQDN,
     REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
     REGISTRY_FIELD_SERVING_SINCE,
+    REGISTRY_FIELD_SHARED_OWNER_ID,
+    REGISTRY_FIELD_SHARED_PROJECT_ID,
+    REGISTRY_FIELD_SHARED_SERVED_COUNT,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_TOKEN_REF,
 )
@@ -65,9 +68,11 @@ from src.services.sandbox.base import (
     SandboxGoneError,
     SandboxHandle,
     SandboxNotReadyError,
+    ServedCount,
     ServedPage,
     base_path_for,
     sandbox_tags,
+    shared_sandbox_tags,
 )
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import get_storage, snapshot_key
@@ -544,6 +549,32 @@ class AcaSandboxClient(SandboxClient):
         except (KeyError, TypeError, ValueError):  # fmt: skip  # ruff py314 strips parens
             return CompileReport(state=CompileState.UNKNOWN, reason="malformed_body")
 
+    async def served_count(self, handle: SandboxHandle) -> ServedCount | None:
+        """Ask the supervisor how many requests the app has served — `GET /_sup/served`.
+
+        NEVER RAISES, same posture as `compile_state`: a transport failure, a pre-`/served`
+        supervisor image, or a malformed body all mean the same thing to the caller — this
+        probe could not answer — and `None` is that answer. Returning a zeroed `ServedCount` on
+        a failure would read as "confirmed no new traffic" and let the reclamation sweep reap a
+        container it simply could not reach, which is the one direction this signal must never
+        be wrong in. `truncated` defaults to `True` on a malformed body for the identical
+        fail-closed reason — an unparseable `truncated` field must not silently read as "this
+        count is a trustworthy total" (`ServedCount`'s own docstring says what `truncated`
+        actually governs)."""
+        try:
+            resp = await self._get(handle, "served", timeout=_OP_TIMEOUT_SECONDS)
+        except SandboxError:
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            body = resp.json()
+            return ServedCount(
+                count=int(body["served"]), truncated=bool(body.get("truncated", True))
+            )
+        except KeyError, TypeError, ValueError:
+            return None
+
     async def what_is_it_serving(self, handle: SandboxHandle) -> ServedPage | None:
         """The app's public root: status plus a bounded head of the body.
 
@@ -649,7 +680,14 @@ class AcaSandboxClient(SandboxClient):
     # --- registry helpers (frozen key builders — never a hand-typed key) --
 
     async def _write_registry(
-        self, user_uuid: uuid.UUID, *, app_name: str, fqdn: str, token_ref: str
+        self,
+        user_uuid: uuid.UUID,
+        *,
+        app_name: str,
+        fqdn: str,
+        token_ref: str,
+        shared_project_id: uuid.UUID | None = None,
+        shared_owner_id: uuid.UUID | None = None,
     ) -> None:
         """Hydrate the registry hash for a JUST-CREATED container.
 
@@ -664,7 +702,14 @@ class AcaSandboxClient(SandboxClient):
         `serving_since` is seeded with the empty sentinel, and only an observer that watched
         this app answer a request may replace it (`build_sessions/locks.py::mark_serving`).
         The platform used to treat this instant as "the app is running"; that is the defect
-        the field exists to end."""
+        the field exists to end.
+
+        `shared_project_id`/`shared_owner_id` (#198) are the SAME disown story as
+        `preview_stay_until`, and for the identical reason: this slot can hold either the
+        user's own build sandbox or a colleague's shared view, and a stamp left behind by
+        one must never be inherited by the other. `shared_project_id is None` means "this is
+        an ordinary build sandbox" and both fields are `hdel`-ed; passing one without the
+        other is a caller error (`launch_shared_preview` always supplies both together)."""
         key = registry_key(user_uuid)
         await get_redis().hset(
             key,
@@ -688,7 +733,32 @@ class AcaSandboxClient(SandboxClient):
                 REGISTRY_FIELD_SERVING_SINCE: "",
             },
         )
-        await get_redis().hdel(key, REGISTRY_FIELD_PREVIEW_STAY_UNTIL)
+        # A SEPARATE `hset`, not folded into the mapping above, purely so each stays a plain
+        # dict literal passed straight to its call — the shape every other field on this hash
+        # already relies on for its typing. `hset(mapping=...)` is still one MERGE either way.
+        if shared_project_id is not None:
+            await get_redis().hset(
+                key,
+                mapping={
+                    REGISTRY_FIELD_SHARED_PROJECT_ID: str(shared_project_id),
+                    REGISTRY_FIELD_SHARED_OWNER_ID: str(shared_owner_id),
+                },
+            )
+        # `shared_served_count` DISOWNED UNCONDITIONALLY, on EVERY fresh container — unlike
+        # `shared_project_id`/`shared_owner_id` below, which only need clearing when THIS arm is
+        # an ordinary build sandbox. A high-water mark left behind survives into whatever comes
+        # next in this slot, whether that is a build sandbox or a REPLACEMENT shared view: the
+        # new container's first `/served` reading then compares against the OLD occupant's
+        # total, `count <= last_seen` reads as "no new traffic" immediately, and the sweep's
+        # `APP_SERVED_TRAFFIC` renewal (`reaper.py::_renew_shared_view_from_traffic`) never
+        # fires for it at all.
+        await get_redis().hdel(
+            key, REGISTRY_FIELD_PREVIEW_STAY_UNTIL, REGISTRY_FIELD_SHARED_SERVED_COUNT
+        )
+        if shared_project_id is None:
+            await get_redis().hdel(
+                key, REGISTRY_FIELD_SHARED_PROJECT_ID, REGISTRY_FIELD_SHARED_OWNER_ID
+            )
         # Deferred import — see the cycle note at the top of this module.
         from src.services.build_sessions.alarms import SANDBOX_REGISTRY_MARKED_PENDING_EVENT
 
@@ -892,7 +962,15 @@ class AcaSandboxClient(SandboxClient):
         raise SandboxError("ACA container provisioning failed") from last
 
     async def _provision_container(
-        self, user_uuid: uuid.UUID, app_name: str, app_env: dict[str, str], *, arm: _BirthArm
+        self,
+        user_uuid: uuid.UUID,
+        app_name: str,
+        app_env: dict[str, str],
+        *,
+        arm: _BirthArm,
+        kind: Literal["build_sandbox", "shared_sandbox"] = "build_sandbox",
+        shared_project_id: uuid.UUID | None = None,
+        shared_owner_id: uuid.UUID | None = None,
     ) -> SandboxHandle:
         """Create the container, write the registry hash at container-create (before
         any fallible post-create step, so a mid-provision death is reaper-visible), and
@@ -900,7 +978,13 @@ class AcaSandboxClient(SandboxClient):
 
         `arm` names WHICH birth this is, for the create notice. It is a `Literal` and not a
         bare `str` so a second spelling of either value is a type error rather than a field
-        that quietly stops matching in the log — the same discipline the event names get."""
+        that quietly stops matching in the log — the same discipline the event names get.
+
+        `kind` (#198) selects which ARM identity gets stamped — see
+        `SandboxClient.restore_from_snapshot`'s own docstring for why `user_uuid` means the
+        RECIPIENT, not the app's owner, on the `shared_sandbox` arm. `shared_project_id`/
+        `shared_owner_id` are the registry-hash half of that same distinction — see
+        `_write_registry`'s own docstring — and are only ever non-`None` on that arm."""
         token = secrets.token_urlsafe(_SUPERVISOR_TOKEN_BYTES)
         # The supervisor bearer lives ONLY in the container env (the supervisor keeps it out of
         # the scrubbed child env) and in-process; Redis stores a token_ref, never the token.
@@ -923,13 +1007,23 @@ class AcaSandboxClient(SandboxClient):
         # frozen client signature carries no app_id. A `KeyError` here means the env builder
         # upstream is broken, which is worth failing loudly on rather than provisioning an
         # anonymous container to paper over.
-        tags = sandbox_tags(user_id=user_uuid, app_id=uuid.UUID(app_env["BIAL_APP_ID"]))
+        app_id = uuid.UUID(app_env["BIAL_APP_ID"])
+        tags = (
+            shared_sandbox_tags(recipient_id=user_uuid, app_id=app_id)
+            if kind == "shared_sandbox"
+            else sandbox_tags(user_id=user_uuid, app_id=app_id)
+        )
         fqdn = await self._create_with_retry(app_name, env, tags, arm=arm)
         token_ref = self._register_token(token)
         self._app_owners[app_name] = user_uuid
         try:
             await self._write_registry(
-                user_uuid, app_name=app_name, fqdn=fqdn, token_ref=token_ref
+                user_uuid,
+                app_name=app_name,
+                fqdn=fqdn,
+                token_ref=token_ref,
+                shared_project_id=shared_project_id,
+                shared_owner_id=shared_owner_id,
             )
         except Exception:
             await self._safe_teardown(app_name)
@@ -1064,6 +1158,9 @@ class AcaSandboxClient(SandboxClient):
         *,
         app_env: dict[str, str],
         source_key: str | None = None,
+        kind: Literal["build_sandbox", "shared_sandbox"] = "build_sandbox",
+        shared_project_id: uuid.UUID | None = None,
+        shared_owner_id: uuid.UUID | None = None,
     ) -> SandboxHandle:
         user_uuid = uuid.UUID(user_id)
         # The caller supplies the app_id via app_env (the frozen client signature carries no
@@ -1108,7 +1205,13 @@ class AcaSandboxClient(SandboxClient):
                     "provisioning over it would orphan it"
                 )
         handle = await self._provision_container(
-            user_uuid, app_name, app_env, arm="restore_from_snapshot"
+            user_uuid,
+            app_name,
+            app_env,
+            arm="restore_from_snapshot",
+            kind=kind,
+            shared_project_id=shared_project_id,
+            shared_owner_id=shared_owner_id,
         )
         try:
             await self._restore_snapshot_into(handle, bundle)

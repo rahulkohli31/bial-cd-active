@@ -37,11 +37,13 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.app_registry import AppRegistry
+from src.db.models.project_share import ProjectShare
 from src.services.build_sessions.locks import read_registry
 from src.services.redis import registry_scan_patterns
 from src.services.redis.keys import REGISTRY_FIELD_APP_NAME
 from src.services.sandbox.base import (
     KIND_BUILD_SANDBOX,
+    KIND_SHARED_SANDBOX,
     TAG_APP_ID,
     TAG_BACKFILLED_AT,
     TAG_CONTROL_PLANE,
@@ -183,22 +185,63 @@ class TagBackfillReport:
     unowned: int
 
 
-async def _app_names_to_owners(db: AsyncSession) -> dict[str, tuple[uuid.UUID, uuid.UUID]]:
-    """Map every app's DERIVED sandbox name back to `(app_id, user_id)`.
+@dataclass(frozen=True)
+class _KnownContainer:
+    """One name this platform could have produced, and what a backfill should stamp it as.
 
-    FORWARD-MATCHED, never reverse-parsed: `app_name_for` produces `sbx-` + 28 of the app_id's 32
-    hex chars, so deriving each known app's name and comparing is exact, while parsing an owner out
-    of a name is a guess that could promote an unproven container into the destroy-eligible tiers.
-    FLEET-WIDE ON PURPOSE — the one query here NOT scoped by `user_id`, because the question is
-    "does ANY user own this"; it reads two identifier columns, no user data, superadmin-only.
-    `app_name_for` is imported in-function to keep `manager`'s heavy imports out of the worker."""
-    from src.services.build_sessions.manager import app_name_for
+    `user_id` means whatever `TAG_USER_ID` means for `kind` — the OWNER for a build sandbox,
+    the RECIPIENT for a shared view (`shared_sandbox_tags`' own rule, restated here rather than
+    left implicit in a bare tuple, which is exactly what let this dict go a whole feature
+    without a `shr-` entry: nothing about `tuple[UUID, UUID]` said which fleet a name belonged
+    to, so nobody who used it needed to answer that question)."""
+
+    app_id: uuid.UUID
+    user_id: uuid.UUID
+    kind: str
+
+
+async def _app_names_to_owners(db: AsyncSession) -> dict[str, _KnownContainer]:
+    """Map every name this platform could have PRODUCED back to who it belongs to — both fleets
+    this one Redis-per-user slot can ever hold (#198): a build sandbox (`sbx-`, keyed by its
+    owner) and a colleague's shared view (`shr-`, keyed by the RECIPIENT — same rule
+    `shared_sandbox_tags` follows, since a `shr-` container's per-slot occupancy and revocable
+    access are the recipient's, not the project owner's).
+
+    FORWARD-MATCHED, never reverse-parsed, on both arms: `app_name_for`/`shr_name_for` each keep
+    only 28 of 32 hex characters, so deriving every known name and comparing is exact, while
+    parsing an owner out of either is a guess that could promote an unproven container into the
+    destroy-eligible tiers. FLEET-WIDE ON PURPOSE — neither query here is scoped by `user_id`,
+    because the question is "does ANY user (or ANY share) own this"; between them they read two
+    identifier columns plus one junction row, no user data, superadmin-only. `app_name_for`/
+    `shr_name_for` are imported in-function to keep `manager`'s heavy imports out of the worker.
+
+    A project shared with several colleagues produces one `shr-` entry per recipient, all keyed
+    off the SAME app id — a fan-out `_owning_app_ids` (this function's one non-reclaim consumer)
+    already tolerates, since it only ever reads the app id back out, never the name."""
+    from src.services.build_sessions.manager import app_name_for, shr_name_for
 
     rows = (await db.execute(sa.select(AppRegistry.id, AppRegistry.user_id))).all()
-    return {app_name_for(app_id): (app_id, user_id) for app_id, user_id in rows}
+    known: dict[str, _KnownContainer] = {
+        app_name_for(app_id): _KnownContainer(
+            app_id=app_id, user_id=user_id, kind=KIND_BUILD_SANDBOX
+        )
+        for app_id, user_id in rows
+    }
+    share_rows = (
+        await db.execute(
+            sa.select(AppRegistry.id, ProjectShare.shared_with_user_id).join(
+                ProjectShare, ProjectShare.project_id == AppRegistry.project_id
+            )
+        )
+    ).all()
+    for app_id, recipient_id in share_rows:
+        known[shr_name_for(app_id, recipient_id)] = _KnownContainer(
+            app_id=app_id, user_id=recipient_id, kind=KIND_SHARED_SANDBOX
+        )
+    return known
 
 
-def _backfill_tags(owner: tuple[uuid.UUID, uuid.UUID] | None) -> dict[str, str]:
+def _backfill_tags(owner: _KnownContainer | None) -> dict[str, str]:
     """The tags to merge onto one pre-existing container.
 
     Two shapes, the difference being the escalate-never-destroy invariant made concrete. Owner
@@ -206,15 +249,20 @@ def _backfill_tags(owner: tuple[uuid.UUID, uuid.UUID] | None) -> dict[str, str]:
     is synthetic. No matching app row: `kind` and `backfilled_at` and NOTHING ELSE —
     escalate-forever by construction, reported every pass and destroyed by none. Filling in a
     plausible owner is the one change that would silently make it destroy-eligible.
-    """
+
+    UNMATCHED STAMPS `KIND_BUILD_SANDBOX`, NEVER `KIND_SHARED_SANDBOX` — a container this pass
+    cannot name is, definitionally, not one `_app_names_to_owners` could resolve to either fleet,
+    so the unmatched arm has no real "which kind" answer to give. `KIND_BUILD_SANDBOX` is the
+    reclaimer's only DESTROY-eligible kind, which is what makes it the correct default here: an
+    unowned container this platform cannot explain is exactly the population idle-reclaim exists
+    to collect, and `KIND_SHARED_SANDBOX` would instead escalate it forever on a guess."""
     stamped_at = dt.datetime.now(dt.UTC).isoformat()
     if owner is None:
         return {TAG_KIND: KIND_BUILD_SANDBOX, TAG_BACKFILLED_AT: stamped_at}
-    app_id, user_id = owner
     return {
-        TAG_KIND: KIND_BUILD_SANDBOX,
-        TAG_USER_ID: str(user_id),
-        TAG_APP_ID: str(app_id),
+        TAG_KIND: owner.kind,
+        TAG_USER_ID: str(owner.user_id),
+        TAG_APP_ID: str(owner.app_id),
         TAG_CONTROL_PLANE: control_plane_segment(),
         TAG_CREATED_AT: stamped_at,
         TAG_BACKFILLED_AT: stamped_at,

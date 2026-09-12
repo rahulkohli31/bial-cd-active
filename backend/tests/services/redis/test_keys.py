@@ -190,6 +190,11 @@ def test_registry_fields_are_the_frozen_set() -> None:
             "stay_writer",
             # Temporary: `keys.py` retires this one with the rest of the legacy arm.
             "adopted_from_legacy",
+            # #198 — present ONLY when this slot holds a shared-runtime view, never on an
+            # ordinary build sandbox's record.
+            "shared_project_id",
+            "shared_owner_id",
+            "shared_served_count",
         }
     )
 

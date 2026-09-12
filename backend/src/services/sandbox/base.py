@@ -55,6 +55,16 @@ list_sandbox_app_names` READS it back to tell our containers from the deployed a
 unrelated workloads sharing the resource group. A drift between those two would make the
 orphan reconciler quietly report nothing."""
 
+SHARED_SANDBOX_NAME_PREFIX = "shr-"
+"""The prefix every SHARED-RUNTIME container carries (`manager.shr_name_for`, #198) — a
+colleague's read-only, app-frame-only view of a project shared with them, restored from the
+builder's own saved snapshot. A THIRD lineage beside `sbx-` (the builder's own build sandbox)
+and `pub-` (a published app), never a variant of either: it is neither the builder's live
+workspace nor a citizen's shipped app, and every place that already tells those two apart by
+name (the portal edge's routing regex, the reaper, the fleet reclaimer) has to learn this
+third shape too, or a shared container becomes invisible to exactly the guards that keep the
+other two lineages from leaking money or access."""
+
 
 def base_path_for(app_name: str) -> str:
     """The path a generated app is served under, e.g. `/a/sbx-<28 hex>`.
@@ -83,8 +93,10 @@ def base_path_for(app_name: str) -> str:
 # reclaimed on a misunderstanding.
 
 TAG_KIND: Final = "bial-kind"
-"""What the resource IS. Today only the `sbx-`/`pub-` name prefix says this, which is a convention,
-rather than a record. Reclamation acts on `KIND_BUILD_SANDBOX` and nothing else."""
+"""What the resource IS. Today only the name prefix (`sbx-`/`pub-`/`shr-`) says this, which is a
+convention, rather than a record. Reclamation only ever DESTROYS `KIND_BUILD_SANDBOX` — a
+`KIND_SHARED_SANDBOX` container is recognized and escalated (never silently ignored), but has
+no destroy policy of its own yet (`reclaim.py::_judge_one`)."""
 
 TAG_USER_ID: Final = "bial-user-id"
 """The owning user's UUID, in plaintext. A container must be judgeable without the coordination
@@ -125,6 +137,13 @@ coming back to it must get their sandbox, not a refusal."""
 
 KIND_BUILD_SANDBOX: Final = "build-sandbox"
 KIND_PUBLISHED_APP: Final = "published-app"
+KIND_SHARED_SANDBOX: Final = "shared-sandbox"
+"""A colleague's read-only view of a project shared with them (#198). `TAG_USER_ID` on a
+container of this kind names the RECIPIENT, not the project's owner — the recipient is whose
+per-slot occupancy and whose access (revocable independent of the project) this container's
+lifecycle actually tracks; `TAG_APP_ID` still names the underlying app being viewed, same as
+every other kind. The owner is recoverable from `TAG_APP_ID` via the app row itself, so no
+third identity field is needed here."""
 
 MAX_TAG_VALUE_LENGTH: Final = 256
 """ARM's per-tag-value ceiling. Enforced HERE rather than discovered from an ARM 400 halfway
@@ -292,6 +311,24 @@ def sandbox_tags(*, user_id: uuid.UUID, app_id: uuid.UUID) -> dict[str, str]:
         {
             TAG_KIND: KIND_BUILD_SANDBOX,
             TAG_USER_ID: str(user_id),
+            TAG_APP_ID: str(app_id),
+            TAG_CONTROL_PLANE: control_plane_segment(),
+            TAG_CREATED_AT: _now_iso(),
+        }
+    )
+
+
+def shared_sandbox_tags(*, recipient_id: uuid.UUID, app_id: uuid.UUID) -> dict[str, str]:
+    """The full ARM-tag identity for a SHARED-RUNTIME sandbox, stamped at create (#198).
+
+    Same shape as `sandbox_tags` — every field the escalate-never-destroy rule needs, `
+    TAG_CREATED_AT` included, since this container's own absolute session ceiling (a Slice-3
+    concern) runs off the same age clock every other tier does. `user_id` is the RECIPIENT
+    (see `KIND_SHARED_SANDBOX`'s docstring for why), never the project's owner."""
+    return checked_tags(
+        {
+            TAG_KIND: KIND_SHARED_SANDBOX,
+            TAG_USER_ID: str(recipient_id),
             TAG_APP_ID: str(app_id),
             TAG_CONTROL_PLANE: control_plane_segment(),
             TAG_CREATED_AT: _now_iso(),
@@ -533,6 +570,23 @@ class ServedPage:
 
 
 @dataclass(frozen=True)
+class ServedCount:
+    """What `GET /_sup/served` actually answers — a count that is NOT monotonic, and the flag
+    that says why (#198).
+
+    The supervisor counts matching lines in a bounded TAIL of the access log (roll-limited to
+    1 MiB, read in a 256 KiB window) — `count` is the true total only up to that window's size.
+    Once traffic pushes the log past it, `count` plateaus or drops as older lines age out of the
+    tail, and `truncated=True` is the supervisor's own admission that this reading is a window,
+    not a total. Comparing two `truncated` readings as if they were cumulative is the bug this
+    type exists to make impossible to reintroduce silently — `count` alone answered a caller's
+    question wrong for as long as this shape did not exist to carry the caveat with it."""
+
+    count: int
+    truncated: bool
+
+
+@dataclass(frozen=True)
 class FileResult:
     """Mirrors the supervisor's `POST /files` per-action response. `detail` carries the
     action-specific body (`content` for view, `replacements` for str_replace, …)."""
@@ -638,6 +692,9 @@ class SandboxClient(abc.ABC):
         *,
         app_env: dict[str, str],
         source_key: str | None = None,
+        kind: Literal["build_sandbox", "shared_sandbox"] = "build_sandbox",
+        shared_project_id: uuid.UUID | None = None,
+        shared_owner_id: uuid.UUID | None = None,
     ) -> SandboxHandle:
         """Provision a FRESH container and restore a git-bundle onto its local disk (git ops
         over `/_sup/exec`), then RE-INJECT the app-data credential from `app_env`. Returns a
@@ -646,7 +703,22 @@ class SandboxClient(abc.ABC):
         `source_key` names WHICH bundle to restore, defaulting to the app's saved snapshot.
         It exists so a recovery can pull the crash-recovery copy instead — the only reason that
         copy is written at all. Optional with a default rather than required, because every
-        existing caller means "the saved one" and should keep reading that way."""
+        existing caller means "the saved one" and should keep reading that way.
+
+        `kind` (#198) selects the ARM identity the fresh container is stamped with —
+        `sandbox_tags` (the default, `user_id` as OWNER) or `shared_sandbox_tags` (`user_id` as
+        RECIPIENT). ADDED, not widened from a callback: every existing caller means the default
+        and this keeps meaning it without touching a single call site. `is_a_shared_sandbox_name`
+        already matched this shape before any caller could produce it — a widening kept in step
+        with the guard it feeds, never announced ahead of one.
+
+        `shared_project_id`/`shared_owner_id` (#198) are the registry-hash counterpart of
+        `kind="shared_sandbox"`: written to `REGISTRY_FIELD_SHARED_PROJECT_ID`/
+        `REGISTRY_FIELD_SHARED_OWNER_ID` so a LATER occupancy check (`_occupying_project`'s
+        sibling in `manager.py`) can recognize "this slot holds a colleague's shared view"
+        without reverse-parsing `shr_name_for`'s hash — which, like every other name this
+        platform derives, is forward-match-only. `None` on the `build_sandbox` arm, always;
+        supplying one without the other is a caller error, never a partial stamp."""
         ...
 
     @abc.abstractmethod
@@ -730,4 +802,26 @@ class SandboxClient(abc.ABC):
         never grew.
         Default: `None` (no container to compile for). NON-LOAD-BEARING BY CONSTRUCTION: an
         override must never raise, and no caller may gate a preview frame on its return."""
+        return None
+
+    async def served_count(self, handle: SandboxHandle) -> ServedCount | None:
+        """How many requests the generated app has served, per `GET /_sup/served` — Caddy's own
+        count of real traffic through the app block, EXCLUDING every control-plane probe
+        (`log_skip` on the `/_sup/*` block; see `sandbox/Caddyfile`). #198's shared-runtime
+        viewer has no chat turn and takes no mutating action, so this is the ONLY evidence
+        available that a colleague is still looking at a shared preview — the reclamation sweep
+        reads it to decide whether to renew `DeadlineWriter.APP_SERVED_TRAFFIC`.
+
+        NOT MONOTONIC — see `ServedCount`'s own docstring. The supervisor counts a bounded TAIL
+        of its access log, so `count` plateaus or drops once traffic pushes the log past that
+        window; `truncated=True` is what tells a caller the reading is a window, not a
+        cumulative total, and `reaper.py::_renew_shared_view_from_traffic` treats that flag as
+        proof of ongoing traffic in its own right rather than comparing a saturated number
+        against whatever was seen last.
+
+        DELIBERATELY NOT abstract, same reason as `someone_has_to_go_first`: the pinned-contract
+        test keeps the abstract set frozen, and every build-sandbox caller is unaffected by this
+        default. `None` means "could not ask" — an unreachable container or a pre-`/served`
+        supervisor image — and must not be read as "definitely no new traffic", which would let
+        the sweep reap a container it simply failed to probe."""
         return None

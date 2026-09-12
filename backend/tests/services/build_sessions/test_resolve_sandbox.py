@@ -14,6 +14,7 @@ the tree. THE ORDER OF THE ASSERTIONS IN THIS FILE IS THE ORDER OF THE RISK.
 from __future__ import annotations
 
 import uuid
+from typing import Literal
 
 import pytest
 import redis.asyncio as aioredis
@@ -231,10 +232,25 @@ async def test_the_sentence_arrives_before_the_restore_runs(
     real_restore = client.restore_from_snapshot
 
     async def watched_restore(
-        user_id: str, app_name: str, *, app_env: dict[str, str], source_key: str | None = None
+        user_id: str,
+        app_name: str,
+        *,
+        app_env: dict[str, str],
+        source_key: str | None = None,
+        kind: Literal["build_sandbox", "shared_sandbox"] = "build_sandbox",
+        shared_project_id: uuid.UUID | None = None,
+        shared_owner_id: uuid.UUID | None = None,
     ) -> SandboxHandle:
         order.append("restored")
-        return await real_restore(user_id, app_name, app_env=app_env, source_key=source_key)
+        return await real_restore(
+            user_id,
+            app_name,
+            app_env=app_env,
+            source_key=source_key,
+            kind=kind,
+            shared_project_id=shared_project_id,
+            shared_owner_id=shared_owner_id,
+        )
 
     monkeypatch.setattr(client, "restore_from_snapshot", watched_restore)
 
@@ -333,7 +349,14 @@ async def test_a_restore_that_fails_still_tells_the_citizen(
     client.exec_handler = _answers(None, commits=0, ancestry="")
 
     async def refuse(
-        user_id: str, app_name: str, *, app_env: dict[str, str], source_key: str | None = None
+        user_id: str,
+        app_name: str,
+        *,
+        app_env: dict[str, str],
+        source_key: str | None = None,
+        kind: Literal["build_sandbox", "shared_sandbox"] = "build_sandbox",
+        shared_project_id: uuid.UUID | None = None,
+        shared_owner_id: uuid.UUID | None = None,
     ) -> SandboxHandle:
         raise SandboxError("the restore did not complete")
 

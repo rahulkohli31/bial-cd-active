@@ -20,6 +20,7 @@ from _router import (
     PUB_KEY,
     ROUTER_IMAGE,
     SBX_KEY,
+    SHR_KEY,
     STUB_IMAGE,
     Router,
     _build,
@@ -57,7 +58,7 @@ def stub_apps(images: None, docker_network: str) -> Iterator[None]:
     """
     name = f"stub-{uuid.uuid4().hex[:8]}"
     args = ["docker", "run", "-d", "--name", name, "--network", docker_network]
-    for key in (SBX_KEY, PUB_KEY, OTHER_SBX_KEY):
+    for key in (SBX_KEY, PUB_KEY, OTHER_SBX_KEY, SHR_KEY):
         args += ["--network-alias", f"{key}.{APPS_DOMAIN}"]
     args += [STUB_IMAGE]
     proc = _run(args, timeout=120)

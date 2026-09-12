@@ -38,9 +38,11 @@ const PROJECT: Project = {
   appId: 'a1',
   appStatus: null,
   hasRelaunchableSnapshot: true,
+  hasSavedSnapshot: null,
   isServing: false,
   createdAt: '2026-07-10T00:00:00Z',
   updatedAt: '2026-07-10T00:00:00Z',
+  access: 'owner',
 }
 
 const noop = () => {}

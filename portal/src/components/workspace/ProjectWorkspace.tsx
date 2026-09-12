@@ -25,6 +25,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import WorkspaceRail from './WorkspaceRail'
 import ProjectRenameDialog from '../projects/ProjectRenameDialog'
+import SharePanel from '../projects/SharePanel'
 import { useWorkspaceState } from './useWorkspaceState'
 import type { StartOutcome } from './workspaceState'
 import {
@@ -66,6 +67,11 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   const [step, setStep] = useState<HandoverStep | null>(null)
   const [renaming, setRenaming] = useState(false)
   const startRename = useCallback(() => setRenaming(true), [])
+  // THE SHARE PANEL'S STATE IS HERE FOR THE SAME REASON RENAME'S IS: the control that opens it
+  // lives in the shell's toolbar row, which has no project object, while this surface has the
+  // project id and name the panel needs (#198).
+  const [sharing, setSharing] = useState(false)
+  const startShare = useCallback(() => setSharing(true), [])
 
   const workspace = useWorkspaceState({
     projectId: project.id,
@@ -200,7 +206,7 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
           // Stop, then WAIT FOR THE STOP TO GENUINELY FINISH, then save, then release — the
           // ordering invariant lives in `handOverWorkspace`, and so does the refusal to proceed
           // on a stop that only timed out.
-          await handOverWorkspace(reclaim.blocked.projectId, save, {}, setStep)
+          await handOverWorkspace(reclaim.blocked, save, {}, setStep)
           // The retry is AWAITED BEFORE the dialog is dismissed, so a switch that fails can still
           // be reported instead of vanishing with the dialog. It is the whole of what was refused:
           // starting this project's app, and — from the rail — opening the chat with the message
@@ -322,7 +328,7 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   // The toolbar row is where the control lives; this is the producer behind it.
   usePublishSave(
     { dirty: workspace.save?.dirty ?? null, saving, error: saveError },
-    { save: workspace.save ? save : null, rename: startRename },
+    { save: workspace.save ? save : null, rename: startRename, share: startShare },
   )
   usePublishReclaim(request)
   // TWO COLUMNS ARE THE REST STATE of the project screen — not something contingent on a build
@@ -339,6 +345,13 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
           project={project}
           onProjectUpdate={props.onProjectUpdate}
           onClose={() => setRenaming(false)}
+        />
+      )}
+      {sharing && (
+        <SharePanel
+          projectId={project.id}
+          projectName={project.name}
+          onClose={() => setSharing(false)}
         />
       )}
     </>

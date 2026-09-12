@@ -40,11 +40,14 @@ import {
   type Project,
   type ProjectCounts,
 } from '../utils/projectApi'
+import { listSharedWithMe, type SharedProject, type SharedProjectsPage } from '../utils/sharingApi'
 import { ApiError } from '../utils/apiError'
 import ProjectCard from '../components/projects/ProjectCard'
 import ProjectRow from '../components/projects/ProjectRow'
+import SharedProjectCard from '../components/projects/SharedProjectCard'
 import ProjectCreateModal from '../components/projects/ProjectCreateModal'
 import ProjectDeleteDialog from '../components/projects/ProjectDeleteDialog'
+import { useKeysetList } from '../hooks/useKeysetList'
 import { Input } from '../components/ui/input'
 import { Skeleton } from '../components/ui/skeleton'
 import { ToggleGroup, ToggleGroupItem } from '../components/ui/toggle-group'
@@ -174,6 +177,11 @@ export default function ProjectsPage(): React.JSX.Element {
 
   const [view, setView] = useState<View>(() => readStored(VIEW_KEY, ['list', 'grid'] as const, 'list'))
   const [density, setDensity] = useState<Density>(() => readStored(DENSITY_KEY, ['S', 'M', 'L'] as const, 'M'))
+  // NOT PERSISTED, NOT IN THE URL — unlike `view`/`density` (a habit) and `page`/`q` (a place
+  // in a list this page is the only way back to), which tab is open is neither: a shared link
+  // to this page is about the citizen's OWN projects either way, and there is nothing here a
+  // colleague would paste around expecting it to land on someone else's "shared with me".
+  const [tab, setTab] = useState<'mine' | 'shared'>('mine')
 
   // COMMITTED query state — WHAT WAS ASKED FOR, and it lives in the address bar.
   //
@@ -371,6 +379,31 @@ export default function ProjectsPage(): React.JSX.Element {
   }
 
   const openProject = (id: string): void => navigate(`/projects/${id}`)
+  const openSharedProject = (id: string): void => navigate(`/shared/${id}`)
+
+  // "Shared with me" — keyset-paginated, unlike the offset-paginated "mine" list above, because
+  // `GET /v1/projects/shared` writes into a list every SHARER adds to rather than one this
+  // reader's own total governs; `useKeysetList` never touches `q` here (no search over this
+  // list exists yet), only `items`/`loading`/`error`/`hasMore`/`loadMore`.
+  const shared = useKeysetList<SharedProject, SharedProjectsPage>({
+    fetchPage: ({ cursor, limit }) => listSharedWithMe({ cursor, limit }),
+  })
+  // FETCHED ONCE, ON FIRST VISIT TO THE TAB — `lastPage === null` is "no page has landed yet",
+  // which `loadMore` itself then flips, so this does not re-fire on every render the tab stays
+  // open, and switching back from "mine" and forth does not repeat the request. `error === null`
+  // is what stops a failed first load from retrying itself every render: `loading` flips back to
+  // `false` on failure too, and without this guard that flip alone would re-satisfy the other two
+  // conditions and fire `loadMore` again, forever, against a server that just refused it. A failed
+  // load waits for the Retry button below instead.
+  useEffect(() => {
+    if (tab === 'shared' && shared.lastPage === null && shared.error === null && !shared.loading) {
+      shared.loadMore()
+    }
+    // `shared` is a fresh object every render (`useKeysetList` returns a new literal each call);
+    // depending on it whole would re-run this on every render the tab stays open. The four
+    // properties actually read above are what should gate the effect, and are exactly what's listed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, shared.lastPage, shared.error, shared.loading, shared.loadMore])
 
   const handleCreated = (project: Project): void => {
     setShowCreate(false)
@@ -498,6 +531,101 @@ export default function ProjectsPage(): React.JSX.Element {
           Each project is one tool — its app, its description, and its chats.
         </p>
 
+        {/* "Shared with me" (#198) is a second list, not a filter on this one — a colleague's
+            project has no page/size/search state of its own to fold into `Committed`, and
+            "mine" keeps every line below untouched by adding a sibling arm instead. */}
+        <ToggleGroup
+          type="single"
+          value={tab}
+          onValueChange={(v) => v && setTab(v as 'mine' | 'shared')}
+          aria-label="Project list"
+          className="mt-4"
+        >
+          <ToggleGroupItem value="mine" className={ACTIVE.trim()}>
+            My projects
+          </ToggleGroupItem>
+          <ToggleGroupItem value="shared" className={ACTIVE.trim()}>
+            Shared with me
+          </ToggleGroupItem>
+        </ToggleGroup>
+
+        {tab === 'shared' ? (
+          <div className="mt-6">
+            {shared.error !== null && shared.items.length === 0 ? (
+              <div
+                data-testid="shared-error"
+                className="bg-white border border-danger/30 rounded-2xl py-16 px-6 text-center"
+              >
+                <AlertTriangle size={22} className="mx-auto text-danger mb-3" />
+                <p className="text-sm font-semibold text-tertiary">Couldn’t load projects shared with you</p>
+                <p className="text-xs text-neutral mt-1 mb-3">The server did not answer. Nothing has been lost.</p>
+                <button onClick={() => shared.refresh()} className="text-xs text-primary font-semibold hover:underline">
+                  Retry
+                </button>
+              </div>
+            ) : shared.lastPage === null ? (
+              <div className={`grid gap-4 ${DENSITY_COLS[density]}`} aria-busy="true">
+                {[0, 1, 2].map((i) => (
+                  <div key={i} className="bg-white border border-bial-border rounded-2xl px-5 py-4">
+                    <Skeleton className="h-4 w-1/2 mb-3" />
+                    <Skeleton className="h-3 w-3/4 mb-2" />
+                    <Skeleton className="h-3 w-1/4" />
+                  </div>
+                ))}
+              </div>
+            ) : shared.items.length === 0 ? (
+              // The plain, message-only empty state `showNoMatches` uses — never `showFirstRun`'s,
+              // which offers "New project": requirement 13 forbids inviting a recipient to create
+              // one from a list that is entirely about what colleagues have shared with them.
+              <div
+                data-testid="shared-empty"
+                className="bg-white border border-bial-border rounded-2xl py-16 px-6 text-center"
+              >
+                <p className="text-sm font-semibold text-tertiary">Nothing shared with you yet</p>
+                <p className="text-xs text-neutral mt-1">
+                  When a colleague shares a project with you, it will show up here.
+                </p>
+              </div>
+            ) : (
+              <>
+                <div className={`grid gap-4 ${DENSITY_COLS[density]}`}>
+                  {shared.items.map((project) => (
+                    <SharedProjectCard
+                      key={project.projectId}
+                      project={project}
+                      onOpen={() => openSharedProject(project.projectId)}
+                    />
+                  ))}
+                </div>
+                {shared.error !== null && (
+                  <p role="alert" className="text-xs text-danger text-center mt-4">
+                    Couldn’t load more.{' '}
+                    <button
+                      type="button"
+                      onClick={() => shared.refresh()}
+                      className="font-semibold text-primary hover:underline"
+                    >
+                      Retry
+                    </button>
+                  </p>
+                )}
+                {shared.hasMore && shared.error === null && (
+                  <div className="flex justify-center mt-5">
+                    <button
+                      type="button"
+                      onClick={() => shared.loadMore()}
+                      aria-disabled={shared.loading}
+                      className="text-xs font-semibold text-primary hover:underline disabled:opacity-50"
+                    >
+                      {shared.loading ? 'Loading…' : 'Load more'}
+                    </button>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        ) : (
+        <>
         {/* THE PAGE'S ONE POLITE REGION — permanently mounted, empty when nothing is in flight.
             The skeletons below are the only thing this page used to say while it
             loaded, and `index.css` suppresses `.animate-pulse` for a citizen who asks for less
@@ -886,6 +1014,8 @@ export default function ProjectsPage(): React.JSX.Element {
               </div>
             </div>
           </>
+        )}
+        </>
         )}
       </main>
 

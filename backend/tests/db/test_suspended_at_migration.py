@@ -51,7 +51,8 @@ def test_chain_ends_at_a_single_linear_head() -> None:
     # past 0038_app_previous_status to 0039_drop_current_code (#191 deleted Generate Description,
     # current_code's one remaining reader, so the column followed it), then to
     # 0040_description_embedding (#191 slice 3 — the semantic-search vector column; shortened
-    # from 0040_project_description_embedding, which overran alembic_version's VARCHAR(32)).
+    # from 0040_project_description_embedding, which overran alembic_version's VARCHAR(32)),
+    # then to 0041_project_shares (#198 slice 1 — the platform's first junction table).
     # 0034 had already been re-parented
     # TWICE by this assertion: authored as an 0029 off 0028_deployment_unpublished_at, moved
     # to 0033 off 0032_rejection_standing on one rebase, and to 0034 off 0033_harness_counters
@@ -65,4 +66,4 @@ def test_chain_ends_at_a_single_linear_head() -> None:
     # `down_revision` really is the head you expected to build on.
     config = Config(str(_BACKEND_ROOT / "alembic.ini"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0040_description_embedding"]
+    assert heads == ["0041_project_shares"]

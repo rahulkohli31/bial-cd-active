@@ -45,6 +45,15 @@ export interface Project {
    */
   hasRelaunchableSnapshot: boolean | null
   /**
+   * Whether the OWNER has ever saved a version — narrower than `hasRelaunchableSnapshot`,
+   * which also counts an autosave/recovery copy (#198). The restricted shared workspace
+   * restores ONLY from the saved bundle, never a recovery copy, so this is the one field it
+   * can trust to decide whether Launch would actually work. `null` for an owner's own view
+   * (irrelevant there) and for a shared view with no app at all; `false` means Launch should
+   * be shown disabled, with the reason, rather than attempted into a known failure.
+   */
+  hasSavedSnapshot: boolean | null
+  /**
    * Is the app SERVING right now? Not derivable from `appStatus`: APPROVED means an
    * administrator said yes, but one-click deploy never writes `status`, so a live app can
    * stay `draft`. Server-computed from deployment history; `false` for no app.
@@ -55,6 +64,14 @@ export interface Project {
   isServing: boolean
   createdAt: string
   updatedAt: string
+  /**
+   * Whether the caller owns this project or is viewing it because a colleague shared it with
+   * them (#198). `'owner'` for every project fetched before this field existed — the historic
+   * contract, and the only reading that keeps every existing owner-oriented screen unchanged
+   * for a caller who is, in fact, the owner. `ProjectPage` reads this to route a shared
+   * viewer to the restricted workspace instead of the full build/save/publish one.
+   */
+  access: 'owner' | 'shared'
 }
 
 /**
@@ -137,6 +154,13 @@ function asAppStatus(value: unknown): AppStatus | null {
     : null
 }
 
+/** Anything but the literal `'shared'` reads as `'owner'` — the historic contract for every
+ *  server response that predates this field, and the fail-safe direction: a caller must
+ *  never be shown fewer build/save/publish controls than they actually own. */
+function asAccess(value: unknown): 'owner' | 'shared' {
+  return value === 'shared' ? 'shared' : 'owner'
+}
+
 /**
  * Narrow one untrusted `ProjectResponse` into the typed `Project` shape.
  *
@@ -158,11 +182,13 @@ function toProject(value: unknown): Project {
     // Anything that is not a literal boolean — absent, null, or a shape we do not recognize —
     // is the "cannot say" answer. That is the fail-safe direction: it withholds the claim.
     hasRelaunchableSnapshot: typeof value.hasRelaunchableSnapshot === 'boolean' ? value.hasRelaunchableSnapshot : null,
+    hasSavedSnapshot: typeof value.hasSavedSnapshot === 'boolean' ? value.hasSavedSnapshot : null,
     // Absent or non-boolean means NOT live: the badge claims something, so an unknown
     // must never render as a claim.
     isServing: value.isServing === true,
     createdAt: asString(value.createdAt),
     updatedAt: asString(value.updatedAt),
+    access: asAccess(value.access),
   }
 }
 

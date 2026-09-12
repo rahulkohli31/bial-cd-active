@@ -121,7 +121,14 @@ describe('★ the take-back never starts a turn', () => {
       fireEvent.click(takeBackButton())
       fireEvent.click(await screen.findByRole('button', { name: button }))
 
-      await waitFor(() => expect(h.handOverWorkspace).toHaveBeenCalledWith('pA', name === 'saving first', {}, expect.any(Function)))
+      await waitFor(() =>
+        expect(h.handOverWorkspace).toHaveBeenCalledWith(
+          expect.objectContaining({ projectId: 'pA' }),
+          name === 'saving first',
+          {},
+          expect.any(Function),
+        ),
+      )
       // LIVENESS, paired with the absence below: the app really did come up, so a zero turn count
       // is a take-back that worked without a turn rather than a press that did nothing at all.
       await waitFor(() => expect(h.relaunchPreview).toHaveBeenCalledTimes(2))

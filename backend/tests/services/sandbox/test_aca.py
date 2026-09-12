@@ -151,6 +151,67 @@ async def test_a_provisioned_sandbox_is_judgeable_without_redis(
     assert identity.was_backfilled is False
 
 
+async def test_a_shared_restore_is_stamped_with_the_recipient_not_the_owner(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """#198: `kind="shared_sandbox"` on a restore is what makes a `shr-` container judgeable
+    by the reclaimer's `KIND_SHARED_SANDBOX` branch instead of being silently mis-tagged as an
+    ordinary build sandbox — which every OTHER restore call defaults to (`RECIPIENT` here is
+    deliberately a DIFFERENT id from `USER`/`APP_ID`'s owner, the same distinction
+    `KIND_SHARED_SANDBOX`'s own docstring in `sandbox/base.py` draws)."""
+    from src.services.sandbox.base import KIND_SHARED_SANDBOX
+
+    recipient = uuid.uuid4()
+    aca = FakeAca()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/files":
+            return httpx.Response(200, json={"ok": True, "created": "app.bundle.b64"})
+        if request.url.path == "/_sup/exec":
+            return httpx.Response(200, json={"stdout": "", "stderr": "", "exit": 0})
+        return httpx.Response(404)
+
+    client = _client(aca, handler)
+    await fake_storage.put(snapshot_key(APP_ID), a_git_bundle())
+    shared_name = "shr-abc123"
+    await client.restore_from_snapshot(
+        str(recipient), shared_name, app_env=_app_env(), kind="shared_sandbox"
+    )
+
+    identity = identity_from_tags(aca.tags[shared_name])
+    assert identity.kind == KIND_SHARED_SANDBOX
+    assert identity.user_id == recipient  # the RECIPIENT, never APP_ID's owner (USER)
+    assert identity.user_id != USER
+    assert identity.app_id == APP_ID  # the underlying app is still recoverable
+    await client.aclose()
+
+
+async def test_an_ordinary_restore_still_defaults_to_a_build_sandbox(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """Regression guard for the signature widening: every call site that predates `kind`
+    must keep stamping exactly what it always stamped."""
+    from src.services.sandbox.base import KIND_BUILD_SANDBOX
+
+    aca = FakeAca()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/files":
+            return httpx.Response(200, json={"ok": True, "created": "app.bundle.b64"})
+        if request.url.path == "/_sup/exec":
+            return httpx.Response(200, json={"stdout": "", "stderr": "", "exit": 0})
+        return httpx.Response(404)
+
+    client = _client(aca, handler)
+    await fake_storage.put(snapshot_key(APP_ID), a_git_bundle())
+    await client.restore_from_snapshot(str(USER), APP_NAME, app_env=_app_env())
+
+    identity = identity_from_tags(aca.tags[APP_NAME])
+    assert identity.kind == KIND_BUILD_SANDBOX
+    assert identity.user_id == USER
+    await client.aclose()
+
+
 async def test_provision_new_writes_registry_and_injects_env(fake_redis: aioredis.Redis) -> None:
     aca = FakeAca()
     client = _client(aca)

@@ -9,6 +9,7 @@ const BLOCKED = {
   projectName: 'Lost & Found',
   dirty: true as boolean | null,
   building: false, agentWorking: false,
+  isSharedView: false,
 }
 /** The refusal a project whose agent is mid-write produces: `building`, and `dirty` null
  *  because the server deliberately did not probe a tree being written to. */

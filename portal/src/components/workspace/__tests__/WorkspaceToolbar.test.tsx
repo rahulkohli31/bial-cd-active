@@ -96,7 +96,7 @@ function Surface({
   heading,
   appUrl = APP_URL,
   save = { dirty: null, saving: false, error: null },
-  actions = { save: null, rename: null },
+  actions = { save: null, rename: null, share: null },
   paneVisible = true,
 }: SurfaceProps) {
   useWorkspaceProject(heading.projectId)
@@ -401,7 +401,11 @@ describe('the app-scoped controls appear only when there is an app to point at',
 
 describe('the Save control', () => {
   const withSave = (save: Omit<SaveSlot, 'canSave'>, onSave: (() => void) | null = null) =>
-    render(<Workspace project={{ heading: PROJECT_HEADING, save, actions: { save: onSave, rename: null } }} />)
+    render(
+      <Workspace
+        project={{ heading: PROJECT_HEADING, save, actions: { save: onSave, rename: null, share: null } }}
+      />,
+    )
 
   it('★ UNKNOWN hides the control rather than claiming the work is saved', () => {
     // THE POINT, carried over verbatim from the control's old home. `null` is not `false`. A chip
@@ -535,7 +539,7 @@ describe('the Save control', () => {
         project={{
           heading: PROJECT_HEADING,
           save: { dirty: true, saving: true, error: null },
-          actions: { save: () => {}, rename: null },
+          actions: { save: () => {}, rename: null, share: null },
         }}
       />,
     )
@@ -603,7 +607,7 @@ describe('the back control and the rename', () => {
 
   it('offers rename on the project screen only, and presses the published action', () => {
     const rename = vi.fn()
-    render(<Workspace project={{ heading: PROJECT_HEADING, actions: { save: null, rename } }} />)
+    render(<Workspace project={{ heading: PROJECT_HEADING, actions: { save: null, rename, share: null } }} />)
     fireEvent.click(screen.getByRole('button', { name: 'Rename project' }))
     expect(rename).toHaveBeenCalledTimes(1)
 
@@ -629,7 +633,7 @@ describe('the back control and the rename', () => {
 
     cleanup()
     const rename = vi.fn()
-    render(<Workspace project={{ heading: PROJECT_HEADING, actions: { save: null, rename } }} />)
+    render(<Workspace project={{ heading: PROJECT_HEADING, actions: { save: null, rename, share: null } }} />)
     fireEvent.click(screen.getByRole('button', { name: 'Rename project' }))
     expect(rename).toHaveBeenCalledTimes(1)
   })
@@ -823,7 +827,7 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
         project={{
           heading: PROJECT_HEADING,
           save: { dirty: true, saving: false, error: null },
-          actions: { save: () => {}, rename: () => {} },
+          actions: { save: () => {}, rename: () => {}, share: null },
         }}
       />,
     )
@@ -959,7 +963,7 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
         chat={{
           heading: { ...CHAT_HEADING, chatTitle: long },
           save: { dirty: true, saving: false, error: null },
-          actions: { save: () => {}, rename: null },
+          actions: { save: () => {}, rename: null, share: null },
         }}
       />,
     )

@@ -15,7 +15,7 @@ import {
   STOP_CEILING_MS,
   STOP_POLL_MS,
 } from '../buildSessionApi'
-import type { SaveState } from '../buildSessionApi'
+import type { ReclaimBlocked, SaveState } from '../buildSessionApi'
 import { ApiError } from '../apiError'
 
 /** A fake `Response`: `json()` is re-callable and `clone()` returns itself, so the
@@ -259,6 +259,7 @@ describe('asReclaimBlocked', () => {
       // ABSENT READS AS FALSE — an older backend with no such field has no agent to report,
       // and defaulting true would tell every citizen their other project is busy.
       agentWorking: false,
+      isSharedView: false,
     })
   })
 
@@ -279,6 +280,22 @@ describe('asReclaimBlocked', () => {
   it('keeps dirty TRI-STATE — a non-boolean is unknown, never clean', () => {
     const err = { code: 'sandbox_reclaim_blocked', details: { projectId: 'p-a', projectName: 'A', dirty: null } }
     expect(asReclaimBlocked(err)?.dirty).toBeNull()
+  })
+
+  it('★ carries `isSharedView` — the client\'s one signal to skip stopActiveBuild/release', () => {
+    // A colleague's shared view names its OWNER in `projectId`/`projectName`, which the
+    // recipient never owns — `stopActiveBuild`/`release` would 404 them on that id.
+    // `isSharedView` is what routes the client to `giveUpSharedView` instead.
+    const err = {
+      code: 'sandbox_reclaim_blocked',
+      details: { projectId: 'owner-p', projectName: 'Owner App', dirty: false, isSharedView: true },
+    }
+    expect(asReclaimBlocked(err)?.isSharedView).toBe(true)
+  })
+
+  it('isSharedView absent reads as false — an older backend never produced a shared occupant', () => {
+    const err = { code: 'sandbox_reclaim_blocked', details: { projectId: 'p-a', projectName: 'A', dirty: false } }
+    expect(asReclaimBlocked(err)?.isSharedView).toBe(false)
   })
 
   it('ignores the OTHER 409 — a running build has no remedy the user can act on', () => {
@@ -329,6 +346,7 @@ describe('asReclaimBlocked', () => {
       dirty: true,
       building: false,
       agentWorking: false,
+      isSharedView: false,
     })
   })
 
@@ -370,6 +388,7 @@ describe('asReclaimBlocked — a project that is still being built', () => {
       dirty: null,
       building: true,
       agentWorking: false,
+      isSharedView: false,
     })
   })
 
@@ -407,6 +426,18 @@ function fastClock() {
 }
 
 describe('handOverWorkspace — the stop → save → release ordering', () => {
+  // An ORDINARY (non-shared) occupant — `handOverWorkspace` now takes the whole
+  // `ReclaimBlocked` rather than a bare project id, so every call below hands it this instead
+  // of the string `'p-1'` it used to pass directly.
+  const BLOCKED_P1: ReclaimBlocked = {
+    projectId: 'p-1',
+    projectName: 'P1',
+    dirty: false,
+    building: false,
+    agentWorking: false,
+    isSharedView: false,
+  }
+
   function recordingFetch(stopState = 'stopped') {
     const seen: string[] = []
     const fetchImpl = vi.fn<FetchImpl>(async (url: string) => {
@@ -422,7 +453,7 @@ describe('handOverWorkspace — the stop → save → release ordering', () => {
 
   it('stops FIRST, then saves, then releases — save and release both refuse while a session is live', async () => {
     const { seen, fetchImpl } = recordingFetch()
-    await handOverWorkspace('p-1', true, { fetchImpl })
+    await handOverWorkspace(BLOCKED_P1, true, { fetchImpl })
     expect(seen).toEqual([
       '/api/build-sessions/projects/p-1/stop-active-build',
       '/api/build-sessions/projects/p-1/save',
@@ -432,7 +463,7 @@ describe('handOverWorkspace — the stop → save → release ordering', () => {
 
   it('SKIPS the save on Leave without saving, and still stops and releases', async () => {
     const { seen, fetchImpl } = recordingFetch()
-    await handOverWorkspace('p-1', false, { fetchImpl })
+    await handOverWorkspace(BLOCKED_P1, false, { fetchImpl })
     expect(seen).toEqual([
       '/api/build-sessions/projects/p-1/stop-active-build',
       '/api/build-sessions/projects/p-1/release',
@@ -446,7 +477,7 @@ describe('handOverWorkspace — the stop → save → release ordering', () => {
       if (url.endsWith('/save')) return res(500, { error: { message: 'disk full' } })
       return res(200, { state: 'stopped' })
     })
-    await expect(handOverWorkspace('p-1', true, { fetchImpl })).rejects.toBeInstanceOf(ApiError)
+    await expect(handOverWorkspace(BLOCKED_P1, true, { fetchImpl })).rejects.toBeInstanceOf(ApiError)
     expect(seen.some((p) => p.endsWith('/release'))).toBe(false)
   })
 
@@ -468,7 +499,7 @@ describe('handOverWorkspace — the stop → save → release ordering', () => {
       return res(200, { released: true })
     })
 
-    await handOverWorkspace('p-1', false, { fetchImpl })
+    await handOverWorkspace(BLOCKED_P1, false, { fetchImpl })
 
     expect(asked).toBe(3)
     // …and the release comes only AFTER the state said so.
@@ -486,7 +517,7 @@ describe('handOverWorkspace — the stop → save → release ordering', () => {
       return res(200, { state: 'still_running' })
     })
 
-    const err = await handOverWorkspace('p-1', false, { fetchImpl }, undefined, fastClock()).catch(
+    const err = await handOverWorkspace(BLOCKED_P1, false, { fetchImpl }, undefined, fastClock()).catch(
       (e: unknown) => e,
     )
 
@@ -498,7 +529,7 @@ describe('handOverWorkspace — the stop → save → release ordering', () => {
 
   it('★ "nothing was running" is a SUCCESS to proceed on, not a miss', async () => {
     const { seen, fetchImpl } = recordingFetch('nothing_was_running')
-    await handOverWorkspace('p-1', false, { fetchImpl })
+    await handOverWorkspace(BLOCKED_P1, false, { fetchImpl })
     expect(seen.some((path) => path.endsWith('/release'))).toBe(true)
     // …and it did not need to poll at all: the ask already answered.
     expect(seen.some((path) => path.endsWith('/stop-state'))).toBe(false)
@@ -510,14 +541,14 @@ describe('handOverWorkspace — the stop → save → release ordering', () => {
       url.endsWith('/release') ? res(200, { released: true }) : res(200, { stopped: true }),
     )
     await expect(
-      handOverWorkspace('p-1', false, { fetchImpl }, undefined, fastClock()),
+      handOverWorkspace(BLOCKED_P1, false, { fetchImpl }, undefined, fastClock()),
     ).rejects.toBeInstanceOf(ApiError)
   })
 
   it('narrates each step, in the order it performs them', async () => {
     const { fetchImpl } = recordingFetch()
     const steps: string[] = []
-    await handOverWorkspace('p-1', true, { fetchImpl }, (step) => steps.push(step))
+    await handOverWorkspace(BLOCKED_P1, true, { fetchImpl }, (step) => steps.push(step))
     expect(steps).toEqual(['stopping', 'saving', 'releasing'])
   })
 
@@ -554,7 +585,7 @@ describe('handOverWorkspace — the stop → save → release ordering', () => {
       return res(200, { state: 'stopped' })
     })
 
-    await handOverWorkspace('p-1', false, { fetchImpl }, undefined, fastClock())
+    await handOverWorkspace(BLOCKED_P1, false, { fetchImpl }, undefined, fastClock())
 
     expect(reads()).toBe(2)
     // …and the hand-over went through on the read that landed.
@@ -577,7 +608,7 @@ describe('handOverWorkspace — the stop → save → release ordering', () => {
         })
       })
 
-      const settled = handOverWorkspace('p-1', false, { fetchImpl }, undefined, fastClock())
+      const settled = handOverWorkspace(BLOCKED_P1, false, { fetchImpl }, undefined, fastClock())
       // Past the per-read deadline, which is a REAL timer rather than the injected clock's.
       await vi.advanceTimersByTimeAsync(20_000)
       await settled
@@ -597,7 +628,7 @@ describe('handOverWorkspace — the stop → save → release ordering', () => {
       res(401, { error: { message: 'Not authenticated' } }),
     )
 
-    const err = await handOverWorkspace('p-1', false, { fetchImpl }, undefined, fastClock()).catch(
+    const err = await handOverWorkspace(BLOCKED_P1, false, { fetchImpl }, undefined, fastClock()).catch(
       (e: unknown) => e,
     )
 
@@ -616,7 +647,7 @@ describe('handOverWorkspace — the stop → save → release ordering', () => {
       attempt === 1 ? res(503, { error: { message: 'unavailable' } }) : res(200, { state: 'stopped' }),
     )
 
-    await handOverWorkspace('p-1', false, { fetchImpl }, undefined, fastClock())
+    await handOverWorkspace(BLOCKED_P1, false, { fetchImpl }, undefined, fastClock())
 
     expect(reads()).toBe(2)
     expect(seen.some((path) => path.endsWith('/release'))).toBe(true)
@@ -628,7 +659,7 @@ describe('handOverWorkspace — the stop → save → release ordering', () => {
     // away as it should. The line must not read as a failure, and must point at the remedy.
     const { fetchImpl, reads } = pollingFetch(async () => res(200, { state: 'still_running' }))
 
-    const err = await handOverWorkspace('p-1', false, { fetchImpl }, undefined, fastClock()).catch(
+    const err = await handOverWorkspace(BLOCKED_P1, false, { fetchImpl }, undefined, fastClock()).catch(
       (e: unknown) => e,
     )
 
@@ -658,8 +689,53 @@ describe('handOverWorkspace — the stop → save → release ordering', () => {
         dirty: true,
       },
     })
-    const err = await handOverWorkspace('p-1', false, { fetchImpl }).catch((e: unknown) => e)
+    const err = await handOverWorkspace(BLOCKED_P1, false, { fetchImpl }).catch((e: unknown) => e)
     expect(asReclaimBlocked(err)?.projectName).toBe('Lost & Found')
+  })
+
+  it('★ a SHARED occupant never touches stopActiveBuild/save/release — it goes through giveUpSharedView instead', async () => {
+    // The regression this pins: `blocked.projectId` on a shared occupant names its OWNER, who
+    // the caller never owns, so `stopActiveBuild`'s `owned_project_or_404` would 404 every one
+    // of the four surfaces that used to call this with `blocked.projectId` alone.
+    const seen: string[] = []
+    const fetchImpl = vi.fn<FetchImpl>(async (url: string) => {
+      seen.push(new URL(url, 'http://x').pathname)
+      return res(200, { released: true })
+    })
+    const sharedBlocked: ReclaimBlocked = {
+      projectId: 'owner-project-id',
+      projectName: 'Owner App',
+      dirty: false,
+      building: false,
+      agentWorking: false,
+      isSharedView: true,
+    }
+
+    await handOverWorkspace(sharedBlocked, false, { fetchImpl })
+
+    expect(seen).toEqual(['/api/build-sessions/shared-view/release'])
+    expect(seen.some((p) => p.includes('owner-project-id'))).toBe(false)
+  })
+
+  it('★ save is accepted but ignored for a shared occupant — there is nothing of theirs to save', async () => {
+    const seen: string[] = []
+    const fetchImpl = vi.fn<FetchImpl>(async (url: string) => {
+      seen.push(new URL(url, 'http://x').pathname)
+      return res(200, { released: true })
+    })
+    const sharedBlocked: ReclaimBlocked = {
+      projectId: 'owner-project-id',
+      projectName: 'Owner App',
+      dirty: false,
+      building: false,
+      agentWorking: false,
+      isSharedView: true,
+    }
+
+    await handOverWorkspace(sharedBlocked, true, { fetchImpl }) // save=true
+
+    expect(seen).toEqual(['/api/build-sessions/shared-view/release'])
+    expect(seen.some((p) => p.endsWith('/save'))).toBe(false)
   })
 })
 

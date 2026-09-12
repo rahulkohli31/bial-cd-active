@@ -133,8 +133,10 @@ const mkProject = (id: string, name: string, over: Partial<Project> = {}): Proje
   isServing: false,
   appStatus: null,
   hasRelaunchableSnapshot: null,
+  hasSavedSnapshot: null,
   createdAt: '2026-07-10T00:00:00Z',
   updatedAt: '2026-07-10T00:00:00Z',
+  access: 'owner',
   ...over,
 })
 

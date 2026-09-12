@@ -31,6 +31,7 @@ import {
   Pencil,
   RotateCcw,
   Save,
+  UserPlus,
 } from 'lucide-react'
 import PublishStatusChip from '../PublishStatusChip'
 import { BusyGlyph, useElapsedSeconds, ELAPSED_AFTER_MS } from '../ui/Waiting'
@@ -236,6 +237,23 @@ export default function WorkspaceToolbar({
           className="inline-flex flex-shrink-0 items-center justify-center rounded-lg p-1 text-neutral transition hover:bg-surface-muted hover:text-primary narrow:min-h-[44px] narrow:min-w-[44px]"
         >
           <Pencil size={13} />
+        </button>
+      )}
+
+      {/* SHARE (#198), the project screen's own control — gated identically to Rename above
+          and for the same reason: it is a fact about THIS project, not about a chat, and the
+          NAME (not the id) is what proves a real project loaded. Placed in the left-hand
+          cluster beside Rename rather than the right-hand action group, since both are
+          "about this project" controls and neither depends on an app existing to serve. */}
+      {!isChat && heading.projectName !== null && (
+        <button
+          type="button"
+          onClick={() => readActions().share?.()}
+          aria-label="Share project"
+          title="Share project"
+          className="inline-flex flex-shrink-0 items-center justify-center rounded-lg p-1 text-neutral transition hover:bg-surface-muted hover:text-primary narrow:min-h-[44px] narrow:min-w-[44px]"
+        >
+          <UserPlus size={13} />
         </button>
       )}
 

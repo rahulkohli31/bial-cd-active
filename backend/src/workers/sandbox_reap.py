@@ -98,4 +98,4 @@ async def _owning_app_ids() -> dict[str, uuid.UUID]:
 
     async with async_session_factory() as db:
         owners = await _app_names_to_owners(db)
-    return {name: app_id for name, (app_id, _user_id) in owners.items()}
+    return {name: known.app_id for name, known in owners.items()}
