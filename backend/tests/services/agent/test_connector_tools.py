@@ -25,7 +25,15 @@ from typing import Any
 
 import pytest
 from pydantic_ai import Agent, ModelRetry, RunContext
-from pydantic_ai.messages import ModelMessage, ModelResponse
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RunUsage
 from structlog.testing import capture_logs
@@ -34,7 +42,9 @@ from src.db.models.conversation import ChatKind
 from src.services.agent.agent import ChatDeps
 from src.services.agent.connector_tools import (
     _CATALOGUE,
+    _UNAVAILABLE,
     CONNECTOR_TOOLSET,
+    MAX_DELIVERIES_PER_CONVERSATION,
     connector_schema,
 )
 from src.services.agent.mode_prompts import PromptContext
@@ -46,12 +56,18 @@ SYSTEM = a_connected_system()
 SHIPPED = (_CATALOGUE / f"{SYSTEM.key}.txt").read_text(encoding="utf-8")
 
 
-def _ctx(*, connected: tuple[Any, ...] | None = (), db: Any = None) -> RunContext[Any]:
+def _ctx(
+    *,
+    connected: tuple[Any, ...] | None = (),
+    db: Any = None,
+    messages: list[ModelMessage] | None = None,
+) -> RunContext[Any]:
     """A run context over the deps shape a real turn builds.
 
     `connected=None` builds the KINDLESS run — `describe.py` composes its own prompt and passes no
     `PromptContext` at all — which is a different absence from "a turn whose project reads
-    nothing", and the tool has to survive both."""
+    nothing", and the tool has to survive both. `messages` is the replayed conversation, which the
+    tool reads as `ctx.messages`."""
     prompt_context = (
         None
         if connected is None
@@ -65,7 +81,12 @@ def _ctx(*, connected: tuple[Any, ...] | None = (), db: Any = None) -> RunContex
         kind=ChatKind.PLAN,
         prompt_context=prompt_context,
     )
-    return RunContext(deps=deps, model=FunctionModel(lambda *_: text_turn("x")), usage=RunUsage())
+    return RunContext(
+        deps=deps,
+        model=FunctionModel(lambda *_: text_turn("x")),
+        usage=RunUsage(),
+        messages=messages or [],
+    )
 
 
 # --------------------------------------------------------------------------------------------
@@ -268,3 +289,121 @@ async def test_the_tool_names_no_connector_in_its_own_source() -> None:
     spelling a system out."""
     source = Path(connector_schema.__code__.co_filename).read_text(encoding="utf-8")
     assert SYSTEM.key not in source.lower().replace("connector_", "")
+
+
+# --------------------------------------------------------------------------------------------
+# The ceiling — the conversation's own history is the state
+# --------------------------------------------------------------------------------------------
+
+
+def _conversation_that_already_holds(*results: str) -> list[ModelMessage]:
+    """A replayed conversation in which each of `results` came back from a `connector_schema`
+    call, shaped the way `load_history` hands it over: a user turn, the call, its return, and the
+    model's answer."""
+    history: list[ModelMessage] = []
+    for n, content in enumerate(results):
+        call_id = f"schema-{n}"
+        history += [
+            ModelRequest(parts=[UserPromptPart(content=f"turn {n}")]),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name=CONNECTOR_SCHEMA_TOOL,
+                        args={"system": SYSTEM.key},
+                        tool_call_id=call_id,
+                    )
+                ]
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name=CONNECTOR_SCHEMA_TOOL, content=content, tool_call_id=call_id
+                    )
+                ]
+            ),
+            ModelResponse(parts=[TextPart(content="noted")]),
+        ]
+    return history
+
+
+async def test_one_earlier_delivery_does_not_trip_the_ceiling() -> None:
+    """The ceiling is two, not one — owner ruling, 2026-09-11. A second full copy is allowed."""
+    history = _conversation_that_already_holds(SHIPPED)
+    answer = await connector_schema(_ctx(connected=(SYSTEM,), messages=history), SYSTEM.key)
+    assert answer == SHIPPED
+
+
+async def test_past_the_ceiling_the_model_is_pointed_back_at_the_copy_it_has() -> None:
+    """★ THE CASE THE CEILING EXISTS FOR. A plain string, not a `ModelRetry` — calling again is the
+    one thing the model should not do — and a WARNING beside it, because a model asking again for
+    something its context already holds twice is the clearest sign that the history this turn
+    replayed did not reach it the way the list says."""
+    history = _conversation_that_already_holds(*[SHIPPED] * MAX_DELIVERIES_PER_CONVERSATION)
+    with capture_logs() as captured:
+        answer = await connector_schema(_ctx(connected=(SYSTEM,), messages=history), SYSTEM.key)
+    assert answer != SHIPPED
+    assert "GENERATED FILE" not in answer
+    assert "already in this conversation" in answer
+    warnings = [e for e in captured if e["event"] == "connector_schema_already_delivered"]
+    assert len(warnings) == 1
+    assert warnings[0]["log_level"] == "warning"
+    assert warnings[0]["deliveries"] == MAX_DELIVERIES_PER_CONVERSATION
+    assert warnings[0]["connector_key"] == SYSTEM.key
+
+
+async def test_a_refusal_is_not_a_delivery() -> None:
+    """Counting `connector_schema` RESULTS rather than deliveries would spend the ceiling on calls
+    that handed over nothing — the unreadable-file answer and the not-switched-on refusal come
+    back under the same tool name."""
+    refusals = [_UNAVAILABLE, f"{SYSTEM.connector.display_name} is not switched on here."] * 3
+    history = _conversation_that_already_holds(*refusals)
+    answer = await connector_schema(_ctx(connected=(SYSTEM,), messages=history), SYSTEM.key)
+    assert answer == SHIPPED
+
+
+@pytest.mark.parametrize(
+    ("earlier", "full_schema_again"),
+    [
+        (0, True),
+        (MAX_DELIVERIES_PER_CONVERSATION - 1, True),
+        (MAX_DELIVERIES_PER_CONVERSATION, False),
+    ],
+)
+async def test_the_ceiling_reads_the_history_a_real_run_replays(
+    earlier: int, full_schema_again: bool
+) -> None:
+    """★ THE MECHANISM, NOT A HAND-BUILT CONTEXT. The ceiling rests on pydantic-ai handing a tool
+    the same history the turn passed in as `message_history` — if that stopped being true the
+    ceiling would silently never fire and every test above would still pass. So the history goes
+    in exactly as the engine passes it, and the answer is read off what the model got back."""
+    received: dict[str, Any] = {}
+
+    def respond(messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        last = messages[-1]
+        returned = (
+            [part for part in last.parts if isinstance(part, ToolReturnPart)]
+            if isinstance(last, ModelRequest)
+            else []
+        )
+        if returned:
+            received["answer"] = returned[0].content
+            return text_turn("done")
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name=CONNECTOR_SCHEMA_TOOL,
+                    args={"system": SYSTEM.key},
+                    tool_call_id="this-turn",
+                )
+            ]
+        )
+
+    agent: Agent[ChatDeps, str] = Agent(deps_type=ChatDeps)
+    await agent.run(
+        "add a column",
+        deps=_ctx(connected=(SYSTEM,)).deps,
+        model=FunctionModel(respond),
+        toolsets=[CONNECTOR_TOOLSET],
+        message_history=_conversation_that_already_holds(*[SHIPPED] * earlier),
+    )
+    assert (received["answer"] == SHIPPED) is full_schema_again

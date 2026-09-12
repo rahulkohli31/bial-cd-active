@@ -42,12 +42,14 @@ actually has on, and only a MATCHED entry's key is used to build a path.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from functools import cache
 from pathlib import Path
 from typing import Any, Final
 
 import structlog
 from pydantic_ai import ModelRetry, RunContext
+from pydantic_ai.messages import ModelMessage, ModelRequest, ToolReturnPart
 from pydantic_ai.toolsets.function import FunctionToolset
 
 from src.core.connectors import ConnectedSystem
@@ -85,6 +87,28 @@ _NO_CONTEXT: Final = (
 Refused rather than raised: a tool that raises on a shape the platform created is a 500 in a
 citizen's turn for something the citizen did not do."""
 
+MAX_DELIVERIES_PER_CONVERSATION: Final = 2
+"""How many full copies of a schema one conversation is handed before a further call is pointed
+back at the copy it already holds.
+
+THE CONVERSATION'S OWN HISTORY IS THE STATE. Every turn reloads the whole conversation and sends it
+to the model, and pydantic-ai hands that same list to this tool as `ctx.messages`, so "was it
+already delivered?" is a count over what is already in memory: no table, no Redis, nothing to keep
+in step. A new conversation starts empty and gets the schema again, which is the case the
+description's "every time" is written for.
+
+TWO, NOT ONE — owner ruling, 2026-09-11. Across the connected-data E2E campaign the model never
+asked twice in one conversation, so this is a ceiling on a failure not yet seen rather than a fix
+for one. Past it, each further call would append another full copy (~7,400 tokens) to a history
+every later turn replays."""
+
+_ALREADY_LOADED: Final = (
+    "This schema is already in this conversation: earlier `connector_schema` calls returned it in "
+    "full, and it has not changed since. Use that earlier result instead of fetching it again."
+)
+"""What the model reads instead of another copy. A plain string, not a `ModelRetry`: calling again
+is exactly what it should not do."""
+
 
 @cache
 def _load(key: str) -> str:
@@ -111,6 +135,22 @@ def _match(system: str, on: tuple[ConnectedSystem, ...]) -> ConnectedSystem | No
         if wanted in {candidate.key.casefold(), candidate.connector.display_name.casefold()}:
             return candidate
     return None
+
+
+def _deliveries(messages: Sequence[ModelMessage], artefact: str) -> int:
+    """How many earlier tool results in this conversation carried exactly this artefact.
+
+    EXACT CONTENT, NOT THE TOOL NAME. The unreadable-file answer and the not-switched-on refusal
+    come back under the same tool name, and counting them would spend the ceiling on calls that
+    handed over nothing. Matching the artefact itself also keeps one system's deliveries from
+    counting against another's."""
+    return sum(
+        1
+        for message in messages
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, ToolReturnPart) and part.content == artefact
+    )
 
 
 async def connector_schema(ctx: RunContext[Any], system: str) -> str:
@@ -155,7 +195,7 @@ async def connector_schema(ctx: RunContext[Any], system: str) -> str:
         )
 
     try:
-        return _load(match.key)
+        artefact = _load(match.key)
     except (OSError, UnicodeDecodeError) as exc:
         # NAMED IN THE SERVER LOG, NEVER IN THE MODEL'S ANSWER. The path is the one thing a human
         # needs to fix this and the one thing the model has no use for.
@@ -175,6 +215,19 @@ async def connector_schema(ctx: RunContext[Any], system: str) -> str:
             exc_info=True,
         )
         return _UNAVAILABLE
+
+    delivered = _deliveries(ctx.messages, artefact)
+    if delivered >= MAX_DELIVERIES_PER_CONVERSATION:
+        # A WARNING, NOT AN INFO LINE. A model asking again for something its context already holds
+        # twice is either a model regression or history that did not reach the model the way this
+        # list says it did, and this is the one place either is visible from.
+        logger.warning(
+            "connector_schema_already_delivered",
+            connector_key=match.key,
+            deliveries=delivered,
+        )
+        return _ALREADY_LOADED
+    return artefact
 
 
 CONNECTOR_TOOLSET: FunctionToolset[Any] = FunctionToolset[Any]([connector_schema], id="connector")
