@@ -28,7 +28,7 @@ import { ComposerPrimitive, useAui, useAuiState } from '@assistant-ui/react'
 import { Paperclip, Send, X } from 'lucide-react'
 
 import { payloadsOf } from './runtime/attachmentAdapter'
-import { useRefusalSink } from './runtime/stagedAttachments'
+import { usePendingAttachmentReads, useRefusalSink } from './runtime/stagedAttachments'
 import { unsupportedFormatMessage } from '../../utils/attachmentInput'
 import type { PendingAttachment } from '../../utils/attachmentInput'
 import AttachmentPreview, { type PreviewTarget } from './AttachmentPreview'
@@ -115,7 +115,28 @@ export default function ComposerBox({
   // keystroke stale on a fast Enter.
   const stagedCount = useAuiState((s) => s.composer.attachments.length)
   const hasContent = useAuiState((s) => s.composer.text.trim().length > 0) || stagedCount > 0
-  const sendUnavailable = unavailableReason !== null || !hasContent || sending
+  /**
+   * FILES TAKEN BUT NOT YET STAGED.
+   *
+   * `add` reads the file to base64 before the runtime appends anything, so between the drop and
+   * the chip there is a window in which the composer's own view is "no attachments" — and on a
+   * four-megabyte workbook that window is long enough to press Enter in. The send that resulted
+   * carried the question and not the file, and the answer that came back simply never mentioned
+   * it. Nothing about that reads as a failure to the person who attached it.
+   *
+   * SO IT IS A REASON SEND WAITS, and it is worded like every other one: the box says why. This
+   * is also the only unavailability the citizen resolves by doing nothing at all, which is why it
+   * is phrased as an in-progress fact rather than as an instruction.
+   */
+  const pendingReads = usePendingAttachmentReads()
+  const attachmentsArriving = pendingReads > 0
+  const waitingForFiles = attachmentsArriving
+    ? pendingReads === 1
+      ? 'Adding your file…'
+      : `Adding your files… (${pendingReads})`
+    : null
+  const sendReason = unavailableReason ?? waitingForFiles
+  const sendUnavailable = sendReason !== null || !hasContent || sending
   /**
    * LOOK vs. WILL-SEND are different questions — collapsing them was a departure from
    * fourteen boards. The canvas paints the send circle `#D6DDE4` only where a pending
@@ -123,6 +144,11 @@ export default function ComposerBox({
    * even empty, so pale ground means "you may not send," not "you haven't typed yet" — and
    * greying it for an empty box would also fail contrast (white on `#D6DDE4` ~1.4:1).
    * `sendUnavailable` still governs `aria-disabled` and the refusal in `doSend` untouched.
+   *
+   * ARRIVING FILES DO NOT LOCK THE BOX EITHER. The lock is the treatment for a
+   * pending QUESTION, and a file a few hundred milliseconds from being staged is not one. It
+   * greys the send circle through `sendUnavailable` and says why in the accessible name; the
+   * box stays white.
    */
   const sendLocked = unavailableReason !== null || sending
 
@@ -130,6 +156,10 @@ export default function ComposerBox({
     // THE ENFORCEMENT, and the whole of it. `aria-disabled` says so; it does not do so. Pressing
     // Enter, clicking a dimmed Send and calling this directly all land here.
     if (unavailableReason !== null || !conversationId || sending) return
+    // THE FILES ARE NOT ALL IN YET. Enforced here as well as drawn, for the same
+    // reason every other refusal is: `aria-disabled` says so, it does not do so, and pressing
+    // Enter lands here. Sending now would send the question without the file.
+    if (attachmentsArriving) return
     const state = aui.composer.getState()
     const attachments = payloadsOf(state.attachments)
     if (state.text.trim().length === 0 && attachments.length === 0) return
@@ -229,7 +259,7 @@ export default function ComposerBox({
     } finally {
       setSending(false)
     }
-  }, [aui, conversationId, onAccepted, onSubmit, onUrgent, sending, unavailableReason])
+  }, [attachmentsArriving, aui, conversationId, onAccepted, onSubmit, onUrgent, sending, unavailableReason])
 
   const attachmentComponents = useMemo(
     () => ({ Attachment: () => <AttachmentChip onPreview={setPreview} /> }),
@@ -305,6 +335,23 @@ export default function ComposerBox({
             </div>
           )}
 
+          {/* THE FILE THAT IS COMING BUT IS NOT A CHIP YET.
+              The library's chip list can only draw what the runtime holds, and the runtime holds
+              nothing until the read finishes — so a large workbook spends its whole read with no
+              mark on the screen at all. Without this the box is indistinguishable from one where
+              the drop was ignored, which is what a citizen concludes and what makes them press
+              Send. `aria-live` because the same news has to reach someone who cannot see the row;
+              `polite` rather than `assertive` because it resolves on its own. */}
+          {attachmentsArriving && (
+            <div
+              data-testid="composer-pending"
+              aria-live="polite"
+              className="text-[12px] leading-relaxed text-neutral"
+            >
+              {waitingForFiles}
+            </div>
+          )}
+
           {/* NEVER `disabled`, in any state — see the docblock. The library's own `disabled` is
               derived from `thread.isDisabled`, which this project never sets, so the attribute is
               absent rather than false; the guard test asserts the absence directly. */}
@@ -345,8 +392,8 @@ export default function ComposerBox({
               aria-disabled={sendUnavailable}
               // The reason rides in the accessible name, so a screen-reader user gets it from the
               // control itself rather than only from a line of text elsewhere on the screen.
-              aria-label={unavailableReason ? `Send message — ${unavailableReason}` : 'Send message'}
-              title={unavailableReason ?? undefined}
+              aria-label={sendReason ? `Send message — ${sendReason}` : 'Send message'}
+              title={sendReason ?? undefined}
               data-testid="composer-send"
               // THE BOARD'S SEND: a 30px teal circle, not a 36px gold square. Its LOCKED treatment
               // is the board's too — a pale ground rather than an opacity, so it still reads as a

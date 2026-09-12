@@ -512,11 +512,6 @@ def test_foundry_optional_defaults_none() -> None:
     assert _settings().foundry is None
 
 
-def test_gotenberg_url_optional_defaults_none() -> None:
-    # None has a DEFINED meaning: deck conversion disabled.
-    assert _settings().GOTENBERG_URL is None
-
-
 def test_foundry_block_validates_when_present() -> None:
     s = _settings(
         foundry={"resource": "r", "deployment": "d", "auth_mode": "api_key", "api_key": "k"}

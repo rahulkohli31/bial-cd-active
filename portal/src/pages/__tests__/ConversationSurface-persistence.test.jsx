@@ -3,9 +3,9 @@
  * turn, and the build fires only when the user confirms the returned brief card.
  *
  * What's pinned: the user turn — INCLUDING its attachment parts — persists on the SEND, before
- * the confirmed build starts, so BRAIN reads attachment context server-side. The row's
- * parentage rides the same `POST .../turns` request as a `create` block, letting the server
- * check the workspace before creating anything — see `fireRelayTurn`'s comment in
+ * the confirmed build starts, so BRAIN reads attachment context server-side. The row itself is
+ * created by its own call AHEAD of the upload, because the server will not accept a file that
+ * does not name an already-written conversation — see `fireRelayTurn`'s comment in
  * `ConversationSurface.tsx`.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
@@ -15,7 +15,7 @@ import { FakeEventSource, makeClient, primeClient, PLAN_CARD_ID, primeTurn, wait
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), getBuild: vi.fn(),
-  listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
+  listProjectConversations: vi.fn(), createConversation: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
   resolvePlanOptions: vi.fn(),
   stop: vi.fn(), getStatus: vi.fn(),
@@ -29,6 +29,9 @@ vi.mock('../../utils/builderHistory', () => ({
 // included) undefined, and Vitest warns the moment a real caller reaches for it.
 vi.mock('../../utils/conversationApi', async (importOriginal) => ({
   ...(await importOriginal()),
+  // The send path creates the chat before its first upload; spied so its order against the
+  // upload is assertable rather than assumed.
+  createConversation: (...a) => h.createConversation(...a),
   listProjectConversations: h.listProjectConversations,
 }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
@@ -84,6 +87,7 @@ beforeEach(() => {
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
+  h.createConversation.mockResolvedValue({ id: 'build-X' })
   h.buildUserParts.mockImplementation(async (text) => [{ type: 'text', text }])
   // A scripted turn that always answers with a ready-to-build brief, so these suites reach the
   // persistence + gating mechanics in one send. Whether the model asks or briefs is the server's
@@ -93,7 +97,7 @@ beforeEach(() => {
 afterEach(() => cleanup())
 
 describe('BuilderPage — the attachment user-turn is persisted before the build starts', () => {
-  it('sends the attachment as an OWNED REF on the wire message, WITH the row\'s own create block, before the build starts', async () => {
+  it('sends the attachment as an OWNED REF on the wire message, on a row created BEFORE the upload, before the build starts', async () => {
     // buildUserParts stands in for the upload: it yields a text part + a file part.
     h.buildUserParts.mockImplementation(async (text) => [
       { type: 'text', text },
@@ -104,15 +108,18 @@ describe('BuilderPage — the attachment user-turn is persisted before the build
 
     // The turn reaches the SERVER with the attachment as an owned reference — the
     // server persists it into the thread BRAIN later reads.
-    const [, wire, , create] = h.startTurn.mock.calls[0]
+    const [, wire] = h.startTurn.mock.calls[0]
     expect(wire.text).toBe('use this layout')
     expect(wire.attachmentIds).toEqual(['a1'])
-    // The row's parentage rides this same call as a 4th `create` argument (present because
-    // this is the FIRST message on an empty thread), letting the server check the workspace
-    // before creating the row at all — see `fireRelayTurn`'s comment in `ConversationSurface.tsx`.
-    expect(create).toMatchObject({ projectId: 'p1', kind: 'build' })
-    // The single call — message + row parentage together — still happens before the build
-    // starts: create+turn → stream → confirm → build.
+    // And `a1` could only have been minted against a row that already existed: the create runs
+    // first, on this FIRST message of an empty thread. Asserting the id without the ordering
+    // would pass on an upload aimed at a conversation the server had never written.
+    expect(h.createConversation).toHaveBeenCalledWith({ id: 'build-X', projectId: 'p1', kind: 'build' })
+    expect(h.createConversation.mock.invocationCallOrder[0]).toBeLessThan(
+      h.buildUserParts.mock.invocationCallOrder[0],
+    )
+    // The whole sequence still lands before the build starts: create → upload → turn → stream
+    // → confirm → build.
     expect(h.startTurn.mock.invocationCallOrder[0]).toBeLessThan(
       h.buildFromPlan.mock.invocationCallOrder[0],
     )

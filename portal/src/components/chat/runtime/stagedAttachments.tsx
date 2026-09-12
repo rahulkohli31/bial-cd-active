@@ -23,7 +23,7 @@
  * `add` has accepted and is still reading; the one case neither covers is two separate picks
  * landing inside one repaint, which would need reading an internal the library does not expose.
  */
-import { createContext, useContext, useMemo, useRef, type MutableRefObject, type ReactNode } from 'react'
+import { createContext, useContext, useMemo, useRef, useState, type MutableRefObject, type ReactNode } from 'react'
 import { useAui, type Attachment, type AttachmentAdapter } from '@assistant-ui/react'
 import { ACCEPT_ATTR } from '../../../utils/attachmentInput'
 import { createAttachmentAdapter } from './attachmentAdapter'
@@ -35,6 +35,13 @@ export interface BoundAdapter {
   stagedRef: MutableRefObject<() => readonly Attachment[]>
   /** Where a refused file's sentence goes. The mounted composer fills it — see `useRefusalSink`. */
   refusalRef: MutableRefObject<(message: string) => void>
+  /**
+   * HOW MANY FILES ARE STILL BEING READ. STATE, not a ref, and that is the whole
+   * reason it is here rather than beside the two refs above: the composer has to RE-RENDER when
+   * this changes — Send goes unavailable and a pending row appears — and a ref cannot ask for a
+   * render. It is the one thing the adapter publishes that the screen has to react to.
+   */
+  pendingReads: number
 }
 
 export function useBoundAttachmentAdapter(): BoundAdapter {
@@ -47,16 +54,40 @@ export function useBoundAttachmentAdapter(): BoundAdapter {
   // `onUrgent` here; until one does, a refusal has nowhere to go and is dropped rather than
   // thrown at the console.
   const refusalRef = useRef<(message: string) => void>(() => {})
+  // A file is not staged until its base64 read has finished, and Send is pressable throughout that
+  // window — so a citizen who attaches a workbook and presses Enter sends their question without
+  // it. `useState` because the composer must re-render; the setter is stable, so the adapter is
+  // still built exactly once.
+  const [pendingReads, setPendingReads] = useState(0)
   const adapter = useMemo(
     () =>
       createAttachmentAdapter({
         accept: ACCEPT_ATTR,
         staged: () => stagedRef.current(),
         onRefused: (message) => refusalRef.current(message),
+        onReadingChanged: setPendingReads,
       }),
     [],
   )
-  return { adapter, stagedRef, refusalRef }
+  return { adapter, stagedRef, refusalRef, pendingReads }
+}
+
+/**
+ * HOW MANY FILES THE COMPOSER IS STILL READING, as context.
+ *
+ * The same shape as the refusal sink and for the same reason: the provider that owns the count is
+ * mounted above the composer and does not know which of its children has the send control. `0`
+ * outside a provider is the honest default — a composer with no runtime can stage nothing, so
+ * nothing can be in flight.
+ */
+const PendingReadsContext = createContext(0)
+
+export function PendingReadsProvider({ value, children }: { value: number; children: ReactNode }) {
+  return <PendingReadsContext.Provider value={value}>{children}</PendingReadsContext.Provider>
+}
+
+export function usePendingAttachmentReads(): number {
+  return useContext(PendingReadsContext)
 }
 
 /**
@@ -102,4 +133,34 @@ export function StagedAttachmentsBinding({
   const aui = useAui()
   target.current = () => aui.composer.getState().attachments
   return null
+}
+
+/**
+ * EVERY PROVIDER A COMPOSER'S ATTACHMENTS NEED, MOUNTED AS ONE.
+ *
+ * ★ THIS EXISTS BECAUSE THE SEND GATE WAS HALF-SHIPPED. The pending-read count reached the chat
+ * composer through `PendingReadsProvider` in `ChatRuntimeProvider` — and the rail composer, which
+ * binds the same adapter, stages the same files and renders the same box, mounted the refusal sink
+ * and the staged binding but never that provider. `usePendingAttachmentReads()` read the context
+ * default `0`, Send's guard never fired, and a file dropped on the rail and sent mid-read landed
+ * nowhere while the chat started from the sentence alone.
+ *
+ * Three pieces wired by hand at each call site is how one gets forgotten, so they are one
+ * component: a composer that binds an adapter mounts this, and gets all three or none.
+ */
+export function AttachmentAdapterProviders({
+  bound,
+  children,
+}: {
+  bound: BoundAdapter
+  children: ReactNode
+}) {
+  return (
+    <RefusalSinkProvider value={bound.refusalRef}>
+      <PendingReadsProvider value={bound.pendingReads}>
+        <StagedAttachmentsBinding target={bound.stagedRef} />
+        {children}
+      </PendingReadsProvider>
+    </RefusalSinkProvider>
+  )
 }

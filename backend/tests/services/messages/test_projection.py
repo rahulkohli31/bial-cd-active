@@ -20,6 +20,7 @@ from typing import get_args
 
 import sqlalchemy as sa
 from pydantic_ai.messages import (
+    BinaryContent,
     ModelRequest,
     ModelResponse,
     RetryPromptPart,
@@ -28,12 +29,16 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
+from sqlalchemy import event
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus, ErrorSource
 from src.api.v1.conversations.schemas import DiagnosticFrame
+from src.db.models.attachment import Attachment
 from src.db.models.conversation import ChatKind
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.services.build_sessions.outcome import write_build_outcome
+from src.services.media.lanes import EXCEL_MEDIA_TYPE
+from src.services.media.magic import chip_kind_for
 from src.services.messages.projection import (
     PROPOSE_SLICE_TOOL,
     TELL_THE_USER_TOOL,
@@ -47,15 +52,18 @@ from src.services.messages.projection import (
     TurnTerminalItem,
     UserTextItem,
     _friendly_area,
+    _user_text_and_refs,
     classify_command,
     classify_file_step,
     classify_tool_call,
     command_only_inspects,
+    project_conversation,
     project_rows,
 )
 from src.services.messages.store import (
     SCHEMA_VERSION,
     append_batch,
+    dump_for_row,
     load_history,
     load_rows,
 )
@@ -63,6 +71,9 @@ from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 from tests.fakes import write_legacy_build_started
 
 PREVIEW = "https://sbx-abc.westeurope.azurecontainerapps.io/"
+# Matches `test_store_roundtrip.py`'s fixture — a real PNG magic prefix, so the store's own
+# byte checks see what they expect.
+_PNG = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) + b"fake-png-body"
 
 
 async def _thread(db_session):
@@ -893,6 +904,27 @@ def test_classify_command_shows_reads_and_hides_only_housekeeping() -> None:
         assert label == "Organized the app's files"
 
 
+def test_a_code_lane_attachment_still_has_a_chip_after_reload() -> None:
+    """★ R23a, INVERTED FOR THE NEW FORMATS.
+
+    A chip is rebuilt from a reference marker in the stored payload. A model-lane file leaves one
+    because `_externalize_binaries` fires on its `BinaryContent`; a code-lane file never becomes
+    one, so it left nothing and its chip vanished on reload — the exact regression this work
+    claims to close, for the formats this work adds.
+
+    Mutation receipt: read only `ATTACHMENT_REF_KIND` here and the spreadsheet's chip disappears
+    while the image's survives.
+    """
+    payload = dump_for_row(
+        [ModelRequest(parts=[UserPromptPart(content="what is in this?")])],
+        file_attachment_ids=["att_sheet"],
+    )
+    text, refs = _user_text_and_refs(payload[0]["parts"][0]["content"])
+
+    assert refs == ["att_sheet"]
+    assert text == "what is in this?"  # the marker is not prose and never renders as it
+
+
 def test_only_configuration_writes_and_housekeeping_are_hidden_on_the_shared_entry() -> None:
     """★ THE NARROWED SET, pinned once at the entry BOTH feeds call.
 
@@ -908,12 +940,37 @@ def test_only_configuration_writes_and_housekeeping_are_hidden_on_the_shared_ent
         ("search_files", '{"query": "visitors"}'),
         ("fetch_output_slice", '{"call_id": "c1"}'),
         ("run_command", '{"command": ["grep", "-rn", "visitors", "app/"]}'),
+        ("read_attachment", '{"file": ".attachments/roster.xlsx"}'),
     ):
         label, hidden = classify_tool_call(tool, args)
         assert hidden is False, tool
         assert label.strip(), tool
     assert classify_tool_call("write_file", '{"path": "tsconfig.json"}')[1] is True
     assert classify_tool_call("run_command", '{"command": ["mkdir", "-p", "app/lib"]}')[1] is True
+
+
+def test_reading_an_attachment_names_the_citizens_own_file() -> None:
+    """★ THE ONE DELIBERATE EXCEPTION TO `_friendly_area`.
+
+    Every other file label in this module hides the path on purpose: `components/GateTable.tsx`
+    is the platform's own machinery and means nothing to the person reading. An attachment is the
+    opposite — the citizen chose the file, named it, and can see a chip carrying that name. So the
+    transcript says WHICH file was read, which is also the only way a turn that read three of them
+    can be told apart afterwards.
+
+    The raw-name fallback is what makes this a branch rather than a nicety: without it the step
+    renders as "Used read_attachment", which is exactly the machinery leak the friendly mapping
+    exists to prevent.
+
+    Mutation receipt: delete the `ATTACHMENT_READ_TOOL` arm and the first assertion reads
+    "Used read_attachment".
+    """
+    label, hidden = classify_tool_call("read_attachment", '{"file": ".attachments/roster.xlsx"}')
+
+    assert label == "Reading roster.xlsx"
+    assert hidden is False
+    # A call with no argument at all still says something true rather than naming nothing.
+    assert classify_tool_call("read_attachment", "{}")[0] == "Reading the attached file"
 
 
 def test_a_read_binary_asked_to_write_is_never_drawn_as_an_inspection() -> None:
@@ -1958,3 +2015,314 @@ async def test_a_first_slice_far_past_the_old_ceiling_renders_whole(db_session) 
     # leaves the citizen a list with nothing to answer.
     assert "These six are the reception desk's whole morning." in proposal.text
     assert proposal.text.endswith("Shall I start there?")
+
+
+# --- the attachment fence never reaches the bubble ------------------------------------
+
+
+async def _user_turn(db_session, user, conversation, content) -> None:
+    """One citizen turn persisted in the U7 wire shape — content is whatever the caller
+    passes, so a test can store the LIST form (attachment items, typed prose last) that the
+    composer really produces."""
+    await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        messages=[ModelRequest(parts=[UserPromptPart(content=content)])],
+        entry_kind=MessageEntryKind.TURN,
+        kind=ChatKind.PLAN,
+        meta={},
+    )
+
+
+async def _user_items(db_session, user, conversation) -> list[UserTextItem]:
+    rows = await _rows(db_session, user, conversation)
+    return [i for i in project_rows(rows) if isinstance(i, UserTextItem)]
+
+
+async def test_an_inlined_file_body_is_kept_out_of_the_user_bubble(db_session) -> None:
+    """★ THE GUARD THIS FILE EXISTS TO PIN.
+
+    `_is_attachment_fence` is the ONLY thing standing between a persisted file body and the
+    citizen's own message bubble, and until now nothing tested it — a grep for `fence` across
+    `backend/tests/` returned only build-prompt fixtures. This work deletes the inline-text lane
+    that produces these blocks, and the fence check looks like part of that lane; it is not.
+    Every conversation already on disk that carried a CSV or a spreadsheet has that content
+    stored as a bare string inside a `user-prompt` content list, so deleting the check makes
+    those turns render the whole file, row by row, as if the citizen had typed it.
+
+    Driven through `append_batch` → `project_rows` rather than by calling the predicate,
+    deliberately: `test_zip_safety.py` is the cautionary example in this repo of a suite that
+    proves an algorithm works and never that anything calls it.
+
+    Mutation receipt: drop the `if not _is_attachment_fence(item)` guard in
+    `_user_text_and_refs` and this test goes red on the CSV rows appearing in `.text`.
+    """
+    user, _, conversation = await _thread(db_session)
+    await _user_turn(
+        db_session,
+        user,
+        conversation,
+        [
+            '<attachment name="roster.csv" type="text">\n'
+            "badge,name,terminal\n"
+            "1041,Asha Rao,T1\n"
+            "1042,Vikram Nair,T2\n"
+            "</attachment>",
+            "How many people are on this?",
+        ],
+    )
+
+    items = await _user_items(db_session, user, conversation)
+
+    assert len(items) == 1
+    # The prose survives whole — the bubble shows what the citizen typed.
+    assert items[0].text == "How many people are on this?"
+    # And nothing of the file does. Asserted on the row CONTENT, not on the fence tags: a
+    # future fence shape that still leaked the body would pass a tag-only assertion.
+    assert "badge,name,terminal" not in items[0].text
+    assert "Asha Rao" not in items[0].text
+    assert "1042" not in items[0].text
+
+
+async def test_a_plain_message_is_not_mistaken_for_a_fence(db_session) -> None:
+    """The companion case, so the guard cannot be satisfied by dropping everything. A citizen
+    who types the word `<attachment` mid-sentence still gets their sentence back."""
+    user, _, conversation = await _thread(db_session)
+    await _user_turn(
+        db_session, user, conversation, ["What does <attachment ...> mean in your logs?"]
+    )
+
+    items = await _user_items(db_session, user, conversation)
+
+    assert items[0].text == "What does <attachment ...> mean in your logs?"
+
+
+async def test_the_bare_string_shape_still_reaches_the_bubble(db_session) -> None:
+    """A text-only turn is persisted as a bare string, not a list (`prompt_content`'s fast
+    path). The filter must not touch that branch — pinned because this work rewrites the producer
+    and the two shapes are easy to collapse into one."""
+    user, _, conversation = await _thread(db_session)
+    await _user_turn(db_session, user, conversation, "just a question, no files")
+
+    items = await _user_items(db_session, user, conversation)
+
+    assert items[0].text == "just a question, no files"
+
+
+async def test_an_attachment_reference_becomes_a_chip_id_not_prose(db_session) -> None:
+    """The other half of `_user_text_and_refs`: a `bial-attachment-ref` marker leaves the prose
+    and arrives as an id the UI draws a chip from. The reload path builds on this — the projection
+    already ships the ids and the reload path throws them away — so the producing side is
+    pinned here before that work moves it."""
+    user, _, conversation = await _thread(db_session)
+    # A REAL `BinaryContent`, not a hand-written marker dict. `_externalize_binaries` mints the
+    # `bial-attachment-ref` shape at persist time, so passing the marker directly would seed the
+    # POST-serialization form into the pre-serialization slot — a shape production never writes,
+    # and one pydantic-ai warns about because it matches no content type.
+    await _user_turn(
+        db_session,
+        user,
+        conversation,
+        [
+            BinaryContent(data=_PNG, media_type="image/png", identifier="att-7f3c"),
+            "what is in this file?",
+        ],
+    )
+
+    items = await _user_items(db_session, user, conversation)
+
+    assert [a.attachment_id for a in items[0].attachments] == ["att-7f3c"]
+    assert items[0].text == "what is in this file?"
+    assert "att-7f3c" not in items[0].text
+    # `project_rows` is pure, so it carries the id and nothing else; the name and media type
+    # are filled by `project_conversation`, which has a database session. Pinned so the split
+    # stays deliberate rather than looking like an unfinished item.
+    assert items[0].attachments[0].name == ""
+    assert items[0].attachments[0].media_type == ""
+
+
+async def _code_lane_turn(db_session, user, conversation, text, ids) -> None:
+    """One citizen turn carrying code-lane file markers, as the send route stamps them."""
+    await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        messages=[ModelRequest(parts=[UserPromptPart(content=text)])],
+        entry_kind=MessageEntryKind.TURN,
+        kind=ChatKind.PLAN,
+        meta={},
+        file_attachment_ids=ids,
+    )
+
+
+async def test_a_code_lane_chip_is_drawn_once_across_the_whole_transcript(db_session) -> None:
+    """★ U7 — ONE CHIP PER FILE, ON THE TURN THAT CARRIED IT.
+
+    The marker used to be stamped with the conversation's WHOLE code-lane set on every turn, so a
+    citizen who attached one spreadsheet and then sent three more messages saw the same chip four
+    times on reload — once under each bubble, including bubbles whose message never mentioned it.
+    The send route narrows the stamp now, but rows written before that narrowing are already on
+    disk and are indistinguishable from narrowed ones, so the projection dedupes as well.
+
+    Seeded in the PRE-narrowing shape deliberately: that is the shape the dedupe exists for, and
+    a test seeded in the post-narrowing shape would pass with the dedupe deleted.
+
+    Mutation receipt: drop `seen_attachments` from `project_rows` and the second and third
+    bubbles regrow `att_sheet`, and the third regrows `att_roster` as well.
+    """
+    user, _, conversation = await _thread(db_session)
+    await _code_lane_turn(db_session, user, conversation, "what is in this sheet?", ["att_sheet"])
+    # The old writer re-stamped everything the conversation had so far, every time.
+    await _code_lane_turn(
+        db_session, user, conversation, "and now the roster too", ["att_sheet", "att_roster"]
+    )
+    await _code_lane_turn(
+        db_session, user, conversation, "no file on this one", ["att_sheet", "att_roster"]
+    )
+
+    items = await _user_items(db_session, user, conversation)
+
+    assert [[a.attachment_id for a in i.attachments] for i in items] == [
+        ["att_sheet"],
+        ["att_roster"],
+        [],
+    ]
+    # THE BUBBLE ITSELF SURVIVES its chips being taken away. A third turn whose every marker was
+    # already spent still has prose, and dropping it would delete the citizen's own message.
+    assert [i.text for i in items] == [
+        "what is in this sheet?",
+        "and now the roster too",
+        "no file on this one",
+    ]
+
+
+async def test_a_turn_with_nothing_left_after_the_dedupe_is_not_drawn(db_session) -> None:
+    """The other side of the guard above: a bubble with no prose AND no fresh chip is nothing to
+    draw, so it must not become an empty one. The composer sends bare-attachment turns with a
+    stand-in sentence, but the pre-narrowing rows on disk include genuinely empty re-stamps."""
+    user, _, conversation = await _thread(db_session)
+    await _code_lane_turn(db_session, user, conversation, "here it is", ["att_sheet"])
+    await _code_lane_turn(db_session, user, conversation, "", ["att_sheet"])
+
+    items = await _user_items(db_session, user, conversation)
+
+    assert [[a.attachment_id for a in i.attachments] for i in items] == [["att_sheet"]]
+    assert [i.text for i in items] == ["here it is"]
+
+
+# --- the enrichment entry point -----------------------------------------------------------
+
+
+async def _stored_attachment(db_session, user_id, attachment_id: str, name: str, media_type: str):
+    row = Attachment(
+        user_id=user_id,
+        attachment_id=attachment_id,
+        media_type=media_type,
+        name=name,
+        size=1,
+        storage_key=f"att/{user_id}/{attachment_id}",
+    )
+    db_session.add(row)
+    await db_session.flush()
+    return row
+
+
+async def test_a_chip_is_filled_in_from_the_attachment_row(db_session) -> None:
+    """`project_rows` is pure and carries only the id; the name and media type live in the
+    attachments table. This is the seam that joins them, and it is what every route calls."""
+    user, _, conversation = await _thread(db_session)
+    await _stored_attachment(db_session, user.id, "att_sheet", "movements.xlsx", EXCEL_MEDIA_TYPE)
+    await _code_lane_turn(db_session, user, conversation, "what is in this?", ["att_sheet"])
+
+    rows = await _rows(db_session, user, conversation)
+    items = [
+        i
+        for i in await project_conversation(db_session, user_id=user.id, rows=rows)
+        if isinstance(i, UserTextItem)
+    ]
+
+    chip = items[0].attachments[0]
+    assert (chip.name, chip.media_type) == ("movements.xlsx", EXCEL_MEDIA_TYPE)
+    assert chip.kind == chip_kind_for(EXCEL_MEDIA_TYPE)
+
+
+async def test_a_transcript_naming_another_citizens_attachment_learns_nothing_about_it(
+    db_session,
+) -> None:
+    """★ THE PREDICATE THIS QUERY CANNOT LOSE.
+
+    An attachment id is a client-supplied string that is stored verbatim into the payload, so a
+    transcript can name any id at all. Without the `user_id` predicate the enrichment would hand
+    back the OWNER's filename and media type — one citizen reading another's file names out of
+    their own chat.
+
+    Mutation receipt: drop `Attachment.user_id == user_id` from the select in
+    `project_conversation` and this goes red on the stranger's filename appearing.
+    """
+    owner = await UserFactory.create(db_session)
+    await _stored_attachment(db_session, owner.id, "att_theirs", "payroll.xlsx", EXCEL_MEDIA_TYPE)
+
+    reader, _, conversation = await _thread(db_session)
+    await _code_lane_turn(db_session, reader, conversation, "what is in this?", ["att_theirs"])
+
+    rows = await _rows(db_session, reader, conversation)
+    items = [
+        i
+        for i in await project_conversation(db_session, user_id=reader.id, rows=rows)
+        if isinstance(i, UserTextItem)
+    ]
+
+    chip = items[0].attachments[0]
+    assert chip.attachment_id == "att_theirs"  # the reference survives — it is in their payload
+    assert chip.name == ""
+    assert chip.media_type == ""
+
+
+async def test_a_reference_whose_row_is_gone_reads_as_unavailable_rather_than_failing(
+    db_session,
+) -> None:
+    """A reclaimed attachment leaves its reference in the payload forever. The chip has to render
+    as unavailable, which the browser draws from exactly this empty-name state."""
+    user, _, conversation = await _thread(db_session)
+    await _code_lane_turn(db_session, user, conversation, "what is in this?", ["att_reclaimed"])
+
+    rows = await _rows(db_session, user, conversation)
+    items = [
+        i
+        for i in await project_conversation(db_session, user_id=user.id, rows=rows)
+        if isinstance(i, UserTextItem)
+    ]
+
+    assert [a.attachment_id for a in items[0].attachments] == ["att_reclaimed"]
+    assert items[0].attachments[0].name == ""
+
+
+async def test_the_whole_transcript_costs_one_attachment_read(db_session) -> None:
+    """★ THE ANTI-N+1 THE DOCSTRING CLAIMS, asserted rather than trusted.
+
+    Ids are collected across every item before the read, so forty attachments cost one query.
+    Counted by instrumenting the session, because the alternative — trusting the comment — is how
+    a later edit moves the select inside the loop without anyone noticing.
+
+    Mutation receipt: move the select into the per-item loop and the count goes above one.
+    """
+    user, _, conversation = await _thread(db_session)
+    for n in range(4):
+        await _stored_attachment(db_session, user.id, f"att_{n}", f"f{n}.xlsx", EXCEL_MEDIA_TYPE)
+        await _code_lane_turn(db_session, user, conversation, f"file {n}", [f"att_{n}"])
+
+    rows = await _rows(db_session, user, conversation)
+    reads: list[str] = []
+
+    @event.listens_for(db_session.sync_session, "do_orm_execute")
+    def _count(state) -> None:
+        if state.is_select and "attachments" in str(state.statement).lower():
+            reads.append("read")
+
+    try:
+        await project_conversation(db_session, user_id=user.id, rows=rows)
+    finally:
+        event.remove(db_session.sync_session, "do_orm_execute", _count)
+
+    assert len(reads) == 1, f"expected one attachment read for the transcript, got {len(reads)}"

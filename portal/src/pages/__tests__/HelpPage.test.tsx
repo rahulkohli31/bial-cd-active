@@ -16,7 +16,11 @@
  */
 import { describe, it, expect } from 'vitest'
 import { FAQS } from '../HelpPage'
-import { ALLOWED_MEDIA_TYPES } from '../../utils/attachmentInput'
+import {
+  ALLOWED_MEDIA_TYPES,
+  ATTACHMENT_LANES_SENTENCE,
+  MAX_FILE_SIZE_MB,
+} from '../../utils/attachmentInput'
 
 /**
  * Literal media types, not imports.
@@ -77,6 +81,20 @@ describe('the attachment answer agrees with the real allowlist', () => {
       expect(ALLOWED_MEDIA_TYPES).toContain(type)
       expect(answer).toMatch(phrase)
     }
+  })
+
+  it('★ speaks the composer’s own sentence and the composer’s own size, never a copy', () => {
+    // R21 IS ABOUT THREE PLACES AGREEING, and this page was the one that could drift silently:
+    // the composer's refusal and the server's are held byte-identical by their own test, while
+    // this answer restated both by hand. It said "up to 4 MB each" — and every other surface has
+    // said ten since the caps were unified, so a citizen reading the help page learned a rule the
+    // platform had stopped enforcing.
+    //
+    // The negative is paired with two positives, so a page whose answer went missing entirely
+    // cannot pass this by having nothing to match.
+    expect(answer).toContain(ATTACHMENT_LANES_SENTENCE)
+    expect(answer).toMatch(new RegExp(`up to ${MAX_FILE_SIZE_MB} MB`))
+    expect(answer).not.toMatch(/4 MB/)
   })
 })
 

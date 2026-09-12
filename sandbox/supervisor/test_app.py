@@ -14,6 +14,7 @@ process's own account BEFORE importing `app`; on the image `APP_USER` is the rea
 from __future__ import annotations
 
 import atexit
+import base64
 import os
 import pwd
 import shutil
@@ -28,11 +29,14 @@ os.environ.setdefault("SUPERVISOR_TOKEN", "test-token-not-a-real-secret")
 os.environ.setdefault("APP_USER", pwd.getpwuid(os.getuid()).pw_name)
 _WS = tempfile.mkdtemp(prefix="bial-sup-ws-")
 os.environ["WORKSPACE"] = _WS
+_ATT = tempfile.mkdtemp(prefix="bial-sup-att-")
+os.environ["ATTACHMENTS_DIR"] = _ATT
+atexit.register(shutil.rmtree, _ATT, ignore_errors=True)
 atexit.register(shutil.rmtree, _WS, ignore_errors=True)  # don't leak the temp workspace per run
 
 from urllib.parse import unquote  # noqa: E402
 
-from app import APP_HOME, WORKSPACE, _child_env, _redact, app  # noqa: E402
+from app import APP_HOME, ATTACHMENTS, WORKSPACE, _child_env, _redact, app  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402  (must follow the env seeding above)
 
 TOKEN = os.environ["SUPERVISOR_TOKEN"]
@@ -274,6 +278,160 @@ def test_files_create_lf_normalizes_and_makes_parents() -> None:
 
 def test_files_create_missing_file_text_is_400() -> None:
     r = client.post("/files", json={"action": "create", "path": "x.txt"}, headers=AUTH)
+    assert r.status_code == 400
+
+
+# --- the attachments root ----------------------------------------------------------
+def test_a_file_can_be_written_outside_the_app_tree() -> None:
+    """★ WHY THERE ARE TWO ROOTS. `WORKSPACE` is the tree that BECOMES the citizen's app — it is
+    snapshotted, restored, saved and deployed. A file someone attached to a chat must not travel
+    with any of that as a side effect of having been attached. Excluding it from each of those
+    paths in turn means getting every exclusion right forever; keeping it out of the tree means
+    there is nothing to exclude.
+
+    Mutation receipt: drop ATTACHMENTS from `_resolve`'s root list and this 400s.
+    """
+    target = ATTACHMENTS / "roster.xlsx"
+    r = client.post(
+        "/files",
+        json={
+            "action": "create_bytes",
+            "path": str(target),
+            "file_b64": base64.b64encode(b"PK payload").decode(),
+        },
+        headers=AUTH,
+    )
+
+    assert r.status_code == 200, r.text
+    assert target.read_bytes() == b"PK payload"
+    # The point of the whole arrangement: it is NOT in the tree that becomes the app.
+    assert WORKSPACE.resolve() not in target.resolve().parents
+
+
+def test_a_relative_path_still_means_the_app_tree() -> None:
+    """The second root is reachable only by naming it absolutely, so no existing caller changes
+    meaning because /workspace/attachments came into existence — an app that happens to contain
+    its own `attachments/` directory still resolves there."""
+    r = client.post(
+        "/files",
+        json={"action": "create", "path": "attachments/note.txt", "file_text": "in the app"},
+        headers=AUTH,
+    )
+
+    assert r.status_code == 200
+    assert (WORKSPACE / "attachments/note.txt").read_text(encoding="utf-8") == "in the app"
+    assert not (ATTACHMENTS / "note.txt").exists()
+
+
+def test_neither_root_is_a_doorway_to_the_other_or_to_anywhere_else() -> None:
+    """The guard is applied twice, not relaxed. `..` is resolved BEFORE the check, so a path that
+    starts inside one root and climbs out of it is refused even though its prefix looked legal."""
+    for path in (
+        str(ATTACHMENTS / ".." / "escaped.bin"),
+        str(WORKSPACE / ".." / "escaped.bin"),
+        "/etc/passwd",
+        str(ATTACHMENTS / ".." / ".." / "etc" / "passwd"),
+    ):
+        r = client.post(
+            "/files",
+            json={"action": "create_bytes", "path": path, "file_b64": "AAEC"},
+            headers=AUTH,
+        )
+        assert r.status_code == 400, f"{path} was not refused"
+
+
+# --- /files: create_bytes --------------------------------------------
+def test_files_create_bytes_writes_the_real_bytes_unchanged() -> None:
+    """A REAL FILE, NOT TEXT. Every other write action here decodes UTF-8 and rewrites CRLF to
+    LF; a spreadsheet is a ZIP archive and carries 0x0D 0x0A constantly, so `create` would
+    silently corrupt one. This is the action that lets the control plane place an attachment.
+
+    Mutation receipt: point `create_bytes` at `write_text` with the CRLF replace and this fails
+    on the byte comparison — the pair in the middle is there to make that certain.
+    """
+    raw = bytes([0x50, 0x4B, 0x03, 0x04]) + b"\r\n" + bytes([0x00, 0xFF, 0x0D, 0x0A, 0x1A])
+    r = client.post(
+        "/files",
+        json={
+            "action": "create_bytes",
+            "path": "att/book.xlsx",
+            "file_b64": base64.b64encode(raw).decode(),
+        },
+        headers=AUTH,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["bytes"] == len(raw)
+    assert (WORKSPACE / "att/book.xlsx").read_bytes() == raw
+
+
+def test_files_create_bytes_makes_parent_directories() -> None:
+    r = client.post(
+        "/files",
+        json={
+            "action": "create_bytes",
+            "path": "deep/er/still/f.bin",
+            "file_b64": base64.b64encode(b"x").decode(),
+        },
+        headers=AUTH,
+    )
+    assert r.status_code == 200
+    assert (WORKSPACE / "deep/er/still/f.bin").read_bytes() == b"x"
+
+
+def test_files_create_bytes_missing_payload_is_400() -> None:
+    r = client.post("/files", json={"action": "create_bytes", "path": "x.bin"}, headers=AUTH)
+    assert r.status_code == 400
+
+
+def test_files_create_bytes_rejects_payload_that_is_not_base64() -> None:
+    """422, not 500. A malformed body is the caller's mistake and must be answered as one —
+    letting binascii raise would surface as an unhandled error from inside the container."""
+    r = client.post(
+        "/files",
+        json={"action": "create_bytes", "path": "x.bin", "file_b64": "not base64!!"},
+        headers=AUTH,
+    )
+    assert r.status_code == 422
+
+
+def test_files_create_bytes_writes_a_file_larger_than_the_deleted_ceiling() -> None:
+    """★ THE SIZE QUESTION IS THE DOOR'S, AND ONLY THE DOOR'S. A second ceiling here used to
+    restate the control plane's per-file cap, and the two would eventually disagree — at which
+    point a file the door had already accepted, stored and charged for would die inside the
+    container with a message no citizen could be shown.
+
+    Five megabytes is over the ceiling that stood here and comfortably under the door's, so this
+    write is exactly the one the disagreement would have swallowed.
+
+    Mutation check: restore any decoded-length check in `create_bytes` and this goes red.
+    """
+    payload = b"\x00" * (5 * 1024 * 1024)
+    r = client.post(
+        "/files",
+        json={
+            "action": "create_bytes",
+            "path": "large.bin",
+            "file_b64": base64.b64encode(payload).decode(),
+        },
+        headers=AUTH,
+    )
+    assert r.status_code == 200
+    assert (WORKSPACE / "large.bin").read_bytes() == payload
+
+
+def test_files_create_bytes_cannot_escape_the_workspace() -> None:
+    """The path guard is `_resolve`'s and is shared with every other action, but a NEW write
+    action is exactly where a missed guard would land — so it is asserted here rather than
+    assumed from the others."""
+    r = client.post(
+        "/files",
+        json={
+            "action": "create_bytes",
+            "path": "../escaped.bin",
+            "file_b64": base64.b64encode(b"x").decode(),
+        },
+        headers=AUTH,
+    )
     assert r.status_code == 400
 
 

@@ -13,18 +13,33 @@ import type { AttachmentDescriptor } from '../utils/attachmentStore'
  * extracted text or converted pages — the conversion stays invisible in the UI; a
  * missing image falls back to an "unavailable" placeholder.
  */
+const PPTX = 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+const SPREADSHEET_TYPES = new Set([
+  'text/csv',
+  'text/tab-separated-values',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+])
+/** The formats code reads rather than the model — mirrors `media/lanes.py`'s set. */
+const CODE_LANE_TYPES = new Set([
+  ...SPREADSHEET_TYPES,
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  PPTX,
+])
+
 function AttachmentChip({ att }: { att: AttachmentDescriptor }) {
-  const isText = att.kind === 'text'
-  const isOffice = att.kind === 'office'
-  const isDeck = att.kind === 'deck'
+  // THREE KINDS, ONE PER THING A CHIP CAN DO. The server derives these from the media
+  // type in `chip_kind_for`, so the chip a citizen sees on reload is the same shape as the one
+  // they watched appear. `document`/`image` are also matched on the media type directly, because
+  // parts staged in the composer carry a locally-assigned kind.
   const isPdf = att.kind === 'document' || att.mediaType === 'application/pdf'
+  const isFile = att.kind === 'file' || (!isPdf && CODE_LANE_TYPES.has(att.mediaType))
   const [src, setSrc] = useState<string | null>(null)
   const [missing, setMissing] = useState(false)
   const [zoomed, setZoomed] = useState(false)
 
   useEffect(() => {
     // Only images preview from bytes.
-    if (isPdf || isText || isOffice || isDeck) return undefined
+    if (isPdf || isFile) return undefined
     let active = true
     fetchAttachmentObjectUrl(att.attachmentId).then((url) => {
       if (!active) return
@@ -34,67 +49,66 @@ function AttachmentChip({ att }: { att: AttachmentDescriptor }) {
     return () => {
       active = false
     }
-  }, [att.attachmentId, isPdf, isText, isOffice, isDeck])
+  }, [att.attachmentId, isPdf, isFile])
 
-  if (isText) {
-    const Icon = att.mediaType === 'text/csv' ? FileSpreadsheet : FileText
+  // ★ FIRST, BEFORE EVERY FORMAT BRANCH. It used to sit below them, and both
+  // the file and PDF chips return above it — so `setMissing(true)` set state, the component
+  // re-rendered, the early return fired again, and this was never reached. The press was
+  // still absorbed in silence for exactly the two formats the branches handle, which is the
+  // one thing a control must never do and the defect the state was added to fix.
+  if (missing) {
+    // R23b/R23c. It said only "attachment unavailable", with no name and no next step, and it
+    // announced nothing — a chip that changes under a citizen's press without the page changing
+    // is a change assistive technology has no other way to notice. `role="status"` is what
+    // carries it; `aria-live="polite"` waits for a pause rather than interrupting.
     return (
       <span
-        title={att.name}
-        className="inline-flex items-center gap-1.5 bg-white/10 border border-white/20 rounded-lg px-2 py-1 text-[11px] max-w-[12rem]"
+        role="status"
+        aria-live="polite"
+        className="inline-flex items-center gap-1.5 bg-white/10 border border-white/20 rounded-lg px-2 py-1 text-[11px] opacity-70"
       >
-        <Icon size={12} className="flex-shrink-0" />
-        <span className="truncate">{att.name}</span>
+        <ImageOff size={12} className="flex-shrink-0" />
+        <span className="truncate max-w-[14rem]">
+          {att.name ? `${att.name} is no longer available` : 'This attachment is no longer available'}
+          {' — attach it again to use it.'}
+        </span>
       </span>
     )
   }
 
-  if (isOffice) {
-    const Icon = att.format === 'excel' ? FileSpreadsheet : FileText
-    // When the AI received a shortened version, spell out what was dropped on hover
-    // (with the real row counts when available); fall back for older parts.
-    const truncMsg = att.truncated
-      ? att.truncationNote || 'This file was shortened for the AI. Download the original for the full content.'
-      : ''
+  if (isFile) {
+    // THE CODE LANE RETURNS THE FILE. A spreadsheet, document or deck cannot be
+    // rendered in a browser without a converter this platform does not host, so pressing the chip
+    // hands the citizen their own file back - under its own name and type, never anonymous bytes.
+    //
+    // This replaces three near-identical branches (text, office, deck). The text one was a dead
+    // `<span>`: pressing it did nothing at all, because the content used to ride inline in the
+    // prompt and there was nothing to fetch. Every attachment is an uploaded file now, so there
+    // always is.
+    const Icon = att.mediaType === PPTX ? Presentation : SPREADSHEET_TYPES.has(att.mediaType) ? FileSpreadsheet : FileText
     return (
       <button
         type="button"
+        data-testid="attachment-download-chip"
         onClick={async () => {
           const url = await fetchAttachmentObjectUrl(att.attachmentId)
+          // A FAILED FETCH SAYS SO. It used to do nothing at all, which reads as a broken
+          // button - the one thing a control must never do is absorb a press silently.
           if (url) downloadObjectUrl(url, att.name)
+          else setMissing(true)
         }}
-        title={truncMsg ? `${truncMsg} (Click to download the original.)` : `Download ${att.name}`}
+        // R23c: the accessible name says WHICH file and WHAT pressing it does. A chip that
+        // downloads and a chip that previews are otherwise the same shape to a screen reader.
+        aria-label={`Download ${att.name}`}
+        title={`Download ${att.name}`}
         className="inline-flex items-center gap-1.5 bg-white/10 hover:bg-white/20 border border-white/20 rounded-lg px-2 py-1 text-[11px] max-w-[14rem] cursor-pointer transition"
       >
         <Icon size={12} className="flex-shrink-0" />
         <span className="truncate">{att.name}</span>
-        {att.truncated && (
-          <span title={truncMsg} className="flex-shrink-0 opacity-70">· truncated</span>
-        )}
       </button>
     )
   }
 
-  if (isDeck) {
-    // A deck re-downloads the ORIGINAL .pptx (exactly like office). The chip shows
-    // only the .pptx name + a Presentation icon and the tooltip never mentions PDF
-    // — the conversion is internal (invisible-conversion user story).
-    return (
-      <button
-        type="button"
-        data-testid="deck-download-chip"
-        onClick={async () => {
-          const url = await fetchAttachmentObjectUrl(att.attachmentId)
-          if (url) downloadObjectUrl(url, att.name)
-        }}
-        title={`Download ${att.name}`}
-        className="inline-flex items-center gap-1.5 bg-white/10 hover:bg-white/20 border border-white/20 rounded-lg px-2 py-1 text-[11px] max-w-[14rem] cursor-pointer transition"
-      >
-        <Presentation size={12} className="flex-shrink-0" />
-        <span className="truncate">{att.name}</span>
-      </button>
-    )
-  }
 
   if (isPdf) {
     return (
@@ -103,7 +117,11 @@ function AttachmentChip({ att }: { att: AttachmentDescriptor }) {
         onClick={async () => {
           const url = await fetchAttachmentObjectUrl(att.attachmentId)
           if (url) openUrlInNewTab(url, att.name)
+          else setMissing(true)
         }}
+        // R23c: which file, and what pressing it does — a chip that opens and a chip that
+        // downloads are otherwise indistinguishable to a screen reader.
+        aria-label={`Open ${att.name}`}
         title={`Open ${att.name}`}
         className="inline-flex items-center gap-1.5 bg-white/10 hover:bg-white/20 border border-white/20 rounded-lg px-2 py-1 text-[11px] max-w-[12rem] cursor-pointer transition"
       >
@@ -113,24 +131,25 @@ function AttachmentChip({ att }: { att: AttachmentDescriptor }) {
     )
   }
 
-  if (missing) {
-    return (
-      <span className="inline-flex items-center gap-1.5 bg-white/10 border border-white/20 rounded-lg px-2 py-1 text-[11px] opacity-70">
-        <ImageOff size={12} className="flex-shrink-0" />
-        attachment unavailable
-      </span>
-    )
-  }
 
   return (
     <>
-      <img
-        src={src || undefined}
-        alt={att.name}
-        title={`View ${att.name}`}
+      {/* A BUTTON, NOT A CLICKABLE IMAGE. It opens a modal, so it has to be reachable and
+          operable from the keyboard — an `<img onClick>` is neither, and a screen reader announced
+          it as an image with no indication that pressing it did anything. */}
+      <button
+        type="button"
         onClick={() => src && setZoomed(true)}
-        className="h-16 w-16 object-cover rounded-lg border border-white/20 bg-white/10 cursor-zoom-in hover:opacity-90 transition"
-      />
+        aria-label={`View ${att.name}`}
+        title={`View ${att.name}`}
+        className="rounded-lg cursor-zoom-in hover:opacity-90 transition focus:outline-none focus:ring-2 focus:ring-white/60"
+      >
+        <img
+          src={src || undefined}
+          alt={att.name}
+          className="h-16 w-16 object-cover rounded-lg border border-white/20 bg-white/10"
+        />
+      </button>
       {/* The hand-rolled full-screen overlay this used to open is gone. The dialog
           that replaces it brings a focus trap, `role="dialog"`, `aria-modal` and a scroll lock —
           none of which the 55-line overlay had, and all of which a modal owes a keyboard user.

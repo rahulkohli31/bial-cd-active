@@ -55,6 +55,8 @@ vi.mock('../../utils/builderHistory', () => ({
 // `listProjectConversations` would leave the rest of the module undefined too.
 vi.mock('../../utils/conversationApi', async (importOriginal) => ({
   ...(await importOriginal()),
+  // The send path creates the chat before its first upload; stubbed so no network is reached.
+  createConversation: async () => ({ id: 'conv-created' }),
   listProjectConversations: h.listProjectConversations,
 }))
 // THE WORKSPACE READ: left unmocked, the poll's real fetch fails and the pane reports it could

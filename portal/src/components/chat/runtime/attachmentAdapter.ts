@@ -27,7 +27,6 @@ import {
   fileToBase64,
   newAttachmentId,
   resolveMediaType,
-  textAttachmentBytes,
   validateAttachmentFiles,
 } from '../../../utils/attachmentInput'
 import type { PendingAttachment as OurAttachment } from '../../../utils/attachmentInput'
@@ -83,6 +82,20 @@ export interface AttachmentAdapterOptions {
    * throws so the library discards it; this callback is how the reason reaches a screen.
    */
   onRefused: (message: string) => void
+  /**
+   * HOW MANY FILES ARE BEING READ RIGHT NOW, published on every change.
+   *
+   * A file is not staged until `fileToBase64` has finished with it, and on a large workbook over
+   * a slow disk that is a real window with nothing on screen in it. Send is pressable throughout
+   * — the composer's own view is "no attachments and maybe some text" — so a citizen who attaches
+   * a spreadsheet and presses Enter sends their question WITHOUT the file and gets an answer that
+   * never mentions it. Nothing about that reads as a failure.
+   *
+   * The count is what the composer needs and the claim list already tracks; it is published rather
+   * than exposed because the composer must RE-RENDER when it changes, and a ref cannot ask for
+   * that.
+   */
+  onReadingChanged?: (count: number) => void
 }
 
 /** `image` for an image, `document` for a PDF, `file` for the text kinds. The library uses this
@@ -93,7 +106,7 @@ function kindOf(mediaType: string): PendingAttachment['type'] {
   return 'file'
 }
 
-export function createAttachmentAdapter({ accept, staged, onRefused }: AttachmentAdapterOptions): AttachmentAdapter {
+export function createAttachmentAdapter({ accept, staged, onRefused, onReadingChanged }: AttachmentAdapterOptions): AttachmentAdapter {
   /**
    * A local `claimed` count above `staged()`, because concurrent `add()` calls (one drop
    * gesture is N parallel calls) all read `staged()` before any of them publish — without
@@ -102,15 +115,21 @@ export function createAttachmentAdapter({ accept, staged, onRefused }: Attachmen
    * has settled with nothing left unpublished (a cancelled `clearAttachments()`). A failed
    * read releases its claim immediately.
    */
-  const claimed = new Map<string, { mediaType: string; size: number }>()
+  const claimed = new Set<string>()
   let reading = 0
 
+  /** Move the in-flight count and tell whoever is drawing the composer. */
+  function readingBy(delta: number): void {
+    reading += delta
+    onReadingChanged?.(reading)
+  }
+
   /** What the caps must count right now: what the composer holds, plus what is still being read. */
-  function countable(): { mediaType: string; size: number }[] {
+  function countable(): number {
     const stagedNow = payloadsOf(staged())
     if (reading === 0) claimed.clear()
     else for (const p of stagedNow) claimed.delete(p.id)
-    return [...stagedNow, ...claimed.values()]
+    return stagedNow.length + claimed.size
   }
 
   return {
@@ -118,11 +137,10 @@ export function createAttachmentAdapter({ accept, staged, onRefused }: Attachmen
 
     async add({ file }): Promise<PendingAttachment> {
       // OUR VALIDATION, AGAINST WHAT IS ALREADY STAGED AND WHAT THIS GESTURE HAS ALREADY TAKEN.
-      // The per-message file cap and the per-conversation text-byte budget are both cumulative, so
-      // the check has to see both lists rather than only the arriving file.
+      // The per-message file cap is cumulative, so the check has to see both lists rather than
+      // only the arriving file.
       const mediaType = resolveMediaType(file)
-      const current = countable()
-      const verdict = validateAttachmentFiles([file], current.length, textAttachmentBytes(current))
+      const verdict = validateAttachmentFiles([file], countable())
       if ('error' in verdict && verdict.error) {
         onRefused(verdict.error)
         throw new AttachmentRefusal(verdict.error)
@@ -134,8 +152,8 @@ export function createAttachmentAdapter({ accept, staged, onRefused }: Attachmen
       // recognised in the staged list once the composer is holding the file — the claim and the
       // attachment have to be the same thing under the same name, or they are counted twice.
       const id = newAttachmentId()
-      claimed.set(id, { mediaType, size: file.size })
-      reading += 1
+      claimed.add(id)
+      readingBy(1)
 
       try {
         const payload: OurAttachment = {
@@ -164,7 +182,7 @@ export function createAttachmentAdapter({ accept, staged, onRefused }: Attachmen
         claimed.delete(id)
         throw err
       } finally {
-        reading -= 1
+        readingBy(-1)
       }
     },
 

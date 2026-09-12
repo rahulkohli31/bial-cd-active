@@ -18,6 +18,7 @@ from src.services.sandbox.base import (
     DevStatus,
     ExecResult,
     FileCreate,
+    FileCreateBytes,
     FileInsert,
     FileOp,
     FileResult,
@@ -130,6 +131,26 @@ def test_file_op_discriminates_each_action() -> None:
         ),
         FileInsert,
     )
+    assert isinstance(
+        _FILE_OP.validate_python(
+            {"action": "create_bytes", "path": "att/book.xlsx", "file_b64": "AAEC"}
+        ),
+        FileCreateBytes,
+    )
+
+
+def test_create_bytes_is_a_separate_op_from_create() -> None:
+    """The binary lane must not be reachable by accident.
+
+    `create` writes through `write_text` and rewrites every CRLF to LF, which corrupts any
+    binary carrying that byte pair — an Office file is a ZIP archive and carries it constantly.
+    A separate action is what keeps the no-normalisation rule a property of the op a caller
+    chose, so neither variant can be satisfied by the other's body.
+    """
+    with pytest.raises(ValidationError):
+        _FILE_OP.validate_python({"action": "create_bytes", "path": "a.bin", "file_text": "z"})
+    with pytest.raises(ValidationError):
+        _FILE_OP.validate_python({"action": "create", "path": "a.bin", "file_b64": "AAEC"})
 
 
 def test_file_op_rejects_unknown_action() -> None:

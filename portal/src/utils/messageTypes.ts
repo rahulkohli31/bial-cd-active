@@ -38,15 +38,22 @@ export interface TextPart {
   }
 }
 
-/** Image/PDF bytes living in the object store. */
+/** Image/PDF bytes living in the object store.
+ *
+ * `key` and `size` are OPTIONAL because a part can be rebuilt from the conversation
+ * projection on reload, which ships neither: the blob key is an internal storage
+ * detail the browser has no business holding, and the byte size is not needed to draw a chip.
+ * Both are carried by the composer's own upload path and neither is ever read — `key` is
+ * written at `attachmentStore.ts` and never consulted, `size` is read nowhere at all — so
+ * typing them as required would force a reload to invent values that look like data. */
 export interface FilePartImageOrDocument {
   type: 'file'
   kind: 'image' | 'document'
   attachmentId: string
-  key: string
+  key?: string
   name: string
   mediaType: string
-  size: number
+  size?: number
 }
 
 /** A HYBRID: original .docx/.xlsx bytes live in the object store (chip

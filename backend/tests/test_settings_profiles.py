@@ -175,7 +175,7 @@ def test_the_worker_boots_on_its_own_block_alone() -> None:
 def test_the_worker_profile_does_not_declare_api_only_fields() -> None:
     """Structural, not behavioural: if `auth` or `superadmin_emails` ever appear on the worker,
     the union-of-everything problem is back and the next operator dodges a gate again."""
-    api_only = {"auth", "superadmin_emails", "FRONTEND_URL", "GOTENBERG_URL", "spa_dist_dir"}
+    api_only = {"auth", "superadmin_emails", "FRONTEND_URL", "spa_dist_dir"}
     leaked = api_only & set(WorkerSettings.model_fields)
     assert leaked == set(), f"API-only fields leaked onto the worker profile: {sorted(leaked)}"
 

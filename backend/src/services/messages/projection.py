@@ -14,15 +14,20 @@ renders as a bubble — later ones are the harness's own repair/continue nudges.
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import Sequence
 from typing import Any, Final, Literal
 
+import sqlalchemy as sa
 from pydantic import Field
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.core.prompt_blocks import APPLY_SCHEMA_CHANGE_TOOL
+from src.core.prompt_blocks import APPLY_SCHEMA_CHANGE_TOOL, ATTACHMENT_READ_TOOL
+from src.db.models.attachment import Attachment
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.schemas import CamelModel
-from src.services.messages.store import ATTACHMENT_REF_KIND
+from src.services.media import chip_kind_for
+from src.services.messages.store import ATTACHMENT_FILE_REF_KIND, ATTACHMENT_REF_KIND
 
 # The Plan chat's options tool. The projection derives the card's resolution state from this
 # tool's stored call/return pair.
@@ -154,13 +159,39 @@ _AREA_GENERIC: Final = "a part of your app"
 _FILE_MUTATORS: Final = frozenset({"write_file", "edit_file", "insert_lines"})
 
 
+class AttachmentRefItem(CamelModel):
+    """One attachment on a citizen's turn, as the transcript needs to draw it.
+
+    IDENTITY WAS NOT ENOUGH. This carried only the id, and a
+    chip cannot be drawn from an id: the browser needs the filename to label it, the media type
+    to decide whether pressing it previews or downloads, and the kind to pick the shape. So a
+    reopened conversation showed no chips at all for any format, and the citizen could not see
+    which files the model was still being charged for.
+
+    `name` AND `media_type` MAY BE EMPTY, and that is a real state rather than a defect: the
+    attachment row is deleted when a conversation is reclaimed, while the id stays in the
+    message payload forever. Emitting the id with no name lets the browser draw its
+    "attachment unavailable" chip, which is the honest answer. Dropping the entry instead would
+    hide from the citizen that a file was ever there.
+    """
+
+    attachment_id: str
+    # The chip vocabulary — `document` or `image` today. Derived from the media type by
+    # `chip_kind_for`, the same function the upload response uses, so a chip rebuilt on reload
+    # is the same shape as the one the citizen watched appear.
+    kind: str = ""
+    name: str = ""
+    media_type: str = ""
+
+
 class UserTextItem(CamelModel):
     type: Literal["user_text"] = "user_text"
     seq: int
     text: str
-    # Attachment reference ids found in the prompt content — the UI renders chips; the bytes
-    # never travel on this read.
-    attachment_ids: list[str] = Field(default_factory=list)
+    # Attachments on this turn — the UI renders chips; the bytes never travel on this read.
+    # Populated with ids by `project_rows` and filled out by `project_conversation`, which is
+    # the entry point every route uses.
+    attachments: list[AttachmentRefItem] = Field(default_factory=list)
 
 
 class AssistantTextItem(CamelModel):
@@ -397,9 +428,32 @@ def _file_step_label(tool_name: str, path: str | None) -> tuple[str, bool]:
     return (f"{verb} {area}", hidden)
 
 
+def _attachment_step_label(file: str | None) -> tuple[str, bool]:
+    """(label, hidden) for a read of an attached file — and here the NAME is the friendly thing.
+
+    ★ THE ONE PLACE THIS MODULE SHOWS A FILE NAME ON PURPOSE. `_friendly_area` exists
+    because a citizen has no idea what `components/GateTable.tsx` is: that is the platform's own
+    machinery, named by the agent. An attachment is the opposite in every respect — the citizen
+    chose the file, named it, and is looking at a chip carrying that name a few inches up the
+    screen. "Looking at part of your app" over their spreadsheet would be LESS informative than
+    the raw name, and it would leave the transcript unable to say which of five attached files an
+    answer came from.
+
+    The name comes from the model's own argument, so it is the on-disk spelling rather than the
+    display name — close enough to recognise, and this module has no database to resolve the
+    other one from.
+    """
+    if not file:
+        return ("Reading the attached file", False)
+    return (f"Reading {file.rsplit('/', 1)[-1]}", False)
+
+
 def _step_label(tool_name: str, args: dict[str, Any]) -> tuple[str, bool]:
     """(label, hidden) for one tool call — the data-driven friendly mapping."""
     path = args.get("path") if isinstance(args.get("path"), str) else None
+    if tool_name == ATTACHMENT_READ_TOOL:
+        file = args.get("file")
+        return _attachment_step_label(file if isinstance(file, str) else None)
     if tool_name in _FILE_MUTATORS:
         return _file_step_label(tool_name, path)
     if tool_name == "read_file":
@@ -528,7 +582,14 @@ def _user_text_and_refs(content: Any) -> tuple[str, list[str]]:
             if isinstance(item, str):
                 if not _is_attachment_fence(item):
                     texts.append(item)
-            elif isinstance(item, dict) and item.get("kind") == ATTACHMENT_REF_KIND:
+            elif isinstance(item, dict) and item.get("kind") in (
+                ATTACHMENT_REF_KIND,
+                ATTACHMENT_FILE_REF_KIND,
+            ):
+                # BOTH KINDS. A code-lane file leaves the second marker because its bytes
+                # never became a `BinaryContent` — and reading only the first is what made a
+                # spreadsheet's chip vanish on reload while an image's survived, which is the R23a
+                # regression this work exists to close, inverted for the new formats.
                 attachment_id = item.get("attachment_id")
                 if isinstance(attachment_id, str):
                     refs.append(attachment_id)
@@ -1046,6 +1107,21 @@ def project_rows(rows: Sequence[Message]) -> list[DisplayItem]:
             merged[answered] = entry
     results = {answered: (text, was_retry) for answered, (text, was_retry, _) in merged.items()}
     items: list[DisplayItem] = []
+    # ★ ONE CHIP PER FILE, ON THE MESSAGE THAT CARRIED IT — first wins across the transcript.
+    #
+    # THE STORED MARKER CHANGED MEANING AND THE ROWS DID NOT. It used to be stamped with the whole
+    # conversation's code-lane set on every turn, so two files across four turns rendered eight
+    # chips on reload; the send route narrows it to what the message actually carried now. But a
+    # pre-narrowing row and a post-narrowing row are indistinguishable on disk — there is nothing
+    # in the payload to branch on — so `SCHEMA_VERSION` cannot discriminate them and this dedupe
+    # is a permanent heuristic rather than a migration.
+    #
+    # IT IS CORRECT ON BOTH SHAPES for one reason worth stating: `code_lane_attachments` orders by
+    # the attachment's UUIDv7 primary key, which is upload order, so an id first appears on the
+    # message that carried it whichever way the marker was written. That ordering is this dedupe's
+    # load-bearing assumption and nothing here can check it — the tests below pin the dedupe, not
+    # the ordering it rests on.
+    seen_attachments: set[str] = set()
 
     for row in rows:
         if row.entry_kind is MessageEntryKind.SYSTEM_EVENT:
@@ -1144,15 +1220,77 @@ def project_rows(rows: Sequence[Message]) -> list[DisplayItem]:
                 for part in message.get("parts", []):
                     if isinstance(part, dict) and part.get("part_kind") == "user-prompt":
                         text, refs = _user_text_and_refs(part.get("content"))
-                        if text or refs:
+                        fresh = [ref for ref in refs if ref not in seen_attachments]
+                        seen_attachments.update(fresh)
+                        if text or fresh:
                             items.append(
                                 UserTextItem(
                                     seq=row.seq,
                                     text=text,
-                                    attachment_ids=refs,
+                                    attachments=[
+                                        AttachmentRefItem(attachment_id=ref) for ref in fresh
+                                    ],
                                 )
                             )
             elif message.get("kind") == "response":
                 _project_response_parts(row, message, results, items)
 
+    return items
+
+
+async def project_conversation(
+    db: AsyncSession, *, user_id: uuid.UUID, rows: Sequence[Message]
+) -> list[DisplayItem]:
+    """`project_rows`, with every attachment chip filled in. THE ENTRY POINT ROUTES USE.
+
+    `project_rows` is a pure function over stored rows and stays that way — it is the one
+    derivation, and it is tested as a pure function. But a chip needs the filename and media
+    type, and those live in the `attachments` table rather than in the message payload, so
+    somebody with a database session has to fill them in. That is this.
+
+    IT WRAPS THE PURE FUNCTION RATHER THAN SITTING BESIDE IT because there are two callers —
+    the reload read and the live turn's catch-up snapshot — and `live == reload` is a stated
+    invariant of this module. Two routes each remembering to enrich is exactly how the two
+    drift; one entry point that cannot be used without enriching is not.
+
+    ONE QUERY FOR THE WHOLE TRANSCRIPT. The ids are collected across every item first, so a
+    conversation with forty attachments costs one read rather than forty — the N+1 this
+    codebase treats as a defect rather than a style note.
+
+    An id with no row is left with empty name and media type on purpose: the row is gone
+    (reclaimed with its conversation) but the reference survives in the payload forever, and
+    the browser draws "attachment unavailable" from exactly that state.
+    """
+    items = project_rows(rows)
+    wanted = {
+        ref.attachment_id
+        for item in items
+        if isinstance(item, UserTextItem)
+        for ref in item.attachments
+    }
+    if not wanted:
+        return items
+
+    found = (
+        await db.execute(
+            sa.select(Attachment.attachment_id, Attachment.name, Attachment.media_type).where(
+                Attachment.user_id == user_id,
+                Attachment.attachment_id.in_(wanted),
+            )
+        )
+    ).all()
+    # OWNER-SCOPED, like every other read on this platform (ADR-0004). An attachment id is a
+    # client-supplied string, so without the `user_id` predicate one citizen's transcript could
+    # name another's file simply by carrying their id.
+    by_id = {row.attachment_id: (row.name, row.media_type) for row in found}
+
+    for item in items:
+        if not isinstance(item, UserTextItem):
+            continue
+        for ref in item.attachments:
+            known = by_id.get(ref.attachment_id)
+            if known is None:
+                continue
+            ref.name, ref.media_type = known
+            ref.kind = chip_kind_for(ref.media_type)
     return items

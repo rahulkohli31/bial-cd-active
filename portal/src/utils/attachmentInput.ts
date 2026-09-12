@@ -12,23 +12,54 @@
  * deliberately out of scope here — a reachable-but-unreferenced path, unshipped not removed.
  */
 export const ALLOWED_MEDIA_TYPES = [
+  // The MODEL lane — it reads these bytes itself.
   'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf',
-  'text/csv', 'text/plain',
+  // The CODE lane — a reader in the workspace opens these and reports what it found.
+  // `text/plain` is deliberately NOT here: it works today and stops, because no client
+  // requirement names it and every format costs a reader arm, refusal copy, a test and a line
+  // in the help page. Scope Boundaries records it as a withdrawal rather than a format never
+  // added.
+  'text/csv', 'text/tab-separated-values',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 ]
-// Text media types are special-cased everywhere binary attachments are: inlined
-// as text blocks (sticky across turns), sized by bytes in the context estimate,
-// and previewed as a labelled icon (no thumbnail).
-export const TEXT_MEDIA_TYPES = new Set(['text/csv', 'text/plain'])
-// Extension tokens let the OS picker show .csv/.txt even when the OS reports an
-// inconsistent or empty MIME (see resolveMediaType).
-export const ACCEPT_ATTR = [...ALLOWED_MEDIA_TYPES, '.csv', '.txt'].join(',')
+// THE INLINE TEXT LANE IS GONE, AND SO IS ITS LAST TRACE. A CSV used to be read in the
+// browser and pushed into the prompt as a fenced text block; every attachment is now an uploaded
+// file with a stored identity, which is what lets a chip be rebuilt on reload for EVERY format by
+// one fix — the inline lane could never have produced an identity to rebuild from.
+//
+// A `TEXT_MEDIA_TYPES` set stood here, deliberately EMPTIED rather than deleted, so its three
+// call sites could move onto the uploaded path one at a time instead of all at once. They have
+// all moved. What was left was a set that answered `false` to everything, two byte caps only it
+// could reach, and a `textAttachmentBytes` helper that could only ever return 0 — dead code with
+// a live test asserting the zero, which is the residue this pass exists to remove.
 
-export const MAX_FILE_SIZE = 4 * 1024 * 1024 // 4 MB on the original File.size (image/PDF)
-// Text files are inlined verbatim into the prompt, so they're capped far lower
-// than binary attachments: 256 KB per file and 512 KB total across one selection
-// keep accumulated inline text under the context warn/truncation budgets.
-export const MAX_TEXT_FILE_SIZE = 256 * 1024
-export const MAX_TEXT_BYTES_PER_CONVERSATION = 512 * 1024
+// WHAT CAN BE SHOWN AS TEXT, which is a different question from how a file travels, and
+// the reason the set above could not simply be reused for it: `AttachmentPreview` asks whether
+// pressing a chip can render the file in place. A CSV is still perfectly readable in a browser,
+// and losing that preview would be a real regression smuggled in by a transport change.
+//
+// Office formats are absent on purpose: a spreadsheet, document or deck cannot be rendered in a
+// browser without a converter this platform does not host, so their chips return the file
+// instead.
+export const TEXT_PREVIEW_MEDIA_TYPES = new Set(['text/csv', 'text/tab-separated-values'])
+// Extension tokens let the OS picker show these even when it reports an inconsistent or empty
+// MIME — which it does constantly for Office and delimited files (see `resolveMediaType`).
+//
+// `.tab` IS HERE BECAUSE THE SERVER ACCEPTS IT. `resolveMediaType` already maps a `.tab` to
+// `text/tab-separated-values` and the TSV door admits that suffix by name — but the picker filters
+// on this list, so a citizen browsing for `movements.tab` could not select it at all, and the file
+// they were told was supported was invisible. The drag path worked; the picker path failed silently.
+export const ACCEPT_ATTR = [
+  ...ALLOWED_MEDIA_TYPES, '.csv', '.tsv', '.tab', '.xlsx', '.docx', '.pptx',
+].join(',')
+
+// ONE SIZE FOR EVERY FORMAT, matching the server's `ATTACHMENT_MAX_BYTES` exactly; a test
+// holds the two equal. Measured on the original `File.size`, so a citizen learns a file is too
+// large before it is read, encoded and sent.
+export const MAX_FILE_SIZE = 10 * 1024 * 1024
+export const MAX_FILE_SIZE_MB = MAX_FILE_SIZE / (1024 * 1024)
 export const MAX_FILES_PER_MESSAGE = 5
 // Cumulative cap across a whole conversation (all turns). Distinct from the
 // per-message cap above and the per-user 50 MB object-store cap (enforced
@@ -53,8 +84,20 @@ export function unsupportedFileMessage(fileName: string): string {
  * a spreadsheet. Rather than let that path speak the library's words, it speaks this one:
  * one author for the advice, the file name the only thing that varies.
  */
+export const ATTACHMENT_LANES_SENTENCE =
+  "Attach a picture or a PDF and I'll look at it; attach a spreadsheet, document or slide deck " +
+  "and I'll open it with code."
+
+/**
+ * ONE SENTENCE, EVERYWHERE. The composer, the help page and every unsupported-format
+ * refusal say this and nothing else — three sentences that drift is how the removed rule failed.
+ *
+ * IT DESCRIBES WHAT HAPPENS, NOT WHICH EXTENSIONS ARE ON A LIST. A list of ten formats is the
+ * shape the old copy failed as: it goes stale the moment the allowlist moves, and it tells a
+ * citizen nothing about why a spreadsheet behaves differently from a photograph.
+ */
 export function unsupportedFormatMessage(): string {
-  return "isn't supported. Attach an image (PNG, JPEG, GIF, WebP), a PDF, or a text file (CSV, TXT)."
+  return `isn't supported. ${ATTACHMENT_LANES_SENTENCE}`
 }
 
 /**
@@ -68,7 +111,10 @@ export function unsupportedFormatMessage(): string {
 export function resolveMediaType(file: File): string {
   const name = file.name || ''
   if (/\.csv$/i.test(name)) return 'text/csv'
-  if (/\.txt$/i.test(name)) return 'text/plain'
+  if (/\.(tsv|tab)$/i.test(name)) return 'text/tab-separated-values'
+  if (/\.xlsx$/i.test(name)) return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  if (/\.docx$/i.test(name)) return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+  if (/\.pptx$/i.test(name)) return 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
   return file.type
 }
 
@@ -77,20 +123,21 @@ export function resolveMediaType(file: File): string {
  * `{ error }` with a user-facing message on the first violation, or `{ ok: true }`. The
  * media type is RESOLVED first (so an OS-mislabeled CSV isn't rejected pre-canonicalization),
  * and both the allowlist and size cap run against that resolved type, measured on the
- * original `File.size`. `existingTextBytes` is the byte total already pending in the
- * composer, so the text budget is enforced across multiple picks — not just one selection.
+ * original `File.size`.
+ *
+ * TWO QUESTIONS, NOT THREE. A per-file text cap and a running text-byte budget used to sit here
+ * for the inline lane; nothing is inlined now, so both bounded a population that is always empty.
+ * Every file takes one path and one size rule.
  */
 export type AttachmentValidationResult = { error: string } | { ok: true }
 
 export function validateAttachmentFiles(
   incoming: File[],
   currentCount = 0,
-  existingTextBytes = 0,
 ): AttachmentValidationResult {
   if (currentCount + incoming.length > MAX_FILES_PER_MESSAGE) {
     return { error: `You can attach at most ${MAX_FILES_PER_MESSAGE} files per message.` }
   }
-  let textBytes = existingTextBytes
   for (const file of incoming) {
     // ONE refusal, for every unsupported format. There is no longer a special case for a legacy
     // `.doc` or `.ppt`: with the OOXML formats refused as well, "save as .docx" led nowhere, and a
@@ -99,20 +146,10 @@ export function validateAttachmentFiles(
     if (!ALLOWED_MEDIA_TYPES.includes(mediaType)) {
       return { error: unsupportedFileMessage(file.name) }
     }
-    const isTextFile = TEXT_MEDIA_TYPES.has(mediaType)
-    if (isTextFile) {
-      if (file.size > MAX_TEXT_FILE_SIZE) {
-        return { error: `"${file.name}" exceeds the ${MAX_TEXT_FILE_SIZE / 1024} KB limit for text files.` }
-      }
-      textBytes += file.size
-    } else if (file.size > MAX_FILE_SIZE) {
-      return { error: `"${file.name}" exceeds the 4 MB limit.` }
+    // Interpolated, never spelled: the figure a citizen is told is the figure enforced.
+    if (file.size > MAX_FILE_SIZE) {
+      return { error: `"${file.name}" exceeds the ${MAX_FILE_SIZE_MB} MB limit.` }
     }
-  }
-  // Inline text is sent on every turn (sticky), so bound the running total of
-  // pending text bytes — not just per file — to keep the prompt in budget.
-  if (textBytes > MAX_TEXT_BYTES_PER_CONVERSATION) {
-    return { error: `Attached text files exceed the ${MAX_TEXT_BYTES_PER_CONVERSATION / 1024} KB total limit. Remove some and try again.` }
   }
   return { ok: true }
 }
@@ -125,20 +162,6 @@ export interface PendingAttachment {
   mediaType: string
   size: number
   base64: string
-}
-
-/** Sum the byte size of the text attachments in a pending/ref list. Accepts
- * `unknown` (not just `PendingAttachment[]`) — the doc'd contract is "a
- * pending/ref list," and the only fields ever read are `mediaType`/`size`,
- * shared by both the pre-upload pending shape and the post-upload server ref.
- * A genuine non-array is a real call shape, not just defensive code:
- * `attachmentInput.test.js` pins `textAttachmentBytes(null) === 0`. */
-export function textAttachmentBytes(attachments: unknown): number {
-  if (!Array.isArray(attachments)) return 0
-  return (attachments as Array<{ mediaType?: string; size?: number }>).reduce(
-    (n, a) => n + (TEXT_MEDIA_TYPES.has(a.mediaType ?? '') ? a.size || 0 : 0),
-    0,
-  )
 }
 
 /**
@@ -157,40 +180,23 @@ export function validateConversationAttachmentCap(existingCount = 0, incomingCou
 }
 
 /**
- * A DOCUMENT LIMIT, NOT A TOKEN LIMIT, and the distinction is the whole reason this exists.
+ * THE PER-DOCUMENT LIMIT IS GONE, and its server twin with it.
  *
- * NOTHING PRICES A DOCUMENT UP FRONT, and the arithmetic that used to stand here — a flat nominal
- * per PDF, three of them over the ceiling before a word is typed — is deleted rather than
- * recomputed, exactly as it is on the server. There is no estimate on either side any more: the
- * window is measured from what the provider reports for a completed turn. Left to that gate, a
- * message too big to serve comes back as "start a new chat" — advice that does not work, because
- * the new chat refuses the identical message. The server already refuses the third document at
- * `resolve_binaries` with its own sentence; this is the same refusal one step earlier, so the
- * composer does not accept a message it knows will bounce.
+ * It was two, and it existed because a document was charged a flat figure sized to a page cap,
+ * so three could not fit one message. The limit bought the citizen a sentence naming it instead
+ * of a context refusal telling them to start a new chat, which then refuses the identical
+ * message (#194). Nothing prices a document up front any more on either side, and the page cap
+ * itself has since gone the same way: the window is measured from what the provider reports for
+ * a completed turn.
  *
- * MIRRORS `backend/src/api/v1/conversations/_shared.py` — `MAX_PDF_BLOCKS` and
- * `TOO_MANY_DOCUMENTS_MSG`. The server is the trust boundary and keeps its own check; if these two
- * ever disagree the server wins and the citizen sees its sentence instead. Raising the page cap
- * makes this stricter, not looser.
+ * It goes because a citizen attaching five files should not have to know which of them the
+ * platform considers expensive. `MAX_FILES_PER_MESSAGE` is now the only per-message count, and
+ * it covers every format.
  *
- * Counted PER MESSAGE, not per conversation: the charge is per attached block on the send, and
- * `MAX_ATTACHMENTS_PER_CONVERSATION` above answers the different, cumulative question.
+ * What replaced the guarantee is not another count: a message the conversation cannot hold is
+ * refused on the room it needs, before it is sent, which is what the removed limit was really
+ * standing in for.
  */
-export const MAX_PDF_ATTACHMENTS_PER_MESSAGE = 2
-export const TOO_MANY_DOCUMENTS_MESSAGE =
-  `You can send up to ${MAX_PDF_ATTACHMENTS_PER_MESSAGE} documents in one message. Take one out and send again.`
-
-/** How many of a pending list are PDFs. Only `mediaType` is read, so a ref list works too. */
-export function countPdfAttachments(list: readonly { mediaType?: string }[] = []): number {
-  return list.filter((a) => a?.mediaType === 'application/pdf').length
-}
-
-export function validatePdfPerMessageCap(list: readonly { mediaType?: string }[] = []): AttachmentValidationResult {
-  if (countPdfAttachments(list) > MAX_PDF_ATTACHMENTS_PER_MESSAGE) {
-    return { error: TOO_MANY_DOCUMENTS_MESSAGE }
-  }
-  return { ok: true }
-}
 
 /** Read a File as raw base64 (stripping the `data:<type>;base64,` prefix). */
 export function fileToBase64(file: File): Promise<string> {

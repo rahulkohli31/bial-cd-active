@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from pydantic_ai import Agent, RunContext
@@ -24,6 +24,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.toolsets.abstract import AbstractToolset
 
 from src.db.models.conversation import ChatKind
+from src.services.agent.attachment_tools import AttachmentReader
 from src.services.agent.read_tools import ExtractedSnapshotWorkspace
 from src.services.agent.toolsets import (
     _WRITE_STRUCTURED_READS,  # the fetch_output_slice trap's allowlist — asserted directly
@@ -407,3 +408,94 @@ def test_no_second_copy_of_the_chat_kind_wording_lives_under_backend_src() -> No
         if any(wording in path.read_text(encoding="utf-8") for wording in wordings)
     ]
     assert offenders == []
+
+
+# --- the attachment capability ------------------------------------
+
+
+def _reader_from_read_deps(ctx: RunContext[ReadDeps]) -> AttachmentReader:
+    """A stand-in accessor: these tests assert WHO is offered the tool, not what it reads."""
+    return AttachmentReader(session=cast(Any, object()))
+
+
+async def test_a_plan_chat_offered_a_reader_gets_the_attachment_tool(
+    workspace: ExtractedSnapshotWorkspace,
+) -> None:
+    """★ R14, on the arm the architecture sanctions.
+
+    Plan already executes in the container, but only the eight read-only binaries on the guest
+    list — `python3` is not among them, so it cannot invoke the shipped reader the way Build
+    does. Widening that list is unavailable: it is shared with the reviewer agent over untrusted
+    contents and takes argv and nothing else, so it cannot be loosened for one caller. Registering
+    the capability on this arm is the difference `toolsets_for_kind` exists to express.
+    """
+    seen: dict[str, Any] = {}
+    agent: Agent[ReadDeps, str] = Agent(deps_type=ReadDeps)
+    await agent.run(
+        "hi",
+        deps=_deps(workspace),
+        model=_tool_listing_model(seen, [text_turn("hello")]),
+        toolsets=toolsets_for_kind(
+            ChatKind.PLAN, workspace_from_read_deps, reader_of=_reader_from_read_deps
+        ).toolsets,
+    )
+
+    assert "read_attachment" in seen["tool_names"]
+    # And it did NOT arrive by widening what Plan may execute: the write tools are still absent.
+    assert not (_WRITE_ONLY_TOOLS | {"apply_schema_change"}) & seen["tool_names"]
+
+
+async def test_a_plan_chat_with_no_reader_is_unchanged(
+    workspace: ExtractedSnapshotWorkspace,
+) -> None:
+    """The capability is optional so the agent-level surface, which has no sandbox at all, still
+    builds a Plan run — a caller with no reader simply does not offer the tool."""
+    seen: dict[str, Any] = {}
+    agent: Agent[ReadDeps, str] = Agent(deps_type=ReadDeps)
+    await agent.run(
+        "hi",
+        deps=_deps(workspace),
+        model=_tool_listing_model(seen, [text_turn("hello")]),
+        toolsets=toolsets_for_kind(ChatKind.PLAN, workspace_from_read_deps).toolsets,
+    )
+
+    assert "read_attachment" not in seen["tool_names"]
+
+
+def test_a_build_chat_is_never_offered_the_attachment_tool() -> None:
+    """★ THE ASYMMETRY IS R15, NOT AN OVERSIGHT. Build holds an unrestricted `run_command` and can
+    read, EDIT and re-run the reader as it would any other file. A fixed-shape tool beside that
+    would be a second, weaker way to do what it already does better — and would make the reader
+    look opaque at the exact moment it stops being so.
+
+    Asserted structurally: the Build arm takes no reader accessor at all, so there is no argument
+    that could put this tool on that surface.
+    """
+    import inspect
+
+    from src.services.agent import toolsets as toolsets_module
+
+    source = inspect.getsource(toolsets_module.toolsets_for_kind)
+    plan_arm, _, build_arm = source.partition("case ChatKind.BUILD:")
+    assert "attachment_toolset" in plan_arm
+    assert "attachment_toolset" not in build_arm
+
+
+def test_the_reviewer_cannot_receive_the_attachment_tool() -> None:
+    """★ THE CONSTRAINT R14 IS REALLY ABOUT. The reviewer agent runs on the control plane over
+    untrusted project contents and SHARES its read surface with Plan — `check_the_guest_list`
+    takes argv and nothing else precisely so no body below it can ask which agent is calling.
+
+    This capability is not on that surface. It is registered by `toolsets_for_kind`, which the
+    reviewer never calls: it builds its own toolset directly from `read_only_toolset`. Asserted
+    here rather than assumed, because the day someone moves this tool into `read_tools.py` for
+    convenience is the day the reviewer silently gains it.
+    """
+    import inspect
+
+    from src.services.agent import read_tools
+    from src.services.classification import agent as review_agent_module
+
+    assert "attachment_toolset" not in inspect.getsource(read_tools)
+    assert "read_attachment" not in inspect.getsource(review_agent_module)
+    assert "toolsets_for_kind" not in inspect.getsource(review_agent_module)

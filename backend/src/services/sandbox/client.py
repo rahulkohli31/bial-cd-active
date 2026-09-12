@@ -419,7 +419,21 @@ class AcaSandboxClient(SandboxClient):
         if resp.status_code != 200:
             # A supervisor 422 (0/N str_replace matches) and 400 (missing sub-field / unknown
             # action) both surface as SandboxError.
-            raise SandboxError(f"files op failed with status {resp.status_code}")
+            #
+            # ★ THE SUPERVISOR'S OWN SENTENCE RIDES ALONG, because the status alone cannot tell
+            # an operator apart the two failures that matter most here: "unknown files action"
+            # (a container running an image that predates the action) and "path escapes
+            # workspace" (a control-plane path bug). Both are 400.
+            #
+            # SAFE TO CARRY, and on a narrower ground than "the supervisor redacts everything" —
+            # it does not: `_redact` covers `exec` output and `view` content only. What makes
+            # this safe is that every non-200 `/files` detail is ENUMERABLE and content-free —
+            # the four fixed `HTTPException` strings, plus `_resolve`'s, which echoes the path
+            # this side sent. No file bytes reach a non-200 body. Capped anyway, because a
+            # message that grows without bound is how a log becomes a payload's home.
+            raise SandboxError(
+                f"files op failed with status {resp.status_code}: {resp.text[:200]}"
+            )
         data: Any = resp.json()
         detail: dict[str, object] = {str(k): v for k, v in data.items() if k != "ok"}
         return FileResult(ok=bool(data.get("ok", True)), detail=detail)

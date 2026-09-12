@@ -37,7 +37,7 @@ from src.core.errors import AppApiError
 from src.db.models.conversation import ChatKind, Conversation
 from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses
 from src.services.conversations import gather_and_delete_conversation
-from src.services.messages.projection import measured_context_tokens, project_rows
+from src.services.messages.projection import measured_context_tokens, project_conversation
 from src.services.messages.store import load_rows
 from src.services.projects import owned_project_or_404
 from src.services.storage import ObjectStorage, sweep_blobs
@@ -237,7 +237,7 @@ async def get_conversation(conversation_id: str, user: CurrentUser, db: DbSessio
     # include_hidden=True: hidden rows render nothing, but the projection needs the unclosed
     # `build_started` markers to derive the in-progress anchor (crashed/mid-build reloads).
     rows = await load_rows(db, user_id=user.id, conversation_id=owned.id, include_hidden=True)
-    items = project_rows(rows)
+    items = await project_conversation(db, user_id=user.id, rows=rows)
     active = get_turn_engine().active_turn_info(owned.id)
     return JSONResponse(
         content={

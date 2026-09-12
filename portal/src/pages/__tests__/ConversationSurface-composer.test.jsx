@@ -20,7 +20,7 @@ const h = vi.hoisted(() => ({
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
   resolvePlanOptions: vi.fn(),
   stop: vi.fn(), getStatus: vi.fn(), relaunchPreview: vi.fn(),
-  notifyUsageChanged: vi.fn(),
+  notifyUsageChanged: vi.fn(), releaseUploadedAttachments: vi.fn(),
 }))
 
 vi.mock('../../utils/usage', () => ({ notifyUsageChanged: h.notifyUsageChanged }))
@@ -32,10 +32,16 @@ vi.mock('../../utils/builderHistory', () => ({
 // export, so a factory naming only `listProjectConversations` would leave it undefined.
 vi.mock('../../utils/conversationApi', async (importOriginal) => ({
   ...(await importOriginal()),
+  // The send path creates the chat before its first upload; stubbed so no network is reached.
+  createConversation: async () => ({ id: 'conv-created' }),
   listProjectConversations: h.listProjectConversations,
 }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
-vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
+vi.mock('../../utils/attachmentStore', async (orig) => ({
+  ...(await orig()),
+  buildUserParts: h.buildUserParts,
+  releaseUploadedAttachments: (...a) => h.releaseUploadedAttachments(...a),
+}))
 // `switchMode` is GONE from this list: the route it posted to no longer exists, and a
 // chat's kind can't change after creation, so there is nothing left for a mock to intercept.
 vi.mock('../../utils/turnStreamApi', async (orig) => ({
@@ -48,7 +54,6 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
 
 import ConversationSurface from '../../components/chat/ConversationSurface'
 import { ApiError } from '../../utils/apiError'
-import { MAX_PDF_ATTACHMENTS_PER_MESSAGE, TOO_MANY_DOCUMENTS_MESSAGE } from '../../utils/attachmentInput'
 import {
   FakeEventSource, makeClient, primeClient, primeTurn, statusResp, turnStreaming, planReply,
   waitForGateOpen, scriptBuildTurn, BUILD_TURN_ID, T_PREVIEW, T_BUILD_END,
@@ -292,12 +297,12 @@ describe('an in-flight turn belongs to ONE chat', () => {
     await waitForGateOpen()
     type('a question')
     fireEvent.keyDown(composer(), { key: 'Enter' })
-    // FOUR ARGS, ALWAYS: `startTurn(id, message, deps, create)`. `toHaveBeenCalledWith` checks
-    // argument COUNT too, so pinning fewer — as the old two-call protocol's assertion did —
-    // would pass against a differently-shaped call. `expect.anything()` for the rest: this test
-    // is about which chat the call belongs to, not the payload shape.
+    // TWO ARGS: `startTurn(id, message)`. The `create` block is gone — the row is created by its
+    // own call before the upload now — and `deps` is left to its default. `toHaveBeenCalledWith`
+    // checks argument COUNT too, so this also catches a call that quietly regrows a third.
+    // `expect.anything()` for the payload: this test is about which chat the call belongs to.
     await waitFor(() =>
-      expect(h.startTurn).toHaveBeenCalledWith('chat-A', expect.anything(), expect.anything(), expect.anything()),
+      expect(h.startTurn).toHaveBeenCalledWith('chat-A', expect.anything()),
     )
 
     // The SAME instance moves to a sibling chat (flat routing — only the chatId prop changes).
@@ -314,9 +319,9 @@ describe('an in-flight turn belongs to ONE chat', () => {
     h.startTurn.mockClear()
     type('a different question')
     fireEvent.keyDown(composer(), { key: 'Enter' })
-    // Same four-arg shape as chat A's assertion above.
+    // Same two-arg shape as chat A's assertion above.
     await waitFor(() =>
-      expect(h.startTurn).toHaveBeenCalledWith('chat-B', expect.anything(), expect.anything(), expect.anything()),
+      expect(h.startTurn).toHaveBeenCalledWith('chat-B', expect.anything()),
     )
   })
 
@@ -332,7 +337,7 @@ describe('an in-flight turn belongs to ONE chat', () => {
     await waitForGateOpen()
     type('a question')
     fireEvent.keyDown(composer(), { key: 'Enter' })
-    await waitFor(() => expect(h.startTurn).toHaveBeenCalledWith('chat-A', expect.anything(), expect.anything(), expect.anything()))
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalledWith('chat-A', expect.anything()))
 
     // They open a sibling while A's reply is still coming — the same instance, flat routing.
     h.getBuild.mockResolvedValue({
@@ -417,10 +422,12 @@ describe('a typed draft survives', () => {
   })
 
   it('a FAILED send keeps it — the toast says try again, so the text has to still be there', async () => {
-    // There is no separate create call left to fail. The row's parentage rides the
-    // turn's OWN request now, so a refused first message takes `startTurn`'s catch — the same
-    // path every later message's refusal takes — and it is what this test rejects.
-    h.getBuild.mockResolvedValue(null) // seq 0 → the FIRST message, which carries `create`
+    // A first message now makes TWO calls — `createConversation`, then `startTurn` — and this
+    // test is about the second one failing. The create is stubbed to succeed at the top of the
+    // file, so what is exercised here is `startTurn`'s catch, the same path every later
+    // message's refusal takes. (The create's own refusal is pinned in
+    // `ConversationSurface-projectfirst.test.jsx`.)
+    h.getBuild.mockResolvedValue(null) // seq 0 → the FIRST message, so the create runs too
     h.startTurn.mockRejectedValue(new Error('network down'))
     const { deps: d } = deps()
     renderAt('build-X', d)
@@ -483,15 +490,13 @@ describe('a finished build offers no canned follow-ups (2026-07-30)', () => {
     h.startTurn.mockClear()
     type('add a dark mode toggle')
     fireEvent.keyDown(composer(), { key: 'Enter' })
-    // Not this chat's first message (the reattached build turn already occupies seq 0), so
-    // `create` is `undefined` here — but still a real 4th positional argument, so
-    // `toHaveBeenCalledWith` still needs a slot for it (see the four-arg suite above).
+    // Two args, as everywhere else: the turn carries the message and nothing about the row.
+    // Not this chat's first message either (the reattached build turn already occupies seq 0),
+    // so no create call precedes it — pinned below.
     await waitFor(() =>
       expect(h.startTurn).toHaveBeenCalledWith(
         NEW_BUILD_CHAT,
         expect.objectContaining({ text: 'add a dark mode toggle' }),
-        expect.anything(),
-        undefined,
       ),
     )
   })
@@ -888,6 +893,77 @@ describe('a refused send leaves the citizen holding their message', () => {
     // It actually sent. Before the fix this press matched the stale guard and vanished.
     await waitFor(() => expect(h.startTurn).toHaveBeenCalledTimes(2))
   })
+
+  it('an upload that fails after the reader has moved on frees Send without speaking over the chat they are in', async () => {
+    // THE SAME WEDGE, ONE ARM EARLIER. `startTurn`'s abort was already unconditional; the upload
+    // arm's was gated on `stillHere()`, so an upload that failed after a chat switch settled
+    // nothing. `ComposerBox` is one long-lived instance, so its `sending` stayed true and greyed
+    // Send in EVERY chat until the page was reloaded.
+    h.getBuild.mockResolvedValue(continuing())
+    let failUpload = () => {}
+    h.buildUserParts.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => { failUpload = () => reject(new Error('the store refused it')) }),
+    )
+    const { deps: d } = deps()
+    const { rerender } = renderAt('build-X', d)
+    await waitForGateOpen()
+
+    type('what does this say?')
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+
+    rerender(
+      <MemoryRouter initialEntries={['/x']}>
+        <ConversationSurface chatId="build-Y" projectId="p1" projectName="VIP Movement" buildSessionDeps={d} />
+      </MemoryRouter>,
+    )
+    await waitForGateOpen()
+    await act(async () => { failUpload() })
+
+    // THE CHAT THEY LEFT DOES NOT TALK OVER THE ONE THEY ARE READING. Asserted as an absence with
+    // a liveness assertion beside it, so a surface that never rendered cannot pass by being empty.
+    expect(composer()).toBeTruthy()
+    expect(screen.queryByTestId('urgent-banner')).toBeNull()
+
+    // AND SEND WORKS HERE, which is the half the gated abort broke.
+    h.startTurn.mockResolvedValue({ turnId: 't1', contextTokens: null })
+    type('a message in the chat I am actually in')
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalledTimes(1))
+  })
+
+  it('an upload that lands after the reader has moved on is given back rather than left behind', async () => {
+    // The files are on the server by then, linked to the chat that was left, and no message will
+    // ever reference them — but they still count against that conversation's twenty. Four switches
+    // and the next upload there is refused with "this conversation has reached its limit of 20
+    // attachments" on a chat displaying none, with only an aged-out reclaimer to take them back.
+    h.getBuild.mockResolvedValue(continuing())
+    const uploaded = [
+      { type: 'file', attachmentId: 'att_1', kind: 'document', name: 'a.pdf', mediaType: 'application/pdf' },
+      { type: 'text', text: 'what does this say?' },
+    ]
+    let landUpload = () => {}
+    h.buildUserParts.mockImplementationOnce(
+      () => new Promise((resolve) => { landUpload = () => resolve(uploaded) }),
+    )
+    const { deps: d } = deps()
+    const { rerender } = renderAt('build-X', d)
+    await waitForGateOpen()
+
+    type('what does this say?')
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+
+    rerender(
+      <MemoryRouter initialEntries={['/x']}>
+        <ConversationSurface chatId="build-Y" projectId="p1" projectName="VIP Movement" buildSessionDeps={d} />
+      </MemoryRouter>,
+    )
+    await waitForGateOpen()
+    await act(async () => { landUpload() })
+
+    await waitFor(() => expect(h.releaseUploadedAttachments).toHaveBeenCalledWith(uploaded))
+    // AND NOTHING WAS SENT INTO THE CHAT THEY MOVED TO, which is the other half of abandoning.
+    expect(h.startTurn).not.toHaveBeenCalled()
+  })
 })
 
 /**
@@ -908,66 +984,12 @@ describe('a refused send leaves the citizen holding their message', () => {
  * answer different questions (per message vs cumulative) and a test that accepted either would go
  * green on the wrong one.
  */
-describe('★ the per-message DOCUMENT cap is enforced where the turn starts', () => {
-  const pdf = (name) => new File(['%PDF-1.7 ' + 'x'.repeat(64)], name, { type: 'application/pdf' })
-  const png = (name) => new File(['x'.repeat(100)], name, { type: 'image/png' })
-
-  /** ONE gesture carrying several files — a multi-select in the picker, or a handful dragged in
-   *  together. Every `add` starts in the same tick, which is the shape the adapter's cap has to
-   *  survive and the one a citizen actually performs. */
-  const dropAll = (...files) =>
-    fireEvent.drop(screen.getByTestId('composer-dropzone'), { dataTransfer: { types: ['Files'], files } })
-
-  /** Wait until the composer is really holding all of them — the base64 read resolves on a TASK,
-   *  so a send fired before the chips exist would carry an empty attachment list and prove
-   *  nothing about a cap. */
-  const stagedAll = (...names) =>
-    waitFor(() => names.forEach((n) => expect(screen.getByText(n)).toBeTruthy()))
-
-  const openChat = async () => {
-    h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
-    renderAt('build-X', deps().deps)
-    await waitForGateOpen()
-  }
-
-  it('refuses a THIRD document in its own words, and starts no turn', async () => {
-    await openChat()
-    dropAll(pdf('lease.pdf'), pdf('annexe.pdf'), pdf('schedule.pdf'))
-    await stagedAll('lease.pdf', 'annexe.pdf', 'schedule.pdf')
-
-    type('summarise these three')
-    fireEvent.keyDown(composer(), { key: 'Enter' })
-
-    // THE EXACT SENTENCE, not a regex that would also match the token gate's advice.
-    expect(await screen.findByText(TOO_MANY_DOCUMENTS_MESSAGE)).toBeTruthy()
-    // NO TURN. The whole point of moving the refusal into the composer is that the server never
-    // has to bounce it — a call here means the message went anyway.
-    expect(h.startTurn).not.toHaveBeenCalled()
-    // NOT THE ADVICE THAT DOES NOT WORK. A new chat refuses the identical message.
-    expect(screen.queryByText(/start a new chat/i)).toBeNull()
-    // NOT THE CONVERSATION CAP EITHER — the other cap, answering the other question.
-    expect(screen.queryByText(/reached its limit of/i)).toBeNull()
-    // A REFUSED SEND LEAVES THE CITIZEN HOLDING THEIR MESSAGE: the text and all three chips stay.
-    expect(composer().value).toBe('summarise these three')
-    expect(screen.getAllByLabelText(/^Remove /)).toHaveLength(3)
-  })
-
-  it('LIVENESS — two documents alongside images go through', async () => {
-    // The cap is `MAX_PDF_ATTACHMENTS_PER_MESSAGE` DOCUMENTS, not a total attachment count, so
-    // images ride along freely. Without this the scenario above would stay green if the composer
-    // simply stopped sending anything with a file on it.
-    expect(MAX_PDF_ATTACHMENTS_PER_MESSAGE).toBe(2)
-    await openChat()
-    dropAll(pdf('lease.pdf'), pdf('annexe.pdf'), png('floorplan.png'))
-    await stagedAll('lease.pdf', 'annexe.pdf', 'floorplan.png')
-
-    type('summarise these two and the plan')
-    fireEvent.keyDown(composer(), { key: 'Enter' })
-
-    await waitFor(() => expect(h.startTurn).toHaveBeenCalledTimes(1))
-    expect(screen.queryByText(TOO_MANY_DOCUMENTS_MESSAGE)).toBeNull()
-  })
-})
+// THE PER-MESSAGE DOCUMENT CAP IS GONE, and its tests with it. It was two, and it
+// shipped as the stopgap that stopped a 61-page PDF blowing the context budget. The count was
+// the belt beside the page cap's braces — and the page cap has since gone the same way, once
+// the flat per-document charge it was sized against stopped existing. One rule governs a message
+// now - five files, any mix - so a citizen never has to know which of their files the platform
+// considers expensive.
 
 describe('an upload the server refuses says WHY, not "try again"', () => {
   /* TWO EMITTERS, ONE BANNER, AND THE ONE THAT KNEW NOTHING WENT LAST.
@@ -976,13 +998,17 @@ describe('an upload the server refuses says WHY, not "try again"', () => {
      non-`SendRefusal` is not silence to `ComposerBox` — it is the GENERIC line. So the specific
      sentence was written and immediately overwritten.
 
-     Found in a browser, not here: a real 40-page PDF, `413 POST /api/attachments` in the network
-     log carrying "That document is too long to work with. Try one under 30 pages.", and "That
-     message did not send … try again." on screen. Retrying re-sends the same 40 pages to the same
-     cap, so the advice the citizen was actually given could never work — the failure
-     `attachmentInput.ts` names as advice that leads nowhere. */
+     Found in a browser, not here: a real refused PDF, `413 POST /api/attachments` carrying the
+     server's own sentence in the network log, and "That message did not send … try again." on
+     screen. Retrying re-sends the identical file into the identical refusal, so the advice the
+     citizen was actually given could never work — the failure `attachmentInput.ts` names as
+     advice that leads nowhere.
 
-  const REFUSAL = 'That document is too long to work with. Try one under 30 pages.'
+     THE FIXTURE MOVED WITH THE CAP. It used to be the page-cap sentence, which no longer exists;
+     what this test is really about is that ANY server sentence survives to the banner, so it now
+     carries a refusal the door still emits. */
+
+  const REFUSAL = 'That file is password-protected. Remove the password and attach it again.'
 
   it('shows the server’s sentence and keeps the message in the box', async () => {
     h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })

@@ -96,12 +96,17 @@ from src.db.models.harness_counter import HarnessCounter
 from src.db.models.message import MessageEntryKind, MessageVisibility
 from src.db.models.user import User
 from src.services.agent.agent import ChatDeps, chat_agent
+from src.services.agent.attachment_tools import AttachmentReader
 from src.services.agent.mode_prompts import PromptContext, workspace_note
 from src.services.agent.read_tools import (
     LiveSandboxWorkspace,
     ReadOnlyWorkspace,
 )
 from src.services.agent.toolsets import toolsets_for_kind
+from src.services.attachments.materialize import (
+    AttachmentDelivery,
+    AttachmentPlacementError,
+)
 from src.services.build_sessions.alarms import (
     APP_FIRST_SERVED_EVENT,
     APP_SERVING_LOST_EVENT,
@@ -265,34 +270,91 @@ _PERSIST_FAILED_MESSAGE = (
 # THE STATUS IS NOT THE MATCH, AND THAT IS THE WHOLE CARE HERE. Every malformed request Foundry
 # refuses is a 400 — an unsupported media type, a bad tool schema, a password-protected PDF —
 # and answering any of them with "this chat is full, start a new chat" sends the citizen to a
-# new chat that fails identically, which is exactly the loop `MAX_PDF_BLOCKS` exists to avoid.
+# new chat that fails identically — a loop the citizen cannot leave by following the advice they
+# were given.
 # So the provider's own sentence decides and the status only narrows it. The second marker is
 # the provider's other phrasing for the same fact: the prompt fits, the prompt plus the reply it
 # is allowed to write does not.
 _CONTEXT_OVERFLOW_MARKERS: Final = ("prompt is too long", "exceed context limit")
 
+# THE OTHER 400 A DOCUMENT CAN EARN, and it is not the same fact as a full chat.
+#
+# The provider refuses any PDF over 600 pages outright — `messages.0.content.0.pdf.source.
+# base64.data: A maximum of 600 PDF pages may be provided.` — measured through this exact stack
+# against the deployment in use. It is not a size refusal: a 0.84 MB PDF of 601 text pages is
+# refused while a 10 MB scan of forty is not, so no byte cap at the upload door can see it
+# coming, and the door deliberately imposes no page cap.
+#
+# WHY IT IS NAMED RATHER THAN LEFT GENERIC. This is a permanent property of the file the citizen
+# just attached, and "the assistant hit a problem and this turn was stopped" invites the one
+# thing that cannot work — sending again.
+#
+# AND WHY THE REMEDY NAMES BOTH HALVES. The user turn is persisted before the model is called,
+# and `load_history` rehydrates its bytes into every later turn, so the document is a permanent
+# resident of the chat it landed in and that chat refuses identically for as long as it exists.
+# Naming only a new chat — the overflow sentence — sends them somewhere the same file fails
+# again. Naming only a shorter document leaves them in a chat that will refuse it. Neither half
+# works alone.
+#
+# In practice the window usually bites first — a page costs ~2,900 tokens measured, so a
+# ~175-page document already fills the conversation — and that path is the overflow arm above.
+# This arm is for the documents that reach 600 pages while staying cheap enough per page not to
+# have overflowed on the way.
+_PDF_TOO_MANY_PAGES_MARKERS: Final = ("maximum of 600 pdf pages", "pdf pages may be provided")
 
-def _is_context_overflow(exc: ModelHTTPError) -> bool:
-    """Whether this provider refusal means the prompt did not fit, rather than any other 400.
+DOCUMENT_TOO_LONG_TEXT: Final = (
+    "That PDF has too many pages for the assistant to read, and it stays in this chat, so "
+    "every message here will hit the same limit. Start a new chat and attach a shorter "
+    "document — or split this one and attach just the part you need."
+)
+"""What the citizen reads when the provider refuses a document on its page count.
+
+Names the file as the cause and gives a remedy that works from where they are standing. Quotes no
+page number deliberately: the limit is the provider's, not the platform's, and a number stated
+here would be one more thing to keep true across a deployment change."""
+
+DOCUMENT_TOO_LONG_CODE: Final = "DOCUMENT_TOO_MANY_PAGES"
+"""The machine-readable half, riding out on the terminal frame beside the sentence."""
+
+
+def _provider_refusal_message(exc: ModelHTTPError) -> str:
+    """The provider's own sentence for a 400, or "" when there is not one to read.
 
     Defensive on the body's SHAPE while staying narrow on its CONTENT: the documented shape is
     a parsed `{"error": {"message": ...}}`, and a body that is a bare string (a gateway that
     answered with something other than the provider's JSON) is read as the message itself.
-    Anything else yields no message and therefore no match — an unreadable body is not evidence
-    that a chat is full."""
+    Anything else yields no message, and therefore matches nothing — an unreadable body is not
+    evidence of any particular cause."""
     if exc.status_code != 400:
-        return False
+        return ""
     body: object = exc.body
-    message = ""
     if isinstance(body, Mapping):
         error: object = body.get("error")
         if isinstance(error, Mapping):
             candidate: object = error.get("message")
-            message = candidate if isinstance(candidate, str) else ""
+            if isinstance(candidate, str):
+                return candidate.lower()
     elif isinstance(body, str):
-        message = body
-    lowered = message.lower()
-    return any(marker in lowered for marker in _CONTEXT_OVERFLOW_MARKERS)
+        return body.lower()
+    return ""
+
+
+def _is_document_too_long(exc: ModelHTTPError) -> bool:
+    """Whether this 400 means the attached PDF has more pages than the provider will read.
+
+    THE STATUS IS NOT THE MATCH, for the same reason it is not the match for the overflow above:
+    every malformed request is a 400, and answering an unsupported media type with "that PDF has
+    too many pages" is the same class of untrue sentence read from the other end."""
+    return any(marker in _provider_refusal_message(exc) for marker in _PDF_TOO_MANY_PAGES_MARKERS)
+
+
+def _is_context_overflow(exc: ModelHTTPError) -> bool:
+    """Whether this provider refusal means the prompt did not fit, rather than any other 400.
+
+    Narrow on CONTENT, and defensive about the body's shape through
+    `_provider_refusal_message`: a body it cannot read yields no message and therefore no match,
+    because an unreadable body is not evidence that a chat is full."""
+    return any(marker in _provider_refusal_message(exc) for marker in _CONTEXT_OVERFLOW_MARKERS)
 
 
 # THE TWO THINGS THE HARNESS SAYS WHEN NOTHING ELSE IS SPEAKING.
@@ -787,6 +849,13 @@ class _TurnState:
     # terminal frame, or a late preview frame lands after `[DONE]`. All three are None only on a
     # turn whose attach never completed.
     sandbox: SandboxSession | None = None
+    # The conversation's code-lane attachments and the store they live in, or
+    # None when it holds none. Set by the send route, which is the only layer holding both the
+    # database session and the object store; used twice — once inside the attach, to put the
+    # files in the container before the agent's first read, and once at the top of the run, to
+    # tell the agent they are there. Carrying the storage HANDLE rather than the bytes is what
+    # keeps a detached turn from pinning tens of megabytes for its whole life.
+    attachments: AttachmentDelivery | None = None
     write_session: BuildSession | None = None
     preview_task: asyncio.Task[None] | None = None
     # The liveness lease renewal. Started where the container is attached,
@@ -945,6 +1014,25 @@ def _sandbox_of(ctx: RunContext[ChatDeps]) -> SandboxSession:
     return session
 
 
+def _reader_of(ctx: RunContext[ChatDeps]) -> AttachmentReader:
+    """The ChatDeps accessor Plan's attachment reader resolves through.
+
+    It reads the same field `_sandbox_of` does, and that is the point rather than a duplication:
+    the reader runs `python3` inside the container, which is a capability no read-only workspace
+    can express — `LiveSandboxWorkspace` routes every command through `check_the_guest_list`, and
+    `python3` is deliberately absent from it. What keeps Plan read-only is the TOOLSET it is
+    handed, which contains nothing that writes; it was never the absence of this field.
+
+    Fail-first for the same reason as its neighbour: a run reaching this tool with no container is
+    a bug in the attach path, and the honest response is to say so rather than to answer about a
+    file nobody placed.
+    """
+    session = ctx.deps.sandbox
+    if session is None:
+        raise RuntimeError("attachment reader resolved on a turn with no attached sandbox")
+    return AttachmentReader(session=session)
+
+
 class TurnEngine:
     """The in-process turn registry + lifecycle (single-replica: this process is the sole
     writer, exactly the `SessionManager._active_by_user` invariant)."""
@@ -994,6 +1082,7 @@ class TurnEngine:
         manager: SessionManager,
         sandbox_client: SandboxClient | None = None,
         expects_mutation: bool = False,
+        attachments: AttachmentDelivery | None = None,
     ) -> uuid.UUID:
         """Claim the conversation, persist the user turn (caller-supplied writer, so the
         route's typed seq-contention mapping stays with the route), spawn the detached run,
@@ -1002,7 +1091,12 @@ class TurnEngine:
         shape now that both kinds attach a live container — the send route refuses a `None`
         sandbox outright, and `_attach_sandbox` fails loudly if one ever reaches it anyway.
         `expects_mutation` is the Build-it caller's declaration that this turn OWES a file
-        change; only the plan-card path opts in (see the mutation guard in `_run_write`)."""
+        change; only the plan-card path opts in (see the mutation guard in `_run_write`).
+
+        `attachments` is the conversation's code-lane files. The ROUTE resolves them
+        because only the route holds the database session and the object store together; the
+        engine holds the container and the model's context, which is where both halves of the
+        delivery happen. None until someone attaches a spreadsheet."""
         claim_conversation(conversation.id)
         try:
             await persist_user_turn()
@@ -1012,6 +1106,7 @@ class TurnEngine:
                 user_id=user_id,
                 kind=conversation.kind,
                 expects_mutation=expects_mutation,
+                attachments=attachments,
             )
             self._by_conversation[conversation.id] = state
             # ANSWER THE SCREEN BEFORE ANYTHING CAN BE SLOW.
@@ -1273,6 +1368,23 @@ class TurnEngine:
             if workspace is not None:
                 note = await self._workspace_note(state)
                 history = [*history, ModelRequest(parts=[UserPromptPart(content=note)])]
+            # AND THE ATTACHED FILES, ON THE SAME CARRIER AND FOR THE SAME REASON.
+            #
+            # An ephemeral tail rather than part of the citizen's own message: the paths are a
+            # fact about THIS container, and a container is not what a conversation is stored
+            # against. Persisting them would leave a transcript naming files at paths a later
+            # container may spell differently — and `new_messages()` never contains injected
+            # history, so this cannot reach the stored rows even by accident.
+            #
+            # UNCONDITIONAL WHENEVER THERE IS A FILE, on every turn rather than the turn it was
+            # uploaded on. The issue calls the agent writing its own parser the single failure
+            # this design exists to prevent, and an agent only knows not to when it is told —
+            # every time, because a model reads the turn in front of it.
+            if state.attachments is not None:
+                history = [
+                    *history,
+                    ModelRequest(parts=[UserPromptPart(content=state.attachments.note())]),
+                ]
             # WHAT WAS AGREED, READ OUT OF THE CONVERSATION ITSELF. No column, no
             # table, no project field: the agreement is the arguments of the last honourable
             # proposal call in these rows, which is the same bounded route the plan travels. A
@@ -1326,8 +1438,25 @@ class TurnEngine:
                         kind=state.kind,
                         prompt_context=prompt_context,
                         workspace=workspace,
+                        # SET ON THIS ARM TOO NOW. It used to be Build-only, and the
+                        # comment on the field said so — but the Plan arm's attachment reader
+                        # runs `python3` in the same container, which is a capability no
+                        # read-only workspace can express: `LiveSandboxWorkspace` routes through
+                        # `check_the_guest_list`, and `python3` is deliberately not on it.
+                        # Handing over the session does NOT widen what Plan may do: the toolset
+                        # built below is what decides that, and Plan's does not contain a single
+                        # tool that writes.
+                        sandbox=state.sandbox,
                     )
-                    toolsets = toolsets_for_kind(state.kind, _workspace_of).toolsets
+                    # THE READER IS OFFERED ONLY WHEN THERE IS SOMETHING TO READ. A tool named
+                    # `read_attachment` on a chat with no attachment is an invitation to invent a
+                    # path and then explain the failure; `toolsets_for_kind` takes the accessor as
+                    # optional for exactly this, and registration is per-run.
+                    toolsets = toolsets_for_kind(
+                        state.kind,
+                        _workspace_of,
+                        reader_of=_reader_of if state.attachments is not None else None,
+                    ).toolsets
                     # UNCONDITIONAL, BECAUSE THE TOOLSET HAS ALREADY DECIDED IT. A run can only
                     # end deferred if a tool that DEFERS was registered on it, and
                     # `present_plan_options` — the one `CallDeferred` in the tree — is on the
@@ -1549,6 +1678,24 @@ class TurnEngine:
                 self._emit(
                     state,
                     lambda seq: TurnErrorFrame(seq=seq, message=CHAT_TOO_LONG_TEXT),
+                )
+                self._finish(state, "failed")
+            elif _is_document_too_long(exc):
+                # A PROPERTY OF THE FILE, NOT OF THE CHAT, so it gets its own sentence rather
+                # than the overflow's. Same shape as the arm above otherwise: bill what ran,
+                # name the cause, finish failed.
+                _log.info(
+                    "turn_document_too_many_pages",
+                    conversation_id=str(state.conversation_id),
+                    turn_id=str(state.turn_id),
+                    status_code=exc.status_code,
+                )
+                await _bill_once()
+                state.end_reason = DOCUMENT_TOO_LONG_CODE
+                state.error_message = DOCUMENT_TOO_LONG_TEXT
+                self._emit(
+                    state,
+                    lambda seq: TurnErrorFrame(seq=seq, message=DOCUMENT_TOO_LONG_TEXT),
                 )
                 self._finish(state, "failed")
             elif _is_transient_model_status(exc.status_code):
@@ -1870,6 +2017,46 @@ class TurnEngine:
             # and a second feed would draw every step twice.
             emitter=None,
         )
+        # THE ATTACHED FILES GO IN NOW — BEFORE THE AGENT'S FIRST READ.
+        #
+        # HERE, RATHER THAN ANYWHERE ELSE, because this is the one place a turn of either kind
+        # first holds a live container, and because the container it holds may be a NEW one. The
+        # attachments root is a sibling of the app tree precisely so no snapshot or restore
+        # carries it, and the price of that is that a recycled container comes back empty — so a
+        # conversation's files are placed on every turn, not on the turn they were uploaded.
+        # `place` skips what is already there at the right size, so the ordinary second turn on a
+        # surviving container transfers nothing.
+        #
+        # A FAILURE ENDS THE TURN. Carrying on would answer a question about a file the agent
+        # cannot see, and every failure mode of that is silent: the reader says `missing`, and the
+        # model either apologises or describes the file from its name. Neither is recoverable by
+        # the citizen, and the second is indistinguishable from a real answer.
+        if state.attachments is not None:
+            try:
+                await state.attachments.place(state.sandbox)
+            except AttachmentPlacementError as exc:
+                _log.warning(
+                    "attachment_placement_failed",
+                    conversation_id=str(state.conversation_id),
+                    turn_id=str(state.turn_id),
+                    app_id=str(session.app_id),
+                    # THE CAUSE, NOT JUST THE FACT. `AttachmentPlacementError`'s own message is
+                    # written for the citizen and says only that the file could not be placed;
+                    # the storage or supervisor error underneath it is the half an operator
+                    # needs. Bound as a field rather than through `exc_info=True`: this
+                    # process's processor chain renders neither a traceback nor frame locals,
+                    # and the frame it would try to render holds the supervisor bearer.
+                    reason=str(exc.__cause__ or exc),
+                )
+                # The sentence is already citizen-facing — `place` words its own refusals for
+                # the person who attached the file, naming it.
+                unplaced = str(exc)
+                state.workspace_state = "unavailable"
+                self._emit(
+                    state,
+                    lambda seq: WorkspaceFrame(seq=seq, state="unavailable", message=unplaced),
+                )
+                raise _WriteEndedError("attachment_unavailable", unplaced) from exc
         # FENCE OFF ANY BROWSER CRASH REPORT THAT PREDATES THIS TURN. A report describes
         # the tree the browser was rendering when it crashed, and this turn is about to change
         # that tree; draining it at the end would fail a verify on a fault the agent may have

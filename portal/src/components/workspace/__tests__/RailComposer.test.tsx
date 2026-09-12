@@ -92,6 +92,45 @@ afterEach(() => {
   sessionStorage.clear()
 })
 
+// THE READ, HELD OPEN. `fileToBase64` is the boundary where the browser hands bytes back, and
+// holding it is the only way to stand inside the window the next block is about. Everything else in
+// `attachmentInput` is the real module. (`vi.mock` and `vi.hoisted` are hoisted, so their position
+// here is only for the reader.)
+const reads = vi.hoisted(() => ({ fileToBase64: vi.fn() }))
+vi.mock('../../../utils/attachmentInput', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../utils/attachmentInput')>()),
+  fileToBase64: reads.fileToBase64,
+}))
+
+describe('★ the rail holds Send while a file is still being read', () => {
+  it('does not start a chat mid-read, and says a file is arriving', async () => {
+    // The rail binds the same adapter as the chat composer, stages the same files and renders the
+    // same box — but it never mounted the pending-read provider, so the count it read was the
+    // context default 0 and Send went straight through. A workbook dropped here and sent before its
+    // read finished started the chat from the sentence alone, and the file landed nowhere.
+    //
+    // Mutation receipt: mount `RefusalSinkProvider` + `StagedAttachmentsBinding` by hand again,
+    // without `PendingReadsProvider`, and this navigates.
+    reads.fileToBase64.mockImplementation(() => new Promise<string>(() => {}))
+    renderComposer()
+
+    fireEvent.drop(screen.getByTestId('composer-dropzone'), {
+      dataTransfer: {
+        types: ['Files'],
+        files: [new File(['id,name\n1,Priya'], 'roster.csv', { type: 'text/csv' })],
+      },
+    })
+    await waitFor(() => expect(reads.fileToBase64).toHaveBeenCalledTimes(1))
+
+    send('what is in this roster?')
+
+    // No navigation: the chat was not started without its file.
+    expect(screen.queryByTestId('path')).toBeNull()
+    // And the box says why it is waiting.
+    expect(screen.getByTestId('composer-pending').textContent).toMatch(/adding your file/i)
+  })
+})
+
 describe('the mint-and-navigate protocol, carried through the deletion', () => {
   it('mints a UUIDv7, not a v4 — this id becomes a primary key', () => {
     // The id must be a sortable primary key. Two sites each kept a private `crypto.randomUUID()`

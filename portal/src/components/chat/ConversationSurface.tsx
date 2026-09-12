@@ -36,7 +36,7 @@ import type { BuildHandoff } from './OfferStrip'
 import ScrollToLatest from './ScrollToLatest'
 import SessionBanners from './SessionBanners'
 import TurnBanner from './TurnBanner'
-import { listProjectConversations } from '../../utils/conversationApi'
+import { createConversation, listProjectConversations } from '../../utils/conversationApi'
 import type { ConversationHeader } from '../../utils/conversationApi'
 import { ApiError } from '../../utils/apiError'
 import { markAppVisible } from '../../utils/observe'
@@ -89,7 +89,7 @@ import { fetchSaveState, saveProject, handOverWorkspace, asReclaimBlocked, fetch
 import type { HandoverStep, ReclaimBlocked, PreviewState } from '../../utils/buildSessionApi'
 import { resolvePlanOptions } from '../../utils/turnStreamApi'
 import { wireMessageFromParts, buildUserParts, partsToText, countAttachments, releaseUploadedAttachments } from '../../utils/attachmentStore'
-import { validateConversationAttachmentCap, validatePdfPerMessageCap } from '../../utils/attachmentInput'
+import { validateConversationAttachmentCap } from '../../utils/attachmentInput'
 import { announceDeploymentChanged } from '../../hooks/usePublishState'
 
 import { loadBuilds, getBuild, deriveTitle } from '../../utils/builderHistory'
@@ -1419,18 +1419,66 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     if (!text) return
 
     const stillHere = () => isAlive() && buildIdRef.current === activeId
+    // READ BEFORE THE AWAITS BELOW, not after: `seqRef` is what tells a first message from a
+    // continuation, and the create call has to be decided before the upload it precedes.
+    const isFirstMessage = seqRef.current === 0
 
     let parts
     try {
-      parts = await buildUserParts(text, attachments)
+      // ★ THE CHAT EXISTS BEFORE ITS FILES DO, and the order is the point.
+      //
+      // The server requires an upload to name the conversation it belongs to, and it must be a
+      // conversation that is already written — which is what makes the per-conversation count
+      // answerable at the door and leaves no file without an owner. `activeId` was already a
+      // required parameter here, so the id was never in doubt; what is new is that the ROW
+      // behind it is created first.
+      //
+      // ONLY ON THE FIRST MESSAGE. Every later turn is sending into a chat that plainly exists,
+      // and a create call there would be a round trip bought for nothing.
+      //
+      // IT SHARES THE UPLOAD'S CATCH, so a create that fails behaves exactly as a failed upload
+      // does: the banner names the server's own sentence, nothing is uploaded, the composer keeps
+      // its text and every staged chip, and Send comes back. The round trip sits inside the same
+      // pending window that already keeps Send unavailable, so nothing leaves the composer
+      // silently.
+      if (isFirstMessage && projectId) {
+        await createConversation({ id: activeId, projectId, kind })
+      }
+      parts = await buildUserParts(text, attachments, undefined, activeId)
     } catch (err) {
       // ABORT — never fall through to a turn that silently forgets the attachment. The user
       // attached a spreadsheet; answering as if they hadn't is the wrong-build bug in miniature.
-      setUrgent(err instanceof Error ? err.message : 'Could not upload the attachment. Please try again.')
-      if (stillHere()) onAbort?.()
+      //
+      // THE BANNER IS A PAINT DECISION AND THE SETTLE IS NOT, which is why only one of them is
+      // gated. A failure that lands after the reader moved on belongs to the chat they left, so
+      // its sentence must not appear over the one they are reading — but the promise
+      // `handleSubmit` is awaiting has to settle wherever they are. Left pending it never runs
+      // `ComposerBox`'s own `finally`, so that box's `sending` stays true and greys Send in EVERY
+      // chat, because the composer is one long-lived instance rather than one per conversation;
+      // `sendingRef` stays stamped too, which holds the abandoned chat's double-Enter guard shut.
+      // The `startTurn` arm below settles unconditionally for the same reason.
+      if (stillHere()) {
+        setUrgent(
+          err instanceof Error ? err.message : 'Could not upload the attachment. Please try again.',
+        )
+      }
+      onAbort?.()
       return
     }
-    if (!stillHere()) return // switched chats mid-upload — abandon, don't clobber the new chat
+    if (!stillHere()) {
+      // Switched chats mid-flight — abandon rather than clobber the new chat, but neither leave
+      // the uploads behind nor leave the promise pending.
+      //
+      // THE FILES ARE ALREADY ON THE SERVER by this point, linked to the chat that was left, and
+      // no message will ever reference them. Unreleased they still count against that
+      // conversation's twenty, so a citizen who does this four times is refused with "this
+      // conversation has reached its limit of 20 attachments" on a chat showing no attachments at
+      // all — and nothing but an aged-out reclaimer ever takes them back. The `startTurn` arm
+      // below releases for the same reason.
+      releaseUploadedAttachments(parts)
+      onAbort?.()
+      return
+    }
 
     // `prior` is passed by the handoff, which fires in the same tick as the `setMessages` that
     // restores the transcript — `messagesRef` is only refreshed on the next render, so reading it
@@ -1442,31 +1490,16 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     const userMsg: ChatMessage = { id: `local_${Date.now()}`, role: 'user', parts, seq: userSeq, createdAt: new Date().toISOString() }
     setMessages([...priorMessages, userMsg])
 
-    // THE ROW'S PARENTAGE RIDES THE TURN, AND THERE IS NO SEPARATE CREATE CALL.
+    // THE TITLE IS STILL DERIVED HERE, AND IT IS THE ONLY THING LEFT OF THE PARENTAGE BLOCK.
     //
-    // This used to be a `createBuild` round trip: the conversation was COMMITTED here, a full
-    // request before the turn — and that route's only workspace awareness was a project-ownership
-    // check. So a first message the workspace then refused left a real, titled, empty conversation
-    // in the project's list, named by `deriveTitle` after the very text that had been refused.
-    // Observed live: a citizen submitted a build, watched it run for nearly two minutes, and was
-    // then asked whether they wanted the workspace at all.
-    //
-    // The server now creates the row inside the turn's own transaction, AFTER every side-effect-free
-    // refusal and with a flush rather than a commit — so a refusal rolls it back. The whole change
-    // on this side is that one round trip is gone and its arguments moved onto the next one.
+    // The conversation row was created above, before the upload, with NO title: `deriveTitle`
+    // reads the draft, and the draft is not known a round trip earlier. So the heading the board
+    // draws comes from the same place it always did — the text being sent — and the row is named
+    // by the first message the server actually accepts.
     const derivedTitle = userSeq === 0 && projectId ? deriveTitle(partsToText(parts)) : null
-    const parentage =
-      userSeq === 0 && projectId
-        ? {
-            projectId,
-            kind,
-            title: derivedTitle ?? '',
-          }
-        : undefined
-    // OPTIMISTIC, AND DELIBERATELY SO. The row is created inside the turn's own transaction and a
-    // refusal rolls it back, so this can name a chat that never came to exist. That is the right
-    // trade for a heading: the board draws the title the moment the message is sent, and a chat
-    // whose creation was refused is one the citizen is being told about in the same breath.
+    // OPTIMISTIC, AND DELIBERATELY SO. A refused send leaves the row untitled, so this can name a
+    // chat the citizen is being told about a refusal for in the same breath. That is the right
+    // trade for a heading: it appears the moment the message is sent rather than a reply later.
     if (derivedTitle) onTitleDerived?.(derivedTitle)
     dropTransientQuery(activeId)
     refreshBuilds()
@@ -1492,18 +1525,11 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     // is read below — after the guard that decides whether anything may be painted at all.
     let outcome: StreamOutcome
     try {
-      const started = await startTurn(
-        activeId,
-        {
-          text: wire.text ?? '',
-          attachmentTexts: wire.attachmentTexts ?? [],
-          attachmentIds: wire.attachmentIds ?? [],
-        },
-        {},
-        // Present only on a first message, and the whole reason this call can now be the
-        // ONE server call the send path makes.
-        parentage,
-      )
+      const started = await startTurn(activeId, {
+        text: wire.text ?? '',
+        attachmentTexts: wire.attachmentTexts ?? [],
+        attachmentIds: wire.attachmentIds ?? [],
+      })
       posted = true
       // THE METER, FROM THE ADMISSION THAT JUST PASSED. This is the number the server measured
       // to decide whether to accept this very turn — one token higher and the call above would
@@ -1584,8 +1610,9 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       // path, and exactly when losing the message would be least forgivable.
       //
       // OUTSIDE `stillHere()`, because settling is not a rendering decision. An unsettled promise
-      // never runs `handleSubmit`'s `finally`, so `sendingRef` keeps naming this chat and every
-      // later press there matches the double-Enter guard and returns as though it had sent.
+      // never runs `ComposerBox`'s `finally`, so its `sending` stays true and greys Send in every
+      // chat; `sendingRef` also keeps naming this one, so a later press here matches the
+      // double-Enter guard and returns as though it had sent.
       //
       // `posted` is the one case that must NOT abort: the server has the message, `onSent` already
       // fired above, and this is only the subscription breaking afterwards.
@@ -1811,11 +1838,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     if (attachments.length > 0) {
       const cap = validateConversationAttachmentCap(countAttachments(messages), attachments.length)
       if ('error' in cap) throw new SendRefusal(cap.error)
-      // The DOCUMENT limit, checked before the token gate can reach the same conclusion with the
-      // wrong advice. The server refuses this too, at `resolve_binaries`; this is the same
-      // refusal one step earlier so the composer does not accept a message it knows will bounce.
-      const docs = validatePdfPerMessageCap(attachments)
-      if ('error' in docs) throw new SendRefusal(docs.error)
     }
 
     // THE CHAT THE COMPOSER STAMPED AT PRESS TIME, not whichever one is open when this

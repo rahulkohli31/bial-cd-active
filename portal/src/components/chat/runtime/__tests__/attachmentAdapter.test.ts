@@ -66,16 +66,20 @@ describe('★ a claim is given back when the citizen takes the chip back', () =>
   })
 
   it('still refuses the file that genuinely does not fit', async () => {
-    // Complement to the test above: nothing is removed here, so the release path above must not
-    // have turned the text budget into a suggestion.
+    // THE OTHER HALF, and the reason the release above is not simply 'count less'. Nothing is
+    // removed here, so every file is real and the last one is over a cap that still exists.
+    //
+    // The cap CHANGED: the 512 KB cumulative text budget went with the inline lane -
+    // a spreadsheet is an uploaded file now and never enters the prompt - so what bounds a
+    // gesture is the per-message FILE COUNT. The release must not have turned that into a
+    // suggestion either, which is the invariant this test has always been about.
     const { adapter, staged, refusals } = makeAdapter()
 
-    const first = adapter.add({ file: sheet('january.csv', 200) })
-    const second = adapter.add({ file: sheet('february.csv', 200) })
-    staged.push(await settle(first))
+    for (let i = 0; i < 5; i += 1) {
+      staged.push(await settle(adapter.add({ file: sheet(`m${i}.csv`, 10) })))
+    }
 
-    await expect(adapter.add({ file: sheet('march.csv', 200) })).rejects.toThrow(/512 KB total limit/)
+    await expect(adapter.add({ file: sheet('sixth.csv', 10) })).rejects.toThrow(/at most 5 files/)
     expect(refusals).toHaveLength(1)
-    await second
   })
 })

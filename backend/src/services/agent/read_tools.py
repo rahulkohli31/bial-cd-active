@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.toolsets.function import FunctionToolset
 
+from src.core.prompt_blocks import ATTACHMENT_READ_TOOL
 from src.core.redaction import (
     cut_before_an_open_credential,
     leaves_a_credential_value_open,
@@ -94,6 +95,63 @@ success is not summarised on a surface that has no slice handle."""
 # Public (with `IGNORED_FILES` below) so the pre-publish credential scan can walk the tree
 # under the exact exclusions the model reads under.
 IGNORED_DIRS = frozenset({".git", "node_modules", ".next", "dist", ".turbo"})
+
+# THE ONE PATH OUTSIDE THE APP ROOT THAT MAY BE NAMED. Attachments live in a sibling
+# of the app tree so nothing a citizen attaches can reach a saved version or a deployed app as a
+# side effect of being attached — which means an agent has to be able to SAY where they are.
+#
+# A PREFIX, NOT A RELAXATION. `_vet_path_token` still refuses a leading `/`, a `~` and every `..`
+# segment, unchanged and still shared with the reviewer agent; this token is an ordinary relative
+# path that passes those checks, and only `LiveSandboxWorkspace` — the Plan/Build side — maps it
+# onto the container's second root. The reviewer resolves an extracted snapshot that has no such
+# directory, so the same string simply finds nothing there.
+#
+# ★ WHICH IS EXACTLY WHY `run_command` MAY NOT SIMPLY ADMIT IT. The tools above translate this
+# prefix; a COMMAND does not — it runs inside the app's folder, where `.attachments/` does not
+# exist. So `cat .attachments/roster.csv` passed every check and then reported a file that was
+# there the whole time as missing, which is the shape an agent answers from the file's name.
+# `_refuse_an_attachment_operand` below turns that silence into a sentence, on the read surface
+# rather than in the path guard — see its own note for why the distinction is load-bearing.
+#
+# DOTTED SO IT CANNOT COLLIDE. A bare `attachments/` would shadow an app that happened to contain
+# a directory of that name, silently reading somebody's chat files when they asked for their own
+# source. The leading dot makes it a reserved namespace the generated template never writes into.
+ATTACHMENTS_PREFIX = ".attachments/"
+_CONTAINER_ATTACHMENTS_ROOT = "/workspace/attachments"
+
+
+def is_an_attachment_path(path: str) -> bool:
+    """Does this model-facing path name the attachments root rather than the app tree?"""
+    return path == ATTACHMENTS_PREFIX.rstrip("/") or path.startswith(ATTACHMENTS_PREFIX)
+
+
+def refuse_unsafe_path(path: str) -> str | None:
+    """The lexical guard, as a public entry point: why this path may not become a command operand,
+    or None if it may. Absolute, `~`-rooted and `..`-bearing tokens are refused.
+
+    ★ IT IS PUBLIC BECAUSE THE PREFIX IS NOT CONTAINMENT. `is_an_attachment_path` answers one
+    question — does this name the reserved prefix — and `.attachments/../../etc/roster.csv` answers
+    it yes. The attachment reader is the one consumer that does NOT go through
+    `LiveSandboxWorkspace`: it builds an argv and hands it to `exec`, which never meets the
+    supervisor's `_resolve`. So it needs this guard, BEFORE `to_container_path` translates —
+    exactly the order that function's own contract states — and reaching into a private from a
+    sibling module would have been the same coupling with none of the documentation.
+    """
+    return _vet_path_token(path)
+
+
+def to_container_path(path: str) -> str:
+    """Model-facing path → the path the container understands.
+
+    Applied AFTER the lexical guard, never instead of it: the token is vetted as the ordinary
+    relative path it is, and only then rewritten. An app-tree path is returned untouched, so this
+    is a translation for exactly one prefix and a no-op for everything else.
+    """
+    if not is_an_attachment_path(path):
+        return path
+    tail = path[len(ATTACHMENTS_PREFIX) :] if path.startswith(ATTACHMENTS_PREFIX) else ""
+    return f"{_CONTAINER_ATTACHMENTS_ROOT}/{tail}".rstrip("/")
+
 
 # Dependency lock files, refused at every site the directory set is applied: a lockfile
 # is the single largest file in a generated app and carries no signal worth its tokens.
@@ -341,6 +399,26 @@ def _strip_the_dot_slash(path: str) -> str:
     return path[2:] if path.startswith("./") else path
 
 
+def to_model_path(path: str) -> str:
+    """Container path → the path the MODEL was taught, the inverse of `to_container_path`.
+
+    ★ A RESULT THE MODEL CANNOT FEED BACK IS A DEAD END. `search_files` translates `subdir` on the
+    way in, so grep runs against `/workspace/attachments/…` and every hit it prints carries that
+    container-absolute prefix. Returned untranslated, those paths name a location the model was
+    never told about and that every read tool refuses — `_vet_path_token` rejects a leading `/` —
+    so a search over an attachment produced hits nothing could act on.
+
+    Translation has to be symmetric: what goes in as `.attachments/x` comes back as
+    `.attachments/x`. An app-tree path is returned untouched, so this is a no-op for everything
+    except the one reserved prefix.
+    """
+    if path == _CONTAINER_ATTACHMENTS_ROOT:
+        return ATTACHMENTS_PREFIX.rstrip("/")
+    if path.startswith(f"{_CONTAINER_ATTACHMENTS_ROOT}/"):
+        return f"{ATTACHMENTS_PREFIX}{path[len(_CONTAINER_ATTACHMENTS_ROOT) + 1 :]}"
+    return path
+
+
 def _is_under_an_ignored_dir(path: str) -> bool:
     return any(part in IGNORED_DIRS for part in path.split("/"))
 
@@ -440,7 +518,7 @@ class LiveSandboxWorkspace:
         above this does its own line windowing. Handing it pre-numbered text would number it
         twice and quietly corrupt every line the model tried to quote back."""
         self._vet(rel_path)
-        result = await self._read(["cat", "--", rel_path])
+        result = await self._read(["cat", "--", to_container_path(rel_path)])
         if result.exit != 0:
             # `cat`'s stderr is the honest reason (missing, a directory, unreadable) and it is
             # already the shape the tool layer turns into a teaching retry.
@@ -465,14 +543,18 @@ class LiveSandboxWorkspace:
     async def search_files(self, pattern: re.Pattern[str], subdir: str | None) -> list[SearchHit]:
         if subdir:
             self._vet(subdir)  # validate (escape/ignored) before it becomes a command operand
-        stdout = await self._read_out(_grep_the_tree(pattern.pattern, subdir or "."))
+        # Translated only AFTER vetting, and only for the reserved prefix — see
+        # `to_container_path`.
+        target = to_container_path(subdir) if subdir else "."
+        stdout = await self._read_out(_grep_the_tree(pattern.pattern, target))
         hits: list[SearchHit] = []
         for line in stdout.splitlines():
             path, path_sep, rest = line.partition(":")
             line_no, line_sep, text = rest.partition(":")
             if not path_sep or not line_sep or not line_no.isdigit():
                 continue  # `grep: …` diagnostics and "Binary file … matches" carry no hit
-            relative = _strip_the_dot_slash(path)
+            # Back to the vocabulary the model was given, so a hit can be passed to `read_file`.
+            relative = to_model_path(_strip_the_dot_slash(path))
             if _is_under_an_ignored_dir(relative) or _is_an_ignored_file(relative):
                 continue
             hits.append(SearchHit(path=relative, line_no=int(line_no), line=text.strip()[:300]))
@@ -628,6 +710,46 @@ def _vet_path_token(token: str) -> str | None:
     return None
 
 
+def _refuse_an_attachment_operand(token: str) -> str | None:
+    """Why a command may not name an attached file, or None when the token is not one.
+
+    ★ TEACHING, NOT FAILING. A command runs inside the app's folder; attachments live in a
+    sibling of it. So an operand naming one either resolves to nothing (`.attachments/roster.csv`,
+    relative, admitted, then missing) or is refused for its leading slash
+    (`/workspace/attachments/roster.csv`) — and both answers send the agent back to describing the
+    file from its name, which is the single outcome the whole attachment feature exists to remove.
+    Both spellings are caught because the turn note deliberately hands the model BOTH: the
+    `.attachments/` one for tools, the absolute one for commands.
+
+    IT IS NOT IN `_vet_path_token`, and that is the load-bearing half. That guard is shared with
+    `read_file` and `search_files`, which resolve this prefix perfectly well — refusing there would
+    take out `read_file(".attachments/…")` and `search_files(".attachments")` alongside the
+    reader itself. This is a fact about COMMANDS, so it lives in the command door.
+
+    A `..` SEGMENT FALLS THROUGH, deliberately. `.attachments/../../etc/passwd` satisfies
+    `is_an_attachment_path` and is a traversal attempt, not a citizen naming their spreadsheet;
+    returning None here hands it to `_vet_path_token`, whose wording is the precise one.
+
+    THE SECOND CLAUSE IS FOR THE AGENT THAT CANNOT TAKE THE FIRST. This string is handed
+    byte-for-byte to the classification reviewer, which shares this surface and can never hold the
+    reader tool — so "use the reader" alone would leave it a refusal with no next action, the exact
+    failure this refusal exists to remove.
+    """
+    if ".." in token.split("/"):
+        return None
+    absolute = token == _CONTAINER_ATTACHMENTS_ROOT or token.startswith(
+        f"{_CONTAINER_ATTACHMENTS_ROOT}/"
+    )
+    if not (is_an_attachment_path(token) or absolute):
+        return None
+    return (
+        f"`{token}` is an attached file, not app source — a command runs inside the app's folder "
+        f"and attachments live outside it. Use the `{ATTACHMENT_READ_TOOL}` tool if you have it, "
+        "passing that same path; otherwise say the file could not be read rather than describing "
+        "it from its name."
+    )
+
+
 def _denied_flag_in(flag: str, policy: CommandPolicy) -> str | None:
     """The denied flag this token carries, or None. Exact match catches the long forms; the
     per-character sweep catches short flags that hide in a cluster or wear their value
@@ -675,10 +797,21 @@ def check_the_guest_list(argv: Sequence[str]) -> str | None:
             # A path also rides in on `--flag=<path>`; vetting only bare tokens let
             # `grep --file=../../x .` walk straight out of the jail.
             if separator:
+                # BEFORE the lexical guard, on BOTH operand branches. Before, because the
+                # absolute spelling of an attachment path starts with `/` and the guard's
+                # leading-slash arm would otherwise answer first, with advice ("drop the leading
+                # `/`") that leads nowhere. Both branches, because an attachment path rides in on
+                # `grep --file=.attachments/patterns` exactly as it does bare.
+                attachment_refusal = _refuse_an_attachment_operand(value)
+                if attachment_refusal is not None:
+                    return attachment_refusal
                 path_refusal = _vet_path_token(value)
                 if path_refusal is not None:
                     return path_refusal
         else:
+            attachment_refusal = _refuse_an_attachment_operand(token)
+            if attachment_refusal is not None:
+                return attachment_refusal
             path_refusal = _vet_path_token(token)
             if path_refusal is not None:
                 return path_refusal

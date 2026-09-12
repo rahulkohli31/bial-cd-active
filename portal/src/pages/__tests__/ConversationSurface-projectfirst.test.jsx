@@ -3,8 +3,9 @@
  * when the user confirms the brief card the model replies with.
  *
  * Invariants pinned below (each fails SILENTLY otherwise):
- *  1. The seed turn is filed under a project (`header.projectId`); a refused turn ABORTS
- *     — a build never starts against a conversation row the server never created.
+ *  1. The seed turn is filed under a project: the row is CREATED first, then the file uploaded
+ *     against it, then the turn posted. A refusal at either of the first two doors ABORTS —
+ *     a build never starts against a conversation row the server never created.
  *  2. The user turn is PERSISTED (same call that folds in the project description + the
  *     interview protocol) before the relay reads it.
  *  3. Navigating between two chats never leaks one chat's composer draft into the other.
@@ -22,7 +23,7 @@ import {
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), getBuild: vi.fn(),
-  listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
+  listProjectConversations: vi.fn(), createConversation: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
   resolvePlanOptions: vi.fn(),
   previewProps: [],
@@ -37,6 +38,9 @@ vi.mock('../../utils/builderHistory', () => ({
 // export undefined, including the shared `uuidv7` `handleBuildIt` needs.
 vi.mock('../../utils/conversationApi', async (importOriginal) => ({
   ...(await importOriginal()),
+  // The send path creates the chat before its first upload; spied so its ORDER against the
+  // upload is assertable, and so a refused create can be staged.
+  createConversation: (...a) => h.createConversation(...a),
   listProjectConversations: h.listProjectConversations,
 }))
 // The REAL observe module runs for the reveal test below \u2014 only the transport is replaced, so the
@@ -90,6 +94,7 @@ beforeEach(() => {
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
+  h.createConversation.mockResolvedValue({ id: 'build-X' })
   h.buildUserParts.mockImplementation(async (text) => [{ type: 'text', text }])
   // Every turn answers with a ready-to-build brief, so a single turn reaches the card these
   // guards need. Whether the model asks or briefs is its own judgment, pinned separately at
@@ -99,15 +104,21 @@ beforeEach(() => {
 afterEach(() => cleanup())
 
 describe('BuilderPage — the seed turn is filed under a project', () => {
-  it('sends the create block (projectId + title) on the turn\'s own FIRST call, then the confirmed brief starts the build', async () => {
-    // `header.projectId` / `title` ride the turn's own `POST .../turns` as its `create` block,
-    // so the server checks the workspace BEFORE creating the row.
+  it('creates the chat row FIRST — before the upload and the turn — then the confirmed brief starts the build', async () => {
+    // The row is no longer a `create` block riding the turn: an upload has to name a conversation
+    // the server has already written, so creation is its own call and it comes first.
+    // No title rides it — the heading is derived from the draft, which is not known a round trip
+    // earlier; the turn that follows is what names the row.
     renderHandoff()
     await waitFor(() => expect(h.startTurn).toHaveBeenCalled())
-    const [id, , , create] = h.startTurn.mock.calls[0]
-    expect(id).toBe('build-X')
-    expect(create.projectId).toBe('p1')
-    expect(create.title).toBeTruthy()
+    expect(h.createConversation).toHaveBeenCalledWith({ id: 'build-X', projectId: 'p1', kind: 'build' })
+    // ORDER IS THE POINT: create → upload → turn. Asserting only that all three ran would pass on
+    // the ordering that put a file in front of a row that did not exist yet.
+    expect(h.createConversation.mock.invocationCallOrder[0])
+      .toBeLessThan(h.buildUserParts.mock.invocationCallOrder[0])
+    expect(h.buildUserParts.mock.invocationCallOrder[0])
+      .toBeLessThan(h.startTurn.mock.invocationCallOrder[0])
+    expect(h.startTurn.mock.calls[0][0]).toBe('build-X')
 
     // The handed-off prompt is an interview turn, so nothing builds until the card is confirmed —
     // and what builds is the model's REFINED brief, not the raw handoff text.
@@ -127,8 +138,22 @@ describe('BuilderPage — the seed turn is filed under a project', () => {
 })
 
 describe('BuilderPage — a refused first-message turn aborts cleanly (was "an append failure aborts the turn")', () => {
-  // The row's creation and the turn's own POST are the SAME call, so a refusal is a refused
-  // `h.startTurn` — every test below rejects it directly, with no separate row-creation call.
+  // Row creation is its own call ahead of the upload now, so a first send has TWO refusable
+  // doors. The create's arm is pinned first; the rest reject `h.startTurn` directly.
+  it('a refused row creation never uploads, and never starts a turn', async () => {
+    // The create shares the upload's catch on purpose: the server's own sentence reaches the
+    // banner and nothing downstream runs. Falling through would put a file — and a turn —
+    // against a conversation row that does not exist.
+    h.createConversation.mockRejectedValue(new Error('Project not found.'))
+    renderHandoff()
+
+    expect(await screen.findByText('Project not found.')).toBeTruthy()
+    await act(async () => { await Promise.resolve() })
+    expect(h.buildUserParts).not.toHaveBeenCalled()
+    expect(h.startTurn).not.toHaveBeenCalled()
+    expect(h.buildFromPlan).not.toHaveBeenCalled()
+  })
+
   it('never reaches a build the server refused to create a row for (network error)', async () => {
     h.startTurn.mockRejectedValue(new Error('network down'))
     renderHandoff()
@@ -213,10 +238,10 @@ describe('BuilderPage — a refine turn', () => {
     await sendAndConfirm('make it blue')
 
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
-    // A subsequent turn on an existing thread creates nothing — the row already exists, so
-    // `create` (the turn call's 4th argument) is omitted rather than passed.
-    const [, , , create] = h.startTurn.mock.calls[0]
-    expect(create).toBeUndefined()
+    // A subsequent turn on an existing thread creates nothing. The row is already written, so a
+    // create call here would be a round trip bought for nothing — and, against a server that
+    // answers an existing id idempotently, an invisible one.
+    expect(h.createConversation).not.toHaveBeenCalled()
     expect(h.buildFromPlan).toHaveBeenCalledWith('build-X', PLAN_CARD_ID, expect.any(String))
   })
 })
@@ -365,7 +390,10 @@ describe('BuilderPage — the StrictMode load strand', () => {
     // A remounted effect must not re-send the handed-off prompt: a doubled seed bills the user
     // for two relay turns and leaves the thread arguing with itself over two briefs.
     expect(h.startTurn).toHaveBeenCalledTimes(1)
-    expect(h.startTurn.mock.calls[0][3]).toMatchObject({ projectId: 'p1' })
+    // And the row is created once too — a doubled create is a second POST the server has to
+    // absorb, and the only reason it is harmless is idempotency this suite does not own.
+    expect(h.createConversation).toHaveBeenCalledTimes(1)
+    expect(h.createConversation).toHaveBeenCalledWith({ id: 'build-X', projectId: 'p1', kind: 'build' })
   })
 })
 

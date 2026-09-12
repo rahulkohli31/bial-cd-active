@@ -576,8 +576,25 @@ class FileInsert(_FileOpBase):
     insert_text: str
 
 
+class FileCreateBytes(_FileOpBase):
+    """Place a REAL FILE in the workspace — the only op here that is not text.
+
+    Its sibling `FileCreate` writes through `write_text` and rewrites every CRLF to LF, which is
+    right for source and silently corrupts a binary: an Office file is a ZIP archive and carries
+    that byte pair constantly. A separate op rather than a flag, so the no-normalisation rule
+    belongs to the op a caller chose rather than to a branch they might miss.
+
+    `file_b64` is base64 of the real bytes. The supervisor holds NO size ceiling of its own —
+    the decoded length is bounded once, at the upload door, and a second number here would be a
+    limit nobody could see from the place that produces the bytes.
+    """
+
+    action: Literal["create_bytes"] = "create_bytes"
+    file_b64: str
+
+
 FileOp = Annotated[
-    FileView | FileStrReplace | FileCreate | FileInsert,
+    FileView | FileStrReplace | FileCreate | FileInsert | FileCreateBytes,
     Field(discriminator="action"),
 ]
 """The typed `/files` request. `files()` takes one `FileOp` and returns one

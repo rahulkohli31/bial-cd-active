@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import Literal
 
 import sqlalchemy as sa
@@ -25,7 +25,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic_ai import BinaryContent
 from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
 from pydantic_ai.models import Model
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.api.deps import CurrentUser, DbSession
@@ -50,16 +49,20 @@ from src.api.v1.conversations.schemas import (
 from src.api.v1.live_build import ReclaimBlockedEnvelope, reclaim_blocked_response
 from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry, AppStatus
-from src.db.models.conversation import ChatKind, Conversation
+from src.db.models.conversation import Conversation
 from src.db.models.message import MessageEntryKind, MessageVisibility
 from src.db.models.project import Project
 from src.db.models.user import User
 from src.schemas import AUTH_401, CamelModel, DailyTokenLimitBody, ErrorEnvelope, error_responses
 from src.services.agent.mode_prompts import PromptContext
+from src.services.attachments.materialize import (
+    AttachmentDelivery,
+    code_lane_attachments,
+)
 from src.services.build_sessions import SandboxReclaimBlockedError
 from src.services.build_sessions.appdata import APP_SWITCHED_OFF, APP_SWITCHED_OFF_CODE
 from src.services.build_sessions.manager import SessionManager
-from src.services.messages.projection import DisplayItem, project_rows
+from src.services.messages.projection import DisplayItem, project_conversation
 from src.services.messages.store import (
     AttachmentRehydrationError,
     SeqContentionError,
@@ -67,7 +70,6 @@ from src.services.messages.store import (
     load_history,
     load_rows,
 )
-from src.services.projects import owned_project_or_404
 from src.services.redis import build_coordination_or_503
 from src.services.sandbox import SandboxClient
 from src.services.turns.copy import (
@@ -109,34 +111,21 @@ _DONE = b"data: [DONE]\n\n"
 KEEPALIVE_SECONDS = 15.0
 
 
-class NewConversation(CamelModel):
-    """The parentage of a conversation that DOES NOT EXIST YET (R-18).
-
-    Present only on a chat's first message; carries only what a row needs, nothing else. WHY:
-    the browser used to create the row via a separate `POST /v1/conversations` a round trip
-    earlier, checking only project ownership, so a refused message left an orphaned, titled,
-    empty conversation. That route is still MOUNTED and works — only its client went, so don't
-    read this as a retirement notice. Folding creation into this request lets refusals roll the
-    row back too."""
-
-    project_id: uuid.UUID
-    # REQUIRED, and this is still the only place a chat's kind is ever set. There is no route
-    # that changes it afterwards; a value outside the enum is refused at this boundary rather
-    # than coerced, because "which chat is this" decides what the model can do.
-    kind: ChatKind
-    title: str | None = None
-
-
 class StartTurnBody(CamelModel):
-    """`POST /conversations/{id}/turns` — the new message; the conversation id rides the
-    path.
+    """`POST /conversations/{id}/turns` — the new message; the conversation id rides the path.
 
-    `create` is present only on a chat's first message, and it is what makes R-18 true: check
-    the workspace, THEN create, THEN run. Absent for every subsequent turn, where the row
-    already exists and an unknown id is a client bug."""
+    ★ NO `create` BLOCK RIDES THIS CALL. One used to, carrying a not-yet-written chat's
+    parentage so the row could be created inside this request, after every side-effect-free
+    refusal — which kept a refused first message from leaving an orphaned, titled, empty chat
+    behind. That guarantee is deliberately traded away: attachments are uploaded AGAINST a
+    conversation now, so the row has to exist a round trip earlier, and `POST /v1/conversations`
+    creates it. The residue is real and recorded — a refused first send leaves an empty chat —
+    and sweeping it is a separate, already-tracked task.
+
+    An unknown conversation id is therefore a client bug on every turn, first or hundredth, and
+    answers the same non-leaking 404 a stranger's id does."""
 
     message: TurnMessage
-    create: NewConversation | None = None
 
 
 def _frame_bytes(frame: TurnStreamFrame) -> bytes:
@@ -213,15 +202,44 @@ async def start_conversation_turn(
     visibility: MessageVisibility = MessageVisibility.VISIBLE,
     meta: dict[str, object] | None = None,
     expects_mutation: bool = False,
+    attachments: AttachmentDelivery | None = None,
+    file_attachment_ids: Sequence[str],
 ) -> uuid.UUID:
     """Persist the user turn and start the run — ONE expression, two readers.
 
     `POST /turns` and `Build it` differ only in prompt origin, visibility, and whether a file
     change is OWED; the rest (pre-run write, engine claim, conflict mappings) is identical, so
     one copy stops two guards drifting apart. `visibility=HIDDEN` puts Build-it's machine seed
-    in model history without the citizen seeing it (`load_history` ignores it, `project_rows`
+    in model history without the citizen seeing it (`load_history` ignores it, the projection
     skips it). `expects_mutation` travels to the engine: no file change makes a Build-it turn a
-    FAILED build but a Write turn just an answered question — only the caller knows which."""
+    FAILED build but a Write turn just an answered question — only the caller knows which.
+
+    `attachments` is the conversation's code-lane files. Only `POST /turns` passes
+    one; Build-it's `None` is a fact rather than a gap, because that route CREATES the Build
+    chat it starts — there is no conversation yet for a file to have been attached to."""
+
+    # THE STORED ROW RECORDS THE CODE LANE; THE PROMPT DOES NOT. A code-lane file's bytes
+    # must never enter the prompt — that is the whole lane — but the message still has to RECORD
+    # that the file was sent, because three separate things decide what is still referenced by
+    # scanning stored payloads: the never-sent reclaimer, the conversation cascade, and the
+    # projection that rebuilds chips on reload. With nothing in the payload all three were blind,
+    # and the reclaimer deleted live spreadsheets as orphans 48 hours after upload.
+    #
+    # ★ THE MARKER NAMES THE MESSAGE THAT CARRIED THE FILE, AND THE CALLER DECIDES WHICH THOSE ARE.
+    # It used to be taken from `attachments.files`, which is the CONVERSATION's code-lane set —
+    # deliberately so, because a recycled container is re-filled every turn — so every later
+    # message in a chat was stamped with every file the chat had ever held. Two files across four
+    # turns drew eight chips. The delivery stays conversation-scoped; only the durable marker
+    # narrows, and it narrows here rather than there.
+    #
+    # NO DEFAULT, so a new caller has to answer the question. `()` is a perfectly good answer —
+    # `transition.py` gives it — but it has to be given.
+    #
+    # The ids go to the STORE rather than into `prompt`, because a marker is a payload concept:
+    # `UserPromptPart.content` has no room for one (an unknown dict coerces to `CachePoint`), which
+    # is the same reason `_externalize_binaries` runs on the serialized tree. `load_history` drops
+    # them again, so the model never meets one.
+    file_refs = list(dict.fromkeys(file_attachment_ids))
 
     async def persist_user_turn() -> None:
         await append_batch(
@@ -233,6 +251,7 @@ async def start_conversation_turn(
             kind=conversation.kind,
             visibility=visibility,
             meta=meta,
+            file_attachment_ids=file_refs,
         )
 
     engine = get_turn_engine()
@@ -251,6 +270,7 @@ async def start_conversation_turn(
             manager=manager,
             sandbox_client=sandbox,
             expects_mutation=expects_mutation,
+            attachments=attachments,
         )
     except ConversationBusyError:
         raise AppApiError(409, "A turn is already running for this conversation.") from None
@@ -275,16 +295,12 @@ async def start_conversation_turn(
             ReclaimBlockedEnvelope,
             "The agent is already working here, or another project holds the workspace",
         ),
-        # TWO DIFFERENT REFUSALS SHARE THIS STATUS, and naming only one of them made the schema
-        # read as though the other could not happen. `resolve_binaries` (`_shared.py`) answers a
-        # third document on one message with the same 413 and its own `too_many_documents` code —
-        # a per-MESSAGE document cap, not the cumulative size limit. The `code` field is what
-        # tells them apart; the description now admits both exist.
+        # ONE REFUSAL ON THIS STATUS. A per-message document cap used to share it and is gone;
+        # a message carrying too many files is refused by the request validator instead.
         (
             413,
             ErrorEnvelope,
-            "This conversation has grown past its per-conversation limit, "
-            "or the message carries more than two documents",
+            "This conversation has grown past its per-conversation limit",
         ),
         (429, DailyTokenLimitBody, "Daily token limit exceeded"),
         (503, ErrorEnvelope, "Claude client not configured"),
@@ -301,48 +317,29 @@ async def start_turn(
     manager: SessionManagerDep,
     sandbox: OptionalSandbox,
 ) -> TurnStartResponse | JSONResponse:
-    # R-18 — CHECK, THEN CREATE, THEN RUN, and the order is the whole deliverable.
+    # ★ THIS ROUTE CREATES NO CONVERSATION: the row exists a round trip before this call.
     #
-    # A first message used to commit its conversation row a round trip EARLIER, in
-    # `POST /conversations`, whose only workspace awareness was a project-ownership check. Only
-    # afterwards did this route ask whether the workspace was free — so a refused or declined
-    # first message deposited a real, titled, empty conversation into the project's list, named
-    # after the text that was refused. Observed live: a citizen submitted a build, watched it run
-    # for nearly two minutes, and was then asked whether they wanted the workspace at all.
+    # It used to. A `create` block rode the first message so the row could be staged here and
+    # flushed below, after every side-effect-free refusal — which meant a refused first message
+    # left nothing behind at all, and the project's chat list was afterwards exactly as long as
+    # it was before (R-18). That was worth having, and it is being traded knowingly.
     #
-    # Nothing durable — no row, no title, no list entry — may exist before the workspace answer is
-    # known. So the row is STAGED here and created below, after every side-effect-free refusal has
-    # passed, and it becomes durable only when the turn's own commit lands.
+    # WHAT BOUGHT IT OUT: a file is uploaded AGAINST a conversation now, so the row has to exist
+    # before the composer's first upload — a round trip earlier than this one. Two orderings
+    # cannot both be true, and the one that makes an upload's owner knowable at the door is the
+    # one that removes a whole class of ownerless file.
     #
-    # THE PATTERN IS ALREADY IN THE TREE. `build_it` — the Build-this-plan transition — is the same
-    # shape and already gets it right: preflight first, then `db.add` + `db.flush()` and
-    # deliberately NOT a commit. This copies it rather than inventing a second ordering.
-    staged = body.create
-    existing = await _conversation_or_none(db, user.id, conversation_id)
-    conversation: Conversation | None
-    project_id: uuid.UUID
-    if existing is not None:
-        # A `create` block on a conversation that already exists is a retry or a second tab. The
-        # existing row wins; the block is ignored rather than refused, matching the idempotency
-        # `POST /v1/conversations` gives on the same id (it answers 200 with the existing header
-        # rather than 409ing a retry). Clearing `staged` is what makes that true —
-        # it is the sole guard on the row-creating branch far below.
-        staged = None
-        conversation, project_id = existing, existing.project_id
-    elif staged is not None:
-        conversation, project_id = None, staged.project_id
-        # OWNERSHIP FIRST, and before anything else reads this project. A 404 here is the same
-        # non-leaking answer the resolver gives, so a project under another owner is
-        # indistinguishable from one that does not exist. Only this arm needs it: an existing
-        # conversation was already read under this user's scope.
-        await owned_project_or_404(db, user.id, project_id)
-    else:
-        # Unchanged for every turn after the first: THIS route creates a conversation only from a
-        # `create` block, so an unknown id with no parentage to build one from is a client bug —
-        # and a cross-user id is indistinguishable from it, which is one non-leaking 404.
-        # Not a claim that a row can be born no other way: `POST /v1/conversations`
-        # still creates one outright, with no message, and is deliberately retained.
+    # THE RESIDUE, STATED RATHER THAN DISCOVERED: a first message refused by the workspace gate,
+    # the daily cap, the sandbox slot or the context wall now leaves a real, empty conversation
+    # row. It carries no title (`POST /v1/conversations` is called before the citizen's text is
+    # known, and stamping refused text into a row nobody can delete would be worse), and sweeping
+    # it is a separate, already-tracked task rather than this route's.
+    conversation = await _conversation_or_none(db, user.id, conversation_id)
+    if conversation is None:
+        # An unknown id is a client bug on every turn now, first or hundredth — and a cross-user
+        # id is indistinguishable from it, which is one non-leaking 404 (ADR-0004).
         raise AppApiError(404, "Conversation not found.")
+    project_id = conversation.project_id
 
     # Daily-token gate BEFORE anything persists — a capped user's message is refused
     # whole, never half-recorded. The error carries its own byte-stable body (limit/used/
@@ -436,8 +433,9 @@ async def start_turn(
         #
         # AND IT IS ALSO THE HAND-OVER'S PREFLIGHT, which is why the body it returns carries
         # more than the status. The browser asks the one-workspace question BY SENDING — every
-        # refusal above this line is side-effect-free, so a send that is refused leaves no chat,
-        # no turn row and no spent card — and draws its dialog from what comes back:
+        # refusal above this line leaves no turn row and no spent card (it no longer leaves no
+        # CHAT: the row is created a round trip earlier now, see the block above the daily gate)
+        # — and draws its dialog from what comes back:
         # `projectName` for which project holds the workspace, and `agentWorking` for whether
         # that project's agent is mid-thought, of ANY kind (`building` stays narrow, and only
         # marks a turn that can write — see `SandboxReclaimBlockedError`). Neither fact is
@@ -466,7 +464,37 @@ async def start_turn(
             raise AppApiError(400, str(exc)) from None
 
     history = await _history()
-    binaries = await resolve_binaries(db, storage, user.id, body.message.attachment_ids)
+    # THE TWO LANES SPLIT HERE, AND THIS IS THE ONLY PLACE THAT KNOWS BOTH.
+    #
+    # One query answers both halves. The files it returns are the ones the platform must write
+    # into the container and name to the agent; their ids are exactly the ids that must NOT reach
+    # `resolve_binaries`, because the rehydrator behind it re-asserts the model allowlist — which
+    # was deliberately not widened — and would refuse a perfectly good spreadsheet as "no longer
+    # matching its declared type". Asking the question twice is how those two answers drift apart.
+    #
+    # SCOPED TO THE CONVERSATION, NOT TO THIS MESSAGE, for a reason that only shows up on the
+    # second turn: `/workspace/attachments` is a sibling of the app tree so that no snapshot or
+    # restore carries it, which means a recycled container comes back without it. The message's
+    # own ids are passed as well, so a row whose conversation link was never stamped is still
+    # found (the column is nullable on purpose).
+    code_lane = await code_lane_attachments(
+        db,
+        user_id=user.id,
+        conversation_id=conversation_id,
+        attachment_ids=body.message.attachment_ids,
+    )
+    delivery = (
+        AttachmentDelivery(files=tuple(code_lane), storage=storage)
+        if code_lane and storage is not None
+        else None
+    )
+    binaries = await resolve_binaries(
+        db,
+        storage,
+        user.id,
+        body.message.attachment_ids,
+        skip={file.attachment_id for file in code_lane},
+    )
     prompt = prompt_content(body.message, binaries)
 
     # The per-conversation guardrail — STILL ABOVE THE FIRST WRITE, which is what the ordering
@@ -503,82 +531,19 @@ async def start_turn(
             detail={"occupied": exc.occupied, "hardLimit": exc.hard_limit},
         ) from None
 
-    # THE CREATION, AND IT LANDS HERE FOR A REASON THAT IS EASY TO GET WRONG BY ONE LINE.
+    # ★ NOTHING IS CREATED OR ADOPTED HERE ANY MORE, and the two deletions are one change.
     #
-    # Every refusal above this point is side-effect-free — the daily cap, the missing workspace,
-    # "your own other chat is running", the reclaim refusal, the context guardrail — so a message
-    # refused by any of them leaves NOTHING behind. That is R-18: the project's conversation list
-    # is afterwards exactly as long as it was before.
+    # A staged conversation row used to be flushed at this point — after every side-effect-free
+    # refusal, before the turn's own commit — together with an `IntegrityError` arm for two first
+    # messages racing the same minted id. Both are gone with the `create` block: the row exists
+    # before this request is made, and the race it guarded is `POST /v1/conversations`'s now,
+    # where the same arm already lives.
     #
-    # `flush`, NOT `commit`. The row becomes durable only when `start_conversation_turn` commits it
-    # together with the first message, so a failure between the two leaves neither — and every
-    # refusal below it still rolls the row back through `get_db`. Committing here would restore the
-    # exact orphan this reorder exists to remove, one line lower down.
-    if staged is not None:
-        conversation = Conversation(
-            id=conversation_id,
-            user_id=user.id,
-            project_id=project_id,
-            kind=staged.kind,
-            title=staged.title,
-        )
-        db.add(conversation)
-        try:
-            await db.flush()
-        except IntegrityError:
-            # THE RACE BACKSTOP, transcribed from `transition.build_it` — the sibling route that
-            # creates a conversation the same way and has had this arm all along.
-            #
-            # THE ORDINARY DOUBLE SEND NEVER REACHES HERE: it was answered by the owner-scoped
-            # read at the top of this route, which is one SELECT rather than a failed INSERT.
-            # What lands here is two first messages on the same minted id genuinely in flight at
-            # once — a duplicated tab on a fresh chat, or a client that re-posted — where both
-            # found nothing up there and one of them loses this insert. Without the arm that
-            # loser got a bare 500: the citizen was told their message failed and watched it
-            # vanish from the screen while the reply it started was actually running.
-            #
-            # `rollback` rather than a savepoint, for the same reason the sibling gives: this is
-            # the one path holding an object the database refused, it has to go, and nothing
-            # this request has written so far is durable — the row above is the first write, and
-            # it is deliberately flushed rather than committed.
-            #
-            # THE RE-READ CANNOT COME BACK EMPTY on the path that gets here. Postgres blocks a
-            # duplicate-key insert until the transaction holding the key settles, so an
-            # `IntegrityError` means the winner has already committed and is visible. An empty
-            # read would mean the id belongs to another owner, and the 404 below is then the
-            # same non-leaking answer every other cross-owner lookup gives.
-            await db.rollback()
-            # THE ROLLBACK EXPIRES EVERY ORM INSTANCE THIS REQUEST HAS LOADED, and both of the
-            # ones below are read after it — `user.id` scopes the re-read on the very next line
-            # and every query under it, and `user.display_name`/`user.email` and `project.name`
-            # compose the prompt context. An expired attribute is fetched lazily, which in an
-            # ASYNC session is IO in a place SQLAlchemy cannot await: it raises `MissingGreenlet`
-            # and the citizen gets exactly the bare 500 this arm exists to replace. Refreshed
-            # explicitly, awaited, so the reads below are ordinary attribute reads again — two
-            # SELECTs on a path that only runs when two first messages genuinely raced.
-            await db.refresh(user)
-            await db.refresh(project)
-            conversation = await _conversation_or_none(db, user.id, conversation_id)
-            if conversation is not None and conversation.project_id != project_id:
-                # THE WINNER'S ROW IS THE AUTHORITY ON WHICH PROJECT THIS CHAT BELONGS TO, the
-                # same rule the `existing` arm applies five branches up. The staged body is the
-                # LOSER's, and if the two asks named different projects then everything below
-                # that still reads the staged id — which app the turn pins, and whose project
-                # name goes into the prompt — would describe a different project from the one
-                # `start_conversation_turn` is handed off `conversation.project_id`. One turn
-                # cannot belong to two projects; the row that exists decides.
-                project_id = conversation.project_id
-                winner = await db.get(Project, project_id)
-                if winner is None:  # the winner's project vanished under us
-                    raise AppApiError(404, "Conversation not found.")
-                project = winner
-        else:
-            # The refresh is not optional: server-default timestamps on a fresh row raise
-            # `MissingGreenlet` when projected without one. It belongs to the winning arm only —
-            # the loser's row was loaded by a SELECT and already has them.
-            await db.refresh(conversation)
-    if conversation is None:  # the losing arm's cross-owner id; otherwise unreachable
-        raise AppApiError(404, "Conversation not found.")
+    # And this is where NULL-linked uploads were adopted into the conversation. There are none to
+    # adopt: an upload names its conversation at the door, so the link is stamped at insert. What
+    # the link no longer proves is that a message CARRIED the file — a refused first send leaves
+    # its uploads linked and unsent — which is why `code_lane_attachments` reads the sent set out
+    # of the stored payloads rather than trusting the link.
 
     # Free text while plan options are pending resolves them as an implicit "keep refining".
     # The model must see a RESOLVED call — the dangling-call repair never has to guess
@@ -598,6 +563,7 @@ async def start_turn(
         project_description=project.description or None,
     )
     app_id = await _app_id_for_project(db, user.id, project_id)
+    sent_ids = set(body.message.attachment_ids)
 
     turn_id = await start_conversation_turn(
         db=db,
@@ -611,6 +577,19 @@ async def start_turn(
         factory=factory,
         manager=manager,
         sandbox=sandbox,
+        attachments=delivery,
+        # ★ THE FILES THIS MESSAGE CARRIED, WHICH IS NOT THE SAME SET THE DELIVERY HOLDS.
+        # `delivery` is the whole conversation's code lane — every turn re-places it, because a
+        # recycled container comes back empty — while the durable marker is a claim about THIS
+        # message, and the projection draws a chip from it. Stamping the delivery made every later
+        # message claim every file the chat had ever held: two files across four turns, eight
+        # chips. Intersected with what the citizen actually sent, and ordered by the delivery so
+        # the marker follows upload order rather than however the request listed them.
+        file_attachment_ids=[
+            file.attachment_id
+            for file in (delivery.files if delivery is not None else ())
+            if file.attachment_id in sent_ids
+        ],
     )
     # `None` rather than `0` for a conversation nobody has measured — see the field's own note.
     # A brand-new chat is UNMEASURED, not empty, and the meter stays silent on the difference.
@@ -682,7 +661,7 @@ async def turn_events(
             rows = await load_rows(
                 db, user_id=user.id, conversation_id=conversation.id, include_hidden=True
             )
-            projected = project_rows(rows)
+            projected = await project_conversation(db, user_id=user.id, rows=rows)
             items = projected[-8:]  # the turn's own tail; full history is a separate GET
         snapshot = engine.build_snapshot(state, items=items)
 

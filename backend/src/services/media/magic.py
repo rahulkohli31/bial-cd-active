@@ -13,6 +13,8 @@ A retired chat relay was a third consumer, and re-checking there is why this is 
 
 from __future__ import annotations
 
+from src.services.media.lanes import is_code_lane
+
 # Allowlisted media types → magic-byte prefix. WebP is a RIFF container: the "RIFF" prefix is
 # checked here and the "WEBP" form-type at offset 8 separately (see `bytes_match_declared`).
 ALLOWED_MEDIA: dict[str, bytes] = {
@@ -38,3 +40,30 @@ def bytes_match_declared(media_type: str, data: bytes) -> bool:
     if magic is None or not magic_matches(data, magic):
         return False
     return not (media_type == "image/webp" and data[8:12] != b"WEBP")
+
+
+def chip_kind_for(media_type: str) -> str:
+    """The chip vocabulary the browser branches on: `document` for a PDF, `image` otherwise.
+
+    HERE RATHER THAN AT THE UPLOAD ROUTE, which is where this rule used to live as a lone
+    ternary. It now has a second caller — the conversation projection, which has to name the
+    same kind for a chip rebuilt on reload as the upload response named when the file was first
+    attached. Two call sites deriving one vocabulary independently is how a reloaded chip ends
+    up rendering as a different shape from the one the citizen just watched appear.
+
+    THREE KINDS, ONE PER THING A CHIP CAN DO. An image opens over the conversation, a
+    PDF opens in a tab, and a code-lane file returns the file — because a spreadsheet, document or
+    deck cannot be rendered in a browser without a converter this platform does not host.
+    `image` is the fallback rather than `file`, so an unrecognised type keeps the behaviour it had
+    before the code lane existed rather than silently becoming a download.
+
+    It sits beside `ALLOWED_MEDIA` deliberately: the five formats admitted here each need a kind
+    here in the same change. Splitting them across two modules is what would let a format be
+    admitted with no chip that knows what to do with it — a spreadsheet drawn as a broken
+    thumbnail, which is what the `image` fallback would have made of one.
+    """
+    if media_type == "application/pdf":
+        return "document"
+    if is_code_lane(media_type):
+        return "file"
+    return "image"

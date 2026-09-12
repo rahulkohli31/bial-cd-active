@@ -20,6 +20,8 @@ exist without `/dev/start` (the agent has replaced the supervisor's child before
 
 from __future__ import annotations
 
+import base64
+import binascii
 import collections
 import enum
 import http.client
@@ -41,6 +43,17 @@ from pydantic import BaseModel
 # --- config (fail-fast: required settings have no defaults) --------------------------------
 TOKEN = os.environ["SUPERVISOR_TOKEN"]
 WORKSPACE = Path(os.environ.get("WORKSPACE", "/workspace/app"))
+# WHERE ATTACHMENTS LIVE, AND WHY IT IS NOT UNDER `WORKSPACE`. `WORKSPACE` is the tree
+# that BECOMES the citizen's app: it is snapshotted, restored, saved and deployed. A file someone
+# attached to a chat must not travel with any of that as a side effect of having been attached, and
+# excluding it from each of those paths in turn means getting every exclusion right forever.
+# Keeping it out of the tree means there is nothing to exclude.
+#
+# A SIBLING, NOT A CHILD. `/workspace/attachments` shares the volume — the sandbox is already there
+# and can already run code, which is the whole reason attachments are here at all — but no
+# snapshot,
+# restore or deploy walks it.
+ATTACHMENTS = Path(os.environ.get("ATTACHMENTS_DIR", "/workspace/attachments"))
 APP_USER = os.environ.get("APP_USER", "appuser")
 # The dev server's self-announcement. It no longer decides ANYTHING: "✓ Ready in <ms>" is printed
 # once the server is listening, which is BEFORE the first route has compiled, so it announced a
@@ -227,11 +240,23 @@ _DEMOTE: dict[str, object] = {"user": APP_UID, "group": APP_GID, "extra_groups":
 
 
 def _resolve(path: str) -> Path:
-    """Resolve a request path under WORKSPACE and refuse escapes."""
+    """Resolve a request path under one of the two roots, and refuse everything else.
+
+    A RELATIVE PATH IS STILL APP-RELATIVE, unchanged: that is what every existing caller sends and
+    what the agent's own tools produce. The second root is reachable only by naming it absolutely,
+    so no relative path can change meaning because `/workspace/attachments` came into existence —
+    an app that happens to contain its own `attachments/` directory still resolves there.
+
+    STILL FAIL-CLOSED, and this is the part worth being careful about: the guard is not relaxed,
+    it is applied twice. A path must resolve INSIDE one of the two roots or it is refused, and
+    `..` is resolved before the check, so neither root can be used as a doorway to the other or to
+    anything outside both.
+    """
     p = (WORKSPACE / path).resolve() if not Path(path).is_absolute() else Path(path).resolve()
-    if WORKSPACE.resolve() not in p.parents and p != WORKSPACE.resolve():
-        raise HTTPException(400, f"path escapes workspace: {path}")
-    return p
+    for root in (WORKSPACE.resolve(), ATTACHMENTS.resolve()):
+        if p == root or root in p.parents:
+            return p
+    raise HTTPException(400, f"path escapes workspace: {path}")
 
 
 def _auth(authorization: str = Header(default="")) -> None:
@@ -1148,12 +1173,29 @@ class ExecBody(BaseModel):
     timeout: int = 900
 
 
+# A SECOND SIZE CEILING LIVED HERE AND IS GONE. It restated the control plane's per-file
+# attachment cap, and two numbers for one rule is the only thing it reliably produced — they were
+# one release apart from disagreeing, at which point a file the door accepted would have died
+# here with a message no citizen could be shown.
+#
+# THE TWO ARGUMENTS FOR KEEPING IT WERE BOTH TRACED AND NEITHER HELD. It did not contain a hostile
+# caller: `create_bytes` is not a model tool and has one caller on the control plane, while
+# `run_command` is a general shell that can already write anywhere the workspace allows. And it
+# did not bound this process's own allocation: placement is a sequential loop with one container
+# and one turn slot per user, so the supervisor holds ONE file at a time — peak is the base64 body
+# plus the decoded copy of a single file, against a 2 GiB container, and the door's cap bounds
+# that transitively.
+
+
 class FilesBody(BaseModel):
     action: str
     path: str
     old_str: str | None = None
     new_str: str | None = None
     file_text: str | None = None
+    # `create_bytes` only. Base64 of the file's real bytes — see the action for why this is a
+    # separate field and a separate action rather than a flag on `create`.
+    file_b64: str | None = None
     insert_line: int | None = None
     insert_text: str | None = None
     view_range: list[int] | None = None
@@ -1243,6 +1285,34 @@ def files(body: FilesBody) -> dict[str, Any]:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(body.file_text.replace("\r\n", "\n"), encoding="utf-8")
         return {"ok": True, "created": str(p)}
+
+    if body.action == "create_bytes":
+        # THE ONLY WAY TO PUT A REAL FILE IN THE WORKSPACE. Every other write action here is
+        # text: `create` decodes as UTF-8 and — the part that matters — rewrites every CRLF to
+        # LF unconditionally. That is right for source, which is why it is there (CRLF has burned
+        # BIAL twice), and it silently corrupts any binary containing the byte pair 0x0D 0x0A. A
+        # spreadsheet is a ZIP archive; that pair occurs in one constantly.
+        #
+        # A SEPARATE ACTION RATHER THAN A FLAG ON `create`, so the no-normalisation rule is a
+        # property of the action a caller chose rather than a branch they might not notice, and
+        # so nobody can send both fields and leave the precedence to be discovered later.
+        #
+        # The existing way to get bytes in — base64 into `file_text`, then `sh -c 'base64 -d'`,
+        # the git-bundle restore transport — needs a shell, which the read-only surface
+        # structurally cannot reach. This action is what lets the control plane place an
+        # attachment without granting one.
+        if body.file_b64 is None:
+            raise HTTPException(400, "create_bytes needs file_b64")
+        try:
+            data = base64.b64decode(body.file_b64, validate=True)
+        except (binascii.Error, ValueError):
+            raise HTTPException(422, "file_b64 is not valid base64") from None
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        # NO `_redact` HERE, and that is not an omission: redaction keeps an injected secret out
+        # of text the MODEL reads back. This writes bytes the control plane already holds, and
+        # reading them back goes through `view`, which redacts exactly as it always did.
+        return {"ok": True, "created": str(p), "bytes": len(data)}
 
     if body.action == "insert":
         if body.insert_line is None or body.insert_text is None:

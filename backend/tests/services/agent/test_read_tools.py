@@ -23,6 +23,7 @@ from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
+from src.core.prompt_blocks import ATTACHMENT_READ_TOOL
 from src.core.redaction import (
     CREDENTIAL_OPEN_SCAN_MAX_CHARS,
     leaves_a_credential_value_open,
@@ -34,6 +35,8 @@ from src.services.agent.read_tools import (
     WorkspacePathError,
     check_the_guest_list,
     read_only_toolset,
+    to_container_path,
+    to_model_path,
 )
 from src.services.agent.toolsets import ReadDeps, toolsets_for_kind, workspace_from_read_deps
 from src.services.classification.agent import ReviewDeps
@@ -277,6 +280,26 @@ async def test_search_returns_no_hits_from_inside_a_lockfile(
     ]
 
 
+def test_a_search_hit_comes_back_in_the_vocabulary_the_model_was_given() -> None:
+    """★ A RESULT THE MODEL CANNOT FEED BACK IS A DEAD END.
+
+    `search_files` translates `subdir` on the way IN, so grep runs against
+    `/workspace/attachments/…` and every hit it prints carries that container-absolute prefix.
+    Returned untranslated those paths name a location the model was never taught, and that every
+    read tool refuses — `_vet_path_token` rejects a leading `/` — so a search over an attachment
+    produced hits nothing could act on.
+
+    Translation has to be symmetric. Mutation receipt: drop `to_model_path` from the hit loop and
+    this comes back container-absolute.
+    """
+    assert to_model_path("/workspace/attachments/roster.csv") == ".attachments/roster.csv"
+    assert to_model_path("/workspace/attachments") == ".attachments"
+    # An app-tree path is untouched — this is a translation for exactly one prefix.
+    assert to_model_path("app/page.tsx") == "app/page.tsx"
+    # And it is the inverse of the inbound translation, which is the property that matters.
+    assert to_model_path(to_container_path(".attachments/book.xlsx")) == ".attachments/book.xlsx"
+
+
 def test_live_find_and_grep_exclude_lockfiles_at_the_source() -> None:
     # The other two application sites: the find prune and the grep exclusion the live
     # workspace ships to the sandbox.
@@ -456,6 +479,73 @@ async def test_exec_readonly_contains_a_path_riding_on_a_flag(
 
 def test_empty_argv_is_bounced() -> None:
     assert check_the_guest_list([]) is not None
+
+
+# --- a command naming an attached file is taught, not failed ------
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["cat", ".attachments/roster.csv"],
+        ["grep", "-n", "total", ".attachments/roster.csv"],
+        ["wc", "-l", ".attachments"],
+        ["grep", "--include=.attachments/roster.csv", "total", "."],
+        ["cat", "/workspace/attachments/roster.csv"],
+    ],
+)
+def test_a_command_naming_an_attachment_is_pointed_at_the_reader(argv: list[str]) -> None:
+    """★ FIVE SPELLINGS, ONE DEAD END. Every one of these was ADMITTED or misrefused before.
+
+    The relative ones passed every check and then ran inside the app's folder, where
+    `.attachments/` does not exist — so the command reported a file that was sitting in
+    `/workspace/attachments` the whole time as missing, and an agent told a file is missing goes
+    back to describing it from its name. The absolute one was refused, but for its leading slash,
+    with the advice "drop the leading `/`" — which routes straight back into the first failure.
+
+    The flag-attached form is in the list for the same reason `_vet_path_token` is applied to one:
+    a path rides in on a `--flag=<value>` as readily as it does bare, and the two doors must not
+    disagree about what a path may name. The bare `.attachments` directory is in it because a
+    `wc -l` over the folder is the obvious next thing an agent tries.
+
+    Mutation check: remove either `_refuse_an_attachment_operand` call and this goes red.
+    """
+    refusal = check_the_guest_list(argv)
+
+    assert refusal is not None
+    assert ATTACHMENT_READ_TOOL in refusal
+    # It says what to do when the reader is not available, because the classification reviewer
+    # receives this string byte-for-byte and can never hold that tool.
+    assert "could not be read" in refusal
+
+
+def test_a_denied_flag_still_answers_first_even_over_an_attachment_path() -> None:
+    """`grep --file=` is denied whatever it points at — the flag reads its pattern list from a
+    file, which is the one place a path rides in unvetted. Its own refusal is the more specific
+    one and must keep winning; teaching the reader here would describe a command that is not
+    going to run for a different reason."""
+    refusal = check_the_guest_list(["grep", "--file=.attachments/patterns", "."])
+
+    assert refusal is not None
+    assert "not available to a read-only `run_command`" in refusal
+    assert ATTACHMENT_READ_TOOL not in refusal
+
+
+def test_a_traversal_wearing_the_attachment_prefix_keeps_the_traversal_refusal() -> None:
+    """`is_an_attachment_path` answers yes to this, and it is not a citizen naming a spreadsheet.
+    The teaching refusal steps aside so `_vet_path_token`'s precise wording answers instead."""
+    refusal = check_the_guest_list(["cat", ".attachments/../../etc/passwd"])
+
+    assert refusal is not None
+    assert "steps outside the workspace" in refusal
+    assert ATTACHMENT_READ_TOOL not in refusal
+
+
+def test_the_ordinary_read_only_classics_are_still_admitted() -> None:
+    """The new branch must not narrow the surface it sits on."""
+    assert check_the_guest_list(["ls", "app"]) is None
+    assert check_the_guest_list(["grep", "-rn", "gate", "app/"]) is None
+    assert check_the_guest_list(["cat", "app/page.tsx"]) is None
 
 
 # --- the tools, driven through a real run ------------------------------------

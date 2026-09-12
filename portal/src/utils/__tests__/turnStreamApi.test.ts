@@ -381,33 +381,25 @@ describe('startTurn', () => {
     ).toBeNull()
   })
 
-  it("binds a new chat's KIND into the create block on a first message", async () => {
-    // Pairs with the test above: with no parentage, the body carries no `create` key at all.
+  it('★ carries the message and NOTHING ELSE — a first turn looks like every other one', async () => {
+    // A GUARD, NOT DELETED COVERAGE. This used to assert that a first message bound the new
+    // chat's KIND into a `create` block, because the server created the row inside the turn's own
+    // transaction and a refusal rolled it back.
+    //
+    // An upload names the conversation it belongs to now, so the row exists a round trip before
+    // the first upload and this request has nothing to create. Asserted as an exact body rather
+    // than a missing key: a `create` that came back — for a retry, say, or a "helpful" default —
+    // would put the browser back to describing a chat the server already has.
     const fetchFn = vi.fn(async () =>
       new Response(JSON.stringify({ turnId: 't1' }), { status: 202 })
     )
-    await startTurn(
-      'c1',
-      { text: 'build me a gate roster' },
-      { fetchImpl: fetchFn },
-      { projectId: 'p1', kind: 'build', title: 'Gate roster' }
-    )
+
+    await startTurn('c1', { text: 'build me a gate roster' }, { fetchImpl: fetchFn })
+
     const [, init] = fetchFn.mock.calls[0] as unknown as [string, RequestInit]
     expect(JSON.parse(init.body as string)).toEqual({
       message: { text: 'build me a gate roster', attachmentTexts: [], attachmentIds: [] },
-      create: { projectId: 'p1', kind: 'build', title: 'Gate roster' },
     })
-
-    // The kind is CARRIED, not defaulted: a plan chat's first message says so on the wire.
-    const planFetch = vi.fn(async () =>
-      new Response(JSON.stringify({ turnId: 't2' }), { status: 202 })
-    )
-    await startTurn('c2', { text: 'help me scope this' }, { fetchImpl: planFetch }, {
-      projectId: 'p1',
-      kind: 'plan',
-    })
-    const [, planInit] = planFetch.mock.calls[0] as unknown as [string, RequestInit]
-    expect(JSON.parse(planInit.body as string).create).toEqual({ projectId: 'p1', kind: 'plan' })
   })
 
   it('maps an error envelope to a typed TurnStartError', async () => {

@@ -162,10 +162,28 @@ async def test_uploaded_image_reaches_the_model_as_binary_content(
 
     attachment_id = "att_gate_floorplan_1"
 
+    # ★ THE CHAT FIRST, THEN ITS FILE, THEN THE MESSAGE — the journey IS the ordering.
+    #
+    # This test used to create the conversation between the upload and the send, which was the
+    # ordering the product had: the composer minted an id in the browser, uploaded against
+    # nothing, and the row was written by the first turn. An upload names the conversation it
+    # belongs to now, so the row has to be there before the bytes are.
+    from tests.factories import ProjectFactory
+
+    project = await ProjectFactory.create(db_session, user.id)
+    conversation_id = str(uuid.uuid4())
+    created = await client.post(
+        "/v1/conversations",
+        headers=headers,
+        json={"id": conversation_id, "projectId": str(project.id), "kind": "plan"},
+    )
+    assert created.status_code == 201, created.text
+
     up = await client.post(
         "/v1/attachments",
         headers=headers,
         json={
+            "conversationId": conversation_id,
             "attachmentId": attachment_id,
             "mediaType": "image/png",
             "base64": _B64_PNG,
@@ -196,19 +214,8 @@ async def test_uploaded_image_reaches_the_model_as_binary_content(
 
     set_chat_model(FunctionModel(stream_function=_record))
 
-    # the SPA sends only the new message — text plus the OWNED reference to the stored
-    # upload; the conversation must exist first (`POST /v1/conversations`).
-    from tests.factories import ProjectFactory
-
-    project = await ProjectFactory.create(db_session, user.id)
-    conversation_id = str(uuid.uuid4())
-    created = await client.post(
-        "/v1/conversations",
-        headers=headers,
-        json={"id": conversation_id, "projectId": str(project.id), "kind": "plan"},
-    )
-    assert created.status_code == 201, created.text
-
+    # The SPA sends only the new message — text plus the OWNED reference to the stored upload.
+    # The conversation was created above, before the file went up.
     started = await client.post(
         f"/v1/conversations/{conversation_id}/turns",
         headers=headers,

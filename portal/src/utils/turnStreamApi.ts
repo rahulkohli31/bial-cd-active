@@ -568,20 +568,6 @@ export interface StartTurnMessage {
 }
 
 /**
- * THE PARENTAGE OF A CHAT THAT DOES NOT EXIST YET — sent only with a chat's FIRST
- * message. Before this, a separate `POST /conversations` a round trip earlier created the
- * row with only a project-ownership check for workspace awareness, so a message the
- * workspace then refused left a real, titled, empty conversation named after the refused
- * text. Carrying it here lets the server check first and create second in one
- * transaction, so a refusal rolls the row back too.
- */
-export interface NewConversationParentage {
-  projectId: string
-  kind: 'plan' | 'build'
-  title?: string
-}
-
-/**
  * What a 202 hands back.
  *
  * `contextTokens` IS THE NUMBER THE SERVER JUST ADMITTED ON — the same expression, on this same
@@ -597,11 +583,19 @@ export interface TurnStarted {
   contextTokens: number | null
 }
 
+/**
+ * Start a turn on a conversation that ALREADY EXISTS.
+ *
+ * ★ IT USED TO BE ABLE TO CREATE ONE. A `create` block rode the first message so the server could
+ * check the workspace and write the row in one transaction, and a refusal rolled the row back —
+ * which is why a refused first send left nothing behind. Attachments are uploaded AGAINST a
+ * conversation now, so the row is created a round trip before the first upload, and the block had
+ * nothing left to carry. An unknown id is a 404 on every turn, first or hundredth.
+ */
 export async function startTurn(
   conversationId: string,
   message: StartTurnMessage,
   deps: AuthFetchDeps = {},
-  create?: NewConversationParentage,
 ): Promise<TurnStarted> {
   const resp = await authFetch(
     `/api/conversations/${conversationId}/turns`,
@@ -614,10 +608,6 @@ export async function startTurn(
           attachmentTexts: message.attachmentTexts ?? [],
           attachmentIds: message.attachmentIds ?? [],
         },
-        // OMITTED, not `undefined`, for every turn after the first: the server treats a `create`
-        // block on an existing conversation as a retry and ignores it, but sending one where none
-        // is meant would make the wire say something the client does not intend.
-        ...(create ? { create } : {}),
       }),
     },
     deps

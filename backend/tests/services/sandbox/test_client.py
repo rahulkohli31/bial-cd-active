@@ -341,6 +341,45 @@ async def test_files_422_maps_to_sandbox_error() -> None:
     await client.aclose()
 
 
+async def test_a_files_failure_carries_the_supervisors_own_sentence() -> None:
+    """★ THE STATUS ALONE CANNOT BE ACTED ON. Two very different failures answer 400 here — a
+    container running an image that predates an action, and a genuine path bug on this side —
+    and "files op failed with status 400" is the same sentence for both. Whoever is holding the
+    log at 2 a.m. needs the supervisor's own words.
+
+    Safe to carry on a narrow ground, not a broad one: the supervisor does NOT redact everything
+    (`_redact` covers `exec` output and `view` content only). What makes it safe is that every
+    non-200 `/files` detail is one of a handful of fixed strings, plus `_resolve`'s, which echoes
+    the path this side sent — no file bytes reach a non-200 body.
+
+    Mutation check: drop `resp.text[:200]` from the raise and the two content assertions go red.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"detail": "unknown files action: create_bytes"})
+
+    client = _client(handler)
+    with pytest.raises(SandboxError) as caught:
+        await client.files(_handle(), FileStrReplace(path="p", old_str="x", new_str="y"))
+    assert "400" in str(caught.value)
+    assert "create_bytes" in str(caught.value)
+    await client.aclose()
+
+
+async def test_a_files_failure_body_is_capped_rather_than_carried_whole() -> None:
+    """A message that grows with its input is how a log becomes the place a payload lives. The
+    cap is small enough that a supervisor sentence survives whole and nothing else does."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text="z" * 5_000)
+
+    client = _client(handler)
+    with pytest.raises(SandboxError) as caught:
+        await client.files(_handle(), FileStrReplace(path="p", old_str="x", new_str="y"))
+    assert caught.value.args[0].count("z") == 200
+    await client.aclose()
+
+
 async def test_preview_url_never_carries_the_token() -> None:
     handle = _handle(token="super-secret")
     assert "super-secret" not in handle.preview_url

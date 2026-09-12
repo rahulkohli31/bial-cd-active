@@ -5,6 +5,7 @@ import {
   revokeAttachmentObjectUrl,
   revokeAllAttachmentUrls,
   AttachmentCapError,
+  CONVERSATION_FULL_CODE,
 } from '../attachmentApi'
 
 // authFetch deps injection — no real token/network.
@@ -35,13 +36,42 @@ describe('uploadAttachment', () => {
     expect(JSON.parse(opts.body)).toMatchObject({ attachmentId: 'a1', mediaType: 'image/png', base64: 'AAAA' })
   })
 
-  it('throws AttachmentCapError on a cap rejection (code ATTACHMENT_STORE_FULL)', async () => {
+  it('throws AttachmentCapError on the conversation-full rejection, wearing the same code', async () => {
+    // ★ ONE CODE, ON BOTH SIDES OF THE THROW. The class hardcoded `ATTACHMENT_STORE_FULL` on
+    // every instance while the branch that constructs it read a different field, so after the
+    // byte budget was replaced by a file count the error advertised a code the server could no
+    // longer send. This asserts the recognised code and the thrown one are the same string.
+    const fetchImpl = vi.fn(async () => ({
+      ok: false,
+      status: 413,
+      json: async () => ({
+        error: {
+          message: 'This conversation has reached its limit of 20 attachments. Start a new chat to add more.',
+          code: CONVERSATION_FULL_CODE,
+        },
+      }),
+    }))
+    const thrown = await uploadAttachment(
+      { attachmentId: 'a1', mediaType: 'image/png', base64: 'AA' },
+      deps(fetchImpl),
+    ).catch((e) => e)
+    expect(thrown).toBeInstanceOf(AttachmentCapError)
+    expect(thrown.code).toBe(CONVERSATION_FULL_CODE)
+    expect(thrown.message).toMatch(/limit of 20 attachments/)
+  })
+
+  it('a code the server no longer sends is an ordinary Error, not a cap error', async () => {
+    // The receipt that the branch above reads the live code rather than matching anything 413.
     const fetchImpl = vi.fn(async () => ({
       ok: false,
       status: 413,
       json: async () => ({ error: { message: 'Attachment storage is full.', code: 'ATTACHMENT_STORE_FULL' } }),
     }))
-    await expect(uploadAttachment({ attachmentId: 'a1', mediaType: 'image/png', base64: 'AA' }, deps(fetchImpl))).rejects.toBeInstanceOf(AttachmentCapError)
+    const thrown = await uploadAttachment(
+      { attachmentId: 'a1', mediaType: 'image/png', base64: 'AA' },
+      deps(fetchImpl),
+    ).catch((e) => e)
+    expect(thrown).not.toBeInstanceOf(AttachmentCapError)
   })
 
   it('throws a generic Error with the server message on other failures', async () => {

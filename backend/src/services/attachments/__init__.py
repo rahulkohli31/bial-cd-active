@@ -1,5 +1,17 @@
 """Attachment-lifecycle service helpers shared across the API and admin layers."""
 
+from src.services.attachments.materialize import (
+    AttachmentDelivery as AttachmentDelivery,
+)
+from src.services.attachments.materialize import (
+    AttachmentPlacementError as AttachmentPlacementError,
+)
+from src.services.attachments.materialize import (
+    CodeLaneAttachment as CodeLaneAttachment,
+)
+from src.services.attachments.materialize import (
+    code_lane_attachments as code_lane_attachments,
+)
 from src.services.attachments.reclaim import (
     NEVER_SENT_RECLAIM_WINDOW as NEVER_SENT_RECLAIM_WINDOW,
 )

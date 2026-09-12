@@ -10,6 +10,84 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 > `1.7.0` section is added above them and tagged `v1.7.0`; the betas stay as the record of how it
 > got there. A version number marks a build, not a merge.
 
+## [Unreleased]
+
+Attachments were reworked end to end: what can be attached, how big it may be, which conversation
+it belongs to, and what the model does with it.
+
+### Breaking
+
+- **Uploading a file now requires naming the conversation it belongs to.** `POST /v1/attachments`
+  rejects a body with no `conversationId` with a 400 and the code `CONVERSATION_ID_REQUIRED`; a
+  conversation that does not exist, or belongs to another user, is a 404. Uploads used to arrive
+  unattached and be adopted by the first turn that followed, which left three questions unanswerable
+  at the door — whose allowance the file counted against, which conversation's limit it was testing,
+  and, when the turn never came, whether it had an owner at all. The portal creates the chat before
+  its first upload, so nothing in the product notices; any other caller must send the field.
+- **The per-file limit is 10 MB, and a conversation holds 20 files.** Both are checked at the door.
+  The old total-bytes-per-conversation budget is gone: a count is a rule people can predict, and a
+  byte budget refused the fourth small file after three large ones for reasons nobody could see.
+
+### Added
+
+- **Spreadsheets, documents and decks can be attached, and the model reads them where they live.**
+  `.xlsx`, `.docx`, `.pptx`, `.csv`, `.tsv` and `.tab` files are placed in the workspace and read by
+  a script inside the container, so a 10 MB spreadsheet costs a few hundred tokens to consult rather
+  than being pasted into the conversation. Images and PDFs are still read directly by the model.
+- **A locked or truncated PDF is refused at the door, with the reason.** A password-protected PDF and
+  one whose bytes end mid-file are both detected on upload, so the refusal names what is wrong with
+  the file instead of arriving as a confused answer several minutes later.
+
+### Fixed
+
+- **A file's chip is drawn once, under the message that carried it.** Attaching one spreadsheet and
+  then sending three more messages showed the same chip four times on reload — once under every
+  bubble, including bubbles whose message never mentioned the file.
+- **Deleting an attachment can no longer leave a chip that opens to nothing.** The row is removed
+  first and the stored file swept afterwards, so a failure part-way through cannot leave a file
+  listed in the composer whose contents are already gone.
+- **A file that has gone missing from storage says so, instead of asking you to try again.** Nothing
+  puts a missing file back, so the old sentence cost the turn twice before the citizen learned the
+  only thing that works is attaching it again. Transient failures — a credential blip, a slow store
+  — still say to try again, because for those it is true.
+- **Asking the agent to open an attached file by its path teaches, instead of refusing.** A command
+  naming a file under the attachments folder now answers with the tool that reads it, rather than a
+  bare refusal the model would retry a different way.
+- **A spreadsheet the reader cannot parse reports the failure instead of an empty file.** Three
+  failure paths in the in-container reader swallowed their own errors and returned nothing, which
+  the model read as "the file is empty" and answered from the file's name.
+- **A dense 10 MB spreadsheet can actually be read.** The reader was building an object for every
+  cell — twice — to report a file's shape, so a 920,000-cell workbook needed 829 MB and was refused
+  as too large for the workspace. It streams now: 46 MB and under six seconds for the same file.
+- **A PDF with more pages than the assistant can read now says so.** Such a document used to end the
+  turn with "the assistant hit a problem", which named nothing and invited sending it again. The
+  refusal now names the document, says that the chat it landed in will keep hitting the same limit,
+  and offers the two things that work from there — start a new chat with a shorter document, or
+  split this one and attach the part you need.
+- **A spreadsheet that misdescribes its own size no longer hides its own data.** A workbook carries
+  a record of how far its sheets extend, and some tools write one that is too small. The reader
+  believed it, so a sheet of fifty rows and three columns declaring itself a single cell was
+  summarised as a single cell — with the other columns missing from everything the assistant saw,
+  no error, and nothing to suggest anything had been missed.
+- **Switching chats while a file is uploading no longer disables Send everywhere.** The composer is
+  shared across conversations, and an upload abandoned by navigating away left it waiting on a
+  message that would never be sent, in every chat, until the page was reloaded. Those abandoned
+  uploads also kept counting against the old chat's twenty-file limit, so it could refuse the next
+  file while showing none.
+- **Two files with the same name can no longer overwrite each other in the workspace.** The escape
+  for a repeated filename was a name a third file could itself have.
+- **A malformed PDF cannot break the password check.** A crafted file could make the check that
+  looks for a password fail outright rather than answer yes or no.
+
+### Known limitations
+
+- **A long PDF is limited by pages, not by megabytes, and the limit is lower than the 10 MB cap
+  suggests.** A PDF page costs the assistant roughly 2,900 tokens, so a document of about 175 pages
+  fills a conversation's entire context on its own regardless of how small the file is; beyond
+  roughly 600 pages the assistant will not accept the document at all. Both refusals are now clearly
+  worded, but neither is caught at upload — the file is accepted and the refusal arrives on the
+  turn. Attaching an excerpt rather than a full report is the reliable approach for long documents.
+
 ## [1.7.0-beta.13] - 2026-09-11
 
 Every app now carries a description in its builder's own words, and that description is what makes

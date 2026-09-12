@@ -75,6 +75,22 @@ RUN curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v2.11.4/c
 RUN pip3 install --no-cache-dir --break-system-packages \
         "fastapi==0.141.1" "uvicorn[standard]==0.52.2" "websockets==17.0.1"
 
+# The attachment reader's libraries. Pinned like their neighbours above, and captured from
+# what this base actually resolved to rather than picked from a changelog.
+#
+# CHOSEN FOR FAMILIARITY, NOT CAPABILITY, which is the requirement's own rule: the agent may edit
+# the reader, so every library it uses must be one the model can already write from memory with no
+# documentation. Faster and more capable alternatives exist for each and are declined on that
+# ground alone - an unfamiliar library is a cost paid on every turn, by every agent, and
+# eventually a skill somebody has to write and keep in sync.
+#
+# polars is the heaviest single addition, roughly 220 MB unpacked, and it is what lets a
+# spreadsheet's shape be reported HONESTLY rather than guessed from its first rows: typed columns,
+# null and distinct counts, and a lazy scan over a file larger than memory. The size is a real
+# cost, accepted deliberately rather than absorbed silently.
+RUN pip3 install --no-cache-dir --break-system-packages \
+        "openpyxl==3.1.5" "python-docx==1.2.0" "python-pptx==1.0.2" "polars==1.44.1"
+
 # Unprivileged user for `next dev` — the untrusted app process. It CANNOT read root's env,
 # so it cannot read the supervisor token. The supervisor demotes
 # children to `appuser` by name; THIS image pins its uid at 10001.
@@ -107,12 +123,19 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 # over the frozen /exec (`/usr/local/bin/{snapshot,restore}.sh <workspace> [b64]`).
 COPY scripts/snapshot.sh scripts/restore.sh /usr/local/bin/
 
+# THE CANONICAL ATTACHMENT READER. Baked at a fixed path OUTSIDE the editable tree, so a
+# Build agent that edits its working copy into a state that no longer works has somewhere
+# known-good to come back from.
+COPY scripts/read_attachment.py /usr/local/lib/bial/read_attachment.py
+
 # Cross-platform guard: strip any CR a Windows checkout introduced, THEN chmod. (A
 # `#!/bin/sh\r` shebang would make the container fail at start — CRLF has burned BIAL twice.) The
 # guard is extended to cover the incoming scripts/ before they are marked executable.
 RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh /etc/caddy/Caddyfile \
         /usr/local/bin/snapshot.sh /usr/local/bin/restore.sh \
-    && chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/snapshot.sh /usr/local/bin/restore.sh
+        /usr/local/lib/bial/read_attachment.py \
+    && chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/snapshot.sh /usr/local/bin/restore.sh \
+        /usr/local/lib/bial/read_attachment.py
 
 # --- golden template + baked node_modules -------------------------------------------------
 # Copy manifests first for layer caching, install with the pinned lockfile (byte-identical
@@ -131,8 +154,12 @@ RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh /etc/caddy/Caddyfile \
 # The runtime npm cache is created here too: a deterministic, appuser-owned path so an on-demand
 # `npm install` at runtime (run as appuser via /exec) — and the restore reconcile install — never
 # falls back to a root-owned one. It stays EMPTY in the image; the build below uses its own.
-RUN mkdir -p /workspace/app /home/appuser/.npm \
-    && chown appuser:appuser /workspace/app /home/appuser/.npm
+# `/workspace/attachments` is a SIBLING of the app tree, not a child: it shares the
+# volume, because the sandbox is already there and can already run code, but no snapshot, restore
+# or deploy walks it — so nothing a citizen attaches can reach a saved version or a published app
+# as a side effect of having been attached.
+RUN mkdir -p /workspace/app /workspace/attachments /home/appuser/.npm \
+    && chown appuser:appuser /workspace/app /workspace/attachments /home/appuser/.npm
 WORKDIR /workspace/app
 USER appuser
 COPY --chown=appuser:appuser template/package.json template/package-lock.json ./

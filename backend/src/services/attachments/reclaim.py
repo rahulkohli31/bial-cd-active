@@ -32,9 +32,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.models.attachment import Attachment
 from src.db.models.message import Message
 
-# REUSED, not reimplemented (drift guard): the reclaimer resolves sent references and derives
-# blob keys (incl. each deck's `{key}.pdf` sibling) through the SAME helpers the conversation
-# cascade uses, so a payload shape the cascade honours is honoured here too.
+# REUSED, not reimplemented (drift guard): the reclaimer resolves sent references and derives blob
+# keys through the SAME helpers the conversation cascade uses, so a payload shape the cascade
+# honours is honoured here too.
 from src.services.conversations.delete import _blob_keys_for, _referenced_attachment_ids
 from src.services.storage import ObjectStorage, sweep_blobs
 
@@ -51,7 +51,7 @@ class AttachmentReclaimResult:
 
     reclaimed: int  # orphan rows deleted
     freed_bytes: int  # SUM(size) reclaimed — the quota this pass gave back
-    swept_keys: int  # object keys swept (each storage_key, plus a deck's `.pdf` sibling)
+    swept_keys: int  # object keys swept, one per attachment
 
 
 async def reclaim_orphaned_attachments(

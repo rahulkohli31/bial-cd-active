@@ -11,7 +11,7 @@ from __future__ import annotations
 import base64
 import re
 import uuid
-from collections.abc import Sequence
+from collections.abc import Container, Sequence
 from typing import Annotated
 
 import sqlalchemy as sa
@@ -54,7 +54,28 @@ from src.services.storage import ObjectStorage, StorageUnconfiguredError, get_st
 # to collapse two numbers into one, that is the reason not to.
 MAX_MESSAGE_TEXT_CHARS = 64_000
 MAX_ATTACHMENT_TEXT_CHARS = 600_000
-MAX_ATTACHMENT_BLOCKS = 8
+
+# THE FILE COUNT IS THE ONE EXCEPTION TO THE PARAGRAPH ABOVE, and the per-conversation
+# count is why it moved.
+#
+# That argument is about TEXT: the server writes messages nobody typed — the plan handoff, a
+# build's first message — so its text ceiling must sit above a number chosen for a text box.
+# None of those paths attaches a FILE. `TurnMessage` is constructed nowhere in `src/`; it only
+# ever arrives from a browser, and the plan prompt says in words that the build chat receives no
+# attachments. So the reason the two text numbers differ has never applied to this one, and it
+# sat at 8 against a composer that offers 5 — the stricter number being the one that is not the
+# trust boundary, which is the wrong way round.
+#
+# IT BOUNDS THE SUM, not each list, and that is the substance rather than the value. As two
+# independent `max_length` bounds this admitted eight text blocks AND eight ids on one message —
+# sixteen files against a browser cap of five. The check that makes it true is in
+# `_bounded_and_non_empty`; the per-list bound stays as a cheap structural guard so a single
+# oversized list is refused before the sum is computed.
+MAX_FILES_PER_MESSAGE = 5
+
+# The historical name, kept as the per-list structural bound. Equal to the total by
+# construction: a single list may not exceed what the whole message may carry.
+MAX_ATTACHMENT_BLOCKS = MAX_FILES_PER_MESSAGE
 
 # An attachment id is a `secrets.token_urlsafe` value — never a path or a raw UUID.
 ATTACHMENT_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
@@ -77,40 +98,25 @@ BUILD_IN_FLIGHT_MSG = (
 VISION_MEDIA_PREFIX = "image/"
 PDF_MEDIA_TYPE = "application/pdf"
 
-# --- the document limit ---------------------------------------------------------------------
+# --- the per-document limit, and why it is gone -------------------------------------------
 #
-# HOW MANY DOCUMENTS MAY RIDE ONE MESSAGE, and why it is a SEPARATE limit from
-# `MAX_ATTACHMENT_BLOCKS` rather than a smaller value of it.
+# THERE IS NO DOCUMENT COUNT ANY MORE. It was two, a stopgap against a long PDF blowing the
+# context budget, and it sat beside a page cap and a flat per-document charge sized to that cap.
+# All three are gone: nothing prices a document before it is sent, so there is no estimate left
+# for a count to protect.
 #
-# IT IS NOT DERIVED. THE PLATFORM DOES NOT PRICE A DOCUMENT UP FRONT: the window check reads the
-# count the provider returns for a completed turn, and nothing charges an attachment a nominal
-# cost on its way in, so no arithmetic sum was ever what refused a third document. It is not
-# derived at this ceiling either, because upcoming attachment-format work removes this limit
-# outright, and sizing it now would churn the sentence a citizen reads twice over.
+# It goes because a citizen attaching five files should not have to know which of them the
+# platform considers expensive. One rule governs every attachment on a message now —
+# `MAX_FILES_PER_MESSAGE`, any mix of formats — the same reasoning that sends a spreadsheet to
+# the code lane at every size rather than above a threshold.
 #
-# What is true, and load-bearing: this cap is a COUNT and not a token figure precisely because
-# it is the one bound that can be checked before the provider has seen anything.
-#
-# THE POINT IS THE SENTENCE, NOT THE NUMBER. Left to anything else, that message is answered with
-# "this chat has got too long — start a new chat", which is wrong advice here: the new chat
-# refuses the identical message, and the citizen is sent round a loop with nothing that works. So
-# the count is checked FIRST, and answered with a sentence naming the limit they actually hit.
-#
-# Images are deliberately not counted: a screenshot measured 1,700-2,000 tokens, so eight of them
-# have never been near any ceiling. `MAX_ATTACHMENT_BLOCKS` stays at 8 and still means what it
-# says for them.
-MAX_PDF_BLOCKS = 2
-
-TOO_MANY_DOCUMENTS_MSG = (
-    f"You can send up to {MAX_PDF_BLOCKS} documents in one message. Take one out and send again."
-)
-"""Citizen copy — verbatim in a 413 body. It names the DOCUMENT limit, not the token limit, and
-the action it gives works. See `MAX_PDF_BLOCKS` for why the two refusals must not be one."""
-
-TOO_MANY_DOCUMENTS_CODE = "too_many_documents"
-"""Beside `TOO_MANY_DOCUMENTS_MSG`. It shares its 413 status with the too-long refusal, so a
-client that read only the status would give the two the same (wrong) remedy — which is the
-reason each of this route's refusals carries a code of its own."""
+# WHAT REPLACES IT IS NOT ANOTHER COUNT, AND IT IS NOT A PRE-SEND CHECK EITHER. The admission
+# gate reads what the provider reported for the conversation's LAST served turn, so it bounds a
+# thread that has already grown too large; it cannot size the message about to be sent, because
+# only the provider can count a prompt. A single long document therefore reaches the provider on
+# its first turn whatever its length, and the refusal comes back from there — which is why
+# `turns/engine.py` translates the provider's own two refusals into sentences of ours rather
+# than leaving them generic.
 
 
 # --- dependencies -------------------------------------------------------------------------
@@ -170,6 +176,12 @@ class TurnMessage(CamelModel):
 
     @model_validator(mode="after")
     def _bounded_and_non_empty(self) -> TurnMessage:
+        # ONE NUMBER FOR THE WHOLE MESSAGE, any mix of formats. The two lists carry
+        # the same thing from a citizen's point of view — files they attached — so counting them
+        # apart let a message hold twice what the composer offered. A citizen should not have to
+        # know which of their five files the platform files under which list.
+        if len(self.attachment_texts) + len(self.attachment_ids) > MAX_FILES_PER_MESSAGE:
+            raise ValueError(f"a message may carry at most {MAX_FILES_PER_MESSAGE} attachments")
         for block in self.attachment_texts:
             if len(block) > MAX_ATTACHMENT_TEXT_CHARS:
                 raise ValueError("an attachment text block is too large")
@@ -218,7 +230,12 @@ def history_rehydrator(
 
 
 async def resolve_binaries(
-    db: AsyncSession, storage: ObjectStorage | None, user_id: uuid.UUID, attachment_ids: list[str]
+    db: AsyncSession,
+    storage: ObjectStorage | None,
+    user_id: uuid.UUID,
+    attachment_ids: list[str],
+    *,
+    skip: Container[str] = frozenset(),
 ) -> list[BinaryContent]:
     """Owned attachment refs → base64-backed `BinaryContent` for the model prompt. Rides the
     store's own rehydrator — owner-scoped row, magic re-check, authoritative media type — then
@@ -226,38 +243,41 @@ async def resolve_binaries(
     anything else are a 400 (their content travels as `attachmentTexts`), and an unknown/foreign
     id fails the same typed way the rehydrator words it.
 
-    It also gates on HOW MANY DOCUMENTS: past `MAX_PDF_BLOCKS` the message is refused here
-    rather than by the token gate downstream, which would answer the same refusal with advice
-    that does not work. The check lives at this seam because this is where a reference becomes a
-    known media type — the route above holds only opaque ids, and the browser's word for a file
-    is not evidence."""
+    It no longer counts documents. One file count governs every format at the upload door, and a
+    document too long for the provider is refused by the provider, in a sentence of ours.
+
+    `skip` NAMES THE CODE LANE, AND IT IS APPLIED BEFORE THE REHYDRATOR RATHER THAN AFTER IT.
+    A code-lane file is not refused and not lost — it travels by being written into the
+    workspace, where the shipped reader opens it. But it cannot pass through here on the way:
+    the rehydrator re-asserts `bytes_match_declared`, which answers False for every code-lane
+    type BECAUSE THE MODEL ALLOWLIST WAS DELIBERATELY NOT WIDENED, so a spreadsheet reaching it
+    would come back as "no longer matches its declared type" — a refusal about a file that is
+    completely fine. The caller resolves which ids those are (it has just queried the rows) and
+    names them.
+
+    The route is what knows, rather than this function: the same query answers "which files must
+    be placed in the container" and "which ids must not enter the prompt", and asking twice is
+    how the two answers drift."""
     if not attachment_ids:
         return []
     if storage is None:
         raise AppApiError(503, "File storage is not configured.")
+    attachment_ids = [ref for ref in attachment_ids if ref not in skip]
+    if not attachment_ids:
+        return []
     rehydrate = attachment_rehydrator(db, storage, user_id)
     try:
         resolved = await rehydrate(attachment_ids)
     except AttachmentRehydrationError as exc:
         raise AppApiError(400, str(exc)) from None
     binaries: list[BinaryContent] = []
-    documents = 0
     for attachment_id in attachment_ids:
         data_b64, media_type = resolved[attachment_id]
         if not (media_type.startswith(VISION_MEDIA_PREFIX) or media_type == PDF_MEDIA_TYPE):
             raise AppApiError(
                 400,
-                "an attached file of this type cannot be sent to the assistant as a file; "
-                "its extracted text travels with the message instead",
+                "an attached file of this type cannot be sent to the assistant as a file",
             )
-        if media_type == PDF_MEDIA_TYPE:
-            documents += 1
-            # Refused HERE, before the token gate downstream reaches the same conclusion with
-            # the wrong sentence (see `MAX_PDF_BLOCKS`). The media type comes from the store's
-            # own rehydrator, which re-checks the magic bytes — so this counts what will really
-            # be sent, not what the client called it.
-            if documents > MAX_PDF_BLOCKS:
-                raise AppApiError(413, TOO_MANY_DOCUMENTS_MSG, code=TOO_MANY_DOCUMENTS_CODE)
         binaries.append(
             BinaryContent(
                 data=base64.b64decode(data_b64), media_type=media_type, identifier=attachment_id

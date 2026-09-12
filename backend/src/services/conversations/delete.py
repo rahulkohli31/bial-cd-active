@@ -23,8 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.models.attachment import Attachment
 from src.db.models.conversation import Conversation
 from src.db.models.message import Message
-from src.services.extract.office import PPTX_MEDIA_TYPE
-from src.services.messages.store import ATTACHMENT_REF_KIND
+from src.services.messages.store import ATTACHMENT_FILE_REF_KIND, ATTACHMENT_REF_KIND
 
 # NOTE: a deck part's internal Files-API `pdfFileId` release is deferred with the Foundry
 # hosting-mode decision (Azure-hosted Foundry has no Files API to release against; wire it
@@ -37,7 +36,14 @@ def _collect_ref_ids(node: Any, ids: set[str]) -> None:
         for item in node:
             _collect_ref_ids(item, ids)
     elif isinstance(node, dict):
-        if node.get("kind") == ATTACHMENT_REF_KIND:
+        # BOTH KINDS, and the second one is why this comment exists. A model-lane file is
+        # externalized from its `BinaryContent` and leaves `ATTACHMENT_REF_KIND`; a code-lane file
+        # never becomes one, so it leaves `ATTACHMENT_FILE_REF_KIND` instead. Scanning only the
+        # first made every spreadsheet, document and deck invisible to the two callers that decide
+        # what is still referenced — so the reclaimer deleted live files as never-sent orphans, and
+        # the conversation cascade left their blobs behind. Discovery has to see a file whichever
+        # lane carried it.
+        if node.get("kind") in (ATTACHMENT_REF_KIND, ATTACHMENT_FILE_REF_KIND):
             ref = node.get("attachment_id")
             if isinstance(ref, str):
                 ids.add(ref)
@@ -56,23 +62,27 @@ def _referenced_attachment_ids(payloads: Iterable[list[Any] | None]) -> set[str]
 
 
 def _blob_keys_for(attachments: Iterable[Attachment]) -> list[str]:
-    """The object-store keys to sweep for these attachment rows: each storage key plus, for
-    a deck (PPTX) attachment, its derived `{key}.pdf` sibling."""
-    blob_keys: list[str] = []
-    for attachment in attachments:
-        blob_keys.append(attachment.storage_key)
-        if attachment.media_type == PPTX_MEDIA_TYPE:
-            blob_keys.append(attachment.storage_key + ".pdf")
-    return blob_keys
+    """The object-store keys to sweep for these attachment rows: one key each.
+
+    THE DECK SIBLING IS GONE. A `.pptx` used to be rendered to PDF by a converter and the
+    derived `{key}.pdf` stored beside the original, so a sweep had to know to remove both. Nothing
+    derives anything from an attachment now — a deck is stored as itself and read in the sandbox —
+    so there is one key per row again.
+
+    Stripped BEFORE `office.py` is deleted, deliberately: this function has three consumers (the
+    cascade, the reclaimer and the storage reconciler) and all three would break at import if the
+    media-type constant vanished under them first.
+    """
+    return [attachment.storage_key for attachment in attachments]
 
 
 async def gather_and_delete_conversation(
     db: AsyncSession, conversation: Conversation, *, user_id: uuid.UUID
 ) -> list[str]:
     """Delete a conversation, its messages (DB `ON DELETE CASCADE`), and its attachment
-    ROWS inside the caller's transaction; return the object-store keys (attachment blobs
-    plus each deck attachment's derived `{key}.pdf` sibling) to sweep AFTER the caller
-    commits. Commit-less: the caller owns both the commit and the post-commit blob sweep.
+    ROWS inside the caller's transaction; return the object-store keys to sweep AFTER the
+    caller commits — one key per attachment, nothing derived. Commit-less: the caller owns
+    both the commit and the post-commit blob sweep.
     Owner-scoped by `user_id` — attachments hang off `user_id`, not the
     conversation, so the caller must pass the owning user id, not trust the row."""
     payloads = (

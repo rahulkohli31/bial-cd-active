@@ -11,13 +11,21 @@
 import { authFetch } from './api'
 import type { AuthFetchDeps } from './api'
 
-/** Thrown when an upload is rejected for the per-user storage cap; the UI catches it. */
+/** The one server code that means "this conversation cannot hold another file". */
+export const CONVERSATION_FULL_CODE = 'CONVERSATION_ATTACHMENTS_FULL'
+
+/** Thrown when an upload is rejected for the per-conversation cap; the UI catches it.
+ *
+ * IT USED TO ADVERTISE A CODE THE SERVER NO LONGER SENDS. The per-conversation BYTE budget was
+ * deleted in favour of a flat file count, taking `ATTACHMENT_STORE_FULL` with it — but this class
+ * hardcoded that string on every instance it threw, so a caller branching on `.code` was reading
+ * a value nothing could produce. Both the throw site's test and this one now name one constant. */
 export class AttachmentCapError extends Error {
   code: string
   constructor(message: string) {
     super(message)
     this.name = 'AttachmentCapError'
-    this.code = 'ATTACHMENT_STORE_FULL'
+    this.code = CONVERSATION_FULL_CODE
   }
 }
 
@@ -27,6 +35,11 @@ interface UploadAttachmentArgs {
   mediaType: string
   size: number
   base64: string
+  /** The thread this file belongs to. Sent so the row carries its conversation link, which the
+   *  server's per-conversation limits count over. The server has always accepted
+   *  and owner-validated this field; no client ever sent it, so every stored row was NULL and a
+   *  conversation-scoped count would have counted nothing. */
+  conversationId?: string
 }
 
 /**
@@ -38,6 +51,10 @@ interface UploadAttachmentArgs {
  *
  * `truncationNote` is now also on `messageTypes.ts`'s `FilePartOffice` —
  * added converting `attachmentStore.ts`, closing the gap flagged here.
+ *
+ * `pageCount` WENT WITH THE PAGE CAP, on both sides of the wire. Its siblings survive because
+ * they still render historic messages; a page count was only ever produced by the admission check
+ * that is gone, so declaring it here would promise a field the route can never send.
  */
 export interface AttachmentRef {
   attachmentId: string
@@ -51,7 +68,6 @@ export interface AttachmentRef {
   truncated?: boolean
   truncationNote?: string
   pdfFileId?: string
-  pageCount?: number
 }
 
 /**
@@ -61,7 +77,7 @@ export interface AttachmentRef {
  * per-user cap is hit, else a generic Error with the server message.
  */
 export async function uploadAttachment(
-  { attachmentId, name, mediaType, size, base64 }: UploadAttachmentArgs,
+  { attachmentId, name, mediaType, size, base64, conversationId }: UploadAttachmentArgs,
   deps: AuthFetchDeps = {},
 ): Promise<AttachmentRef> {
   const res = await authFetch(
@@ -69,7 +85,7 @@ export async function uploadAttachment(
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ attachmentId, name, mediaType, size, base64 }),
+      body: JSON.stringify({ attachmentId, name, mediaType, size, base64, conversationId }),
     },
     deps,
   )
@@ -81,7 +97,7 @@ export async function uploadAttachment(
     const errBody: unknown = await res.json().catch(() => ({}))
     const err = errBody as { error?: { message?: string; code?: string } }
     const message = err.error?.message || `Attachment upload failed (${res.status}).`
-    if (err.error?.code === 'ATTACHMENT_STORE_FULL') throw new AttachmentCapError(message)
+    if (err.error?.code === CONVERSATION_FULL_CODE) throw new AttachmentCapError(message)
     throw new Error(message)
   }
   // UNCHECKED (matches pre-migration behavior): the shape is asserted, not validated.

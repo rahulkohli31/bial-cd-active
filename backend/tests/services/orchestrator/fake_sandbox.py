@@ -15,6 +15,7 @@ let a test assert BRAIN never ran `git`, restarted the dev server, or tore down.
 
 from __future__ import annotations
 
+import base64
 from collections import deque
 from typing import assert_never
 
@@ -23,6 +24,7 @@ from src.services.sandbox import (
     DevStatus,
     ExecResult,
     FileCreate,
+    FileCreateBytes,
     FileInsert,
     FileOp,
     FileResult,
@@ -67,6 +69,12 @@ workspace was born with."""
 FAKE_SUPERVISOR_TOKEN = "tok_supervisor_SECRET_never_leak_me"  # noqa: S105
 
 
+#: The supervisor's second root, named here rather than imported: `sandbox/supervisor` is a
+#: separate deployable with no shared package. Kept in step with `attachments/materialize`'s
+#: `CONTAINER_ATTACHMENTS_ROOT` and the supervisor's own `ATTACHMENTS`.
+ATTACHMENTS_ROOT = "/workspace/attachments"
+
+
 def _lf(text: str) -> str:
     """LF-normalize like the supervisor does before it touches a file."""
     return text.replace("\r\n", "\n").replace("\r", "\n")
@@ -82,6 +90,8 @@ class FakeSandbox(SandboxClient):
         fqdn: str = "app-xyz.westeurope.azurecontainerapps.io",
         seed_files: dict[str, str] | None = None,
     ) -> None:
+        # Binary writes land here rather than in `workspace` — see `files()`'s create_bytes arm.
+        self.binary_workspace: dict[str, bytes] = {}
         self.workspace: dict[str, str] = {
             path: _lf(text) for path, text in (seed_files or {}).items()
         }
@@ -292,6 +302,14 @@ class FakeSandbox(SandboxClient):
             return self._str_replace(op)
         if isinstance(op, FileInsert):
             return self._insert(op)
+        if isinstance(op, FileCreateBytes):
+            # A SEPARATE STORE, not `workspace`, because `workspace` is `dict[str, str]` and
+            # these are real bytes. Coercing them into the text map would make the fake model
+            # the very confusion the op exists to prevent — and a test asserting on a decoded
+            # string would pass against a supervisor that had corrupted the file.
+            self._guard_escape(op.path)
+            self.binary_workspace[op.path] = base64.b64decode(op.file_b64, validate=True)
+            return FileResult(ok=True, detail={"path": op.path, "created": True})
         assert_never(op)
 
     def _view(self, op: FileView) -> FileResult:
@@ -335,6 +353,15 @@ class FakeSandbox(SandboxClient):
     def _guard_escape(path: str) -> None:
         # The supervisor's 400-on-escape → opaque SandboxError. BRAIN's write guard denies
         # these above the seam, but the fake still models the client-side rejection.
+        #
+        # TWO ROOTS, MIRRORING THE SUPERVISOR'S `_resolve`. A relative path is still
+        # app-relative and is still the only shape any agent tool produces; the attachments root
+        # is reachable ONLY by naming it absolutely, which is the property that keeps an app
+        # containing its own `attachments/` directory resolving where it always did. Without this
+        # arm the fake refuses a write the real supervisor accepts, and the platform's own
+        # attachment placement is untestable against it.
+        if path.startswith(f"{ATTACHMENTS_ROOT}/") and ".." not in path.split("/"):
+            return
         if path.startswith("/") or ".." in path.split("/"):
             raise SandboxError(f"path escapes the workspace: {path}")
 

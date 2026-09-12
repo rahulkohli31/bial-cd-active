@@ -38,6 +38,8 @@ vi.mock('../../utils/builderHistory', () => ({
 // Vitest now warns loudly the moment a real caller reaches for a missing export.
 vi.mock('../../utils/conversationApi', async (importOriginal) => ({
   ...(await importOriginal()),
+  // The send path creates the chat before its first upload; stubbed so no network is reached.
+  createConversation: async () => ({ id: 'conv-created' }),
   listProjectConversations: h.listProjectConversations,
 }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
