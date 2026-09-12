@@ -414,6 +414,21 @@ def load_definitions() -> tuple[tuple[str, str], ...]:
     return tuple((str(row["name"]), str(row["definition"])) for row in rows)
 
 
+def marked_for_gloss() -> frozenset[str]:
+    """Columns whose definition must be rendered even though their NAME looks self-describing.
+
+    A THIRD FIELD, AND ONLY BECAUSE THE CLIENT'S ANSWERS EARNED IT. The pair above is deliberately
+    narrow, and the ruling it records -- that `source`/`client_status` tiering ends the day the
+    client returns the workbook -- still holds; this is not that. `gloss` says a definition carries
+    something the name cannot, which the 2026-09 review round demonstrated: AIBT_AOBT_TIME is the
+    arrival's in-block time OR the departure's off-block time depending on the row. `is_opaque`
+    would keep that silent because the name is long. The mark is written by the ingest script, so
+    what the client teaches us reaches the agent without anyone remembering to edit this file."""
+    path = DATA_DIR / "definitions.json"
+    rows: list[dict[str, Any]] = json.loads(path.read_text(encoding="utf-8"))["columns"]
+    return frozenset(str(row["name"]) for row in rows if row.get("gloss"))
+
+
 # --- Rendering one column ------------------------------------------------------------------------
 
 _OPAQUE_NAME: Final = re.compile(r"[A-Za-z0-9]{2,5}")
@@ -528,7 +543,7 @@ def value_clause(column: dict[str, Any]) -> str:
     return f"= at least {max(distinct, len(values)):,} distinct values observed"
 
 
-def column_line(column: dict[str, Any], definition: str) -> str:
+def column_line(column: dict[str, Any], definition: str, *, forced: bool = False) -> str:
     """One line for one column: `NAME (type) = values -- meaning`.
 
     SELF-DESCRIBING RATHER THAN POSITIONAL, and that is a deliberate 109 tokens. A tab-separated
@@ -551,7 +566,13 @@ def column_line(column: dict[str, Any], definition: str) -> str:
     # first clause. Taking the first clause dropped `OTP`'s sign convention ("negative is early")
     # and `BAGS`'s "stored as a decimal string" — the two facts on those lines most likely to
     # produce a green build with wrong numbers.
-    if is_opaque(column["name"]) and definition.strip():
+    # A `gloss` mark overrides the name test. `is_opaque` reads the NAME and assumes a long one
+    # speaks for itself; the client's 2026-09 review round proved that assumption can be wrong --
+    # AIBT_AOBT_TIME holds the arrival's in-block time OR the departure's off-block time depending
+    # on the row, which no name can say and which is the same trap SIBT_SOBT_TIME gets a paragraph
+    # for. The mark is set by `ingest_client_definitions.py` when an answer describes shape rather
+    # than subject, so the set grows with what the client tells us instead of being frozen here.
+    if (is_opaque(column["name"]) or forced) and definition.strip():
         parts.append(f"-- {ascii_only(definition)}")
     return " ".join(parts)
 
@@ -761,8 +782,11 @@ def build(profile: dict[str, Any], definitions: tuple[tuple[str, str], ...]) -> 
         )
 
     grouped: dict[str, list[str]] = defaultdict(list)
+    forced = marked_for_gloss()
     for name, definition in definitions:
-        grouped[group_of(name)].append(column_line(columns[name], definition))
+        grouped[group_of(name)].append(
+            column_line(columns[name], definition, forced=name in forced)
+        )
 
     body = "\n\n".join(
         f"## {key} -- {label}\n" + "\n".join(grouped[key])

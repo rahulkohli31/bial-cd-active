@@ -90,21 +90,21 @@ CREATION_DATE_CDAT (timestamp)
 FLAGS_DATASOURCE_DSSF = at least 110 distinct values observed
 LAST_UPDATE_DATE_TIME (timestamp)
 LSTU -- The AODB last-update marker for the row.
-RKEY (decimal) -- The AODB internal record key.
-USEU = at least 110 distinct values observed -- The user or upstream system that last updated the record (e.g. AFTN, ATCA, an airline desk code).
+RKEY (decimal) -- Rotation Key - Key that brings arrival and Dep together
+USEU = at least 110 distinct values observed -- Last Updated by
 yearmonth = '202601', '202602', '202603', '202604', '202605', '202606', '202607', '202608', '202609'
 
 ## identity -- Which flight this is
-AIRCRAFT_ID (decimal)
-AIRLINES_ID (decimal)
+AIRCRAFT_ID (decimal) -- Looks Like ID Seq of Aircraft
+AIRLINES_ID (decimal) -- Looks like ID SEQ of Airlines
 AODB_AFTTAB_PK_URNO
 BAG_DELAY_ID (decimal)
 CALL_SIGN_CSGN
-DEST_AIRPORT_ID (decimal)
-FLIGHT_ID (decimal)
+DEST_AIRPORT_ID (decimal) -- ID Seq of Destination Airport Code
+FLIGHT_ID (decimal) -- ID Seq of Flight record
 FULL_FLIGHT_NUMBER_FLNO
 NUM_FLIGHT_NUMBER_FLTN
-ORIGIN_AIRPORT_ID (decimal)
+ORIGIN_AIRPORT_ID (decimal) -- ID Seq of Airport Code
 
 ## airline -- Who is operating it
 AIRLINE_NAME = at least 72 distinct values observed
@@ -128,8 +128,8 @@ ORIGIN_AIRPORT_CODE_ORG4 = at least 251 distinct values observed
 ## schedule -- When it was meant to happen
 SCHEDULED_IN_BLOCK_TIME_SIBT (timestamp)
 SCHEDULED_OFF_BLOCK_TIME_SOBT (timestamp)
-SCH_END_TIME_B1ES (timestamp)
-SCH_STA_TIME_B1BS (timestamp)
+SCH_END_TIME_B1ES (timestamp) -- Looks like Schedule time of Arrival of a turn
+SCH_STA_TIME_B1BS (timestamp) -- Looks like Schedule Departure time of a turn
 SIBT_SOBT_TIME (timestamp)
 
 ## actual_times -- When it actually happened (A-CDM milestones)
@@ -138,26 +138,26 @@ ACTUAL_LANDING_TIME_ALDT (timestamp)
 ACTUAL_OFF_BLOCK_TIME_AOBT (timestamp)
 ACTUAL_READY_TIME_ARDT (timestamp)
 ACTUAL_TAKEOFF_TIME_ATOT (timestamp)
-AIBT_AOBT_TIME (timestamp)
+AIBT_AOBT_TIME (timestamp) -- Actual In-Block Time if row belongs to Arrival | Actual Off Block Time if row belongs to Departure
 ARR_DEP_TIME (timestamp)
-ASAT = free text, not a code list -- Actual Startup Approved Time
-ASRT = free text, not a code list -- Actual Startup Request Time
+ASAT = free text, not a code list -- Actual Start up Approval Time
+ASRT = free text, not a code list -- Actual Start up Requested time
 FB_TIME (timestamp)
-FPLA = free text, not a code list -- Flight-plan arrival timestamp, written as YYYYMMDDHHMMSS text.
-FPLD = free text, not a code list -- Flight-plan departure timestamp, written as YYYYMMDDHHMMSS text.
+FPLA = free text, not a code list -- Flight Plan Activation time for Arrival. Flight-plan arrival timestamp, written as YYYYMMDDHHMMSS text.
+FPLD = free text, not a code list -- Flight Plan Activation time for Departure. Flight-plan departure timestamp, written as YYYYMMDDHHMMSS text.
 LB_TIME (timestamp)
 TARGET_OFF_BLOCK_TIME_TOBT (timestamp)
 TIME_AIRBORNE_TIME_AIRB (timestamp)
 TLDT = free text, not a code list -- Target Landing Time
-TMOA = free text, not a code list -- A movement-area timestamp, written as YYYYMMDDHHMMSS text.
-TTOT = free text, not a code list -- Target Take-Off Time
+TMOA = free text, not a code list -- Ten Miles Out /Final Landing Time. A movement-area timestamp, written as YYYYMMDDHHMMSS text.
+TTOT = free text, not a code list -- Target Take off Time
 
 ## estimates -- What was expected at the time
 BEST_EST_TIME_ETAI (timestamp)
 BEST_EST_TIME_ETDI (timestamp)
-EIBT = free text, not a code list -- Estimated Inblock Time
-ENRC = free text, not a code list -- An en-route timestamp stored as text in TWO different formats, not one: YYYYMMDDHHMMSS and 'YYYY-MM-DD HH:MM:SS' both occur in the same column. Parse both, and never order it as text - '2026-...' sorts before '20260...', so a text sort puts every dashed row before every compact one regardless of date.
-ETOT = free text, not a code list -- Estimated Take-Off Time
+EIBT = free text, not a code list -- Estimated In block Time
+ENRC = free text, not a code list -- Enroute Clearance Time. An en-route timestamp stored as text in TWO different formats, not one: YYYYMMDDHHMMSS and 'YYYY-MM-DD HH:MM:SS' both occur in the same column.
+ETOT = free text, not a code list -- Estimated Take-off Time
 FIDS_ETA_ETOA (timestamp)
 FIDS_ETD_ETOD (timestamp)
 
@@ -201,7 +201,7 @@ ACT_END_TIME_B1EA (timestamp)
 ACT_STA_TIME_B1BA (timestamp)
 BAGGAGE_BELT1_BLT1 = at least 49 distinct values observed
 BAGGAGE_BELT2_BLT2 = at least 21 distinct values observed
-BAGS = at least 823 distinct values observed -- Number of bags, stored as a decimal string (e.g. '42.00000') rather than a number.
+BAGS = at least 823 distinct values observed -- Total number of bags arrived. Number of bags, stored as a decimal string (e.g. '42.00000') rather than a number.
 FIRST_BAG_TIME (integer)
 LAST_BAG_TIME (integer)
 
@@ -215,21 +215,21 @@ FINAL_CALL_FCAL (timestamp)
 
 ## runway -- Which runway it used
 RUNWAY = '09L', '09R', '27L', '27R'
-RWYA = '09L', '09R', '27L', '27R' -- The arrival runway.
-RWYD = '09L', '09R', '27L', '27R' -- The departure runway.
+RWYA = '09L', '09R', '27L', '27R' -- Arrival Runway
+RWYD = '09L', '09R', '27L', '27R' -- Departure Runway
 
 ## punctuality -- On-time performance and turnaround
-FB_ONTIME (integer)
+FB_ONTIME (integer) -- First bag Delivery. Looks like a flag Delayed /Ontime
 FOR_ATM (integer)
 FOR_OTP (integer)
 LB_ONTIME (integer)
 OTP (integer) -- On-time performance for this flight, against schedule. SIGNED - negative is early, positive is late. The unit is SECONDS, not minutes: every one of the 301 values profiled is a whole multiple of 60, as are both extremes, which a minute-granular column would not be (TAT, a real minutes column, takes values like 9, 11 and 23). Divide by 60 before showing minutes. Observed range is roughly -90,720 to 253,860 - about -25 to +70 hours - so the extremes are data-quality outliers rather than real delays.
-TAT (integer) -- Turnaround time in minutes - the interval between arrival on-stand and departure off-stand for the same aircraft.
+TAT (integer) -- Turn Around Time. Turnaround time in minutes - the interval between arrival on-stand and departure off-stand for the same aircraft.
 
 ## handling -- Ground handling and the operational zone
-ACGT = free text, not a code list -- Start Ground Handling
-ACOR = free text, not a code list -- A ground-handling milestone timestamp, written as YYYYMMDDHHMMSS text rather than a date. Same shape and sparsity as ACGT (Start Ground Handling).
-AEGT = free text, not a code list -- Actual End of Ground Handling
+ACGT = free text, not a code list -- Actual Commencement of Ground Handling Time
+ACOR = free text, not a code list -- Aircraft in Range / Flight In Range (FIRT). A ground-handling milestone timestamp, written as YYYYMMDDHHMMSS text rather than a date.
+AEGT = free text, not a code list -- Actual End of Ground Handling Time
 BAZ1 = at least 24 distinct values observed -- Baggage zone or make-up area identifier.
 GROUND_HANDLER = 'Air India SATS', 'GlobeGround India', 'Indigo ', 'Menzies Aviation India Pvt. Ltd.', 'Menzies Aviation booba bangalore pvt ltd'
 REMP = '0', '1', 'F', 'H', 'N', 'S', 'T', 'V', 'X' -- An operational handling code.
@@ -252,4 +252,4 @@ FLIGHT_TYPE_FTYP = ' ', 'B', 'D', 'N', 'O', 'X', 'Z'
 IS_DOMESTIC (integer)
 IS_INTERNATIONAL (integer)
 IS_MIXED = 'N', 'Y'
-SUFFIX_FLNS = '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'
+SUFFIX_FLNS = '0', '1', '2', '3', '4', '5', '6', '7', '8', '9' -- Looks like Last Letter from IATA Flight Number

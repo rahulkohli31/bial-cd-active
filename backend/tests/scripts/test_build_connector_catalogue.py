@@ -39,6 +39,7 @@ from typing import Any
 import pytest
 
 from scripts.build_connector_catalogue import (
+    marked_for_gloss,
     CONNECTOR_KEY,
     DATA_DIR,
     GROUPS,
@@ -605,8 +606,11 @@ def test_a_decimal_renders_its_type_and_not_its_values() -> None:
 
     Mutation check: narrow the set to `{"integer"}` and this goes red naming the column."""
     lines = column_lines(SHIPPED)
-    assert lines["AIRLINES_ID"] == "AIRLINES_ID (decimal)"
-    assert lines["AIRCRAFT_ID"] == "AIRCRAFT_ID (decimal)"
+    # THE VALUE CLAUSE IS THE SUBJECT, and a gloss may now sit beside it: the client's 2026-09
+    # round said this column is an internal sequence, not the airline code it resembles, which is
+    # exactly the confusion this test exists to prevent. Assert the half under test.
+    assert lines["AIRLINES_ID"].split(" -- ")[0] == "AIRLINES_ID (decimal)", lines["AIRLINES_ID"]
+    assert lines["AIRCRAFT_ID"].split(" -- ")[0] == "AIRCRAFT_ID (decimal)", lines["AIRCRAFT_ID"]
     # The suppression is doing real work: these columns DO carry values, they are simply not a
     # vocabulary anyone should filter on.
     assert len(COLUMNS["AIRLINES_ID"]["values"]) > INLINE_VALUE_MAX
@@ -653,7 +657,14 @@ def test_an_opaque_code_renders_its_whole_gloss_unclipped() -> None:
     # The three whose whole point is what the first clause would have thrown away.
     assert "SECONDS" in glossed["OTP"] and "negative is early" in glossed["OTP"]
     assert "decimal string" in glossed["BAGS"]
-    assert glossed["TAT"].endswith("departure off-stand for the same aircraft.")
+    # TAT WAS A THIRD LITERAL HERE and it went red on the client's round-1 answers, which replaced
+    # our sentence with the acronym spelled out. That is their call to make -- what turnaround
+    # MEASURES is stated as a formula in the MEASURES block regardless -- and this file's own
+    # docstring warns that a pinned literal teaches reviewers to paste new text in unread. So the
+    # property is asserted instead: the longest definition arrives whole, which is what clipping
+    # would break. OTP and BAGS stay literal because they pin MEASURED facts, not prose.
+    longest = max(glossed, key=lambda name: len(definitions[name]))
+    assert glossed[longest] == ascii_only(definitions[longest])
 
 
 def test_a_self_describing_name_gets_no_gloss() -> None:
@@ -667,17 +678,27 @@ def test_a_self_describing_name_gets_no_gloss() -> None:
         "AIRCRAFT_BODY_TYPE",
     ):
         assert " -- " not in lines[self_describing]
-    glossed = [name for name, line in lines.items() if " -- " in line]
-    assert len(glossed) == 23
-    assert all(len(name) <= 5 for name in glossed)
+    # A LONG NAME IS GLOSSED ONLY WHEN IT WAS MARKED, and the mark is evidence-driven rather than
+    # taste: the client's 2026-09 review round returned meanings no name can carry (AIBT_AOBT_TIME
+    # holds the arrival's in-block time OR the departure's off-block time depending on the row --
+    # the SIBT_SOBT_TIME trap again). Before that round the count was 23, all bare codes. The rule
+    # this test defends is unchanged: prose the model can read off the name is still not rendered.
+    glossed = {name for name, line in lines.items() if " -- " in line}
+    marked = marked_for_gloss()
+    assert all(len(name) <= 5 or name in marked for name in glossed), sorted(
+        name for name in glossed if len(name) > 5 and name not in marked
+    )
+    assert len(marked) < 20, f"{len(marked)} marks is a tier system, not an exception: {marked}"
 
 
 def test_a_timestamp_stored_as_text_is_not_offered_as_a_code_list() -> None:
     """Thirteen columns hold more distinct values than any vocabulary plausibly has because they
     are timestamps written as text. Telling the agent to `SELECT DISTINCT` 125,028 of them would
     be advice to read the whole table for nothing."""
+    # THE VALUE CLAUSE IS THE ASSERTION, not the gloss beside it: the gloss is the client's text and
+    # moves every review round, while "free text, not a code list" is the decision under test.
     line = column_lines(SHIPPED)["ACGT"]
-    assert line == "ACGT = free text, not a code list -- Start Ground Handling"
+    assert line.split(" -- ")[0] == "ACGT = free text, not a code list", line
     assert int(COLUMNS["ACGT"]["distinct_max"]) > NOT_A_VOCABULARY_ABOVE
 
 
