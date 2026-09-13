@@ -13,14 +13,14 @@
  * region and the consent copy.
  *
  * THE CONSENT PANEL SHIPS WHOLE, AND IT SHIPS FROM THE WIRE. Its lines are promises about what
- * an approval does and does not give you, and R1 makes copy that states a capability or a
- * consequence binding in substance — they may be shortened, they may not start meaning something
- * else, and summarising them is the exact failure R1 exists to prevent. So this file renders
+ * an approval does and does not give you, and copy that states a capability or a consequence is
+ * binding in substance — they may be shortened, they may not start meaning something else, and
+ * summarising them is the exact failure that rule exists to prevent. So this file renders
  * every one of them, in the order the server sent them, and pins none of them: the sentences live
  * on the registry entry in `backend/src/core/connectors.py`, where the administrator's
  * differently-voiced set already lives, and where a test holds both byte-exact against the boards.
  *
- * NOT ONE SENTENCE HERE IS ABOUT A PARTICULAR SYSTEM, AND THAT IS THE POINT (R18). The title, the
+ * NOT ONE SENTENCE HERE IS ABOUT A PARTICULAR SYSTEM, AND THAT IS THE POINT. The title, the
  * subtitle and every ticked line all come off `entry`. A second connector is therefore a
  * registry entry plus its board copy — no migration, no route, and nothing to change in here.
  */
@@ -55,8 +55,8 @@ const REMARKS_HELPER =
  * The word rule, stated BEFORE it is tripped rather than only after — the form and the server
  * must agree about what is required, and a 422 must never be the first news of it.
  *
- * THE CONSTANTS KEEP THEIR DELETE-FLAVOURED NAMES on purpose, exactly as the server's do: owner
- * decision D1 is "use the rule already shipped for a deletion reason", and a parallel set of
+ * THE CONSTANTS KEEP THEIR DELETE-FLAVOURED NAMES on purpose, exactly as the server's do: the
+ * owner's decision is "use the rule already shipped for a deletion reason", and a parallel set of
  * aliases would be two names for one number — the drift `words.ts` exists to prevent.
  */
 const RULE_ID = 'connector-remarks-rule'

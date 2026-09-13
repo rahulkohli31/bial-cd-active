@@ -7,8 +7,8 @@ developer machine has no lake, and that is a supported posture rather than a bro
 
 NO LITERAL FROM THIS FILE'S SUBJECT LIVES IN CODE. The account name and the identity's two
 identifiers are the client's, not ours, so they arrive as configuration and never as constants in
-`src/core/connectors.py` — which is also what keeps R11's checkable form (a word-boundary grep
-that must hit exactly one module) true.
+`src/core/connectors.py` — which is also what keeps the naming rule's checkable form (a
+word-boundary grep that must hit exactly one module) true.
 
 NOTHING HERE IS A BEARER CREDENTIAL, AND THAT IS DELIBERATE. A URL and two identity identifiers
 are LABELS: holding them grants nothing. The credential is the managed identity itself, which is

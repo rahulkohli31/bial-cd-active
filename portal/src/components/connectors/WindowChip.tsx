@@ -2,17 +2,17 @@
  * The date pill on a connector row, and the one rule that decides what it says.
  *
  * IT IS THE POPOVER'S TRIGGER, not a label beside one — `PopoverTrigger asChild` over a shadcn
- * `Button` (R14), so the pill IS the control. It must be rendered inside a `<Popover>`; the row
+ * `Button`, so the pill IS the control. It must be rendered inside a `<Popover>`; the row
  * owns that root, because the row is what closes it after a successful write.
  *
  * IT RENDERS THE WINDOW'S OWN SHAPE — `Last 7 days` for a preset, `1 – 30 Sep` for a fixed range.
  * The two boards disagree here: `DialogProjects` draws one project of each kind, and `DateRange`
  * ticks `Last 30 days` over a project whose chip reads dates. The owner settled it on the shape
- * rule (D7), which makes `DialogProjects` internally consistent and reads `DateRange`'s tick as
+ * rule, which makes `DialogProjects` internally consistent and reads `DateRange`'s tick as
  * the board showing its controls rather than that project's stored state.
  *
  * IT RENDERS THE RESOLVED FIELDS ONLY. A project storing `1 – 30 Sep`, read in October, shows the
- * CLAMPED range, because that is what the resolver returned (R13). `window.stored` is not read
+ * CLAMPED range, because that is what the resolver returned. `window.stored` is not read
  * here at all — it crosses the wire solely so the popover knows which option to tick.
  *
  * THE ACCESSIBLE NAME NAMES ITS SUBJECT, built by the row and passed in whole. `1 – 30 Sep` on

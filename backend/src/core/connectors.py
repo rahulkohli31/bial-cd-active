@@ -1,6 +1,6 @@
 """The connector catalogue — the ONE module in this tree that is allowed to say DICE.
 
-WHY THIS EXISTS. Connectors are generic by name and specific only by value (R18): the tables are
+WHY THIS EXISTS. Connectors are generic by name and specific only by value: the tables are
 `connector_access_requests` and `project_connectors`, the enums are `connector_request_status` and
 `connector_window_kind`, the routes are `/v1/connectors` and `/v1/admin/connector-requests`, and
 the portal ships `IntegrationsDialog` / `ConnectorRow` / `connectorApi.ts`. DICE appears only as a
@@ -9,14 +9,14 @@ rule is a word-boundary, case-insensitive search for `dice` across `backend/src/
 `portal/src/`: it must hit this file and nothing else. (Use a word boundary — a bare substring
 search also matches `indices` in `portal/src/components/chat/ActivityGroup.tsx`.)
 
-A MODULE CONSTANT, NOT A TABLE (R15, origin Q18). There is exactly one connector. A `connectors`
+A MODULE CONSTANT, NOT A TABLE. There is exactly one connector. A `connectors`
 table would store display strings the boards own, would need seeding in every environment and every
 test database, and would eventually want an admin CRUD screen for rows nobody is allowed to add.
 The registry is code, reviewed like code, and deployed with the code that renders it.
 
 EXACTLY ONE ENTRY, AND THAT IS THE POINT. The boards draw a second, greyed
 `[ANOTHER BIAL SYSTEM]` / `Nothing else is connected to the platform yet` row as a placeholder for
-a future integration. The owner ruled on 2026-09-08 that it is not built — so it is not in this
+a future integration. The owner ruled that it is not built — so it is not in this
 mapping either. A registry entry that nothing may be done with is exactly how the placeholder would
 get back onto the screen, because every surface in this feature (the Integrations dialog's list,
 the admin queue's filter pills, the rail's DATA rows) is rendered by ITERATING this mapping rather
@@ -29,7 +29,7 @@ name. With the placeholder gone there is no known-but-unusable key: anything out
 is unknown and 404s, which is the same guard for no field and no branch. Do not add the flag back
 for a connector that does not exist yet.
 
-EVERYTHING A CONNECTOR DIFFERS BY LIVES ON ITS ENTRY (owner ruling, 2026-09-08). Not in a
+EVERYTHING A CONNECTOR DIFFERS BY LIVES ON ITS ENTRY. Not in a
 component, not in a module constant beside it. That is what makes "add a second connector" a
 registry entry plus its board copy rather than a migration, a route and a component change. In
 particular `max_window_days` is DICE's RETENTION, not a platform fact — the client document caps
@@ -37,17 +37,15 @@ the DICE build at the last thirty days, and another system will have its own num
 The window resolver at the foot of this module reads the cap off the entry it is already handed, so
 a second connector needs no change to the resolver.
 
-TWO CONSENT SETS, NOT ONE — READ THIS BEFORE MERGING THEM BACK TOGETHER. The plan's U1 approach
-described `consent_lines` as a single tuple "the ask dialog and the decide dialog show". The boards
-disagree, and the boards are the specification (R1): `AskAccess` draws `WHAT AN APPROVAL GIVES YOU`
+TWO CONSENT SETS, NOT ONE — READ THIS BEFORE MERGING THEM BACK TOGETHER. The boards are the
+specification: `AskAccess` draws `WHAT AN APPROVAL GIVES YOU`
 in the second person for the citizen, and `AdminReview` draws `WHAT APPROVING GIVES THEM` in the
 third person for the administrator — different voice AND different content. The administrator's
 third line is the only one of the six that names the thirty-day cap, and the citizen's first line
 reads `Nothing you build can change DICE data`. Collapsing the two sets would therefore drop a
 promise from the approver's panel and simultaneously ship second-person copy to the approver. Both
-panels are consent copy, which R1's first condition makes binding in substance, so they ship as two
-fields. The literals below are byte-exact from
-`docs/ux-canvas/dice/boards/{AskAccess,AdminReview}.dc.html.txt`, cross-checked against the PNGs.
+panels are consent copy, binding in substance, so they ship as two fields. The literals below are
+byte-exact from the `AskAccess` and `AdminReview` boards.
 
 THE WINDOW RESOLVER LIVES HERE TOO. Registry and resolver are both pure and share one home
 (`src/core/` is where pure cross-cutting modules live — `errors.py`, `words.py`, `redaction.py` —
@@ -102,7 +100,7 @@ class Connector:
     its title, which says what the system holds AND that one administrator answers once for you.
     The panel that draws it cannot derive one from the other, so both ride the entry and both ride
     the wire — the alternative is a component that knows what DICE is, which is the exact thing
-    R18 forbids."""
+    the module docblock forbids."""
 
     display_name: str
     subtitle: str
@@ -110,7 +108,7 @@ class Connector:
     # WHAT THIS CONNECTOR'S DATA IS CALLED, in the rail's two state sentences: `Reading N days of
     # {data_noun}` and `Switch it on when a chat needs {data_noun}`. It lives here for the same
     # reason `ask_subtitle` does — the sentences are the board's, but the noun inside them is this
-    # connector's, and a second connector must not cost a component edit (R18). Lowercase, because
+    # connector's, and a second connector must not cost a component edit. Lowercase, because
     # it always appears mid-sentence.
     data_noun: str
     max_window_days: int
@@ -136,7 +134,7 @@ class Connector:
 
 
 # The `WHAT AN APPROVAL GIVES YOU` panel on `AskAccess`, shown to the citizen who is asking.
-# Second person throughout; these are promises the harness track makes true, and R1 makes them
+# Second person throughout; these are promises the harness track makes true, and they are
 # binding in substance — they may be shortened, they may not start meaning something else.
 _DICE_CONSENT_REQUESTER: Final = (
     ConsentLine(
@@ -209,7 +207,7 @@ class ResolvedWindow:
     """What one project actually reads from one connector, right now — the permission answer and
     the two dates, resolved together because nothing downstream is allowed to compute either again.
 
-    `effectively_on` IS THE WHOLE PREDICATE (R12/R13): the project's switch AND the owner's
+    `effectively_on` IS THE WHOLE PREDICATE: the project's switch AND the owner's
     approval. `project_connectors.enabled` on its own is only the switch position; a caller that
     spells the conjunction itself has created a second place the platform decides whether a
     connector reads, and the two will eventually disagree.
@@ -233,7 +231,7 @@ class ResolvedWindow:
     latest: date
 
 
-# A row whose columns disagree with its own `window_kind` cannot exist: U1's
+# A row whose columns disagree with its own `window_kind` cannot exist:
 # `ck_project_connectors_window_shape` refuses it at the database. The two guards below are both
 # the type narrowing and the honest failure if that constraint is ever dropped — a resolver that
 # quietly substituted a default would hand the citizen a window nobody chose, worse than a 500.
@@ -287,22 +285,15 @@ def resolve_window(
     calendar grid greys its dates against the returned `earliest`/`latest`, so the popover
     inherits the rule with no change of its own.
 
-    TWO HISTORICAL WRONG TURNS, PINNED HERE BECAUSE THE ORDER OF THE CLAMP IS THE WHOLE OF IT:
+    THE ORDER OF THE CLAMP IS THE WHOLE OF IT: cap `end` at `latest` first, then pull `start` down
+    to that capped `end`, then raise it to the floor and cap the length against the RESOLVED `end`.
+    Skipping the second step inverts the pair for a future-dated window.
 
-    1. The first draft had NO CEILING AT ALL. A stored 10 August – 31 December resolved to 144 days
-       with `clamped` reading false, and the rail announced `Reading 144 days of flight data` for a
-       connector that keeps thirty and holds nothing at all after its own ceiling.
-    2. The correction introduced a second bug: capping `end` and THEN raising `start` to the floor
-       INVERTS THE PAIR for a future-dated window — 1–30 October read on 8 September gives
-       `start = 1 October`, `end = 8 September`. Step 2 (pull `start` down to the capped `end`) and
-       the `else` arm of step 3 (cap the length against the RESOLVED end, not against the floor
-       alone) are what make the order safe. Do not reorder them.
+    The aged-out arm resolves to a window OF THE SAME LENGTH ending at `latest`, itself capped.
 
-    The aged-out arm resolves to a window OF THE SAME LENGTH ending at `latest`, itself capped. An
-    earlier "falls back to the floor" silently widened a three-day pick to thirty.
-
-    `stored.window_start <= stored.window_end` is the writer's guarantee (U4 validates it) and is
-    taken as given here — validated once at the boundary, never re-checked inward.
+    `stored.window_start <= stored.window_end` is the writer's guarantee (`AbsoluteWindowChoice`
+    validates it) and is taken as given here — validated once at the boundary, never re-checked
+    inward.
 
     `owner_access_state` is the person's derived access state, or `None` for never-asked. There is
     NO `AND not withdrawn` term: nothing in this pass can set that fact, and a permanently-true
@@ -352,10 +343,10 @@ def resolve_window(
         if stored_start is None or stored_end is None:
             raise ValueError(_SHAPE_VIOLATION)
 
-        # 1. THE CEILING, FIRST. Nothing reads the future. (Wrong turn 1.)
+        # 1. THE CEILING, FIRST. Nothing reads the future.
         end = min(stored_end, latest)
-        # 2. A start that is now after the end collapses onto it. (Wrong turn 2 — this is the step
-        #    whose absence inverts a future-dated pair.)
+        # 2. A start that is now after the end collapses onto it — the step whose absence
+        #    inverts a future-dated pair.
         start = min(stored_start, end)
         if end < earliest:
             # 3a. AGED OUT ENTIRELY — the whole pick is older than the connector keeps. Slide it
@@ -405,7 +396,7 @@ class ConnectedSystem:
 
     NOTHING HERE REACHES THE MODEL BUT THE TWO NAMES. `window` is carried so a tool can fail
     first on a system that came back not-effectively-on; its DATES are deliberately never
-    rendered into a prompt (owner ruling, 2026-09-10). The window is a portal and approval
+    rendered into a prompt. The window is a portal and approval
     concept — the code an agent writes reads the lake directly, for whatever dates the app's own
     users pick — so telling the model about a thirty-day sample would describe a constraint that
     does not exist and that nothing it writes would honour."""

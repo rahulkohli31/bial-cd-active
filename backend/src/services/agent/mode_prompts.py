@@ -53,17 +53,17 @@ class PromptContext:
 def _connected_data_stub(systems: tuple[ConnectedSystem, ...]) -> str:
     """The CONNECTED DATA block, or `""` when this project reads nothing outside the platform.
 
-    THE STUB DESCRIBES NOTHING ABOUT THE DATA — owner ruling, 2026-09-11. It names what is
+    THE STUB DESCRIBES NOTHING ABOUT THE DATA. It names what is
     connected and says to call the tool; the tool call is what places the data, and a second,
     smaller copy of that in the prompt is a claim somebody has to keep true. Two earlier designs
     died here: a registry field holding a hand-typed sentence about the client's table, and its
     replacement, a generated summary line pinned to the profile by its own claim test. The second
     was machinery built to make the first safe, and deleting the claim deleted the machinery.
 
-    NO WINDOW, NO DATES, NO SAMPLE SIZE — owner ruling, 2026-09-10. See `ConnectedSystem`.
+    NO WINDOW, NO DATES, NO SAMPLE SIZE. See `ConnectedSystem`.
 
     The per-system line is `display_name` and `subtitle` verbatim off the registry, which is what
-    keeps this function from knowing what any particular connected system is (R9). It renders no
+    keeps this function from knowing what any particular connected system is. It renders no
     key: the tool matches a name case-insensitively against both, so the citizen's agent passes
     back what it reads here."""
     if not systems:

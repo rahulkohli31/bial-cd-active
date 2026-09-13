@@ -15,7 +15,7 @@ case, and `tests/api/v1/connectors/test_person_state.py` drives it again through
 
 WHY THIS IS A MODULE AND NOT AN INLINE QUERY (ADR-0010 wants a reason). Present-tense reuse:
 `GET /v1/connectors` reads it, `POST /v1/connectors/{key}/request` refuses a second ask on it,
-`POST /v1/connectors/{key}/cancel` reports the resulting state with it, and U4's per-project
+`POST /v1/connectors/{key}/cancel` reports the resulting state with it, and the per-project
 switch-on refuses on it as well. The realized testing benefit is the direct test named above —
 the cancelled-history case is the whole reason the rule is not one line, and testing it through
 HTTP alone would leave the rule provable only by the surface that happens to call it.

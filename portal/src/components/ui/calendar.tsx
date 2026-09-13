@@ -14,7 +14,7 @@ import { cn } from "@/lib/utils"
  * checked against a real `npx tailwindcss` build of `tailwind.config.js`.
  *
  * NOTHING HERE KNOWS A DATE RULE. No floor, no ceiling, no "today": the caller passes
- * `disabled`, `startMonth` and `endMonth`, and those come off the wire (R13). A calendar that
+ * `disabled`, `startMonth` and `endMonth`, and those come off the wire. A calendar that
  * worked out its own bounds would put a browser clock in Bangalore against a server clock in UTC
  * and offer a date the next read refuses.
  *

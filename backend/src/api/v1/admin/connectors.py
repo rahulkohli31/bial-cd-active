@@ -33,7 +33,7 @@ already has one — `connector_access_requests.decision_remarks`, which this que
 which the citizen's own state response quotes to them verbatim. A copy here would be a second
 emitter of one sentence, free to drift the day either side is edited.
 
-R18: nothing in this module names the connector. The catalogue is iterated
+Nothing in this module names the connector. The catalogue is iterated
 (`src/core/connectors.py`), the key is a value, and the display name rides the wire.
 """
 
@@ -146,14 +146,15 @@ def _consent_lines(connector_key: str) -> list[ConsentLine]:
     """`WHAT APPROVING GIVES THEM`, as wire objects, in registry order.
 
     A COPY OF THE ORDER AND NOTHING ELSE — the citizen router's `_consent_lines` beside its own
-    panel, with the OTHER tuple. No filtering, no joining, no re-voicing: these are R1-binding
+    panel, with the OTHER tuple. No filtering, no joining, no re-voicing: these are binding
     consent sentences pinned byte-exact in `tests/db/test_connector_models.py`, and the dialog
     that renders them is a renderer.
 
     THE APPROVER'S SET, NEVER THE REQUESTER'S. They are third person and only this one names the
     day cap; handing the citizen's second-person tuple to an administrator would ship copy about
     what "you build" to somebody who is not building anything. (Quoting either set here would put
-    one connector's name in this module and break R18's grep — the sentences live on the entry.)
+    one connector's name in this module, which the naming test forbids — the sentences live on
+    the entry.)
 
     AN EMPTY LIST FOR A KEY THE REGISTRY NO LONGER OFFERS, and — unlike `_connector_name` above
     — the browser treats that as a contract break rather than degrading. The two differ because
@@ -211,8 +212,8 @@ async def _enabled_project_counts(
     switches onto every row.
 
     COUNTING `enabled` IS COUNTING EFFECTIVE STATE HERE, and only here: the column is projected
-    onto APPROVED rows only, so `enabled AND the owner is approved` (R12/R13,
-    `core.connectors.resolve_window`) has its second conjunct already true for everything
+    onto APPROVED rows only, so `enabled AND the owner is approved`
+    (`core.connectors.resolve_window`) has its second conjunct already true for everything
     counted. It is not a licence to read `enabled` and call it "on" anywhere else."""
     if not pairs:
         return {}
@@ -307,7 +308,7 @@ async def list_connector_requests(
     if statuses is None:
         raise AppApiError(status.HTTP_400_BAD_REQUEST, _INVALID_STATE, code="invalid_state")
     if connector is not None and connector not in CONNECTORS:
-        # The registry is the catalogue (R15), so an unknown key is caught here and never by the
+        # The registry is the catalogue, so an unknown key is caught here and never by the
         # database. A 400 rather than the citizen routes' 404: there the key is a path segment
         # naming the resource being acted on, here it is a filter over a listing that exists.
         # The CODE is deliberately the same word, so the portal reads one vocabulary.
@@ -525,7 +526,7 @@ async def _decide(
                 decided_by_id=admin.id,
                 decided_at=now,
                 # Stated even on an approval, where it writes the NULL the column already holds:
-                # "an approval stores no remark" (R10) is a decision, and a decision invisible in
+                # "an approval stores no remark" is a decision, and a decision invisible in
                 # the code is one a later reader undoes by accident.
                 decision_remarks=remarks,
             )

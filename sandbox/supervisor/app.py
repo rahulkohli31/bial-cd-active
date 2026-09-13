@@ -85,11 +85,9 @@ _ENV_ALLOW_PREFIXES = ("LC_", "NODE_", "NEXT_", "CHOKIDAR_", "WATCHPACK_", "npm_
 # token endpoint and its bearer, and `ManagedIdentityCredential` inside `next dev` reads them by
 # those exact names. The child env is built from an EMPTY dict, so without the two rows below the
 # coordinates are present, the identity is attached, and the credential still cannot mint a token:
-# the failure reads as a missing role assignment. This is a DELIBERATE widening of the scrub, and
-# the security note that documents the scrub predicted this exact moment — see
-# `docs/solutions/security-issues/sandbox-supervisor-child-env-scrub-allowlist-2026-07-13.md`,
-# Prevention item 3. A future reader auditing this allowlist should read those two rows as a
-# decision, not as an accident.
+# the failure reads as a missing role assignment. This is a DELIBERATE widening of the scrub. A
+# future reader auditing this allowlist should read those two rows as a decision, not as an
+# accident.
 class InjectedEnvVar(NamedTuple):
     name: str
     description: str

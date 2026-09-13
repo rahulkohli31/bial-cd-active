@@ -4,7 +4,7 @@
  * THE LARGEST DEPARTURE IN THE PASS IS IN HERE, AND IT IS A GOVERNANCE SHAPE RATHER THAN A
  * STYLE CHOICE. The board draws `YOUR REMARKS` with a permanent `REQUIRED` pill and the sentence
  * `Approving needs a remark as well as declining — Priya reads it either way, and it is kept in
- * the audit log.` Both come off (R10):
+ * the audit log.` Both come off:
  *
  *   · There is no remark on approval AT ALL. The textarea is not in the document at rest, and
  *     the approve button approves immediately with nothing stored. An optional approval remark
@@ -30,9 +30,9 @@
  *
  * THE CONSENT PANEL SHIPS WHOLE AND SHIPS FROM THE WIRE. All three ticked lines with their bold
  * leads, in the order the server sent them, off `consentLinesApprover` on the row. They are
- * R1-binding promises about what an approval does and does not give somebody, and they live on
+ * binding promises about what an approval does and does not give somebody, and they live on
  * the registry entry in `backend/src/core/connectors.py` where a test holds them byte-exact
- * against the board. Not one sentence about a particular system is written down in here (R18):
+ * against the board. Not one sentence about a particular system is written down in here:
  * the title, the panel and every line come off `request`.
  *
  * BOTH REMARKS ARE PLAIN JSX TEXT. The citizen writes theirs and an administrator reads it; the
@@ -164,7 +164,7 @@ function firstName(displayName: string): string {
 }
 
 export interface ConnectorReviewDialogProps {
-  /** The waiting row `Review` was pressed on. Every string on screen comes off it (R18). */
+  /** The waiting row `Review` was pressed on. Every string on screen comes off it. */
   request: ConnectorRequestRow
   /** Dismissed with nothing written — `Cancel`, the corner X, Escape, or a press outside. */
   onClose: () => void

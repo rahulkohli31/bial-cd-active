@@ -1,6 +1,6 @@
 """The `connector_access_requests` table — one row per time a person asked to reach a connector.
 
-ACCESS BELONGS TO THE PERSON, NOT TO A PROJECT (R2). The grant keys on `user_id` alone: an
+ACCESS BELONGS TO THE PERSON, NOT TO A PROJECT. The grant keys on `user_id` alone: an
 administrator answers once, about a human being, and every project that person owns — including the
 ones they have not made yet — inherits the answer. A project never asks for permission; it only
 answers "switched on here?" and "how far back?", which is what `project_connectors` stores.
@@ -9,7 +9,7 @@ AN APPEND-ONLY LEDGER, NOT A STATE ROW. The obvious alternative is one mutable r
 `(user_id, connector_key)` carrying the current state. It is rejected: the decision is auditable
 history — who decided, when, and in whose words — and a citizen may ask, cancel and ask again,
 which a single row would either overwrite or refuse. So each ask is its own row and the person's
-CURRENT state is derived from the rows (U3), by the rule "the most recent NON-cancelled row". Naive
+CURRENT state is derived from the rows, by the rule "the most recent NON-cancelled row". Naive
 "latest row wins" is wrong twice over: somebody who asks and then cancels would read `Cancelled`,
 which is not one of the four person states at all, and somebody whose entire history is cancelled
 would read it forever instead of returning to `Never asked`.
@@ -20,13 +20,13 @@ with approved / declined / cancelled rows accumulating freely underneath it. A p
 `UniqueConstraint` on the pair would forbid the second ask entirely; no constraint at all would let
 a double-submitted dialog put two identical requests in the administrator's queue.
 
-`declined` IS TERMINAL FOR THIS PASS. `Ask again` is not built (owner ruling, 2026-09-08), and this
+`declined` IS TERMINAL FOR THIS PASS. `Ask again` is not built, and this
 pass gives an administrator no way to grant access directly either — so a decline has no path back,
 server-side as well as in the UI. Say that to the client rather than letting them find it in the
 first mis-click.
 
 THERE IS NO `withdrawn` MEMBER. Person state 5 on the `ConnectorStates` board — the connector's
-owner revoking the platform's access — is out of this pass (origin Q2), nothing here could set it,
+owner revoking the platform's access — is out of this pass, nothing here could set it,
 and an unreachable label would cost an `ALTER TYPE` to remove later. Its absence is deliberate, not
 an oversight.
 """
@@ -45,7 +45,7 @@ from src.db.mixins import OwnedByUserMixin, TimestampMixin, UUIDv7PrimaryKeyMixi
 
 # The stored width of a `connector_key`. Both connector tables use it, and it is declared HERE
 # rather than on the registry in `src/core/connectors.py` — the semantically better home — because
-# U2 gives that module `from src.services.usage import ist_today`, and `src.services.usage`
+# that module imports `ist_today` from `src.services.usage`, and `src.services.usage`
 # re-exports from `src.db.models.token_usage`; a model importing the registry would close a
 # models → core → services → models loop. `tests/db/test_connector_models.py` asserts every
 # registry key fits this width, so the two cannot drift apart unnoticed.
@@ -86,8 +86,8 @@ class ConnectorAccessRequest(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampM
     __table_args__ = (
         # AT MOST ONE OPEN ASK per person per connector. Partial (not a `UniqueConstraint`)
         # because the uniqueness holds only while the row is `pending` — see the module docblock.
-        # A partial index cannot be named as an `ON CONSTRAINT` target, so U3's insert infers
-        # against it with `index_elements=[...] , index_where=...`.
+        # A partial index cannot be named as an `ON CONSTRAINT` target, so the ask route's insert
+        # infers against it with `index_elements=[...] , index_where=...`.
         #
         # THE PREDICATE IS A LITERAL AND MUST STAY ONE. `status = 'pending'` written as a bound
         # parameter anywhere the planner has to match this index would stop matching it from the
@@ -110,7 +110,7 @@ class ConnectorAccessRequest(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampM
         ),
     )
 
-    # WHICH connector, as a key rather than a boolean or a foreign key (R15). There is no
+    # WHICH connector, as a key rather than a boolean or a foreign key. There is no
     # `connectors` table to point at — `src/core/connectors.py` is the catalogue — so an unknown
     # key is caught at the route (404), never by the database.
     connector_key: Mapped[str] = mapped_column(sa.String(MAX_CONNECTOR_KEY), nullable=False)
@@ -142,7 +142,7 @@ class ConnectorAccessRequest(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampM
 
     # THE ADMINISTRATOR'S WORDS, WRITTEN ONLY ON A DECLINE, and shown back to the citizen verbatim
     # on their Integrations row — the whole of what a refused person is owed, since `Ask again` is
-    # not built. An APPROVAL stores nothing here (R10): the `AdminReview` board draws a permanent
+    # not built. An APPROVAL stores nothing here: the `AdminReview` board draws a permanent
     # `REQUIRED` pill on `YOUR REMARKS` and a sentence saying approving needs one too, and both
     # come off — approval is a click, decline reveals the box. So NULL on an `approved` row is
     # correct, not a missing write. Rendered as plain text on every surface, never through a

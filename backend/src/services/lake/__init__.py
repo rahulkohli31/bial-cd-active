@@ -31,7 +31,7 @@ scope, so adding it to the list below closes the cycle and the process cannot bo
 schedule_window_copy`). `tests/services/lake/test_import_graph.py` fails loudly if
 that ever stops being true, because none of the four static gates executes an import.
 
-NOTHING HERE NAMES A CONNECTOR (R11). The vocabulary is `lake`, `config`, `window`, `transfer`;
+NOTHING HERE NAMES A CONNECTOR. The vocabulary is `lake`, `config`, `window`, `transfer`;
 which connector this is a lake FOR arrives as a `connector_key` value from the registry in
 `src/core/connectors.py`.
 """

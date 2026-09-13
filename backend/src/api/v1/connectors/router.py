@@ -15,12 +15,12 @@ same clause (that table deliberately carries no `user_id` of its own — `projec
 ownership anchor). The only rows-free read is the registry itself, which is a module constant,
 identical for everybody, and holds no user data.
 
-NO WRITE HERE IS AUDITED, and that is a decision rather than an omission (R11/origin R9). The
+NO WRITE HERE IS AUDITED, and that is a decision rather than an omission. The
 citizen is acting on their OWN row: an audit entry would carry the same actor and the same
 timestamp `connector_access_requests` already holds, so it would be a second copy of the row it
 describes. The project switch is the same argument — `project_connectors` is its own record of
 who set what, and `updated_at` dates it. Approve and decline — one person acting on another — DO
-write one, in U5.
+write one, in `src/api/v1/admin/connectors.py`.
 
 Errors use the data-plane `{"error": {"message", "code"}}` envelope (`AppApiError`), not the auth
 endpoints' `{"detail": ...}`; the SPA already branches on `error.code`.
@@ -114,7 +114,7 @@ _STATE_WITHOUT_ITS_ROW = "a decided connector state arrived with no request row 
 
 
 def _known_connector(connector_key: str) -> Connector:
-    """The registry is the catalogue (R15) — there is no `connectors` table, so an unknown key is
+    """The registry is the catalogue — there is no `connectors` table, so an unknown key is
     caught HERE and never by the database. Membership first, then subscript: a `.get()` returning
     `None` would put the absent case and the present case on the same line."""
     if connector_key not in CONNECTORS:
@@ -129,7 +129,7 @@ async def _on_project_count(db: DbSession, user_id: uuid.UUID, connector_key: st
     predicate is on the join target, and dropping it would count every citizen's projects.
 
     COUNTING `enabled` IS COUNTING EFFECTIVE STATE HERE, and only here. Effective on is
-    `enabled AND the owner is approved` (R12/R13, `core.connectors.resolve_window`), and this
+    `enabled AND the owner is approved` (`core.connectors.resolve_window`), and this
     number is rendered on the APPROVED row only — the second conjunct is already true for every
     row it counts. It is not a licence to read `enabled` and call it "on" anywhere else."""
     counted = await db.scalar(
@@ -149,7 +149,7 @@ def _consent_lines(connector: Connector) -> list[ConsentLine]:
     """The registry's requester consent tuple, as wire objects, in board order.
 
     A COPY OF THE ORDER AND NOTHING ELSE. No filtering, no joining, no re-voicing: the panel that
-    renders these is a renderer, and the sentences are R1-binding consent copy pinned byte-exact
+    renders these is a renderer, and the sentences are binding consent copy pinned byte-exact
     in `tests/db/test_connector_models.py`. The approver's set stays where it is — it is third
     person and it names the day cap, and it belongs to the admin queue, not to this list."""
     return [
@@ -341,10 +341,6 @@ async def cancel_access_request(
     return await _entry(db, user.id, connector_key, connector)
 
 
-# ================================================================================
-# THE PROJECT'S SWITCH AND ITS DAYS
-# ================================================================================
-#
 # A SECOND ROUTER IN THE SAME MODULE, and the mount points are why. Everything above hangs off
 # `/v1/connectors` because access belongs to the PERSON. Two of the three routes below hang off
 # `/v1/projects/{project_id}/connectors` instead, because the switch and the days belong to the
@@ -738,8 +734,8 @@ async def set_project_connector(
     connector = _known_connector(connector_key)
     project_name = await _owned_project_or_404(db, project_id, user.id)
 
-    # R12 IS ENFORCED HERE, NOT IN THE FORM. The switch is only drawn for an approved person, so
-    # nobody meets this through the product — which is the whole reason it has to exist on the
+    # APPROVAL IS ENFORCED HERE, NOT IN THE FORM. The switch is only drawn for an approved person,
+    # so nobody meets this through the product — which is the whole reason it has to exist on the
     # server. Read through `current_access` rather than a status comparison of our own: the
     # person's state is a derivation over their remaining rows, and a second copy of that rule
     # would be correct only until somebody cancels and asks again.
