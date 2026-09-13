@@ -499,7 +499,7 @@ def _step_label(tool_name: str, args: dict[str, Any]) -> tuple[str, bool]:
         # and an agent that then invented column names.
         #
         # CONNECTOR-AGNOSTIC IN ITS OWN WORDING, so this module needs no `data_noun` lookup and
-        # no import from the connector registry (R9). `checking` is already a `stepIconFor`
+        # no import from the connector registry. `checking` is already a `stepIconFor`
         # branch in the portal, so no portal file changes for this.
         return ("Checking what data is connected", False)
     if tool_name == "declare_done":

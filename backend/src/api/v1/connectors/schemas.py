@@ -39,7 +39,7 @@ from src.services.connectors import ConnectorPersonState
 def _clean_request_remarks(value: str) -> str:
     """The connector access request's binding of the shared 5-50 word stated-reason rule.
 
-    THE SAME RULE THE DELETE REASON USES, by owner decision D1 — not a note type of its own.
+    THE SAME RULE THE DELETE REASON USES, by owner decision — not a note type of its own.
     Both surfaces count words with `portal/src/utils/words.ts`, so a browser counter can never
     let through something this API refuses, and `Give a little more detail — at least 5 words.`
     is something a person can act on where a character floor is not.
@@ -79,7 +79,7 @@ class ConsentLine(CamelModel):
 class ConnectorEntry(CamelModel):
     """One registry connector as the asking person sees it. See the module docblock.
 
-    THE ASK PANEL'S COPY RIDES THIS OBJECT (R18). `askSubtitle` and `consentLinesRequester` are
+    THE ASK PANEL'S COPY RIDES THIS OBJECT. `askSubtitle` and `consentLinesRequester` are
     the two things `AskAccess` says about a connector that no client can derive from a name: what
     the system holds, and what an approval does and does not give you. They come off the registry
     entry, which is where the same sentences already live for the administrator's panel. Without
@@ -98,8 +98,8 @@ class ConnectorEntry(CamelModel):
     #: The `AskAccess` board's own sentence under its title — a whole sentence, and NOT
     #: `subtitle` (the row's four-word label). Neither is derivable from the other.
     ask_subtitle: str
-    #: `AskAccess`'s three ticked promises, in board order. Consent copy: R1 makes it binding in
-    #: substance, and the approver's differently-voiced set never travels to the citizen.
+    #: `AskAccess`'s three ticked promises, in board order. Consent copy, binding in substance,
+    #: and the approver's differently-voiced set never travels to the citizen.
     consent_lines_requester: list[ConsentLine]
     state: ConnectorPersonState
     #: `pending` only: when they asked. The board reads `Asked 5 Sep, 08:30 · waiting on an
@@ -217,7 +217,7 @@ class ProjectConnectorEntry(CamelModel):
     #: What this connector's data is CALLED, lowercase, for the rail's two state sentences:
     #: `Reading N days of {dataNoun}` and `Switch it on when a chat needs {dataNoun}`. It rides
     #: the wire for the same reason `askSubtitle` does — the sentence is the board's, the noun
-    #: inside it is the connector's, and a second connector must not cost a component edit (R18).
+    #: inside it is the connector's, and a second connector must not cost a component edit.
     data_noun: str
     state: ConnectorPersonState
     #: `pending` only: when this person asked. The rail's state-d sentence names the date.

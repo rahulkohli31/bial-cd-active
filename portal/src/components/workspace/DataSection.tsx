@@ -3,7 +3,7 @@
  *
  * THE APP PANE IS NOT TOUCHED, and that is a ruling rather than an omission. `NoAccess` draws a
  * centred paragraph inside the pane telling a citizen their app has no flight data yet and where
- * to ask for some; none of it is built (owner, 2026-09-08). The row three inches from it already
+ * to ask for some; none of it is built. The row three inches from it already
  * says `You do not have access to … yet` and carries the control that fixes it, so the paragraph
  * would be the same message twice — and it claims to know the app NEEDS flight data, which the
  * platform cannot know. Nothing in `AppPane.tsx` or `workspaceState.ts` learns about connectors.
@@ -27,7 +27,7 @@
  * `Reading N days` IS DERIVED AND NEVER 30. `Main` draws a project set to 30 days; a project on
  * `Last 7 days` reads `Reading 7 days of flight data`. The number comes off the RESOLVED window
  * the server sent — the same field the chip beside it renders — so the sentence and the chip on
- * one row cannot contradict each other (R13).
+ * one row cannot contradict each other.
  *
  * IT RE-READS WHEN THE DIALOG CLOSES, and the rail is what wires that up. `Manage integrations →`
  * opens the Integrations dialog OVER this section; toggling this very project inside the
@@ -78,7 +78,7 @@ function viewOf(entry: ProjectConnectorEntry): RowView {
       return { kind: 'waiting', askedAt: entry.askedAt }
     case 'approved':
       // `effectivelyOn`, not `enabled`: "can this project see the data" is the resolver's answer
-      // and this must not become a second home for that conjunction (R13). The window is checked
+      // and this must not become a second home for that conjunction. The window is checked
       // beside it because the sentence COUNTS it — an on-ness with nothing to count is a
       // contract break the server cannot emit, and this is the narrowing that says so.
       return entry.effectivelyOn && entry.window !== null
@@ -102,7 +102,7 @@ function stateLine(entry: ProjectConnectorEntry, view: RowView): { text: string;
     case 'noAccess':
       // THE CONNECTOR IS NAMED FROM THE WIRE. The board writes the name into this sentence; a
       // literal here would be the one place in the feature that has to change for a second
-      // connector (R18).
+      // connector.
       return { text: `You do not have access to ${entry.displayName} yet`, tone: 'text-neutral' }
     case 'waiting':
       return {

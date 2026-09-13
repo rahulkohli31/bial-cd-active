@@ -1,7 +1,7 @@
 """The `project_connectors` table — one row per project that has ever switched a connector on,
 carrying that project's switch and the days it reads.
 
-THE DAYS BELONG TO THE PROJECT (R2). Access is answered once for a person
+THE DAYS BELONG TO THE PROJECT. Access is answered once for a person
 (`connector_access_requests`); after that a project only ever answers two questions of its own —
 is this switched on here, and how far back does it read — and neither needs anybody's permission.
 A departures board and a six-month trend want different history, so the window is per project.
@@ -18,11 +18,11 @@ that a project transfer would have to keep in step. This is `project_databases`'
 new call.
 
 THE ROW IS KEPT ON SWITCH-OFF. `enabled = false` means "switched off, and the days you picked are
-still here"; deleting the row would destroy the stored window that origin R10 requires survive, for
+still here"; deleting the row would destroy the stored window, which must survive, for
 no saving. Switching a connector off is not spending the approval, and switching it back on must
 not silently re-pick `Last 30 days` over the range the citizen chose.
 
-STORED STATE IS NOT EFFECTIVE STATE (R12/R13). `enabled = true` on this row means the project's
+STORED STATE IS NOT EFFECTIVE STATE. `enabled = true` on this row means the project's
 switch is up — nothing more. Whether the connector actually reads is `enabled AND the owner is
 approved`, and that conjunction is computed in exactly ONE place, the resolver in
 `src/core/connectors.py`. Nothing may read `enabled` and call it "on".
@@ -30,7 +30,7 @@ approved`, and that conjunction is computed in exactly ONE place, the resolver i
 WINDOWS STORE THEIR KIND, and one CHECK constraint keeps the columns honest. The alternative —
 inferring `relative` vs `absolute` from which columns happen to be null — needs the same constraint
 to be trustworthy, reads worse at every call site, and still has to put a kind on the wire.
-Recorded because the choice should be visible (origin Q6).
+Recorded because the choice should be visible.
 
 THE CHECK IS ALSO WHY THE UPSERT MUST BRANCH. `PUT .../connectors/{key}` takes an optional
 `window`: omitted means "keep whatever is stored". The obvious `DO UPDATE SET x =
@@ -123,7 +123,7 @@ class ProjectConnector(UUIDv7PrimaryKeyMixin, TimestampMixin, Base):
         nullable=False,
     )
 
-    # WHICH connector, as a key (R15) — the catalogue is `src/core/connectors.py`, not a table, so
+    # WHICH connector, as a key — the catalogue is `src/core/connectors.py`, not a table, so
     # there is nothing to point a foreign key at and an unknown key is refused at the route.
     connector_key: Mapped[str] = mapped_column(sa.String(MAX_CONNECTOR_KEY), nullable=False)
 

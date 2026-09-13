@@ -6,7 +6,7 @@ WHY IT IS A TOOL AND NOT A PROMPT BLOCK. The answer is ~8,700 tokens. Resident o
 every connector-enabled project it would be the largest thing in the prompt and would be paid for
 by turns that never touch the data; fetched, it is paid for once and then replayed at the
 cache-read rate, because the library moves a cache breakpoint forward over history as a
-conversation grows (and since PR #231 both the Plan arm and the Build arm set that marker).
+conversation grows (and both the Plan arm and the Build arm set that marker).
 
 WHY THERE IS ONE TOOL AND NOT TWO. The design this came from had a second, `connector_column_
 values`, for the value lists the block could not afford to carry — at 408 columns those were 835
@@ -16,11 +16,6 @@ than any code list plausibly has (timestamps written as text), and the remaining
 codes, aircraft registrations, parking stands and airline names — which a generated app should
 read with `SELECT DISTINCT` at runtime rather than be handed 2,652 of. A second tool would have
 answered a question the app should ask the data.
-
-  (The plan's own table says 21 / 26 / 84. Those numbers predate the rendering this ships and do
-  not add up against it; they are corrected here rather than carried forward, because they are
-  the justification for the one-tool cut and a stale justification is how a retired design gets
-  re-argued.)
 
 WHY IT READS NO DATABASE. `ChatDeps.db` is a live session on the Plan arm and `None` on the Build
 arm — a Build turn runs for minutes and must not pin a pooled connection idle-in-transaction — so
@@ -35,7 +30,7 @@ find a way past. The refusals below are the belt to that braces: they are unreac
 registration, and they are asserted rather than assumed.
 
 THE CONNECTOR IS NEVER NAMED HERE. The artefact is `connector_catalogue/<key>.txt`, the key comes
-off the registry, and no literal in this module says which system it is (R9). The model's own
+off the registry, and no literal in this module says which system it is. The model's own
 argument never reaches the filesystem: it is matched against the registry entries this project
 actually has on, and only a MATCHED entry's key is used to build a path.
 """

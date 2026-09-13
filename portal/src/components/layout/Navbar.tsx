@@ -59,7 +59,7 @@ export default function Navbar() {
   const [toastMsg, setToastMsg] = useState<string | null>(null)
   const [usage, setUsage] = useState<UsageToday | null>(null)
   const [feedbackOpen, setFeedbackOpen] = useState(false)
-  // THE ONLY NEW DOOR (R5, the `OpenIt` board's own annotation). No Settings link, no route:
+  // THE ONLY NEW DOOR (the `OpenIt` board's own annotation). No Settings link, no route:
   // Integrations opens from this menu, on every screen, as a dialog over whatever was underneath.
   // Conditionally mounted like every other dialog in this portal.
   const [integrationsOpen, setIntegrationsOpen] = useState(false)
@@ -387,8 +387,8 @@ export default function Navbar() {
         triggerRef={feedbackBtnRef}
       />
 
-      {/* Integrations — the same dialog `Manage integrations →` in the workspace rail opens
-          (U10), over whatever screen the citizen is standing on. */}
+      {/* Integrations — the same dialog `Manage integrations →` in the workspace rail opens,
+          over whatever screen the citizen is standing on. */}
       {integrationsOpen && <IntegrationsDialog onClose={() => setIntegrationsOpen(false)} />}
 
       {/* Toast */}

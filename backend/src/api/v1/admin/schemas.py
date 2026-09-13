@@ -713,7 +713,7 @@ class HarnessCountersResponse(CamelModel):
 def _clean_decline_remarks(value: str) -> str:
     """The administrator's decline remark, on the shared 5-50 word stated-reason rule.
 
-    THE SAME RULE THE CITIZEN'S REQUEST USES (owner decision D1), and deliberately NOT the
+    THE SAME RULE THE CITIZEN'S REQUEST USES (an owner decision), and deliberately NOT the
     20-character `RejectionNote` the app registry rejects with. Both connector dialogs count
     words with `portal/src/utils/words.ts`, so one validator has to answer both sides of this
     conversation or the browser's counter would let through something the API refuses — and
@@ -729,7 +729,7 @@ class ConnectorDeclineRequest(CamelModel):
     """The body `POST /v1/admin/connector-requests/{request_id}/decline` requires.
 
     THERE IS NO APPROVE BODY AT ALL, and that asymmetry is the `AdminReview` board's largest
-    departure (R10). The board draws a permanent `REQUIRED` pill over `YOUR REMARKS` and the
+    departure. The board draws a permanent `REQUIRED` pill over `YOUR REMARKS` and the
     sentence `Approving needs a remark as well as declining`; both come off. Approving is a
     click that stores nothing, because an approval remark would be readable nowhere — the audit
     row carries ids only, the citizen is never shown it, and `ALREADY DECIDED` has no remarks
@@ -779,7 +779,7 @@ class ConnectorRequestRow(CamelModel):
     #: The stored `connector_key` — stable, lowercase, never rendered.
     connector_key: str
     #: The catalogue's name for it, so the `CONNECTOR` column needs no second lookup and no
-    #: component has to know what any connector is called (R18).
+    #: component has to know what any connector is called.
     connector_display_name: str
     #: `AdminReview`'s `WHAT APPROVING GIVES THEM` panel — the registry's THIRD-PERSON consent
     #: set, which is a different tuple from the citizen's `consentLinesRequester` and not
@@ -788,10 +788,9 @@ class ConnectorRequestRow(CamelModel):
     #: ON EVERY ROW, INCLUDING THE DECIDED ONES, AND THAT REDUNDANCY IS THE POINT. The decide
     #: dialog is handed one row and nothing else, so the row is the only object the copy can
     #: ride; a component that reconstructed these three sentences would make "add a second
-    #: connector" a component change, which is exactly the claim R18 makes and which
-    #: `1935588e` had to come back and repair on the citizen's side. Narrowing it to `waiting`
-    #: rows would save a few hundred bytes and reintroduce the state-conditional copy field
-    #: `ConnectorEntry`'s docblock argues against.
+    #: connector" a component change. Narrowing it to `waiting` rows would save a few hundred
+    #: bytes and reintroduce the state-conditional copy field `ConnectorEntry`'s docblock argues
+    #: against.
     consent_lines_approver: list[ConsentLine]
     #: The citizen's own words, in full. The queue renders them untruncated (board) and as plain
     #: text on every surface, never through a markdown component: one user writes this and
@@ -809,7 +808,7 @@ class ConnectorRequestRow(CamelModel):
     #: since been deleted — `decided_by_id` is `ON DELETE SET NULL`, so a decision outlives its
     #: decider and the row keeps its date with the decider unnamed.
     decided_by_name: str | None = None
-    #: Written only on a decline (R10). `null` on an approval is correct, not a missing write.
+    #: Written only on a decline. `null` on an approval is correct, not a missing write.
     decision_remarks: str | None = None
     #: `USING IT IN` — how many of THIS person's projects have THIS connector switched on.
     #: `null` on a declined row (the board draws an em dash) and on a waiting one; `0` is a real

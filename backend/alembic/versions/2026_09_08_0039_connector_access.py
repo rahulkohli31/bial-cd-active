@@ -9,12 +9,12 @@ PERSON — `connector_access_requests`, keyed on `user_id`, one row per ask, dec
 covering every project that person owns. The days belong to the PROJECT — `project_connectors`, one
 row per project that has ever switched a connector on, carrying its switch and the window it reads.
 
-NO `connectors` TABLE (R15, origin Q18). There is exactly one connector and its catalogue is
+NO `connectors` TABLE. There is exactly one connector and its catalogue is
 `src/core/connectors.py`. A table would store display strings the boards own, need seeding in every
 environment, and eventually want an admin CRUD screen for rows nobody may add. `connector_key` is a
 plain `varchar(32)`; an unknown key is refused at the route, not by a foreign key.
 
-GENERIC BY NAME, DICE ONLY BY VALUE (R18): nothing named here says DICE. It is the first of several
+GENERIC BY NAME, DICE ONLY BY VALUE: nothing named here says DICE. It is the first of several
 integrations, so a second one should be a registry entry plus its board copy — not this migration
 again.
 
@@ -110,8 +110,7 @@ def upgrade() -> None:
         # deleted must not delete the record that somebody else was granted access.
         sa.Column("decided_by_id", sa.Uuid(), nullable=True),
         sa.Column("decided_at", sa.DateTime(timezone=True), nullable=True),
-        # Written only on a decline (R10 removed the board's approve-remark), shown back to the
-        # citizen verbatim.
+        # Written only on a decline, shown back to the citizen verbatim.
         sa.Column("decision_remarks", sa.Text(), nullable=True),
         sa.Column(
             "created_at",

@@ -20,7 +20,7 @@
  * same way, because a decision that landed and a row another administrator decided first leave
  * this queue equally stale.
  *
- * R18: no connector is named anywhere in this file. The pills are built from the connectors the
+ * No connector is named anywhere in this file. The pills are built from the connectors the
  * API actually reported, and every label on screen is `connectorDisplayName` off the wire.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -191,7 +191,7 @@ export interface IntegrationsPanelProps {
 
 /**
  * One connector as a filter pill. Built from the rows the API returned — never a written-down
- * list, which would be a component that had to know what a connector is called (R18).
+ * list, which would be a component that had to know what a connector is called.
  */
 interface ConnectorOption {
   key: string

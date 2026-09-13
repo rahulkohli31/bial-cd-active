@@ -148,7 +148,7 @@ export default function WorkspaceRail({ project, save, onProjectUpdate }: Worksp
         />
       </section>
 
-      {/* The SAME dialog the profile menu opens (R5) — one component, two doors, no new route.
+      {/* The SAME dialog the profile menu opens — one component, two doors, no new route.
           THE RE-READ IS NOT WIRED HERE ANY MORE, deliberately: this door used to call
           `dataSection.reload()` on close and the profile-menu door called nothing, so entering
           from the avatar menu — which is on this very screen — left the section describing a

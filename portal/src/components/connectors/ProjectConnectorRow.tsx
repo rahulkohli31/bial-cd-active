@@ -3,17 +3,17 @@
  *
  * THE TWO MOUNTS, and the reason the props are shaped the way they are:
  *
- *   - The drill-down (`ConnectorProjectsPanel`, U8) mounts one per project the citizen owns.
+ *   - The drill-down (`ConnectorProjectsPanel`) mounts one per project the citizen owns.
  *     `projectName` is that project's name, which is what the row draws on the left and what both
  *     controls name themselves after.
- *   - The rail's DATA section (`DataSection`, U10) mounts one per registry connector, on the
+ *   - The rail's DATA section (`DataSection`) mounts one per registry connector, on the
  *     project screen. `projectName` is `null` there — the project IS the screen — so the row
  *     draws the connector's name instead and the controls say `in this project`. The rail also
  *     passes `leading` (the connector's teal tile) and `detail` (its state sentence), and, for
  *     the two states that have no switch to offer, `trailing` (`Request →` / an inert `Waiting`).
  *
- * U10 MUST NOT NEED TO FORK THIS. The switch and the chip being the same components in both
- * places is what makes origin R5's "the two must read from one source and cannot disagree"
+ * THE RAIL MUST NOT NEED TO FORK THIS. The switch and the chip being the same components in both
+ * places is what makes "the two must read from one source and cannot disagree"
  * structural rather than an assertion — the rail and the drill-down cannot show different
  * switch positions for one project, because there is one component and one write.
  *
@@ -39,7 +39,7 @@
  *
  * NO WINDOW IS EVER GUESSED. A toggle flips `enabled` optimistically because a switch that lags
  * its own press feels broken — but the chip re-renders only from what the server RESOLVED, never
- * from the local pick, because the resolver is the only thing that knows about the clamp (R13).
+ * from the local pick, because the resolver is the only thing that knows about the clamp.
  */
 import { useCallback, useRef, useState } from 'react'
 import type { ConnectorWindow, WindowChoice } from '../../utils/connectorApi'
