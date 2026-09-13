@@ -250,4 +250,27 @@ describe('WindowPopover', () => {
     expect(onCancel).toHaveBeenCalledTimes(1)
     expect(onApply).not.toHaveBeenCalled()
   })
+
+  it('holds Escape, a press outside and Cancel while Apply is in flight', async () => {
+    let refuse: (reason: unknown) => void = () => {}
+    const onApply = vi.fn<(choice: unknown) => Promise<void>>().mockReturnValue(
+      new Promise<void>((_, reject) => {
+        refuse = reject
+      }),
+    )
+    const { onCancel } = open(thirtyDays, onApply)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    await waitFor(() => expect(onApply).toHaveBeenCalledTimes(1))
+
+    fireEvent.keyDown(document.body, { key: 'Escape' })
+    fireEvent.pointerDown(document.body)
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(onCancel).not.toHaveBeenCalled()
+
+    refuse(new Error('You do not have access to ORBIT yet.'))
+    expect((await screen.findByRole('alert')).textContent).toBe(
+      'You do not have access to ORBIT yet.',
+    )
+  })
 })

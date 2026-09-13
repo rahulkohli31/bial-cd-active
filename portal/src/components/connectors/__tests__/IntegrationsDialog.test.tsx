@@ -196,6 +196,39 @@ describe('asking for access', () => {
     expect(await screen.findByRole('button', { name: 'Request access' })).toBeTruthy()
     expect(document.querySelector('[data-testid="integrations-dialog"]')).toBe(before)
   })
+
+  it('holds Back and Cancel while the ask is in flight, so a refusal still has the panel to land on', async () => {
+    let refuse: (reason: unknown) => void = () => {}
+    h.requestConnectorAccess.mockReturnValue(
+      new Promise((_, reject) => {
+        refuse = reject
+      }),
+    )
+    open()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Request access' }))
+    fireEvent.change(await screen.findByLabelText('Why you need access to ORBIT'), {
+      target: { value: A_GOOD_REASON },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Ask an administrator' }))
+    await waitFor(() => expect(h.requestConnectorAccess).toHaveBeenCalledTimes(1))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Back to integrations' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(screen.getByText('Ask for access to ORBIT')).toBeTruthy()
+
+    refuse(
+      new ApiError(
+        'You have already asked for access to this. An administrator is looking at it.',
+        409,
+        'already_pending',
+      ),
+    )
+
+    expect((await screen.findByRole('alert')).textContent).toBe(
+      'You have already asked for access to this. An administrator is looking at it.',
+    )
+  })
 })
 
 describe('waiting, approved and declined', () => {
