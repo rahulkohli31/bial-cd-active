@@ -290,8 +290,8 @@ async def test_a_save_that_dies_midway_still_reports_the_steps_that_ran(
 
 async def test_write_snapshot_times_every_step_of_a_save(fake_storage: FakeStorage) -> None:
     """Save is synchronous in-request with no client-side timeout, so this event is the only
-    record of which of ASM39's three named suspects — the four execs, the per-app lock queue, or
-    the blob write — a slow save actually lost its time to. One field per step, not one duration
+    record of which of the three candidates — the four execs, the per-app lock queue, or the blob
+    write — a slow save actually lost its time to. One field per step, not one duration
     for the whole call, and not for just the execs `_bundle_the_tree` can see."""
     client = FakeSandboxClient()
 

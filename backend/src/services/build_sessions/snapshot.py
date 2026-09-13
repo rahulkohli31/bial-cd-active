@@ -96,8 +96,8 @@ derive rather than count by reading this file."""
 
 #: Fields: `app_id`, `lock_wait_ms`, `commit_ms`, `bundle_ms`, `base64_ms`, `cleanup_ms`,
 #: `store_ms`. Save is synchronous in-request with no client-side timeout, so this is the only
-#: record of which of ASM39's three named suspects — the four execs, the per-app queue, or the
-#: blob write — a slow save actually lost its time to. One event per save, success or failure; a
+#: record of which of the three candidates — the four execs, the per-app queue, or the blob
+#: write — a slow save actually lost its time to. One event per save, success or failure; a
 #: step never reached (a failed exec, or the recovery guard's no-op skip) stays `None`.
 SNAPSHOT_STEP_TIMINGS_EVENT: Final = "snapshot_step_timings"
 
