@@ -526,6 +526,55 @@ def test_a_recovered_drift_does_not_outrank_the_failure_that_stopped_the_build()
     )
 
 
+def test_the_notice_that_a_drift_was_recovered_never_becomes_the_failure_title() -> None:
+    """The other half of the same interaction, and the half the marker ranking cannot reach.
+
+    The deps stage announces its own recovery, and that line is the FIRST thing a container build
+    prints. When the build then dies of something the marker table does not know — a missing
+    standalone output, a webpack abort, a guard in the Dockerfile — the markers all miss and the
+    title is picked by the fallback, which takes the earliest surviving line. Left readable, the
+    recovery notice is always that line, so every such failure would be reported as a lockfile
+    fault and the repair run aimed at a manifest that installed cleanly."""
+    log = (
+        f"#10 2.1 {errors.DRIFT_RECOVERED_NOTICE}; falling back to npm install\n"
+        "#10 9.0 added 129 packages in 9s\n"
+        "#18 [stage-2 7/9] RUN test -d .next/standalone\n"
+        '#18 ERROR: process "/bin/sh -c test -d .next/standalone" did not complete '
+        "successfully: exit code: 1\n"
+    )
+
+    err = errors.from_next_build(log)
+
+    assert errors.DRIFT_RECOVERED_NOTICE not in err.title, (
+        "a recovered drift is residue from a step that worked; got: " + err.title
+    )
+    assert not errors.is_dependency_failure(err)
+    # Saying we have no diagnostic is the honest answer here, and the one the fallback's own
+    # docstring argues for: inventing a cause from chatter is what this guards against.
+    assert err.title == errors._FALLBACK_TITLE, err.title
+
+
+def test_a_dependency_failure_that_is_not_drift_names_npms_own_error() -> None:
+    """The class the deps stage deliberately refuses to recover from — an integrity hash that
+    does not match, a version that resolves nowhere — and the one whose diagnosis npm writes
+    under the same `npm` prefix as its chatter. Filtering the prefix as a family leaves the
+    builder's trailer rule as the only survivor, so the citizen is told their app failed
+    because `------` and the repair run is handed the same."""
+    log = (
+        "#10 0.4 npm notice New major version of npm available!\n"
+        "#10 1.9 npm error code EINTEGRITY\n"
+        "#10 1.9 npm error sha512-Xk3x... integrity checksum failed\n"
+        '#10 ERROR: process "/bin/sh -c npm ci" did not complete successfully: exit code: 1\n'
+        "------\n"
+        "Dockerfile:59\n"
+    )
+
+    err = errors.from_next_build(log)
+
+    assert err.title == "npm error code EINTEGRITY", err.title
+    assert "------" not in err.title
+
+
 def test_a_dependency_failure_with_no_compile_diagnostic_still_wins_the_title() -> None:
     """The other direction, and the reason ranking them last is safe: a build that genuinely
     died installing never reaches the compiler, so it carries no compile marker for the

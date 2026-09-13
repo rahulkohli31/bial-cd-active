@@ -19,6 +19,8 @@ from importlib import resources
 
 import pytest
 
+from src.services.orchestrator.errors import DRIFT_RECOVERED_NOTICE
+
 _ASSETS = "src.services.deploy.assets"
 _ASSET_NAMES = (
     "Dockerfile",
@@ -120,6 +122,18 @@ def test_the_fallback_says_so_in_the_build_log_before_it_runs() -> None:
     assert "npm install" in announcement, "the logged line does not name the arm it takes"
     assert separator == "&& npm install", "the announcement must precede the install"
     assert command.strip().startswith("--ignore-scripts")
+
+
+def test_the_classifier_filters_the_exact_sentence_the_fallback_prints() -> None:
+    """Two files, one string. The recovery notice is the first line a container build prints, so
+    the classifier has to drop it or it titles every later failure of that build. Matching on a
+    copy of the sentence would let this file and the Dockerfile drift apart silently, and the
+    symptom would be a citizen told to fix a lockfile that installed cleanly."""
+    announcement = _dependency_install().partition("||")[2].partition("&& npm install")[0]
+
+    assert DRIFT_RECOVERED_NOTICE in announcement, (
+        "the Dockerfile no longer prints the sentence the classifier filters on: " + announcement
+    )
 
 
 def test_only_a_drifted_lockfile_takes_the_fallback() -> None:

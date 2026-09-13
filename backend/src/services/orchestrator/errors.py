@@ -40,6 +40,14 @@ _DEPENDENCY_MARKERS: Final = (
     "npm error code EUSAGE",
 )
 
+# The sentence the dependency stage echoes when it RECOVERS a drifted lockfile
+# (`services/deploy/assets/Dockerfile`). A recovered drift is not the failure, so this is noise
+# below — but it is the earliest line the stage prints, which makes it the line the fallback
+# would otherwise title every later failure of that build on. `tests/services/deploy/
+# test_assets.py` pins this string to the one the Dockerfile prints, so the filter cannot fall
+# out of step with the build.
+DRIFT_RECOVERED_NOTICE: Final = "lockfile drifted from package.json"
+
 # `next build` opens with a banner and progress spinners, so its FIRST line is reliably
 # "▲ Next.js 16.2.10" — noise. Scan for the line that actually names the failure, in
 # SPECIFICITY order (a later `Type error:` beats an earlier generic `TypeError:`), the same
@@ -106,7 +114,34 @@ _NEXT_BUILD_NOISE_PREFIXES = (
     "┌",
     "> ",
     "$ ",
-    "npm ",
+    # NOT THE WHOLE `npm ` FAMILY. npm prints its progress, its warnings and its DIAGNOSIS under
+    # one prefix, so dropping the family drops the only line naming a failed install, and the
+    # surviving candidate becomes the builder's own trailer rule — a real dependency failure
+    # titled `------`, with nothing for the repair run to read either. Only the chatter is listed;
+    # `npm error` stays visible so an install that fails outside the markers above still says why.
+    "npm notice",
+    "npm warn",
+    "npm WARN",
+    "npm info",
+    "npm http",
+    "npm timing",
+    # npm's install SUMMARY, which it prints on success and which carries no `npm ` prefix. The
+    # deps stage is the first thing a container build runs, so without these the line announcing
+    # that the install WORKED becomes the stated cause of a failure three stages later.
+    "added ",
+    "removed ",
+    "changed ",
+    "up to date",
+    "audited ",
+    "found 0 vulnerabilities",
+    "packages are looking for funding",
+    # BuildKit closes a failed step with a rule, then the Dockerfile excerpt, and the local
+    # builder adds a dashboard link after it. None of the three carries a step marker or matches
+    # any prefix above, so they outlive every filter here and the rule is the first of them.
+    "------",
+    "View build details:",
+    "Dockerfile:",
+    DRIFT_RECOVERED_NOTICE,
     "Creating an optimized production build",
     "Compiled successfully",
     "Linting and checking validity of types",
