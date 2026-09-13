@@ -8,7 +8,7 @@
  * only way this row can be wrong is if the server is.
  *
  * THE DECLINED ROW CARRIES NO CONTROL. Not an omission: `Ask again` is drawn on the board and was
- * ruled out for this pass (owner, 2026-09-08), and `declined` is terminal server-side too. The
+ * ruled out for this pass, and `declined` is terminal server-side too. The
  * citizen is still owed the whole answer — the date, who decided, and the administrator's remark
  * in full, in the bordered quote the board draws — so all three are here and the button is not.
  *
@@ -90,7 +90,7 @@ function dayMonthTime(iso: string): string {
  * true sentence in that case; `Approved for you 2 Sep · ` is a dangling separator, and looking up
  * an email here would invent a second answer to a question the server already answered.
  */
-function dotted(parts: readonly (string | null)[]): string {
+export function dotted(parts: readonly (string | null)[]): string {
   return parts.filter((part): part is string => part !== null && part !== '').join(' · ')
 }
 
@@ -146,7 +146,7 @@ export interface ConnectorRowProps {
   /** Pending only. Withdraws the waiting request. */
   onCancelRequest: () => void
   /**
-   * Approved only. Drills into every project the citizen owns (U8). Owned by the dialog, which is
+   * Approved only. Drills into every project the citizen owns. Owned by the dialog, which is
    * what swaps its own body — the row does not know it is inside one.
    */
   onOpenProjects: () => void

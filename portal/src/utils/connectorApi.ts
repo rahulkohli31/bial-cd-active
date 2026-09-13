@@ -208,7 +208,7 @@ function toEntries(body: unknown): ConnectorEntry[] {
   return doc.connectors.map(toEntry)
 }
 
-const jsonOpts = (method: string, body?: unknown): RequestInit => ({
+export const jsonOpts = (method: string, body?: unknown): RequestInit => ({
   method,
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify(body ?? {}),
@@ -294,7 +294,7 @@ export interface StoredWindow {
 /**
  * The days one project reads from one connector RIGHT NOW, as `resolve_window` answered.
  *
- * EVERY FIELD IS AN ANSWER, NOT AN INPUT (R13). `start`, `end` and `days` are post-clamp, so the
+ * EVERY FIELD IS AN ANSWER, NOT AN INPUT. `start`, `end` and `days` are post-clamp, so the
  * chip and the rail's `Reading N days of flight data` are the same numbers from the same
  * emitter. Nothing in this portal recomputes any of them, and `ConnectorProjectsPanel.test.tsx`
  * feeds a resolved window deliberately inconsistent with its stored pair to prove it.
@@ -366,7 +366,7 @@ export interface ProjectConnectorEntry {
   /**
    * What this connector's data is called, lowercase, for the rail's two state sentences. It
    * comes off the wire rather than living in the component for the same reason the ask panel's
-   * copy does: a second connector must cost a registry entry and nothing else (R18).
+   * copy does: a second connector must cost a registry entry and nothing else.
    */
   dataNoun: string
   state: ConnectorState
@@ -475,7 +475,7 @@ function toProjectConnector(value: unknown): ProjectConnectorEntry {
  * two axes: this one fixes the project and walks the connectors, that one fixes the connector and
  * walks the projects. Both hand back rows the same `ProjectConnectorRow` renders.
  *
- * IT IS RE-READ, NEVER CACHED (origin Q12). Days resolve against today, an administrator's
+ * IT IS RE-READ, NEVER CACHED. Days resolve against today, an administrator's
  * approval can land between two visits, and this portal has no query cache to invalidate — so
  * the section fetches on every project navigation and again whenever the Integrations dialog
  * closes over it. That guaranteed pre-load moment is why the section owns a skeleton.

@@ -5,7 +5,7 @@ import { tableHeadLabelClass } from '../ui/table'
 // The connector glyph and the board's month list, imported rather than re-drawn: the queue's
 // `CONNECTOR` cell is the same teal tile the citizen's own Integrations list draws, and `dayMonth`
 // is the single place `2 Sep` is spelled (see its docblock for why `Intl` cannot produce it).
-import { ConnectorGlyph, dayMonth } from '../connectors/ConnectorRow'
+import { ConnectorGlyph, dayMonth, dotted } from '../connectors/ConnectorRow'
 import type { LimitFields } from '../../utils/admin'
 import type { ConnectorRequestRow, ConnectorRequestStatus } from '../../utils/adminConnectorApi'
 
@@ -343,11 +343,6 @@ export function clockTime(iso: string): string | null {
 function dayMonthTime(iso: string): string {
   const clock = clockTime(iso)
   return clock === null ? iso : `${dayMonth(iso)}, ${clock}`
-}
-
-/** The board's ` · ` separator, with absent parts dropped rather than rendered as a dangling gap. */
-function dotted(parts: readonly (string | null)[]): string {
-  return parts.filter((part): part is string => part !== null && part !== '').join(' · ')
 }
 
 /**
