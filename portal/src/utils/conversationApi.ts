@@ -102,7 +102,7 @@ function fileParts(item: RawProjectionItem): MessagePart[] {
     if (!attachmentId) continue
     parts.push({
       type: 'file',
-      kind: entry.kind === 'document' ? 'document' : 'image',
+      kind: entry.kind === 'document' || entry.kind === 'file' ? entry.kind : 'image',
       attachmentId,
       name: typeof entry.name === 'string' ? entry.name : '',
       mediaType: typeof entry.mediaType === 'string' ? entry.mediaType : '',

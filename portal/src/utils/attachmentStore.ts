@@ -14,7 +14,7 @@
  */
 import type { PendingAttachment } from './attachmentInput'
 import { uploadAttachment as defaultUpload, deleteAttachment as defaultDelete } from './attachmentApi'
-import type { MessagePart, TextPart } from './messageTypes'
+import type { FilePartImageOrDocument, MessagePart, TextPart } from './messageTypes'
 
 /** The chip descriptor `attachmentsFromParts` builds — traced from its one real
  * consumer, `AttachmentChips.tsx`'s own doc comment: `{ attachmentId, kind,
@@ -169,7 +169,7 @@ export async function buildUserParts(
       type: 'file',
       attachmentId: ref.attachmentId,
       key: ref.key,
-      kind: ref.kind as 'image' | 'document',
+      kind: ref.kind as FilePartImageOrDocument['kind'],
       name: ref.name,
       mediaType: ref.mediaType,
       size: ref.size,

@@ -29,7 +29,7 @@ import { Paperclip, Send, X } from 'lucide-react'
 
 import { payloadsOf } from './runtime/attachmentAdapter'
 import { usePendingAttachmentReads, useRefusalSink } from './runtime/stagedAttachments'
-import { unsupportedFormatMessage } from '../../utils/attachmentInput'
+import { ATTACHMENT_LANES_SENTENCE, unsupportedFormatMessage } from '../../utils/attachmentInput'
 import type { PendingAttachment } from '../../utils/attachmentInput'
 import AttachmentPreview, { type PreviewTarget } from './AttachmentPreview'
 import { SendRefusal } from './sendRefusal'
@@ -379,7 +379,7 @@ export default function ComposerBox({
             <ComposerPrimitive.AddAttachment
               data-testid="composer-attach"
               aria-label="Attach a file"
-              title="Attach images, PDFs or text files (CSV, TXT), or drop them anywhere in the composer"
+              title={`${ATTACHMENT_LANES_SENTENCE} Or drop files anywhere in the composer.`}
               // DIMMED WITH THE BOX, never unavailable. The board draws it at 40% while an offer
               // waits, and it stays pressable at 40%: staging a file is composing, not answering.
               className={`ms-auto inline-flex text-neutral transition hover:text-primary${locked ? ' opacity-40' : ''}`}

@@ -117,7 +117,7 @@ describe('the gate withholds SENDING, not typing', () => {
     expect(composer().disabled).toBe(false)
     fireEvent.change(composer(), { target: { value: 'typed while it thinks' } })
     expect(composer().value).toBe('typed while it thinks')
-    expect(screen.getByTitle(/Attach images/i).disabled).toBe(false)
+    expect(screen.getByTestId('composer-attach').disabled).toBe(false)
     expect(sendButton().getAttribute('aria-disabled')).toBe('true')
     // AN INERTNESS GUARD, not a frozen-pill check: `ModeSwitcher` and the axis it switched are
     // both gone, so no control exists to freeze. The liveness assertions above already prove

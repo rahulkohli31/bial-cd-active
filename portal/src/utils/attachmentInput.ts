@@ -4,25 +4,29 @@
  * the server (media-type allowlist + magic-byte check); these checks are UX.
  */
 /**
- * THE LINE IS A RULE, NOT A LIST: images/PDFs upload as themselves; text (CSV/TXT) rides
- * inline as a fenced block, so it shares this allowlist despite not being binary. Anything
- * needing conversion — Word/Excel/PowerPoint — is gone client-side: the server used to
- * extract them to Markdown, so a citizen asking about a spreadsheet's layout was describing
- * something the model never saw. That extraction machinery still exists server-side,
- * deliberately out of scope here — a reachable-but-unreferenced path, unshipped not removed.
+ * The CODE lane — a reader in the project's workspace opens these and reports what it found.
+ * Mirrors `media/lanes.py`'s set, and a chip's shape is decided by this membership too.
+ *
+ * `text/plain` is deliberately NOT here: it works today and stops, because no client
+ * requirement names it and every format costs a reader arm, refusal copy, a test and a line
+ * in the help page. Scope Boundaries records it as a withdrawal rather than a format never
+ * added.
  */
-export const ALLOWED_MEDIA_TYPES = [
-  // The MODEL lane — it reads these bytes itself.
-  'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf',
-  // The CODE lane — a reader in the workspace opens these and reports what it found.
-  // `text/plain` is deliberately NOT here: it works today and stops, because no client
-  // requirement names it and every format costs a reader arm, refusal copy, a test and a line
-  // in the help page. Scope Boundaries records it as a withdrawal rather than a format never
-  // added.
+export const CODE_LANE_MEDIA_TYPES = [
   'text/csv', 'text/tab-separated-values',
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+]
+/**
+ * THE LINE IS A RULE, NOT A LIST: every attachment uploads as itself, and its media type
+ * decides which lane reads it. Nothing is converted here and nothing rides inline in the
+ * prompt.
+ */
+export const ALLOWED_MEDIA_TYPES = [
+  // The MODEL lane — it reads these bytes itself.
+  'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf',
+  ...CODE_LANE_MEDIA_TYPES,
 ]
 // THE INLINE TEXT LANE IS GONE, AND SO IS ITS LAST TRACE. A CSV used to be read in the
 // browser and pushed into the prompt as a fenced text block; every attachment is now an uploaded

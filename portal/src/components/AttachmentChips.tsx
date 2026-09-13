@@ -1,38 +1,32 @@
 import { useState, useEffect } from 'react'
-import { FileText, FileSpreadsheet, ImageOff, Presentation } from 'lucide-react'
+import { FileText, FileSpreadsheet, ImageOff, Presentation, type LucideIcon } from 'lucide-react'
 import { fetchAttachmentObjectUrl } from '../utils/attachmentApi'
 import { openUrlInNewTab, downloadObjectUrl } from '../utils/attachmentViewer'
+import { CODE_LANE_MEDIA_TYPES } from '../utils/attachmentInput'
 import AttachmentPreview from './chat/AttachmentPreview'
 import type { AttachmentDescriptor } from '../utils/attachmentStore'
 
-/**
- * Renders one persisted attachment descriptor by `kind`. Images fetch bytes as an
- * object URL for an inline lightbox thumbnail; PDFs open in a new tab; text/CSV get a
- * chip with no byte read (the content already travelled inline in the prompt);
- * Word/Excel/deck chips re-download the ORIGINAL file, since the model only ever saw
- * extracted text or converted pages — the conversion stays invisible in the UI; a
- * missing image falls back to an "unavailable" placeholder.
- */
-const PPTX = 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
-const SPREADSHEET_TYPES = new Set([
-  'text/csv',
-  'text/tab-separated-values',
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-])
-/** The formats code reads rather than the model — mirrors `media/lanes.py`'s set. */
-const CODE_LANE_TYPES = new Set([
-  ...SPREADSHEET_TYPES,
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  PPTX,
-])
+/** Which icon a code-lane chip wears; anything else in the lane reads as a document. */
+const LANE_ICONS: Record<string, LucideIcon | undefined> = {
+  'text/csv': FileSpreadsheet,
+  'text/tab-separated-values': FileSpreadsheet,
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': FileSpreadsheet,
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': Presentation,
+}
 
+/**
+ * Renders one persisted attachment descriptor by `kind`. Images fetch bytes as an object URL for
+ * an inline lightbox thumbnail; PDFs open in a new tab; a code-lane file downloads the stored
+ * original, which is the same file the reader opens in the workspace; a missing image falls back
+ * to an "unavailable" placeholder.
+ */
 function AttachmentChip({ att }: { att: AttachmentDescriptor }) {
   // THREE KINDS, ONE PER THING A CHIP CAN DO. The server derives these from the media
   // type in `chip_kind_for`, so the chip a citizen sees on reload is the same shape as the one
   // they watched appear. `document`/`image` are also matched on the media type directly, because
   // parts staged in the composer carry a locally-assigned kind.
   const isPdf = att.kind === 'document' || att.mediaType === 'application/pdf'
-  const isFile = att.kind === 'file' || (!isPdf && CODE_LANE_TYPES.has(att.mediaType))
+  const isFile = att.kind === 'file' || (!isPdf && CODE_LANE_MEDIA_TYPES.includes(att.mediaType))
   const [src, setSrc] = useState<string | null>(null)
   const [missing, setMissing] = useState(false)
   const [zoomed, setZoomed] = useState(false)
@@ -85,7 +79,7 @@ function AttachmentChip({ att }: { att: AttachmentDescriptor }) {
     // `<span>`: pressing it did nothing at all, because the content used to ride inline in the
     // prompt and there was nothing to fetch. Every attachment is an uploaded file now, so there
     // always is.
-    const Icon = att.mediaType === PPTX ? Presentation : SPREADSHEET_TYPES.has(att.mediaType) ? FileSpreadsheet : FileText
+    const Icon = LANE_ICONS[att.mediaType] ?? FileText
     return (
       <button
         type="button"

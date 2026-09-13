@@ -429,7 +429,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     // citizen can compose their next message while they watch, and the note says why send is off.
     const textarea = screen.getByPlaceholderText(/ask for another change/i)
     expect(textarea.disabled).toBe(false)
-    expect(screen.getByTitle(/Attach images/i).disabled).toBe(false)
+    expect(screen.getByTestId('composer-attach').disabled).toBe(false)
     expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/send unlocks when it is done/i)
 
     // ENFORCED, not merely rendered: `aria-disabled` is affordance only, so Enter must be refused
@@ -464,7 +464,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     await turn.end()
     await waitFor(() => expect(screen.queryByTestId('composer-gate-note')).toBeNull())
     expect(screen.getByPlaceholderText(/ask for another change/i).disabled).toBe(false)
-    expect(screen.getByTitle(/Attach images/i).disabled).toBe(false)
+    expect(screen.getByTestId('composer-attach').disabled).toBe(false)
 
     h.buildFromPlan.mockClear()
     h.stop.mockClear()
@@ -545,7 +545,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     const textarea = await screen.findByPlaceholderText(/ask for another change/i)
     await waitFor(() => expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/send unlocks/i))
     expect(textarea.disabled).toBe(false)
-    expect(screen.getByTitle(/Attach images/i).disabled).toBe(false)
+    expect(screen.getByTestId('composer-attach').disabled).toBe(false)
     // AN INERTNESS GUARD, not a frozen-pill assertion: there is no mode pill to freeze or thaw,
     // mid-build reload or otherwise.
     expect(screen.queryByRole('button', { name: /^Mode:/ })).toBeNull()

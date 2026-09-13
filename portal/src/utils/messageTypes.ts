@@ -38,7 +38,8 @@ export interface TextPart {
   }
 }
 
-/** Image/PDF bytes living in the object store.
+/** Image, PDF or code-lane file bytes living in the object store — `kind` is the chip
+ * vocabulary `chip_kind_for` emits, one arm per thing a chip can do.
  *
  * `key` and `size` are OPTIONAL because a part can be rebuilt from the conversation
  * projection on reload, which ships neither: the blob key is an internal storage
@@ -48,7 +49,7 @@ export interface TextPart {
  * typing them as required would force a reload to invent values that look like data. */
 export interface FilePartImageOrDocument {
   type: 'file'
-  kind: 'image' | 'document'
+  kind: 'image' | 'document' | 'file'
   attachmentId: string
   key?: string
   name: string
