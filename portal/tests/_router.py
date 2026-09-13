@@ -36,9 +36,11 @@ APPS_DOMAIN = "bial-apps.test"
 APPS_HOSTNAME = "apps.bial.test"
 PORTAL_ORIGIN = "https://portal.bial.test"
 
-# 28 lowercase hex, exactly as `app_name_for` / `published_app_name` mint them.
+# 28 lowercase hex, exactly as `app_name_for` / `published_app_name` / `shr_name_for` mint them.
 SBX_KEY = "sbx-" + "1a2b3c4d5e6f70819a2b3c4d5e6f"
 PUB_KEY = "pub-" + "1a2b3c4d5e6f70819a2b3c4d5e6f"
+# #198 — a colleague's shared-runtime view of a project shared with them, the third lineage.
+SHR_KEY = "shr-" + "1a2b3c4d5e6f70819a2b3c4d5e6f"
 OTHER_SBX_KEY = "sbx-" + "99887766554433221100aabbccdd"
 # Correctly shaped and deliberately NOT given a DNS alias: this is what an expired sandbox or a
 # mistyped-but-plausible key looks like to the router.

@@ -7,6 +7,7 @@ import ChatRoute from './pages/ChatRoute'
 import MarketplacePage from './pages/MarketplacePage'
 import ProjectsPage from './pages/ProjectsPage'
 import ProjectPage from './pages/ProjectPage'
+import SharedProjectPage from './pages/SharedProjectPage'
 import WorkspaceShell from './components/workspace/WorkspaceShell'
 import { isAuthenticated, bootstrapSession } from './utils/auth'
 import { BusyGlyph } from './components/ui/Waiting'
@@ -146,6 +147,12 @@ export default function App() {
               a path segment. */}
           <Route path="/chat/:chatId" element={<ChatRoute />} />
         </Route>
+
+        {/* A colleague's restricted view of a project shared with them (#198) — deliberately
+            OUTSIDE `WorkspaceShell`. That layout exists to carry a builder's own running app
+            across chat/rail/toolbar surfaces a shared recipient must never reach; this route
+            gets its own minimal chrome instead of a share of that one. */}
+        <Route path="/shared/:projectId" element={<RequireAuth><SharedProjectPage /></RequireAuth>} />
 
         <Route path="/help" element={<RequireAuth><HelpPage /></RequireAuth>} />
         <Route path="/admin" element={<RequireAuth><AdminPage /></RequireAuth>} />

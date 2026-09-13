@@ -256,8 +256,27 @@ class ProjectResponse(CamelModel):
     # ONLY the single-project GET computes it: the list endpoint would need one HEAD per row,
     # and nothing on that surface offers Relaunch. It stays `null` there and no caller reads it.
     has_relaunchable_snapshot: bool | None = None
+    # WHETHER THE OWNER HAS EVER SAVED — narrower than `has_relaunchable_snapshot` on purpose
+    # (#198 R10's second sentence). The shared runtime restores ONLY from the saved bundle,
+    # never the autosave/recovery copy `has_relaunchable_snapshot` also counts (R21) — a
+    # recipient told "restorable" on the strength of an autosave alone would press Launch into
+    # a guaranteed 404. Computed by the same `snapshot_presence` check `create_share` (R10's
+    # first sentence) already refuses a share creation on, so the two surfaces agree.
+    #
+    # `null` for an owner's own view (irrelevant there — an owner uses Relaunch, which reads
+    # `has_relaunchable_snapshot` instead) and for a shared view with no app at all. `false`
+    # is what lets the restricted workspace disable Launch and explain why, rather than
+    # letting a recipient press it into a failure it could have shown without the round trip.
+    has_saved_snapshot: bool | None = None
     created_at: datetime
     updated_at: datetime
+    # WHO THE CALLER IS TO THIS PROJECT (#198 R11/R14) — "owner" everywhere except the one
+    # place a share can widen access, `get_project`. This is what the restricted workspace
+    # view keys off client-side; the API's OWN refusal of every mutating action for a
+    # recipient does not depend on this field at all (those routes call the strict
+    # `owned_project_or_404`, which a share never satisfies) — it exists so the UI can decide
+    # what to render before it tries something the API would refuse anyway.
+    access: Literal["owner", "shared"] = "owner"
 
 
 class ProjectCountsResponse(CamelModel):

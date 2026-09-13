@@ -481,11 +481,15 @@ export function useTakeBack(report: WorkspaceReport | null): TakeBack {
     // genuinely finish, save, release. A rejection while the step is still `stopping` therefore
     // means nothing was stopped — the holder is untouched and its own ceiling sentence says so —
     // while a rejection at `saving` or `releasing` means the holder is down and the slot is still
-    // held, which is a pair of facts the pane has to state.
+    // held, which is a pair of facts the pane has to state. `holder.isSharedView`'s arm never
+    // reaches `saving`/`releasing` on a rejection either, for the same reason it starts at
+    // `stopping`: `giveUpSharedView` narrates only on success, so a throw leaves `reached` right
+    // where it started and `stoppedHolder` correctly comes out `null` — nothing was ever stopped
+    // on that arm, on either outcome.
     let reached: HandoverStep = 'stopping'
     try {
       try {
-        await handOverWorkspace(holder.projectId, save, {}, (next) => {
+        await handOverWorkspace(holder, save, {}, (next) => {
           reached = next
           ifStillOurs(projectId, () => setStep(next))
         })
@@ -502,7 +506,15 @@ export function useTakeBack(report: WorkspaceReport | null): TakeBack {
         return
       }
       ifStillOurs(projectId, () => setStep('starting'))
-      const ended = await askForTheWorkspace(rep, projectId, holder.projectName)
+      // NO HOLDER TO REPORT AS STOPPED ON THE SHARED ARM, which is what `null` means here: the
+      // relaunch below can still fail after the give-up succeeded, and `take-back-failed` carries
+      // whatever is passed straight into the pane's "X was stopped" sentence. Nothing of the
+      // colleague's was ever running under this citizen's account to stop.
+      const ended = await askForTheWorkspace(
+        rep,
+        projectId,
+        holder.isSharedView ? null : holder.projectName,
+      )
       // THE ENDING THAT WORKED, SAID OUT LOUD.
       //
       // The other four endings are already sentences on the pane, written by the map from
@@ -520,9 +532,14 @@ export function useTakeBack(report: WorkspaceReport | null): TakeBack {
       if (ended === 'started') {
         ifStillOurs(projectId, () =>
           setOutcome(
-            save
-              ? `“${holder.projectName}” was saved and stopped. Your app has the workspace now.`
-              : `“${holder.projectName}” was stopped without saving. Your app has the workspace now.`,
+            // "STOPPED" IS THE WRONG VERB FOR A SHARED VIEW. Nothing of the colleague's was ever
+            // running under this citizen's account — there is no build to stop or save, only
+            // their own one-per-user slot to give up, so `save` is meaningless on this arm too.
+            holder.isSharedView
+              ? `You closed your view of “${holder.projectName}”. Your app has the workspace now.`
+              : save
+                ? `“${holder.projectName}” was saved and stopped. Your app has the workspace now.`
+                : `“${holder.projectName}” was stopped without saving. Your app has the workspace now.`,
           ),
         )
       }

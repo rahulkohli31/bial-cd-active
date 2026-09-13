@@ -42,6 +42,9 @@ _MUTATING_POSTS = [
     "/v1/build-sessions/relaunch",
     "/v1/build-sessions/projects/{project_id}/stop-active-build",
     "/v1/build-sessions/projects/{project_id}/release",
+    "/v1/build-sessions/projects/{project_id}/shared-launch",
+    "/v1/build-sessions/projects/{project_id}/shared-refresh",
+    "/v1/build-sessions/shared-view/release",
 ]
 
 _PLACEHOLDER = re.compile(r"\{[^}]+\}")

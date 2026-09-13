@@ -153,7 +153,7 @@ describe('nginx.conf — the apps site routes /a/<key>/ by composing the upstrea
 
   it('matches the exact key shape — prefix plus 28 lowercase hex — and captures the key', () => {
     const re = keyPattern()
-    for (const prefix of ['sbx', 'pub']) {
+    for (const prefix of ['sbx', 'pub', 'shr']) {
       const key = `${prefix}-${HEX28}`
       expect(`/a/${key}/`.match(re)?.[1]).toBe(key)
       expect(`/a/${key}`.match(re)?.[1]).toBe(key) // no trailing slash is still the app root

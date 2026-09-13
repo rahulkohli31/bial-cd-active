@@ -16,8 +16,9 @@ let a test assert BRAIN never ran `git`, restarted the dev server, or tore down.
 from __future__ import annotations
 
 import base64
+import uuid
 from collections import deque
-from typing import assert_never
+from typing import Literal, assert_never
 
 from src.services.sandbox import (
     DevLogs,
@@ -235,6 +236,9 @@ class FakeSandbox(SandboxClient):
         *,
         app_env: dict[str, str],
         source_key: str | None = None,
+        kind: Literal["build_sandbox", "shared_sandbox"] = "build_sandbox",
+        shared_project_id: uuid.UUID | None = None,
+        shared_owner_id: uuid.UUID | None = None,
     ) -> SandboxHandle:
         return await self.provision_new(user_id, app_name, app_env=app_env)
 

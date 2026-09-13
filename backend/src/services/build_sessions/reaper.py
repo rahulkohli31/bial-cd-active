@@ -30,12 +30,13 @@ import asyncio
 import uuid
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Final, Literal
 
 import redis.asyncio as aioredis
 import structlog
 
+from src.api.v1.build_sessions.schemas import SHARED_PREVIEW_ABSOLUTE_CEILING_SECONDS
 from src.services.build_sessions.alarms import (
     APP_FIRST_SERVED_EVENT,
     APP_SERVING_LOST_EVENT,
@@ -45,10 +46,12 @@ from src.services.build_sessions.alarms import (
 from src.services.build_sessions.durable_copy import CopyVerdict, confirm_durable_copy
 from src.services.build_sessions.integrity import container_state
 from src.services.build_sessions.locks import (
+    DeadlineWriter,
     an_instant_on_the_hash,
     clear_serving,
     delete_registry,
     elapsed_ms,
+    grant_stay_of_execution,
     heartbeat_is_alive,
     liveness_lease_is_held,
     lock_is_held,
@@ -62,16 +65,17 @@ from src.services.build_sessions.locks import (
     stay_of_execution_is_current,
 )
 from src.services.build_sessions.snapshot import RecoveryOutcome, write_recovery_copy
-from src.services.redis import REGISTRY_STATE_READY, registry_scan_patterns
+from src.services.redis import REGISTRY_STATE_READY, registry_key, registry_scan_patterns
 from src.services.redis.keys import (
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
     REGISTRY_FIELD_SERVING_SINCE,
+    REGISTRY_FIELD_SHARED_SERVED_COUNT,
     REGISTRY_FIELD_STATE,
 )
 from src.services.sandbox import DevStatus, SandboxClient, SandboxError, SandboxHandle
-from src.services.sandbox.base import SANDBOX_NAME_PREFIX
+from src.services.sandbox.base import SANDBOX_NAME_PREFIX, SHARED_SANDBOX_NAME_PREFIX
 
 _log = structlog.get_logger()
 
@@ -165,6 +169,20 @@ def is_a_sandbox_name(app_name: str) -> bool:
     if not app_name.startswith(SANDBOX_NAME_PREFIX):
         return False
     slug = app_name[len(SANDBOX_NAME_PREFIX) :]
+    return len(slug) == _NAME_SLUG_LENGTH and all(c in _HEX_LOWER for c in slug)
+
+
+def is_a_shared_sandbox_name(app_name: str) -> bool:
+    """The `shr-` sibling of `is_a_sandbox_name` (#198) — same fail-closed shape check, same
+    reason: a name this platform will hand to an ARM delete has to be provably one it minted
+    (`manager.shr_name_for`), not assumed from a prefix alone.
+
+    Wired into `reap_user`'s own gate alongside its `sbx-` sibling: the one per-user slot the
+    registry describes can hold EITHER lineage — a builder's own sandbox or a colleague's
+    shared-runtime view restored into it — and `reap_user` tears down whichever is there."""
+    if not app_name.startswith(SHARED_SANDBOX_NAME_PREFIX):
+        return False
+    slug = app_name[len(SHARED_SANDBOX_NAME_PREFIX) :]
     return len(slug) == _NAME_SLUG_LENGTH and all(c in _HEX_LOWER for c in slug)
 
 
@@ -679,7 +697,12 @@ async def reap_user(
         await reap_lock(redis, user_uuid)
         return False
     registered_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
-    if not is_a_sandbox_name(registered_name):
+    # #198: the per-user slot this record names can hold EITHER lineage — the user's own build
+    # sandbox or a colleague's shared-runtime view restored into it — and both are provably ours
+    # to tear down. Recognizing only `sbx-` here was the orphaning bug the shared runtime would
+    # otherwise reproduce on every Revoke: the record would be deleted (below) while a `shr-`
+    # container it could not vouch for kept running and billing, forever anonymous.
+    if not (is_a_sandbox_name(registered_name) or is_a_shared_sandbox_name(registered_name)):
         # FAIL CLOSED ON A NAME WE CANNOT VOUCH FOR. Everything below hands this string to an ARM
         # delete, and the record it came from is the least trustworthy input here. Refusing but
         # KEEPING the record would re-refuse every five minutes forever, so the record goes and
@@ -693,7 +716,17 @@ async def reap_user(
         await release_liveness_lease(redis, user_uuid)
         await reap_lock(redis, user_uuid)
         return False
-    if app_id is not None:
+    # THE DURABLE-COPY GATE NEVER RUNS FOR A SHARED VIEW (#198), whatever `app_id` the caller
+    # resolved. `sweep_all`'s own `_owning_app_id` currently maps a `shr-` registry record to the
+    # OWNER's app id (`_app_names_to_owners` keys every `shr-` name off the recipient, but the
+    # value it carries is still the shared app's id) — passing that here would gate this
+    # RECIPIENT's teardown against the OWNER's recovery slot, and R22 says that storage is
+    # read-never-write for a recipient. Worse, a diverted or first-write guarded write then
+    # REFUSES the reap outright, sparing the container forever — the exact bill-forever leak R16/
+    # R17 exist to close. A shared view holds nothing worth preserving in the first place: the
+    # recipient never edits its tree directly, and what they own of it is a restore of the
+    # owner's own snapshot, already durable at its source.
+    if app_id is not None and not is_a_shared_sandbox_name(registered_name):
         # THE REAL HEAD, not a hardcoded `None`. See `_reach_the_container`: a constant `None`
         # here made the gate's fallback its only branch, and the comparison it exists to perform
         # unreachable. A container that will not answer still falls back — it just has to
@@ -817,6 +850,78 @@ async def reap_the_container_we_judged(
     return True
 
 
+_SHARED_PREVIEW_ABSOLUTE_CEILING = timedelta(seconds=SHARED_PREVIEW_ABSOLUTE_CEILING_SECONDS)
+
+
+async def _renew_shared_view_from_traffic(
+    redis: aioredis.Redis,
+    user_uuid: uuid.UUID,
+    sandbox_client: SandboxClient,
+    reg: dict[str, str],
+) -> None:
+    """#198's ONLY liveness signal for a shared-runtime view: real traffic through the app,
+    self-reported by the supervisor (`SandboxClient.served_count`, excluding every
+    control-plane probe — see `sandbox/Caddyfile`). A no-op for every OTHER kind of record: a
+    build sandbox has `TURN_IN_FLIGHT`/`BUILDER_ACTED`/its own heartbeat instead, and this must
+    never compete with those or run an extra supervisor round trip on their behalf.
+
+    OBSERVATION, NOT AN INPUT, same posture as `_observe_the_serving_proof` and for the same
+    reason: it runs ahead of every sparing arm in `reconcile_user`, so a failure here must never
+    affect the reap decision reading them. Recorded and swallowed; `CancelledError` still
+    propagates."""
+    app_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
+    if not is_a_shared_sandbox_name(app_name):
+        return
+    try:
+        handle = await sandbox_client.attach_existing(str(user_uuid))
+        served = await sandbox_client.served_count(handle)
+        if served is None:
+            return  # could not ask; the ceiling and the standing stay decide instead
+        last_seen_raw = reg.get(REGISTRY_FIELD_SHARED_SERVED_COUNT)
+        last_seen = int(last_seen_raw) if last_seen_raw else 0
+        # `truncated` IS ITS OWN EVIDENCE OF ONGOING TRAFFIC (`ServedCount`'s own docstring) —
+        # checked BEFORE the equality comparison, not folded into it. The supervisor's count is
+        # a bounded TAIL, not a cumulative total, so once real traffic pushes the log past that
+        # window `served.count` plateaus OR DROPS (a log roll starts a fresh, smaller window at
+        # `truncated=False`). Comparing with `<=` treated that drop as "no new traffic" and
+        # reaped a session mid-use the moment it rolled, even though the count changing at all —
+        # in either direction — while untruncated is itself proof something new happened; only
+        # an EXACT match means nothing changed since the last pass. A `truncated` reading means
+        # the log has substantial recent activity in it BY DEFINITION — enough to have filled
+        # the window — so it renews unconditionally rather than trusting a number that can no
+        # longer answer "did anything NEW happen".
+        if not served.truncated and served.count == last_seen:
+            # No NEW traffic since the last pass — a steady background poll from an idle tab
+            # must not read as fresh evidence every five minutes forever, or the ceiling above
+            # is the only thing that would ever end a session nobody is actually reading.
+            return
+        await redis.hset(
+            registry_key(user_uuid), REGISTRY_FIELD_SHARED_SERVED_COUNT, str(served.count)
+        )
+        await grant_stay_of_execution(redis, user_uuid, writer=DeadlineWriter.APP_SERVED_TRAFFIC)
+    except Exception:
+        _log.exception(
+            "shared-view traffic observation failed; the reap decision is unaffected",
+            user_id=str(user_uuid),
+            app_name=app_name,
+        )
+
+
+def _shared_view_past_its_ceiling(reg: dict[str, str], now: datetime) -> bool:
+    """#198's absolute session ceiling (requirement 20) — independent of the renewable traffic
+    stay above, so a wedged or spoofed supervisor report can never buy a shared view
+    immortality. `False` for every OTHER kind of record (an ordinary build sandbox has no
+    ceiling of its own here; its own signals govern it) and for a shared view still inside the
+    window — this only ever SUBTRACTS from what the stay would otherwise spare, never adds a
+    reason to spare one."""
+    if not is_a_shared_sandbox_name(reg.get(REGISTRY_FIELD_APP_NAME, "")):
+        return False
+    created = an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT)
+    if created is None:
+        return False  # cannot prove an age; the arms in `reconcile_user` decide instead
+    return now - created >= _SHARED_PREVIEW_ABSOLUTE_CEILING
+
+
 async def reconcile_user(
     redis: aioredis.Redis,
     user_uuid: uuid.UUID,
@@ -863,6 +968,11 @@ async def reconcile_user(
     if reg is None:
         await reap_lock(redis, user_uuid)  # clear any orphaned lock (no lockout)
         return False
+    # #198: a no-op for every record but a shared-runtime view (checked inside), so this changes
+    # nothing about the four arms below for an ordinary build sandbox. Ahead of them because a
+    # renewal it grants THIS pass must be visible to the stay check further down THIS SAME pass —
+    # picking it up only on the next sweep would needlessly reap a session that just proved active.
+    await _renew_shared_view_from_traffic(redis, user_uuid, sandbox_client, reg)
     if not certified_dead and await liveness_lease_is_held(redis, user_uuid):
         # The one liveness input readable from a process that is not running the build.
         # Checked BEFORE the lock/heartbeat pair below because it outranks it in both
@@ -897,7 +1007,15 @@ async def reconcile_user(
             redis, user_uuid, sandbox_client, reg, thin_the_re_ask=thin_the_re_ask
         )
         return False
-    if honor_stay and await stay_of_execution_is_current(redis, user_uuid):
+    if (
+        honor_stay
+        and await stay_of_execution_is_current(redis, user_uuid)
+        # #198: `False` for every record but a shared view (checked inside), so this changes
+        # nothing about a relaunched build preview's own reprieve. A shared view past its
+        # absolute ceiling falls straight through to the reap below EVEN THOUGH its stay is
+        # still current — the one condition nothing renews, by design (requirement 20).
+        and not _shared_view_past_its_ceiling(reg, datetime.now(UTC))
+    ):
         # A relaunched preview holds no lock and renews no heartbeat, so the stay is all that
         # stands between it and the sweep, which passes True. Reconcile-on-start keeps the
         # default and reaps THROUGH an unexpired stay: the incoming build needs the single
