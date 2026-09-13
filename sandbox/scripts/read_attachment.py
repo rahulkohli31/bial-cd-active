@@ -338,7 +338,7 @@ def read_xlsx(path: Path) -> dict[str, Any]:
 
         sheets.append(
             {
-                "name": name,
+                "name": _clip(name),
                 "rows": rows,
                 "columns": cols,
                 # BOUNDED LIKE EVERY OTHER LIST HERE. A wide sheet — genuinely wide, or one
@@ -391,7 +391,7 @@ def read_delimited(path: Path, separator: str) -> dict[str, Any]:
 
     columns = [
         {
-            "name": name,
+            "name": _clip(name),
             "type": str(frame.schema[name]),
             "nulls": int(frame[name].null_count()),
             "distinct": int(frame[name].n_unique()),
@@ -399,7 +399,7 @@ def read_delimited(path: Path, separator: str) -> dict[str, Any]:
         for name in frame.columns
     ]
     sample = [
-        {k: _clip(v) for k, v in row.items()}
+        {_clip(k): _clip(v) for k, v in row.items()}
         for row in _sample(frame.head(MAX_SAMPLE_ROWS).to_dicts())
     ]
     # `rows` is the TRUE height, not the sample's length — the number the old extractor never said.
@@ -444,13 +444,13 @@ def read_docx(path: Path) -> dict[str, Any]:
     for table in document.tables:
         rows = table.rows
         header = [_clip(c.text.strip()) for c in rows[0].cells] if rows else []
-        body = [[_clip(c.text.strip()) for c in r.cells] for r in rows[1:]]
+        body = [[_clip(c.text.strip()) for c in r.cells] for r in rows[1 : 1 + MAX_SAMPLE_ROWS]]
         tables.append(
             {
                 # Kept as a HEADER, not folded into the body — and bounded, because a table can
                 # be arbitrarily wide and this manifest goes to the model whole.
                 "header": _listing(header),
-                "rows": len(body),
+                "rows": max(0, len(rows) - 1),
                 "columns": len(header),
                 "sampleRows": _sample(body),
             }
@@ -504,7 +504,7 @@ def read_pptx(path: Path) -> dict[str, Any]:
                         "categories": _listing([_clip(c) for c in categories]),
                         "series": _listing(
                             [
-                                {"name": s.name, "values": _listing(list(s.values))}
+                                {"name": _clip(s.name), "values": _listing(list(s.values))}
                                 for s in shape.chart.series
                             ]
                         ),
@@ -545,7 +545,7 @@ def _zip_media(path: Path) -> dict[str, Any]:
     try:
         with zipfile.ZipFile(path) as archive:
             media = [
-                {"name": info.filename.split("/")[-1], "bytes": info.file_size}
+                {"name": _clip(info.filename.split("/")[-1]), "bytes": info.file_size}
                 for info in archive.infolist()
                 if "/media/" in info.filename
             ]

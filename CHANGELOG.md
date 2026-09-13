@@ -78,6 +78,10 @@ it belongs to, and what the model does with it.
   for a repeated filename was a name a third file could itself have.
 - **A malformed PDF cannot break the password check.** A crafted file could make the check that
   looks for a password fail outright rather than answer yes or no.
+- **A very long column, sheet or slide name can no longer crowd out the answer.** Every name the
+  reader reports is trimmed the way the rest of its output already was. A spreadsheet whose header
+  ran to sixty thousand characters used to reach the assistant in full, and again with each sample
+  row shown beneath it, leaving little of the conversation for anything else.
 
 ### Known limitations
 
