@@ -68,6 +68,7 @@ from src.services.build_sessions.alarms import (
     BUILD_WORKSPACE_CLAIMED_EVENT,
     PREVIEW_STATE_REPORTED_UNKNOWN_EVENT,
     RECOVERY_WRITE_DID_NOT_LAND_EVENT,
+    SANDBOX_DEV_STARTED_EVENT,
     SANDBOX_TORN_DOWN_EVENT,
     SERVING_PROOF_STAMP_REFUSED,
     WORKSPACE_LOST_WHILE_IDLE_EVENT,
@@ -970,11 +971,11 @@ def _registry_serves_and_is_ready(reg: dict[str, str], app_name: str) -> bool:
     )
 
 
-# WHICH watcher won the race to see the app answer. Only the two this module can emit are
+# WHICH watcher won the race to see the app answer. Only the ones this module can emit are
 # spelled here; `alarms.APP_FIRST_SERVED_EVENT` holds the whole vocabulary, the rest of which
 # belongs to the turn watcher and the reconciler. A closed Literal so a typo cannot mint an
 # observer that never existed.
-_ServingObserver = Literal["relaunch_wait", "relaunch_continuation"]
+_ServingObserver = Literal["relaunch_wait", "relaunch_continuation", "restore_continuation"]
 
 
 async def _record_the_first_serve(
@@ -2896,6 +2897,7 @@ class SessionManager:
             app_name=app_name,
             already_waited_s=already_waited_s,
             cold=cold,
+            observer="relaunch_continuation",
         )
 
     def _keep_watching_for_a_first_serve(
@@ -2908,6 +2910,7 @@ class SessionManager:
         app_name: str,
         already_waited_s: float,
         cold: bool,
+        observer: _ServingObserver,
     ) -> None:
         """Detach the bounded continuation and return immediately.
 
@@ -2929,6 +2932,7 @@ class SessionManager:
                 app_name=app_name,
                 already_waited_s=already_waited_s,
                 cold=cold,
+                observer=observer,
             )
         )
         self._tasks.add(watcher)
@@ -2944,6 +2948,7 @@ class SessionManager:
         app_name: str,
         already_waited_s: float,
         cold: bool,
+        observer: _ServingObserver,
     ) -> None:
         """Keep asking whether the app has started SHOWING A PAGE, for one more cold budget, then
         stop — either way with a line saying which. NEVER RAISES: nothing awaits this task, so
@@ -3003,7 +3008,7 @@ class SessionManager:
                         redis,
                         user_id,
                         app_name=app_name,
-                        observer="relaunch_continuation",
+                        observer=observer,
                         cold=cold,
                     )
                     return
@@ -3020,7 +3025,7 @@ class SessionManager:
                 APP_FIRST_SERVE_NOT_OBSERVED_EVENT,
                 waited_ms=int((already_waited_s + (loop.time() - started_at)) * 1000),
                 budget_ms=int((already_waited_s + _COLD_READY_BUDGET_SECONDS) * 1000),
-                arm="relaunch_continuation",
+                arm=observer,
                 dev_running=dev_running,
                 dev_compile=dev_compile,
                 app_name=app_name,
@@ -3524,6 +3529,7 @@ class SessionManager:
                             app_name=app_name_for(app_id),
                             already_waited_s=time.monotonic() - readiness_started_at,
                             cold=not attached,
+                            observer="relaunch_continuation",
                         )
                     else:
                         something_watched_it_paint = dev.shows_a_page
@@ -4032,7 +4038,37 @@ class SessionManager:
         )
         self._sessions[session.session_id] = session
         self._active_by_user[user_id] = session.session_id
+        if resolved.restored:
+            # Past the lock scope on purpose: a failure here must not reach the compensation
+            # that tears down the container the restore has just built.
+            await self._boot_the_tree_we_put_back(sandbox_client, handle, user_id)
         return session
+
+    async def _boot_the_tree_we_put_back(
+        self, sandbox_client: SandboxClient, handle: SandboxHandle, user_id: uuid.UUID
+    ) -> None:
+        """Start the app a restore just put back, then watch for its first page, detached.
+
+        The turn that ran the restore ends before the engine starts anything, so without this the
+        restored container serves nothing and the preview waits for a page that never comes. A
+        refused start is logged rather than raised: the watcher, and the reconciler under it,
+        still report whatever the container does next."""
+        try:
+            await sandbox_client.dev_start(handle)
+        except SandboxError:
+            _log.warning("restored_tree_dev_start_failed", app_name=handle.app_name, exc_info=True)
+        else:
+            _log.info(SANDBOX_DEV_STARTED_EVENT, arm="restore", already_running=False)
+        self._keep_watching_for_a_first_serve(
+            sandbox_client,
+            handle,
+            get_redis(),
+            user_id,
+            app_name=handle.app_name,
+            already_waited_s=0.0,
+            cold=True,
+            observer="restore_continuation",
+        )
 
     async def _resolve_sandbox(
         self,

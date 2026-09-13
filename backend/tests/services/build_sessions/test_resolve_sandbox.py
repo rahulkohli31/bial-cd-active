@@ -14,6 +14,7 @@ the tree. THE ORDER OF THE ASSERTIONS IN THIS FILE IS THE ORDER OF THE RISK.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from typing import Literal
 
@@ -21,13 +22,16 @@ import pytest
 import redis.asyncio as aioredis
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
+from src.api.v1.build_sessions.schemas import PreviewLifeState
 from src.config import settings
 from src.db.models.user import User
 from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions import pass_history
 from src.services.build_sessions import snapshot as snapshot_module
 from src.services.build_sessions.alarms import (
+    APP_FIRST_SERVED_EVENT,
     APP_STOPPED_WHILE_IDLE_EVENT,
     WORKSPACE_LOST_WHILE_IDLE_EVENT,
 )
@@ -49,7 +53,7 @@ from src.services.sandbox.base import DevStatus, ExecResult, SandboxHandle
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import quarantine_prefix, recovery_key, snapshot_key
 from tests.factories import ProjectFactory, UserFactory
-from tests.fakes import FakeSandboxClient, FakeStorage, a_git_bundle
+from tests.fakes import DevServerDownUntilStarted, FakeSandboxClient, FakeStorage, a_git_bundle
 
 RECORDED = "a" * 40
 
@@ -149,13 +153,18 @@ class _Heard:
 
 
 async def _attached(
-    db: AsyncSession, manager: SessionManager, user: User, project_id: uuid.UUID
+    db: AsyncSession,
+    manager: SessionManager,
+    user: User,
+    project_id: uuid.UUID,
+    *,
+    client: FakeSandboxClient | None = None,
 ) -> tuple[FakeSandboxClient, uuid.UUID]:
     """Get to the ATTACH arm — the only one where the tree is older than the request.
 
     The other two arms have just built the workspace from a bundle or a template, so there is
     nothing for them to have lost. Reaching this one takes a real provision first."""
-    client = FakeSandboxClient()
+    client = client or FakeSandboxClient()
     session = await manager.ensure_sandbox(
         db, user, project_id, sandbox_client=client, may_write=True
     )
@@ -301,6 +310,43 @@ async def test_the_sentence_arrives_before_the_restore_runs(
     assert order == ["said:restoring", "restored"]
     assert session.news is RecoveryNews.RESTORING
     assert session.restored is True
+
+
+async def test_a_restore_inside_a_turn_starts_the_dev_server_and_stamps_its_first_page(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ The restore brought this container up, so the restore is what must start its app.
+
+    The turn it happens in is held and never reaches the engine's own start, so a restore that
+    stops at the files leaves the preview waiting on a server nobody started.
+
+    Mutation check: drop the `dev_start` call and the preview stays STARTING; drop the watcher and
+    no first page is ever stamped."""
+    monkeypatch.setattr(manager_module, "READINESS_POLL_S", 0)
+    user, project_id = await _mk(db_session, "u2restart@rvaiglobal.com")
+    manager = SessionManager()
+    client = DevServerDownUntilStarted()
+    _, app_id = await _attached(db_session, manager, user, project_id, client=client)
+    await _seed_recovery(fake_storage, app_id)
+    client.exec_handler = _answers(None, commits=0, ancestry="")
+
+    with capture_logs() as logs:
+        session = await manager.ensure_sandbox(
+            db_session, user, project_id, sandbox_client=client, may_write=True
+        )
+        for watcher in list(manager._tasks):
+            with contextlib.suppress(Exception):
+                await watcher
+
+    assert session.restored is True
+    assert client.dev_started == [session.handle.app_name]
+    preview = await manager.project_preview_state(db_session, user, project_id)
+    assert preview.state is PreviewLifeState.ALIVE
+    served = [e for e in logs if e.get("event") == APP_FIRST_SERVED_EVENT]
+    assert [e["observer"] for e in served] == ["restore_continuation"]
 
 
 async def test_the_reverted_tree_is_parked_before_it_is_replaced(
