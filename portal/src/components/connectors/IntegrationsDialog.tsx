@@ -1,6 +1,6 @@
 /**
- * Integrations — the one door to connector access, opened from the profile menu (R5) and, from
- * U10, from `Manage integrations →` in the workspace rail. No new route, no Settings link, and no
+ * Integrations — the one door to connector access, opened from the profile menu and from
+ * `Manage integrations →` in the workspace rail. No new route, no Settings link, and no
  * navigation: it lands as a dialog over whatever the citizen was doing.
  *
  * ONE `Dialog` ROOT, THREE BODIES. This component owns the single `<Dialog open>` mount and swaps
@@ -17,7 +17,7 @@
  * portal, and `AppRegistryPanel` is where this shape comes from.
  *
  * THE LIST IS THE REGISTRY, AND THE REGISTRY HAS ONE ENTRY. The boards draw a second, greyed
- * `[ANOTHER BIAL SYSTEM]` placeholder row; it is not built (owner ruling, 2026-09-08) and there is
+ * `[ANOTHER BIAL SYSTEM]` placeholder row; it is not built and there is
  * no entry behind it. Rendering one anyway turns this file's first test red on purpose.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
@@ -104,6 +104,12 @@ export default function IntegrationsDialog({
     void load()
   }, [load])
 
+  /** Leaving the ask panel mid-request would unmount the only place its refusal can show. */
+  const backFromAsk = useCallback((): void => {
+    if (busyKey !== null) return
+    setBody({ view: 'list' })
+  }, [busyKey])
+
   const cancelRequest = useCallback(
     async (entry: ConnectorEntry): Promise<void> => {
       if (busyKey !== null) return
@@ -142,11 +148,9 @@ export default function IntegrationsDialog({
   /**
    * THE ONE WAY OUT OF THIS DIALOG, and it does two things every exit needs.
    *
-   * IT HONOURS THE IN-FLIGHT HOLD. The corner X used to call `onClose` directly while
-   * `onOpenChange` held Escape and the overlay press — so the comment below claiming "the
-   * header's X all arrive here" was false, and the one control a citizen is most likely to reach
-   * for was the one that could close the dialog mid-ask. The request lands either way; a dialog
-   * that vanished would leave them with no idea whether they had asked.
+   * IT HONOURS THE IN-FLIGHT HOLD. The corner X, Escape and the overlay press all arrive here, so
+   * none of them can close the dialog mid-ask. The request lands either way; a dialog that vanished
+   * would leave them with no idea whether they had asked.
    *
    * IT ANNOUNCES THAT CONNECTOR STATE MAY HAVE MOVED. This dialog has two doors — the profile
    * menu, present on every authed screen, and `Manage integrations →` in the workspace rail — and
@@ -192,7 +196,7 @@ export default function IntegrationsDialog({
           <AskAccessPanel
             entry={body.entry}
             busy={busyKey === body.entry.key}
-            onBack={() => setBody({ view: 'list' })}
+            onBack={backFromAsk}
             onClose={close}
             onSubmit={(remarks) => submitAsk(body.entry, remarks)}
           />

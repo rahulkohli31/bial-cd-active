@@ -5,12 +5,12 @@
  * chip that triggers it, because the row is what closes it after a write the row made. This file
  * renders the `PopoverContent` and nothing outside it.
  *
- * BOTH BOUNDS COME FROM THE SERVER AND NOTHING HERE COMPUTES A DATE RULE (R13). `earliestDate`
+ * BOTH BOUNDS COME FROM THE SERVER AND NOTHING HERE COMPUTES A DATE RULE. `earliestDate`
  * and `latestDate` arrive on the window; the grid disables everything before the first and after
  * the last, and the nav is bounded by the same pair — which is why the board draws its next-month
  * chevron greyed. There is no `new Date()` in this file. A browser clock in Bangalore and a
- * server clock in UTC are 5½ hours apart, and `today - 29` in the browser is the one thing R13
- * exists to forbid.
+ * server clock in UTC are 5½ hours apart, and `today - 29` in the browser is the one thing that
+ * rule exists to forbid.
  *
  * THE ONE PIECE OF ARITHMETIC, AND WHY IT IS NOT THAT. Ticking `Last 7 days` moves the grid's
  * highlight and the footer summary to the seven days ending at `latestDate`. That is a PREVIEW of
@@ -19,7 +19,7 @@
  * re-renders from what the resolver returned. The board draws exactly this state, `Last 30 days`
  * ticked over a highlighted 1–30 Sep.
  *
- * THE AMBER NOTE NAMES THE CONNECTOR AND THE NUMBER, AND BOTH ARE DATA (R18). The name is
+ * THE AMBER NOTE NAMES THE CONNECTOR AND THE NUMBER, AND BOTH ARE DATA. The name is
  * `displayName` off the wire; the number is the span between the two bounds, which is the
  * connector's own retention by construction (the resolver sets `earliest = latest - (retention -
  * 1)`, where `latest` is the connector's freshness ceiling and NOT today — the lake is loaded the
@@ -30,7 +30,7 @@
  * WHAT THE BOARD'S COPY DOES NOT COVER: the note explains the FLOOR only, and this grid also
  * disables dates after `latestDate` — which is the ceiling, a day or more before today, not today
  * itself. The sentence is the board's, verbatim, and is not extended here —
- * R1 makes that copy binding in substance and an addition is the owner's call, not an
+ * that copy is binding in substance and an addition is the owner's call, not an
  * implementer's. It is wired as the grid's `aria-describedby` so a screen reader hears the
  * available span rather than only that a date is unavailable.
  */
@@ -82,7 +82,7 @@ export interface WindowPopoverProps {
    * popover and an unchanged chip they have to notice for themselves.
    */
   onApply: (choice: WindowChoice) => Promise<void>
-  /** `Cancel`, Escape and an outside press all land here. Nothing is written. */
+  /** `Cancel`, Escape and an outside press land here once no Apply is in flight. Nothing is written. */
   onCancel: () => void
 }
 
@@ -146,12 +146,22 @@ export default function WindowPopover({
     }
   }
 
+  // Dismissal waits for an in-flight Apply: closing now would unmount the only place its refusal
+  // can show, and `preventDefault` is what stops Radix closing the popover on its own.
+  const dismiss = (event?: Event): void => {
+    if (saving) {
+      event?.preventDefault()
+      return
+    }
+    onCancel()
+  }
+
   return (
     <PopoverContent
       align="start"
       data-testid="window-popover"
-      onEscapeKeyDown={onCancel}
-      onInteractOutside={onCancel}
+      onEscapeKeyDown={dismiss}
+      onInteractOutside={dismiss}
       // Keep the popover clear of the window edge when Radix has to shift or flip it.
       collisionPadding={12}
       // `p-0 w-[302px]`: the board's own width, and each band owns its padding because the
@@ -267,7 +277,7 @@ export default function WindowPopover({
           <Button
             type="button"
             variant="outline"
-            onClick={onCancel}
+            onClick={() => dismiss()}
             className="h-auto rounded-lg border-bial-border bg-white px-3 py-1.5 text-[11.5px] font-semibold text-neutral shadow-none hover:bg-white hover:text-primary-900"
           >
             Cancel
