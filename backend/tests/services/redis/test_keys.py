@@ -26,6 +26,9 @@ from src.services.redis.keys import (
     REGISTRY_STATE_READY,
     heartbeat_key,
     key_prefix,
+    lake_file_key,
+    lake_index_key,
+    lake_key_prefix,
     lease_key,
     legacy_registry_key,
     lock_key,
@@ -99,6 +102,57 @@ def test_one_users_key_is_never_another_families_key() -> None:
     for a, b in ((locks, beats), (locks, regs), (locks, leases), (beats, regs), (beats, leases)):
         assert a.isdisjoint(b)
     assert regs.isdisjoint(leases)
+
+
+# --- the connector data plane sits in its OWN domain ----------------------------------------
+#
+# `sandbox:` is scanned by a job that DELETES AZURE CONTAINERS on the strength of what it finds,
+# and everything under it is read as a claim about a container. The lake families are file blobs,
+# so they sit in a peer domain — and these assertions are what stop a later "tidy-up" from folding
+# them back in.
+
+# A sha256 hex digest of a blob name, as `transfer.py` builds it. Written out rather than computed
+# so the format assertion below cannot be satisfied by whatever the production code happens to do.
+_DIGEST = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+
+def test_lake_key_formats_are_byte_stable() -> None:
+    assert lake_key_prefix() == f"bial:{_ENV}:lake:"
+    assert lake_index_key() == f"bial:{_ENV}:lake:index"
+    assert lake_file_key(_DIGEST) == f"bial:{_ENV}:lake:file:{_DIGEST}"
+
+
+def test_the_lake_domain_is_a_peer_of_the_sandbox_domain_not_a_family_inside_it() -> None:
+    """They agree on everything above the domain segment and differ from there down, so neither
+    can ever be a prefix of the other however the environment is spelled — and a fleet sweep's
+    `bial:{env}:sandbox:*` literal cannot reach a parquet copy."""
+    assert lake_key_prefix().removesuffix("lake:") == key_prefix().removesuffix("sandbox:")
+    assert not lake_key_prefix().startswith(key_prefix())
+    assert not key_prefix().startswith(lake_key_prefix())
+    for pattern in registry_scan_patterns():
+        assert not lake_index_key().startswith(pattern.rstrip("*"))
+        assert not lake_file_key(_DIGEST).startswith(pattern.rstrip("*"))
+
+
+@pytest.mark.parametrize(
+    "not_a_digest",
+    [
+        "",
+        "AOS/tb_flight_fact_report/2026/SEPTEMBER/a.parquet",  # the raw blob name
+        "e3b0c442",  # too short
+        _DIGEST.upper(),  # hex, but not the spelling we write
+        _DIGEST + "0",  # too long
+        _DIGEST[:-1] + ":",  # a separator smuggled in at the end
+    ],
+    ids=["empty", "raw-name", "too-short", "uppercase", "too-long", "smuggled-colon"],
+)
+def test_a_lake_file_key_refuses_anything_that_is_not_a_sha256_digest(not_a_digest: str) -> None:
+    """The same guard `ns()`'s `uuid.UUID` check is, met from the other side. A blob name is
+    arbitrary text from another system: it carries `/` by construction, may carry `:`, and is
+    unbounded — so a raw name in a key could forge a different family or a different
+    environment."""
+    with pytest.raises(ValueError, match="sha256"):
+        lake_file_key(not_a_digest)
 
 
 # --- The environment segment is the whole point -------------------------------------------

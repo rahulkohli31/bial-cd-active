@@ -64,6 +64,7 @@ from src.db.models.user import User
 from src.services.build_sessions.alarms import (
     APP_FIRST_SERVE_NOT_OBSERVED_EVENT,
     APP_FIRST_SERVED_EVENT,
+    APP_STOPPED_WHILE_IDLE_EVENT,
     BUILD_WORKSPACE_CLAIMED_EVENT,
     PREVIEW_STATE_REPORTED_UNKNOWN_EVENT,
     RECOVERY_WRITE_DID_NOT_LAND_EVENT,
@@ -71,6 +72,7 @@ from src.services.build_sessions.alarms import (
     SERVING_PROOF_STAMP_REFUSED,
     WORKSPACE_LOST_WHILE_IDLE_EVENT,
 )
+from src.services.build_sessions.appconnector_env import build_connector_env
 from src.services.build_sessions.appdata import build_app_env, resolve_app_for_project
 from src.services.build_sessions.appdb_env import provision_app_database
 from src.services.build_sessions.appstorage import provision_app_storage
@@ -93,10 +95,12 @@ from src.services.build_sessions.locks import (
     delete_registry,
     elapsed_ms,
     grant_stay_of_execution,
+    liveness_lease_is_held,
     mark_registry_ending,
     mark_serving,
     read_registry,
     read_registry_and_starting_marker,
+    read_starting_marker,
     reap_lock,
     release_lock_as_holder,
     renew_lock,
@@ -120,6 +124,7 @@ from src.services.build_sessions.snapshot import (
     write_recovery_copy,
     write_snapshot,
 )
+from src.services.lake.copy import schedule_window_copy
 from src.services.orchestrator.constants import READINESS_POLL_S
 from src.services.redis import RedisNotConfiguredError, get_redis
 from src.services.redis.keys import (
@@ -136,6 +141,7 @@ from src.services.sandbox import (
     SANDBOX_NAME_PREFIX,
     SHARED_SANDBOX_NAME_PREFIX,
     CompileState,
+    DevStatus,
     SandboxClient,
     SandboxError,
     SandboxGoneError,
@@ -281,10 +287,10 @@ def _terminal_status(reason: str) -> Literal[BuildSessionStatus.ENDED, BuildSess
 # the repo does have other scheduled work elsewhere.
 _ENDED_RETENTION_SECONDS: float = 300.0
 
-# How long a start will wait for an ended-but-still-finalizing session's shielded end
-# sequence before keeping the 409 — a refine sent right after natural completion must not
-# bounce off its own finished build (the finalize is usually sub-second; the bound only
-# guards a wedged teardown).
+# How long a start will wait for an ended-but-still-finalizing session to let go of the slot
+# before keeping the 409 — a message sent right after natural completion must not bounce off
+# its own finished turn (letting go is usually sub-second; the bound only guards a wedged
+# teardown).
 _FINALIZE_GRACE_SECONDS: float = 30.0
 
 # How long the end sequence will wait for the outcome record before giving up and emitting the
@@ -450,6 +456,31 @@ def reset_idle_checks_for_tests() -> None:
     """Drop the per-app idle-check memo. Process-local, so a remembered answer must not leak into
     the next test and silently make its container call disappear."""
     _idle_checks.clear()
+
+
+# THE PAUSE BEFORE THE SECOND LOOK at a dev server that did not answer. Reporting takes one
+# reading; putting a container away is an action, so it takes two. Nothing restarts a dev server
+# between turns on its own — the supervisor has no restart loop — so the pause is for a blip in the
+# reading, not a recovery in progress, and a couple of seconds is all that needs. Short, because a
+# tab's poll is waiting on this call.
+_SECOND_LOOK_AFTER_S: Final = 2.0
+
+
+async def _stopped_reading(
+    sandbox_client: SandboxClient, handle: SandboxHandle
+) -> DevStatus | None:
+    """The supervisor's reading when it says the app has STOPPED, else `None`.
+
+    BOTH HALVES MUST SAY NO. `running` is the supervisor's own child; `ready` is a request to the
+    app root that succeeded. The open sandbox lets the agent `pkill` that child and `nohup` its own
+    replacement, so `running=False` beside `ready=True` is an app serving perfectly well — the
+    reaper's retraction reads the pair the same way. A reading that FAILED is `None` too: a
+    supervisor that did not answer has not found the process dead."""
+    try:
+        status = await sandbox_client.dev_status(handle)
+    except SandboxError:
+        return None
+    return None if status.running or status.ready else status
 
 
 class _Quarantine(enum.StrEnum):
@@ -750,7 +781,7 @@ class SandboxUnreachableError(NoLiveSandboxError):
     same silent destruction, just rarer."""
 
 
-async def _existing_app_id(
+async def existing_app_id(
     db: AsyncSession, user_id: uuid.UUID, project_id: uuid.UUID
 ) -> uuid.UUID | None:
     """The project's app id WITHOUT minting one (`resolve_app_for_project` upserts)."""
@@ -825,7 +856,7 @@ async def _occupying_shared_project(
     project_name = await db.scalar(sa.select(Project.name).where(Project.id == project_id))
     if project_name is None:
         return None
-    app_id = await _existing_app_id(db, owner_id, project_id)
+    app_id = await existing_app_id(db, owner_id, project_id)
     if app_id is None:
         return None
     return _OccupyingProject(app_id=app_id, project_id=project_id, project_name=project_name)
@@ -897,7 +928,7 @@ async def _sandbox_name_for_existing_app(
     `resolve_app_for_project` upserts, and a read that mints is a read that leaves a DRAFT row
     behind every time a turn is refused. None means the project has never been built, so there
     is nothing live that could belong to it."""
-    app_id = await _existing_app_id(db, user_id, project_id)
+    app_id = await existing_app_id(db, user_id, project_id)
     return app_name_for(app_id) if app_id is not None else None
 
 
@@ -1252,9 +1283,35 @@ class BuildSession:
     # The single shielded end-sequence task (created by the first _finalize caller); every
     # caller awaits it, so a caller's own cancellation can't tear the sequence in half.
     finalize_task: asyncio.Task[None] | None = None
+    # The TURN path's counterpart to `finalize_task`, and the reason it needs one: a turn's end
+    # runs `finish_turn_sandbox` inline in the turn that is unwinding, so there is no task for
+    # anyone else to await. Bound the moment that sequence starts and SET the moment it lets go
+    # of the one-per-user slot — which is what lets a message sent the instant a turn ends wait
+    # for the release instead of bouncing off the sender's own finished turn.
+    turn_finish: asyncio.Event | None = None
     # Stamped when the end sequence completes — starts the retention window after which the
     # session (and its envelope buffer) is evicted from the manager.
     ended_at: datetime | None = None
+
+
+def _what_will_release_the_slot(
+    session: BuildSession | None,
+) -> asyncio.Task[None] | asyncio.Event | None:
+    """Whatever has to finish before this session lets go of the one-per-user slot — or None when
+    the session is genuinely still working and a claimant must be refused. THE ONE DECISION
+    behind both the turn gate's refusal and the slot claim's bounded wait.
+
+    TWO SHAPES, because the two end paths are built differently: a stop or a force-end runs the
+    end sequence in `finalize_task`, which anyone can await, and a turn's end runs
+    `finish_turn_sandbox` inline in the unwinding turn, which leaves only the event it sets.
+    Reading `terminal_committed` instead would answer False on every ordinary turn end — only
+    `_finalize` ever sets it — and a citizen's next message would be refused for as long as the
+    turn's recovery copy took to write."""
+    if session is None:
+        return None
+    if session.finalize_task is not None:
+        return session.finalize_task
+    return session.turn_finish
 
 
 class SessionManager:
@@ -1334,6 +1391,17 @@ class SessionManager:
     def active_session_for(self, user_id: uuid.UUID) -> BuildSession | None:
         session_id = self._active_by_user.get(user_id)
         return self._sessions.get(session_id) if session_id is not None else None
+
+    def is_letting_go_of_the_workspace(self, session: BuildSession) -> bool:
+        """Is this session OVER — terminal committed, nothing left but the release of the
+        one-per-user slot?
+
+        The question `api/v1/conversations/turns.py` asks before it refuses a second message.
+        A session in this state must not earn a refusal there: the slot claim inside the turn
+        waits (bounded) for the release and then admits the message, or keeps the 409 on its own
+        terms. A session that is genuinely working answers False and is refused at once — two
+        turns at once for one person is what the single slot exists to prevent."""
+        return _what_will_release_the_slot(session) is not None
 
     def live_user_ids(self) -> set[uuid.UUID]:
         """Users with a live in-proc session — never reaped by a sweep."""
@@ -1646,24 +1714,19 @@ class SessionManager:
             return
         blocking_id = self._active_by_user.get(user_id)
         blocking = self._sessions.get(blocking_id) if blocking_id is not None else None
-        finalize = blocking.finalize_task if blocking is not None else None
-        if blocking is None or not blocking.terminal_committed or finalize is None:
+        releasing = _what_will_release_the_slot(blocking)
+        if releasing is None:
             raise await self._slot_conflict_for(
                 user_id, blocking, blocking_id, db, requested_project_id
             )
-        # The blocking session has already COMMITTED its terminal — it is ended but still
-        # finalizing. Wait (bounded) for the shielded end sequence instead of 409ing the user's
-        # own finished build, then fall through to a fresh allocation; on a timeout or a finalize
-        # error, keep the 409.
-        #
-        # ONLY A STOP CAN PUT US HERE NOW. `finalize_task` is assigned in exactly one place,
-        # `_finalize`, and with `_run_and_finalize` deleted the only caller left is `_end` — i.e.
-        # `stop` / `force_end`. The case this was written for ("a refine sent right on the heels
-        # of natural completion") needed a build that finalized itself on completion, which no
-        # longer exists. The guard stays because it still reads correctly and fails closed: on a
-        # session that never finalizes, `finalize` is None and the 409 above is taken.
+        # The blocking session has already COMMITTED its terminal — it is ended and only letting
+        # go. Wait (bounded) for that instead of 409ing the user's own finished work, then fall
+        # through to a fresh allocation; on a timeout or an error in there, keep the 409.
+        letting_go: Awaitable[object] = (
+            asyncio.shield(releasing) if isinstance(releasing, asyncio.Task) else releasing.wait()
+        )
         try:
-            await asyncio.wait_for(asyncio.shield(finalize), timeout=_FINALIZE_GRACE_SECONDS)
+            await asyncio.wait_for(letting_go, timeout=_FINALIZE_GRACE_SECONDS)
         except Exception:
             raise await self._slot_conflict_for(
                 user_id, blocking, blocking_id, db, requested_project_id
@@ -1685,7 +1748,7 @@ class SessionManager:
         mid-write would bundle half-finished disk state as the saved bundle Relaunch restores.
         Scoped to WRITING sessions, not merely attached ones (Ask/Plan attach too), or the
         ordinary Save button would refuse mid-chat."""
-        app_id = await _existing_app_id(db, user.id, project_id)
+        app_id = await existing_app_id(db, user.id, project_id)
         if app_id is None:
             raise NoLiveSandboxError(project_id)
         # A save mid-write bundles whatever half-written state is on disk — the switch
@@ -1726,7 +1789,7 @@ class SessionManager:
         frozen at NO container call (a browser tab on a 45-second timer); this is its own call,
         gated by the caller on a preview already framed. `UNKNOWN` for every unanswerable case
         — absent must never read as clean; `compile_state` never raises."""
-        app_id = await _existing_app_id(db, user.id, project_id)
+        app_id = await existing_app_id(db, user.id, project_id)
         if app_id is None:
             return CompileState.UNKNOWN
         try:
@@ -1746,15 +1809,21 @@ class SessionManager:
         *,
         sandbox_client: SandboxClient,
     ) -> WorkspaceState:
-        """Is the app the citizen is looking at still the app? — asked by an idle tab: the
-        per-turn integrity check catches drift only between messages, nothing for a citizen
-        reading, in another tab, or at lunch, while the completion claim keeps saying "your
-        app is live". Never folded into `project_preview_state` (frozen at no container call);
-        fires only when the preview already reports alive and a completion claim stands.
-        RATE-LIMITED PER APP on purpose — without it an idle tab is a container exec every 45
-        seconds forever. NEVER restores or destroys, only reports; the restore belongs to the
-        next turn, where the citizen can confirm it."""
-        app_id = await _existing_app_id(db, user.id, project_id)
+        """Is the app the citizen is looking at still the app — and is anything still running it?
+        Asked by an idle tab: the per-turn integrity check catches drift only between messages,
+        nothing for a citizen reading, in another tab, or at lunch, while the completion claim
+        keeps saying "your app is live". Never folded into `project_preview_state` (frozen at no
+        container call); the client asks under a standing completion claim, or over a wait that
+        looks stuck. RATE-LIMITED PER APP on purpose — without it an idle tab is a container exec
+        every 45 seconds forever.
+
+        IT RESTORES NOTHING: the restore belongs to the next turn, where the citizen can confirm
+        it. IT PUTS ONE THING AWAY — an INTACT app whose dev server has stopped
+        (`_put_away_if_stopped`), because nothing else ends that wait. `preview-state` answers from
+        the registry, so over an exited process it goes on saying `alive`, or `starting` once the
+        reaper retracts the serving proof, and the pane waits for a load that cannot come. Put
+        away, the next reading is `asleep` with the work restorable."""
+        app_id = await existing_app_id(db, user.id, project_id)
         if app_id is None:
             return WorkspaceState.INTACT  # nothing built yet: nothing to have lost
         remembered = _idle_checks.get(app_id)
@@ -1785,7 +1854,61 @@ class SessionManager:
                 recovery_copy_available=verdict.durable_copy_exists,
                 verdict=verdict.state.value,
             )
+        if verdict.state is WorkspaceState.INTACT:
+            await self._put_away_if_stopped(user.id, app_id, handle, sandbox_client)
         return verdict.state
+
+    async def _put_away_if_stopped(
+        self,
+        user_id: uuid.UUID,
+        app_id: uuid.UUID,
+        handle: SandboxHandle,
+        sandbox_client: SandboxClient,
+    ) -> None:
+        """Put an INTACT app whose dev server has stopped away, so the wait over it ends on the
+        saved app and its start control instead of on nothing.
+
+        TWO READINGS, `_SECOND_LOOK_AFTER_S` apart: one is enough to report, and this acts.
+
+        NEVER UNDER ANYTHING USING THE CONTAINER. Refused — not waited for — while a start holds
+        this user's start lock: a start brings its own dev server, and the tab asking is polling
+        for the app to arrive. Refused while a turn is live in this process, while the liveness
+        lease or the start-in-flight marker stands, and once the registry names anything but this
+        app READY. The second reading is taken under the lock, after those checks, so nothing can
+        start between the last look and the put-away.
+
+        NEVER AT THE COST OF WORK. The reap passes `app_id`, which runs the durable-copy gate: a
+        copy is taken when the newest change postdates the newest copy, and a container whose work
+        cannot be proven preserved is SPARED — the citizen keeps the slow card, which is where they
+        were before this existed."""
+        if await _stopped_reading(sandbox_client, handle) is None:
+            return
+        await asyncio.sleep(_SECOND_LOOK_AFTER_S)
+        start = self._start_lock_for(user_id)
+        if start.locked():
+            return
+        async with start:
+            redis = get_redis()
+            if (
+                user_id in self._active_by_user
+                or await liveness_lease_is_held(redis, user_id)
+                or await read_starting_marker(redis, user_id) is not None
+                or not await _the_live_sandbox_is_already_the_one_we_want(
+                    redis, user_id, app_name_for(app_id)
+                )
+            ):
+                return
+            stopped = await _stopped_reading(sandbox_client, handle)
+            if stopped is None:
+                return
+            put_away = await reap_user(redis, user_id, sandbox_client, app_id=app_id)
+        _log.error(
+            APP_STOPPED_WHILE_IDLE_EVENT,
+            app_id=str(app_id),
+            app_name=handle.app_name,
+            exit_code=stopped.exit_code,
+            put_away=put_away,
+        )
 
     async def project_save_state(
         self,
@@ -1801,7 +1924,7 @@ class SessionManager:
         state while the two commits stay put. `dirty=None` means UNKNOWN, distinct from False:
         no live container (nothing to compare), or a store we could not read. A UI that renders
         unknown as clean tells the user their work is safe when nobody checked."""
-        app_id = await _existing_app_id(db, user.id, project_id)
+        app_id = await existing_app_id(db, user.id, project_id)
         if app_id is None:
             return SaveState(app_id=None, dirty=None, container_head=None, saved_head=None)
         try:
@@ -2169,7 +2292,7 @@ class SessionManager:
         # but stopping is destructive, and stopping a different project than the one the
         # caller named just because it happened to hold the slot would be a silent-action
         # failure of its own.
-        app_id = await _existing_app_id(db, user.id, project_id)
+        app_id = await existing_app_id(db, user.id, project_id)
         if app_id is None:
             return StopOutcome.NOTHING_WAS_RUNNING
         return await self._stop_the_held_session(
@@ -2249,7 +2372,7 @@ class SessionManager:
         when nothing was asked before, `STOPPED` when an earlier ask already settled. ONE STOP
         PER PROJECT: a racing second ask joins the first rather than starting a second, so two
         racing transfers end with one container."""
-        app_id = await _existing_app_id(db, user.id, project_id)
+        app_id = await existing_app_id(db, user.id, project_id)
         self._prune_settled_stop_records()
         key = (user.id, project_id)
         in_flight = self._stop_records.get(key)
@@ -2294,7 +2417,7 @@ class SessionManager:
         at most, an in-process dict lookup, nothing else, so a poll never manufactures
         activity of its own. `STOPPED` requires BOTH that nothing holds the app AND that a
         stop was asked for; absent the second, the answer is `NOTHING_WAS_RUNNING`."""
-        app_id = await _existing_app_id(db, user.id, project_id)
+        app_id = await existing_app_id(db, user.id, project_id)
         if app_id is not None and self._live_session_holds(user.id, app_id):
             # STILL UNWINDING — or something else took the slot in the meantime. Either way the
             # container is not free, and however long this goes on the answer stays this one.
@@ -2386,7 +2509,7 @@ class SessionManager:
         # and a container round trip, let a `RedisError` turn a poll into a 503, and make every
         # framed preview touch its container every 45 seconds — a manufactured activity signal
         # that would keep an unused sandbox looking busy forever.
-        app_id = await _existing_app_id(db, user.id, project_id)
+        app_id = await existing_app_id(db, user.id, project_id)
         try:
             reg, starting = await read_registry_and_starting_marker(get_redis(), user.id)
         except RedisNotConfiguredError:
@@ -2551,11 +2674,11 @@ class SessionManager:
         """Give up this project's container, on the user's explicit say-so — the teardown the
         start path used to do behind their back, moved into an action they take. `reap_user`
         is reused verbatim (mark-ending, teardown, clear registry, release lock). Refuses
-        while a build is genuinely running for this user; returns False when there is
-        nothing to release, reported as a plain success. `strict=True` keeps that true: the
-        lenient default would collapse "nothing registered" and "teardown failed" into the
-        same False, sending the caller straight back into a reclaim refusal it was told had
-        been cleared — strict re-raises instead, and the router turns it into a 503.
+        while a session is genuinely holding THIS project's container; returns False when
+        there is nothing to release, reported as a plain success. `strict=True` keeps that
+        true: the lenient default would collapse "nothing registered" and "teardown failed"
+        into the same False, sending the caller straight back into a reclaim refusal it was
+        told had been cleared — strict re-raises instead, and the router answers 503.
 
         ACCEPTS EITHER LINEAGE IN THE SLOT (#198, R16's acceptance example: "when the reaper
         sweeps it OR the release path runs, the container is actually deleted"). The registry
@@ -2566,11 +2689,15 @@ class SessionManager:
         without reaping anything: a recipient whose slot held a shared view had no route back
         to their own build sandbox, and Azure/Redis both still showed the container live."""
         async with self._start_lock_for(user.id):
-            if user.id in self._active_by_user:
-                raise BuildSessionConflictError(self._active_by_user.get(user.id))
-            app_id = await _existing_app_id(db, user.id, project_id)
+            app_id = await existing_app_id(db, user.id, project_id)
             if app_id is None:
                 return False
+            # THE APP ID IS RESOLVED BEFORE THE REFUSAL so the refusal can compare. The slot is
+            # per-user but a container belongs to one project, and a session holding a DIFFERENT
+            # project's container is no reason to refuse this one — giving up an idle project is
+            # precisely how a citizen frees the slot the live one is occupying.
+            if self._live_session_holds(user.id, app_id):
+                raise BuildSessionConflictError(self._active_by_user.get(user.id))
             redis = get_redis()
             reg = await read_registry(redis, user.id)
             if reg is None or reg.get(REGISTRY_FIELD_STATE) != REGISTRY_STATE_READY:
@@ -2957,11 +3084,15 @@ class SessionManager:
         immediately regardless of the lease — that build needs the one-per-user slot, and
         sparing the preview there would orphan its container under the new registry entry.
 
-        Diverged from the deleted `_start_locked` in two deliberate ways, and both still hold
-        against `_claim_the_one_build_slot`, which is where that logic lives:
-        - No finalize-grace wait on a terminal-committed session: the snapshot relaunch would
-          restore is written only by that session's finalize, so 409ing until it settles is
-          correct — never unify this with the `_FINALIZE_GRACE_SECONDS` arm.
+        The slot answer is `_claim_the_one_build_slot`'s, not a copy of it. That call is a
+        pre-check: it raises on a genuinely live session and otherwise returns having claimed
+        nothing, so relaunch still occupies no slot. It also means relaunch waits out a session
+        that has ended and is only letting go, which is the right answer here for the same
+        reason it is right for a message — the snapshot relaunch restores is the one that
+        session's finalize is writing, so waiting hands back the FRESH tree where refusing sent
+        the citizen away to press again.
+
+        One divergence from the deleted `_start_locked` still holds:
         - It must NOT reuse `_restore_or_provision`, whose confirmed-absent arm provisions a
           BLANK template — the wrong answer for relaunch, where an empty app is not a preview
           of the user's work. Instead it checks the snapshot itself and restores directly:
@@ -3041,20 +3172,12 @@ class SessionManager:
         async with self._start_lock_for(user.id):
             redis = get_redis()
             user_id = user.id
-            if user_id in self._active_by_user:
-                # The SAME choice `_claim_the_one_build_slot` makes, and relaunch is the
-                # door the citizen actually walks through: the rail composer preflights this
-                # route before it opens a chat, so this is the refusal that reaches the screen
-                # first. A different project holding the slot earns the hand-over dialog, not
-                # "try again" advice that cannot come true while that build runs.
-                blocking_id = self._active_by_user.get(user_id)
-                raise await self._slot_conflict_for(
-                    user_id,
-                    self._sessions.get(blocking_id) if blocking_id is not None else None,
-                    blocking_id,
-                    db,
-                    project_id,
-                )
+            # THE SAME CLAIM, not a copy of it: relaunch is the door the citizen actually walks
+            # through — the rail composer preflights this route before it opens a chat — so the
+            # refusal that reaches the screen first has to be the one the turn would have given,
+            # a hand-over dialog for a different project's hold and a bounded wait for a turn
+            # that has already ended. Held under the same per-user start lock the claim expects.
+            await self._claim_the_one_build_slot(user_id, db=db, requested_project_id=project_id)
             # WHICH container would satisfy this relaunch? Read-only on purpose, and computed
             # out here because it has to be: `app_id` is not bound until inside the lock, and
             # `resolve_app_for_project` is an UPSERT that mints a DRAFT row — so it can never
@@ -3160,8 +3283,9 @@ class SessionManager:
                     # THE COLD CLOCK STARTS HERE — see `cold_started_at` above for why this
                     # instant and not function entry.
                     cold_started_at = time.monotonic()
-                    # The FIVE injected vars (the two always-present BIAL_* + the two blob
-                    # coordinates with a freshly rotated SAS + the per-project DSN), exactly as
+                    # The injected vars — the two always-present BIAL_*, the two blob
+                    # coordinates with a freshly rotated SAS, the per-project DSN, and (only for
+                    # an approved, switched-on connector) the lake's two coordinates — exactly as
                     # a start's birth arm builds them. Deliberately written twice — this must
                     # NOT be unified with `_restore_or_provision` (see the docstring above), so
                     # a var added to only one of the two sites is a silent half-fix. Built only
@@ -3174,6 +3298,7 @@ class SessionManager:
                         **build_app_env(app_id),
                         **await provision_app_storage(app_id),
                         **await provision_app_database(db, project_id),
+                        **await build_connector_env(db, user_id=user_id, project_id=project_id),
                     }
                     # `_restore_or_bust` re-raises `StorageNotFoundError` (a bundle that
                     # vanished between head-check and pull) — the same 404 bucket.
@@ -3193,6 +3318,12 @@ class SessionManager:
                         )
                     except StorageNotFoundError as exc:
                         raise NoSnapshotToRelaunchError(app_id) from exc
+                    # A BIRTH, so the connector data-plane copy fires here. Detached and
+                    # unawaited: nothing on the platform reads what it writes — a generated app
+                    # reads the lake directly, with its own identity — so the citizen must never
+                    # wait on it and must never lose a relaunch to it. It answers "no lake", "not
+                    # switched on", "not approved" and "already held" for itself, quietly.
+                    schedule_window_copy(user_id, project_id)
                 # THE RESTORE ARM'S LEASE STARTS HERE, before the wait — and ONLY the restore
                 # arm's. `_restore_or_bust` has just created the container AND written its
                 # registry hash, so from this instant the sweep can see a user whose state
@@ -3595,7 +3726,7 @@ class SessionManager:
                     db,
                     project.id,
                 )
-            owner_app_id = await _existing_app_id(db, project.user_id, project.id)
+            owner_app_id = await existing_app_id(db, project.user_id, project.id)
             if owner_app_id is None:
                 raise SharedProjectHasNoAppError(project.id)
             shared_name = shr_name_for(owner_app_id, recipient.id)
@@ -3857,6 +3988,11 @@ class SessionManager:
                 env = {
                     **build_app_env(app_id),
                     **await provision_app_database(db, project_id),
+                    # The connector coordinates, and — because the sandbox client derives the
+                    # managed identity from their presence — the grant that makes them usable.
+                    # `{}` unless a lake is configured, the connector is switched on for this
+                    # project, and its owner's access has been approved.
+                    **await build_connector_env(db, user_id=user_id, project_id=project_id),
                 }
                 # `take` records the handle AND spares it when this was the attach arm. THE
                 # ATTACH ARM IS THE STEADY STATE HERE: every Write message after the first
@@ -3866,6 +4002,12 @@ class SessionManager:
                 resolved = await self._resolve_sandbox(
                     sandbox_client, user_id, app_id, env, announce=announce
                 )
+                # BIRTH ONLY. `_resolve_sandbox` reports its arm, and the attach arm is the
+                # steady state here — every Write message after the first reuses the running
+                # container. Firing on attach would list the lake once per message for a copy
+                # nobody reads. Detached and unawaited, for the reason the relaunch arm gives.
+                if not resolved.attached:
+                    schedule_window_copy(user_id, project_id)
                 handle = scope.take(resolved)
                 # Inside the protected region, before adopt: a `write_heartbeat` RedisError
                 # out here would orphan `_active_by_user[user_id]` forever and leak the
@@ -4612,6 +4754,13 @@ class SessionManager:
         # is no longer a dead end the thread has to be rescued from), and the snapshot itself.
         redis = get_redis()
 
+        # Bound HERE, before the first await: from this line the turn's terminal is already
+        # written and the slot is still held, so a message sent the instant the turn ends lands
+        # inside this window. `_claim_the_one_build_slot` waits on this event rather than
+        # refusing; a window that opened even one await later would have a hole at its start.
+        finishing = asyncio.Event()
+        session.turn_finish = finishing
+
         # STILL NO SAVE HERE.
         #
         # 1b. The generation-time overpromise detector, while the container is still up. A
@@ -4692,6 +4841,8 @@ class SessionManager:
             # pardon raised, or this user can never send another Write message.
             self._active_by_user.pop(session.user_id, None)
             self._maybe_prune_start_lock(session.user_id)
+            # AFTER the pop, so whoever this wakes finds the slot already free.
+            finishing.set()
 
         session.status = BuildSessionStatus.ENDED
         session.ended_at = datetime.now(UTC)

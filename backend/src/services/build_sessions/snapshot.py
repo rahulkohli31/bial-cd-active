@@ -17,11 +17,12 @@ import asyncio
 import base64
 import enum
 import secrets
+import time
 import uuid
 from collections import Counter
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Final, Literal
 
@@ -92,6 +93,30 @@ SNAPSHOT_EXECS: Final = 4
 """How many bounded execs one `write_snapshot` runs: commit, bundle, base64, and the cleanup in
 the `finally`. Named beside the per-exec bound so the product of the two is a number a caller can
 derive rather than count by reading this file."""
+
+#: Fields: `app_id`, `lock_wait_ms`, `commit_ms`, `bundle_ms`, `base64_ms`, `cleanup_ms`,
+#: `store_ms`. Save is synchronous in-request with no client-side timeout, so this is the only
+#: record of which of the three candidates — the four execs, the per-app queue, or the blob
+#: write — a slow save actually lost its time to. One event per save, success or failure; a
+#: step never reached (a failed exec, or the recovery guard's no-op skip) stays `None`.
+SNAPSHOT_STEP_TIMINGS_EVENT: Final = "snapshot_step_timings"
+
+
+@dataclass
+class _SaveStepTimings:
+    """Filled in as one save's steps complete, across two scopes: the per-app lock wait and the
+    store write happen in `write_snapshot`/`write_recovery_copy`, the four execs happen inside
+    `_bundle_the_tree`. MUTABLE and passed in rather than returned, so a step that raises still
+    leaves every step before it on the record — a return value cannot do that once the raise has
+    already unwound past it."""
+
+    lock_wait_ms: int | None = None
+    commit_ms: int | None = None
+    bundle_ms: int | None = None
+    base64_ms: int | None = None
+    cleanup_ms: int | None = None
+    store_ms: int | None = None
+
 
 # One serialization lock per app, plus a holder+waiter count so the entry can be dropped when it
 # is provably idle. Unique bundle names above already make a concurrent pair non-destructive; this
@@ -208,13 +233,27 @@ async def write_snapshot(
     `write_recovery_copy`, the same write with a guard in front. The head sha is stamped into the
     object's metadata and callers compare THAT, not `last_modified`: Azure stamps mtimes in whole
     seconds, so a Save and an autosave in the same second cannot be told apart by time, and the tie
-    would restore an older tree over newer work. Serialized per app: callers queue, never race."""
+    would restore an older tree over newer work. Serialized per app: callers queue, never race.
+
+    Emits `SNAPSHOT_STEP_TIMINGS_EVENT` once, in the `finally`, whether this returns or raises —
+    a manual Save can queue behind an autosave holding the same app's lock, and `lock_wait_ms` is
+    the only place that queue is visible at all."""
     key = (destination or Destination.saved(app_id)).key
-    async with _serialized_per_app(app_id):
-        store = _the_store_first()
-        tree = await _bundle_the_tree(sandbox_client, handle)
-        await _store_it(store, key, tree)
-        return tree.head_sha
+    timings = _SaveStepTimings()
+    lock_wait_started = time.monotonic()
+    try:
+        async with _serialized_per_app(app_id):
+            timings.lock_wait_ms = _elapsed_ms(lock_wait_started)
+            store = _the_store_first()
+            tree = await _bundle_the_tree(sandbox_client, handle, timings)
+            await _timed_store(store, key, tree, timings)
+            return tree.head_sha
+    finally:
+        # SUPPRESSED, because this runs in a `finally` on the save path: a save that failed is
+        # propagating an exception through here, and an instrument that raised would replace the
+        # citizen's real failure with its own. A measurement is never worth a diagnosis.
+        with suppress(Exception):
+            _log.info(SNAPSHOT_STEP_TIMINGS_EVENT, app_id=str(app_id), **asdict(timings))
 
 
 # HOW MANY TIMES IN A ROW THIS APP'S RECOVERY WRITE HAS BEEN REFUSED. Process-local like the
@@ -247,95 +286,111 @@ async def write_recovery_copy(
     moved" reading the sha BEFORE it would discard every turn's recovery copy: the agent does not
     commit as it works, so "HEAD unchanged + dirty tree" is the normal shape of a building turn
     (`test_a_dirty_tree_at_unchanged_head_still_writes_a_recovery_copy`). NEVER RAISES FOR A
-    REFUSAL — only bundle/upload failure is raised, at the call site that saw it throw."""
-    async with _serialized_per_app(app_id):
-        store = _the_store_first()
-        meta = await store.head(recovery_key(app_id))
-        recorded = head_sha_from_metadata(meta.metadata if meta else None)
-        tree = await _bundle_the_tree(sandbox_client, handle)
+    REFUSAL — only bundle/upload failure is raised, at the call site that saw it throw.
 
-        if meta is None:
-            # NO OBJECT AT ALL. There is nothing to overwrite and nothing to compare against, so
-            # the first write simply proceeds.
-            await _store_it(store, recovery_key(app_id), tree)
-            _consecutive_diverts.pop(app_id, None)
-            return RecoveryWrite(
-                RecoveryOutcome.WRITTEN, "no previous copy to protect", bundled_head=tree.head_sha
-            )
+    Emits `SNAPSHOT_STEP_TIMINGS_EVENT` once, in the `finally`, whether this returns or raises —
+    `store_ms` stays `None` on the `SKIPPED` outcome below, the one arm that writes nothing."""
+    timings = _SaveStepTimings()
+    lock_wait_started = time.monotonic()
+    try:
+        async with _serialized_per_app(app_id):
+            timings.lock_wait_ms = _elapsed_ms(lock_wait_started)
+            store = _the_store_first()
+            meta = await store.head(recovery_key(app_id))
+            recorded = head_sha_from_metadata(meta.metadata if meta else None)
+            tree = await _bundle_the_tree(sandbox_client, handle, timings)
 
-        if recorded is None:
-            # AN OBJECT IS THERE AND WE CANNOT COMPARE AGAINST IT — a bundle predating the head
-            # stamp. That is not a licence to overwrite it: an app whose container has reverted
-            # has exactly this shape, so writing would stamp the reverted tree over the user's
-            # only durable copy, into a store with neither versioning nor soft delete — and the
-            # reaper reads a WRITTEN as proof the work is safe and deletes the container in the
-            # same call. Diverted instead, so the bytes are kept for an operator to promote. Same
-            # reasoning `_where_head_sits_relative_to` applies to a `recorded` that is not
-            # sha-shaped.
+            if meta is None:
+                # NO OBJECT AT ALL. There is nothing to overwrite and nothing to compare
+                # against, so the first write simply proceeds.
+                await _timed_store(store, recovery_key(app_id), tree, timings)
+                _consecutive_diverts.pop(app_id, None)
+                return RecoveryWrite(
+                    RecoveryOutcome.WRITTEN,
+                    "no previous copy to protect",
+                    bundled_head=tree.head_sha,
+                )
+
+            if recorded is None:
+                # AN OBJECT IS THERE AND WE CANNOT COMPARE AGAINST IT — a bundle predating the
+                # head stamp. That is not a licence to overwrite it: an app whose container has
+                # reverted has exactly this shape, so writing would stamp the reverted tree over
+                # the user's only durable copy, into a store with neither versioning nor soft
+                # delete — and the reaper reads a WRITTEN as proof the work is safe and deletes
+                # the container in the same call. Diverted instead, so the bytes are kept for an
+                # operator to promote. Same reasoning `_where_head_sits_relative_to` applies to a
+                # `recorded` that is not sha-shaped.
+                where = divert_key(app_id, taken_at)
+                await _timed_store(store, where, tree, timings)
+                _consecutive_diverts[app_id] = _consecutive_diverts.get(app_id, 0) + 1
+                _log.error(
+                    RECOVERY_WRITE_DID_NOT_LAND_EVENT,
+                    app_id=str(app_id),
+                    reason=RecoveryOutcome.DIVERTED.value,
+                    recorded_head=None,
+                    bundled_head=tree.head_sha,
+                    ancestry="uncomparable",
+                    diverted_to=where,
+                )
+                return RecoveryWrite(
+                    RecoveryOutcome.DIVERTED,
+                    "the copy on record carries no head to compare against",
+                    bundled_head=tree.head_sha,
+                    diverted_to=where,
+                )
+
+            if tree.head_sha == recorded:
+                # The commit step found nothing to commit AND the tree is where the copy already
+                # is. Normal, and it must NOT alarm: this is every read-only turn.
+                _consecutive_diverts.pop(app_id, None)
+                return RecoveryWrite(
+                    RecoveryOutcome.SKIPPED,
+                    "the tree has not moved since the last copy",
+                    recorded_head=recorded,
+                    bundled_head=tree.head_sha,
+                )
+
+            ancestry = await _where_head_sits_relative_to(sandbox_client, handle, recorded)
+            if ancestry is Ancestry.DESCENDANT:
+                await _timed_store(store, recovery_key(app_id), tree, timings)
+                _consecutive_diverts.pop(app_id, None)
+                return RecoveryWrite(
+                    RecoveryOutcome.WRITTEN,
+                    "this turn built on the copy it is replacing",
+                    recorded_head=recorded,
+                    bundled_head=tree.head_sha,
+                )
+
+            # EVERYTHING ELSE DIVERTS. The tree in hand is not a descendant of the copy on
+            # record — or we could not establish that it is — so promoting it would replace a
+            # known-good bundle with one whose relationship to the user's work is unknown. The
+            # bytes are kept rather than dropped: in a false refusal they are the newest copy of
+            # somebody's afternoon.
             where = divert_key(app_id, taken_at)
-            await _store_it(store, where, tree)
+            await _timed_store(store, where, tree, timings)
             _consecutive_diverts[app_id] = _consecutive_diverts.get(app_id, 0) + 1
             _log.error(
                 RECOVERY_WRITE_DID_NOT_LAND_EVENT,
                 app_id=str(app_id),
                 reason=RecoveryOutcome.DIVERTED.value,
-                recorded_head=None,
+                recorded_head=recorded,
                 bundled_head=tree.head_sha,
-                ancestry="uncomparable",
+                ancestry=ancestry.value,
                 diverted_to=where,
             )
             return RecoveryWrite(
                 RecoveryOutcome.DIVERTED,
-                "the copy on record carries no head to compare against",
+                f"the tree is {ancestry.value} of the copy on record",
+                recorded_head=recorded,
                 bundled_head=tree.head_sha,
                 diverted_to=where,
             )
-
-        if tree.head_sha == recorded:
-            # The commit step found nothing to commit AND the tree is where the copy already is.
-            # Normal, and it must NOT alarm: this is every read-only turn.
-            _consecutive_diverts.pop(app_id, None)
-            return RecoveryWrite(
-                RecoveryOutcome.SKIPPED,
-                "the tree has not moved since the last copy",
-                recorded_head=recorded,
-                bundled_head=tree.head_sha,
-            )
-
-        ancestry = await _where_head_sits_relative_to(sandbox_client, handle, recorded)
-        if ancestry is Ancestry.DESCENDANT:
-            await _store_it(store, recovery_key(app_id), tree)
-            _consecutive_diverts.pop(app_id, None)
-            return RecoveryWrite(
-                RecoveryOutcome.WRITTEN,
-                "this turn built on the copy it is replacing",
-                recorded_head=recorded,
-                bundled_head=tree.head_sha,
-            )
-
-        # EVERYTHING ELSE DIVERTS. The tree in hand is not a descendant of the copy on record —
-        # or we could not establish that it is — so promoting it would replace a known-good bundle
-        # with one whose relationship to the user's work is unknown. The bytes are kept rather
-        # than dropped: in a false refusal they are the newest copy of somebody's afternoon.
-        where = divert_key(app_id, taken_at)
-        await _store_it(store, where, tree)
-        _consecutive_diverts[app_id] = _consecutive_diverts.get(app_id, 0) + 1
-        _log.error(
-            RECOVERY_WRITE_DID_NOT_LAND_EVENT,
-            app_id=str(app_id),
-            reason=RecoveryOutcome.DIVERTED.value,
-            recorded_head=recorded,
-            bundled_head=tree.head_sha,
-            ancestry=ancestry.value,
-            diverted_to=where,
-        )
-        return RecoveryWrite(
-            RecoveryOutcome.DIVERTED,
-            f"the tree is {ancestry.value} of the copy on record",
-            recorded_head=recorded,
-            bundled_head=tree.head_sha,
-            diverted_to=where,
-        )
+    finally:
+        # SUPPRESSED, because this runs in a `finally` on the save path: a save that failed is
+        # propagating an exception through here, and an instrument that raised would replace the
+        # citizen's real failure with its own. A measurement is never worth a diagnosis.
+        with suppress(Exception):
+            _log.info(SNAPSHOT_STEP_TIMINGS_EVENT, app_id=str(app_id), **asdict(timings))
 
 
 async def _where_head_sits_relative_to(
@@ -373,31 +428,59 @@ async def _store_it(store: ObjectStorage, key: str, tree: _BundledTree) -> None:
     )
 
 
-async def _bundle_the_tree(sandbox_client: SandboxClient, handle: SandboxHandle) -> _BundledTree:
-    """Commit whatever is in the worktree, bundle it, and read it back out of the container."""
+def _elapsed_ms(started: float) -> int:
+    return int((time.monotonic() - started) * 1000)
+
+
+async def _timed_store(
+    store: ObjectStorage, key: str, tree: _BundledTree, timings: _SaveStepTimings
+) -> None:
+    """`_store_it`, timed onto the shared accumulator. A separate wrapper rather than inlining
+    at each call site: `write_recovery_copy` picks one of four keys to write to, and every arm
+    must time the same way."""
+    started = time.monotonic()
+    await _store_it(store, key, tree)
+    timings.store_ms = _elapsed_ms(started)
+
+
+async def _bundle_the_tree(
+    sandbox_client: SandboxClient,
+    handle: SandboxHandle,
+    timings: _SaveStepTimings,
+) -> _BundledTree:
+    """Commit whatever is in the worktree, bundle it, and read it back out of the container.
+
+    Times each of the four execs onto `timings`; the caller owns logging the event once its own
+    lock-wait and store steps are known too."""
     bundle_name = f"{_BUNDLE_PREFIX}.{secrets.token_hex(8)}"
     run_command = sandbox_client.exec  # aliased to keep the call off the JS-oriented exec guard
     # Every step's exit code is checked (a non-zero exit is a NORMAL ExecResult): a failed
     # commit or bundle must abort HERE, never fall through to base64-ing whatever happens to be
     # on disk and uploading it as "latest".
+    commit_started = time.monotonic()
     commit = await run_command(
         handle, ["sh", "-c", _COMMIT_SCRIPT], timeout_s=SNAPSHOT_EXEC_TIMEOUT_SECONDS
     )
+    timings.commit_ms = _elapsed_ms(commit_started)
     if commit.exit != 0:
         raise SandboxError(f"snapshot commit failed (exit {commit.exit})")
     try:
         # Bare argv, no shell: `bundle_name` is hex from `secrets`, but keeping the interpolated
         # path off a command line is the property worth having rather than the audit.
+        bundle_started = time.monotonic()
         bundle = await run_command(
             handle,
             ["git", "bundle", "create", bundle_name, "HEAD"],
             timeout_s=SNAPSHOT_EXEC_TIMEOUT_SECONDS,
         )
+        timings.bundle_ms = _elapsed_ms(bundle_started)
         if bundle.exit != 0:
             raise SandboxError(f"snapshot bundle failed (exit {bundle.exit})")
+        base64_started = time.monotonic()
         result = await run_command(
             handle, ["base64", bundle_name], timeout_s=SNAPSHOT_EXEC_TIMEOUT_SECONDS
         )
+        timings.base64_ms = _elapsed_ms(base64_started)
         if result.exit != 0:
             raise SandboxError(f"snapshot bundle read failed (exit {result.exit})")
         data = base64.b64decode(result.stdout)
@@ -410,10 +493,12 @@ async def _bundle_the_tree(sandbox_client: SandboxClient, handle: SandboxHandle)
         # left behind is multi-MB of binary sitting in the worktree that the next snapshot's
         # `git add -A` would commit into the user's tree. `/app.bundle*` in the template's
         # .gitignore is the backstop for a call killed before it reaches here; this is the fix.
+        cleanup_started = time.monotonic()
         with suppress(SandboxError):
             await run_command(
                 handle, ["rm", "-f", bundle_name], timeout_s=SNAPSHOT_EXEC_TIMEOUT_SECONDS
             )
+        timings.cleanup_ms = _elapsed_ms(cleanup_started)
 
 
 class ParkedTreeNotOursError(Exception):

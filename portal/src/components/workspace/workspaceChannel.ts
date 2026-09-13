@@ -159,6 +159,12 @@ export interface PaneView {
    * announces that, which is the one failure a measurement cannot detect.
    */
   onRevealed?: () => void
+  /**
+   * The stalled-frame edge, for the publisher's "has this app stopped?" question. On the channel
+   * for the reason `onRevealed` is: a re-hosted pane that dropped it would leave a stopped app on
+   * the slow card for good, and nothing would announce that either.
+   */
+  onStallChange?: (stalled: boolean) => void
 }
 
 /**

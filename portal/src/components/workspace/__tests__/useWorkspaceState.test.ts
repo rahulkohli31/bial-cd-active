@@ -713,3 +713,120 @@ describe('the start outcome slot', () => {
     expect(api.fetchPreviewState).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('a wait that looks stuck asks whether the app has stopped', () => {
+  /** The server's side of the check: finding the app stopped, it puts the container away, so every
+   *  read after the check answers `asleep` with the work restorable. */
+  function aServerThatPutsTheAppAway(before: PreviewState) {
+    let putAway = false
+    api.checkWorkspace.mockImplementation(async () => {
+      putAway = true
+      return false
+    })
+    api.fetchPreviewState.mockImplementation(async () =>
+      putAway ? reading({ state: 'asleep', restorable: true }) : before,
+    )
+  }
+
+  it('★ a stalled frame on a running app asks at once, then reads again for the answer', async () => {
+    // The reading that prompted the question predates the put-away, so the check is followed by one
+    // more read — which is what lands the pane on the saved app instead of on the slow card.
+    aServerThatPutsTheAppAway(reading({ state: 'alive', alive: true }))
+    const { result } = mount()
+    await waitFor(() => expect(result.current.state.name).toBe('running'))
+    // LIVENESS BEFORE ABSENCE: the poll is reading, and no reading so far has asked.
+    expect(api.checkWorkspace).not.toHaveBeenCalled()
+
+    await act(async () => {
+      result.current.reportFrameStall(true)
+    })
+
+    await waitFor(() => expect(result.current.state.name).toBe('not-running'))
+    expect(api.checkWorkspace).toHaveBeenCalledTimes(1)
+    expect(api.checkWorkspace).toHaveBeenCalledWith('proj-1')
+    expect(result.current.state.action?.kind).toBe('start')
+  })
+
+  it('★ a start stuck past the accelerated window asks on the first background read, never inside it', async () => {
+    aServerThatPutsTheAppAway(reading({ state: 'starting' }))
+    const { result } = mount()
+    await waitFor(() => expect(result.current.state.name).toBe('starting'))
+
+    // THE WHOLE WINDOW buys cheap reads only — the bargain `nextProbeCadence` makes with a start.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS * STARTING_PROBE_LIMIT)
+    })
+    expect(api.fetchPreviewState.mock.calls.length).toBe(1 + STARTING_PROBE_LIMIT)
+    expect(api.checkWorkspace).not.toHaveBeenCalled()
+    expect(result.current.state.name).toBe('starting')
+
+    // Past it, the first background read asks, and the read after the answer is the saved app.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PREVIEW_PROBE_MS + 1)
+    })
+    await waitFor(() => expect(result.current.state.name).toBe('not-running'))
+    expect(api.checkWorkspace).toHaveBeenCalledTimes(1)
+  })
+
+  it('★ a stall does not outlive the app it was about — launched again, a running app is not asked', async () => {
+    // Put away, the pane unmounts with no chance to take its stall back, so the reading that takes
+    // the frame away has to. Mutation check: drop that reset and the relaunched app is asked about
+    // on every background read, for as long as the tab stays open.
+    let putAway = false
+    let launched = false
+    api.checkWorkspace.mockImplementation(async () => {
+      putAway = true
+      return false
+    })
+    api.fetchPreviewState.mockImplementation(async () =>
+      launched || !putAway
+        ? reading({ state: 'alive', alive: true })
+        : reading({ state: 'asleep', restorable: true }),
+    )
+    const { result } = mount()
+    await waitFor(() => expect(result.current.state.name).toBe('running'))
+    await act(async () => {
+      result.current.reportFrameStall(true)
+    })
+    await waitFor(() => expect(result.current.state.name).toBe('not-running'))
+
+    // The citizen presses Launch; the start lands and the surface asks again at once.
+    launched = true
+    await act(async () => {
+      result.current.refresh()
+    })
+    await waitFor(() => expect(result.current.state.name).toBe('running'))
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PREVIEW_PROBE_MS * 2 + 1)
+    })
+
+    // LIVENESS: the poll is reading the relaunched app…
+    expect(api.fetchPreviewState.mock.calls.length).toBeGreaterThan(4)
+    // …and the stall from before the put-away bought it no question.
+    expect(api.checkWorkspace).toHaveBeenCalledTimes(1)
+  })
+
+  it('a stall the pane has since taken back asks nothing more', async () => {
+    api.fetchPreviewState.mockResolvedValue(reading({ state: 'alive', alive: true }))
+    const { result } = mount()
+    await waitFor(() => expect(result.current.state.name).toBe('running'))
+    await act(async () => {
+      result.current.reportFrameStall(true)
+    })
+    await waitFor(() => expect(api.checkWorkspace).toHaveBeenCalledTimes(1))
+
+    // A late beacon won: the citizen is looking at their app, so the poll stops asking about it.
+    await act(async () => {
+      result.current.reportFrameStall(false)
+    })
+    const readsBefore = api.fetchPreviewState.mock.calls.length
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PREVIEW_PROBE_MS * 2 + 1)
+    })
+
+    // LIVENESS: the poll kept reading…
+    expect(api.fetchPreviewState.mock.calls.length).toBeGreaterThan(readsBefore)
+    // …and asked nothing more.
+    expect(api.checkWorkspace).toHaveBeenCalledTimes(1)
+  })
+})

@@ -7,8 +7,9 @@
 # Two hardening choices below are load-bearing, because `package.json` is agent-editable
 # and is therefore the last remaining arbitrary-code-execution vector in this build:
 #
-#   * `npm ci --ignore-scripts` — a `postinstall` hook would otherwise run whatever the
-#     agent wrote, inside the build agent, with network access.
+#   * `--ignore-scripts` on every install — the `npm ci` below and the `npm install` it falls
+#     back to — because a `postinstall` hook would otherwise run whatever the agent wrote,
+#     inside the build agent, with network access.
 #   * `npx --no-install next build` rather than `npm run build` — the `build` script is
 #     agent-editable and could be replaced with anything at all.
 #
@@ -35,10 +36,31 @@ ARG NODE_IMAGE=node:24-trixie-slim@sha256:0711b541c1c33a8a530ac4f0d391baa9a15b3d
 FROM ${NODE_IMAGE} AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
-# A drifted lockfile fails HERE, loudly, with npm's own "not in sync" message — which is
-# the honest outcome. The sandbox can hide that drift (its node_modules is baked into the
-# image and already satisfies the import), so this is often the first place it surfaces.
-RUN npm ci --ignore-scripts --no-audit --no-fund --loglevel=error
+# `npm ci` refuses a lockfile that has drifted from `package.json`, and a generated app's lock
+# drifts routinely — the sandbox hides it, its node_modules being baked into the image and
+# already satisfying the import. Falling back to `npm install` resolves from `package.json`
+# rather than refusing to publish at all, at the price of versions nobody previewed; the echo
+# is what tells the build log which arm ran.
+#
+# THE FALLBACK IS GATED ON THE DRIFT SIGNATURE, not on `npm ci` failing. `npm ci` also refuses
+# when a tarball does not match the hash the lock vetted (`EINTEGRITY`), and falling back there
+# would answer a supply-chain signal by resolving the package again from the registry — turning
+# the one check that would catch a swapped tarball into a suggestion. Anything that is not
+# drift keeps npm's own diagnosis and fails the build.
+#
+# The first arm's stderr is held back rather than streamed, and replayed only when the build is
+# going to fail anyway. A recovered drift is not a failure, and its `Invalid:` lines are the
+# residue of a step that worked — left in the log they outrank the real diagnosis of whatever
+# fails later.
+#
+# `--ignore-scripts` is on BOTH arms. Without it on the fallback, a `postinstall` hook gets the
+# arbitrary-code-execution vector named at the top of this file — and the fallback is the arm
+# that reads the agent's `package.json` directly.
+RUN npm ci --ignore-scripts --no-audit --no-fund --loglevel=error 2>/tmp/npm-ci.err \
+ || (grep -qE 'code EUSAGE|Invalid:' /tmp/npm-ci.err \
+     && echo "lockfile drifted from package.json; falling back to npm install" \
+     && npm install --ignore-scripts --no-audit --no-fund --loglevel=error) \
+ || (cat /tmp/npm-ci.err >&2; exit 1)
 
 # ── build ────────────────────────────────────────────────────────────────────
 FROM ${NODE_IMAGE} AS builder

@@ -437,6 +437,15 @@ export interface LivePreviewProps {
   // "this is how long until the citizen saw their app" was reporting the fastest views of the day
   // for exactly the runs in which they saw nothing at all.
   onRevealed?: () => void
+  // Told when the wait on the framed document is LABELLED SLOW — `true` the moment the re-requests
+  // run out with no vouch — and told again with `false` when that label comes down: a late beacon
+  // that wins, or a new document with a wait of its own. Same fire-and-forget rules as `onRevealed`.
+  //
+  // A STALLED FRAME IS THE ONLY SIGN THIS PANE GETS OF A STOPPED APP. `preview-state` answers from
+  // the registry and goes on saying `alive` over a dev server that has died, so the caller asks the
+  // server to look at the process instead — and a stopped app with its work saved is put away and
+  // offered back with its start control, rather than this card waiting for a load that cannot come.
+  onStallChange?: (stalled: boolean) => void
 }
 
 export default function LivePreview({
@@ -466,6 +475,7 @@ export default function LivePreview({
   device = 'Desktop',
   reloadNonce: externalReloadNonce = 0,
   onRevealed,
+  onStallChange,
 }: LivePreviewProps) {
 
   // The sandbox preview origin, held in a ref so the mount-once message listener always reads
@@ -1123,6 +1133,21 @@ export default function LivePreview({
       // outcome this whole surface is built to avoid.
     }
   }, [seenByCitizen, frameKey, onRevealed])
+  // …and the STALL, told as an edge in BOTH directions rather than once per key. The caller holds it
+  // as "is the framed app stuck right now" and asks the server on its own schedule, so it has to hear
+  // the label come down as well as go up. Starts at `false`, so a pane that never stalls never calls
+  // — and nothing is sent on unmount: the caller clears its own copy on any reading that takes the
+  // frame away.
+  const reportedStall = useRef(false)
+  useEffect(() => {
+    if (reportedStall.current === frameStalled) return
+    reportedStall.current = frameStalled
+    try {
+      onStallChange?.(frameStalled)
+    } catch {
+      // The pane owes the caller nothing — the rule the reveal above states in full.
+    }
+  }, [frameStalled, onStallChange])
   const framePending = showFrame && !frameVouched && !frameStalled
   // `starting` joins the wait WITHOUT a `status` term, deliberately. The other two arms both key
   // on the build lifecycle, and a relaunch has no build lifecycle at all — it carries the status

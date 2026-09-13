@@ -33,6 +33,8 @@ const h = vi.hoisted(() => ({
 const seen = []
 /** Every `workspaceLost` the pane has been handed, in order. */
 const lostSeen = []
+/** The newest stalled-frame reporter the pane has been handed — how a test plays the pane's stall. */
+let reportStall = null
 
 vi.mock('../../utils/builderHistory', () => ({
   loadBuilds: h.loadBuilds, getBuild: h.getBuild, deriveTitle: (t) => (t || '').slice(0, 40),
@@ -48,6 +50,7 @@ vi.mock('../../components/LivePreview', () => ({
     seen.push(props.compileState)
     // the retraction reaches the pane as its own prop, watched here without rendering LivePreview itself.
     lostSeen.push(props.workspaceLost)
+    reportStall = props.onStallChange ?? null
     return null
   },
 }))
@@ -149,6 +152,7 @@ const COMPILE = (state, seq = 5) => ({ type: 'compile', seq, state })
 beforeEach(() => {
   seen.length = 0
   lostSeen.length = 0
+  reportStall = null
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
   primeClient(h)
@@ -380,5 +384,67 @@ describe('BuilderPage — a workspace lost while the tab sat idle', () => {
 
     // LIVENESS: the probe really ran, so the `false` below is an answer rather than a no-op.
     expect(lostSeen.every((v) => v !== true)).toBe(true)
+  })
+})
+
+describe('BuilderPage — a stalled frame asks whether the app has stopped', () => {
+  /** The project's running app, framed on a hard load with no turn — and NO standing claim, which is
+   *  the point: a stuck frame is worth asking about whether or not anything was ever claimed. */
+  async function framedWithNoClaim() {
+    h.fetchPreviewState.mockResolvedValue({
+      state: 'alive', alive: true, previewUrl: PREVIEW_URL,
+      occupyingProjectName: null, restorable: true,
+    })
+    renderThread()
+    await waitFor(() => expect(reportStall).not.toBeNull())
+  }
+
+  // Mutation check: drop `mayBeStopped` from the probe's gate and the check below is never asked.
+  it('★ asks the server at once, with no completion claim standing, then reads again', async () => {
+    await framedWithNoClaim()
+    // LIVENESS BEFORE ABSENCE: the probe has read the workspace, and nothing made it ask yet.
+    await waitFor(() => expect(h.fetchPreviewState).toHaveBeenCalled())
+    expect(h.checkWorkspace).not.toHaveBeenCalled()
+    const readsBefore = h.fetchPreviewState.mock.calls.length
+
+    await act(async () => { reportStall(true) })
+
+    await waitFor(() => expect(h.checkWorkspace).toHaveBeenCalledWith('p1'))
+    // The reading that prompted the check predates whatever the server did about it, so the probe
+    // reads once more — the stall's own read and the one after the answer, and then no further:
+    // the second read is an accelerated one, which cannot ask again.
+    await waitFor(() => expect(h.fetchPreviewState.mock.calls.length).toBe(readsBefore + 2))
+    await act(async () => { await new Promise((resolve) => { setTimeout(resolve, 50) }) })
+    expect(h.fetchPreviewState.mock.calls.length).toBe(readsBefore + 2)
+    expect(h.checkWorkspace).toHaveBeenCalledTimes(1)
+  })
+
+  // Put away, the pane unmounts without taking its stall back, so the reading that takes the frame
+  // away has to. Mutation check: drop that reset and the relaunched app is asked about on the next look.
+  it('★ a stall does not outlive the app it was about — launched again, a running app is not asked', async () => {
+    let putAway = false
+    let launched = false
+    let asleepAnswers = 0
+    h.checkWorkspace.mockImplementation(async () => { putAway = true; return false })
+    h.fetchPreviewState.mockImplementation(async () => {
+      if (launched || !putAway) {
+        return { state: 'alive', alive: true, previewUrl: PREVIEW_URL, occupyingProjectName: null, restorable: true }
+      }
+      asleepAnswers += 1
+      return { state: 'asleep', alive: false, previewUrl: null, occupyingProjectName: null, restorable: true }
+    })
+    renderThread()
+    await waitFor(() => expect(reportStall).not.toBeNull())
+    await act(async () => { reportStall(true) })
+    await waitFor(() => expect(asleepAnswers).toBeGreaterThan(0))
+
+    // Launched again from elsewhere; the citizen comes back to this tab.
+    launched = true
+    const readsAtLaunch = h.fetchPreviewState.mock.calls.length
+    await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
+    await waitFor(() => expect(h.fetchPreviewState.mock.calls.length).toBeGreaterThan(readsAtLaunch))
+    await act(async () => { await new Promise((resolve) => { setTimeout(resolve, 50) }) })
+
+    expect(h.checkWorkspace).toHaveBeenCalledTimes(1)
   })
 })

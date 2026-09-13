@@ -57,7 +57,17 @@ class _Aca:
         if self.delete_fails:
             raise AcaError("ARM refused the delete")
 
-    async def create_app(self, *, name: str, env: dict[str, str], tags: dict[str, str]) -> str:
+    async def create_app(
+        self,
+        *,
+        name: str,
+        env: dict[str, str],
+        tags: dict[str, str],
+        identity_resource_id: str | None = None,
+    ) -> str:
+        # `identity_resource_id` is accepted so the double matches the port and ignored because
+        # this file asserts teardown ORDERING; which identity a container was born with is
+        # asserted in `test_aca.py`.
         self.created.append(name)
         return f"{name}.westeurope.azurecontainerapps.io"
 

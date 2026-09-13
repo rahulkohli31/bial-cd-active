@@ -12,6 +12,12 @@ Five sandbox families share the environment-scoped root `bial:{environment}:sand
     lease:{user_id}      string — liveness lease (epoch seconds, TTL mandatory)
     starting:{user_id}   string — start-in-flight marker (project id, TTL mandatory)
 
+A SEVENTH DOMAIN, `bial:{environment}:lake:`, holds the connector data-plane copy — parquet
+bytes and the index that orders them. It is DELIBERATELY NOT under `sandbox:`: that segment is
+reserved for sandbox LIFECYCLE state, a fleet sweep scans it and deletes Azure containers on the
+strength of what it finds, and a family of file blobs sitting in the middle of that would be
+read by a reader who assumed everything below `sandbox:` describes a container.
+
 A sixth family, taskiq's queue in `src/broker.py`, sits under `bial:` but outside `sandbox:` —
 `bial:{env}:taskiq:stream`, where those braces are a literal Redis hash tag, not a placeholder.
 Only the library-derived `autoclaim:<group>:<stream>` lock has a literal prefix outside `bial:`.
@@ -28,14 +34,23 @@ legacy prefix stays read-only."""
 
 from __future__ import annotations
 
+import re
 import uuid
 from typing import Final
+
+# What a lake file key's discriminator must look like: exactly a sha256 hex digest.
+IS_SHA256_HEX: Final = re.compile(r"[0-9a-f]{64}")
 
 # The reserved product root, shared with the taskiq families in `src/broker.py`.
 KEY_ROOT: Final = "bial:"
 
 # The sandbox domain segment, below the environment.
 KEY_DOMAIN: Final = "sandbox:"
+
+# The connector data-plane domain segment, a PEER of `sandbox:` rather than a family inside it.
+# See the module docblock: `sandbox:` is scanned by a sweep that deletes Azure containers, and its
+# contents are read as claims about containers.
+KEY_DOMAIN_LAKE: Final = "lake:"
 
 # The legacy root, from before the environment segment was added to sandbox keys, frozen as
 # HISTORY rather than taste: it is what the live fleet was registered under, so a typo here
@@ -51,6 +66,11 @@ FAMILY_HEARTBEAT: Final = "heartbeat"
 FAMILY_REGISTRY: Final = "registry"
 FAMILY_LEASE: Final = "lease"
 FAMILY_STARTING: Final = "starting"
+
+# The two lake families. `file` holds one copied parquet file's BYTES; `index` is the single
+# sorted set that orders every copied file by when it was copied, and is what the trim walks.
+FAMILY_LAKE_FILE: Final = "file"
+FAMILY_LAKE_INDEX: Final = "index"
 
 
 def _environment() -> str:
@@ -150,6 +170,52 @@ def legacy_registry_key(user_id: uuid.UUID) -> str:
             f"a sandbox key is built from a uuid.UUID, never a {type(user_id).__name__}"
         )
     return f"{LEGACY_KEY_PREFIX}{FAMILY_REGISTRY}:{user_id}"
+
+
+# --- the connector data plane (domain `lake:`) --------------------------------
+
+
+def lake_key_prefix() -> str:
+    """`bial:{environment}:lake:` — the root the data-plane copy sits under.
+
+    A PEER of `key_prefix()`, not a child. Nothing in the sandbox sweep may ever match these
+    keys, and nothing here may ever match a sandbox key: the two prefixes differ at the segment
+    after the environment, which is the earliest possible place to differ."""
+    return f"{KEY_ROOT}{_environment()}:{KEY_DOMAIN_LAKE}"
+
+
+def lake_file_key(digest: str) -> str:
+    """`bial:{env}:lake:file:{digest}` — one copied parquet file, as raw bytes.
+
+    `digest` is a sha256 hex of the blob's full name, and hashing is not decoration. A blob name
+    is arbitrary text from another system: it carries `/` by construction, may carry `:`, and is
+    unbounded in length — so using it raw would let a name forge a different family or a different
+    environment, which is the same hazard `ns()`'s `uuid.UUID` guard exists to close, met from the
+    other side. A fixed-width hex digest cannot. Nothing reads this copy, so the name is not
+    needed back out of the key.
+
+    THE VALUE IS BYTES, written through `get_redis_bytes()`. The ordinary client decodes, and
+    decoding a parquet file is silent corruption of the one thing this feature copies verbatim."""
+    if not IS_SHA256_HEX.fullmatch(digest):
+        raise ValueError(
+            "a lake file key is built from a sha256 hex digest of the blob name, never from the "
+            "name itself: a blob name can carry ':' and forge a different key family"
+        )
+    return f"{lake_key_prefix()}{FAMILY_LAKE_FILE}:{digest}"
+
+
+def lake_index_key() -> str:
+    """`bial:{env}:lake:index` — the ONE sorted set ordering every copied file by copy time.
+
+    NOT PER USER, and that is the design rather than an oversight. The budget it enforces is a
+    ceiling on this feature's total footprint in a shared Redis instance, so it has to be walkable
+    in one place; a per-user index would make "are we over budget" an N-key question, which is
+    exactly what a sharded instance refuses to answer in one command.
+
+    Its members are `{size}:{digest}` — the size rides the member so the total is DERIVED by
+    summing what is actually indexed, rather than kept in a counter that can drift away from the
+    thing it counts."""
+    return f"{lake_key_prefix()}{FAMILY_LAKE_INDEX}"
 
 
 def registry_scan_patterns() -> tuple[str, ...]:

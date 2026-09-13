@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -42,6 +43,7 @@ from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.conversation import ChatKind
 from src.db.models.user import User
+from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions.appdata import (
     APP_SWITCHED_OFF_CODE,
     build_app_env,
@@ -68,7 +70,12 @@ from src.services.build_sessions.manager import (
 )
 from src.services.build_sessions.outcome import write_build_outcome
 from src.services.build_sessions.reaper import sweep_all
-from src.services.build_sessions.snapshot import Destination, write_snapshot
+from src.services.build_sessions.snapshot import (
+    Destination,
+    RecoveryOutcome,
+    RecoveryWrite,
+    write_snapshot,
+)
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
@@ -97,7 +104,12 @@ from src.services.storage import (
     StorageNotFoundError,
     snapshot_key,
 )
-from tests.factories import ConversationFactory, ProjectFactory, UserFactory
+from tests.factories import (
+    AppRegistryFactory,
+    ConversationFactory,
+    ProjectFactory,
+    UserFactory,
+)
 from tests.fakes import FakeSandboxClient, FakeStorage, a_sandbox_name
 
 
@@ -1220,6 +1232,135 @@ async def test_start_awaits_a_still_finalizing_terminal_session_then_starts_fres
     await ending
 
 
+# --- the turn seam: a message sent the instant a turn ends ----------------------------
+
+
+def _a_gated_recovery_copy(
+    entered: asyncio.Event, gate: asyncio.Event
+) -> Callable[..., Awaitable[RecoveryWrite]]:
+    """Hold `finish_turn_sandbox` open inside its recovery write — the turn is over, its
+    terminal is written, and the one-per-user slot is still held. That is the window a citizen's
+    next message lands in, and the recovery write is what makes it long enough to matter."""
+
+    async def gated(*_args: object, **_kwargs: object) -> RecoveryWrite:
+        entered.set()
+        await gate.wait()
+        return RecoveryWrite(outcome=RecoveryOutcome.WRITTEN, reason="written")
+
+    return gated
+
+
+async def test_a_message_sent_while_a_turn_is_still_letting_go_waits_instead_of_refusing(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sibling above, through the door every ordinary message takes. A turn's end runs
+    `finish_turn_sandbox`, which assigns no `finalize_task` and never sets `terminal_committed`
+    — so an escape asking for either answers "still building" on every finished turn and refuses
+    the citizen's next message for as long as the recovery copy takes to write.
+
+    Mutation check: drop `_what_will_release_the_slot`'s `turn_finish` arm and this goes red."""
+    user, project_id = await _mk(db_session, "m19b@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    first = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
+    client.attach_handle = first.handle  # the pardoned container answers the next message
+
+    entered, gate = asyncio.Event(), asyncio.Event()
+    monkeypatch.setattr(
+        manager_module, "write_recovery_copy", _a_gated_recovery_copy(entered, gate)
+    )
+
+    # DETACHED, and that is the shape rather than the convenience: the turn awaits its own
+    # unwind while the next message arrives on a different request's task.
+    finishing = asyncio.create_task(manager.finish_turn_sandbox(first, client, touched=True))
+    await entered.wait()
+    assert manager.active_session_for(user.id) is first  # ended, and still holding the slot
+
+    starter = asyncio.create_task(
+        manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client, may_write=True)
+    )
+    for _ in range(20):  # it WAITS on the turn's release instead of 409ing
+        await asyncio.sleep(0)
+    assert not starter.done()
+
+    gate.set()  # the turn lets go -> the waiting message proceeds
+    second = await starter
+    await finishing
+    assert second.session_id != first.session_id
+    assert client.torn_down == []  # onto the pardoned container, not a rebuilt one
+
+
+async def test_a_turn_that_never_lets_go_of_the_slot_keeps_the_conflict(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bound is what makes the wait safe to perform at all: a wedged turn end answers the
+    same 409 it always did rather than holding the next message open indefinitely."""
+    user, project_id = await _mk(db_session, "m19c@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    first = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
+
+    entered, gate = asyncio.Event(), asyncio.Event()
+    monkeypatch.setattr(
+        manager_module, "write_recovery_copy", _a_gated_recovery_copy(entered, gate)
+    )
+    monkeypatch.setattr(manager_module, "_FINALIZE_GRACE_SECONDS", 0.05)
+
+    finishing = asyncio.create_task(manager.finish_turn_sandbox(first, client, touched=True))
+    await entered.wait()
+
+    with pytest.raises(BuildSessionConflictError):
+        await manager.ensure_sandbox(
+            db_session, user, project_id, sandbox_client=client, may_write=True
+        )
+
+    gate.set()
+    await finishing
+
+
+async def test_a_turn_that_is_still_running_is_refused_at_once_and_never_waited_for(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE DANGEROUS DIRECTION. A session that has not committed its terminal is a turn still
+    working, and admitting a second one alongside it would run two containers for one person —
+    the exact thing the single slot exists to prevent. It is refused immediately, not waited on.
+
+    The bound is raised to an hour so a wait cannot pass as a pause: any waiting at all blows
+    the timeout below instead of quietly costing a citizen 30 seconds."""
+    user, project_id = await _mk(db_session, "m19d@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    first = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
+    client.attach_handle = first.handle
+
+    monkeypatch.setattr(manager_module, "_FINALIZE_GRACE_SECONDS", 3600.0)
+    with pytest.raises(BuildSessionConflictError):
+        await asyncio.wait_for(
+            manager.ensure_sandbox(
+                db_session, user, project_id, sandbox_client=client, may_write=True
+            ),
+            timeout=5,
+        )
+
+    assert manager.active_session_for(user.id) is first  # the running turn keeps the slot
+    assert client.provisioned == [app_name_for(first.app_id)]  # and no second container
+
+
 # --- best-effort mark_registry_ending in _end (the kill switch must never 500) --------
 
 
@@ -2042,6 +2183,57 @@ async def test_relaunch_while_a_build_is_live_is_409(
     assert caught.value.session_id == session.session_id
 
 
+async def test_a_relaunch_while_a_turn_is_still_letting_go_waits_like_a_message_does(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The third door onto the one slot, and the sibling above is the half that must not move:
+    a live turn still refuses a relaunch at once. Relaunch is the door the citizen walks through
+    — the rail composer preflights it before opening a chat — so it must answer an ENDED turn
+    the way the message would, which it does by calling the same claim rather than copying it.
+
+    Mutation check: put the inline `user_id in self._active_by_user` refusal back into
+    `relaunch_preview` and this goes red."""
+    user, project_id = await _mk(db_session, "r6b@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
+
+    entered, gate = asyncio.Event(), asyncio.Event()
+    monkeypatch.setattr(
+        manager_module, "write_recovery_copy", _a_gated_recovery_copy(entered, gate)
+    )
+    finishing = asyncio.create_task(manager.finish_turn_sandbox(session, client, touched=True))
+    await entered.wait()
+
+    relaunching = asyncio.create_task(
+        manager.relaunch_preview(db_session, user, project_id, _RelaunchRecorder())
+    )
+    # THE BARRIER, and it is not decoration: relaunch awaits a counter write before it reaches
+    # the slot at all, so pumping a few event-loop turns and finding the task unfinished proves
+    # only that it had not got there yet. It takes the per-user start lock in the statement
+    # before the claim, so THAT is the observable that says it has arrived.
+    for _ in range(2000):
+        held = manager._start_locks.get(user.id)
+        if relaunching.done() or (held is not None and held.locked()):
+            break
+        await asyncio.sleep(0.001)
+    else:
+        raise AssertionError("the relaunch never reached the one-per-user slot")
+    for _ in range(20):  # and having arrived, it WAITS on the turn's release instead of 409ing
+        await asyncio.sleep(0)
+    assert not relaunching.done()
+
+    gate.set()
+    await finishing
+    assert (await relaunching).preview_url  # and then the preview comes back up
+
+
 async def test_relaunch_404_leaves_no_committed_app_row_and_provisions_no_storage(
     db_session: AsyncSession,
     fake_redis: aioredis.Redis,
@@ -2821,7 +3013,7 @@ async def test_save_still_succeeds_while_the_app_is_switched_off(
     nothing consumes it: publish still refuses, approval pins a submission rather than the
     saved head, and the app is off the live roster and out of the catalog.
 
-    Structurally this holds because Save reads its app id through `_existing_app_id`, never
+    Structurally this holds because Save reads its app id through `existing_app_id`, never
     through `resolve_app_for_project` — so wiring the gate into Save would take a deliberate
     edit. Making that edit turns this test red.
     """
@@ -2857,3 +3049,283 @@ async def test_save_still_succeeds_while_the_app_is_switched_off(
     # THE WORK REACHED DURABLE STORAGE. Not "no exception was raised" — a refusal that
     # returned quietly would pass that, and the citizen's work would still be gone.
     assert snapshot_key(app_id) in fake_storage.objects
+
+
+# --- the connector coordinates reach BOTH birth arms ------------------------------------------
+#
+# A container gets its environment exactly once, at birth, and there are TWO births — the
+# relaunch arm and the turn-start arm. `manager.py`'s own docblock says a variable added to only
+# one of them is a silent half-fix, so each arm is asserted SEPARATELY: a single test through one
+# path is exactly the half-fix that warning describes. The attach arm forwards no environment at
+# all and is not a birth, which is why there is no third case here.
+
+
+async def _approved_connector_project(db: AsyncSession, email: str) -> tuple[User, uuid.UUID]:
+    """A citizen an administrator has approved, with the connector switched on for one project."""
+    from src.db.models.connector_access import ConnectorRequestStatus
+    from src.db.models.project_connector import ConnectorWindowKind, ProjectConnector
+    from tests.api.v1.connectors.conftest import KEY, seed_decision
+
+    user, project_id = await _mk(db, email)
+    await seed_decision(db, user.id, ConnectorRequestStatus.APPROVED, None)
+    db.add(
+        ProjectConnector(
+            project_id=project_id,
+            connector_key=KEY,
+            enabled=True,
+            window_kind=ConnectorWindowKind.RELATIVE,
+            window_days=7,
+        )
+    )
+    await db.flush()
+    return user, project_id
+
+
+@pytest.fixture
+def _lake_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.services.lake.config import LakeConfig
+
+    monkeypatch.setattr(
+        settings,
+        "connector_lake",
+        LakeConfig(
+            url=_LAKE_URL,
+            identity_client_id=_LAKE_CLIENT_ID,
+            identity_resource_id="/subscriptions/s/resourcegroups/r/providers/p/id/an-identity",
+        ),
+    )
+
+
+_LAKE_URL = "https://alakeaccount.blob.core.windows.net/acontainer/AOS/reports/"
+_LAKE_CLIENT_ID = "52b74947-0621-46e2-a523-a6b466f47c33"
+
+
+def _connector_names() -> tuple[str, str]:
+    from src.services.lake.env import connector_env_names
+    from tests.api.v1.connectors.conftest import KEY
+
+    return connector_env_names(KEY)
+
+
+async def test_the_turn_start_birth_arm_carries_the_connector_coordinates(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    _lake_configured: None,
+) -> None:
+    user, project_id = await _approved_connector_project(db_session, "cx1@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+
+    await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
+
+    url_name, client_id_name = _connector_names()
+    assert client.provision_env is not None, "the turn-start arm never provisioned"
+    assert client.provision_env[url_name] == _LAKE_URL
+    assert client.provision_env[client_id_name] == _LAKE_CLIENT_ID
+
+
+async def test_the_relaunch_birth_arm_carries_them_too(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    _lake_configured: None,
+) -> None:
+    user, project_id = await _approved_connector_project(db_session, "cx2@rvaiglobal.com")
+    manager = SessionManager()
+    client = _RelaunchRecorder()
+    await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+
+    await manager.relaunch_preview(db_session, user, project_id, client)
+
+    url_name, client_id_name = _connector_names()
+    assert client.restore_env is not None, "the relaunch arm never restored"
+    assert client.restore_env[url_name] == _LAKE_URL
+    assert client.restore_env[client_id_name] == _LAKE_CLIENT_ID
+
+
+async def test_an_unapproved_project_is_born_with_nothing_extra(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    _lake_configured: None,
+) -> None:
+    """The lake is CONFIGURED and the container still gets nothing, because this citizen was
+    never approved. Asserted on the birth env rather than on the envelope so the two halves of
+    the gate — coordinates and identity — each have their own failing test."""
+    user, project_id = await _mk(db_session, "cx3@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+
+    await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
+
+    url_name, client_id_name = _connector_names()
+    assert client.provision_env is not None
+    assert url_name not in client.provision_env
+    assert client_id_name not in client.provision_env
+
+
+# --- the copy fires on a BIRTH, and only on a birth ----------------------------------------------
+
+
+async def test_both_birth_arms_schedule_the_window_copy(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    _lake_configured: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ The two arms that hand a container its environment must also start the copy of the files
+    that environment points at. The call is fire-and-forget by design — it returns before the task
+    runs and swallows everything after — so nothing downstream ever notices its absence. Deleting
+    either `schedule_window_copy(...)` line leaves every other test in this file green.
+
+    Both arms in one test because they are one decision made twice, and a test per arm would let
+    somebody add a third arm without noticing there was a pattern to follow."""
+    fired: list[tuple[uuid.UUID, uuid.UUID]] = []
+    monkeypatch.setattr(
+        manager_module,
+        "schedule_window_copy",
+        lambda user_id, project_id: fired.append((user_id, project_id)),
+    )
+
+    user, project_id = await _approved_connector_project(db_session, "cx4@rvaiglobal.com")
+    manager = SessionManager()
+    await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=FakeSandboxClient(), may_write=True
+    )
+    assert fired == [(user.id, project_id)], "the turn-start birth arm did not start the copy"
+
+    other, other_project = await _approved_connector_project(db_session, "cx5@rvaiglobal.com")
+    await _seed_app_with_bundle(db_session, other, other_project, fake_storage)
+    await manager.relaunch_preview(db_session, other, other_project, _RelaunchRecorder())
+    assert fired[-1] == (other.id, other_project), "the relaunch birth arm did not start the copy"
+
+
+async def test_attaching_to_a_live_container_does_not_re_copy_the_window(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    _lake_configured: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ THE ABSENCE IS THE POINT, AND IT IS THE COMMON PATH. Attach is the steady state — every
+    message after the first — and it forwards no environment because the container already has
+    one. Firing the copy here would list the lake and re-check a whole window once per message,
+    for a copy nothing reads.
+
+    Paired with a liveness assertion rather than left as a bare `== []`: a run that had somehow
+    taken the BIRTH arm, or failed before reaching either, would satisfy the absence for entirely
+    the wrong reason. `client.provisioned` staying empty is what proves this went through attach.
+    """
+    user, project_id = await _approved_connector_project(db_session, "cx6@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    app_id = await resolve_app_for_project(db_session, user.id, project_id)
+    await db_session.commit()
+    client.attach_handle = SandboxHandle(
+        fqdn="existing.example",
+        token="tok",
+        app_name=app_name_for(app_id),
+        preview_url="https://existing.example/",
+        ready=True,
+    )
+    await fake_redis.hset(
+        registry_key(user.id),
+        mapping={
+            REGISTRY_FIELD_APP_NAME: app_name_for(app_id),
+            REGISTRY_FIELD_FQDN: "existing.example",
+            REGISTRY_FIELD_TOKEN_REF: "ref",
+            REGISTRY_FIELD_CREATED_AT: "2026-07-14T00:00:00+00:00",
+            REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
+        },
+    )
+
+    fired: list[tuple[uuid.UUID, uuid.UUID]] = []
+    monkeypatch.setattr(
+        manager_module,
+        "schedule_window_copy",
+        lambda user_id, project_id: fired.append((user_id, project_id)),
+    )
+    await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
+
+    assert client.provisioned == [], "this took the BIRTH arm; the assertion below proves nothing"
+    assert fired == []
+
+
+# --- release refuses for the project holding the container, and only that one -------------
+
+
+async def test_releasing_an_idle_project_is_allowed_while_another_one_is_live(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """The slot is per person; a container belongs to ONE project. So a session holding one
+    project's container cannot answer for another project's release — and must not, because
+    giving up an idle project is how a citizen frees the slot for the live one.
+
+    Mutation-check: refuse on any entry in `_active_by_user` and this goes red with a
+    `BuildSessionConflictError` raised for a project that holds nothing."""
+    user, live_project = await _mk(db_session, "m90@rvaiglobal.com")
+    idle_project = (await ProjectFactory.create(db_session, user.id)).id
+    await AppRegistryFactory.create(db_session, user_id=user.id, project_id=idle_project)
+    manager = SessionManager()
+    client = FakeSandboxClient()
+
+    live = await manager.ensure_sandbox(
+        db_session, user, live_project, sandbox_client=client, may_write=True
+    )
+    # LIVENESS: the release below proves nothing unless something really is holding the slot.
+    assert manager._live_session_holds(user.id, live.app_id) is True
+
+    released = await manager.release_project_sandbox(
+        db_session, user, idle_project, sandbox_client=client
+    )
+
+    assert released is False  # nothing of this project's to release — a plain success
+    assert client.torn_down == []  # and the live project's container was left alone
+    assert manager._live_session_holds(user.id, live.app_id) is True
+
+
+async def test_releasing_the_project_whose_container_is_live_is_still_refused(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """The case the refusal exists for: pulling a container out from under the session working
+    in it destroys whatever is not yet saved, so this one is a conflict however the citizen
+    asks for it."""
+    user, project_id = await _mk(db_session, "m91@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+
+    live = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
+
+    with pytest.raises(BuildSessionConflictError) as refusal:
+        await manager.release_project_sandbox(db_session, user, project_id, sandbox_client=client)
+
+    assert refusal.value.session_id == live.session_id
+    assert client.torn_down == []  # refused BEFORE the teardown, so the work is still there
+
+
+async def test_releasing_a_project_with_nothing_running_is_a_plain_success(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """No session anywhere, no container registered: the workspace is already in the state the
+    caller asked for, which is a success reported as `False`, never a refusal."""
+    user, project_id = await _mk(db_session, "m92@rvaiglobal.com")
+    await AppRegistryFactory.create(db_session, user_id=user.id, project_id=project_id)
+    manager = SessionManager()
+    client = FakeSandboxClient()
+
+    released = await manager.release_project_sandbox(
+        db_session, user, project_id, sandbox_client=client
+    )
+
+    assert released is False
+    assert client.torn_down == []

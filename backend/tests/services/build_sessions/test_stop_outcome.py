@@ -474,7 +474,7 @@ async def test_two_racing_transfers_for_one_citizen_end_with_one_container(
     session_factory,
 ) -> None:
     """Two tabs, one workspace, one stop: two asks could race into two cancels, so one record per
-    project must catch both. The barrier sits inside `_existing_app_id`, after its real DB round
+    project must catch both. The barrier sits inside `existing_app_id`, after its real DB round
     trip (see the inline comments there for why that is the race-safe spot); counts are of
     `_stop_the_held_session` CALLS, not `len(_stop_records)`, which reads `1` either way.
 
@@ -491,7 +491,7 @@ async def test_two_racing_transfers_for_one_citizen_end_with_one_container(
         db_session, _fresh_engine, session_factory, manager, client, user, project_a, turn
     )
 
-    real_app_id = manager_module._existing_app_id
+    real_app_id = manager_module.existing_app_id
     # Two parties, and only the first two asks are held: the sequential third ask further down
     # must not wait for a partner that is never coming.
     at_the_check = asyncio.Barrier(2)
@@ -509,7 +509,7 @@ async def test_two_racing_transfers_for_one_citizen_end_with_one_container(
             await asyncio.wait_for(at_the_check.wait(), timeout=10)
         return app_id
 
-    monkeypatch.setattr(manager_module, "_existing_app_id", _holds_both_tabs_at_the_check)
+    monkeypatch.setattr(manager_module, "existing_app_id", _holds_both_tabs_at_the_check)
 
     stops_started: list[uuid.UUID] = []
     real_stop = manager._stop_the_held_session

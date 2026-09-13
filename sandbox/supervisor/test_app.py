@@ -53,12 +53,18 @@ def _write(name: str, text: str) -> Path:
 
 # --- the fail-closed child-env scrub (a pure function — the security boundary) ----------------
 def test_child_env_is_a_fail_closed_allowlist() -> None:
-    # The parent env carries secrets a suffix denylist would miss (IDENTITY_HEADER matches no
-    # suffix; a *_DSN sails through), the supervisor token, and every injected BIAL_* var.
+    # The parent env carries secrets a suffix denylist would miss (a *_DSN sails through), the
+    # supervisor token, and every injected var.
+    #
+    # `IDENTITY_HEADER` USED TO BE THE HEADLINE DENIAL IN THIS TEST AND IS NOW ADMITTED ON
+    # PURPOSE — it is Azure's managed-identity bearer, and the generated app needs it to read the
+    # connector's data lake as the identity attached to this container app. The default-deny
+    # property is unchanged and is still asserted below, with a differently-shaped secret
+    # (`FOO_PASSWORD`, `SOME_DSN`) standing in for what it used to prove.
     seeded = {
         "FOO_PASSWORD": "hunter2",
-        "IDENTITY_HEADER": "azure-msi-secret",
         "SOME_DSN": "postgres://u:p@h/db",
+        "AZURE_CLIENT_ID": "the-platforms-own-identity-not-the-lakes",
         "BIAL_APP_ID": "app-123",
         "BIAL_PORTAL_ORIGIN": "https://portal.example",
         "BIAL_BLOB_SAS": "sv=2021-08-06&sig=abc",
@@ -73,9 +79,13 @@ def test_child_env_is_a_fail_closed_allowlist() -> None:
 
     # Denied by default — none of these match the allowlist.
     assert "FOO_PASSWORD" not in env
-    assert "IDENTITY_HEADER" not in env
     assert "SOME_DSN" not in env
     assert "SUPERVISOR_TOKEN" not in env
+    # AZURE_CLIENT_ID belongs to the PLATFORM's own identity. It must never reach the child:
+    # `DefaultAzureCredential` would read it and ask the lake as the wrong principal, which fails
+    # with a 403 indistinguishable from a missing role assignment. The worked example in the
+    # template names that as its first mistake; this line is what makes the mistake unavailable.
+    assert "AZURE_CLIENT_ID" not in env
 
     # Every injected BIAL_* var survives the scrub — including the two that end in `_URL`,
     # which a suffix denylist would wrongly drop.
@@ -550,6 +560,80 @@ def test_child_env_admits_the_blob_vars() -> None:
     assert env["BIAL_BLOB_SAS"] == seeded["BIAL_BLOB_SAS"]
     assert "SOME_DSN" not in env
     assert "SUPERVISOR_TOKEN" not in env  # the real token is never carried into the child env
+
+
+# --- the connector data plane: two labels, and Azure's own token-endpoint pair -------------
+_IDENTITY_HEADER = "eyJhbGciOiJIUzI1NiJ9.a-managed-identity-bearer-not-a-real-one"
+
+
+def test_child_env_admits_the_lake_coordinates_and_the_identity_pair() -> None:
+    """★ THE FOUR ROWS THAT MAKE A BUILD ABLE TO READ THE LAKE, and the reason all four are needed.
+
+    The two `BIAL_DICE_*` values say WHERE the lake is and WHICH identity to name. The two
+    `IDENTITY_*` values are Azure's own, injected into this container's environment the moment a
+    user-assigned identity is attached, and they are what `ManagedIdentityCredential` uses to mint
+    a token. The child env is built from an EMPTY dict, so admitting the coordinates without the
+    pair produces a container that has everything it needs except the ability to authenticate —
+    and the failure reads as a missing role assignment, which is a day of looking in the wrong
+    place.
+    """
+    seeded = {
+        "BIAL_DICE_URL": "https://alake.blob.core.windows.net/acontainer/AOS/reports/",
+        "BIAL_DICE_CLIENT_ID": "52b74947-0621-46e2-a523-a6b466f47c33",
+        "IDENTITY_ENDPOINT": "http://169.254.170.2/msi/token",
+        "IDENTITY_HEADER": _IDENTITY_HEADER,
+        "SOME_DSN": "postgres://u:p@h/db",  # still denied — the widening is BY NAME, not by shape
+    }
+    os.environ.update(seeded)
+    try:
+        env = _child_env()
+    finally:
+        for k in seeded:
+            os.environ.pop(k, None)
+
+    for name in ("BIAL_DICE_URL", "BIAL_DICE_CLIENT_ID", "IDENTITY_ENDPOINT", "IDENTITY_HEADER"):
+        assert env[name] == seeded[name], f"{name} did not survive the scrub"
+    assert "SOME_DSN" not in env
+    assert "SUPERVISOR_TOKEN" not in env
+
+
+def test_the_identity_header_is_redacted_from_observable_output() -> None:
+    """★ It is a bearer, so it is redacted exactly as the SAS and the DSN are — from `/exec`,
+    `/dev/logs` and `/files`. The other three lake-adjacent values are LABELS and stay readable:
+    an operator debugging a denial has to be able to see which identity asked."""
+    os.environ["IDENTITY_HEADER"] = _IDENTITY_HEADER
+    os.environ["BIAL_DICE_CLIENT_ID"] = "52b74947-0621-46e2-a523-a6b466f47c33"
+    try:
+        red = _redact(
+            f"curl -H 'X-IDENTITY-HEADER: {_IDENTITY_HEADER}' $IDENTITY_ENDPOINT\n"
+            "AuthorizationFailed for client 52b74947-0621-46e2-a523-a6b466f47c33\n"
+            "keep this ordinary text"
+        )
+    finally:
+        os.environ.pop("IDENTITY_HEADER", None)
+        os.environ.pop("BIAL_DICE_CLIENT_ID", None)
+
+    assert _IDENTITY_HEADER not in red
+    assert "***" in red
+    assert "52b74947-0621-46e2-a523-a6b466f47c33" in red, (
+        "the client id is a label, not a credential — redacting it would remove the one "
+        "diagnostic that tells a wrong identity apart from a missing role assignment"
+    )
+    assert "keep this ordinary text" in red
+
+
+def test_the_injected_table_is_the_only_source_of_both_derived_views() -> None:
+    """The allowlist and the redaction set are DERIVED, so they cannot disagree with the table.
+
+    Asserted rather than assumed because the whole safety argument for widening the scrub is that
+    adding a row is the only way in — if either view were maintained by hand, a row could be
+    admitted without being redacted, or redacted without being admitted."""
+    from app import _INJECTED_ENV, _INJECTED_KEYS, _SECRET_ENV_NAMES
+
+    assert _INJECTED_KEYS == tuple(row.name for row in _INJECTED_ENV)
+    assert _SECRET_ENV_NAMES == tuple(row.name for row in _INJECTED_ENV if row.secret)
+    assert "IDENTITY_HEADER" in _SECRET_ENV_NAMES
+    assert "IDENTITY_ENDPOINT" not in _SECRET_ENV_NAMES
 
 
 # --- GET /env/manifest is retired — nothing in the platform had ever called it -----------

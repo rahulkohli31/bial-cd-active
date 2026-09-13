@@ -62,7 +62,11 @@ describe('vendored ui primitives', () => {
     // consumer, they gained one later (projects-list loading state; row tooltip) and are
     // vendored again on purpose. The second test below is what actually enforces "no
     // orphans", and covers them too.
-    const removed = ['avatar', 'collapsible', 'dropdown-menu']
+    //
+    // `dropdown-menu` LEFT THIS LIST for the same reason, and the reversal is deliberate: the
+    // avatar menu in `Navbar.tsx` was hand-rolled, so the primitive really was an orphan; it is
+    // now that menu's implementation, which is a consumer the second test below enforces.
+    const removed = ['avatar', 'collapsible']
     expect(primitives().filter((name) => removed.includes(name))).toEqual([])
 
     const manifest = JSON.parse(

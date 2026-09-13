@@ -85,9 +85,14 @@ def _client(monkeypatch: pytest.MonkeyPatch, container_apps: object = None) -> A
     return AcaPublishedApps(_config())
 
 
-def _envelope(*, config: dict[str, Any] | None = None, **overrides: object):
+def _envelope(
+    *, config: dict[str, Any] | None = None, env: dict[str, str] | None = None
+) -> aca_models.ContainerApp:
     """A client with only its config, so `envelope()` can be exercised without touching a
-    credential or a mgmt client — it is a pure function of the config and its arguments."""
+    credential or a mgmt client — it is a pure function of the config and its arguments.
+
+    `env` defaults to the four values every published app carries. Pass it to add the connector
+    coordinates, which is the one input that changes whether the spec carries an identity."""
     client = AcaPublishedApps.__new__(AcaPublishedApps)
     client._config = _config(**(config or {}))
     return client.envelope(
@@ -99,9 +104,8 @@ def _envelope(*, config: dict[str, Any] | None = None, **overrides: object):
             app_id=_APP_ID,
             digest=_DIGEST,
         ),
-        env=dict(_ENV),
         container_url="https://acct.blob.core.windows.net/app-x",
-        **overrides,
+        env=dict(_ENV) if env is None else env,
     )
 
 
@@ -460,3 +464,126 @@ async def test_a_failed_create_never_deletes_the_live_app(monkeypatch: pytest.Mo
             container_url=None,
         )
     assert deleted == []
+
+
+# --- the connector's managed identity ----------------------------------------------------------
+#
+# A PUBLISHED APP READS THE LAKE FOR ITS OWN USERS, WITH THE SAME IDENTITY THE BUILD USED. That is
+# what stops the pass shipping an app that can read flight data while it is being built and not
+# after it is published — which reads as a bug, not as a boundary.
+#
+# The gate is the same one the sandbox uses and it is asserted HERE, on the built envelope,
+# because this is what ARM actually receives. A test that only covered `build_published_env`
+# would pass while every published app on the platform carried the credential.
+
+_LAKE_URL = "https://alakeaccount.blob.core.windows.net/acontainer/AOS/reports/"
+_LAKE_CLIENT_ID = "52b74947-0621-46e2-a523-a6b466f47c33"
+_LAKE_RESOURCE_ID = (
+    "/subscriptions/s/resourcegroups/r/providers/Microsoft.ManagedIdentity"
+    "/userAssignedIdentities/an-identity"
+)
+
+
+@pytest.fixture
+def lake_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.config import settings
+    from src.services.lake.config import LakeConfig
+
+    monkeypatch.setattr(
+        settings,
+        "connector_lake",
+        LakeConfig(
+            url=_LAKE_URL,
+            identity_client_id=_LAKE_CLIENT_ID,
+            identity_resource_id=_LAKE_RESOURCE_ID,
+        ),
+    )
+
+
+def _granted_env() -> dict[str, str]:
+    from src.services.lake.env import connector_env_names
+    from tests.api.v1.connectors.conftest import KEY
+
+    url_name, client_id_name = connector_env_names(KEY)
+    return {**_ENV, url_name: _LAKE_URL, client_id_name: _LAKE_CLIENT_ID}
+
+
+def test_a_granted_app_gets_the_identity_block(lake_configured: None) -> None:
+    envelope = _envelope(env=_granted_env())
+
+    assert envelope.identity is not None
+    assert envelope.identity.type == "UserAssigned"
+    assert list(envelope.identity.user_assigned_identities or {}) == [_LAKE_RESOURCE_ID]
+
+
+def test_an_app_whose_owner_was_never_granted_it_has_no_identity(lake_configured: None) -> None:
+    """★ THE GATE. The lake is CONFIGURED here — the platform could attach an identity — and this
+    app still gets none, because its environment carries no coordinates. Attaching whenever a
+    lake is merely configured platform-wide would hand every published app on the platform a
+    credential to BIAL's flight data.
+
+    ASSERTED AS ARM'S EXPLICIT `None`, NOT AS AN ABSENT BLOCK. This call is a full `PUT` over a
+    resource that is already live, and the platform's ONLY revocation story is "redeploy the app
+    after its owner's access is withdrawn". Omitting the property leaves whether that detaches up
+    to ARM; `type: "None"` is ARM's documented detach and says it outright. The withdrawn app and
+    the never-granted app are the same envelope here, so the explicit form has to be the one both
+    of them get."""
+    identity = _envelope().identity
+    assert identity is not None, "an absent block leaves the revocation up to ARM to interpret"
+    assert identity.type == "None"
+    assert not identity.user_assigned_identities
+
+
+def test_a_spec_with_no_identity_is_still_byte_identical_to_one_built_with_no_lake(
+    lake_configured: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ Deploying an app with the connector off produces the same spec whether or not a lake is
+    configured platform-wide — asserted as an equality rather than as a list of fields that happen
+    to match. What a lake existing somewhere must never do is change the shape of a deploy for an
+    app that has nothing to do with it.
+
+    This spec is NO LONGER byte-identical to what the platform sent before connectors existed:
+    every published app now carries an explicit `identity: {type: "None"}`. That is a deliberate
+    trade and the test above has the reason. It is a semantic no-op for an app that never had an
+    identity, and the same full-`PUT` ownership this module already asserts over `tags` — where a
+    value missing from the envelope is STRIPPED rather than merely un-written — so an identity
+    attached to a published app out of band is removed on its next deploy, by the same rule."""
+    from src.config import settings
+
+    with_lake = _envelope().as_dict()
+    monkeypatch.setattr(settings, "connector_lake", None)
+    without_lake = _envelope().as_dict()
+
+    assert with_lake == without_lake
+    assert with_lake["identity"] == {"type": "None"}
+
+
+def test_the_coordinates_ride_as_plain_values_not_as_secret_references(
+    lake_configured: None,
+) -> None:
+    """★ They are LABELS. The secret path exists for the SAS and the database DSN — bearer
+    credentials whose values must not appear on the container spec — and putting a label there
+    would say something untrue about it in every `az containerapp show`."""
+    from src.services.lake.env import connector_env_names
+    from tests.api.v1.connectors.conftest import KEY
+
+    url_name, client_id_name = connector_env_names(KEY)
+    env = _env(_envelope(env=_granted_env()))
+
+    for name, expected in ((url_name, _LAKE_URL), (client_id_name, _LAKE_CLIENT_ID)):
+        assert env[name].value == expected
+        assert env[name].secret_ref is None
+
+
+def test_everything_the_published_app_already_carried_is_unchanged(lake_configured: None) -> None:
+    """★ Asserted as "the pre-existing set is unchanged", not merely as "the additions are
+    present" — the second passes just as happily on an envelope that dropped the database DSN."""
+    before = set(_env(_envelope()))
+
+    after = set(_env(_envelope(env=_granted_env())))
+
+    from src.services.lake.env import connector_env_names
+    from tests.api.v1.connectors.conftest import KEY
+
+    assert after - before == set(connector_env_names(KEY))
+    assert before - after == set()

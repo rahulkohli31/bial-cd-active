@@ -11,6 +11,8 @@ from src.db.models.classification_review import ClassificationReview as Classifi
 from src.db.models.classification_review import (
     ClassificationReviewStatus as ClassificationReviewStatus,
 )
+from src.db.models.connector_access import ConnectorAccessRequest as ConnectorAccessRequest
+from src.db.models.connector_access import ConnectorRequestStatus as ConnectorRequestStatus
 from src.db.models.conversation import Conversation as Conversation
 from src.db.models.deleted_project import DeletedProject as DeletedProject
 from src.db.models.deployment import Deployment as Deployment
@@ -19,6 +21,8 @@ from src.db.models.harness_counter import HarnessCount as HarnessCount
 from src.db.models.harness_counter import HarnessCounter as HarnessCounter
 from src.db.models.message import Message as Message
 from src.db.models.project import Project as Project
+from src.db.models.project_connector import ConnectorWindowKind as ConnectorWindowKind
+from src.db.models.project_connector import ProjectConnector as ProjectConnector
 from src.db.models.project_database import ProjectDatabase as ProjectDatabase
 from src.db.models.project_share import ProjectShare as ProjectShare
 from src.db.models.refresh_token import RefreshToken as RefreshToken

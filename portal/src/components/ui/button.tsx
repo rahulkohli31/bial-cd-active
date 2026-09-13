@@ -17,11 +17,25 @@ import { cn } from "@/lib/utils"
  *    Copy button solid orange under the pointer. The canvas specifies one hover in 41 boards
  *    (a link going teal-dark) and no orange surface anywhere; `accent` keeps its two real board
  *    roles (token-meter fill, 6px unsaved dot) and stops being a hover.
- * 3. THE VARIANT TABLE IS ONLY WHAT IS MOUNTED: `destructive`, `link`, and sizes `sm`/`lg` went
- *    the way `secondary` did — the one production call site (`assistant-ui/thread.tsx`'s copy
- *    control) asks for `variant="ghost" size="icon"`, and the portal has no
- *    `variant={…}`/`size={…}` expression to select any other key. `outline` STAYS: it's the sole
- *    coverage of the `asChild`/Slot branch below, live code riding the variant as a vehicle.
+ * 3. THE VARIANT TABLE IS ONLY WHAT IS MOUNTED: `link` and sizes `sm`/`lg` went the way
+ *    `secondary` did — the one production call site (`assistant-ui/thread.tsx`'s copy control)
+ *    asks for `variant="ghost" size="icon"`, and the portal has no `variant={…}`/`size={…}`
+ *    expression to select any other key. `outline` STAYS: it's the sole coverage of the
+ *    `asChild`/Slot branch below, live code riding the variant as a vehicle. `destructive` was
+ *    pruned with them and has come back — see 4.
+ * 4. `destructive` IS AN OUTLINE, NOT THE REGISTRY'S RED FILL. It was pruned for having no live
+ *    caller; `ConnectorReviewDialog`'s `Decline` is that caller, and the `AdminReview` board
+ *    draws it as a white button with a red hairline and red label, beside a teal-filled approve.
+ *    Stock shadcn's `bg-destructive text-destructive-foreground` would put two solid buttons in
+ *    one action row and make the destructive one the loudest thing in the dialog — the opposite
+ *    of what the board weights. The COLOUR is the ramp's `--destructive`, not the board's
+ *    #B4483F/#F4C7C7 pair: `tailwind.config.js` already owns those two as the `problem` family,
+ *    whose documented role is "a group whose work failed" inside a transcript — a container, at
+ *    container weights — and a second red on the one control that means "refuse" is how two
+ *    reds start disagreeing about which is the refusal.
+ *    IT IS STILL SELECTED ONLY BY STRING LITERAL. `variant="destructive"` at one call site; the
+ *    claim in 3 that this portal has no runtime variant expression is what lets that list stay
+ *    honest, and it is load-bearing for the pruning argument itself.
  */
 const buttonVariants = cva(
   "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0",
@@ -32,6 +46,8 @@ const buttonVariants = cva(
           "bg-primary text-primary-foreground shadow hover:bg-primary/90",
         outline:
           "border border-input bg-background shadow-sm hover:bg-surface-muted hover:text-foreground",
+        destructive:
+          "border border-destructive/30 bg-background text-destructive shadow-sm hover:bg-destructive/10 hover:text-destructive",
         ghost: "hover:bg-surface-muted hover:text-foreground",
       },
       size: {

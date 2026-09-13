@@ -22,6 +22,7 @@ from pydantic_settings import NoDecode
 from src.services.appdb.config import AppDatabaseSettings
 from src.services.auth.config import AuthConfig
 from src.services.deploy.config import DeployConfig
+from src.services.lake.config import LakeConfig
 from src.services.redis.config import RedisConfig
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage.config import StorageConfig
@@ -101,6 +102,18 @@ class ApiSettings(CoreSettings):
     # Azure AI Foundry access. Genuinely optional: dev/test exercise the agent harness with
     # Pydantic AI's TestModel and make no live call, and None means "AI chat not configured".
     foundry: FoundryConfig | None = None
+
+    # WHERE A CONNECTOR'S DATA ACTUALLY LIVES, and which managed identity may read it. Unset
+    # means no build and no published app is handed the coordinates or the identity, and the
+    # control plane copies nothing — every path in that feature already answers `{}` or `None`
+    # for an unconfigured lake, because a developer machine has none.
+    #
+    # A FEATURE SWITCH RATHER THAN A PRODUCTION GATE, and the reason is the same one `deploy`
+    # gives two fields above: the switch here is the ADMINISTRATOR'S approval, not this
+    # variable. A production gate would make the backend refuse to boot the moment this merged,
+    # which is an outage for a capability whose real gate is a person saying yes. Add the gate
+    # in the same change that makes an approved connector unconditionally readable.
+    connector_lake: LakeConfig | None = None
 
     # Built React/Vite SPA directory served by FastAPI when it runs as the whole stack. None =
     # FastAPI serves NO SPA, correct for two-process local dev where Vite serves it on :5173. A

@@ -144,19 +144,37 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from src.services.appdb import aclose_maintenance_engine
     from src.services.deploy.aca_publish import aclose_published_apps
     from src.services.deploy.images import aclose_image_builder
+    from src.services.lake import aclose_lake
     from src.services.redis import aclose_redis
     from src.services.sandbox import aclose_sandbox
     from src.services.storage import aclose_storage
 
-    await aclose_redis()
-    await aclose_sandbox()
-    await aclose_storage()
-    await aclose_maintenance_engine()
-    # The publish path holds its OWN managed-identity credential and mgmt client, plus an
-    # httpx pool for the registry. Without these two it leaks a second token cache and a
-    # second connection pool alongside the sandbox's.
-    await aclose_published_apps()
-    await aclose_image_builder()
+    # EVERY CLOSER RUNS, WHATEVER THE ONE BEFORE IT DID. Written as a loop rather than a column
+    # of `await`s because a column has a property nobody wants: the first one that raises
+    # abandons every closer after it, so the pools that leak are decided by list position rather
+    # than by anything real — and the ones at the bottom are the newest, least-exercised clients.
+    # A shutdown is exactly where "recover or re-raise" gives way to "close the rest anyway":
+    # the process is going away, and the failure has nowhere to be handled.
+    #
+    # `aclose_published_apps` and `aclose_image_builder` hold the publish path's OWN
+    # managed-identity credential, mgmt client and httpx registry pool — a second token cache and
+    # connection pool alongside the sandbox's. `aclose_lake` holds a THIRD managed-identity
+    # credential, a different identity from the other two and named by client id rather than
+    # resolved from the ambient environment, plus its own blob client. Each is a no-op when its
+    # resource was never opened.
+    for close in (
+        aclose_redis,
+        aclose_sandbox,
+        aclose_storage,
+        aclose_maintenance_engine,
+        aclose_published_apps,
+        aclose_image_builder,
+        aclose_lake,
+    ):
+        try:
+            await close()
+        except Exception:
+            _log.exception("shutdown_closer_failed", closer=close.__name__)
 
 
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})

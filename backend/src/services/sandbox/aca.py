@@ -169,6 +169,26 @@ def fqdn_of(app: aca_models.ContainerApp) -> str | None:
     return str(fqdn) if fqdn else None
 
 
+def _user_assigned(resource_id: str | None) -> aca_models.ManagedServiceIdentity | None:
+    """The ARM `identity` block for one user-assigned identity, or `None` for no identity at all.
+
+    `None` rather than an empty `ManagedServiceIdentity(type="None")`: a spec with no identity key
+    is byte-identical to what this platform sent before connectors existed, which is what lets
+    "an unapproved project's container is unchanged" be asserted as an equality rather than as a
+    list of fields that happen to match.
+
+    The map is keyed by the identity's full ARM resource id
+    (`/subscriptions/.../userAssignedIdentities/<name>`); the value is an empty object, because
+    everything ARM would put in it (`clientId`, `principalId`) is read-only and filled in by the
+    service."""
+    if resource_id is None:
+        return None
+    return aca_models.ManagedServiceIdentity(
+        type=aca_models.ManagedServiceIdentityType.USER_ASSIGNED,
+        user_assigned_identities={resource_id: aca_models.UserAssignedIdentity()},
+    )
+
+
 def _fleet_member_of(app: aca_models.ContainerApp) -> FleetMember:
     """Project one SDK `ContainerApp` down to the five fields a reclamation pass may judge on.
 
@@ -234,10 +254,37 @@ class AcaControlPlane:
         self._credential = DefaultAzureCredential()
         self._client = ContainerAppsAPIClient(self._credential, config.subscription_id)
 
-    def _envelope(self, env: dict[str, str], tags: dict[str, str]) -> aca_models.ContainerApp:
+    def _envelope(
+        self, env: dict[str, str], tags: dict[str, str], *, identity_resource_id: str | None
+    ) -> aca_models.ContainerApp:
+        """The container-app spec. Pure — no I/O — so the identity block below is assertable
+        without Azure, which is what makes the approval gate testable at all.
+
+        `identity_resource_id` is `None` for every container that was NOT granted a connector's
+        data: no lake configured, the connector switched off for this project, or its owner not
+        approved. The caller derives it from the coordinates already in `env`
+        (`services/lake/env.py::identity_resource_id_for_env`), so "has the coordinates" and "has
+        the credential" are the same fact rather than two that have to be kept in step. Passing a
+        resource id here while `env` carries no coordinates would hand this container a credential
+        to data its owner was never granted."""
         c = self._config
         return aca_models.ContainerApp(
             location=c.region,
+            # THE ONE LINE THAT LETS A BUILD READ A CONNECTOR'S DATA, and `None` on every
+            # container that was not granted it — which is every container on a deployment with
+            # no lake, so the envelope is byte-identical to before this existed.
+            #
+            # ARM keys this map by the identity's full RESOURCE id, and the client-id field on
+            # the model is read-only, so a client id cannot attach anything. The two identifiers
+            # are different values for the same identity: the client id goes INSIDE the container
+            # (the credential names it); this one goes on the spec.
+            #
+            # ATTACHING AN IDENTITY NEEDS `Managed Identity Operator` ON THE IDENTITY RESOURCE,
+            # held by whatever principal `DefaultAzureCredential` resolves to for this process.
+            # That is a different grant from the resource-group rights that let the platform
+            # create container apps at all, which is exactly why it is easy to miss — and its
+            # symptom is loud: every create is refused.
+            identity=_user_assigned(identity_resource_id),
             # Identity ON THE ENVELOPE rather than PATCHed on afterwards, so a container is
             # judgeable-without-Redis from the FIRST MOMENT it exists: there is no window in
             # which a create that succeeded and a follow-up stamp that did not leaves an
@@ -288,14 +335,21 @@ class AcaControlPlane:
             ),
         )
 
-    async def create_app(self, *, name: str, env: dict[str, str], tags: dict[str, str]) -> str:
+    async def create_app(
+        self,
+        *,
+        name: str,
+        env: dict[str, str],
+        tags: dict[str, str],
+        identity_resource_id: str | None = None,
+    ) -> str:
         """Create (or update) the container app; return its public ingress FQDN
         (host-only, no scheme). Retryable failures raise `AcaTransientError`.
 
         `tags` is REQUIRED, not defaulted (`fail-first.md`). There is no deployment in which an
         untagged sandbox is correct — an untagged container is an anonymous container — and a
         default would let a new call site create one silently."""
-        envelope = self._envelope(env, tags)
+        envelope = self._envelope(env, tags, identity_resource_id=identity_resource_id)
 
         def _run() -> str:
             poller = self._client.container_apps.begin_create_or_update(

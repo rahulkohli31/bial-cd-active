@@ -244,18 +244,31 @@ def compute_publish_state(
     already written as one of the thirteen states.
     ORDER IS THE POLICY: `DISABLED`/`PENDING` win outright over the deployment row —
     an admin's lockout or a pending submission is the most current fact, and must not be
-    masked by an OLDER row in the append-only `deployments` table."""
+    masked by an OLDER row in the append-only `deployments` table.
+    AN APPROVAL OUTRANKS THE ROUTED-FAILURE ARM AND NOTHING ELSE: the drift re-check
+    settles a routed submission AS a failed row, so an approved app's newest row is that
+    same failed one, and reading it answers in-review to a citizen an administrator
+    already said yes to. Every other row is a container fact no approval can contradict
+    and falls through — a serving app reports live or offline, a running one starting up,
+    and a publish that genuinely broke still reports that it did not start."""
     if app.status is AppStatus.DISABLED:
         return PublishState.SWITCHED_OFF
     if app.status is AppStatus.PENDING:
         return PublishState.IN_REVIEW
     if app.status is AppStatus.REJECTED:
         return PublishState.CHANGES_REQUESTED
-    if app.status is AppStatus.APPROVED and deployment is None:
-        # Never published since approval (or never published at all): "ready" is the
-        # self-publish lineage with a pin that still names what is saved — anything else
-        # (the runbook lineage, no pin, or a pin a later Save has moved past) needs the
-        # citizen to publish through the gate again rather than press one button.
+    if app.status is AppStatus.APPROVED and (
+        deployment is None
+        or (
+            deployment.status is DeploymentStatus.FAILED
+            and deployment.failure_code in _ROUTED_FAILURE_CODES
+        )
+    ):
+        # Nothing of this approval was ever attempted: no row at all, or the one the
+        # routing itself settled. "Ready" is the self-publish lineage with a pin that
+        # still names what is saved — anything else (the runbook lineage, no pin, or a
+        # pin a later Save has moved past) needs the citizen to publish through the gate
+        # again rather than press one button.
         pin_matches = (
             app.approval_route is ApprovalRoute.SELF_PUBLISH
             and app.approved_commit_sha is not None

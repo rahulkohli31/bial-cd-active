@@ -216,6 +216,7 @@ from src.services.turns.copy import (
     STILL_SHOWING_TEMPLATE,
     UNVERIFIED_TEXT,
     WRITING_UP_THE_PLAN_LABEL,
+    still_open_send_again_text,
 )
 from src.services.turns.guard import claim_conversation, release_conversation
 from src.services.turns.plan_options import META_PENDING
@@ -702,17 +703,11 @@ def _sandbox_unavailable_message(exc: Exception) -> str:
         # The route's preflight normally turns this into a 409 the client renders as a choice,
         # so reaching here means the incumbent appeared in the window between the two. Name the
         # project anyway: "could not be started right now" invites a retry that will fail the
-        # same way, and hides the one action — saving the other project — that resolves it.
+        # same way, and hides the one action — dealing with the other project — that resolves it.
         #
-        # Hedge on the tri-state exactly as `reclaim_blocked_response` and the dialog do.
-        # `dirty=None` means nobody could question that container — including the arm where we
-        # could not even reach it — and stating "has unsaved changes" there asserts something
-        # the system does not know.
-        unsaved = "has unsaved changes" if exc.dirty else "may have unsaved changes"
-        return (
-            f"“{exc.project_name}” is still open and {unsaved}. "
-            "Save or close it, then send this again."
-        )
+        # The same tri-state sentence `reclaim_blocked_response` sends, with the action added
+        # because this one arrives as prose with nothing to press beside it.
+        return still_open_send_again_text(exc.project_name, dirty=exc.dirty)
     return "Your workspace could not be started right now. Please try again shortly."
 
 
@@ -1468,6 +1463,11 @@ class TurnEngine:
                         # tool that writes.
                         sandbox=state.sandbox,
                     )
+                    # THE CONNECTED-DATA SURFACE RIDES THE PROMPT CONTEXT, and passing it is what
+                    # makes the feature exist at all: the argument defaults to none, so a call
+                    # that forgot it would register the tool for nobody while every registration
+                    # test — which calls `toolsets_for_kind` directly — stayed green.
+                    #
                     # THE READER IS OFFERED ONLY WHEN THERE IS SOMETHING TO READ. A tool named
                     # `read_attachment` on a chat with no attachment is an invitation to invent a
                     # path and then explain the failure; `toolsets_for_kind` takes the accessor as
@@ -1476,6 +1476,7 @@ class TurnEngine:
                         state.kind,
                         _workspace_of,
                         reader_of=_reader_of if state.attachments is not None else None,
+                        connected_systems=prompt_context.connected_systems,
                     ).toolsets
                     # UNCONDITIONAL, BECAUSE THE TOOLSET HAS ALREADY DECIDED IT. A run can only
                     # end deferred if a tool that DEFERS was registered on it, and
@@ -2471,7 +2472,14 @@ class TurnEngine:
             deps=deps,
             model=model,
             message_history=messages,
-            toolsets=toolsets_for_kind(ChatKind.BUILD, _workspace_of, _sandbox_of).toolsets,
+            # Same connected-data surface as the Plan arm, off the same one value — see the
+            # note at the Plan call site.
+            toolsets=toolsets_for_kind(
+                ChatKind.BUILD,
+                _workspace_of,
+                _sandbox_of,
+                connected_systems=prompt_context.connected_systems,
+            ).toolsets,
             output_type=str,
             usage_limits=UsageLimits(request_limit=MODEL_TURN_CEILING),
             # Without `max_tokens` pydantic-ai's Anthropic default of 4096 truncates a

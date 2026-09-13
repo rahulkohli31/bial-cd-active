@@ -27,12 +27,17 @@ from src.api.v1.build_sessions.deps import (
     sandbox_or_none_dependency,
     session_manager_dependency,
 )
+from src.api.v1.conversations import transition as transition_module
 from src.api.v1.conversations._shared import MAX_MESSAGE_TEXT_CHARS
 from src.api.v1.conversations.transition import NO_PLAN_CODE, PLAN_TOO_LONG_CODE
 from src.config import settings
+from src.core.connectors import CONNECTORS
+from src.db.models.connector_access import ConnectorAccessRequest, ConnectorRequestStatus
 from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.message import Message, MessageVisibility
+from src.db.models.project_connector import ConnectorWindowKind, ProjectConnector
 from src.db.models.user_limit import UserLimit
+from src.services.agent.mode_prompts import PromptContext, compose_kind_prompt
 from src.services.build_sessions import SessionManager
 from src.services.build_sessions.manager import SandboxReclaimBlockedError
 from src.services.messages.projection import (
@@ -53,6 +58,8 @@ from tests.api.v1.build_sessions.conftest import _sandbox_config
 from tests.api.v1.conversations.conftest import _headers
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 from tests.fakes import FakeSandboxClient
+
+_CONNECTOR_KEY = next(iter(CONNECTORS))
 
 _PLAN = (
     "Here is what your visitor log will do.\n\n"
@@ -268,6 +275,93 @@ async def test_the_new_chat_opens_with_the_plan_and_nothing_else(
     assert isinstance(first, UserTextItem)
     assert first.text == _PLAN  # verbatim, in full — no prefix, no wrapper
     assert rows[0].visibility is MessageVisibility.VISIBLE
+
+
+async def test_the_handoff_resolves_the_projects_connected_data_for_the_build_it_starts(
+    client, db_session, set_chat_model, wire, _fresh_engine, fake_redis, fake_storage, monkeypatch
+) -> None:
+    """★ THE SECOND CALL SITE, AND THE ONE NOTHING ELSE COVERS.
+
+    `transition.py` builds its OWN `PromptContext` — it does not reuse the Plan chat's — so the
+    connector resolution here is separate code, and deleting it is invisible everywhere else: the
+    registration suite calls `toolsets_for_kind` directly, the prompt suite composes its own
+    context, and the argument defaults to none. The feature would ship inert on the path by which
+    a connected project actually reaches a build, which is this one: pressing Build on a plan is
+    how most builds start.
+
+    ASSERTED ON THE CONTEXT THIS ROUTE HANDS THE TURN STARTER, not on the model's tool list. That
+    is the DECISION this file's route makes — everything after it is the shared turn machinery
+    `test_turn_stream.py` drives end to end on both arms. Driving it here would prove the same
+    thing twice and cannot in any case: a Build turn in this module's harness fails its sandbox
+    attach on the fixture's already-committed transaction and never reaches the model, which is
+    why no test in this file inspects `AgentInfo`.
+
+    The rows are seeded BEFORE the plan turn: that turn runs through the real route and commits,
+    closing the fixture transaction, so a write after it raises rather than seeding anything."""
+    user = await UserFactory.create(db_session)
+    conv = await ConversationFactory.create(db_session, user.id, kind=ChatKind.PLAN)
+    db_session.add(
+        ConnectorAccessRequest(
+            user_id=user.id,
+            connector_key=_CONNECTOR_KEY,
+            status=ConnectorRequestStatus.APPROVED,
+            requester_remarks="The stand board needs on-block times.",
+        )
+    )
+    db_session.add(
+        ProjectConnector(
+            project_id=conv.project_id,
+            connector_key=_CONNECTOR_KEY,
+            enabled=True,
+            window_kind=ConnectorWindowKind.RELATIVE,
+            window_days=7,
+        )
+    )
+    await db_session.flush()
+
+    headers = _headers(user)
+    set_chat_model(_plan_model())
+    resp = await client.post(
+        f"/v1/conversations/{conv.id}/turns",
+        headers=headers,
+        json={
+            "message": {
+                "text": "plan the stand board",
+                "attachmentTexts": [],
+                "attachmentIds": [],
+            }
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    await _settle(_fresh_engine, conv.id)
+
+    # WRAPPED, NOT REPLACED. The real turn still starts — the route needs its id back and the
+    # rest of this module's guarantees (a chat that exists, a plan that is verbatim) must keep
+    # holding around this test.
+    seen: dict[str, object] = {}
+    # Reached through the module object rather than imported, because the ROUTE resolves it
+    # that way at call time — patching the name it imported is what makes the wrap take
+    # effect. `transition` does not re-export it, so mypy is told this is deliberate.
+    real_starter = transition_module.start_conversation_turn  # type: ignore[attr-defined]
+
+    async def _capturing_starter(*args, **kwargs):
+        seen["prompt_context"] = kwargs["prompt_context"]
+        return await real_starter(*args, **kwargs)
+
+    monkeypatch.setattr(transition_module, "start_conversation_turn", _capturing_starter)
+
+    set_chat_model(_streaming_text("building it now"))
+    minted = uuid.uuid4()
+    resp = await client.post(_build_url(conv), headers=headers, json={"chatId": str(minted)})
+    assert resp.status_code == 200, resp.text
+    await _settle(_fresh_engine, minted)
+
+    context = seen["prompt_context"]
+    assert isinstance(context, PromptContext)
+    assert [system.key for system in context.connected_systems] == [_CONNECTOR_KEY]
+    assert context.connected_systems[0].window.effectively_on is True
+    # And the stub it produces names the system, so the Build chat's first turn says so.
+    assert "CONNECTED DATA" in compose_kind_prompt(ChatKind.BUILD, context)
 
 
 async def test_a_plan_past_the_browsers_cap_still_opens_a_chat_with_all_of_it(

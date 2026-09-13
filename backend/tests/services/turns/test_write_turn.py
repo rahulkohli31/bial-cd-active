@@ -53,6 +53,7 @@ from src.api.v1.conversations.schemas import (
     TurnTextPart,
     WorkingFrame,
 )
+from src.api.v1.live_build import reclaim_blocked_response
 from src.config import settings
 from src.core.integrity_types import BaselineIdentity
 from src.db.models.conversation import ChatKind
@@ -60,7 +61,11 @@ from src.db.models.message import Message, MessageEntryKind
 from src.db.models.token_usage import TokenUsage
 from src.services.agent.mode_prompts import PromptContext, workspace_note
 from src.services.build_sessions.alarms import HMR_PROTOCOL_DRIFT_EVENT
-from src.services.build_sessions.manager import RecoveryNews, SessionManager
+from src.services.build_sessions.manager import (
+    RecoveryNews,
+    SandboxReclaimBlockedError,
+    SessionManager,
+)
 from src.services.messages.projection import _LBL_FALLBACK, long_operation_line
 from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.errors import from_client, from_tsc
@@ -82,10 +87,13 @@ from src.services.turns.copy import (
     STILL_SHOWING_EARLIER,
     STILL_SHOWING_NOTHING,
     STILL_SHOWING_TEMPLATE,
+    still_open_send_again_text,
+    still_open_text,
 )
 from src.services.turns.engine import (
     _BUILD_FINISHED_FALLBACK,
     TurnEngine,
+    _sandbox_unavailable_message,
     _TurnState,
     _what_it_is_showing,
     set_turn_engine_for_tests,
@@ -1527,6 +1535,71 @@ def test_no_sentence_this_plan_shows_a_citizen_carries_developer_jargon() -> Non
     for sentence in sentences:
         for term in _FORBIDDEN_IN_CITIZEN_COPY:
             assert term not in sentence, f"{term!r} reached a citizen in {sentence!r}"
+
+
+def _held_by(dirty: bool | None) -> SandboxReclaimBlockedError:
+    """Another project of this user's holding the one workspace, in one of the three states its
+    tree can be reported in."""
+    return SandboxReclaimBlockedError(
+        project_id=uuid.uuid4(),
+        project_name="Visitor Log",
+        app_id=uuid.uuid4(),
+        dirty=dirty,
+    )
+
+
+def test_a_project_read_as_having_work_in_it_is_told_so_plainly() -> None:
+    """The one state where a claim about unsaved work is a fact: the tree was questioned and it
+    answered. Nothing hedges here, or the citizen learns to discount all three."""
+    sentence = still_open_text("Visitor Log", dirty=True)
+
+    assert "“Visitor Log”" in sentence, "the citizen is told WHICH project is in the way"
+    assert "has changes that are not saved yet" in sentence
+    assert "may have" not in sentence
+
+
+def test_a_project_the_platform_has_proven_saved_is_never_described_as_unsaved() -> None:
+    """★ THE DEFECT. The answer is three-valued and the sentence had two arms, so a tree read as
+    CLEAN was described with the same hedge as one that could not be read at all — sending the
+    citizen to hunt for changes that are not there, and offering to save them."""
+    sentence = still_open_text("Visitor Log", dirty=False)
+    with_action = still_open_send_again_text("Visitor Log", dirty=False)
+
+    assert "everything in it is saved" in sentence
+    for wrong in ("not saved", "unsaved", "may have"):
+        assert wrong not in sentence, f"{wrong!r} claims work the platform has proven saved"
+    assert "Save" not in with_action, "there is nothing to save, so nothing asks them to"
+    assert "Close it, then send this again." in with_action
+
+
+def test_a_project_that_could_not_be_questioned_is_hedged_rather_than_guessed_at() -> None:
+    """Nobody could reach the tree, or it would not answer. The hedge leans towards unsaved
+    because only one of the two ways to be wrong here costs the citizen their work."""
+    sentence = still_open_text("Visitor Log", dirty=None)
+
+    assert "may have changes that are not saved yet" in sentence
+    assert sentence != still_open_text("Visitor Log", dirty=True)
+    assert sentence != still_open_text("Visitor Log", dirty=False)
+
+
+def test_the_conflict_and_the_turn_ending_say_the_same_thing_about_the_work() -> None:
+    """★ Two surfaces carry this sentence — the conflict a client renders as a choice, and the
+    prose a turn ends on — and they were kept in step by a comment.
+
+    Collapsing the clean arm back into the hedge at EITHER site turns this red. The endings may
+    differ (only one of them has no buttons beside it); what is claimed about the work may not."""
+    said: list[str] = []
+    for dirty in (True, False, None):
+        blocked = _held_by(dirty)
+        conflict = json.loads(bytes(reclaim_blocked_response(blocked).body))["error"]["message"]
+        ending = _sandbox_unavailable_message(blocked)
+
+        assert ending.startswith(conflict), (
+            f"dirty={dirty!r}: the turn ending says {ending!r}, the conflict says {conflict!r}"
+        )
+        said.append(conflict)
+
+    assert len(set(said)) == 3, f"three states must read as three sentences, got {said!r}"
 
 
 async def test_the_workspace_note_rides_a_build_turn_too(

@@ -25,6 +25,7 @@ from pydantic_ai.messages import (
     ModelResponse,
     RetryPromptPart,
     TextPart,
+    ThinkingPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
@@ -40,6 +41,7 @@ from src.services.build_sessions.outcome import write_build_outcome
 from src.services.media.lanes import EXCEL_MEDIA_TYPE
 from src.services.media.magic import chip_kind_for
 from src.services.messages.projection import (
+    CONNECTOR_SCHEMA_TOOL,
     PROPOSE_SLICE_TOOL,
     TELL_THE_USER_TOOL,
     TURN_TERMINAL_KIND,
@@ -581,6 +583,45 @@ async def test_a_plan_turn_that_only_reads_has_a_non_empty_activity_group(db_ses
     ]
 
 
+async def test_a_reasoning_block_is_never_projected_to_the_citizen(db_session) -> None:
+    """The redactor exempts a `ThinkingPart`'s `content` — it has to, because the provider
+    verifies the signature against it and a masked block gets the next turn rejected. That
+    exemption rests entirely on reasoning never being projected.
+
+    It used to be inert: the deployment returned signed-but-EMPTY blocks, so there was nothing
+    to leak. Asking for a summarized display makes the content real, which makes this the live
+    guarantee it was always written as — and a guarantee that only a comment states is not one."""
+    user, _project, conversation = await _thread(db_session)
+    await _step(
+        db_session,
+        user,
+        conversation,
+        uuid.uuid4(),
+        [
+            ModelResponse(
+                parts=[
+                    ThinkingPart(
+                        content="The connection string is postgresql://bial:hunter2@db/app.",
+                        signature="sig-abc",
+                    ),
+                    TextPart(content="I wired the form up to the database."),
+                ]
+            )
+        ],
+    )
+
+    rows = await _rows(db_session, user, conversation)
+    # LIVENESS: the row really is on disk carrying the reasoning, so the absence below is the
+    # projection declining to render it rather than a fixture that never wrote anything.
+    stored = json.dumps([row.payload for row in rows])
+    assert "hunter2" in stored, "the fixture never stored the reasoning it is about to assert on"
+
+    rendered = json.dumps(project_rows(rows), default=str)
+    assert "hunter2" not in rendered
+    assert "postgresql://" not in rendered
+    assert "I wired the form up to the database." in rendered
+
+
 async def test_hidden_rows_render_nothing_but_stay_auditable(db_session) -> None:
     # The mode-switch marker used to be the third hidden row here. It is gone with the switch
     # that wrote it (`tests/api/v1/conversations/test_mode_switch.py` is its inertness guard).
@@ -947,6 +988,39 @@ def test_only_configuration_writes_and_housekeeping_are_hidden_on_the_shared_ent
         assert label.strip(), tool
     assert classify_tool_call("write_file", '{"path": "tsconfig.json"}')[1] is True
     assert classify_tool_call("run_command", '{"command": ["mkdir", "-p", "app/lib"]}')[1] is True
+
+
+def test_the_connected_data_read_is_labelled_by_its_attempt_not_its_outcome() -> None:
+    """★ A REFUSAL IS A *SUCCESSFUL* TOOL CALL as far as this module is concerned — `state` reads
+    "failed" only when the stored result was a retry — so an outcome-shaped label ("Read the
+    flight data schema") would render with a success tick over a call that refused and an agent
+    that then invented column names. "Checking what data is connected" describes the ATTEMPT, so
+    it stays true either way.
+
+    IT IS ALSO CONNECTOR-AGNOSTIC IN ITS OWN WORDING, which is why `projection.py` needs no
+    `data_noun` lookup and no import from the connector registry. And `checking` is already a
+    `stepIconFor` branch in the portal, so this label draws with an existing glyph and no portal
+    file changes for it."""
+    label, hidden = classify_tool_call(CONNECTOR_SCHEMA_TOOL, '{"system": "DICE"}')
+    assert label == "Checking what data is connected"
+    assert hidden is False
+    # NOT the raw-tool-name fallback, which is what an unrecognised tool would draw into a
+    # citizen's feed.
+    assert label != f"Used {CONNECTOR_SCHEMA_TOOL}"
+    # The label says nothing about having READ anything, and names no connected system.
+    lowered = label.lower()
+    for outcome_shaped in ("read", "fetched", "loaded", "got", "dice", "flight", "schema"):
+        assert outcome_shaped not in lowered, f"the label claims {outcome_shaped!r}"
+
+
+def test_the_connected_data_label_survives_arguments_it_cannot_parse() -> None:
+    """The live emitter passes the wire args JSON straight through, and a truncated frame is a
+    string this function has to survive. It degrades to the argless label rather than to the raw
+    tool name, because the label does not read its arguments at all."""
+    for args in ("", "{", '{"system": null}', "[]"):
+        assert classify_tool_call(CONNECTOR_SCHEMA_TOOL, args)[0] == (
+            "Checking what data is connected"
+        )
 
 
 def test_reading_an_attachment_names_the_citizens_own_file() -> None:

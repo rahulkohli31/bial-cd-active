@@ -1,7 +1,8 @@
 """The environment a PUBLISHED app runs with.
 
-Three of four values match the sandbox — same DB, same object-store container — so the app the
-citizen tested is the app that ships. Only the Blob CREDENTIAL differs, and it is load-bearing:
+The values match the sandbox — same DB, same object-store container, and the same connector
+coordinates when the project has been granted them — so the app the citizen tested is the app that
+ships. Only the Blob CREDENTIAL differs, and it is load-bearing:
 the sandbox's builder mints a 7-day SESSION SAS, but a published app outlives that, so publish
 mints the LONG-LIVED credential instead (the one that already exists for the manual runbook;
 revocable via a per-app stored access policy rather than an inlined expiry).
@@ -32,7 +33,7 @@ class PublishedStorageError(Exception):
 
 
 async def build_published_env(
-    db: AsyncSession, *, app_id: uuid.UUID, project_id: uuid.UUID
+    db: AsyncSession, *, app_id: uuid.UUID, project_id: uuid.UUID, user_id: uuid.UUID
 ) -> tuple[dict[str, str], str | None]:
     """`(env, container_url)` for the published container.
 
@@ -41,16 +42,34 @@ async def build_published_env(
     The Blob base is deliberately the SIGNING ACCOUNT's own host, not the sandbox-facing
     override (which exists only so a container on a local Docker network can reach Azurite) —
     reusing it would inject a development host into production.
+
+    `user_id` IS THE OWNERSHIP CLAIM, not a convenience. The connector coordinates are granted
+    per person and per project, so the builder below needs to know whose project this is; an
+    app published by somebody who never had access to a connector must not carry a credential
+    to it. It is threaded in rather than looked up here for the reason the whole module is
+    written this way: the caller already holds it, and a second lookup is a second chance to
+    scope it wrongly.
+
+    NO WINDOW DATES, for the same reason the sandbox gets none: a deployed app is uncapped by
+    ruling, so a build-time window injected into it would be a limit that means nothing. It
+    still inherits the connector's day-late ceiling, which is a fact about the data rather than
+    a grant.
     """
     # Lazily imported: `src.services.build_sessions.__init__` reaches the API deps module,
     # which imports back into the partially-initialized package, so a module-level import
     # here makes the cycle depend on which module the interpreter happens to load first.
     # Same accommodation `appdb/provision.py` makes for `src.config`.
+    from src.services.build_sessions.appconnector_env import build_connector_env
     from src.services.build_sessions.appdata import build_app_env
     from src.services.build_sessions.appdb_env import provision_app_database
 
     env = build_app_env(app_id)
     env |= await provision_app_database(db, project_id)
+    # THE SAME GATE THE SANDBOX USES, through the same function: a lake configured, the
+    # connector switched on for this project, and its owner's access approved. Not inferred from
+    # the lake being configured platform-wide — that would hand every published app on the
+    # platform a credential to BIAL's flight data.
+    env |= await build_connector_env(db, user_id=user_id, project_id=project_id)
 
     store = get_app_container_store()
     if store is None:

@@ -13,6 +13,7 @@ the tree. THE ORDER OF THE ASSERTIONS IN THIS FILE IS THE ORDER OF THE RISK.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Literal
 
@@ -24,27 +25,42 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.config import settings
 from src.db.models.user import User
 from src.services.build_sessions import manager as manager_module
+from src.services.build_sessions import pass_history
 from src.services.build_sessions import snapshot as snapshot_module
-from src.services.build_sessions.alarms import WORKSPACE_LOST_WHILE_IDLE_EVENT
+from src.services.build_sessions.alarms import (
+    APP_STOPPED_WHILE_IDLE_EVENT,
+    WORKSPACE_LOST_WHILE_IDLE_EVENT,
+)
 from src.services.build_sessions.integrity import (
     WorkspaceState,
     reset_integrity_streaks_for_tests,
 )
+from src.services.build_sessions.locks import read_registry
 from src.services.build_sessions.manager import (
     RecoveryNews,
     SessionManager,
     WorkspaceUnreadableError,
     reset_idle_checks_for_tests,
 )
+from src.services.build_sessions.pass_history import CopyAttempt
 from src.services.build_sessions.snapshot import reset_divert_streaks_for_tests
 from src.services.sandbox import SandboxError
-from src.services.sandbox.base import ExecResult, SandboxHandle
+from src.services.sandbox.base import DevStatus, ExecResult, SandboxHandle
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import quarantine_prefix, recovery_key, snapshot_key
 from tests.factories import ProjectFactory, UserFactory
 from tests.fakes import FakeSandboxClient, FakeStorage, a_git_bundle
 
 RECORDED = "a" * 40
+
+# What `/dev/status` answers, by name. `_STOPPED` carries 137, the SIGKILL a shell reports when the
+# out-of-memory killer takes the process below the supervisor's child (a kill landing on the child
+# itself reads -9). `_RESTARTED_BY_THE_AGENT` is a NORMAL state: the open sandbox lets the agent
+# `pkill` the supervisor's child and `nohup` its own replacement, so the supervisor's child is gone
+# while the app answers perfectly well.
+_SERVING = DevStatus(running=True, ready=True, port=3000, root_status=None)
+_STOPPED = DevStatus(running=False, ready=False, port=3000, exit_code=137, root_status=None)
+_RESTARTED_BY_THE_AGENT = DevStatus(running=False, ready=True, port=3000, root_status=None)
 
 
 @pytest.fixture(autouse=True)
@@ -70,6 +86,30 @@ def _no_leaked_streaks() -> None:
     reset_integrity_streaks_for_tests()
     reset_divert_streaks_for_tests()
     reset_idle_checks_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def attempts(monkeypatch: pytest.MonkeyPatch) -> list[CopyAttempt]:
+    """Every copy-before-reclaim outcome a put-away recorded, WITHOUT touching the database.
+
+    AUTOUSE, AND NOT FOR CONVENIENCE: `record_durable_copy_attempt` opens its own session and
+    COMMITS, so an unspied put-away here leaves a permanent row in the SHARED test database that
+    `test_reclamation_report_only.py` and `test_durable_copy_gate.py` count. The real writer is
+    exercised, against a connection that rolls back, in `test_durable_copy_gate.py`."""
+    recorded: list[CopyAttempt] = []
+
+    async def _spy(attempt: CopyAttempt) -> None:
+        recorded.append(attempt)
+
+    monkeypatch.setattr(pass_history, "record_durable_copy_attempt", _spy)
+    return recorded
+
+
+@pytest.fixture(autouse=True)
+def _no_pause_before_the_second_look(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pause exists for a real supervisor. A fake answers from a script, so waiting would only
+    make the suite slower."""
+    monkeypatch.setattr(manager_module, "_SECOND_LOOK_AFTER_S", 0.0)
 
 
 async def _mk(db: AsyncSession, email: str) -> tuple[User, uuid.UUID]:
@@ -559,24 +599,256 @@ async def test_an_idle_reversion_is_caught_at_the_poll_and_alarmed(
     assert payload["verdict"] == WorkspaceState.REVERTED.value
 
 
+@pytest.mark.parametrize("dev", [_SERVING, _STOPPED], ids=["serving", "stopped"])
 async def test_the_idle_check_restores_nothing_and_destroys_nothing(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+    dev: DevStatus,
 ) -> None:
-    """★ IT ONLY REPORTS. The restore belongs to the next turn, where the citizen is present, has
-    been told, and can confirm — recovering somebody's app behind their back while they are
-    looking at another tab is not a kindness, and it would run a full teardown-and-restore under
-    a preview they are staring at."""
+    """★ A REVERTED TREE IS ONLY REPORTED. The restore belongs to the next turn, where the citizen
+    is present, has been told, and can confirm — recovering somebody's app behind their back while
+    they are looking at another tab is not a kindness, and it would run a full teardown-and-restore
+    under a preview they are staring at.
+
+    AND A STOPPED DEV SERVER DOES NOT CHANGE THAT. The one thing this check puts away is an INTACT
+    app that has stopped. A reverted container is not holding the citizen's app, so there is
+    nothing of theirs in it to protect by a copy, and the next turn's restore is the path that
+    knows how to bring the right tree back."""
     user, project_id = await _mk(db_session, "u4b@rvaiglobal.com")
     manager = SessionManager()
     client, app_id = await _attached(db_session, manager, user, project_id)
     await _seed_recovery(fake_storage, app_id)
     client.exec_handler = _answers(None, commits=0, ancestry="")
+    _script_dev(monkeypatch, client, dev)
 
     await manager.project_workspace_check(db_session, user, project_id, sandbox_client=client)
 
     assert client.restored == []
     assert client.torn_down == []
     assert [k for k in fake_storage.objects if k.startswith(quarantine_prefix(app_id))] == []
+
+
+# =============================================================================
+# The app that stopped while nobody was sending messages
+# =============================================================================
+
+
+def _script_dev(
+    monkeypatch: pytest.MonkeyPatch, client: FakeSandboxClient, *readings: DevStatus
+) -> None:
+    """Script what `/dev/status` answers, one reading per ask; the last one repeats."""
+    queue = list(readings)
+
+    async def _read(handle: SandboxHandle) -> DevStatus:
+        return queue.pop(0) if len(queue) > 1 else queue[0]
+
+    monkeypatch.setattr(client, "dev_status", _read)
+
+
+def _sandbox_name(client: FakeSandboxClient) -> str:
+    assert client.attach_handle is not None
+    return client.attach_handle.app_name
+
+
+async def test_an_intact_app_whose_dev_server_stopped_is_put_away_so_it_can_be_launched_again(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+    attempts: list[CopyAttempt],
+) -> None:
+    """★ THE WAIT THAT NEVER ENDED. Measured against a real build on 2026-09-11: correct source,
+    `preview-state` saying `alive`, and nothing listening on :3000 inside the container — the pane
+    said "taking longer than usual to open" for as long as anybody looked, with no control on
+    screen. `preview-state` cannot see a process (no container call, by contract), and the
+    integrity verdict reads the git tree, which a dead process does not change.
+
+    Put away, the registry record is gone, so the next reading is `asleep` with the work
+    restorable: "Your app is saved", and the start control that brings it back running.
+
+    Mutation check: drop the put-away from `project_workspace_check` and `torn_down` stays
+    empty."""
+    user, project_id = await _mk(db_session, "u4-stopped@rvaiglobal.com")
+    manager = SessionManager()
+    client, app_id = await _attached(db_session, manager, user, project_id)
+    await _seed_recovery(fake_storage, app_id)
+    _script_dev(monkeypatch, client, _STOPPED)
+    raised: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        manager_module._log, "error", lambda event, **kw: raised.append((event, kw))
+    )
+
+    state = await manager.project_workspace_check(
+        db_session, user, project_id, sandbox_client=client
+    )
+
+    assert state is WorkspaceState.INTACT, "the files are fine; this is not a reversion"
+    assert client.torn_down == [_sandbox_name(client)]
+    assert await read_registry(fake_redis, user.id) is None, "so the next reading is asleep"
+    assert [event for event, _ in raised] == [APP_STOPPED_WHILE_IDLE_EVENT]
+    assert raised[0][1]["exit_code"] == 137
+    assert raised[0][1]["put_away"] is True
+    assert attempts == [CopyAttempt.NOTHING_TO_COPY], (
+        "the durable-copy gate ran and found it current"
+    )
+
+
+async def test_an_app_the_agent_restarted_itself_is_left_running(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ `running` ALONE IS NOT THE PROCESS FACT. `running=False` beside `ready=True` is an app the
+    agent restarted itself, serving its citizen perfectly well — the reaper reads the pair the same
+    way. Putting that container away would take a working app off somebody's screen.
+
+    Mutation check: read `running` alone and this container is torn down."""
+    user, project_id = await _mk(db_session, "u4-restarted@rvaiglobal.com")
+    manager = SessionManager()
+    client, app_id = await _attached(db_session, manager, user, project_id)
+    await _seed_recovery(fake_storage, app_id)
+    _script_dev(monkeypatch, client, _RESTARTED_BY_THE_AGENT)
+
+    await manager.project_workspace_check(db_session, user, project_id, sandbox_client=client)
+
+    assert client.torn_down == []
+    assert await read_registry(fake_redis, user.id) is not None
+
+
+async def test_a_dev_server_that_answers_the_second_look_is_left_running(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One dead reading is a sample, and putting a container away is an action — so it is asked
+    twice, and a second reading that answers wins.
+
+    Mutation check: act on the first reading alone and this container is torn down."""
+    user, project_id = await _mk(db_session, "u4-blip@rvaiglobal.com")
+    manager = SessionManager()
+    client, app_id = await _attached(db_session, manager, user, project_id)
+    await _seed_recovery(fake_storage, app_id)
+    _script_dev(monkeypatch, client, _STOPPED, _SERVING)
+
+    await manager.project_workspace_check(db_session, user, project_id, sandbox_client=client)
+
+    assert client.torn_down == []
+
+
+async def test_a_supervisor_that_cannot_answer_puts_nothing_away(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ A READING THAT FAILED IS NOT A STOPPED APP. A supervisor that errors or times out has not
+    found the process dead — it has not been asked — and a container put away over a network blip
+    is a working app taken off somebody's screen."""
+    user, project_id = await _mk(db_session, "u4-blind@rvaiglobal.com")
+    manager = SessionManager()
+    client, app_id = await _attached(db_session, manager, user, project_id)
+    await _seed_recovery(fake_storage, app_id)
+
+    async def _boom(handle: SandboxHandle) -> DevStatus:
+        raise SandboxError("dev/status failed with status 502")
+
+    monkeypatch.setattr(client, "dev_status", _boom)
+
+    state = await manager.project_workspace_check(
+        db_session, user, project_id, sandbox_client=client
+    )
+
+    assert state is WorkspaceState.INTACT, "and the integrity answer is unaffected"
+    assert client.torn_down == []
+
+
+async def test_a_stopped_app_whose_work_is_not_provably_saved_is_left_standing(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+    attempts: list[CopyAttempt],
+) -> None:
+    """★ NEVER AT THE COST OF WORK. The reap runs the durable-copy gate, and a container whose work
+    cannot be proven preserved is spared: the citizen keeps the slow card, which is where they were
+    before this existed, rather than losing work to end a wait.
+
+    Mutation check: reap without `app_id` and this container is torn down with no copy behind
+    it."""
+    user, project_id = await _mk(db_session, "u4-unsaved@rvaiglobal.com")
+    manager = SessionManager()
+    client, _app_id = await _attached(db_session, manager, user, project_id)
+    _script_dev(monkeypatch, client, _STOPPED)
+
+    await manager.project_workspace_check(db_session, user, project_id, sandbox_client=client)
+
+    assert client.torn_down == []
+    assert await read_registry(fake_redis, user.id) is not None
+    # LIVENESS FOR THE ABSENCE ABOVE: the gate really was asked, and it is what said no.
+    assert attempts, "the durable-copy gate ran"
+    assert CopyAttempt.NOTHING_TO_COPY not in attempts
+
+
+async def test_a_stopped_app_is_never_put_away_under_a_live_turn(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ A TURN MAY HAVE STOPPED THE DEV SERVER ON PURPOSE. The agent restarts it with `pkill` and
+    `nohup`, and between the two the process is genuinely dead — so a tab asking at that moment
+    must not take the container out from under the turn that is using it.
+
+    Mutation check: drop the live-session refusal and this container is torn down mid-turn."""
+    user, project_id = await _mk(db_session, "u4-stopped-turn@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
+    client.attach_handle = session.handle
+    await _seed_recovery(fake_storage, session.app_id)
+    _script_dev(monkeypatch, client, _STOPPED)
+
+    await manager.project_workspace_check(db_session, user, project_id, sandbox_client=client)
+
+    assert client.torn_down == []
+    assert await read_registry(fake_redis, user.id) is not None
+
+
+async def test_a_stopped_app_is_never_put_away_while_a_start_holds_the_workspace(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ A START BRINGS ITS OWN DEV SERVER. A relaunch holds the start lock across the restore, the
+    `dev_start` and the wait for it, so a dead reading taken inside that window is a server that
+    has not been started yet. The tab asking must not wait behind a restore to learn that — its
+    poll is what shows the app arriving.
+
+    Mutation check: wait for the lock instead of refusing, and this call hangs behind the start."""
+    user, project_id = await _mk(db_session, "u4-stopped-start@rvaiglobal.com")
+    manager = SessionManager()
+    client, app_id = await _attached(db_session, manager, user, project_id)
+    await _seed_recovery(fake_storage, app_id)
+    _script_dev(monkeypatch, client, _STOPPED)
+    start = manager._start_lock_for(user.id)
+
+    await start.acquire()
+    try:
+        await asyncio.wait_for(
+            manager.project_workspace_check(db_session, user, project_id, sandbox_client=client),
+            timeout=5,
+        )
+    finally:
+        start.release()
+
+    assert client.torn_down == []
 
 
 async def test_repeated_polls_inside_the_window_make_one_container_call(

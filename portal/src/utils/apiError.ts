@@ -44,11 +44,41 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 /**
  * A nullable string field off an untrusted body: absent, null, or the wrong type all read as
  * `null`. Lives beside `isRecord` as the narrowing every typed client starts from. A field
- * that is genuinely REQUIRED does not use this — it throws at its own boundary
- * (`readString`), because a missing required field is a contract break, not an absent value.
+ * that is genuinely REQUIRED does not use this — it throws instead, via `requiredString`
+ * below, because a missing required field is a contract break, not an absent value.
  */
 export function optionalString(value: unknown): string | null {
   return typeof value === 'string' ? value : null
+}
+
+/**
+ * A REQUIRED string off an untrusted body, or a throw. Absent, empty, or the wrong type is the
+ * server breaking its own contract — not an absent value — so it raises here rather than
+ * yielding a falsy default that surfaces as a blank label three components away, where nobody
+ * can tell whether the field was missing or genuinely empty.
+ *
+ * `subject` is the caller's own noun for the thing being read ("connector", "request"). It is a
+ * parameter because two typed clients each carried a private copy of this function whose only
+ * difference was that word, which is the shape a shared rule drifts apart in.
+ */
+export function requiredString(value: unknown, subject: string, field: string): string {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new ApiError(`The server sent a ${subject} we could not read (${field}).`, 500)
+  }
+  return value
+}
+
+/**
+ * A nullable COUNT off an untrusted body — and `null` is not `0`.
+ *
+ * Both answers are real and they mean different things: `0` is "none", `null` is "we did not
+ * count". The connector surfaces depend on that split (`onProjectCount` is null in every state
+ * but `approved`; `usingItIn` is null on a declined row), which is why this does NOT collapse to
+ * zero the way a plain count reader would — a row whose control IS a count must not render "0
+ * projects" for a person nobody counted.
+ */
+export function optionalCount(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : null
 }
 
 function nonEmptyString(value: unknown): value is string {

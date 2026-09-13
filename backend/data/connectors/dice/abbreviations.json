@@ -1,0 +1,165 @@
+{
+  "note": "The client's own abbreviation table, transcribed from the Abbreviations sheet of the returned column workbook, in the sheet's order. An empty `stands_for` is a code the client could not expand either.",
+  "abbreviations": [
+    {
+      "abbreviation": "AIBT",
+      "stands_for": "Actual In-Block Time"
+    },
+    {
+      "abbreviation": "AOBT",
+      "stands_for": "Actual Off-Block Time"
+    },
+    {
+      "abbreviation": "ALDT",
+      "stands_for": "Actual Landing Time"
+    },
+    {
+      "abbreviation": "ATOT",
+      "stands_for": "Actual Take-Off Time"
+    },
+    {
+      "abbreviation": "SIBT",
+      "stands_for": "Scheduled In-Block Time"
+    },
+    {
+      "abbreviation": "SOBT",
+      "stands_for": "Scheduled Off-Block Time"
+    },
+    {
+      "abbreviation": "EIBT",
+      "stands_for": "Estimated In-Block Time"
+    },
+    {
+      "abbreviation": "EOBT",
+      "stands_for": "Estimated Off-Block Time"
+    },
+    {
+      "abbreviation": "TOBT",
+      "stands_for": "Target Off-Block Time"
+    },
+    {
+      "abbreviation": "ARDT",
+      "stands_for": "Actual Ready Time"
+    },
+    {
+      "abbreviation": "TTOT",
+      "stands_for": "Target Take-Off Time"
+    },
+    {
+      "abbreviation": "ETOT",
+      "stands_for": "Estimated Take-Off Time"
+    },
+    {
+      "abbreviation": "TLDT",
+      "stands_for": "Target Landing Time"
+    },
+    {
+      "abbreviation": "ELDT",
+      "stands_for": "Estimated Landing Time"
+    },
+    {
+      "abbreviation": "STOA",
+      "stands_for": "Scheduled Time of Arrival"
+    },
+    {
+      "abbreviation": "STOD",
+      "stands_for": "Scheduled Time of Departure"
+    },
+    {
+      "abbreviation": "ASAT",
+      "stands_for": "Actual Start-Up Approval Time"
+    },
+    {
+      "abbreviation": "ASRT",
+      "stands_for": "Actual Start-Up Request Time"
+    },
+    {
+      "abbreviation": "TSAT",
+      "stands_for": "Target Start-Up Approval Time"
+    },
+    {
+      "abbreviation": "TMOA",
+      "stands_for": "Ten Miles Out"
+    },
+    {
+      "abbreviation": "ACGT",
+      "stands_for": "Actual Commencement of Ground Handling Time"
+    },
+    {
+      "abbreviation": "AEGT",
+      "stands_for": "Actual End for Ground Handling Time"
+    },
+    {
+      "abbreviation": "ACOR",
+      "stands_for": "Aircraft In Range / Flight In Range"
+    },
+    {
+      "abbreviation": "ENRC",
+      "stands_for": "Enroute Clearance"
+    },
+    {
+      "abbreviation": "FPLA",
+      "stands_for": "Arrival Flight Plan Activation Time"
+    },
+    {
+      "abbreviation": "FPLD",
+      "stands_for": "Deparrture Flight Plan Activation Time"
+    },
+    {
+      "abbreviation": "LSTU",
+      "stands_for": ""
+    },
+    {
+      "abbreviation": "USEU",
+      "stands_for": ""
+    },
+    {
+      "abbreviation": "RKEY",
+      "stands_for": "Rotation Key"
+    },
+    {
+      "abbreviation": "REMP",
+      "stands_for": ""
+    },
+    {
+      "abbreviation": "BAZ1",
+      "stands_for": ""
+    },
+    {
+      "abbreviation": "TAT",
+      "stands_for": "Turnaround Time"
+    },
+    {
+      "abbreviation": "OTP",
+      "stands_for": "On-Time Performance"
+    },
+    {
+      "abbreviation": "ADID",
+      "stands_for": "Arrival / Departure indicator"
+    },
+    {
+      "abbreviation": "TTYP",
+      "stands_for": "Flight nature / traffic type"
+    },
+    {
+      "abbreviation": "STYP",
+      "stands_for": "Service type"
+    },
+    {
+      "abbreviation": "FTYP",
+      "stands_for": "Flight type"
+    },
+    {
+      "abbreviation": "FLNS",
+      "stands_for": "Flight number suffix"
+    },
+    {
+      "abbreviation": "URNO",
+      "stands_for": "Unique record number"
+    },
+    {
+      "abbreviation": "DSSF",
+      "stands_for": "Data source flag"
+    }
+  ]
+}

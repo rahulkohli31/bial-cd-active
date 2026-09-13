@@ -4,11 +4,180 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-> **Pre-releases.** The sandbox-first workspace ships to `main` as one release, `1.7.0`. Until then
-> each wave that lands on `feat/sandbox-first-workspace` is cut as a beta below, and `VERSION`
-> carries the suffix — `1.7.0-beta.N`, then `-rc.N` once only fixes remain. At the merge a dated
-> `1.7.0` section is added above them and tagged `v1.7.0`; the betas stay as the record of how it
-> got there. A version number marks a build, not a merge.
+## [1.7.0] - 2026-09-13
+
+The release. Everything cut as a 1.7.0 beta since 1.6.19 ships as 1.7.0: the sandbox-first
+workspace, where the project screen is the running app and a chat is a plan chat or a build chat;
+one chat surface and one agent voice; the project list as the landing screen; a required app
+description with semantic marketplace search; sharing a project with a colleague; Word, Excel,
+PowerPoint, CSV and TSV attachments read by code; and the production fixes of 9 to 11 September.
+The sixteen betas below record what each build carried.
+
+New in this release, and described in full here, is the DICE data connector: an app can now be
+built on the airport's own flight data. A citizen asks for access once, a super-admin decides, each
+project chooses whether it reads the data and how far back, and the agent is handed a description
+of that data built from what was measured rather than guessed.
+
+### Added
+
+- **A citizen can ask for access to connected data, once, for themselves.** The profile menu, now a
+  standard dropdown, gains Integrations, which lists the systems that can be connected. Asking
+  takes a short reason and can be withdrawn while it waits, and a person holds at most one waiting
+  request per system. The request is for the person rather than a project, so an approval reaches
+  every project they own, including ones they have not made yet.
+- **A super-admin decides from a queue in the admin console.** A new Integrations tab, badged with
+  how many people are waiting, lists the requests. Approving is one click; declining asks for a
+  remark. Both decisions are written to the audit log. A decline is final in this release: asking
+  again is refused, and no administrator control reverses it.
+- **Each project chooses whether it reads the data, and how far back.** The workspace rail gains a
+  DATA section saying how many of the person's projects have the connector on and how many days
+  this one reads, with a way into the same dialog. A window runs up to 30 days and ends yesterday
+  at the latest: the lake lands a day late, so today is never offered. A project's settings cannot
+  change while one of its chats or builds is running, because an app that is already running keeps
+  the settings it started with, and the refusal names the project.
+- **An app built with the connector on reads the flight data directly.** Its workspace, and the
+  app once published, receive the lake's coordinates and a managed identity together, behind one
+  check, so neither can be granted without the other. Switching the connector off and publishing
+  again detaches the identity, observed end to end against Azure. The app template ships a worked
+  example of reading the flight files, with the seven mistakes it avoids written beside the lines
+  that avoid them.
+- **The agent knows what is in the lake instead of guessing.** Plan and Build chats on a project
+  with the connector on carry a short note naming the connected system, and the agent gets a
+  `connector_schema` tool that exists only where the connector is on: the project's switch and the
+  owner's approval both. The tool hands over one catalogue of 131 columns in 19 groups, 16 KPI
+  definitions, and the rules a correct query needs: which rows are duplicates, why a file's load
+  date is not its flights' date, and which values need trimming. Every value in it comes from the
+  measured column profile. The chat shows the call as "Checking what data is connected".
+- **The catalogue carries BIAL's own column definitions.** 106 of the 131 columns now read as the
+  airport defined them. The nine it answered "No Idea" keep our text, labelled as ours, so the
+  agent never reads a guess as the airport's answer, and seven keep our measured storage note
+  beside BIAL's meaning. A column whose meaning changes from row to row, such as `AIBT_AOBT_TIME`,
+  carries a gloss, and the airport's 40-row abbreviation table reaches the agent too.
+  `backend/scripts/ingest_client_definitions.py` folds the next returned workbook in and prints
+  what moved.
+- **A conversation is handed the catalogue twice at most.** Each copy costs about 7,400 tokens that
+  every later turn replays. After the second, the agent is pointed at the copy it already holds.
+- **Operators can find an app whose dev server keeps dying.** Each time this happens the platform
+  logs `app_stopped_while_idle`, with the supervisor's exit code (`-9` or `137` means the process was
+  killed, most often for running out of memory) and whether the container was put away or spared.
+- **The reclamation report says how many containers carry no ownership tag**, the precondition for
+  letting it destroy anything: `untagged` on `POST /v1/admin/apps/reclamation-report`.
+- **New API, all additive.** `GET /v1/connectors`, `POST /v1/connectors/{connector_key}/request`,
+  `POST /v1/connectors/{connector_key}/cancel`, `GET /v1/connectors/{connector_key}/projects`,
+  `GET /v1/projects/{project_id}/connectors` and
+  `PUT /v1/projects/{project_id}/connectors/{connector_key}`; for super-admins,
+  `GET /v1/admin/connector-requests`, `GET /v1/admin/connector-requests/counts`, and
+  `POST /v1/admin/connector-requests/{request_id}/approve` and `/decline`.
+
+### Changed
+
+- **A publish no longer fails because the app's lockfile drifted.** The agent edits dependency
+  versions by hand, so a generated app's `package-lock.json` routinely stops matching its
+  `package.json`, and `npm ci` refused to install it. The build now falls back to `npm install`
+  when, and only when, npm reports that drift, with install scripts off either way. A package whose
+  download does not match the hash in the lockfile still fails the build with `EINTEGRITY`.
+- **A failed publish says what broke.** The citizen used to be shown a line of the build tool's own
+  framing as the cause, and the repair agent was handed the same line. The message now carries the
+  real diagnostic, or says plainly that the build reported none.
+- **A build in one project no longer holds up the person's other projects.** Switching a connector
+  on or off, changing its window, and closing an idle project were refused for every project a
+  person owned while any one of them had a chat or build running. Only the busy project is refused
+  now, and the refusal names it: "“…” has a chat or a build running. Finish or stop it, then close
+  the project."
+- **The agent's reasoning is asked for in words.** Its thinking came back signed but empty, so there
+  was nothing to read. It is now requested as a summary and stored with the message. It is never
+  shown to a citizen.
+- **A published app with the connector off now states that it has no identity** (`identity: {type:
+  "None"}` in its container spec) rather than leaving the property out. Nothing changes for an app
+  that never had one; it is what makes publishing again after switching the connector off detach
+  the identity.
+
+### Removed
+
+- **The `serving_proof_never_arrived` alarm.** A container whose serving proof was cleared after it
+  had served reached teardown looking exactly like one that never served, so the alarm claimed
+  something it could not know. `serving_proof_absent_at_teardown` replaces it and says only that
+  the proof is absent. Alerts and saved searches on the old name need the new one.
+
+### Fixed
+
+- **An app whose dev server stopped no longer looks like a slow app that never opens.** When the
+  process serving a finished app died between messages — out of memory, crashed, or never brought
+  back after a restart — the preview kept saying "Your app is taking longer than usual to open", or
+  "Getting your app ready" once the platform had noticed, with no button and no end. The only way
+  out was to send a chat message, and nothing said so. Now, once the preview has waited longer than
+  an app ever takes to open, it asks the platform to look at the process itself. If the app has
+  stopped and its work is safely saved, the stopped container is put away and the preview shows
+  "Your app is saved" with **Launch Application**, which brings it back running. Nothing is put
+  away while a build or a start is using the workspace, on a reading that could not be taken, or
+  when the work cannot be proven saved — in those cases the preview waits exactly as before.
+- **A refusal that names another open project now says when its work is safe.** Opening or sending
+  in one project while another held the workspace said the other "may have unsaved changes" even
+  when its work was proven saved, sending people to look for work that was not missing. It now
+  reads "“…” is still open, and everything in it is saved."
+- **A message sent the moment the previous turn ends is accepted.** It was refused with a conflict
+  while the platform was still letting go of the workspace; it now waits for that to finish.
+- **An approved app no longer reads "in review".** After an administrator approved a submission
+  that had been routed for review, the publish chip kept saying it was in review and offered only
+  Take it back, which then failed. It now says the version is approved and publishing is the next
+  step. An approved app whose publish genuinely failed still shows the red "didn't start" with Try
+  again.
+
+### Known limitations
+
+- **Switching the connector on between messages does not reach a workspace that is already
+  running.** The next message reuses that workspace, which started without the data, while the
+  agent is told the data is connected, so the app it builds fails against data it believes it has.
+  Closing the project and opening it again starts a workspace that has the data.
+- **The worked example reads every file in the window into memory before filtering.** A 30-day
+  window of production data is roughly 2 million rows, against workspaces and published apps of
+  1 to 2 GiB, so an app copied from it on a wide window can run out of memory.
+- **The agent does not know where the DATA section or the Integrations dialog is,** so it cannot
+  tell a citizen where to ask for access or where to switch the connector on.
+- **An app whose connector has been switched off does not say so.** After switching off and
+  publishing again, the app still answered with a page instead of failing with a switched-off
+  message. What that page showed was not checked.
+- **No administrator can withdraw an approval.** The citizen's own project switch, followed by a
+  publish, is the only way to take the data away from a published app.
+- **A message sent right after a turn ends can still be refused, after a wait.** The platform waits
+  up to 30 seconds for the workspace to be let go, and letting go can take about two minutes. Past
+  the wait the refusal arrives after the message has been saved.
+- **A publish whose lockfile drifted and whose fallback install then also fails is reported as a
+  lockfile problem**, because the drift message is replayed as the last thing the build said.
+- **Running the definitions ingest twice on the same workbook is not a no-op.** A second run
+  relabels part of the airport's own text as our note and lengthens it, so run it once per
+  returned workbook.
+- **A colleague's shared view of an app that reads the connector gets no data.** A shared workspace
+  is never handed the owner's coordinates or identity, so that app fails there.
+
+### Deploying this release
+
+- **Ship in this order: sandbox image, portal, backend, worker.** The workspace supervisor now
+  passes the managed identity's endpoint to the app, so a new backend on an old image attaches an
+  identity the app cannot use, and the worked example only reaches a workspace built from the new
+  image. Build with context `sandbox/` and `--platform linux/amd64`, and push under a new immutable
+  tag and `:latest`. A deployment older than beta.15 also follows the beta.15 and beta.16 notes
+  below.
+- **Run `alembic upgrade head`.** It applies `0039_connector_access`, then
+  `0041_merge_connector_heads` and `0042_merge_shares_connectors`, which only join migration lines.
+  `0039`'s downgrade drops the access ledger, so take a dump before running it after go-live.
+- **The connector is off until three settings are set.** With `CONNECTOR_LAKE__URL`,
+  `CONNECTOR_LAKE__IDENTITY_CLIENT_ID` and `CONNECTOR_LAKE__IDENTITY_RESOURCE_ID` unset, no
+  workspace or published app receives coordinates or an identity and nothing is copied; asking and
+  deciding still work. Unsetting them is also the rollback. Turning the connector on needs two role
+  grants, the identity attached to the backend App Service, storage diagnostic logging, and a check
+  that the extra identity leaves the backend's other Azure credentials unambiguous; all of it is in
+  `ops/ONE-CLICK-DEPLOY-PROD.md` §4.
+- **The identity those settings name is attached to every workspace and published app whose project
+  has the connector on, and code the agent writes there can use it.** That code can obtain tokens
+  for the identity and read any date in the container, not only the project's window, so the
+  identity's role assignments are what generated apps are able to do.
+- **The control plane keeps a copy of each project's window in Redis**, on the instance that also
+  coordinates builds: about 300 MB across all projects, oldest evicted first, each copy expiring
+  after 7 days.
+- **The `messages` table now holds the model's reasoning as text**, backups included. Nothing
+  renders it, and it is exempt from secret masking because the provider checks it against its
+  signature.
 
 ## [1.7.0-beta.16] - 2026-09-13
 

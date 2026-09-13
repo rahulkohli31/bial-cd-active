@@ -162,9 +162,29 @@ class BuildConflictEnvelope(CamelModel):
     error: _ConflictError | ReclaimBlockedError
 
 
-def _conflict_response(exc: BuildSessionConflictError) -> JSONResponse:
+_BUILD_SESSION_ACTIVE = "A build session is already active."
+
+_PROJECT_IS_HOLDING_IT = (
+    "“{project}” has a chat or a build running. Finish or stop it, then close the project."
+)
+
+
+def _conflict_response(
+    exc: BuildSessionConflictError, *, project_name: str | None = None
+) -> JSONResponse:
+    """The one 409 both conflicting routes answer with — same code, same shape, two sentences.
+
+    NAMING THE PROJECT IS THE RELEASE ROUTE'S ALONE. Its gate compares the app the live session
+    holds against the one this project owns, so the project it refuses IS the project holding
+    the workspace, and saying which one is the whole of what the citizen can act on. Relaunch
+    conflicts on the per-user slot and knows no project, so it keeps the bare sentence rather
+    than naming one it has not compared."""
     error: dict[str, str] = {
-        "message": "A build session is already active.",
+        "message": (
+            _BUILD_SESSION_ACTIVE
+            if project_name is None
+            else _PROJECT_IS_HOLDING_IT.format(project=project_name)
+        ),
         "code": "build_session_already_active",
     }
     if exc.session_id is not None:
@@ -789,14 +809,14 @@ async def release_project(
     # under one is the strand this module exists to prevent.
     if sandbox is None:
         raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG)
-    await owned_project_or_404(db, user.id, project_id)
+    project_name = (await owned_project_or_404(db, user.id, project_id)).name
     with build_coordination_or_503():
         try:
             released = await manager.release_project_sandbox(
                 db, user, project_id, sandbox_client=sandbox
             )
         except BuildSessionConflictError as exc:
-            return _conflict_response(exc)
+            return _conflict_response(exc, project_name=project_name)
         except SandboxError as exc:
             # The container would not go away. Say so rather than reporting a release that did
             # not happen — the caller is about to start something that needs the slot.
@@ -1041,9 +1061,10 @@ async def workspace_check(
     """Is the app this tab is framing still the citizen's app?
 
     A POST, WITH CSRF, because it is not a free read: it costs a container exec and it can
-    raise an operational alarm. IT ONLY REPORTS — nothing is restored and nothing is destroyed
-    here. The restore belongs to the next turn, where the citizen is present, has been told,
-    and can confirm."""
+    raise an operational alarm. IT RESTORES NOTHING — the restore belongs to the next turn, where
+    the citizen is present, has been told, and can confirm. The one thing it may put away is an
+    INTACT app whose dev server has stopped, because nothing else ever ends that wait; see
+    `SessionManager.project_workspace_check` for the guards."""
     # THE TURN MAY NEVER COME. Every other integrity check in this system runs at the start of a
     # turn, which catches every reversion between one message and the next — and catches nothing
     # at all for someone who is reading, or in another tab, or at lunch. A standing completion
@@ -1055,9 +1076,9 @@ async def workspace_check(
     #
     # DELIBERATELY NOT FOLDED INTO `preview-state`, whose budget is fixed at NO container call of
     # any kind because a browser tab drives it on a 45-second timer. The client calls this one only
-    # when preview-state already reports alive AND a completion claim is standing, so the two never
-    # both fire on a dark pane — and the manager rate-limits per app on top of that, so a tab left
-    # open overnight cannot spin the container.
+    # on a reading worth a container call — `alive` under a standing completion claim, or a wait
+    # that looks stuck (`mayHaveStopped` in the portal) — and the manager rate-limits per app on
+    # top of that, so a tab left open overnight cannot spin the container.
     #
     # Recovering somebody's app behind their back while they are looking at another tab is not a
     # kindness.

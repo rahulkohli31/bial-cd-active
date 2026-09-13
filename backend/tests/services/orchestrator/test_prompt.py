@@ -39,9 +39,11 @@ from src.services.agent.toolsets import (
     registered_tool_definitions,
     render_tool_surface,
 )
+from src.services.messages.projection import CONNECTOR_SCHEMA_TOOL
 from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.prompt import build_repair_prompt
 from src.services.orchestrator.tools import sandbox_toolset
+from tests.fakes import a_connected_system
 
 _BUILD_PROMPT = compose_kind_prompt(
     ChatKind.BUILD,
@@ -711,6 +713,34 @@ async def test_the_tool_surface_is_generated_from_the_tools_the_write_arm_regist
     zero composition sites would satisfy the equality assertion perfectly well."""
     await _the_drift_check()
     assert _BUILD_PROMPT.count(WRITE_TOOL_SURFACE) == 1
+
+
+async def test_the_snapshot_stays_the_platforms_surface_not_one_projects() -> None:
+    """★ ADDED, NOT CHANGED — and if this gate makes you regenerate the snapshot, it is being read
+    wrong.
+
+    `WRITE_TOOL_SURFACE` is a snapshot of what EVERY project's Build prompt carries. The
+    connected-data tool is registered only for a project whose connector an administrator has
+    approved and whose owner has switched it on, so rendering the snapshot with a connector passed
+    would bake that tool into the Build prompt of every project on the platform — including one
+    whose administrator refused it. That is precisely what registration-gating exists to prevent,
+    and the checked-in block is where it would leak silently: the prompt would promise a tool the
+    runtime then rejects as unknown.
+
+    So: the default render is the snapshot (the drift check above), the connected render is one
+    tool larger, and the tool's own description reaches the model through the tool schema and the
+    project's CONNECTED DATA stub — beside the data it reads, exactly when the tool exists."""
+    default = await render_tool_surface(ChatKind.BUILD)
+    connected = await render_tool_surface(
+        ChatKind.BUILD, connected_systems=(a_connected_system(),)
+    )
+    assert default == WRITE_TOOL_SURFACE
+    assert CONNECTOR_SCHEMA_TOOL not in default
+    assert f"- `{CONNECTOR_SCHEMA_TOOL}` \u2014 " in connected
+    assert len(connected.splitlines()) == len(default.splitlines()) + 1
+    # The composed Build prompt of an ordinary project names it nowhere — not in the tool surface
+    # block, not anywhere else.
+    assert CONNECTOR_SCHEMA_TOOL not in _BUILD_PROMPT
 
 
 async def test_the_prompts_tool_list_is_exactly_what_the_write_arm_registers() -> None:

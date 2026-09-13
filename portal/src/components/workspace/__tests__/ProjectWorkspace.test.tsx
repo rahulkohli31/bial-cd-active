@@ -17,6 +17,7 @@ import {
   usePublishAddress,
   usePublishHeading,
   usePublishPaneView,
+  useWorkspacePane,
   useWorkspaceProject,
   type PaneView,
 } from '../workspaceChannel'
@@ -33,6 +34,7 @@ const api = vi.hoisted(() => ({
   // ASKED — a scenario that only inspected rendered text would pass just as happily against a
   // screen that made the call and ignored the answer.
   fetchCompileState: vi.fn(),
+  checkWorkspace: vi.fn(),
   relaunchPreview: vi.fn(),
   saveProject: vi.fn(),
   listProjectConversations: vi.fn(),
@@ -44,6 +46,7 @@ vi.mock('../../../utils/buildSessionApi', async (importOriginal) => ({
   fetchPreviewState: api.fetchPreviewState,
   fetchSaveState: api.fetchSaveState,
   fetchCompileState: api.fetchCompileState,
+  checkWorkspace: api.checkWorkspace,
   relaunchPreview: api.relaunchPreview,
   saveProject: api.saveProject,
 }))
@@ -251,6 +254,7 @@ beforeEach(() => {
   // asserts nothing. Never `'clean'` — an absent answer read as good news is the one behaviour the
   // whole four-valued type exists to forbid.
   api.fetchCompileState.mockResolvedValue('unknown')
+  api.checkWorkspace.mockResolvedValue(false)
   api.saveProject.mockResolvedValue({ appId: 'app-1', headSha: 'ccc' })
   api.getDeployment.mockResolvedValue(deployment())
 })
@@ -929,5 +933,52 @@ describe('★ the LAST SAVED row after a save', () => {
     await pressSave()
     await waitFor(() => expect(api.getDeployment).toHaveBeenCalledTimes(3))
     expect(api.saveProject).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('the project screen asks whether a stuck app has stopped', () => {
+  /** Every pane view the channel has carried, read the way the real pane host reads it. */
+  const panesSeen: (PaneView | null)[] = []
+  function PaneReader() {
+    const pane = useWorkspacePane()
+    panesSeen.push(pane)
+    return null
+  }
+
+  it('★ publishes the stall edge, and a stalled frame asks the server about THIS project', async () => {
+    // Without it on the channel, the pane's stall reaches nobody and a stopped app sits on the slow
+    // card for good. Mutation check: drop `onStallChange` from this surface's pane view and the
+    // reporter below is never published.
+    panesSeen.length = 0
+    api.fetchPreviewState.mockResolvedValue(
+      preview({ state: 'alive', alive: true, previewUrl: APP_URL, restorable: true }),
+    )
+    render(
+      <MemoryRouter initialEntries={['/projects/pA']}>
+        <Routes>
+          <Route element={<WorkspaceShell />}>
+            <Route
+              path="/projects/:projectId"
+              element={
+                <>
+                  <Surface />
+                  <PaneReader />
+                </>
+              }
+            />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    )
+    await waitFor(() => expect(panesSeen.at(-1)?.onStallChange).toBeTypeOf('function'))
+    // LIVENESS BEFORE ABSENCE: the read has landed, and a frame that is not stuck asked nothing.
+    await waitFor(() => expect(api.fetchPreviewState).toHaveBeenCalledWith('pA'))
+    expect(api.checkWorkspace).not.toHaveBeenCalled()
+
+    await act(async () => {
+      panesSeen.at(-1)?.onStallChange?.(true)
+    })
+
+    await waitFor(() => expect(api.checkWorkspace).toHaveBeenCalledWith('pA'))
   })
 })

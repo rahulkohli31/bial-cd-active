@@ -41,6 +41,16 @@ agree on the spelling or a spoken line renders on one side and not the other."""
 PROPOSE_SLICE_TOOL: Final = "propose_first_slice"
 """The scope-negotiation tool's wire name. Named here for the same reason the other two are."""
 
+CONNECTOR_SCHEMA_TOOL: Final = "connector_schema"
+"""The connected-data schema tool's wire name, and the third thing that has to agree on it.
+
+Named here for the same reason as the three above — this module labels the call — and read by two
+others that would otherwise each spell it: `services/agent/connector_tools.py`, where it IS the
+registered function's name (pydantic-ai registers a function under its `__name__`), and
+`services/agent/mode_prompts.py`, where the CONNECTED DATA stub tells the agent to call it. A
+prompt naming a tool that is registered under a different spelling is a citizen's turn spent
+discovering an unknown-tool rejection."""
+
 PLATFORM_TEXT_KIND: Final = "platform_text"
 """`meta.kind` of a row whose sentence is the PLATFORM's, not the model's.
 
@@ -481,6 +491,17 @@ def _step_label(tool_name: str, args: dict[str, Any]) -> tuple[str, bool]:
         # rather than the fallback below, which renders the raw tool name ("Used
         # apply_schema_change") into the feed.
         return (_LBL_DATA_SETUP, False)
+    if tool_name == CONNECTOR_SCHEMA_TOOL:
+        # THE LABEL DESCRIBES THE ATTEMPT, NOT THE OUTCOME, and that is what keeps it honest.
+        # A refusal is a SUCCESSFUL tool call as far as this module is concerned — `state` is
+        # "failed" only when the stored result was a retry — so an outcome-shaped label ("Read
+        # the flight data schema") would render with a success tick over a call that refused
+        # and an agent that then invented column names.
+        #
+        # CONNECTOR-AGNOSTIC IN ITS OWN WORDING, so this module needs no `data_noun` lookup and
+        # no import from the connector registry. `checking` is already a `stepIconFor`
+        # branch in the portal, so no portal file changes for this.
+        return ("Checking what data is connected", False)
     if tool_name == "declare_done":
         return ("Wrapping up the build", False)
     if tool_name == "run_command":

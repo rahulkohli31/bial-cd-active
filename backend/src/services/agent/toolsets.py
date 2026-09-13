@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import re
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Final, cast
 
@@ -37,8 +37,10 @@ from pydantic_ai.toolsets.abstract import AbstractToolset
 from pydantic_ai.toolsets.function import FunctionToolset
 from pydantic_ai.usage import RunUsage
 
+from src.core.connectors import ConnectedSystem
 from src.db.models.conversation import ChatKind
 from src.services.agent.attachment_tools import AttachmentReader, attachment_toolset
+from src.services.agent.connector_tools import CONNECTOR_TOOLSET
 from src.services.agent.conversation_tools import CONVERSATION_TOOLSET
 from src.services.agent.read_tools import ReadOnlyWorkspace, read_only_toolset
 from src.services.orchestrator.deps import SandboxSession
@@ -135,11 +137,26 @@ def _structured_reads_only(_ctx: RunContext[Any], tool_def: ToolDefinition) -> b
     return tool_def.name in _WRITE_STRUCTURED_READS
 
 
+def _plus_connected_data[DepsT](
+    toolsets: list[AbstractToolset[DepsT]], connected_systems: Sequence[ConnectedSystem]
+) -> list[AbstractToolset[DepsT]]:
+    """Append the connected-data surface when this project actually reads one, on either arm.
+
+    ONE FUNCTION SO THE TWO ARMS CANNOT DIFFER. The rule is the same for Plan and Build — R4 says
+    both arms, and the second axis this registry now gates on is the PROJECT, not the kind — so it
+    is written once and both `case` arms call it."""
+    if not connected_systems:
+        return toolsets
+    return [*toolsets, cast(AbstractToolset[DepsT], CONNECTOR_TOOLSET)]
+
+
 def toolsets_for_kind[DepsT](
     kind: ChatKind,
     workspace_of: Callable[[RunContext[DepsT]], ReadOnlyWorkspace],
     sandbox_of: Callable[[RunContext[DepsT]], SandboxSession] | None = None,
     reader_of: Callable[[RunContext[DepsT]], AttachmentReader] | None = None,
+    *,
+    connected_systems: Sequence[ConnectedSystem] = (),
 ) -> ToolSurface[DepsT]:
     """The per-run tool surface for a chat kind, over whatever deps type the caller's accessors
     resolve the workspace (and, for Build, the sandbox) from.
@@ -147,7 +164,22 @@ def toolsets_for_kind[DepsT](
     THIS MATCH IS THE GUARDRAIL — the only place permitted to read the chat kind to decide what
     the model can do. Plan cannot change the app because the write tools and `run_command` are
     simply absent from its list, never because something downstream notices the kind. Exhaustive
-    over the enum: an unknown kind is a programming error, not a fallback."""
+    over the enum: an unknown kind is a programming error, not a fallback.
+
+    AND IT NOW GATES ON A SECOND AXIS: THE PROJECT. `connected_systems` is what this project may
+    actually read from outside the platform, resolved once at the router off
+    `resolve_window(...).effectively_on` — the project's switch AND the owner's approval. Empty is
+    the ordinary case and adds nothing, so a project with no connector pays nothing for this
+    feature on any turn and the checked-in `WRITE_TOOL_SURFACE` snapshot still renders at twelve
+    tools.
+
+    THE GATE IS REGISTRATION, NOT REFUSAL, and that is the whole reason it lives here rather than
+    inside the tool. The platform already has a flow whose purpose is to say no to a project — an
+    administrator declining the request, or a revocation flipping `effectively_on` back — and a
+    surface that ignored it would leave the model to discover the refusal by spending a round
+    trip. Absent instead: a forged call meets the runtime's unknown-tool rejection, exactly as a
+    Build tool does in a Plan chat. Toolsets are built per run, so a revoked approval takes the
+    tool away on the citizen's next turn with no invalidation step anywhere."""
     match kind:
         case ChatKind.PLAN:
             plan_toolsets: list[AbstractToolset[DepsT]] = [
@@ -168,7 +200,10 @@ def toolsets_for_kind[DepsT](
             # Plan run; a caller with no reader simply does not offer the tool.
             if reader_of is not None:
                 plan_toolsets.append(attachment_toolset(reader_of))
-            return ToolSurface(toolsets=plan_toolsets, may_write=False)
+            return ToolSurface(
+                toolsets=_plus_connected_data(plan_toolsets, connected_systems),
+                may_write=False,
+            )
         case ChatKind.BUILD:
             if sandbox_of is None:
                 raise ValueError(
@@ -179,11 +214,14 @@ def toolsets_for_kind[DepsT](
             # read-only `read_file`/`run_command` — the duplicate-name `UserError` is
             # structurally unreachable rather than merely avoided by convention.
             return ToolSurface(
-                toolsets=[
-                    sandbox_toolset(sandbox_of),
-                    read_only_toolset(workspace_of).filtered(_structured_reads_only),
-                    cast(AbstractToolset[DepsT], CONVERSATION_TOOLSET),
-                ],
+                toolsets=_plus_connected_data(
+                    [
+                        sandbox_toolset(sandbox_of),
+                        read_only_toolset(workspace_of).filtered(_structured_reads_only),
+                        cast(AbstractToolset[DepsT], CONVERSATION_TOOLSET),
+                    ],
+                    connected_systems,
+                ),
                 may_write=True,
             )
 
@@ -321,27 +359,47 @@ def first_sentence(description: str) -> str:
     return flattened
 
 
-async def registered_tool_definitions(kind: ChatKind) -> dict[str, ToolDefinition]:
+async def registered_tool_definitions(
+    kind: ChatKind, *, connected_systems: Sequence[ConnectedSystem] = ()
+) -> dict[str, ToolDefinition]:
     """Exactly what `kind` registers, in registration order, as pydantic-ai hands it to the
     model — names AND descriptions, straight off `toolsets_for_kind`.
 
     The accessors are the ones that raise: resolving a workspace or a sandbox is what a tool
     CALL needs, and nothing here calls a tool. That is deliberate rather than convenient — a
     renderer that needed a live sandbox to describe the surface could not run in a test, and
-    a drift check that cannot run is not a check."""
+    a drift check that cannot run is not a check.
+
+    `connected_systems` MIRRORS `toolsets_for_kind`'s, DEFAULT AND ALL. It has to: without it the
+    connector-on registration is not expressible from a test, and with a different default the
+    checked-in `WRITE_TOOL_SURFACE` snapshot would render a tool that most projects never see."""
     sandbox_of = _the_renderer_never_calls_a_tool if kind is ChatKind.BUILD else None
     ctx: RunContext[Any] = RunContext(deps=None, model=_RENDER_ONLY_MODEL, usage=RunUsage())
     definitions: dict[str, ToolDefinition] = {}
-    for toolset in toolsets_for_kind(kind, _the_renderer_never_calls_a_tool, sandbox_of).toolsets:
+    surface = toolsets_for_kind(
+        kind, _the_renderer_never_calls_a_tool, sandbox_of, connected_systems=connected_systems
+    )
+    for toolset in surface.toolsets:
         for name, tool in (await toolset.get_tools(ctx)).items():
             definitions[name] = tool.tool_def
     return definitions
 
 
-async def render_tool_surface(kind: ChatKind) -> str:
-    """The prompt's TOOL SURFACE block for `kind`, generated from the tools it registers."""
+async def render_tool_surface(
+    kind: ChatKind, *, connected_systems: Sequence[ConnectedSystem] = ()
+) -> str:
+    """The prompt's TOOL SURFACE block for `kind`, generated from the tools it registers.
+
+    THE DEFAULT IS WHAT `WRITE_TOOL_SURFACE` IS A SNAPSHOT OF, and regenerating that snapshot with
+    a connector passed here would bake the connected-data tool into the Build prompt of every
+    project on the platform — including one whose administrator refused the connector, which is
+    the case registration-gating exists to serve. The block is a fact about the PLATFORM's
+    surface; what a particular project adds to it is described in its own CONNECTED DATA stub,
+    beside the data it reads, so the description appears exactly when the tool does."""
     lines = ["TOOL SURFACE:"]
-    for name, definition in (await registered_tool_definitions(kind)).items():
+    for name, definition in (
+        await registered_tool_definitions(kind, connected_systems=connected_systems)
+    ).items():
         if not definition.description:
             raise ValueError(
                 f"`{name}` is registered with no description, so the prompt has nothing "
