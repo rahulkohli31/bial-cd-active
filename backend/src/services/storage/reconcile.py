@@ -11,8 +11,7 @@ age we cannot prove is the one mistake this unit must not make.
 
 Per-prefix rules:
 - `att/{user_id}/` — owned-set from `Attachment.storage_key`, NEVER a PK-derived key (uploads
-  mint a fresh uuid7 unrelated to the row's PK); built via `_blob_keys_for` so a deck's derived
-  `.pdf` sibling is owned too, or the sweep deletes the only form the model reads.
+  mint a fresh uuid7 unrelated to the row's PK); built via `_blob_keys_for`, one key per row.
 - `snapshots/`, `recovery/` — reconciled against `AppRegistry` existence; delete-eligible.
 - `submissions/{app_id}/` — REPORT-ONLY: the immutable approval record. "No app row" is NOT a
   licence to delete — an append-only audit row outlives the app and still names the bundle via
@@ -39,9 +38,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.models.app_registry import AppRegistry
 from src.db.models.attachment import Attachment
 
-# REUSED, not reimplemented (drift guard): the owned-set for `att/` derives blob keys — including
-# each deck's `{key}.pdf` sibling — through the SAME helper the conversation cascade and the
-# never-sent-upload reclaim use, so a key shape one honours is honoured here too.
+# REUSED, not reimplemented (drift guard): the owned-set for `att/` derives blob keys through the
+# SAME helper the conversation cascade and the never-sent-upload reclaim use, so a key shape one
+# honours is honoured here too.
 from src.services.conversations.delete import _blob_keys_for
 from src.services.storage.base import ObjectStorage
 from src.services.storage.listing import all_keys_under
@@ -103,7 +102,7 @@ class StorageReconcileReport:
 
 def _membership(keys: frozenset[str]) -> Callable[[str], bool]:
     """Owner check for `att/`: a key is owned iff it is one of the persisted attachment blob keys
-    (each `storage_key`, plus each deck's `{storage_key}.pdf` sibling)."""
+    (one `storage_key` per row)."""
 
     def _is_owned(key: str) -> bool:
         return key in keys
@@ -200,7 +199,7 @@ async def reconcile_orphaned_storage(
     cutoff = (now or datetime.datetime.now(datetime.UTC)) - RECONCILE_GRACE
 
     # Owned-set for `att/`: the persisted blob keys, NEVER a PK-derived key (`_blob_keys_for`
-    # yields each `storage_key` plus each deck's `{storage_key}.pdf` sibling).
+    # yields one `storage_key` per row).
     attachments: Sequence[Attachment] = (await db.execute(sa.select(Attachment))).scalars().all()
     owned_att_keys = frozenset(_blob_keys_for(attachments))
     # Owned-set for the app-keyed prefixes: every live app id.

@@ -33,6 +33,8 @@ vi.mock('../../utils/projectApi', () => ({
   deleteProject: h.deleteProject,
 }))
 vi.mock('../../utils/conversationApi', () => ({
+  // The send path creates the chat before its first upload; stubbed so no network is reached.
+  createConversation: async () => ({ id: 'conv-created' }),
   listProjectConversations: h.listProjectConversations,
   CONVERSATION_LIST_CAP: 200,
 }))

@@ -24,12 +24,6 @@ dependencies = [
     "pgvector>=0.4.1",
     "pydantic>=2.13.5",
     "pydantic-settings>=2.15.0",
-    # UPPER-BOUNDED, alone among these, because `services/parse/parsers.py` calls pypdf's
-    # PRIVATE `PdfReader._flatten(list_only=True)` — the only entry point that the
-    # encrypted-file short-circuit in `get_num_pages()` does not stand in front of (#194).
-    # A major that renames or drops it turns every PDF into a 400 "malformed file".
-    "pypdf>=6.17.0,<7",
-    "python-docx>=1.2.0",
     "sqlalchemy>=2.0.52",
     "structlog>=26.1.0",
     "taskiq>=0.12.6",
@@ -44,9 +38,6 @@ dependencies = [
 #   dev    = tooling + tests
 api = [
     "fastapi[standard]>=0.141.1",
-    "mammoth>=1.12.1",
-    "markdownify>=1.2.3",
-    "openpyxl>=3.1.5",
     # `openai` extra added for #191 slice 3 (hybrid search): `OpenAIEmbeddingModel` +
     # `AzureProvider` need the `openai` package pydantic-ai-slim vendors behind this extra.
     "pydantic-ai-slim[anthropic,openai]>=2.37.0",
@@ -132,10 +123,8 @@ module = ["authlib.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-# The office-extraction stack ships no py.typed / stubs: mammoth (docx→html),
-# markdownify (html→markdown), and openpyxl (xlsx). Treat as untyped so the direct
-# imports in services/extract/office.py don't fail mypy --strict.
-module = ["mammoth.*", "markdownify.*", "openpyxl.*"]
+# openpyxl ships no py.typed / stubs, and `scripts/exception_register.py` imports it.
+module = ["openpyxl.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

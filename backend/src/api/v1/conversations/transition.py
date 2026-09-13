@@ -313,6 +313,11 @@ async def build_it(
         # nothing" is not a legitimate outcome: the citizen pressed Build on a plan, so a run
         # that writes nothing is a failed build and must be reported as one.
         expects_mutation=True,
+        # NO FILES, AND SAID EXPLICITLY RATHER THAN DEFAULTED. This route CREATES the Build chat
+        # it starts, from a plan's text — there is no composer, no upload and no conversation for
+        # a file to have been attached to. The parameter carries no default so that a route which
+        # ever does carry files has to say so instead of inheriting an empty one.
+        file_attachment_ids=(),
     )
 
     # --- ONLY NOW: the one write in the Plan chat -------------------------------------------

@@ -16,13 +16,6 @@ describe('AttachmentChips — descriptor branches', () => {
     expect(html).not.toContain('<img')
   })
 
-  it('renders a .txt attachment as a labelled chip with no <img>', () => {
-    const html = renderToStaticMarkup(
-      <AttachmentChips attachments={[{ attachmentId: 't2', kind: 'text', name: 'notes.txt', mediaType: 'text/plain' }]} />,
-    )
-    expect(html).toContain('notes.txt')
-    expect(html).not.toContain('<img')
-  })
 
   it('renders a PDF as a clickable labelled chip, no <img>', () => {
     const html = renderToStaticMarkup(
@@ -48,23 +41,7 @@ describe('AttachmentChips — descriptor branches', () => {
     expect(html).not.toContain('<img')
   })
 
-  it('renders an Excel office attachment and shows a "truncated" note when flagged', () => {
-    const html = renderToStaticMarkup(
-      <AttachmentChips attachments={[{ attachmentId: 'x1', kind: 'office', format: 'excel', name: 'big.xlsx', mediaType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', truncated: true }]} />,
-    )
-    expect(html).toContain('big.xlsx')
-    expect(html).toContain('truncated')
-    expect(html).not.toContain('<img')
-  })
 
-  it('surfaces the truncationNote (with counts) in the chip tooltip when present', () => {
-    const html = renderToStaticMarkup(
-      <AttachmentChips
-        attachments={[{ attachmentId: 'x2', kind: 'office', format: 'excel', name: 'roster.xlsx', mediaType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', truncated: true, truncationNote: 'A large sheet was shortened for the AI: "Roster" (first 1,000 of 2,300 rows).' }]} />,
-    )
-    expect(html).toContain('first 1,000 of 2,300 rows') // real counts shown to the user on hover
-    expect(html).toContain('(Click to download the original.)') // tooltip also points at the full download
-  })
 })
 
 describe('AttachmentChips — deck (.pptx) chip', () => {
@@ -92,5 +69,70 @@ describe('AttachmentChips — deck (.pptx) chip', () => {
       <AttachmentChips attachments={[{ attachmentId: 'w1', kind: 'office', format: 'word', name: 'plan.docx', mediaType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }]} />,
     )
     expect(html).not.toContain('lucide-presentation')
+  })
+})
+
+// --- pressing a chip does something, and says what -------------------------
+
+describe('every chip is a control that says which file and what it does', () => {
+  const chip = (over) => ({
+    attachmentId: 'a1', kind: 'file', name: 'roster.xlsx',
+    mediaType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', ...over,
+  })
+
+  it('★ a code-lane chip is a BUTTON, not the dead span it used to be', () => {
+    // THE DEFECT. A text chip was a `<span>` with a `title` and no handler: pressing it did
+    // nothing at all, because the content rode inline in the prompt and there was nothing to
+    // fetch. Every attachment is an uploaded file now, so there always is — and a control that
+    // absorbs a press silently is the one thing a control must never be.
+    const html = renderToStaticMarkup(<AttachmentChips attachments={[chip()]} />)
+
+    expect(html).toContain('<button')
+    expect(html).toContain('roster.xlsx')
+    expect(html).not.toContain('<img')
+  })
+
+  it('★ names the file AND what pressing it does, which is the whole of R23c', () => {
+    // A chip that downloads and a chip that opens are the same shape to a screen reader. Without
+    // the verb, both announce as "roster.xlsx" and the citizen cannot tell them apart.
+    const download = renderToStaticMarkup(<AttachmentChips attachments={[chip()]} />)
+    const open = renderToStaticMarkup(
+      <AttachmentChips attachments={[chip({ kind: 'document', name: 'spec.pdf', mediaType: 'application/pdf' })]} />,
+    )
+    const view = renderToStaticMarkup(
+      <AttachmentChips attachments={[chip({ kind: 'image', name: 'gate.png', mediaType: 'image/png' })]} />,
+    )
+
+    expect(download).toContain('aria-label="Download roster.xlsx"')
+    expect(open).toContain('aria-label="Open spec.pdf"')
+    expect(view).toContain('aria-label="View gate.png"')
+  })
+
+  it('routes each of the five code-lane formats to the download branch', () => {
+    // The kind comes from the server (`chip_kind_for`), but the media type is matched too, so a
+    // part staged in the composer — which assigns its own kind locally — behaves identically.
+    for (const mediaType of [
+      'text/csv',
+      'text/tab-separated-values',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    ]) {
+      const html = renderToStaticMarkup(
+        <AttachmentChips attachments={[chip({ kind: undefined, mediaType, name: `f-${mediaType.slice(-6)}` })]} />,
+      )
+      expect(html, mediaType).toContain('<button')
+      expect(html, mediaType).not.toContain('<img')
+    }
+  })
+
+  it('an image is still a thumbnail, so the code lane did not swallow the model lane', () => {
+    // The liveness half: every assertion above is about the absence of `<img>`, and all of them
+    // would pass just as happily against a component that had stopped rendering images at all.
+    const html = renderToStaticMarkup(
+      <AttachmentChips attachments={[chip({ kind: 'image', name: 'gate.png', mediaType: 'image/png' })]} />,
+    )
+
+    expect(html).toContain('<img')
   })
 })

@@ -122,6 +122,17 @@ what the platform records, and renaming a label must never migrate a record.
 "Keep refining" was the previous second label; the client found it confusing, and it is not a
 synonym worth keeping alive in a comment."""
 
+ATTACHMENT_READ_TOOL = "read_attachment"
+"""The Plan arm's one way to open a file the citizen attached.
+
+HERE RATHER THAN BESIDE THE TOOL because two modules that never import each other need the same
+spelling: `services/agent/attachment_tools.py` registers the tool, and
+`services/messages/projection.py` renders its step in the transcript. A tool whose step falls
+through the label mapping is drawn as "Used read_attachment" — the raw-machinery leak the whole
+friendly mapping exists to prevent — and a name repeated as a literal in two files is how that
+happens quietly, the day one of them is renamed.
+"""
+
 APPLY_SCHEMA_CHANGE_TOOL = "apply_schema_change"
 """The ONE sanctioned channel for a schema change, and the ONE spelling of it.
 

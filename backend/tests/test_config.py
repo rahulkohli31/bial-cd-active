@@ -505,16 +505,11 @@ def test_cookie_secure_false_outside_production_boots(environment: str) -> None:
     )
 
 
-# --- Foundry (optional integration) + Gotenberg (optional knob) --------------
+# --- Foundry (optional integration) ------------------------------------------
 
 
 def test_foundry_optional_defaults_none() -> None:
     assert _settings().foundry is None
-
-
-def test_gotenberg_url_optional_defaults_none() -> None:
-    # None has a DEFINED meaning: deck conversion disabled.
-    assert _settings().GOTENBERG_URL is None
 
 
 def test_foundry_block_validates_when_present() -> None:

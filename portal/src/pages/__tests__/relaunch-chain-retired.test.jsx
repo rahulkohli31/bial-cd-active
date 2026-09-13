@@ -45,6 +45,8 @@ vi.mock('../../utils/builderHistory', () => ({
 }))
 vi.mock('../../utils/conversationApi', async (orig) => ({
   ...(await orig()),
+  // The send path creates the chat before its first upload; stubbed so no network is reached.
+  createConversation: async () => ({ id: 'conv-created' }),
   listProjectConversations: h.listProjectConversations,
 }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))

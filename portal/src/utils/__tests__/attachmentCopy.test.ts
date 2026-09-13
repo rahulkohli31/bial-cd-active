@@ -34,29 +34,45 @@ function refusalFor(file: File): string {
 const unsupported = () => new File(['x'], 'terminal-3.zip', { type: 'application/zip' })
 
 describe('the composer refusal sentence agrees with the real allowlist', () => {
-  it('names every format the picker accepts and none that it refuses', () => {
+  it('describes a LANE for every format the picker accepts', () => {
+    // ★ THE RECONCILIATION SURVIVES, IN THE ONLY SHAPE THAT STILL MAKES SENSE.
+    //
+    // This used to check the sentence named each accepted format and no refused one. The
+    // sentence is no longer an inventory: R21 requires one sentence describing what HAPPENS to a
+    // file — "never a list of ten formats, which is the shape the removed rule failed as". A
+    // list goes stale the moment the allowlist moves and tells a citizen nothing about why a
+    // spreadsheet behaves differently from a photograph.
+    //
+    // So the two directions become lane-shaped. Every accepted format must fall under a lane the
+    // sentence describes, and a format in NEITHER lane must not be accepted. Adding a sixth
+    // format without extending the copy still goes red; so does an accepted format the sentence
+    // cannot account for.
     const message = refusalFor(unsupported())
-    // The bounded inventory of formats this sentence is ABOUT. Each is reconciled in both
-    // directions, so narrowing the allowlist without editing the sentence goes red — and so
-    // does widening it.
-    for (const [type, phrase] of [
-      ['image/png', /PNG/i],
-      ['image/jpeg', /JPEG/i],
-      ['image/gif', /GIF/i],
-      ['image/webp', /WebP/i],
-      ['application/pdf', /PDF/i],
-      ['text/csv', /CSV/i],
-      ['text/plain', /TXT/i],
-      [WORD_MEDIA_TYPE, /Word|\.docx/i],
-      [EXCEL_MEDIA_TYPE, /Excel|\.xlsx/i],
-      [PPTX_MEDIA_TYPE, /PowerPoint|\.pptx/i],
-    ] as const) {
-      if ((ALLOWED_MEDIA_TYPES as readonly string[]).includes(type)) {
-        expect(message, `the picker accepts ${type} but the refusal never names it`).toMatch(phrase)
-      } else {
-        expect(message, `the picker refuses ${type} but the refusal still offers it`).not.toMatch(phrase)
-      }
+    const MODEL_LANE = /picture|image|PDF/i
+    const CODE_LANE = /spreadsheet|document|slide deck/i
+
+    expect(message, 'the sentence does not describe the lane the model reads').toMatch(MODEL_LANE)
+    expect(message, 'the sentence does not describe the lane code reads').toMatch(CODE_LANE)
+
+    const lanes: Record<string, RegExp> = {
+      'image/png': MODEL_LANE,
+      'image/jpeg': MODEL_LANE,
+      'image/gif': MODEL_LANE,
+      'image/webp': MODEL_LANE,
+      'application/pdf': MODEL_LANE,
+      'text/csv': CODE_LANE,
+      'text/tab-separated-values': CODE_LANE,
+      [WORD_MEDIA_TYPE]: CODE_LANE,
+      [EXCEL_MEDIA_TYPE]: CODE_LANE,
+      [PPTX_MEDIA_TYPE]: CODE_LANE,
     }
+    for (const type of ALLOWED_MEDIA_TYPES as readonly string[]) {
+      expect(lanes[type], `the picker accepts ${type} but no lane in the copy covers it`).toBeDefined()
+      expect(message).toMatch(lanes[type])
+    }
+    // The other direction: a format the picker refuses is not implied by the copy either.
+    expect((ALLOWED_MEDIA_TYPES as readonly string[]).includes('text/plain')).toBe(false)
+    expect(message).not.toMatch(/\.txt|plain text/i)
   })
 
   it('is a real sentence, not an empty string every negative assertion would pass against', () => {
@@ -76,7 +92,6 @@ describe('the composer refusal sentence agrees with the real allowlist', () => {
     for (const legacy of [
       new File(['x'], 'gate-plan.ppt', { type: 'application/vnd.ms-powerpoint' }),
       new File(['x'], 'terminal-brief.doc', { type: 'application/msword' }),
-      new File(['x'], 'rota.xlsx', { type: EXCEL_MEDIA_TYPE }),
     ]) {
       // The ADVICE is what is under test, not the whole sentence: the message quotes the
       // citizen's own filename back to them, so `"rota.xlsx" isn't supported` legitimately
@@ -84,7 +99,7 @@ describe('the composer refusal sentence agrees with the real allowlist', () => {
       // from "we told you to bring it back in a format we also refuse".
       const advice = refusalFor(legacy).replace(/^"[^"]*"/, '')
       expect(advice, 'the refusal sends the citizen to a format the picker also refuses').not.toMatch(
-        /\.pptx|\.docx|\.xlsx|save as/i,
+        /save as|\.doc\b|\.ppt\b|\.xls\b/i,
       )
       // …and it still tells them what WOULD work, rather than only saying no.
       expect(advice).toMatch(/PDF/i)

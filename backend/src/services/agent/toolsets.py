@@ -38,6 +38,7 @@ from pydantic_ai.toolsets.function import FunctionToolset
 from pydantic_ai.usage import RunUsage
 
 from src.db.models.conversation import ChatKind
+from src.services.agent.attachment_tools import AttachmentReader, attachment_toolset
 from src.services.agent.conversation_tools import CONVERSATION_TOOLSET
 from src.services.agent.read_tools import ReadOnlyWorkspace, read_only_toolset
 from src.services.orchestrator.deps import SandboxSession
@@ -138,6 +139,7 @@ def toolsets_for_kind[DepsT](
     kind: ChatKind,
     workspace_of: Callable[[RunContext[DepsT]], ReadOnlyWorkspace],
     sandbox_of: Callable[[RunContext[DepsT]], SandboxSession] | None = None,
+    reader_of: Callable[[RunContext[DepsT]], AttachmentReader] | None = None,
 ) -> ToolSurface[DepsT]:
     """The per-run tool surface for a chat kind, over whatever deps type the caller's accessors
     resolve the workspace (and, for Build, the sandbox) from.
@@ -148,14 +150,25 @@ def toolsets_for_kind[DepsT](
     over the enum: an unknown kind is a programming error, not a fallback."""
     match kind:
         case ChatKind.PLAN:
-            return ToolSurface(
-                toolsets=[
-                    read_only_toolset(workspace_of),
-                    cast(AbstractToolset[DepsT], CONVERSATION_TOOLSET),
-                    cast(AbstractToolset[DepsT], _PLAN_OPTIONS_TOOLSET),
-                ],
-                may_write=False,
-            )
+            plan_toolsets: list[AbstractToolset[DepsT]] = [
+                read_only_toolset(workspace_of),
+                cast(AbstractToolset[DepsT], CONVERSATION_TOOLSET),
+                cast(AbstractToolset[DepsT], _PLAN_OPTIONS_TOOLSET),
+            ]
+            # THE ATTACHMENT CAPABILITY, ON THIS ARM ALONE. Plan already executes in
+            # the container, but only the eight read-only binaries on `check_the_guest_list` —
+            # `python3` is deliberately absent, so it cannot invoke the shipped reader the way
+            # Build does. Widening that list is not available: it is shared with the reviewer
+            # agent over untrusted contents and takes argv and nothing else, precisely so no body
+            # below can ask which agent is calling. Registering the capability HERE is the
+            # difference the architecture already sanctions — this function is the one place
+            # permitted to read the chat kind.
+            #
+            # Optional so the U8 agent-level surface, which has no sandbox at all, still builds a
+            # Plan run; a caller with no reader simply does not offer the tool.
+            if reader_of is not None:
+                plan_toolsets.append(attachment_toolset(reader_of))
+            return ToolSurface(toolsets=plan_toolsets, may_write=False)
         case ChatKind.BUILD:
             if sandbox_of is None:
                 raise ValueError(

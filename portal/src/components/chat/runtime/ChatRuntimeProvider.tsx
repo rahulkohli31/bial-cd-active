@@ -13,7 +13,7 @@
 import type { ReactNode } from 'react'
 import { AssistantRuntimeProvider, type AppendMessage } from '@assistant-ui/react'
 import { useChatRuntime } from './useChatRuntime'
-import { RefusalSinkProvider, StagedAttachmentsBinding, useBoundAttachmentAdapter } from './stagedAttachments'
+import { AttachmentAdapterProviders, useBoundAttachmentAdapter } from './stagedAttachments'
 import type { ChatMessage } from '../../../utils/messageTypes'
 
 export interface ChatRuntimeProviderProps {
@@ -33,14 +33,19 @@ export default function ChatRuntimeProvider({
   onCancel,
   children,
 }: ChatRuntimeProviderProps) {
-  const { adapter, stagedRef, refusalRef } = useBoundAttachmentAdapter()
-  const runtime = useChatRuntime({ messages, isRunning, onNew, onCancel, attachments: adapter })
+  const bound = useBoundAttachmentAdapter()
+  const runtime = useChatRuntime({
+    messages,
+    isRunning,
+    onNew,
+    onCancel,
+    attachments: bound.adapter,
+  })
   return (
     <AssistantRuntimeProvider runtime={runtime}>
-      <RefusalSinkProvider value={refusalRef}>
-        <StagedAttachmentsBinding target={stagedRef} />
-        {children}
-      </RefusalSinkProvider>
+      {/* The refusal sink, the pending-read count and the staged binding, mounted as
+          one so no composer can take two of the three — see `AttachmentAdapterProviders`. */}
+      <AttachmentAdapterProviders bound={bound}>{children}</AttachmentAdapterProviders>
     </AssistantRuntimeProvider>
   )
 }

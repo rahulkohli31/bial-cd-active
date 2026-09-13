@@ -5,6 +5,24 @@ starter plus the in-container **supervisor + Caddy + entrypoint** that run it, b
 Docker image. Snapshot/restore and the real Azure acceptance test have shipped (see *Ownership
 boundary*), and PTY-backed `/exec` is still deferred.
 
+## Ship order — read this before building the image
+
+**The image ships FIRST, and the portal ships BEFORE the backend.** This image and the control plane
+are versioned together by hand, so the order is load-bearing and the two halves fail in opposite
+directions:
+
+| Shipped | Result |
+|---|---|
+| New image, old backend | **Fine.** Nothing calls the new action. |
+| New portal, old backend | **Fine.** The portal's create-then-upload order works against either. |
+| New backend, old portal | **Broken.** Every file upload is refused — the shipped portal does not send the conversation id the backend now requires. |
+| New backend, old image | **Degraded, loudly.** Writing an attachment answers `400 … path escapes workspace`, because `/workspace/attachments` does not exist in the old image. That is *not* a control-plane path bug. |
+
+So: **image → portal → backend → worker.** Build with context `sandbox/` and
+`--platform linux/amd64`; push under an immutable tag **and** `:latest` (prod's `SANDBOX__IMAGE_REF`
+is on `:latest`). A template or supervisor change under a reused tag is silently untested — the
+preview comes up on the old image and reports healthy.
+
 **It is a STARTER, not a CRUD template.** `app/page.tsx` is a placeholder heading that says to
 replace it, and `db/schema.ts` is `export {};` with an empty migration journal beside it — there is
 deliberately no demonstration data model to work around or delete.

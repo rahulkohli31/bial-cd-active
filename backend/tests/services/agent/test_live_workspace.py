@@ -279,3 +279,82 @@ async def test_the_tool_layer_names_the_live_workspace_when_there_is_nothing_to_
     fake = FakeSandbox()
     feed = await _tool_feed(_live(fake, ""), "search_files", {"pattern": "visitors"})
     assert "your app's live workspace" in feed
+
+
+# --- the attachments prefix ---------------------------------------
+
+
+async def test_the_attachments_prefix_reaches_the_second_root() -> None:
+    """★ ATTACHMENTS LIVE OUTSIDE THE APP TREE, so an agent has to be able to NAME them.
+
+    The app tree is what gets snapshotted, restored, saved and deployed; a file someone attached
+    to a chat must not travel with any of that. Keeping it in a sibling directory means there is
+    nothing to exclude — but a sibling is unreachable unless the read surface can address it.
+
+    Mutation receipt: drop `to_container_path` from `read_file` and the argv carries the bare
+    `.attachments/roster.xlsx`, which resolves inside the app tree and finds nothing.
+    """
+    fake = FakeSandbox()
+    workspace = _live(fake, stdout="badge,name\n")
+
+    await workspace.read_file(".attachments/roster.xlsx")
+
+    argv = fake.command_calls[-1]
+    assert "/workspace/attachments/roster.xlsx" in argv
+    assert ".attachments/roster.xlsx" not in argv
+
+
+async def test_an_ordinary_app_path_is_not_translated() -> None:
+    """The translation is for exactly one prefix and a no-op for everything else — an app path
+    must reach the container unchanged or every existing read breaks."""
+    fake = FakeSandbox()
+    workspace = _live(fake, stdout="export default function Page() {}\n")
+
+    await workspace.read_file("app/page.tsx")
+
+    argv = fake.command_calls[-1]
+    assert "app/page.tsx" in argv
+    assert not any("/workspace/attachments" in token for token in argv)
+
+
+async def test_the_prefix_is_dotted_so_a_real_app_directory_cannot_be_shadowed() -> None:
+    """A bare `attachments/` would shadow an app that happened to contain a directory of that
+    name — silently reading somebody's chat files when they asked for their own source. The
+    reserved prefix is dotted, and the undotted spelling stays an ordinary app path."""
+    fake = FakeSandbox()
+    workspace = _live(fake, stdout="")
+
+    await workspace.read_file("attachments/notes.md")
+
+    argv = fake.command_calls[-1]
+    assert "attachments/notes.md" in argv
+    assert not any("/workspace/attachments" in token for token in argv)
+
+
+async def test_the_prefix_does_not_relax_the_shared_path_guard() -> None:
+    """★ THE PART THAT MUST NOT HAVE MOVED. `_vet_path_token` is shared with the reviewer agent,
+    which runs over untrusted project contents, and it deliberately cannot tell which agent is
+    calling. So the prefix is an ordinary relative path that PASSES the existing checks — it is
+    not an exemption from them, and every escape the guard refused before is still refused when
+    it is spelled with the prefix in front."""
+    workspace = _live(FakeSandbox())
+
+    for bad in (
+        "/workspace/attachments/roster.xlsx",  # absolute: still refused
+        "~/.attachments/roster.xlsx",  # home-relative: still refused
+        ".attachments/../../etc/passwd",  # climbing out: still refused
+        ".attachments/../app/page.tsx",  # crossing into the app tree: still refused
+    ):
+        with pytest.raises(WorkspacePathError):
+            await workspace.read_file(bad)
+
+
+async def test_search_can_be_scoped_to_the_attachments_root() -> None:
+    """`search_files`' subdir operand goes through the same translation, after the same vetting."""
+    fake = FakeSandbox()
+    workspace = _live(fake, stdout="")
+
+    await workspace.search_files(re.compile("badge"), ".attachments")
+
+    argv = fake.command_calls[-1]
+    assert "/workspace/attachments" in argv

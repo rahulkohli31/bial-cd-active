@@ -102,10 +102,6 @@ class ApiSettings(CoreSettings):
     # Pydantic AI's TestModel and make no live call, and None means "AI chat not configured".
     foundry: FoundryConfig | None = None
 
-    # Gotenberg sidecar base URL for pptx->PDF deck conversion. None disables deck conversion, so
-    # dev/test boot without a Gotenberg sidecar.
-    GOTENBERG_URL: str | None = None
-
     # Built React/Vite SPA directory served by FastAPI when it runs as the whole stack. None =
     # FastAPI serves NO SPA, correct for two-process local dev where Vite serves it on :5173. A
     # value that IS set but has no built `index.html` fails at startup (`_mount_spa`).

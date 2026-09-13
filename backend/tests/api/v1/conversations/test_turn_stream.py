@@ -1335,28 +1335,149 @@ async def _conversation_count(db_session, user_id) -> int:
     return int(total or 0)
 
 
-async def _post_first_message(
-    client, headers, chat_id, project_id, *, kind="build", text="a visitor log"
-):
-    """A chat's FIRST message: the id is minted by the client, the row does not exist yet, and the
-    parentage rides the turn request rather than a separate create call."""
+async def _create_chat(client, headers, chat_id, project_id, *, kind="build"):
+    """The round trip that now precedes a chat's first message.
+
+    ★ NO TITLE, and that is the composer's real shape rather than a shortcut: `deriveTitle` reads
+    the draft, and the draft is not known until the send, one round trip later. Stamping refused
+    text into a row nobody can delete would be worse than leaving it unnamed, so the first message
+    that actually lands titles the chat.
+    """
     return await client.post(
-        f"/v1/conversations/{chat_id}/turns",
+        "/v1/conversations",
         headers=headers,
-        json={
-            "message": {"text": text, "attachmentTexts": [], "attachmentIds": []},
-            "create": {"projectId": str(project_id), "kind": kind, "title": text},
-        },
+        json={"id": str(chat_id), "projectId": str(project_id), "kind": kind},
     )
 
 
-async def test_a_first_message_refused_by_the_workspace_leaves_no_conversation_behind(
+async def _post_first_message(
+    client, headers, chat_id, project_id, *, kind="build", text="a visitor log"
+):
+    """A chat's FIRST message, in the order the composer now sends it: create the row, then post
+    the turn against it.
+
+    ★ THE `create` BLOCK IS GONE, and this helper is what that cost. It used to carry the
+    chat's parentage on the turn itself, so the server could check the workspace and write the row
+    in ONE transaction — every refusal above the creation left nothing behind, and the project's
+    chat list was afterwards exactly as long as it was before (R-18).
+
+    An upload names the conversation it belongs to now, so the row has to exist before the first
+    FILE goes up, which is a round trip before the turn. Two orderings cannot both be true. The
+    tests below assert what the trade actually produces rather than the guarantee it replaced.
+    """
+    created = await _create_chat(client, headers, chat_id, project_id, kind=kind)
+    if created.status_code not in (200, 201):
+        return created
+    return await client.post(
+        f"/v1/conversations/{chat_id}/turns",
+        headers=headers,
+        json={"message": {"text": text, "attachmentTexts": [], "attachmentIds": []}},
+    )
+
+
+async def test_the_first_message_of_a_new_chat_can_carry_a_spreadsheet(
+    client, db_session, set_chat_model, fake_redis, fake_storage, app, _fresh_engine
+) -> None:
+    """★ THIS WAS A HARD 500, on the opening move of a demo.
+
+    The 500 was an adoption UPDATE autoflushed into a foreign key that did not exist yet: the
+    upload stored NULL because the chat's row was written by the first send, and the send route
+    linked it afterwards. Both halves of that are gone — the row exists before the upload, so the
+    link is stamped at insert and nothing adopts anything.
+
+    THE TEST STAYS because the journey it covers is the one that broke: a brand-new chat whose
+    very first message carries a spreadsheet, driven through the real routes in the real order.
+    """
+    import base64
+    import io
+
+    from openpyxl import Workbook
+
+    from src.api.v1.build_sessions.deps import sandbox_or_none_dependency
+    from src.api.v1.conversations._shared import chat_storage
+    from src.db.models.attachment import Attachment
+    from tests.fakes import FakeSandboxClient
+
+    set_chat_model(_streaming_text("ok"))
+    user = await UserFactory.create(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    await db_session.commit()
+    headers = _headers(user)
+    chat_id = uuid.uuid4()
+
+    # THE CHAT FIRST. The composer creates the row before it uploads anything against it.
+    created = await _create_chat(client, headers, chat_id, project.id, kind="plan")
+    assert created.status_code == 201, created.text
+
+    # A real workbook, because the upload door checks that it is one.
+    book = io.BytesIO()
+    Workbook().save(book)
+    uploaded = await client.post(
+        "/v1/attachments",
+        headers=headers,
+        json={
+            "conversationId": str(chat_id),
+            "attachmentId": "att_first_book",
+            "name": "roster.xlsx",
+            "mediaType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "base64": base64.b64encode(book.getvalue()).decode(),
+        },
+    )
+    assert uploaded.status_code == 201, uploaded.text
+
+    # The turn route reads its store through `chat_storage`, not the upload's
+    # `storage_dependency` the conftest binds — an attachment id with no store is a typed 503.
+    app.dependency_overrides[chat_storage] = lambda: fake_storage
+    app.dependency_overrides[sandbox_or_none_dependency] = lambda: FakeSandboxClient()
+    try:
+        resp = await client.post(
+            f"/v1/conversations/{chat_id}/turns",
+            headers=headers,
+            json={
+                "message": {
+                    "text": "what is in this roster?",
+                    "attachmentTexts": [],
+                    "attachmentIds": ["att_first_book"],
+                },
+            },
+        )
+        assert resp.status_code == 202, resp.text
+        # The turn runs on after the 202, on the session the test shares with the app — wait for
+        # it before reading, as every other first-message test in this file does.
+        await _settle(_fresh_engine, chat_id)
+    finally:
+        app.dependency_overrides.pop(sandbox_or_none_dependency, None)
+        app.dependency_overrides.pop(chat_storage, None)
+
+    # The file belongs to the chat from the moment it was stored, so turn two still finds it.
+    db_session.expire_all()
+    linked = await db_session.scalar(
+        sa.select(Attachment.conversation_id).where(Attachment.attachment_id == "att_first_book")
+    )
+    assert linked == chat_id
+
+
+async def test_a_first_message_refused_by_the_workspace_leaves_an_empty_chat_and_no_turn(
     client, db_session, set_chat_model, fake_redis, fake_storage, app
 ) -> None:
-    """★ THE SCENARIO THE BUG IS: a 409 always came back, but it also deposited a titled,
-    empty conversation into the project, named after the very text the platform had just
-    refused."""
+    """★ THE TRADE THE NEW ORDERING MAKES, ASSERTED RATHER THAN ASSUMED — this test used to
+    say the opposite.
+
+    It used to pin R-18: a first message refused by the workspace left NOTHING, because the row
+    was staged inside the turn's transaction and rolled back with it. The row is created a round
+    trip earlier now, so the refusal leaves it behind.
+
+    WHAT IS STILL TRUE IS THE HALF THAT COSTS THE CITIZEN SOMETHING. The chat is EMPTY and
+    UNTITLED — no turn row, no spent card, and nothing named after text the platform just refused.
+    The observed failure this all began with was a citizen watching a build run for two minutes
+    and then being asked whether they wanted the workspace at all, with a chat titled after the
+    refused message sitting in their project; that does not happen.
+
+    Sweeping the empty row is a separate, already-tracked task. Recorded here so it is a known
+    cost rather than something the next person discovers.
+    """
     from src.api.v1.build_sessions.deps import sandbox_or_none_dependency
+    from src.db.models.message import Message
     from src.services.build_sessions.manager import SandboxReclaimBlockedError, SessionManager
     from tests.fakes import FakeSandboxClient
 
@@ -1366,6 +1487,7 @@ async def test_a_first_message_refused_by_the_workspace_leaves_no_conversation_b
     await db_session.commit()
     user_id, project_id, headers = user.id, project.id, _headers(user)
     before = await _conversation_count(db_session, user_id)
+    chat_id = uuid.uuid4()
 
     async def _blocked(*a, **k):
         raise SandboxReclaimBlockedError(
@@ -1376,42 +1498,58 @@ async def test_a_first_message_refused_by_the_workspace_leaves_no_conversation_b
     SessionManager.reclaim_preflight = _blocked  # type: ignore[method-assign]
     app.dependency_overrides[sandbox_or_none_dependency] = lambda: FakeSandboxClient()
     try:
-        resp = await _post_first_message(client, headers, uuid.uuid4(), project_id)
+        resp = await _post_first_message(client, headers, chat_id, project_id)
     finally:
         SessionManager.reclaim_preflight = monkey  # type: ignore[method-assign]
         app.dependency_overrides.pop(sandbox_or_none_dependency, None)
 
     assert resp.status_code == 409
     assert resp.json()["error"]["code"] == "sandbox_reclaim_blocked"
-    # THE ASSERTION THAT MATTERS. Not one row, not a soft-deleted one — the list is exactly as long
-    # as it was before the message was sent.
-    assert await _conversation_count(db_session, user_id) == before
+
+    db_session.expire_all()
+    # The row is there — the cost, stated.
+    assert await _conversation_count(db_session, user_id) == before + 1
+    row = await db_session.scalar(sa.select(Conversation).where(Conversation.id == chat_id))
+    assert row is not None
+    # ...and it is EMPTY and UNTITLED, which is the half that still protects the citizen.
+    assert not row.title
+    messages = await db_session.scalar(
+        sa.select(sa.func.count()).select_from(Message).where(Message.conversation_id == chat_id)
+    )
+    assert int(messages or 0) == 0, "a refused message must not be recorded"
 
 
-async def test_every_other_side_effect_free_refusal_leaves_zero_rows_too(
+async def test_every_other_side_effect_free_refusal_records_no_turn_either(
     client, db_session, set_chat_model, fake_redis, fake_storage, app
 ) -> None:
-    """A fix that only covered the reclaim refusal would leave THREE other ways to make the same
-    orphan. Each refusal below sits above the creation, and each is asserted against the list."""
+    """A fix that only covered the reclaim refusal would leave three other ways to record a turn
+    the citizen never got. Each refusal below sits above the first write, and each is asserted
+    against the message count rather than against the conversation list — which the create call a
+    round trip earlier has already added to."""
     from src.api.v1.build_sessions.deps import sandbox_or_none_dependency
+    from src.db.models.message import Message
 
     set_chat_model(_streaming_text("ok"))
     user = await UserFactory.create(db_session)
     project = await ProjectFactory.create(db_session, user.id)
     await db_session.commit()
-    user_id, project_id, headers = user.id, project.id, _headers(user)
-    before = await _conversation_count(db_session, user_id)
+    project_id, headers = project.id, _headers(user)
+    chat_id = uuid.uuid4()
 
     # The one refusal that needs the sandbox seam UNBOUND — written here rather than assumed
     # by the suite's default fixture.
     app.dependency_overrides[sandbox_or_none_dependency] = lambda: None
     try:
-        refused = await _post_first_message(client, headers, uuid.uuid4(), project_id)
+        refused = await _post_first_message(client, headers, chat_id, project_id)
     finally:
         app.dependency_overrides.pop(sandbox_or_none_dependency, None)
 
     assert refused.status_code == 503
-    assert await _conversation_count(db_session, user_id) == before
+    db_session.expire_all()
+    messages = await db_session.scalar(
+        sa.select(sa.func.count()).select_from(Message).where(Message.conversation_id == chat_id)
+    )
+    assert int(messages or 0) == 0
 
 
 async def test_a_project_someone_else_owns_is_refused_and_creates_nothing(
@@ -1419,7 +1557,11 @@ async def test_a_project_someone_else_owns_is_refused_and_creates_nothing(
 ) -> None:
     """OWNERSHIP IS CHECKED BEFORE ANYTHING IS READ OR WRITTEN, and the 404 is the same
     non-leaking answer an unknown project gets — existence under another owner is not
-    distinguishable from absence."""
+    distinguishable from absence.
+
+    The check moved with the creation: it is `POST /v1/conversations` that refuses now, one round
+    trip earlier, so the refusal arrives before the citizen has even typed a message.
+    """
     set_chat_model(_streaming_text("ok"))
     mine = await UserFactory.create(db_session)
     theirs = await UserFactory.create(db_session)
@@ -1458,12 +1600,16 @@ async def test_a_first_message_with_the_workspace_free_creates_exactly_one_conve
     assert await _conversation_count(db_session, user_id) == 1
 
 
-async def test_the_row_and_the_first_message_become_durable_together(
+async def test_the_first_message_lands_in_the_row_the_create_call_made(
     client, db_session, set_chat_model, fake_redis, fake_storage, _fresh_engine
 ) -> None:
-    """`flush`, NOT `commit`. The row is durable only when the turn's own commit lands, so a
-    failure between the two leaves NEITHER — the property that makes every refusal below the
-    creation safe as well as every one above it."""
+    """★ THE PAIRING THAT REPLACED "durable together".
+
+    The row and its first message used to become durable in one commit — a flush, never a commit,
+    so a failure between the two left neither. The row is committed by its own route now, so what
+    is left to assert is that the message lands in THAT row rather than in one the turn made for
+    itself: two rows under one client-minted id would be the failure this ordering could produce.
+    """
     from sqlalchemy import func, select
 
     from src.db.models.message import Message
@@ -1480,6 +1626,10 @@ async def test_the_row_and_the_first_message_become_durable_together(
 
     db_session.expire_all()
     assert await db_session.get(Conversation, chat_id) is not None
+    with_that_id = await db_session.scalar(
+        select(func.count()).select_from(Conversation).where(Conversation.id == chat_id)
+    )
+    assert int(with_that_id or 0) == 1
     messages = await db_session.scalar(
         select(func.count()).select_from(Message).where(Message.conversation_id == chat_id)
     )
@@ -1489,8 +1639,8 @@ async def test_the_row_and_the_first_message_become_durable_together(
 async def test_a_second_message_in_an_existing_conversation_is_unchanged(
     client, db_session, set_chat_model, fake_redis, fake_storage, _fresh_engine
 ) -> None:
-    """THIS IS THE FIRST-MESSAGE PATH ONLY. A chat that already exists takes no `create` block, and
-    a stale one is ignored rather than refused — a retry or a second tab must not 409."""
+    """THIS IS THE FIRST-MESSAGE PATH ONLY. A chat that already exists takes no create call at
+    all — the composer makes one only when `seq` is zero."""
     set_chat_model(_streaming_text("ok"))
     user, conv = await _auth_with_conversation(db_session)
     user_id, conv_id, headers = user.id, conv.id, _headers(user)
@@ -1503,219 +1653,56 @@ async def test_a_second_message_in_an_existing_conversation_is_unchanged(
     assert await _conversation_count(db_session, user_id) == before
 
 
-async def test_a_create_block_on_a_conversation_that_already_exists_is_ignored(
+async def test_creating_a_chat_that_already_exists_is_idempotent_not_a_conflict(
     client, db_session, set_chat_model, fake_redis, fake_storage, _fresh_engine
 ) -> None:
-    """Idempotency the separate create route used to provide, kept: two tabs racing the same mint,
-    or a retry after a dropped response, must not 409 and must not make a second row."""
+    """★ THE RETRY AFTER A REFUSED FIRST SEND, which the new ordering makes an ordinary case
+    rather than a rare
+    one: the refusal leaves a real, empty chat, and the citizen's second attempt calls create
+    again on the same id. If that answered 409 the leftover row would refuse its own retry, and
+    the citizen would be stuck in a chat they cannot use and cannot delete.
+
+    Two tabs racing the same mint take the same path. The existing row wins outright: a chat's
+    kind is fixed at creation, and re-creating it is not a route that changes one.
+    """
     set_chat_model(_streaming_text("ok"))
     user, conv = await _auth_with_conversation(db_session, kind=ChatKind.BUILD)
     user_id, conv_id, project_id, headers = user.id, conv.id, conv.project_id, _headers(user)
     before = await _conversation_count(db_session, user_id)
 
-    resp = await _post_first_message(client, headers, conv_id, project_id, kind="plan")
+    again = await _create_chat(client, headers, conv_id, project_id, kind="build")
+    assert again.status_code == 200, again.text  # 200, not 201 and not 409
 
+    resp = await _post_turn(client, headers, conv)
     assert resp.status_code == 202
     await _settle(_fresh_engine, conv_id)
+
     row = await db_session.scalar(sa.select(Conversation).where(Conversation.id == conv_id))
     assert row is not None
-    # THE EXISTING ROW WINS. A `create` block naming a different kind must not mutate one — a
-    # chat's kind is fixed at creation and there is no route that changes it.
     assert row.kind is ChatKind.BUILD
     assert await _conversation_count(db_session, user_id) == before
 
 
-@pytest.mark.route_rollback
-async def test_a_first_message_that_loses_the_insert_race_joins_the_winners_chat(
-    client, db_session, set_chat_model, fake_redis, fake_storage, _fresh_engine, monkeypatch
-) -> None:
-    """★ THE GENUINE RACE: two first messages on the same client-minted id in flight at once,
-    both finding nothing at the idempotency read and one losing the insert. Reached by
-    blinding `_conversation_or_none` to answer None exactly once, under
-    `@pytest.mark.route_rollback` (per-test only — a savepoint-joined session provisions its
-    connection lazily, and any test whose detached task shares it breaks). See
-    `_rollback_like_production` below for why the fixture's rollback must be overridden to
-    match production, and what that makes mutation-detectable."""
-    from src.api.v1.conversations import turns as turns_module
-    from src.db.models.message import Message
-    from src.services.messages.projection import UserTextItem, project_rows
-    from src.services.messages.store import load_rows
-
-    set_chat_model(_streaming_text("picking up where the winner left off"))
-    user = await UserFactory.create(db_session)
-    project = await ProjectFactory.create(db_session, user.id)
-    # Deliberately given a kind and title the loser's `create` block disagrees with, so the
-    # assertions at the end can tell "continued on the winner's row" from "quietly used the
-    # staged object".
-    winner = await ConversationFactory.create(
-        db_session,
-        user.id,
-        project_id=project.id,
-        kind=ChatKind.PLAN,
-        title="the winner's title",
-    )
-    # Commit so the savepoint holding this setup is released before the request opens its
-    # own — the route's rollback can then reach only what the route itself wrote.
-    await db_session.commit()
-    user_id, project_id, chat_id = user.id, project.id, winner.id
-    headers = _headers(user)
-    before = await _conversation_count(db_session, user_id)
-
-    real_rollback = db_session.rollback
-
-    async def _rollback_like_production() -> None:
-        # A savepoint rollback expires only what changed inside the savepoint; the real one
-        # expires the WHOLE identity map, so every instance already loaded comes back needing
-        # a lazy SELECT — which is what makes the route's two `db.refresh` calls
-        # mutation-detectable: delete either one and this test goes red on `MissingGreenlet`.
-        await real_rollback()
-        db_session.expire_all()
-
-    monkeypatch.setattr(db_session, "rollback", _rollback_like_production)
-
-    real_read = turns_module._conversation_or_none
-    reads = {"n": 0}
-
-    async def _blind_the_first_read(db, uid, cid):
-        """`None` once — the answer the losing request really got — then the truth."""
-        reads["n"] += 1
-        if reads["n"] == 1:
-            return None
-        return await real_read(db, uid, cid)
-
-    monkeypatch.setattr(turns_module, "_conversation_or_none", _blind_the_first_read)
-
-    resp = await _post_first_message(client, headers, chat_id, project_id, kind="build")
-
-    # 202, not the old 500: the loser's message is accepted and its turn is real.
-    assert resp.status_code == 202, resp.text
-    turn_id = resp.json()["turnId"]
-    # LIVENESS: the create branch was genuinely taken and the flush genuinely collided. Only the
-    # `except IntegrityError` arm reads the conversation a second time, so a test that reached
-    # here with one read would be pinning the fast path under this test's name.
-    assert reads["n"] == 2, "the create branch was never taken — the blind did not take effect"
-    await _settle(_fresh_engine, chat_id)
-
-    state = _fresh_engine.peek(chat_id)
-    assert state is not None
-    assert str(state.turn_id) == turn_id
-    assert state.conversation_id == chat_id
-
-    # Exactly one row: a second row under this id is the outcome the arm exists to prevent.
-    with_that_id = await db_session.scalar(
-        sa.select(sa.func.count()).select_from(Conversation).where(Conversation.id == chat_id)
-    )
-    assert int(with_that_id or 0) == 1
-    assert await _conversation_count(db_session, user_id) == before
-
-    # The winner's row is untouched: the loser's `create` block said `build`, but a chat's
-    # kind is fixed at creation, and losing a race is not a route that changes it.
-    row = await db_session.scalar(sa.select(Conversation).where(Conversation.id == chat_id))
-    assert row is not None
-    assert row.kind is ChatKind.PLAN
-    assert row.title == "the winner's title"
-
-    # And the message the citizen typed is in that chat — the half the old 500 destroyed.
-    stored = await db_session.scalar(
-        sa.select(sa.func.count()).select_from(Message).where(Message.conversation_id == chat_id)
-    )
-    assert int(stored or 0) >= 1
-    items = project_rows(
-        list(await load_rows(db_session, user_id=user_id, conversation_id=chat_id))
-    )
-    assert [item.text for item in items if isinstance(item, UserTextItem)] == ["a visitor log"]
+# ★ THE TWO INSERT-RACE TESTS ARE GONE, WITH THE ARM THEY COVERED.
+#
+# They drove `turns.py`'s `except IntegrityError` branch: two first messages on one client-minted
+# id in flight at once, both finding nothing at the idempotency read and one losing the insert —
+# and they pinned the loser joining the winner's chat, taking the winner's PROJECT, and keeping
+# its own message. That branch existed because this route created conversations.
+#
+# It does not any more, so the race moved with the creation to `POST /v1/conversations`,
+# which has had the identical arm all along and is covered by `test_create.py`'s idempotency and
+# conflict cases. Deleting the tests here rather than re-pointing them is deliberate: re-pointed,
+# they would assert `test_create.py`'s behaviour under this file's name and through a route that
+# no longer has a branch to take.
 
 
-@pytest.mark.route_rollback
-async def test_the_loser_of_the_race_takes_the_winners_project_not_its_own_staged_one(
-    client, db_session, set_chat_model, fake_redis, fake_storage, _fresh_engine, monkeypatch
-) -> None:
-    """★ THE OTHER HALF OF JOINING THE WINNER'S CHAT: joining its PROJECT too. Left unrebound,
-    everything downstream keeps the LOSER's staged `project_id` while the engine gets
-    `conversation.project_id`, the winner's — one turn pinning one project while told it is
-    another. Two DIFFERENT projects, not the same one the shipped SPA races, so the pin names
-    one of them out loud instead of the mismatch being invisible behind equal ids.
-
-    Mutation check: delete the `project_id = conversation.project_id` rebind in the route's
-    `except IntegrityError` arm and all three assertions below go red together."""
-    from src.api.v1.conversations import turns as turns_module
-    from tests.factories import AppRegistryFactory
-
-    set_chat_model(_streaming_text("picking up in the winner's project"))
-    user = await UserFactory.create(db_session)
-    winners_project = await ProjectFactory.create(db_session, user.id, name="the winner's project")
-    losers_project = await ProjectFactory.create(db_session, user.id, name="the loser's project")
-    winners_app = await AppRegistryFactory.create(
-        db_session, user_id=user.id, project_id=winners_project.id
-    )
-    losers_app = await AppRegistryFactory.create(
-        db_session, user_id=user.id, project_id=losers_project.id
-    )
-
-    winner = await ConversationFactory.create(
-        db_session, user.id, project_id=winners_project.id, kind=ChatKind.PLAN
-    )
-    await db_session.commit()
-    # Every id read off an ORM object is taken NOW: the route's rollback expires the whole
-    # identity map (reproduced below), so an attribute read after the request would be a lazy
-    # SELECT an async session answers with `MissingGreenlet`.
-    chat_id, winners_project_id = winner.id, winners_project.id
-    losers_project_id = losers_project.id
-    winners_app_id, losers_app_id = winners_app.id, losers_app.id
-    headers = _headers(user)
-
-    real_rollback = db_session.rollback
-
-    async def _rollback_like_production() -> None:
-        await real_rollback()
-        db_session.expire_all()
-
-    monkeypatch.setattr(db_session, "rollback", _rollback_like_production)
-
-    real_read = turns_module._conversation_or_none
-    reads = {"n": 0}
-
-    async def _blind_the_first_read(db, uid, cid):
-        reads["n"] += 1
-        return None if reads["n"] == 1 else await real_read(db, uid, cid)
-
-    monkeypatch.setattr(turns_module, "_conversation_or_none", _blind_the_first_read)
-
-    started: dict[str, Any] = {}
-    real_start = turns_module.start_conversation_turn
-
-    async def _record_what_the_turn_was_started_with(**kwargs):
-        started.update(kwargs)
-        return await real_start(**kwargs)
-
-    monkeypatch.setattr(
-        turns_module, "start_conversation_turn", _record_what_the_turn_was_started_with
-    )
-
-    assert winners_app_id != losers_app_id  # or the pin below could not tell them apart
-    resp = await _post_first_message(
-        client, headers, chat_id, losers_project_id, kind="build", text="a visitor log"
-    )
-
-    assert resp.status_code == 202, resp.text
-    # LIVENESS: the create branch was genuinely taken and the flush genuinely collided — only the
-    # `except IntegrityError` arm reads the conversation a second time.
-    assert reads["n"] == 2, "the create branch was never taken — the blind did not take effect"
-    await _settle(_fresh_engine, chat_id)
-
-    assert started["app_id"] == winners_app_id
-    # The prompt must derive from the SAME id as the pin, or the agent is told it is somewhere
-    # it is not.
-    assert started["prompt_context"].project_name == "the winner's project"
-    assert started["conversation"].project_id == winners_project_id
-
-
-async def test_an_unknown_conversation_with_no_parentage_is_still_a_404(
+async def test_an_unknown_conversation_is_a_404_on_every_turn(
     client, db_session, set_chat_model, fake_redis, fake_storage
 ) -> None:
-    """Unchanged for every turn after the first. Without a `create` block there is nothing to build
-    a row from, so an unknown id is a client bug — and a cross-user id is indistinguishable from
-    it, which is one non-leaking answer."""
+    """Unchanged for every turn, and now true of the first one as well: this route builds no row
+    from anything, so an unknown id is a client bug — and a cross-user id is indistinguishable
+    from it, which is one non-leaking answer."""
     set_chat_model(_streaming_text("ok"))
     user = await UserFactory.create(db_session)
     await db_session.commit()

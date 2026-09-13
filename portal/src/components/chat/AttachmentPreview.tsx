@@ -22,7 +22,7 @@
  */
 import { useEffect, useState, type FC } from 'react'
 
-import { TEXT_MEDIA_TYPES } from '../../utils/attachmentInput'
+import { TEXT_PREVIEW_MEDIA_TYPES } from '../../utils/attachmentInput'
 import { decodeBase64Text } from '../../utils/attachmentStore'
 
 import {
@@ -69,7 +69,9 @@ const AttachmentPreview: FC<AttachmentPreviewProps> = ({ target, onClose }) => {
   if (!target) return null
   const src = target.dataUrl ?? null
   const isImage = target.mediaType.startsWith('image/')
-  const isText = TEXT_MEDIA_TYPES.has(target.mediaType)
+  // The DISPLAY set, not the transport one: whether this can be rendered in place is a
+  // different question from whether it was inlined into the prompt.
+  const isText = TEXT_PREVIEW_MEDIA_TYPES.has(target.mediaType)
   const text = isText ? decodedText(target) : null
 
   return (

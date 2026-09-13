@@ -68,16 +68,19 @@ describe('wireMessageFromParts — the stateless wire message', () => {
     expect(JSON.stringify(message)).not.toContain('base64')
   })
 
-  it('an inline text attachment rides as a fence block alongside the prose', () => {
+  it('a stored fence part is FILTERED, not sent, now that nothing mints one', () => {
+    // THE PRODUCER WENT, THE FILTER STAYED, and they are not the same thing. A CSV used
+    // to be read in the browser and pushed into the prompt as a fence block; every attachment
+    // is an uploaded file now, so nothing produces one of these parts. But conversations
+    // already on disk carry them, and this filter is what keeps a stored CSV body off the wire
+    // - deleting it with its producer would send a 4,000-row file as the citizen's own prose.
     const message = wireMessageFromParts([
-      textAttachmentPart('d.csv', 'a,b\n1,2'),
+      textAttachmentPart('d.csv', 'a,b'),
       imagePart('img'),
       { type: 'text', text: 'turn 1' },
     ])
     expect(message.text).toBe('turn 1')
-    expect(message.attachmentTexts).toHaveLength(1)
-    expect(message.attachmentTexts[0]).toContain('<attachment name="d.csv" type="text">')
-    expect(message.attachmentTexts[0]).toContain('a,b\n1,2')
+    expect(message.attachmentTexts).toBeUndefined()
     expect(message.attachmentIds).toEqual(['img'])
   })
 
@@ -93,17 +96,22 @@ describe('decodeBase64Text', () => {
 })
 
 describe('buildUserParts', () => {
-  it('inlines text attachments and uploads binaries, prose text last', async () => {
+  it('uploads EVERY attachment, prose text last', async () => {
+    // ONE MECHANISM. A CSV was read in the browser and inlined; a PNG was uploaded. Both
+    // are uploads now - which is what lets a chip be rebuilt on reload for every format by one
+    // fix, because the inline lane could never produce an identity to rebuild from.
     const upload = vi.fn(async (a) => ({ attachmentId: a.attachmentId, key: `att/u/${a.attachmentId}`, kind: 'image', name: a.name, mediaType: a.mediaType, size: a.size }))
     const pending = [
-      { id: 'csv1', name: 'r.csv', mediaType: 'text/csv', size: 5, base64: b64Utf8('a,b\n1') },
+      { id: 'csv1', name: 'r.csv', mediaType: 'text/csv', size: 5, base64: b64Utf8('a,b') },
       { id: 'img1', name: 'p.png', mediaType: 'image/png', size: 10, base64: 'AAAA' },
     ]
+
     const parts = await buildUserParts('analyze these', pending, upload)
-    expect(parts[0]).toEqual({ type: 'text', text: 'a,b\n1', attachment: { attachmentId: 'csv1', name: 'r.csv', mediaType: 'text/csv', size: 5 } })
-    expect(parts[1]).toMatchObject({ type: 'file', attachmentId: 'img1', kind: 'image', mediaType: 'image/png' })
+
+    expect(parts[0]).toMatchObject({ type: 'file', attachmentId: 'csv1', mediaType: 'text/csv' })
+    expect(parts[1]).toMatchObject({ type: 'file', attachmentId: 'img1', mediaType: 'image/png' })
     expect(parts[2]).toEqual({ type: 'text', text: 'analyze these' })
-    expect(upload).toHaveBeenCalledTimes(1) // only the binary uploaded
+    expect(upload).toHaveBeenCalledTimes(2)  // both, not one
   })
 
   it('propagates an upload failure so the caller can abort the send', async () => {
@@ -183,5 +191,35 @@ describe('no conversion-dependent part can be produced', () => {
     expect(wire.attachmentIds).toEqual(['a1'])
     expect(wire.text).toBe('hello')
     expect(JSON.stringify(wire)).not.toMatch(/deck|pdfFileId|pageCount/)
+  })
+})
+
+describe('the conversation link rides with an upload', () => {
+  it('sends the thread id, so the row can be counted per conversation', async () => {
+    // THE GAP THIS CLOSES. The server has always accepted `conversationId`, resolved it
+    // owner-scoped and stamped it on the row — and no client ever sent one, so every stored
+    // attachment had conversation_id NULL. A per-conversation count or storage budget would have
+    // counted nothing at all, which is the wrong way for a limit to appear to work.
+    //
+    // Mutation receipt: drop `conversationId` from the upload body and this goes red.
+    const upload = vi.fn(async (a) => ({
+      attachmentId: a.attachmentId, key: 'k', kind: 'image', name: a.name, mediaType: a.mediaType, size: a.size,
+    }))
+    const pending = [{ id: 'a1', name: 'gate.png', mediaType: 'image/png', size: 10, base64: 'x' }]
+
+    await buildUserParts('look', pending, upload, 'conv-42')
+
+    expect(upload.mock.calls[0][0].conversationId).toBe('conv-42')
+  })
+
+  it('omits it rather than inventing one when no thread is given', async () => {
+    const upload = vi.fn(async (a) => ({
+      attachmentId: a.attachmentId, key: 'k', kind: 'image', name: a.name, mediaType: a.mediaType, size: a.size,
+    }))
+    const pending = [{ id: 'a1', name: 'gate.png', mediaType: 'image/png', size: 10, base64: 'x' }]
+
+    await buildUserParts('look', pending, upload)
+
+    expect(upload.mock.calls[0][0].conversationId).toBeUndefined()
   })
 })

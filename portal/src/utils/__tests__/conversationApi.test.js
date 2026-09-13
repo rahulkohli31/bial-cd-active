@@ -5,6 +5,7 @@ import {
   listProjectConversations,
   getConversation,
   messagesFromProjection,
+  createConversation as mod_createConversation,
   createConversationStore,
   deriveTitle,
 } from '../conversationApi'
@@ -63,7 +64,7 @@ describe('getConversation', () => {
       ok({
         conversation: { _id: 'c1', kind: 'build', title: 'App', context: { theme: 'bial' } },
         projection: [
-          { type: 'user_text', seq: 0, text: 'hi', attachmentIds: [] },
+          { type: 'user_text', seq: 0, text: 'hi', attachments: [] },
           { type: 'assistant_text', seq: 1, text: 'hello!' },
         ],
         activeTurn: null,
@@ -282,28 +283,31 @@ describe('messagesFromProjection — the loud fallback arm', () => {
   })
 })
 
-describe('the create / patch / delete round trips are gone', () => {
+describe('the patch / delete round trips are gone, and create came back on purpose', () => {
   /**
-   * A GUARD, not deleted coverage. All three were clients with no caller, and
-   * each lost its caller to a decision rather than to an accident.
+   * A GUARD, NARROWED — not deleted, and not widened by accident.
    *
-   * `createConversation` and `patchConversation`: a row's parentage rides its FIRST TURN now
-   * (`startTurn`'s `create` block), written inside that turn's transaction after every
-   * side-effect-free refusal — so a refused first message no longer leaves a titled, empty chat
-   * in the project, which is what the separate `POST /conversations` round trip did. The wire
-   * contract this block used to assert — THE CHAT'S KIND IS BOUND INTO THE CREATE BODY — moved
-   * with it, to `turnStreamApi.test.ts`, against the request that now carries it.
+   * It used to cover three absences. `createConversation` IS BACK, and that was a decision
+   * someone made on purpose, which is exactly what this block existed to force: an upload now
+   * names the conversation it belongs to, so the row has to exist before the first file is sent,
+   * a round trip earlier than the turn that used to create it. The guarantee that went with the
+   * old ordering — a refused first message leaving no chat behind — is knowingly traded, and the
+   * empty row it leaves is a tracked follow-up rather than a surprise.
    *
-   * `deleteConversation` had exactly one caller, the project rail's past-conversations list, and
-   * a later product decision deleted the list: nothing points back to a chat, so nothing offers
-   * to delete one. The SERVER routes are all untouched. Asserted rather than left silent so that
-   * re-adding any of these clients has to be a decision someone makes on purpose.
+   * THE OTHER TWO STAY ABSENT, and for reasons nothing in this change touches. `patchConversation`
+   * had no caller once a chat's title came from its first message. `deleteConversation` had
+   * exactly one, the project rail's past-conversations list, and a later product decision deleted
+   * the list: nothing points back to a chat, so nothing offers to delete one. The SERVER routes
+   * are all untouched.
    */
-  it('★ neither the module nor the store offers create, patch or delete', async () => {
+  it('★ the module offers create and a read half — and still no patch or delete', async () => {
     const mod = await import('../conversationApi')
-    expect('createConversation' in mod).toBe(false)
+    expect(typeof mod.createConversation).toBe('function')
     expect('patchConversation' in mod).toBe(false)
     expect('deleteConversation' in mod).toBe(false)
+    // THE STORE IS A READ STORE STILL. `createConversation` is called by the send path directly,
+    // where the conversation id and its project are already in hand; putting it back on the store
+    // would offer it to every holder of one, which is a wider surface than the change needs.
     const store = mod.createConversationStore('plan')
     expect('createConversation' in store).toBe(false)
     expect('deleteConversation' in store).toBe(false)
@@ -311,6 +315,34 @@ describe('the create / patch / delete round trips are gone', () => {
     // real absences and not an empty module or an empty store object.
     expect(typeof mod.listProjectConversations).toBe('function')
     expect(typeof store.getConversation).toBe('function')
+  })
+
+  it('★ creates with NO title — the draft is not known a round trip early', async () => {
+    // Stamping the refused text into a row nobody can delete would be worse than leaving it
+    // unnamed, so the first message that actually lands titles the chat.
+    const fetchImpl = vi.fn(async () => ok({ conversation: { _id: 'c1', kind: 'build', projectId: 'p1' } }))
+
+    const header = await mod_createConversation(
+      { id: 'c1', projectId: 'p1', kind: 'build' },
+      deps(fetchImpl),
+    )
+
+    const [url, init] = fetchImpl.mock.calls[0]
+    expect(url).toBe('/api/conversations')
+    expect(init.method).toBe('POST')
+    expect(JSON.parse(init.body)).toEqual({ id: 'c1', projectId: 'p1', kind: 'build' })
+    expect(header.id).toBe('c1')
+  })
+
+  it('throws the server sentence so the composer can show it and keep the message', async () => {
+    const fetchImpl = vi.fn(async () => ({
+      ok: false,
+      status: 404,
+      json: async () => ({ error: { message: 'Project not found.' } }),
+    }))
+    await expect(
+      mod_createConversation({ id: 'c1', projectId: 'p1', kind: 'build' }, deps(fetchImpl)),
+    ).rejects.toThrow('Project not found.')
   })
 })
 
@@ -389,7 +421,7 @@ describe('messagesFromProjection — keys are unique per ITEM, not per row', () 
 
   it('keys stay unique across kinds that can repeat within one row', () => {
     const keys = keysOf([
-      { type: 'user_text', seq: 1, mode: 'ask', text: 'a', attachmentIds: [] },
+      { type: 'user_text', seq: 1, mode: 'ask', text: 'a', attachments: [] },
       { type: 'user_text', seq: 1, mode: 'ask', text: 'b', attachmentIds: [] },
       { type: 'step', seq: 2, tool: 'write_file', label: 'x', state: 'ok', hidden: false },
       { type: 'step', seq: 2, tool: 'write_file', label: 'y', state: 'ok', hidden: false },
@@ -650,5 +682,70 @@ describe('messagesFromProjection — a stopped turn still looks stopped after a 
     // Distinct keys, since one row can project several items and React silently corrupts a list
     // with duplicates.
     expect(new Set(messages.map((m) => m.id)).size).toBe(3)
+  })
+})
+
+
+describe('attachment chips survive a reload', () => {
+  const withAttachments = (attachments) =>
+    messagesFromProjection([{ type: 'user_text', seq: 1, text: 'what is in this?', attachments }])
+
+  it('rebuilds a file part per attachment, so the chip can name its file', () => {
+    // THE DEFECT THIS CLOSES. The server has always sent the attachment identities on every
+    // user_text item and this path used to build `parts: [{type:'text'}]` and nothing else, so
+    // every chip vanished on refresh — for every format, not only images. The citizen lost
+    // their only sight of the files still riding on every turn, and the per-conversation tally
+    // taken over these messages silently reset to zero.
+    //
+    // Mutation receipt: drop `...fileParts(item)` from the parts array and this goes red.
+    const [msg] = withAttachments([
+      { attachmentId: 'att-1', kind: 'document', name: 'roster.pdf', mediaType: 'application/pdf' },
+      { attachmentId: 'att-2', kind: 'image', name: 'gate.png', mediaType: 'image/png' },
+    ])
+
+    expect(msg.parts).toEqual([
+      { type: 'file', kind: 'document', attachmentId: 'att-1', name: 'roster.pdf', mediaType: 'application/pdf' },
+      { type: 'file', kind: 'image', attachmentId: 'att-2', name: 'gate.png', mediaType: 'image/png' },
+      { type: 'text', text: 'what is in this?' },
+    ])
+  })
+
+  it('puts the files BEFORE the prose, matching how the message was composed', () => {
+    // `buildUserParts` pushes files then text, so a reloaded turn must too or the same message
+    // renders in two different orders depending on whether the page has been refreshed.
+    const [msg] = withAttachments([
+      { attachmentId: 'att-1', kind: 'image', name: 'a.png', mediaType: 'image/png' },
+    ])
+
+    expect(msg.parts[0].type).toBe('file')
+    expect(msg.parts[msg.parts.length - 1].type).toBe('text')
+  })
+
+  it('keeps a reclaimed attachment as a part so the chip can say it is unavailable', () => {
+    // The row is deleted when its conversation is reclaimed, but the id lives in the message
+    // payload forever, so the server sends the id with an empty name. Dropping it here would
+    // hide from the citizen that a file was ever attached; emitting it lets the chip's own
+    // fetch fail and render "attachment unavailable", which is the honest answer.
+    const [msg] = withAttachments([{ attachmentId: 'att-gone', kind: '', name: '', mediaType: '' }])
+
+    expect(msg.parts[0]).toEqual({
+      type: 'file',
+      kind: 'image',
+      attachmentId: 'att-gone',
+      name: '',
+      mediaType: '',
+    })
+  })
+
+  it('draws nothing for an entry with no id, rather than a chip that cannot be fetched', () => {
+    const [msg] = withAttachments([{ kind: 'image', name: 'orphan.png', mediaType: 'image/png' }])
+
+    expect(msg.parts).toEqual([{ type: 'text', text: 'what is in this?' }])
+  })
+
+  it('a turn with no attachments is unchanged', () => {
+    const [msg] = withAttachments(undefined)
+
+    expect(msg.parts).toEqual([{ type: 'text', text: 'what is in this?' }])
   })
 })

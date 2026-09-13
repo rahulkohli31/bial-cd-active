@@ -27,8 +27,7 @@ import { SendRefusal } from '../chat/sendRefusal'
 import { convertMessage } from '../chat/runtime/convertMessage'
 import type { ChatMessage } from '../../utils/messageTypes'
 import {
-  RefusalSinkProvider,
-  StagedAttachmentsBinding,
+  AttachmentAdapterProviders,
   useBoundAttachmentAdapter,
 } from '../chat/runtime/stagedAttachments'
 import type { ChatKind } from '../../pages/ChatRoute'
@@ -60,7 +59,7 @@ export interface RailComposerProps {
 }
 
 export default function RailComposer({ projectId }: RailComposerProps) {
-  const { adapter, stagedRef, refusalRef } = useBoundAttachmentAdapter()
+  const bound = useBoundAttachmentAdapter()
   // A COMPOSER-ONLY RUNTIME. Empty transcript, never running, nothing to cancel — every capability
   // off except `attachments`, which is what makes the library's add control, its chips and its
   // dropzone render at all.
@@ -69,15 +68,18 @@ export default function RailComposer({ projectId }: RailComposerProps) {
     isRunning: false,
     onNew: refuseLibrarySend,
     convertMessage,
-    adapters: { attachments: adapter },
+    adapters: { attachments: bound.adapter },
   })
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
-      <RefusalSinkProvider value={refusalRef}>
-        <StagedAttachmentsBinding target={stagedRef} />
+      {/* ★ ALL THREE ATTACHMENT PROVIDERS, NOT TWO. This used to mount the
+          refusal sink and the staged binding by hand and miss the pending-read count, so the
+          rail's Send never waited for a file still being read: a spreadsheet dropped here and sent
+          mid-read landed nowhere, and the chat started from the sentence alone. */}
+      <AttachmentAdapterProviders bound={bound}>
         <RailComposerBody projectId={projectId} />
-      </RefusalSinkProvider>
+      </AttachmentAdapterProviders>
     </AssistantRuntimeProvider>
   )
 }

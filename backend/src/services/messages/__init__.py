@@ -23,6 +23,9 @@ from src.services.messages.projection import (
     UserTextItem as UserTextItem,
 )
 from src.services.messages.projection import (
+    project_conversation as project_conversation,
+)
+from src.services.messages.projection import (
     project_rows as project_rows,
 )
 from src.services.messages.store import (

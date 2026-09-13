@@ -333,6 +333,29 @@ def test_a_plan_chat_stays_lean() -> None:
     assert "declare_done" not in composed
 
 
+def test_the_plan_segment_points_at_the_reader_rather_than_at_extraction() -> None:
+    """★ This paragraph used to describe a mechanism that no longer exists: an
+    attachment's text was extracted on the SERVER and inlined into the prompt, so the segment only
+    had to say "put what it means into the plan". Nothing extracts anything now — the file sits in
+    the workspace and code opens it — and a prompt still written against the old mechanism would
+    leave a Plan agent with no idea a reader exists.
+
+    The half that survived is the one the deletion did not touch: whatever the file says, the PLAN
+    still names no file, no folder and no framework, and what the build chat gets is the plan
+    alone.
+
+    Mutation receipt: delete the attachment paragraph and the first two assertions go red; delete
+    the audience rule with it and the third does too.
+    """
+    lowered = _PLAN_SEGMENT.lower()
+
+    assert "reader" in lowered
+    assert "already in your workspace" in lowered
+    assert "nothing in the plan names a file" in lowered
+    # The retired mechanism is not described as though it still ran.
+    assert "extracted" not in lowered
+
+
 _FORBIDDEN_FRUIT = (
     # Prohibition prose aimed at tools the mode doesn't have. The registry already
     # removed them, and ban text would teach the model to reason about capabilities it
