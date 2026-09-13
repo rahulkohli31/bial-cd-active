@@ -470,6 +470,8 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // apart by a render and let a consumer combine halves of two different readings — `SaveReading`
   // in `workspaceChannel.ts` records why that is the bug and not a nicety.
   const [saveReading, setSaveReading] = useState<SaveReading>(NO_SAVE_READING)
+  // Only the newest save-state answer may land: each read, and each Save, takes the next number.
+  const saveReadSeq = useRef(0)
   // The tri-state on its own, for the two consumers that genuinely only want the flag.
   const saveDirty = saveReading.dirty
   const [saving, setSaving] = useState(false)
@@ -546,20 +548,23 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
    *  reload or a second tab — both of which lose in-memory state while the commits stay put. */
   const refreshSaveState = useCallback(async (activeProjectId: string | null) => {
     if (!activeProjectId) return
+    const read = ++saveReadSeq.current
     try {
       const state = await fetchSaveState(activeProjectId)
       // BOTH HALVES OF THE ONE ANSWER. Taking `state.dirty` alone was the whole of the reported
       // bug: the recovery instant arrived on the wire, was dropped here, and every surface
       // downstream was left announcing unsaved changes about a freshly built app the platform
       // could put back at any moment.
-      if (projectIdRef.current === activeProjectId) {
+      if (projectIdRef.current === activeProjectId && read === saveReadSeq.current) {
         setSaveReading({ dirty: state.dirty, recoveryAt: state.recoveryAt })
       }
     } catch {
       // UNKNOWN, never "clean". A failed check must not report the work as safe — and it drops the
       // recovery instant with it rather than leaving the previous one standing beside a tri-state
       // that no longer came from the same read. A reading nobody has is not a reading.
-      if (projectIdRef.current === activeProjectId) setSaveReading(NO_SAVE_READING)
+      if (projectIdRef.current === activeProjectId && read === saveReadSeq.current) {
+        setSaveReading(NO_SAVE_READING)
+      }
     }
   }, [])
 
@@ -581,6 +586,8 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
         // bundle and destroys no recovery copy, and with `dirty` false nothing reads the instant
         // anyway. Inventing one here — or clearing one that still exists — would be this surface
         // reporting a fact it did not read.
+        // A read still on the wire describes the tree before this save, so it must not land after it.
+        saveReadSeq.current += 1
         setSaveReading((held) => ({ ...held, dirty: false }))
         // There is now a snapshot to relaunch from — say so without waiting for a reload.
         setSavedBuildProjectId(activeProjectId)
@@ -2180,6 +2187,18 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // places `previewState` speaks for the workspace.
   const [polledPreview, setPolledPreview] = useState<{ projectId: string; state: PreviewState } | null>(null)
   const previewState = polledPreview?.projectId === projectId ? polledPreview.state : null
+  // A workspace that has just come up holds a tree no earlier save-state read saw — a start, a
+  // relaunch or a restore, none of which ends a turn. Only a move INTO `alive` asks; the first
+  // reading of a page is the mount read's job.
+  const previewLife = previewState?.state ?? null
+  const lastPreviewLife = useRef<typeof previewLife>(null)
+  useEffect(() => {
+    const before = lastPreviewLife.current
+    lastPreviewLife.current = previewLife
+    if (previewLife === 'alive' && before !== null && before !== 'alive') {
+      void refreshSaveState(projectId)
+    }
+  }, [previewLife, projectId, refreshSaveState])
   const address = resolvePreviewAddress({
     turnPreviewUrl: turnPreview.url,
     turnStatus: turnBuildStatus,

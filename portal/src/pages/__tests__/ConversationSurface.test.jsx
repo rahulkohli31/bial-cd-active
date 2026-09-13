@@ -440,3 +440,71 @@ describe('★ a Save from the chat raises the deployment nudge', () => {
     expect(nudges[0].projectId).toBe('p1')
   })
 })
+
+/**
+ * ★ THE SAVE CHIP ON A CHAT FOLLOWS THE WORKSPACE, NOT ONLY THE TURNS.
+ *
+ * A save-state read describes the tree it was taken against, and it went stale two ways here: a
+ * read already on the wire when Save was pressed landed afterwards and lit Save again, and a
+ * workspace that came up after the page loaded was never read at all.
+ */
+describe('★ the Save chip on a chat follows the workspace, not only the turns', () => {
+  it('a read already on the wire when Save is pressed does not light Save again', async () => {
+    // Mutation check: drop the sequence bump from `handleSave` and the late read relights Save.
+    h.fetchSaveState.mockResolvedValue({ dirty: true })
+    renderBuilder({ deps: deps().deps })
+    await screen.findByTestId('save-project')
+
+    let answerLate = null
+    h.fetchSaveState.mockImplementation(() => new Promise((resolve) => { answerLate = resolve }))
+    await send('add a date filter')
+    await waitFor(() => expect(answerLate).toBeTypeOf('function'))
+
+    fireEvent.click(screen.getByTestId('save-project'))
+    await waitFor(() => expect(h.saveProject).toHaveBeenCalledWith('p1'))
+    expect(await screen.findByText('Saved')).toBeTruthy()
+
+    answerLate({ dirty: true })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(screen.getByText('Saved')).toBeTruthy()
+    expect(screen.queryByText(/^Save$/)).toBeNull()
+  })
+
+  it('a workspace that comes up after the page loaded is read again', async () => {
+    // Mutation check: remove the re-read on arrival and only the mount read ever happens.
+    h.fetchPreviewState.mockResolvedValue({
+      state: 'asleep', alive: false, previewUrl: null,
+      occupyingProjectName: null, occupyingProjectId: null, restorable: true,
+    })
+    h.fetchSaveState.mockResolvedValue({ dirty: null })
+    renderBuilder({ deps: deps().deps })
+    const launch = await findStartAppControl()
+    await waitFor(() => expect(h.fetchSaveState).toHaveBeenCalledTimes(1))
+
+    h.fetchPreviewState.mockResolvedValue({
+      state: 'alive', alive: true, previewUrl: 'https://app/',
+      occupyingProjectName: null, occupyingProjectId: null, restorable: null,
+    })
+    h.fetchSaveState.mockResolvedValue({ dirty: true })
+    fireEvent.click(launch)
+
+    await waitFor(() => expect(h.fetchSaveState).toHaveBeenCalledTimes(2))
+    expect(await screen.findByTestId('save-project')).toBeTruthy()
+  })
+
+  it('a page that opens on a running workspace reads it once', async () => {
+    // Mutation check: let the first preview answer re-read too and every page load asks twice.
+    h.fetchPreviewState.mockResolvedValue({
+      state: 'alive', alive: true, previewUrl: 'https://app/',
+      occupyingProjectName: null, occupyingProjectId: null, restorable: null,
+    })
+    h.fetchSaveState.mockResolvedValue({ dirty: true })
+    renderBuilder({ deps: deps().deps })
+
+    // Liveness: the running answer has landed and framed the app, so the count below is final.
+    await waitFor(() => expect(document.querySelector('iframe')).not.toBeNull())
+    expect(await screen.findByTestId('save-project')).toBeTruthy()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(h.fetchSaveState).toHaveBeenCalledTimes(1)
+  })
+})
