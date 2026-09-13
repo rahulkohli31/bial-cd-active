@@ -132,7 +132,7 @@ from the data with SELECT DISTINCT at runtime.
 CREATION_DATE_CDAT (timestamp)
 FLAGS_DATASOURCE_DSSF = at least 110 distinct values observed
 LAST_UPDATE_DATE_TIME (timestamp)
-LSTU -- The AODB last-update marker for the row. BIAL was asked to define this column and could not. The meaning stated here is ours, not theirs; do not rely on it.
+LSTU -- The AODB last-update marker for the row. BIAL was asked what this column means and could not say, so the MEANING stated here is ours rather than theirs. The units, ranges and value counts are measured from the data and hold regardless.
 RKEY (decimal) -- Rotation Key - Key that brings arrival and Dep together
 USEU = at least 110 distinct values observed -- Last Updated by
 yearmonth = '202601', '202602', '202603', '202604', '202605', '202606', '202607', '202608', '202609'
@@ -240,13 +240,13 @@ TRANSFER_PAX_TOTAL (integer)
 TRANSIT_PAX_COUNT_PAXI (integer)
 
 ## baggage -- Bags and belts
-ACT_END_TIME_B1EA (timestamp) -- Act end time. BIAL was asked to define this column and could not. The meaning stated here is ours, not theirs; do not rely on it.
-ACT_STA_TIME_B1BA (timestamp) -- Act sta time. BIAL was asked to define this column and could not. The meaning stated here is ours, not theirs; do not rely on it.
+ACT_END_TIME_B1EA (timestamp) -- Act end time. BIAL was asked what this column means and could not say, so the MEANING stated here is ours rather than theirs. The units, ranges and value counts are measured from the data and hold regardless.
+ACT_STA_TIME_B1BA (timestamp) -- Act sta time. BIAL was asked what this column means and could not say, so the MEANING stated here is ours rather than theirs. The units, ranges and value counts are measured from the data and hold regardless.
 BAGGAGE_BELT1_BLT1 = at least 49 distinct values observed
 BAGGAGE_BELT2_BLT2 = at least 21 distinct values observed
 BAGS = at least 823 distinct values observed -- Total number of bags arrived. Number of bags, stored as a decimal string (e.g. '42.00000') rather than a number.
 FIRST_BAG_TIME (integer)
-LAST_BAG_TIME (integer) -- Last bag. The unit is SECONDS, not minutes: each value profiled is a whole multiple of 60. Divide by 60 before showing minutes. BIAL was asked to define this column and could not. The meaning stated here is ours, not theirs; do not rely on it.
+LAST_BAG_TIME (integer) -- Last bag. The unit is SECONDS, not minutes: each value profiled is a whole multiple of 60. Divide by 60 before showing minutes. BIAL was asked what this column means and could not say, so the MEANING stated here is ours rather than theirs. The units, ranges and value counts are measured from the data and hold regardless.
 
 ## cargo -- Freight and mail
 IS_CARGO (integer)
@@ -266,16 +266,16 @@ FB_ONTIME (integer) -- First bag Delivery. Looks like a flag Delayed /Ontime
 FOR_ATM (integer)
 FOR_OTP (integer)
 LB_ONTIME (integer)
-OTP (integer) -- On-time performance for this flight, against schedule. SIGNED - negative is early, positive is late. The unit is SECONDS, not minutes: every one of the 301 values profiled is a whole multiple of 60, as are both extremes, which a minute-granular column would not be (TAT, a real minutes column, takes values like 9, 11 and 23). Divide by 60 before showing minutes. Observed range is roughly -90,720 to 253,860 - about -25 to +70 hours - so the extremes are data-quality outliers rather than real delays. BIAL was asked to define this column and could not. The meaning stated here is ours, not theirs; do not rely on it.
+OTP (integer) -- On-time performance for this flight, against schedule. SIGNED - negative is early, positive is late. The unit is SECONDS, not minutes: every one of the 301 values profiled is a whole multiple of 60, as are both extremes, which a minute-granular column would not be (TAT, a real minutes column, takes values like 9, 11 and 23). Divide by 60 before showing minutes. Observed range is roughly -90,720 to 253,860 - about -25 to +70 hours - so the extremes are data-quality outliers rather than real delays. BIAL was asked what this column means and could not say, so the MEANING stated here is ours rather than theirs. The units, ranges and value counts are measured from the data and hold regardless.
 TAT (integer) -- Turn Around Time. Turnaround time in minutes - the interval between arrival on-stand and departure off-stand for the same aircraft.
 
 ## handling -- Ground handling and the operational zone
 ACGT = free text, not a code list -- Actual Commencement of Ground Handling Time
 ACOR = free text, not a code list -- Aircraft in Range / Flight In Range (FIRT). A ground-handling milestone timestamp, written as YYYYMMDDHHMMSS text rather than a date.
 AEGT = free text, not a code list -- Actual End of Ground Handling Time
-BAZ1 = at least 24 distinct values observed -- Baggage zone or make-up area identifier. BIAL was asked to define this column and could not. The meaning stated here is ours, not theirs; do not rely on it.
+BAZ1 = at least 24 distinct values observed -- Baggage zone or make-up area identifier. BIAL was asked what this column means and could not say, so the MEANING stated here is ours rather than theirs. The units, ranges and value counts are measured from the data and hold regardless.
 GROUND_HANDLER = 'Air India SATS', 'GlobeGround India', 'Indigo ', 'Menzies Aviation India Pvt. Ltd.', 'Menzies Aviation booba bangalore pvt ltd'
-REMP = '0', '1', 'F', 'H', 'N', 'S', 'T', 'V', 'X' -- An operational handling code. BIAL was asked to define this column and could not. The meaning stated here is ours, not theirs; do not rely on it.
+REMP = '0', '1', 'F', 'H', 'N', 'S', 'T', 'V', 'X' -- An operational handling code. BIAL was asked what this column means and could not say, so the MEANING stated here is ours rather than theirs. The units, ranges and value counts are measured from the data and hold regardless.
 ZONE_DIR = 'NorthZone', 'OtherZone', 'SouthZone'
 ZONE_TAG = 'Zone0', 'ZoneA', 'ZoneB', 'ZoneC', 'ZoneD', 'ZoneE', 'ZoneF'
 ZONE_VALUE = 'DOM_ABC', 'DOM_DE', 'DOM_F', 'INTL', 'UNSCH'
@@ -284,8 +284,8 @@ ZONE_VALUE = 'DOM_ABC', 'DOM_DE', 'DOM_F', 'INTL', 'UNSCH'
 ARR_DAY_DOOA = '1', '2', '3', '4', '5', '6', '7'
 BOOK_LOAD (integer)
 DEP_DAY_DOOD = '1', '2', '3', '4', '5', '6', '7'
-DOM_INT_OPS = 'DOM', 'INT' -- Domestic international. BIAL was asked to define this column and could not. The meaning stated here is ours, not theirs; do not rely on it.
-DOM_INT_REVENUE = 'DOM', 'INT' -- Domestic international revenue. BIAL was asked to define this column and could not. The meaning stated here is ours, not theirs; do not rely on it.
+DOM_INT_OPS = 'DOM', 'INT' -- Domestic international. BIAL was asked what this column means and could not say, so the MEANING stated here is ours rather than theirs. The units, ranges and value counts are measured from the data and hold regardless.
+DOM_INT_REVENUE = 'DOM', 'INT' -- Domestic international revenue. BIAL was asked what this column means and could not say, so the MEANING stated here is ours rather than theirs. The units, ranges and value counts are measured from the data and hold regardless.
 FLIGHT_NATURE_TTYP = at least 27 distinct values observed
 FLIGHT_NATURE_TTYP_DESC = at least 17 distinct values observed
 FLIGHT_SERVICE_STYP = 'A', 'C', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'P', 'T', 'W', 'X', 'Z'

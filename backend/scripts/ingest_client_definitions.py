@@ -81,11 +81,18 @@ SOURCE_ANSWERED: Final = "Client — answered {round}"
 SOURCE_MERGED: Final = "Client — answered {round}, plus our measured note"
 SOURCE_UNDEFINED: Final = "INFERRED — BIAL could not define ({round})"
 QUESTION_UNDEFINED: Final = (
-    "BIAL was asked to define this column and could not. The meaning stated here is ours, not "
-    "theirs; do not rely on it."
+    "BIAL was asked what this column means and could not say, so the MEANING stated here is ours "
+    "rather than theirs. The units, ranges and value counts are measured from the data and hold "
+    "regardless."
 )
 """Rendered into the schema block beside the definition it warns about, so it is written for that
-position -- the model is looking at the sentence it doubts, not at a file it cannot see."""
+position -- the model is looking at the sentence it doubts, not at a file it cannot see.
+
+IT DISCLAIMS THE MEANING AND NOTHING ELSE. The builder appends it after the WHOLE definition, and
+several of those definitions carry facts we measured ourselves -- that a column is in seconds
+because every profiled value is a multiple of 60, its observed range, how many distinct values it
+holds. A caveat that reads as doubting the line it closes tells the agent to disregard a
+divide-by-60 instruction that is correct, so the scope has to be said out loud."""
 
 
 @dataclass(frozen=True)

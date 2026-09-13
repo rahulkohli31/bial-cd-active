@@ -94,7 +94,7 @@
       "null_pct": 82.87,
       "distinct": 121566,
       "examples": "2026-09-08 20:46:00 | 2026-09-09 01:05:00 | 2026-09-09 02:58:00",
-      "question": "BIAL was asked to define this column and could not. The meaning stated here is ours, not theirs; do not rely on it.",
+      "question": "BIAL was asked what this column means and could not say, so the MEANING stated here is ours rather than theirs. The units, ranges and value counts are measured from the data and hold regardless.",
       "gloss": true
     },
     {
@@ -107,7 +107,7 @@
       "null_pct": 82.87,
       "distinct": 124190,
       "examples": "2026-09-08 20:33:00 | 2026-09-09 00:44:00 | 2026-09-09 02:34:00",
-      "question": "BIAL was asked to define this column and could not. The meaning stated here is ours, not theirs; do not rely on it.",
+      "question": "BIAL was asked what this column means and could not say, so the MEANING stated here is ours rather than theirs. The units, ranges and value counts are measured from the data and hold regardless.",
       "gloss": true
     },
     {
@@ -363,7 +363,7 @@
       "null_pct": 78.18,
       "distinct": 24,
       "examples": "103 | 101 | 106",
-      "question": "BIAL was asked to define this column and could not. The meaning stated here is ours, not theirs; do not rely on it.",
+      "question": "BIAL was asked what this column means and could not say, so the MEANING stated here is ours rather than theirs. The units, ranges and value counts are measured from the data and hold regardless.",
       "gloss": true
     },
     {
@@ -593,7 +593,7 @@
       "null_pct": 0.0,
       "distinct": 2,
       "examples": "INT | DOM",
-      "question": "BIAL was asked to define this column and could not. The meaning stated here is ours, not theirs; do not rely on it.",
+      "question": "BIAL was asked what this column means and could not say, so the MEANING stated here is ours rather than theirs. The units, ranges and value counts are measured from the data and hold regardless.",
       "gloss": true
     },
     {
@@ -606,7 +606,7 @@
       "null_pct": 0.0,
       "distinct": 2,
       "examples": "INT | DOM",
-      "question": "BIAL was asked to define this column and could not. The meaning stated here is ours, not theirs; do not rely on it.",
+      "question": "BIAL was asked what this column means and could not say, so the MEANING stated here is ours rather than theirs. The units, ranges and value counts are measured from the data and hold regardless.",
       "gloss": true
     },
     {
@@ -1053,7 +1053,7 @@
       "null_pct": 77.92,
       "distinct": 81,
       "examples": "1260 | 900 | 1140",
-      "question": "BIAL was asked to define this column and could not. The meaning stated here is ours, not theirs; do not rely on it.",
+      "question": "BIAL was asked what this column means and could not say, so the MEANING stated here is ours rather than theirs. The units, ranges and value counts are measured from the data and hold regardless.",
       "gloss": true
     },
     {
@@ -1102,7 +1102,7 @@
       "null_pct": 0.0,
       "distinct": 244162,
       "examples": "20260909181102 | 20260909175357 | 20260909070817 | 20260909090241",
-      "question": "BIAL was asked to define this column and could not. The meaning stated here is ours, not theirs; do not rely on it.",
+      "question": "BIAL was asked what this column means and could not say, so the MEANING stated here is ours rather than theirs. The units, ranges and value counts are measured from the data and hold regardless.",
       "gloss": true
     },
     {
@@ -1188,7 +1188,7 @@
       "null_pct": 53.37,
       "distinct": 1117,
       "examples": "60 | -420 | -540",
-      "question": "BIAL was asked to define this column and could not. The meaning stated here is ours, not theirs; do not rely on it.",
+      "question": "BIAL was asked what this column means and could not say, so the MEANING stated here is ours rather than theirs. The units, ranges and value counts are measured from the data and hold regardless.",
       "gloss": true
     },
     {
@@ -1237,7 +1237,7 @@
       "null_pct": 0.0,
       "distinct": 9,
       "examples": "N | X | T",
-      "question": "BIAL was asked to define this column and could not. The meaning stated here is ours, not theirs; do not rely on it.",
+      "question": "BIAL was asked what this column means and could not say, so the MEANING stated here is ours rather than theirs. The units, ranges and value counts are measured from the data and hold regardless.",
       "gloss": true
     },
     {
