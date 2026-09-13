@@ -32,10 +32,12 @@ import uuid
 from datetime import date
 from typing import Final
 
+import redis.asyncio as aioredis
 import sqlalchemy as sa
 from fastapi import APIRouter, status
 from redis.exceptions import RedisError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import SQLAlchemyError
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.deps_csrf import RequireCsrf
@@ -54,6 +56,7 @@ from src.api.v1.connectors.schemas import (
     RelativeWindowChoice,
     StoredWindow,
 )
+from src.api.v1.live_build import the_live_session_is_this_app
 from src.core.connectors import CONNECTORS, Connector, resolve_window
 from src.core.errors import AppApiError
 from src.db.models.connector_access import ConnectorAccessRequest, ConnectorRequestStatus
@@ -63,11 +66,14 @@ from src.schemas import AUTH_401, ErrorEnvelope, error_responses
 from src.services.build_sessions.locks import (
     liveness_lease_is_held,
     lock_is_held,
+    read_registry,
     read_starting_marker,
 )
+from src.services.build_sessions.manager import existing_app_id
 from src.services.connectors import ConnectorPersonState, PersonAccess, current_access
 from src.services.redis import get_redis
 from src.services.redis.client import RedisNotConfiguredError
+from src.services.redis.keys import REGISTRY_FIELD_APP_NAME
 
 router = APIRouter(prefix="/connectors", tags=["connectors"])
 
@@ -76,7 +82,7 @@ _ALREADY_ASKED = "You have already asked for access to this. An administrator is
 _ALREADY_DECIDED = "An administrator has already answered this request."
 _NOTHING_TO_CANCEL = "There is no waiting request to cancel."
 
-# R11a. A CONTAINER RECEIVES ITS ENVIRONMENT EXACTLY ONCE, AT BIRTH, so a connector switched on
+# A CONTAINER RECEIVES ITS ENVIRONMENT EXACTLY ONCE, AT BIRTH, so a connector switched on
 # while a build or a conversation is running would leave the rail saying "on" over a container
 # that cannot reach anything — and the attach arm, which is the steady state, forwards no
 # environment at all. Rather than reconciling that state, the owner ruled it out of existence:
@@ -85,10 +91,12 @@ _NOTHING_TO_CANCEL = "There is no waiting request to cancel."
 #
 # THE REFUSAL IS SERVER-SIDE BECAUSE A GREYED-OUT CONTROL IS NOT A GUARD. The message names what
 # the citizen has to do, because they can actually do it — the workspace has a Stop control, and
-# a turn ends on its own.
+# a turn ends on its own. It names the PROJECT as well: this refuses only for the project whose
+# own session is live, and the switch is reachable from a list where nothing else on screen says
+# which of a person's projects is the one to go and finish.
 _SESSION_IS_LIVE = (
-    "You have a chat or a build running. Finish or stop it, then change what {name} reads — "
-    "an app that is already running keeps the settings it started with."
+    "“{project}” has a chat or a build running. Finish or stop it, then change what {name} "
+    "reads — an app that is already running keeps the settings it started with."
 )
 
 # The residual, stated once so nobody reads the lock as tighter than it is: this refuses a change
@@ -414,8 +422,43 @@ def _unsupported_window_message(connector: Connector) -> str:
     return f"Pick one of the ranges {connector.display_name} offers: {listed} days."
 
 
-async def _refuse_while_a_session_is_live(user_id: uuid.UUID, connector: Connector) -> None:
-    """R11a: refuse a settings change while this citizen has a turn in flight.
+async def _the_live_session_is_this_project(
+    db: DbSession,
+    redis: aioredis.Redis,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    starting_project_id: uuid.UUID | None,
+) -> bool:
+    """Is the session the signals above report the one running inside THIS project?
+
+    THE THREE SIGNALS CARRY TWO KINDS OF IDENTITY. The starting marker holds a PROJECT id
+    outright and is written under the lock, so while one stands it IS the live session's
+    identity — and it is the only one that can answer during a cold start, before a registry
+    entry exists. The lock and the lease carry none: theirs comes from the registry hash's app
+    name, which `the_live_session_is_this_app` compares and fails closed on.
+
+    A PROJECT NOTHING WAS EVER BUILT IN HAS NO APP ROW, and so no container of its own — a
+    registry naming an app is naming somebody else's work. A registry naming NOTHING is
+    ambiguity rather than innocence, and refuses here for the reason it refuses there."""
+    if starting_project_id is not None:
+        return starting_project_id == project_id
+    # Read, never mint: `resolve_app_for_project` upserts, and a settings write that minted a
+    # draft app would leave one behind for a project nobody has ever built in.
+    app_id = await existing_app_id(db, user_id, project_id)
+    if app_id is None:
+        registry = await read_registry(redis, user_id)
+        return not (registry or {}).get(REGISTRY_FIELD_APP_NAME, "")
+    return await the_live_session_is_this_app(redis, user_id, app_id)
+
+
+async def _refuse_while_a_session_is_live(
+    db: DbSession,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    project_name: str,
+    connector: Connector,
+) -> None:
+    """Refuse a settings change while this project has a turn in flight.
 
     THREE SIGNALS, ANY OF WHICH MEANS LIVE, because they cover the whole of a session's shape:
     the one-per-user LOCK is held for the duration of a turn; the liveness LEASE is the one signal
@@ -423,6 +466,11 @@ async def _refuse_while_a_session_is_live(user_id: uuid.UUID, connector: Connect
     STARTING marker covers the window between "a start was asked for" and "the lock was taken".
     Reading only the lock would let a change land during a cold start, which is precisely the
     window in which the container's environment is being assembled.
+
+    ALL THREE ARE KEYED ON THE PERSON, because a citizen gets one workspace — so a build anywhere
+    lights all three. Only the project that session is running in has an environment a change
+    could contradict, so the refusal is narrowed to it and the citizen's other projects stay
+    settable while it runs.
 
     FAILS CLOSED. A Redis error refuses the change rather than allowing it — the same posture
     `acquire_lock` takes, and the consistent one: if the platform cannot tell whether a session is
@@ -435,37 +483,47 @@ async def _refuse_while_a_session_is_live(user_id: uuid.UUID, connector: Connect
     except RedisNotConfiguredError:
         return
     try:
-        live = (
+        starting_project_id = await read_starting_marker(redis, user_id)
+        live_here = (
             await lock_is_held(redis, user_id)
             or await liveness_lease_is_held(redis, user_id)
-            or await read_starting_marker(redis, user_id) is not None
+            or starting_project_id is not None
+        ) and await _the_live_session_is_this_project(
+            db, redis, user_id, project_id, starting_project_id
         )
-    except RedisError as exc:
+    except (RedisError, SQLAlchemyError) as exc:
+        # BOTH stores, because the question now needs both: the three signals come from Redis
+        # and the project's app id from Postgres. A database fault reaching the caller as a 500
+        # would still block the write, but it would break the fail-closed CONTRACT this
+        # docstring states and hand the citizen an error with nothing to do about it.
         raise AppApiError(
             status.HTTP_409_CONFLICT,
-            _SESSION_IS_LIVE.format(name=connector.display_name),
+            _SESSION_IS_LIVE.format(project=project_name, name=connector.display_name),
             code="session_is_live",
         ) from exc
-    if live:
+    if live_here:
         raise AppApiError(
             status.HTTP_409_CONFLICT,
-            _SESSION_IS_LIVE.format(name=connector.display_name),
+            _SESSION_IS_LIVE.format(project=project_name, name=connector.display_name),
             code="session_is_live",
         )
 
 
-async def _owned_project_or_404(db: DbSession, project_id: uuid.UUID, user_id: uuid.UUID) -> None:
-    """Prove the caller owns this project, or fail closed with the non-leaking 404.
+async def _owned_project_or_404(db: DbSession, project_id: uuid.UUID, user_id: uuid.UUID) -> str:
+    """Prove the caller owns this project and hand back its name, or fail closed with the
+    non-leaking 404.
 
-    A PROOF, NOT A LOAD. Neither route wants a column off `projects`, and putting `user_id` in
-    the WHERE clause — rather than loading the row and comparing afterwards — is what the
-    single-tenant rule asks for: the predicate IS the isolation boundary, and a predicate cannot
-    be forgotten between the load and the check."""
-    owned = await db.scalar(
-        sa.select(Project.id).where(Project.id == project_id, Project.user_id == user_id)
+    ONE COLUMN, NOT THE ROW, and putting `user_id` in the WHERE clause — rather than loading the
+    row and comparing afterwards — is what the single-tenant rule asks for: the predicate IS the
+    isolation boundary, and a predicate cannot be forgotten between the load and the check. The
+    name comes back because the live-session refusal says it; `projects.name` is NOT NULL, so an
+    absent row is the only way to read `None` here."""
+    name: str | None = await db.scalar(
+        sa.select(Project.name).where(Project.id == project_id, Project.user_id == user_id)
     )
-    if owned is None:
+    if name is None:
         raise AppApiError(status.HTTP_404_NOT_FOUND, _PROJECT_NOT_FOUND, code="project_not_found")
+    return name
 
 
 def _resolved(
@@ -678,7 +736,7 @@ async def set_project_connector(
     clamped on every READ instead, so it ages out on its own. Returns this project's connector in
     its new state, resolved exactly as the read returns it."""
     connector = _known_connector(connector_key)
-    await _owned_project_or_404(db, project_id, user.id)
+    project_name = await _owned_project_or_404(db, project_id, user.id)
 
     # R12 IS ENFORCED HERE, NOT IN THE FORM. The switch is only drawn for an approved person, so
     # nobody meets this through the product — which is the whole reason it has to exist on the
@@ -693,10 +751,10 @@ async def set_project_connector(
             code="access_not_approved",
         )
 
-    # R11a — AFTER the approval check and BEFORE anything is written. Ordered that way on
+    # AFTER the approval check and BEFORE anything is written. Ordered that way on
     # purpose: an unapproved citizen gets the 403 they would always have got, rather than a
     # confusing "stop your build" for a setting they were never allowed to change.
-    await _refuse_while_a_session_is_live(user.id, connector)
+    await _refuse_while_a_session_is_live(db, user.id, project_id, project_name, connector)
 
     window = body.window
     if isinstance(window, RelativeWindowChoice) and window.days not in _offered_days(connector):

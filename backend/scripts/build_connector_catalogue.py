@@ -9,12 +9,14 @@ tells a citizen's agent about the shape of the connected system's data, so every
 has to be true of that data, and the way this stays true is that NOTHING IN IT IS TYPED BY HAND
 except prose that makes no claim about a column.
 
-THE THREE INPUTS, AND WHICH ONE IS THE AUTHORITY.
+THE FOUR INPUTS, AND WHICH ONE IS THE AUTHORITY.
 
   data/connectors/<key>/profile.json      THE AUTHORITY. What the columns actually hold, read off
                                           the lake. Types, value sets, cardinalities, ranges.
   data/connectors/<key>/definitions.json  The working column list AND their meanings. Its 131
                                           names ARE the set this block describes — see below.
+  data/connectors/<key>/abbreviations.json  The client's own code glossary, transcribed from the
+                                            sheet they returned it on, not in this repository.
   MEASURES / MAPPING / UNANSWERABLE       The client's own KPI arithmetic, as module constants.
   / PARTIAL, below                        A formula cannot be derived from a profile; it comes
                                           from BIAL's workbook whichever file holds it, and a
@@ -400,6 +402,18 @@ def load_profile() -> dict[str, Any]:
     return parsed
 
 
+def _definitions_rows() -> tuple[dict[str, Any], ...]:
+    """The working column list. Three readers below take three different fields off it, and
+    each opening the file for itself is how one of them quietly grows a different idea of what
+    is in it — deliberately NOT cached, because this file is rewritten by the ingest between
+    runs and a reader holding the previous round's rows is the failure this consolidates."""
+    path = DATA_DIR / "definitions.json"
+    if not path.is_file():
+        raise SystemExit(f"cannot find {path} — it is the working column list")
+    rows: list[dict[str, Any]] = json.loads(path.read_text(encoding="utf-8"))["columns"]
+    return tuple(rows)
+
+
 def load_definitions() -> tuple[tuple[str, str], ...]:
     """(name, definition) for every column in the working set, in the workbook's own order.
 
@@ -407,11 +421,7 @@ def load_definitions() -> tuple[tuple[str, str], ...]:
     client has confirmed and which are ours; nothing here branches on them, nothing marks them and
     no test counts them (owner ruling, 2026-09-11) — the whole distinction ends the day the client
     returns the workbook, and a tiering system built for it would outlive it."""
-    path = DATA_DIR / "definitions.json"
-    if not path.is_file():
-        raise SystemExit(f"cannot find {path} — it is the working column list")
-    rows: list[dict[str, Any]] = json.loads(path.read_text(encoding="utf-8"))["columns"]
-    return tuple((str(row["name"]), str(row["definition"])) for row in rows)
+    return tuple((str(row["name"]), str(row["definition"])) for row in _definitions_rows())
 
 
 def marked_for_gloss() -> frozenset[str]:
@@ -423,10 +433,38 @@ def marked_for_gloss() -> frozenset[str]:
     something the name cannot, which the 2026-09 review round demonstrated: AIBT_AOBT_TIME is the
     arrival's in-block time OR the departure's off-block time depending on the row. `is_opaque`
     would keep that silent because the name is long. The mark is written by the ingest script, so
-    what the client teaches us reaches the agent without anyone remembering to edit this file."""
-    path = DATA_DIR / "definitions.json"
-    rows: list[dict[str, Any]] = json.loads(path.read_text(encoding="utf-8"))["columns"]
-    return frozenset(str(row["name"]) for row in rows if row.get("gloss"))
+    what the client teaches us reaches the agent without anyone remembering to edit this file, and
+    a column the client could not define is marked too -- its warning needs text to warn about."""
+    return frozenset(str(row["name"]) for row in _definitions_rows() if row.get("gloss"))
+
+
+def recorded_caveats() -> dict[str, str]:
+    """`{column: the warning the ingest wrote against it}` for the columns the client could not
+    define.
+
+    A FOURTH FIELD, AND THE ONE THAT SAYS HOW FAR TO TRUST THE THIRD. Our inferred sentence reads
+    exactly as confidently as the client's own, and nothing else in the block distinguishes them;
+    the ingest already records which meanings they declined to confirm, and a warning nobody
+    renders is a warning nobody reads."""
+    return {
+        str(row["name"]): str(row["question"])
+        for row in _definitions_rows()
+        if row.get("question")
+    }
+
+
+def load_abbreviations() -> tuple[tuple[str, str], ...]:
+    """(code, what it stands for) in the client's own order, `""` where they could not expand it.
+
+    A COMMITTED FILE RATHER THAN A CONSTANT, unlike the KPI arithmetic above. The expansions are
+    the client's answers about their own data, they arrive by the same review rounds the column
+    definitions do, and the sheet they come from is not in this repository -- so the transcription
+    has to be, or the next round has nothing to correct."""
+    path = DATA_DIR / "abbreviations.json"
+    if not path.is_file():
+        raise SystemExit(f"cannot find {path} — it is the record of the client's code glossary")
+    rows: list[dict[str, Any]] = json.loads(path.read_text(encoding="utf-8"))["abbreviations"]
+    return tuple((str(row["abbreviation"]), str(row["stands_for"])) for row in rows)
 
 
 # --- Rendering one column ------------------------------------------------------------------------
@@ -543,7 +581,9 @@ def value_clause(column: dict[str, Any]) -> str:
     return f"= at least {max(distinct, len(values)):,} distinct values observed"
 
 
-def column_line(column: dict[str, Any], definition: str, *, forced: bool = False) -> str:
+def column_line(
+    column: dict[str, Any], definition: str, *, forced: bool = False, caveat: str = ""
+) -> str:
     """One line for one column: `NAME (type) = values -- meaning`.
 
     SELF-DESCRIBING RATHER THAN POSITIONAL, and that is a deliberate 109 tokens. A tab-separated
@@ -573,7 +613,14 @@ def column_line(column: dict[str, Any], definition: str, *, forced: bool = False
     # for. The mark is set by `ingest_client_definitions.py` when an answer describes shape rather
     # than subject, so the set grows with what the client tells us instead of being frozen here.
     if (is_opaque(column["name"]) or forced) and definition.strip():
-        parts.append(f"-- {ascii_only(definition)}")
+        gloss = ascii_only(definition)
+        # THE WARNING RIDES INSIDE THE GLOSS AND NOT BESIDE IT. A sentence telling the model not
+        # to rely on a meaning it cannot see says nothing, so the mark that renders the meaning
+        # and the warning that doubts it are written by the same branch of the ingest and fail
+        # together rather than apart.
+        if caveat:
+            gloss = f"{gloss} {ascii_only(caveat)}"
+        parts.append(f"-- {gloss}")
     return " ".join(parts)
 
 
@@ -754,6 +801,30 @@ def measures_header() -> str:
     )
 
 
+GLOSSARY_HEADER: Final = _paragraphs(
+    """
+    ABBREVIATIONS -- what the airport's own codes stand for, in its own words. These are CODES,
+    NOT COLUMNS: some name no column described below, and the ones that do appear as the tail of
+    a longer column name. The codes at the end with no expansion are ones the airport could not
+    expand either, so read what those columns hold rather than the letters.
+    """
+)
+
+
+def glossary() -> str:
+    """The client's code table, as `  CODE = what it stands for`.
+
+    INDENTED, AND THAT IS LOAD-BEARING RATHER THAN COSMETIC. Twenty of these codes are also column
+    names, and a line starting at column zero with one of them is a column line to every reader
+    this block has -- the model, and the tests that parse the artefact back."""
+    rows = load_abbreviations()
+    lines = [f"  {code} = {ascii_only(text)}" for code, text in rows if text]
+    bare = [code for code, text in rows if not text]
+    if bare:
+        lines.append(f"  (no expansion supplied for {', '.join(bare)})")
+    return GLOSSARY_HEADER + "\n\n" + "\n".join(lines)
+
+
 LEGEND: Final = _paragraphs(
     """
     HOW TO READ THE COLUMN LINES. One line per column, grouped by what it is about. A column
@@ -783,9 +854,15 @@ def build(profile: dict[str, Any], definitions: tuple[tuple[str, str], ...]) -> 
 
     grouped: dict[str, list[str]] = defaultdict(list)
     forced = marked_for_gloss()
+    caveats = recorded_caveats()
     for name, definition in definitions:
         grouped[group_of(name)].append(
-            column_line(columns[name], definition, forced=name in forced)
+            column_line(
+                columns[name],
+                definition,
+                forced=name in forced,
+                caveat=caveats.get(name, ""),
+            )
         )
 
     body = "\n\n".join(
@@ -797,6 +874,7 @@ def build(profile: dict[str, Any], definitions: tuple[tuple[str, str], ...]) -> 
         f"{_GENERATED_BANNER}\n\n"
         f"{header(profile, columns, [n for n, _ in definitions])}\n\n"
         f"{measures_header()}\n\n"
+        f"{glossary()}\n\n"
         f"{LEGEND}\n\n"
         f"{body}\n"
     )

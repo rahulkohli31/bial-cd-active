@@ -448,7 +448,7 @@ def _report(  # noqa: ANN201
         staged=1 if verdict is Verdict.STAGE else 0,
         destroy=1 if verdict is Verdict.DESTROY else 0,
         escalate=0, not_ours=0, store_fault=False,
-        candidates=(_candidate(name, verdict=verdict),), owners=owners,
+        candidates=(_candidate(name, verdict=verdict),), owners=owners, untagged=0,
     )  # fmt: skip
 
 
@@ -790,6 +790,7 @@ async def test_one_container_that_refuses_the_stamp_does_not_cost_the_others_the
             _candidate(n, verdict=Verdict.STAGE) for n in ("sbx-refused", "sbx-second")
         ),
         owners={},
+        untagged=0,
     )  # fmt: skip
 
     assert await reclamation._stage_the_candidates(report) == 1

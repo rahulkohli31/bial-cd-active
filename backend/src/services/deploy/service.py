@@ -67,7 +67,7 @@ from src.services.deploy.gate import (
 from src.services.deploy.images import ImageBuilder, ImageBuildError
 from src.services.deploy.names import image_reference, revision_name
 from src.services.deploy.outcome import write_deploy_outcome
-from src.services.orchestrator.errors import from_next_build
+from src.services.orchestrator.errors import from_next_build, is_dependency_failure
 from src.services.sandbox.aca import AcaError
 from src.services.storage import StorageError, get_storage
 from src.services.storage.snapshot_read import (
@@ -76,6 +76,7 @@ from src.services.storage.snapshot_read import (
     SnapshotExtractionError,
     extract_snapshot,
 )
+from src.services.turns.copy import DEPENDENCY_DRIFT_TEXT
 
 _log = structlog.get_logger()
 
@@ -325,6 +326,7 @@ class DeployService:
                     code=failure.code,
                     detail=failure.detail,
                     citizen_message=failure.citizen_message,
+                    model_detail=failure.model_detail,
                 )
             except asyncio.CancelledError:
                 # Shutdown. Leave the row alone — the reconciler resolves it against ARM,
@@ -867,8 +869,13 @@ class DeployService:
         code: str,
         detail: str | None,
         citizen_message: str,
+        # None where the citizen sentence names the fault itself, which is every class but one.
+        model_detail: str | None = None,
     ) -> None:
         safe = redact_and_cap(detail, _DETAIL_MAX_CHARS)
+        # The same redactor and the same ceiling as the operator detail: this string now reaches
+        # a model holding a shell, which is a harder egress than the deployment row.
+        safe_for_the_model = redact_and_cap(model_detail, _DETAIL_MAX_CHARS)
         # A ROUTED settlement is not a breakage, and the row's `detail` is the only thing
         # the citizen's publish banner has to render on this path: the 202 already returned,
         # so the surface has no routed response to read and falls through to `failureDetail`.
@@ -891,6 +898,7 @@ class DeployService:
             succeeded=False,
             message=citizen_message,
             detail=safe,
+            model_detail=safe_for_the_model,
         )
 
     async def _tell_the_citizen(
@@ -904,9 +912,12 @@ class DeployService:
         message: str,
         url: str | None = None,
         detail: str | None = None,
+        model_detail: str | None = None,
     ) -> None:
         """Write the outcome into the chat. Best-effort by design: the deployment row is the
-        record of truth, and a chat write that fails must not undo a deploy that worked."""
+        record of truth, and a chat write that fails must not undo a deploy that worked.
+
+        `model_detail` rides a hidden row of its own — see `outcome.py`."""
         if conversation_id is None:
             return
         try:
@@ -921,6 +932,7 @@ class DeployService:
                     message=message,
                     url=url,
                     detail=detail,
+                    model_detail=model_detail,
                 )
         except Exception:
             _log.warning(
@@ -954,21 +966,37 @@ class DeployService:
 
 
 class _DeployFailedError(Exception):
-    """A pipeline failure with everything both audiences need: a stable code for the row and
-    an operator's alert, and prose for the citizen."""
+    """A pipeline failure with everything all three audiences need: a stable code for the row
+    and an operator's alert, prose for the citizen, and — only where that prose deliberately
+    names no fault — the fault itself for the agent that will be asked to repair it.
 
-    def __init__(self, code: str, *, detail: str | None, citizen_message: str) -> None:
+    `model_detail` None means the citizen sentence already carries the fault, so nothing extra
+    is owed the model; sending it anyway would put the same diagnostic in history twice."""
+
+    def __init__(
+        self,
+        code: str,
+        *,
+        detail: str | None,
+        citizen_message: str,
+        model_detail: str | None = None,
+    ) -> None:
         super().__init__(code)
         self.code = code
         self.detail = detail
         self.citizen_message = citizen_message
+        self.model_detail = model_detail
 
     @classmethod
     def from_build(cls, exc: ImageBuildError) -> _DeployFailedError:
         """A build failure is the one the citizen can actually act on, so it carries the
         registry's own log through the same de-noiser the self-heal loop uses — ANSI
         stripped, paths relativized, secrets redacted, and titled on the line that names the
-        fault rather than the Next.js banner."""
+        fault rather than the Next.js banner.
+
+        THE TITLE IS NOT ALWAYS SAYABLE TO A CITIZEN. A failed dependency install titles on a
+        package name and two version numbers, so that class reads a written sentence and the
+        fault travels on `model_detail` and the operator detail instead."""
         log = exc.log_tail
         if not log:
             return cls(
@@ -980,13 +1008,22 @@ class _DeployFailedError(Exception):
                 ),
             )
         error = from_next_build(log)
+        hides_the_fault = is_dependency_failure(error)
         return cls(
             FAIL_BUILD,
-            detail=error.cleaned_stack,
+            # The title LEADS the detail rather than being left to be found inside it: both
+            # this field and `cleaned_stack` are capped from the FRONT, and a registry log can
+            # open with more preamble than either cap allows before the fault is named.
+            detail=f"{error.title}\n\n{error.cleaned_stack}",
             citizen_message=(
-                f"Your app did not build, so it was not deployed:\n\n{error.title}\n\n"
-                "Your previous version is still running. Ask me to fix it and try again."
+                DEPENDENCY_DRIFT_TEXT
+                if hides_the_fault
+                else (
+                    f"Your app did not build, so it was not deployed:\n\n{error.title}\n\n"
+                    "Your previous version is still running. Ask me to fix it and try again."
+                )
             ),
+            model_detail=error.title if hides_the_fault else None,
         )
 
 

@@ -7,8 +7,9 @@ import base64
 import uuid
 
 import pytest
+from structlog.testing import capture_logs
 
-from src.services.build_sessions.snapshot import write_snapshot
+from src.services.build_sessions.snapshot import SNAPSHOT_STEP_TIMINGS_EVENT, write_snapshot
 from src.services.sandbox.base import ExecResult, SandboxError, SandboxHandle
 from src.services.storage import snapshot_key
 from tests.fakes import FakeSandboxClient, FakeStorage, a_git_bundle
@@ -252,3 +253,68 @@ async def test_a_failed_snapshot_leaves_no_bundle_for_the_next_one_to_commit(
     paths = _read_paths(client.commands)
     removed = [cmd[2] for cmd in client.commands if cmd[:2] == ["rm", "-f"]]
     assert removed == paths
+
+
+# --- per-step timing -------------------------------------------------------------------
+
+
+async def test_a_save_that_dies_midway_still_reports_the_steps_that_ran(
+    fake_storage: FakeStorage,
+) -> None:
+    """The whole reason the accumulator is passed IN and mutated rather than returned: once an
+    exception has unwound past `_bundle_the_tree`, a return value is gone, and the steps that
+    did run are exactly what says WHERE the save died. A slow save that then fails is the case
+    this instrument exists for, so it cannot be the case it goes blind on."""
+    client = FakeSandboxClient()
+
+    def dies_at_the_bundle(cmd: list[str]) -> ExecResult:
+        if cmd[:2] == ["git", "bundle"]:
+            return ExecResult(stdout="", stderr="no space left on device", exit=1)
+        return ExecResult(stdout="", stderr="", exit=0)
+
+    client.exec_handler = dies_at_the_bundle
+    with capture_logs() as logs:
+        with pytest.raises(SandboxError):
+            await write_snapshot(client, _handle(), APP_ID)
+
+    timings = [log for log in logs if log["event"] == SNAPSHOT_STEP_TIMINGS_EVENT]
+    assert len(timings) == 1, "a failed save reported no timings at all"
+    timing = timings[0]
+    # The steps that RAN carry a number — the lock was waited for and the commit did happen.
+    assert isinstance(timing["lock_wait_ms"], int)
+    assert isinstance(timing["commit_ms"], int)
+    # The steps that never ran are absent rather than zero: a zero would read as instantaneous.
+    assert timing["base64_ms"] is None
+    assert timing["store_ms"] is None
+
+
+async def test_write_snapshot_times_every_step_of_a_save(fake_storage: FakeStorage) -> None:
+    """Save is synchronous in-request with no client-side timeout, so this event is the only
+    record of which of the three candidates — the four execs, the per-app lock queue, or the blob
+    write — a slow save actually lost its time to. One field per step, not one duration
+    for the whole call, and not for just the execs `_bundle_the_tree` can see."""
+    client = FakeSandboxClient()
+
+    def handler(cmd: list[str]) -> ExecResult:
+        if cmd[:1] == ["base64"]:
+            return ExecResult(stdout=base64.b64encode(a_git_bundle()).decode(), stderr="", exit=0)
+        return ExecResult(stdout="", stderr="", exit=0)
+
+    client.exec_handler = handler
+    with capture_logs() as logs:
+        await write_snapshot(client, _handle(), APP_ID)
+
+    timings = [log for log in logs if log["event"] == SNAPSHOT_STEP_TIMINGS_EVENT]
+    assert len(timings) == 1
+    timing = timings[0]
+    assert timing["app_id"] == str(APP_ID)
+    for field in (
+        "lock_wait_ms",
+        "commit_ms",
+        "bundle_ms",
+        "base64_ms",
+        "cleanup_ms",
+        "store_ms",
+    ):
+        assert isinstance(timing[field], int)
+        assert timing[field] >= 0

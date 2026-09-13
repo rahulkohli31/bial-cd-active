@@ -218,14 +218,111 @@ def test_approved_with_a_matching_pin_and_no_deployment_reads_ready_to_publish()
 
 def test_a_routed_failure_code_resolves_above_the_failure_arm() -> None:
     """The `failure_code` bullet, exercised through the fallthrough arm rather than the
-    `AppStatus.PENDING` shortcut (`app.status` here is `APPROVED`, not `PENDING`, so
-    this pins the deployment-row check itself, not the status-level one that would
-    also produce `IN_REVIEW` for the ordinary case). Without this rule a citizen
-    correctly routed to an administrator would read `did_not_start`."""
-    app = _app(status=AppStatus.APPROVED, approval_route=ApprovalRoute.SELF_PUBLISH)
+    `AppStatus.PENDING` shortcut (`app.status` here is `DRAFT`, so no status-level arm
+    can answer and this pins the deployment-row check itself). Without this rule a
+    citizen correctly routed to an administrator would read `did_not_start`."""
+    app = _app(status=AppStatus.DRAFT)
     deployment = _deployment(status=DeploymentStatus.FAILED, failure_code=FAIL_ROUTED_FOR_REVIEW)
 
     assert compute_publish_state(app, deployment, None) is PublishState.IN_REVIEW
+
+
+def test_an_approval_outranks_the_failed_row_the_routing_itself_wrote() -> None:
+    """The drift re-check routes a submission by settling the claimed deployment row as
+    FAILED with a routed code, so that row is still the newest one once an administrator
+    approves. Read as a failure it says in-review, and the only action the portal offers
+    there is a withdrawal the store refuses on a non-pending app — so a citizen whose app
+    was approved is left with no way forward at all."""
+    app = _app(
+        status=AppStatus.APPROVED,
+        approval_route=ApprovalRoute.SELF_PUBLISH,
+        approved_commit_sha=_SAVED_SHA,
+    )
+    routed = _deployment(status=DeploymentStatus.FAILED, failure_code=FAIL_ROUTED_FOR_REVIEW)
+
+    assert compute_publish_state(app, routed, _SAVED_SHA) is PublishState.APPROVED_READY_TO_PUBLISH
+
+
+def test_a_save_after_the_approval_still_needs_the_gate_again_on_that_same_row() -> None:
+    """The approval pins ONE commit. Outranking the failure arms must not also outrank
+    the pin: a Save since the approval moved the saved head off it, and one button press
+    may not publish work no administrator has seen."""
+    app = _app(
+        status=AppStatus.APPROVED,
+        approval_route=ApprovalRoute.SELF_PUBLISH,
+        approved_commit_sha=_SUBMITTED_SHA,
+    )
+    routed = _deployment(status=DeploymentStatus.FAILED, failure_code=FAIL_ROUTED_FOR_REVIEW)
+
+    assert (
+        compute_publish_state(app, routed, _SAVED_SHA) is PublishState.APPROVED_NEEDS_REVIEW_AGAIN
+    )
+
+
+@pytest.mark.parametrize(
+    ("expected", "approved_commit_sha", "deployment", "saved_head"),
+    [
+        pytest.param(
+            PublishState.LIVE_CURRENT,
+            _SAVED_SHA,
+            _deployment(status=DeploymentStatus.SUCCEEDED, head_sha=_SAVED_SHA),
+            _SAVED_SHA,
+            id="live_current: the pin names what is saved, and that is what went live",
+        ),
+        pytest.param(
+            PublishState.LIVE_NEWER_WORK,
+            _LIVE_SHA,
+            _deployment(status=DeploymentStatus.SUCCEEDED, head_sha=_LIVE_SHA),
+            _SAVED_SHA,
+            id="live_newer_work: saves since the approval moved the head off the pin",
+        ),
+        pytest.param(
+            PublishState.TAKEN_OFFLINE,
+            _SAVED_SHA,
+            _deployment(
+                status=DeploymentStatus.SUCCEEDED,
+                head_sha=_SAVED_SHA,
+                unpublished_at=datetime(2026, 8, 20, tzinfo=UTC),
+            ),
+            _SAVED_SHA,
+            id="taken_offline: an administrator took the approved app down",
+        ),
+        pytest.param(
+            PublishState.STARTING_UP,
+            _SAVED_SHA,
+            _deployment(status=DeploymentStatus.RUNNING),
+            _SAVED_SHA,
+            id="starting_up: the approved version is being published right now",
+        ),
+        pytest.param(
+            PublishState.DID_NOT_START,
+            _SAVED_SHA,
+            _deployment(status=DeploymentStatus.FAILED, failure_code="revision_unhealthy"),
+            _SAVED_SHA,
+            id="did_not_start: the approved version was published and the publish broke",
+        ),
+    ],
+)
+def test_an_approved_apps_own_deployment_row_still_speaks_for_itself(
+    expected: PublishState,
+    approved_commit_sha: str,
+    deployment: Deployment,
+    saved_head: str,
+) -> None:
+    """THE BOUNDARY of the arm above: an approval outranks the ROUTED-failure arm only. A
+    matching pin is the ordinary condition of an app that published what was approved and
+    is serving it, so answering "ready to publish" off the pin alone would paint a publish
+    button over every live app — and over one mid-publish.
+
+    The last row is the other direction of the same mistake: a genuine publish failure
+    reads red and offers a retry, and an approval must not repaint it green."""
+    app = _app(
+        status=AppStatus.APPROVED,
+        approval_route=ApprovalRoute.SELF_PUBLISH,
+        approved_commit_sha=approved_commit_sha,
+    )
+
+    assert compute_publish_state(app, deployment, saved_head) is expected
 
 
 def test_a_non_routed_failure_code_reads_did_not_start() -> None:

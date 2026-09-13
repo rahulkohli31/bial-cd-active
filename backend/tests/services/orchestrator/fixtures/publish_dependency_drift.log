@@ -1,0 +1,77 @@
+#0 building with "desktop-linux" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 6.97kB done
+#1 DONE 0.0s
+
+#2 resolve image config for docker-image://docker.io/docker/dockerfile:1
+#2 DONE 1.1s
+
+#3 docker-image://docker.io/docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
+#3 resolve docker.io/docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32 0.0s done
+#3 CACHED
+
+#4 [internal] load metadata for docker.io/library/node:24-trixie-slim@sha256:0711b541c1c33a8a530ac4f0d391baa9a15b3d804695b1b24a47daa5fb60e74d
+#4 DONE 0.0s
+
+#5 [internal] load .dockerignore
+#5 transferring context: 662B done
+#5 DONE 0.0s
+
+#6 [deps 1/4] FROM docker.io/library/node:24-trixie-slim@sha256:0711b541c1c33a8a530ac4f0d391baa9a15b3d804695b1b24a47daa5fb60e74d
+#6 resolve docker.io/library/node:24-trixie-slim@sha256:0711b541c1c33a8a530ac4f0d391baa9a15b3d804695b1b24a47daa5fb60e74d 0.0s done
+#6 DONE 0.0s
+
+#7 [internal] load build context
+#7 transferring context: 177.77kB 0.0s done
+#7 DONE 0.0s
+
+#8 [deps 2/4] WORKDIR /app
+#8 CACHED
+
+#9 [deps 3/4] COPY package.json package-lock.json ./
+#9 DONE 0.1s
+
+#10 [deps 4/4] RUN npm ci --ignore-scripts --no-audit --no-fund --loglevel=error
+#10 5.689 npm error code EUSAGE
+#10 5.696 npm error
+#10 5.696 npm error `npm ci` can only install packages when your package.json and package-lock.json or npm-shrinkwrap.json are in sync. Please update your lock file with `npm install` before continuing.
+#10 5.696 npm error
+#10 5.696 npm error Invalid: lock file's @azure/identity@4.11.1 does not satisfy @azure/identity@4.13.2
+#10 5.696 npm error Invalid: lock file's @azure/storage-blob@12.31.0 does not satisfy @azure/storage-blob@12.33.0
+#10 5.696 npm error Invalid: lock file's hyparquet@1.19.0 does not satisfy hyparquet@1.30.1
+#10 5.696 npm error Missing: @azure/core-process@1.0.0 from lock file
+#10 5.696 npm error Invalid: lock file's @azure/msal-browser@4.30.0 does not satisfy @azure/msal-browser@5.21.0
+#10 5.696 npm error Invalid: lock file's @azure/msal-node@3.8.10 does not satisfy @azure/msal-node@5.6.0
+#10 5.696 npm error Invalid: lock file's @azure/msal-common@15.17.0 does not satisfy @azure/msal-common@16.14.0
+#10 5.696 npm error Missing: @azure/msal-common@16.13.0 from lock file
+#10 5.696 npm error
+#10 5.696 npm error Clean install a project
+#10 5.696 npm error
+#10 5.696 npm error Usage:
+#10 5.696 npm error npm ci
+#10 5.696 npm error
+#10 5.696 npm error Options:
+#10 5.696 npm error [--install-strategy <hoisted|nested|shallow|linked>] [--legacy-bundling]
+#10 5.696 npm error [--global-style] [--omit <dev|optional|peer> [--omit <dev|optional|peer> ...]]
+#10 5.696 npm error [--include <prod|dev|optional|peer> [--include <prod|dev|optional|peer> ...]]
+#10 5.696 npm error [--strict-peer-deps] [--foreground-scripts] [--ignore-scripts]
+#10 5.696 npm error [--allow-directory <all|none|root>] [--allow-file <all|none|root>]
+#10 5.696 npm error [--allow-git <all|none|root>] [--allow-remote <all|none|root>]
+#10 5.696 npm error [--allow-scripts <package-list> [--allow-scripts <package-list> ...]]
+#10 5.696 npm error [--strict-allow-scripts] [--dangerously-allow-all-scripts] [--no-audit]
+#10 5.696 npm error [--no-bin-links] [--no-fund] [--dry-run]
+#10 5.696 npm error [-w|--workspace <workspace-name> [-w|--workspace <workspace-name> ...]]
+#10 5.696 npm error [--workspaces] [--include-workspace-root] [--install-links]
+#10 5.696 npm error
+#10 5.696 npm error   --install-strategy
+#10 5.696 npm error     Sets the strategy for installing packages in node_modules.
+#10 5.696 npm error
+#10 5.696 npm error   --legacy-bundling
+#10 5.696 npm error     Instead of hoisting package installs in `node_modules`, install packages
+#10 5.696 npm error
+#10 5.696 npm error   --global-style
+#10 5.696 npm error     Only install direct dependencies in the top level `node_modules`,
+#10 5.696 npm error
+#10 5.696 npm error   --omit
+#10 

@@ -2,7 +2,7 @@
 # that tool's description, on every request. Edit it as prompt text, not as an internal note.
 """The one tool that tells an agent what is in a connected system's data.
 
-WHY IT IS A TOOL AND NOT A PROMPT BLOCK. The answer is ~7,000 tokens. Resident on every turn of
+WHY IT IS A TOOL AND NOT A PROMPT BLOCK. The answer is ~8,700 tokens. Resident on every turn of
 every connector-enabled project it would be the largest thing in the prompt and would be paid for
 by turns that never touch the data; fetched, it is paid for once and then replayed at the
 cache-read rate, because the library moves a cache breakpoint forward over history as a
@@ -99,7 +99,7 @@ description's "every time" is written for.
 
 TWO, NOT ONE — owner ruling, 2026-09-11. Across the connected-data E2E campaign the model never
 asked twice in one conversation, so this is a ceiling on a failure not yet seen rather than a fix
-for one. Past it, each further call would append another full copy (~7,400 tokens) to a history
+for one. Past it, each further call would append another full copy (~8,700 tokens) to a history
 every later turn replays."""
 
 _ALREADY_LOADED: Final = (

@@ -27,7 +27,7 @@ from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
 from src.db.models.audit import AuditLog
 from src.db.models.deployment import Deployment, DeploymentStatus
-from src.db.models.message import Message, MessageEntryKind
+from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.services.approvals import submit as submit_module
 from src.services.classification import store as review_store
 from src.services.classification.service import ReviewReadout
@@ -405,6 +405,49 @@ async def test_a_build_failure_is_reported_with_the_error_the_agent_can_fix(
     # The TITLE is the actionable line, not the Next.js banner.
     assert "Type error:" in message.payload[0]["parts"][0]["content"]
     assert "Next.js 16.2.10" not in message.payload[0]["parts"][0]["content"]
+
+
+async def test_a_dependency_failure_splits_what_the_citizen_reads_from_what_the_agent_gets(
+    wire, db_session
+) -> None:
+    """The whole pipeline's version of the split, and the only thing that proves the two
+    strings are threaded from the classifier all the way to the chat.
+
+    The citizen sentence for this class names no fault on purpose — a package name and two
+    version numbers is not something they can act on — so the diagnosis rides a hidden row the
+    model reads and the projection does not."""
+    user, app, conversation = await _project(db_session)
+    wire.images.error = ImageBuildError(
+        "the image build failed",
+        log_tail=(
+            '#0 building with "desktop-linux" instance using docker driver\n'
+            "#10 [deps 4/4] RUN npm ci --ignore-scripts\n"
+            "#10 5.689 npm error code EUSAGE\n"
+            "#10 5.696 npm error Invalid: lock file's @azure/identity@4.11.1 "
+            "does not satisfy @azure/identity@4.13.2\n"
+        ),
+    )
+
+    _started, row = await _run(wire, db_session, user, app, conversation.id)
+
+    assert row.failure_code == "build_failed"
+    rows = (
+        (
+            await db_session.execute(
+                sa.select(Message)
+                .where(Message.conversation_id == conversation.id)
+                .order_by(Message.seq.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    shown, handed_over = rows
+    assert shown.visibility is MessageVisibility.VISIBLE
+    assert "@azure" not in shown.payload[0]["parts"][0]["content"]
+    assert "desktop-linux" not in shown.payload[0]["parts"][0]["content"]
+    assert handed_over.visibility is MessageVisibility.HIDDEN
+    assert "does not satisfy" in handed_over.payload[0]["parts"][0]["content"]
 
 
 async def test_a_failed_deploy_says_the_previous_version_still_runs(wire, db_session) -> None:

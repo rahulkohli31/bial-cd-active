@@ -161,9 +161,14 @@ def _user_assigned(resource_id: str | None) -> aca_models.ManagedServiceIdentity
     user-assigned identity is to send `type: "None"` — omitting the property is the ambiguous
     case, and the reading that "a redeploy revokes a withdrawn app's access" depends entirely on
     which way ARM resolves it. Sending the explicit block is what makes the revocation a written
-    instruction instead of a hope. See the pre-flight in `ops/ONE-CLICK-DEPLOY-PROD.md` §4: ARM
-    writes are blocked on the development subscription, so this has NOT been observed end to end
-    and the runbook asks for it to be confirmed once against a real app."""
+    instruction instead of a hope.
+
+    OBSERVED END TO END against a live published app. Switching the connector off and redeploying
+    minted a new revision, and ARM then reported `{"type": "None"}` with no user-assigned
+    identities left on the resource. The app's reads of the lake went from 81 authenticated
+    GetBlob calls in the window before to zero in the window after. Re-enabling and redeploying
+    put the identity back and the reads resumed. The detach is real, and it takes a full deploy
+    to land — there is no separate revoke."""
     if resource_id is None:
         return aca_models.ManagedServiceIdentity(type=aca_models.ManagedServiceIdentityType.NONE)
     return aca_models.ManagedServiceIdentity(
