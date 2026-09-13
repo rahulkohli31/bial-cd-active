@@ -55,9 +55,11 @@ const PROJECT: Project = {
   appId: 'app-1',
   appStatus: null,
   hasRelaunchableSnapshot: true,
+  hasSavedSnapshot: null,
   isServing: false,
   createdAt: '2026-07-10T00:00:00Z',
   updatedAt: '2026-07-10T00:00:00Z',
+  access: 'owner',
 }
 
 /** The refusal the server raises when the one workspace is held by another project. */
@@ -313,7 +315,7 @@ describe('transferring', () => {
 
     await waitFor(() => expect(screen.getByTestId('chat-opened')).toBeTruthy())
     expect(api.handOverWorkspace).toHaveBeenCalledTimes(1)
-    expect(api.handOverWorkspace.mock.calls[0]?.[0]).toBe('pA')
+    expect(api.handOverWorkspace.mock.calls[0]?.[0]).toMatchObject({ projectId: 'pA' })
     // ONE chat, not two: the first attempt was refused before it navigated.
     expect(screen.getAllByTestId('chat-opened')).toHaveLength(1)
     expect(where()).toMatch(/^\/chat\/[0-9a-f-]+\?projectId=pB&kind=plan$/)
@@ -539,7 +541,14 @@ describe('★ taking the workspace back, with nothing sent', () => {
     fireEvent.click(await screen.findByRole('button', { name: /^Stop “Car pool” and open this app instead$/ }))
     fireEvent.click(await screen.findByRole('button', { name: /^Stop “Car pool” without saving$/ }))
 
-    await waitFor(() => expect(api.handOverWorkspace).toHaveBeenCalledWith('pA', false, {}, expect.any(Function)))
+    await waitFor(() =>
+      expect(api.handOverWorkspace).toHaveBeenCalledWith(
+        expect.objectContaining({ projectId: 'pA' }),
+        false,
+        {},
+        expect.any(Function),
+      ),
+    )
     // LIVENESS: the app really came up, so the absences below are a take-back that worked.
     await waitFor(() => expect(api.relaunchPreview).toHaveBeenCalledTimes(2))
     // ★ THE GUARANTEE. Reuse the rail's own retry closure here and all three go red.

@@ -179,7 +179,7 @@ def test_the_app_still_builds_with_its_full_route_surface() -> None:
     paths = list(app.openapi().get("paths", {}))
     build_session_paths = [p for p in paths if "build-session" in p]
 
-    # 16 build-session paths. Beyond the CRUD/turn set, this counts `projects/{project_id}/
+    # 19 build-session paths. Beyond the CRUD/turn set, this counts `projects/{project_id}/
     # client-error` (the app's own in-browser error report), `projects/{project_id}/
     # compile-state` (the compile signal for a tab with no live turn — the turn stream's
     # producer stops at the terminal), `projects/{project_id}/workspace-check` (the idle-tab
@@ -188,10 +188,13 @@ def test_the_app_still_builds_with_its_full_route_surface() -> None:
     # immediately while a detached task does the waiting, so the outcome — three states, not
     # a boolean — needs a reader; holding the request open for the length of a stop was a
     # dependency nobody could satisfy, since the budget had to sit under the request timeout
-    # of a gateway owned by the client's network), and the two superadmin operator routes for
+    # of a gateway owned by the client's network), the two superadmin operator routes for
     # the parked/promoted trees (`internal/apps/{app_id}/parked` and `.../promote`) — without
     # a reader those objects would be write-only, and in a false reversion they hold the only
-    # copy of somebody's work.
+    # copy of somebody's work — and three routes for #198: `projects/{project_id}/
+    # shared-launch`/`shared-refresh`, a colleague's own door into a project shared with them,
+    # restored into their own per-user slot rather than the owner's, and `shared-view/release`,
+    # the self-service exit from a shared view that needs no project id to ask for.
     #
     # It excludes the lock ops (`lock/acquire`/`renew`/`release`/`heartbeat`/`force-end`):
     # nothing calls them any more. The portal's keep-alive loop, the only caller of the first
@@ -202,8 +205,8 @@ def test_the_app_still_builds_with_its_full_route_surface() -> None:
     # removed together with the harness, the module-level build agent, and the run-build
     # dependency it was the sole door into, once the workspace moved onto the chat turn and
     # took away its only browser client.
-    assert len(build_session_paths) == 16, (
-        f"the C3 build-session route surface changed: expected 16 paths, found "
+    assert len(build_session_paths) == 19, (
+        f"the C3 build-session route surface changed: expected 19 paths, found "
         f"{len(build_session_paths)}. If a route was deliberately added or removed, amend C3 "
         f"and update this number in the same change.\n{sorted(build_session_paths)}"
     )

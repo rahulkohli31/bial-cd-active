@@ -225,6 +225,33 @@ REGISTRY_FIELD_STAY_WRITER: Final = "stay_writer"
 # process — than the adoption.
 REGISTRY_FIELD_ADOPTED_FROM_LEGACY: Final = "adopted_from_legacy"
 
+# --- shared-runtime identity (#198) — written ONLY when this slot holds a `shr-` container ---
+#
+# The per-user slot this hash describes can hold EITHER the user's own build sandbox OR a
+# colleague's shared project, restored read-only into their slot. `app_name` alone cannot say
+# which: `shr_name_for` hashes the (app, recipient) pair, so nothing may reverse-parse an app id
+# or project id back out of it (same forward-match-only rule `app_name_for`/`published_app_name`
+# follow). Written once, at Launch, so the occupancy check a future slice adds (recognizing "you
+# already hold a shared view" before a new build silently reclaims it) never needs a backfill.
+
+REGISTRY_FIELD_SHARED_PROJECT_ID: Final = "shared_project_id"
+"""The shared `projects.id` this slot is a read-only view of. Absent on every other registry
+record — including an ordinary build sandbox's — which is exactly the signal a reader needs to
+tell the two occupants of this one slot apart."""
+
+REGISTRY_FIELD_SHARED_OWNER_ID: Final = "shared_owner_id"
+"""The project's owner — the user whose saved snapshot this view was restored from. NOT the
+`user_id` the registry key itself is keyed by (that is the RECIPIENT, whose slot this is); see
+`KIND_SHARED_SANDBOX`'s own docstring in `sandbox/base.py` for why the ARM tags make the same
+choice."""
+
+REGISTRY_FIELD_SHARED_SERVED_COUNT: Final = "shared_served_count"
+"""The supervisor's `/served` COUNT as of the last sweep that checked it — a monotonically
+increasing total, never a delta. The sweep compares this against a fresh read to decide whether
+to grant `DeadlineWriter.APP_SERVED_TRAFFIC`; an unchanged count between two sweeps means nobody
+new has looked at the app since the last pass, not that the count reset. Absent until the first
+sweep observes this slot."""
+
 # The complete frozen field set (a completeness/disjointness anchor for tests and
 # for SESSION-API's hydration of the registry hash).
 REGISTRY_FIELDS: Final = frozenset(
@@ -238,6 +265,9 @@ REGISTRY_FIELDS: Final = frozenset(
         REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
         REGISTRY_FIELD_STAY_WRITER,
         REGISTRY_FIELD_ADOPTED_FROM_LEGACY,
+        REGISTRY_FIELD_SHARED_PROJECT_ID,
+        REGISTRY_FIELD_SHARED_OWNER_ID,
+        REGISTRY_FIELD_SHARED_SERVED_COUNT,
     }
 )
 

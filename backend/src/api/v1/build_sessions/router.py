@@ -53,6 +53,7 @@ from src.api.v1.build_sessions.schemas import (
     PromoteParkedResponse,
     RelaunchPreviewRequest,
     RelaunchPreviewResponse,
+    SharedPreviewResponse,
     StopBuildRequest,
     StopBuildResponse,
     WorkspaceCheckResponse,
@@ -72,6 +73,7 @@ from src.services.build_sessions import (
     SandboxReclaimBlockedError,
     SandboxUnreachableError,
     SessionManager,
+    SharedProjectHasNoAppError,
     SnapshotUnavailableError,
     StopOutcome,
     app_name_for,
@@ -85,7 +87,11 @@ from src.services.build_sessions.snapshot import (
 from src.services.orchestrator.client_errors import (
     park_client_error,
 )
-from src.services.projects.resolve import owned_project_or_404
+from src.services.projects.resolve import (
+    ProjectAccess,
+    owned_project_or_404,
+    resolve_project_access,
+)
 from src.services.redis import (
     build_coordination_or_503,
     coordination_is_gone,
@@ -797,6 +803,174 @@ async def release_project(
             raise AppApiError(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "Could not close that workspace just now. Please try again.",
+            ) from exc
+        return ReleaseResponse(released=released)
+    raise _coordination_is_gone()
+
+
+# --- a colleague's shared-runtime view (#198) --------------------------------
+
+
+async def _shared_preview_or_refuse(
+    project_id: uuid.UUID,
+    user: CurrentUser,
+    db: DbSession,
+    sandbox: OptionalSandbox,
+    manager: SessionManagerDep,
+    *,
+    force_refresh: bool,
+) -> SharedPreviewResponse | JSONResponse:
+    """The whole of Launch and Refresh (#198 R19-R22) — the two endpoints below differ only in
+    which arm of `SessionManager.launch_shared_preview` they ask for, so the access gate, the
+    exception mapping and the response shape live here once.
+
+    SHARED-ONLY, NEVER OWNER: `resolve_project_access` also admits the project's own owner, but
+    an owner has `relaunch_preview` for this — Launch/Refresh exist for a COLLEAGUE'S restricted
+    view, and an owner reaching this route reads identically to a stranger who was never shared
+    with (the same non-leaking 404 `owned_project_or_404` gives everywhere else)."""
+    if sandbox is None:
+        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG)
+    resolved = await resolve_project_access(db, user.id, project_id)
+    if resolved.access is not ProjectAccess.SHARED:
+        raise AppApiError(status.HTTP_404_NOT_FOUND, "Project not found.")
+    with build_coordination_or_503():
+        try:
+            preview = await manager.launch_shared_preview(
+                db, user, resolved.project, sandbox, force_refresh=force_refresh
+            )
+        except BuildSessionConflictError as exc:
+            # The recipient is mid-build on a project of their OWN — a shared view never
+            # pre-empts that (409, same shape `relaunch_preview` answers with).
+            return _conflict_response(exc)
+        except SandboxReclaimBlockedError as exc:
+            return reclaim_blocked_response(exc)
+        except SharedProjectHasNoAppError as exc:
+            # Unreachable in practice (see the error's own docstring) — mapped to the same
+            # "nothing to launch" 404 a confirmed-absent snapshot gets, since from the
+            # recipient's side the two facts read identically.
+            raise AppApiError(
+                status.HTTP_404_NOT_FOUND,
+                "Nothing to launch for this shared project.",
+                code="no_saved_build",
+            ) from exc
+        except NoSnapshotToRelaunchError as exc:
+            raise AppApiError(
+                status.HTTP_404_NOT_FOUND,
+                "The owner hasn't saved a version of this app yet.",
+                code="no_saved_build",
+            ) from exc
+        except (SnapshotUnavailableError, SandboxUnreachableError, SandboxError) as exc:
+            raise AppApiError(
+                status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG
+            ) from exc
+        return SharedPreviewResponse(
+            app_id=preview.app_id,
+            preview_url=preview.preview_url,
+            ready=preview.ready,
+            snapshot_taken_at=preview.snapshot_taken_at,
+        )
+    raise _coordination_is_gone()
+
+
+@router.post(
+    "/projects/{project_id}/shared-launch",
+    response_model=SharedPreviewResponse,
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        (403, ErrorEnvelope, "CSRF check failed"),
+        AUTH_401,
+        (404, ErrorEnvelope, "Project not found, not shared with you, or nothing saved yet"),
+        (
+            409,
+            BuildConflictEnvelope,
+            "You have a build running, or another project holds your workspace with unsaved work",
+        ),
+        (503, ErrorEnvelope, "The sandbox or build coordination is temporarily unavailable"),
+    ),
+)
+async def launch_shared_project(
+    project_id: uuid.UUID,
+    user: CurrentUser,
+    db: DbSession,
+    sandbox: OptionalSandbox,
+    manager: SessionManagerDep,
+) -> SharedPreviewResponse | JSONResponse:
+    """Open a project a colleague shared with you (#198 R19). Attaches to an already-live view
+    if one is up (a reopened tab, a second click); otherwise restores one from the owner's
+    latest SAVED snapshot — never their crash-recovery bundle (requirement 21)."""
+    return await _shared_preview_or_refuse(
+        project_id, user, db, sandbox, manager, force_refresh=False
+    )
+
+
+@router.post(
+    "/projects/{project_id}/shared-refresh",
+    response_model=SharedPreviewResponse,
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        (403, ErrorEnvelope, "CSRF check failed"),
+        AUTH_401,
+        (404, ErrorEnvelope, "Project not found, not shared with you, or nothing saved yet"),
+        (
+            409,
+            BuildConflictEnvelope,
+            "You have a build running, or another project holds your workspace with unsaved work",
+        ),
+        (503, ErrorEnvelope, "The sandbox or build coordination is temporarily unavailable"),
+    ),
+)
+async def refresh_shared_project(
+    project_id: uuid.UUID,
+    user: CurrentUser,
+    db: DbSession,
+    sandbox: OptionalSandbox,
+    manager: SessionManagerDep,
+) -> SharedPreviewResponse | JSONResponse:
+    """Re-restore a shared project from whatever is CURRENTLY saved (#198 R22) — unlike Launch,
+    never attaches to an already-live view even when one is up, since the owner may have saved
+    something newer since it was brought up. `snapshotTakenAt` on the response is how the
+    caller learns whether anything actually moved."""
+    return await _shared_preview_or_refuse(
+        project_id, user, db, sandbox, manager, force_refresh=True
+    )
+
+
+@router.post(
+    "/shared-view/release",
+    response_model=ReleaseResponse,
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        (403, ErrorEnvelope, "CSRF check failed"),
+        AUTH_401,
+        (409, ConflictEnvelope, "A build is running in this workspace"),
+        (503, ErrorEnvelope, "The sandbox or build coordination is temporarily unavailable"),
+    ),
+)
+async def release_shared_view(
+    user: CurrentUser,
+    manager: SessionManagerDep,
+    sandbox: OptionalSandbox,
+) -> ReleaseResponse | JSONResponse:
+    """Give up whatever colleague's shared view currently holds the caller's OWN slot (#198,
+    requirement 24's self-service exit) — no `project_id`, because the caller may not own one
+    that names it. The occupant `SandboxReclaimBlockedError` reports for a shared view is its
+    OWNER's project, which a recipient never owns, so `stopActiveBuild`/`release` (both gated on
+    `owned_project_or_404`) can never be the hand-over dialog's remedy for this case; this route
+    asks nothing but "is a shared view sitting in my slot right now" and needs no id to ask it.
+
+    `released: false` is a success — nothing was there to give up, or what was there was the
+    caller's OWN build sandbox (`release_project_sandbox`'s job, not this one's)."""
+    if sandbox is None:
+        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG)
+    with build_coordination_or_503():
+        try:
+            released = await manager.give_up_shared_view(user.id, sandbox_client=sandbox)
+        except BuildSessionConflictError as exc:
+            return _conflict_response(exc)
+        except SandboxError as exc:
+            raise AppApiError(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Could not close that shared app just now. Please try again.",
             ) from exc
         return ReleaseResponse(released=released)
     raise _coordination_is_gone()

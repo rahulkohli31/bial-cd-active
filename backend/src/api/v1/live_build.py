@@ -67,12 +67,19 @@ class ReclaimBlockedError(CamelModel):
     # Wider than `building` and carried beside it, never folded in: `building` decides WHICH
     # dialog the client renders, `agentWorking` decides what that dialog says is happening now.
     agent_working: bool
+    # WHICH REMEDY WORKS (#198). `projectId` above names a project the CALLER owns for an
+    # ordinary build occupant — `stopActiveBuild`/`release` both gate on `owned_project_or_404`,
+    # which that caller satisfies. For a colleague's shared view, `projectId` names its OWNER,
+    # whom a recipient never owns, so those same two routes would 404 them out of their own
+    # slot. `True` tells the client to route to the self-scoped give-up-my-shared-view endpoint
+    # instead, which needs no project id or ownership check at all.
+    is_shared_view: bool = False
 
 
 class ReclaimBlockedEnvelope(CamelModel):
-    """`{"error": {message, code, projectId, projectName, dirty, building, agentWorking}}` — the
-    409 a turn, start or relaunch returns when taking the one sandbox slot would destroy another
-    project's work.
+    """`{"error": {message, code, projectId, projectName, dirty, building, agentWorking,
+    isSharedView}}` — the 409 a turn, start or relaunch returns when taking the one sandbox slot
+    would destroy another project's work.
 
     Lives in this shared module rather than in one domain router because more than one router
     answers it."""
@@ -111,6 +118,7 @@ def reclaim_blocked_response(exc: SandboxReclaimBlockedError) -> JSONResponse:
                 "dirty": exc.dirty,
                 "building": exc.building,
                 "agentWorking": exc.agent_working,
+                "isSharedView": exc.is_shared_view,
             }
         },
     )

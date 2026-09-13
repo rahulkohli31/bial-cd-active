@@ -336,9 +336,12 @@ export const NO_SAVE_READING: SaveReading = { dirty: null, recoveryAt: null }
 export interface WorkspaceActions {
   save: (() => void) | null
   rename: (() => void) | null
+  /** Open the share panel (#198) — `null` wherever nothing on screen can share (a chat, or
+   *  a shared viewer's own restricted screen, which never registers this channel at all). */
+  share: (() => void) | null
 }
 
-export const NO_ACTIONS: WorkspaceActions = { save: null, rename: null }
+export const NO_ACTIONS: WorkspaceActions = { save: null, rename: null, share: null }
 
 /**
  * The address, plus the ONE thing that can invalidate it after its publisher is gone.

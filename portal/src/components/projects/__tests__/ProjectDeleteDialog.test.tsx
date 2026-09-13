@@ -32,9 +32,11 @@ const project: Project = {
   appId: null,
   appStatus: null,
   hasRelaunchableSnapshot: null,
+  hasSavedSnapshot: null,
   isServing: false,
   createdAt: '',
   updatedAt: '',
+  access: 'owner',
 }
 
 beforeEach(() => {

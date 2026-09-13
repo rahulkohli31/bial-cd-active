@@ -813,7 +813,10 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // shell's two exit guards arm on, and it is KEPT across an unmount, while these two are cleared
   // with their publisher. THE ROW WANTS THE FLAG ALONE, deliberately: its chip reports whether a
   // version exists, which is the question `dirty` answers, and a recovery copy is not one.
-  usePublishSave({ dirty: saveDirty, saving, error: saveError }, { save: handleSave, rename: null })
+  usePublishSave(
+    { dirty: saveDirty, saving, error: saveError },
+    { save: handleSave, rename: null, share: null },
+  )
 
   // A genuine unmount must cancel the in-flight turn-stream reader — a chat switch already
   // aborts it before resubscribing, but nothing did on unmount, leaking the reader (and its
@@ -2607,7 +2610,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     // Stop, then WAIT FOR THE STOP TO GENUINELY FINISH, then save, then release — the ordering
     // invariant lives in `handOverWorkspace`, and so does the refusal to proceed on a stop that
     // only timed out. The narration is the dialog's; this is what feeds it.
-    await handOverWorkspace(blocked.projectId, save, {}, setHandoverStep)
+    await handOverWorkspace(blocked, save, {}, setHandoverStep)
     setHandoverStep('starting')
     // The retry is awaited BEFORE the dialog is dismissed. Clearing
     // first unmounts the only surface that can say "that didn't work", so a retry that failed

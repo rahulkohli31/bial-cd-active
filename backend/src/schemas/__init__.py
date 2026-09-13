@@ -25,3 +25,10 @@ from src.schemas.responses import ErrorEnvelope as ErrorEnvelope
 from src.schemas.responses import OkResponse as OkResponse
 from src.schemas.responses import error_responses as error_responses
 from src.schemas.responses import raw_body_doc as raw_body_doc
+from src.schemas.shares import ColleagueResult as ColleagueResult
+from src.schemas.shares import ColleagueSearchResponse as ColleagueSearchResponse
+from src.schemas.shares import ProjectSharesResponse as ProjectSharesResponse
+from src.schemas.shares import SharedProjectListResponse as SharedProjectListResponse
+from src.schemas.shares import SharedProjectResponse as SharedProjectResponse
+from src.schemas.shares import ShareRequest as ShareRequest
+from src.schemas.shares import ShareResponse as ShareResponse
