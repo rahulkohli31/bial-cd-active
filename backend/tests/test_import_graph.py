@@ -210,3 +210,16 @@ def test_the_app_still_builds_with_its_full_route_surface() -> None:
         f"{len(build_session_paths)}. If a route was deliberately added or removed, amend C3 "
         f"and update this number in the same change.\n{sorted(build_session_paths)}"
     )
+
+
+def test_the_error_signature_module_reaches_nothing_in_services() -> None:
+    """The turn engine and the log configuration of every process import this, so it has to stay a
+    leaf: loading it must not pull in a single `src.services` module. Mutation check: add an import
+    from `src.services` to `core/error_signature.py` and this goes red."""
+    result = _import_in_fresh_interpreter(
+        "import importlib, sys;"
+        " importlib.import_module('src.core.error_signature');"
+        " print(sorted(m for m in sys.modules if m.startswith('src.services')))"
+    )
+    assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    assert result.stdout.strip() == "[]", result.stdout
