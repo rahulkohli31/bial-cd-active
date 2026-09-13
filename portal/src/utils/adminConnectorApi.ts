@@ -19,12 +19,12 @@
  * cannot read is a contract break and throws — the panel has an error-and-retry state, and that
  * is the honest one.
  *
- * R18: nothing here names a connector. The key is a value, the display name rides the wire.
+ * Nothing here names a connector. The key is a value, the display name rides the wire.
  */
 import { ApiError, isRecord, optionalCount, optionalString, readApiError, requiredString } from './apiError'
 import { authFetch } from './api'
 import type { AuthFetchDeps } from './api'
-import { readConsentLines } from './connectorApi'
+import { jsonOpts, readConsentLines } from './connectorApi'
 import type { ConsentLine } from './connectorApi'
 
 /**
@@ -74,9 +74,7 @@ export interface ConnectorRequestRow {
    * tuple from the citizen's `consentLinesRequester` and not derivable from it.
    *
    * IT RIDES THE ROW BECAUSE THE DECIDE DIALOG IS HANDED A ROW AND NOTHING ELSE. A component
-   * that spelled these three sentences would make "add a second connector" a component change,
-   * which is the claim R18 makes and the exact defect the citizen's half of this wire has
-   * already been repaired for once.
+   * that spelled these three sentences would make "add a second connector" a component change.
    */
   consentLinesApprover: readonly ConsentLine[]
   /** The citizen's own words, in full. Rendered untruncated, as plain text, never markdown. */
@@ -224,7 +222,7 @@ export async function fetchWaitingConnectorCount(deps: AuthFetchDeps = {}): Prom
  * Give this person access to the connector they asked for.
  *
  * NO BODY AT ALL, and that is the `AdminReview` board's largest departure rather than an
- * omission (R10). The board draws a permanent `REQUIRED` remark over both outcomes; an approval
+ * omission. The board draws a permanent `REQUIRED` remark over both outcomes; an approval
  * stores nothing, because an approval remark would be readable nowhere — the audit row carries
  * ids, the citizen is never shown one, and the decided table has no remarks column. Sending an
  * empty `{}` here would be a body the route does not declare and a reader would have to work out
@@ -264,11 +262,7 @@ export async function declineConnectorRequest(
 ): Promise<void> {
   const res = await authFetch(
     `/api/admin/connector-requests/${encodeURIComponent(requestId)}/decline`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ remarks }),
-    },
+    jsonOpts('POST', { remarks }),
     deps,
   )
   if (!res.ok) throw await readApiError(res, 'Failed to decline the request')

@@ -10,11 +10,12 @@ that is made structural rather than remembered: `identity_resource_id_for_env` d
 from the presence of the coordinates, so a caller cannot attach one without the other.
 
 THE NAMES ARE GENERATED FROM THE CONNECTOR'S KEY. `backend/src/` may not contain the connector's
-name (R11, enforced by a word-boundary grep), so the container's `BIAL_DICE_URL` is built here as
-`f"BIAL_{key.upper()}_URL"` and never written down. `sandbox/supervisor/app.py` hardcodes the
-literals, because `sandbox/` sits outside that search — the two are produced independently and are
-asserted to agree for every registry entry. They fail CLOSED when they disagree: the backend sets
-a name the supervisor's allowlist does not carry, and the child simply never sees it.
+name (enforced by a word-boundary grep), so the container's URL variable is built here by
+`connector_env_names` as `f"BIAL_{key.upper()}_URL"` and never written down.
+`sandbox/supervisor/app.py` hardcodes the literals, because `sandbox/` sits outside that search —
+the two are produced independently and are asserted to agree for every registry entry. They fail
+CLOSED when they disagree: the backend sets a name the supervisor's allowlist does not carry, and
+the child simply never sees it.
 
 NOT RE-EXPORTED FROM THIS PACKAGE'S `__init__`. It reads the connector registry, which reaches
 `src/db/models/`, and `src/settings/api.py` imports this package's `config` module — see the
@@ -23,9 +24,12 @@ NOT RE-EXPORTED FROM THIS PACKAGE'S `__init__`. It reads the connector registry,
 
 from __future__ import annotations
 
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from src.core.connectors import CONNECTORS
+
+if TYPE_CHECKING:
+    from src.services.lake.config import LakeConfig
 
 # The prefix every injected variable shares, so a reader inside a workspace can tell what the
 # platform put there from what their own app added.
@@ -61,6 +65,18 @@ def connector_env_names(connector_key: str) -> tuple[str, str]:
     return f"{_PREFIX}{slug}_URL", f"{_PREFIX}{slug}_CLIENT_ID"
 
 
+def _configured_lake() -> LakeConfig | None:
+    """The configured lake, or `None` — read from `settings` at call time."""
+    # LOCAL, AND NOT FOR AN IMPORT CYCLE — hoisting this to module scope has been tried and the
+    # process boots. It stays local because this package is where two import directions meet:
+    # `src/settings/api.py` reaches `lake/config.py` from the settings side while this module is
+    # reached from the ORM side, and none of the four static gates executes an import, so the day
+    # that stops being safe would be found in production rather than in CI.
+    from src.config import settings
+
+    return settings.connector_lake
+
+
 def lake_env_for(connector_key: str) -> dict[str, str]:
     """The two values a container needs to read this connector's lake, or `{}` when no lake is
     configured.
@@ -72,14 +88,7 @@ def lake_env_for(connector_key: str) -> dict[str, str]:
     more allowlist rows, two more documentation rows and an assertion for a value with no reader.
     The window's only job in this pass is deciding which files transfer.
     """
-    # LOCAL, AND NOT FOR AN IMPORT CYCLE — hoisting this to module scope has been tried and the
-    # process boots. It stays local because this package is where two import directions meet:
-    # `src/settings/api.py` reaches `lake/config.py` from the settings side while this module is
-    # reached from the ORM side, and none of the four static gates executes an import, so the day
-    # that stops being safe would be found in production rather than in CI.
-    from src.config import settings
-
-    lake = settings.connector_lake
+    lake = _configured_lake()
     if lake is None:
         return {}
     url_name, client_id_name = connector_env_names(connector_key)
@@ -101,14 +110,7 @@ def identity_resource_id_for_env(app_env: dict[str, str]) -> str | None:
     a deployment with no lake, every project with the connector off, and every project whose owner
     is pending, declined or has never asked.
     """
-    # LOCAL, AND NOT FOR AN IMPORT CYCLE — hoisting this to module scope has been tried and the
-    # process boots. It stays local because this package is where two import directions meet:
-    # `src/settings/api.py` reaches `lake/config.py` from the settings side while this module is
-    # reached from the ORM side, and none of the four static gates executes an import, so the day
-    # that stops being safe would be found in production rather than in CI.
-    from src.config import settings
-
-    lake = settings.connector_lake
+    lake = _configured_lake()
     if lake is None:
         return None
     for connector_key in CONNECTORS:
