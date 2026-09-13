@@ -400,7 +400,6 @@ async def test_delete_cascades_children_and_sweeps_blobs(client, db_session, fak
     project = await ProjectFactory.create(db_session, user.id)
     app = await AppRegistryFactory.create(db_session, user_id=user.id, project_id=project.id)
     fake_storage.objects[snapshot_key(app.id)] = b"bundle"
-    # A PPTX attachment carries a derived `.pdf` sibling; both have to go.
     conv = await ConversationFactory.create(db_session, user.id, project_id=project.id)
     att_id = await _attachment(db_session, user.id, "att/deck", media_type=PPTX_MEDIA_TYPE)
     fake_storage.objects["att/deck"] = b"deck"
@@ -560,7 +559,7 @@ async def test_cascade_deletes_rows_and_returns_blob_keys(db_session) -> None:
 async def test_cascade_batches_many_conversations_and_dedups_shared_attachment(db_session) -> None:
     user = await UserFactory.create(db_session)
     project = await ProjectFactory.create(db_session, user.id)
-    shared = await _attachment(db_session, user.id, "att/shared")  # image → no pdf sibling
+    shared = await _attachment(db_session, user.id, "att/shared")
     deck = await _attachment(db_session, user.id, "att/deck", media_type=PPTX_MEDIA_TYPE)
 
     conv_a = await ConversationFactory.create(db_session, user.id, project_id=project.id)

@@ -5,10 +5,10 @@ check, so a within-grace or unknown-age blob is never deleted even with no ownin
 recorded lifecycle-triad bug was a liveness check that short-circuited to eligible with ZERO
 grace). `submissions/` and `apps/` are report-only pending a data-retention decision; `att/` and
 `snapshots/` delete the ownerless-and-past-grace keys. Owned-set for `att/` comes from the
-persisted `storage_key` column (never a PK-derived key), including each deck's `{key}.pdf`.
+persisted `storage_key` column (never a PK-derived key), one key per row.
 
-SERVICE-level tests (fixed injected `now`) — the owned-attachment / derived-key / deck-sibling
-pins that run through the REAL upload path live in `tests/api/v1/admin/test_storage_reconcile.py`.
+SERVICE-level tests (fixed injected `now`) — the owned-attachment and derived-key pins that run
+through the REAL upload path live in `tests/api/v1/admin/test_storage_reconcile.py`.
 """
 
 from __future__ import annotations
