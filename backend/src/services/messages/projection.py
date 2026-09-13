@@ -176,7 +176,7 @@ class AttachmentRefItem(CamelModel):
     """
 
     attachment_id: str
-    # The chip vocabulary — `document` or `image` today. Derived from the media type by
+    # The chip vocabulary — `document`, `file` or `image`. Derived from the media type by
     # `chip_kind_for`, the same function the upload response uses, so a chip rebuilt on reload
     # is the same shape as the one the citizen watched appear.
     kind: str = ""

@@ -47,14 +47,16 @@ from src.db.models.attachment import MAX_ATTACHMENT_NAME, Attachment
 from src.db.models.conversation import Conversation
 from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses
 from src.services.extract.zip_safety import FileParseError, assert_zip_not_bomb
-from src.services.media.lanes import (
+from src.services.media import (
+    ALLOWED_MEDIA,
     PASSWORD_PROTECTED_TEXT,
+    bytes_match_declared,
+    chip_kind_for,
     code_lane_refusal,
     is_code_lane,
     is_opc_archive,
     pdf_refusal,
 )
-from src.services.media.magic import ALLOWED_MEDIA, chip_kind_for, magic_matches
 from src.services.ratelimit import rate_limit
 from src.services.storage import (
     ObjectStorage,
@@ -138,8 +140,8 @@ situation told twice in different words."""
 
 # The allowlist + magic-byte prefixes live in `src.services.media.magic` — the SINGLE source of
 # truth shared with every other path that can put bytes in front of the model, so a block the
-# upload path would reject cannot slip in through one of them. `ALLOWED_MEDIA` / `magic_matches`
-# imported above.
+# upload path would reject cannot slip in through one of them. `ALLOWED_MEDIA` /
+# `bytes_match_declared` imported above.
 
 # Attachment limiter (Express: ~30/min, POST + DELETE only; GET is never limited).
 ATTACHMENT_RATE_LIMIT = 30
@@ -182,18 +184,15 @@ def _validate_attachment_bytes(media_type: str, b64: Any) -> str | None:
     """
     if not isinstance(b64, str) or not b64:
         return "Invalid attachment: missing bytes."
-    magic = ALLOWED_MEDIA.get(media_type)
-    if magic is None:
+    if media_type not in ALLOWED_MEDIA:
         return f"Unsupported attachment type: {media_type}. {ATTACHMENT_LANES_SENTENCE}"
     # 24 base64 chars → 18 bytes: enough for any magic prefix + the WebP form-type at offset 8.
     try:
         prefix = base64.b64decode(b64[:24])
     except (binascii.Error, ValueError):  # fmt: skip  # ruff py314 strips parens
         prefix = b""
-    if not magic_matches(prefix, magic):
+    if not bytes_match_declared(media_type, prefix):
         return f"Attachment bytes do not match the declared type {media_type}."
-    if media_type == "image/webp" and prefix[8:12] != b"WEBP":
-        return "Attachment bytes do not match the declared type image/webp."
     return None
 
 
@@ -214,10 +213,8 @@ def _attachment_name(value: Any) -> str:
 def _sniff_media_type(data: bytes) -> str | None:
     """Reverse-lookup the media type from the magic bytes (only allowlisted/validated bytes
     are ever stored), matching Express `sniffMediaType`. None → application/octet-stream."""
-    for media, magic in ALLOWED_MEDIA.items():
-        if magic_matches(data, magic):
-            if media == "image/webp" and data[8:12] != b"WEBP":
-                continue
+    for media in ALLOWED_MEDIA:
+        if bytes_match_declared(media, data):
             return media
     return None
 

@@ -13,6 +13,8 @@ A retired chat relay was a third consumer, and re-checking there is why this is 
 
 from __future__ import annotations
 
+from typing import Literal
+
 from src.services.media.lanes import is_code_lane
 
 # Allowlisted media types → magic-byte prefix. WebP is a RIFF container: the "RIFF" prefix is
@@ -42,8 +44,9 @@ def bytes_match_declared(media_type: str, data: bytes) -> bool:
     return not (media_type == "image/webp" and data[8:12] != b"WEBP")
 
 
-def chip_kind_for(media_type: str) -> str:
-    """The chip vocabulary the browser branches on: `document` for a PDF, `image` otherwise.
+def chip_kind_for(media_type: str) -> Literal["document", "file", "image"]:
+    """The chip vocabulary the browser branches on: `document` for a PDF, `file` for a code-lane
+    format, `image` otherwise.
 
     HERE RATHER THAN AT THE UPLOAD ROUTE, which is where this rule used to live as a lone
     ternary. It now has a second caller — the conversation projection, which has to name the

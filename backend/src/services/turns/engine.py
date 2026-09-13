@@ -1349,6 +1349,26 @@ class TurnEngine:
             self._emit(state, lambda seq: TurnErrorFrame(seq=seq, message=message))
             self._finish(state, "failed")
 
+        async def _end_named_refusal(event: str, code: str, text: str, status_code: int) -> None:
+            """A provider refusal the citizen can act on, ended in the platform's own words.
+
+            The spend that got this far still counts, exactly as it does on every other ending:
+            the refused request is free, the turns before it were not. The `code` rides out on the
+            terminal frame beside the sentence, which is how the browser offers the way forward.
+            Takes the status code rather than the exception: Python unbinds the `as` name at the
+            end of an except block."""
+            _log.info(
+                event,
+                conversation_id=str(state.conversation_id),
+                turn_id=str(state.turn_id),
+                status_code=status_code,
+            )
+            await _bill_once()
+            state.end_reason = code
+            state.error_message = text
+            self._emit(state, lambda seq: TurnErrorFrame(seq=seq, message=text))
+            self._finish(state, "failed")
+
         try:
             workspace = await self._pin_workspace(
                 state,
@@ -1658,46 +1678,26 @@ class TurnEngine:
             # takes it HERE rather than by being re-raised, because a sibling `except` would not
             # catch it. See `_fail_generically` for what re-raising would cost.
             if _is_context_overflow(exc):
-                _log.info(
-                    "turn_context_overflow",
-                    conversation_id=str(state.conversation_id),
-                    turn_id=str(state.turn_id),
-                    status_code=exc.status_code,
-                )
-                # The spend that got this far still counts, exactly as it does on every other
-                # ending: the refused request is free, the turns before it were not.
-                await _bill_once()
                 # THE SAME SENTENCE AND THE SAME CODE THE ADMISSION CHECK REFUSES WITH — the
                 # 413 `turns.start_turn` raises when the conversation is already past the
                 # ceiling. One condition, one remedy, one wording: a second sentence for "this
                 # chat is full" is a second thing to keep true, and the citizen cannot tell the
-                # two situations apart anyway. The code rides out on the terminal frame as the
-                # machine-readable half, which is how the browser offers the same way forward.
-                state.end_reason = CHAT_TOO_LONG_CODE
-                state.error_message = CHAT_TOO_LONG_TEXT
-                self._emit(
-                    state,
-                    lambda seq: TurnErrorFrame(seq=seq, message=CHAT_TOO_LONG_TEXT),
+                # two situations apart anyway.
+                await _end_named_refusal(
+                    "turn_context_overflow",
+                    CHAT_TOO_LONG_CODE,
+                    CHAT_TOO_LONG_TEXT,
+                    exc.status_code,
                 )
-                self._finish(state, "failed")
             elif _is_document_too_long(exc):
                 # A PROPERTY OF THE FILE, NOT OF THE CHAT, so it gets its own sentence rather
-                # than the overflow's. Same shape as the arm above otherwise: bill what ran,
-                # name the cause, finish failed.
-                _log.info(
+                # than the overflow's.
+                await _end_named_refusal(
                     "turn_document_too_many_pages",
-                    conversation_id=str(state.conversation_id),
-                    turn_id=str(state.turn_id),
-                    status_code=exc.status_code,
+                    DOCUMENT_TOO_LONG_CODE,
+                    DOCUMENT_TOO_LONG_TEXT,
+                    exc.status_code,
                 )
-                await _bill_once()
-                state.end_reason = DOCUMENT_TOO_LONG_CODE
-                state.error_message = DOCUMENT_TOO_LONG_TEXT
-                self._emit(
-                    state,
-                    lambda seq: TurnErrorFrame(seq=seq, message=DOCUMENT_TOO_LONG_TEXT),
-                )
-                self._finish(state, "failed")
             elif _is_transient_model_status(exc.status_code):
                 await _end_model_unavailable(exc)
             else:

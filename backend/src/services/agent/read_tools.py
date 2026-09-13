@@ -786,6 +786,7 @@ def check_the_guest_list(argv: Sequence[str]) -> str | None:
             "most reads."
         )
     for token in argv[1:]:
+        operand = token
         if token.startswith("-"):
             flag, separator, value = token.partition("=")
             denied = _denied_flag_in(flag, policy)
@@ -796,25 +797,15 @@ def check_the_guest_list(argv: Sequence[str]) -> str | None:
                 )
             # A path also rides in on `--flag=<path>`; vetting only bare tokens let
             # `grep --file=../../x .` walk straight out of the jail.
-            if separator:
-                # BEFORE the lexical guard, on BOTH operand branches. Before, because the
-                # absolute spelling of an attachment path starts with `/` and the guard's
-                # leading-slash arm would otherwise answer first, with advice ("drop the leading
-                # `/`") that leads nowhere. Both branches, because an attachment path rides in on
-                # `grep --file=.attachments/patterns` exactly as it does bare.
-                attachment_refusal = _refuse_an_attachment_operand(value)
-                if attachment_refusal is not None:
-                    return attachment_refusal
-                path_refusal = _vet_path_token(value)
-                if path_refusal is not None:
-                    return path_refusal
-        else:
-            attachment_refusal = _refuse_an_attachment_operand(token)
-            if attachment_refusal is not None:
-                return attachment_refusal
-            path_refusal = _vet_path_token(token)
-            if path_refusal is not None:
-                return path_refusal
+            if not separator:
+                continue
+            operand = value
+        # The attachment refusal runs BEFORE the lexical guard, because the absolute spelling of
+        # an attachment path starts with `/` and the guard's leading-slash arm would otherwise
+        # answer first, with advice ("drop the leading `/`") that leads nowhere.
+        refusal = _refuse_an_attachment_operand(operand) or _vet_path_token(operand)
+        if refusal is not None:
+            return refusal
     if policy.validator is not None:
         return policy.validator(argv)
     return None
