@@ -12,76 +12,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Attachments were reworked end to end: what can be attached, how big it may be, which conversation
-it belongs to, and what the model does with it.
-
-### Breaking
-
-- **Uploading a file now requires naming the conversation it belongs to.** `POST /v1/attachments`
-  rejects a body with no `conversationId` with a 400 and the code `CONVERSATION_ID_REQUIRED`; a
-  conversation that does not exist, or belongs to another user, is a 404. Uploads used to arrive
-  unattached and be adopted by the first turn that followed, which left three questions unanswerable
-  at the door — whose allowance the file counted against, which conversation's limit it was testing,
-  and, when the turn never came, whether it had an owner at all. The portal creates the chat before
-  its first upload, so nothing in the product notices; any other caller must send the field.
-- **The per-file limit is 10 MB, and a conversation holds 20 files.** Both are checked at the door.
-  The old total-bytes-per-conversation budget is gone: a count is a rule people can predict, and a
-  byte budget refused the fourth small file after three large ones for reasons nobody could see.
-
-### Added
-
-- **Spreadsheets, documents and decks can be attached, and the model reads them where they live.**
-  `.xlsx`, `.docx`, `.pptx`, `.csv`, `.tsv` and `.tab` files are placed in the workspace and read by
-  a script inside the container, so a 10 MB spreadsheet costs a few hundred tokens to consult rather
-  than being pasted into the conversation. Images and PDFs are still read directly by the model.
-- **A locked or truncated PDF is refused at the door, with the reason.** A password-protected PDF and
-  one whose bytes end mid-file are both detected on upload, so the refusal names what is wrong with
-  the file instead of arriving as a confused answer several minutes later.
-
 ### Fixed
 
-- **A file's chip is drawn once, under the message that carried it.** Attaching one spreadsheet and
-  then sending three more messages showed the same chip four times on reload — once under every
-  bubble, including bubbles whose message never mentioned the file.
-- **Deleting an attachment can no longer leave a chip that opens to nothing.** The row is removed
-  first and the stored file swept afterwards, so a failure part-way through cannot leave a file
-  listed in the composer whose contents are already gone.
-- **A file that has gone missing from storage says so, instead of asking you to try again.** Nothing
-  puts a missing file back, so the old sentence cost the turn twice before the citizen learned the
-  only thing that works is attaching it again. Transient failures — a credential blip, a slow store
-  — still say to try again, because for those it is true.
-- **Asking the agent to open an attached file by its path teaches, instead of refusing.** A command
-  naming a file under the attachments folder now answers with the tool that reads it, rather than a
-  bare refusal the model would retry a different way.
-- **A spreadsheet the reader cannot parse reports the failure instead of an empty file.** Three
-  failure paths in the in-container reader swallowed their own errors and returned nothing, which
-  the model read as "the file is empty" and answered from the file's name.
-- **A dense 10 MB spreadsheet can actually be read.** The reader was building an object for every
-  cell — twice — to report a file's shape, so a 920,000-cell workbook needed 829 MB and was refused
-  as too large for the workspace. It streams now: 46 MB and under six seconds for the same file.
-- **A PDF with more pages than the assistant can read now says so.** Such a document used to end the
-  turn with "the assistant hit a problem", which named nothing and invited sending it again. The
-  refusal now names the document, says that the chat it landed in will keep hitting the same limit,
-  and offers the two things that work from there — start a new chat with a shorter document, or
-  split this one and attach the part you need.
-- **A spreadsheet that misdescribes its own size no longer hides its own data.** A workbook carries
-  a record of how far its sheets extend, and some tools write one that is too small. The reader
-  believed it, so a sheet of fifty rows and three columns declaring itself a single cell was
-  summarised as a single cell — with the other columns missing from everything the assistant saw,
-  no error, and nothing to suggest anything had been missed.
-- **Switching chats while a file is uploading no longer disables Send everywhere.** The composer is
-  shared across conversations, and an upload abandoned by navigating away left it waiting on a
-  message that would never be sent, in every chat, until the page was reloaded. Those abandoned
-  uploads also kept counting against the old chat's twenty-file limit, so it could refuse the next
-  file while showing none.
-- **Two files with the same name can no longer overwrite each other in the workspace.** The escape
-  for a repeated filename was a name a third file could itself have.
-- **A malformed PDF cannot break the password check.** A crafted file could make the check that
-  looks for a password fail outright rather than answer yes or no.
-- **A very long column, sheet or slide name can no longer crowd out the answer.** Every name the
-  reader reports is trimmed the way the rest of its output already was. A spreadsheet whose header
-  ran to sixty thousand characters used to reach the assistant in full, and again with each sample
-  row shown beneath it, leaving little of the conversation for anything else.
 - **An app whose dev server stopped no longer looks like a slow app that never opens.** When the
   process serving a finished app died between messages — out of memory, crashed, or never brought
   back after a restart — the preview kept saying "Your app is taking longer than usual to open", or
@@ -96,16 +28,320 @@ it belongs to, and what the model does with it.
   logs `app_stopped_while_idle`, with the supervisor's exit code (`-9` or `137` means the process was
   killed, most often for running out of memory) and whether the container was put away or spared.
 
+## [1.7.0-beta.16] - 2026-09-13
+
+Spreadsheets, Word documents and slide decks can be attached to a chat, and the assistant reads the
+whole file rather than a slice of it. Around that, attachments were reworked end to end: one size
+limit for every format, a file count per conversation in place of a storage allowance, and chips
+that are still there after a reload.
+
+### Breaking
+
+- **Uploading a file now requires naming the conversation it belongs to.** `POST /v1/attachments`
+  refuses a body with no `conversationId` with a 400 and the code `CONVERSATION_ID_REQUIRED`; a
+  conversation that does not exist, or belongs to someone else, is a 404. Uploads used to arrive
+  unattached and be adopted by whichever message followed, so a file whose message was never sent
+  belonged to no conversation at all. The portal now creates the chat before its first upload, so
+  nothing in the product notices; any other caller must send the field.
+
+### Added
+
+- **Excel, Word, PowerPoint and TSV files can be attached, and the assistant reads them with code.**
+  `.xlsx`, `.docx`, `.pptx`, `.tsv` and `.tab` files are placed in the project's workspace and
+  opened there by a reader built into the workspace. The assistant receives a bounded summary of
+  the whole file — every sheet with its true row count, the columns and their types, a few sample
+  rows, formulas that have no calculated result — and never the file itself. Images and PDFs are
+  still read directly by the assistant.
+- **The reader copes with large and awkward files.** A dense 10 MB workbook is read in a few
+  seconds. A file it cannot read comes back as a named failure, never as an empty file the
+  assistant would then describe from its name. A workbook whose own record of its width is too
+  small is still read in full, and a column, sheet or slide name tens of thousands of characters
+  long is trimmed like every other piece of text the reader reports.
+- **An attached file shapes the app; it is not loaded into it.** The assistant opens a spreadsheet
+  to learn its columns, types and vocabulary and builds to match. It is told not to copy the file's
+  rows into the app's database and to ask first if seed data seems needed, and to treat anything
+  written inside a file as data rather than as instructions.
+- **A reloaded chat still shows every attachment, one chip under the message that carried it.**
+  Before this release a reload showed no chips at all, for any format — a file's bytes still
+  rode on every later turn, but nothing on screen said it had been sent. The chat now looks the
+  same after a refresh as it did the moment the file was attached.
+
+### Changed
+
+- **One size limit for every file: 10 MB, up from 4 MB.** A CSV used to be held to 256 KB, and a
+  selection of text files to 512 KB between them. Every format now takes the same 10 MB, checked in
+  the browser before the file is sent and again at the server.
+- **A conversation holds up to 20 files, and that is now the whole storage rule.** The 50 MB
+  allowance each person had across all of their chats is gone, so nothing limits how much one
+  person stores in total. The browser always counted twenty files per chat, but its count reset on
+  every reload; the server now enforces it and says "Start a new chat to add more."
+- **A message can carry any mix of up to five files.** The limit of two PDFs per message is gone,
+  in the composer and at the server, and the server now holds a message to the same five files the
+  composer offers.
+- **A CSV is uploaded and read by code, instead of being pasted into the conversation.** Copying it
+  into the message text is why it was held to 256 KB. It now travels like any other file, can still
+  be previewed in the composer before sending, and pressing its chip in the conversation downloads
+  it.
+- **A PDF is no longer refused at upload for its length.** The 30-page limit is gone, so a long
+  document is accepted and the assistant tries to read it — see Known limitations for where that
+  stops. A PDF cut off partway through is still refused at the door, and now says it could not be
+  read rather than that it is too long. A password-protected PDF, Word, Excel or PowerPoint file
+  gets one sentence: remove the password and attach it again.
+
+### Removed
+
+- **Plain-text (`.txt`) files can no longer be attached.** They used to be pasted into the message
+  alongside CSV files, and that route is gone. Paste the contents into the message instead.
+- **The server no longer converts Word and Excel files to text, and the slide-deck converter is
+  gone.** Word and Excel files used to be flattened to Markdown on the server, keeping the first
+  thousand rows of each sheet, and a `.pptx` depended on a document-conversion sidecar (Gotenberg)
+  that was never deployed. The portal had already stopped offering either, and the reader above
+  replaces both. The `GOTENBERG_URL` setting goes with them, as do the server's PDF page counter
+  and the libraries behind all three. Conversations that already carry an extracted file still
+  show it.
+
+### Fixed
+
+- **Pressing Send while a file is still being added no longer sends the message without it.** A
+  file is not attached until the browser has finished reading it, and on a large file that took
+  long enough to press Enter: the question went, the file did not, and nothing on screen said so.
+  Send now waits and the box says "Adding your file…", in the chat composer and the workspace rail
+  alike.
+- **Deleting an attachment can no longer leave a chip that opens to nothing.** The stored file used
+  to be removed before its row, so a failure in between left a chip whose contents were already
+  gone. The row is removed first and the file swept afterwards.
+- **Switching chats while a file is uploading no longer leaves Send unavailable in every chat.** The
+  composer is shared across conversations, and an upload abandoned by navigating away left it
+  waiting on a message that would never be sent, until the page was reloaded. Files that had
+  already reached the server are released rather than left behind in the chat that was left.
+- **A chip whose file has gone says so, and names it.** Pressing a PDF, spreadsheet, document or
+  deck chip whose stored file was missing did nothing at all. It now reads "… is no longer
+  available — attach it again to use it", and the change is announced to screen readers.
+- **An attached image can be opened from the keyboard.** It was a clickable picture that neither a
+  keyboard nor a screen reader could reach as a control; it is now a button named for the file.
+
 ### Known limitations
 
-- **A long PDF is limited by pages, not by megabytes, and the limit is lower than the 10 MB cap
-  suggests.** A PDF page costs the assistant roughly 2,900 tokens, so page count is what decides,
-  however small the file is. Around 175 pages a single document fills a conversation's whole
-  allowance: that message is still answered, and the chat is finished afterwards. Past roughly 350
-  the document is refused outright, and past 600 it is refused for its page count specifically.
-  Every one of those refusals is now clearly worded, but none is caught at upload — the file is
-  accepted and the refusal arrives on the turn. Attaching an excerpt rather than a full report is
-  the reliable approach for long documents.
+- **A long PDF is limited by pages, not megabytes, and the limit sits well below what 10 MB
+  allows.** A PDF page costs the assistant roughly 2,900 tokens, measured, however small the file.
+  Around 175 pages a single document fills a conversation's allowance: that message is still
+  answered, and the next one is refused with "This chat has got too long to carry on". Past roughly
+  350 pages the message itself is refused with the same sentence, and past 600 the refusal names
+  the document and says to start a new chat with a shorter one or to split it. None of these is
+  caught at upload, and because the document stays in the chat's history, that chat keeps refusing.
+  Attaching an excerpt is the reliable approach for long documents.
+- **A refused first message now leaves an empty chat behind.** A chat is created a step before its
+  first message is sent, because a file has to name the chat it belongs to, so when that first
+  message is refused the untitled chat remains. Sending again in it works.
+- **A workbook that records the right width but the wrong height is summarised at the height it
+  declares.** Checking every row to catch it would put ordinary files on the reader's 30-second
+  limit.
+- **A file abandoned by switching chats mid-upload disappears without a word.** The composer
+  recovers and the upload is released, but the chat that was left says nothing about the file that
+  did not arrive.
+
+### Deploying this release
+
+- **Ship in this order: sandbox image, portal, backend, worker.** A new backend with the old portal
+  refuses every upload with `CONVERSATION_ID_REQUIRED`, because the old portal never sends the
+  field. A new portal with the old backend works for images and PDFs — the old backend already
+  accepted `conversationId` and already served `POST /v1/conversations` — but refuses a CSV, TSV or
+  deck, and handles Word and Excel files the old way, so keep that gap short. A new image with the
+  old backend changes nothing: nothing calls the reader yet.
+- **Build the sandbox image first, and push it under a new immutable tag and `:latest`.** Build with
+  context `sandbox/` and `--platform linux/amd64`. The image now carries the reader at
+  `/usr/local/lib/bial/read_attachment.py`, its four Python libraries — polars alone is roughly
+  220 MB — and a `/workspace/attachments` directory beside the app. A new backend on the old image
+  cannot place a file: the turn ends with "… could not be placed in your workspace. Please try
+  again.", and the log shows `400 … path escapes workspace`, which means an old image rather than a
+  path bug. If `SANDBOX__IMAGE_REF` points at `:latest` no setting changes; if it names a pinned
+  tag, point it at the new one.
+- **A workspace already running keeps the image it was created with.** Reattaching to a live
+  container does not check its image, so a spreadsheet, document or deck attached in a workspace
+  that predates the push fails as above until that workspace is torn down and provisioned again.
+  Images and PDFs are unaffected.
+- **No migration and no new settings; `GOTENBERG_URL` is removed.** Left set as an environment
+  variable it is ignored, but the backend refuses unknown keys in its env file, so delete the line
+  from any env file that still carries it or the backend will not start.
+- **The backend and worker share one image, and it must be rebuilt.** Its lockfile drops the Word,
+  Excel and PDF libraries. The worker runs none of the attachment code and simply rolls with the
+  new image.
+- **To roll back, revert the backend before the portal; the sandbox image can stay.** An old portal
+  on the new backend refuses every upload. And once a spreadsheet, document or deck has been sent,
+  the old backend cannot see how the new one recorded it: its superadmin storage reconcile treats
+  those files as never sent and deletes any older than 48 hours, so do not run that sweep on a
+  rolled-back backend.
+
+## [1.7.0-beta.15] - 2026-09-13
+
+A project that will never be published can now be handed to a colleague. Its builder picks people
+by name, those people find it under "Shared with me", and opening it runs the app in a workspace of
+their own, restored from the builder's last saved version. There is no deployment and no approval,
+and nothing in the builder's own workspace is touched.
+
+### Added
+
+- **A project can be shared with named colleagues.** A Share control beside Rename on the project
+  screen opens a panel that finds colleagues by the start of any word in their name, or the start of
+  their email address. It also lists who can use the project, with a Remove button beside each
+  person. Results show a name and the part of the address before the @, never the full address. You
+  never appear in your own results, and sharing with the same person twice changes nothing. A search
+  needs three characters, returns at most ten people and is limited to thirty a minute. Under the
+  box, each of those states is a plain sentence rather than an error code.
+- **The share panel says what a share grants before anyone is added.** It reads: "Anyone you add can
+  open and use this app. Anything they enter is saved into the project's real data." A share is
+  labelled "Can use", never "view only". A colleague uses the real app against the project's real
+  database, and can add, change and delete its records through the app's own screens exactly as the
+  builder can.
+- **A project can be shared only once a version of it has been saved.** Until then, sharing is
+  refused with "Save a version of this app before sharing it — there's nothing to share yet." An
+  autosaved copy does not count, because a colleague is only ever shown what the builder chose to
+  save. An administrator having refused to publish the app does not stop it being shared: publishing
+  and sharing are separate decisions. Every share and every removal is written to the audit log, and
+  a share also records the app's status at that moment.
+- **"Shared with me" lists what colleagues have handed you.** A second tab beside "My projects"
+  shows each shared project's name and description, who shared it and when, newest first, with
+  "Load more" at the bottom. When the list is empty it explains what will appear there, and it
+  offers no "New project" button, since nothing can be created from that list.
+- **Opening a shared project runs the app in a workspace of your own, and shows nothing else.** The
+  page holds the app, its name, a "Can use" label and a Refresh control — no chat, no save, no
+  publish, no rename. The app starts as the page opens and shows "Getting this app ready…" while it
+  does. If it cannot start, the page says "Couldn't open this app" and offers Retry. The app is
+  restored from the builder's last saved version, never from unsaved or autosaved work, and the
+  builder's own workspace is never touched. "Snapshot from …" says how old that version is, and
+  Refresh starts the app again from whatever the builder has saved since. When the builder has
+  nothing saved, the page says "Nothing to launch yet" instead of trying. The server refuses a
+  colleague every other action on the project, whatever the page shows. Someone who opens the wrong
+  address for their role is sent to the right one: a colleague to the shared view, the builder to
+  their own workspace.
+- **A shared app counts as your one app at a time, and you are asked before it replaces another.**
+  If one of your own apps is running, opening a shared project raises the same prompt as starting
+  any other app, naming the app that will stop. Starting your own app while a shared one is open
+  asks the same way, then tells you it closed your view of the shared app and that your app now has
+  the workspace.
+- **Removing a colleague ends their access at once.** Their share is removed first and their open
+  copy of the app is closed straight after. The next time they open the project they are sent back
+  to their projects with "That project is no longer available." If their copy cannot be closed at
+  that moment, the builder is told the share was removed and the app will be cleared automatically.
+  Deleting a project closes every colleague's copy of it, along with the builder's own.
+- **A shared app nobody is using closes by itself.** A colleague's copy is kept for at least half an
+  hour after it starts, and after that for as long as the app keeps receiving requests. Every copy
+  closes four hours after it was last started, however much it is used, so a stuck container cannot
+  keep running, and billing, indefinitely.
+
+### Changed
+
+- **Fetching a project that was shared with you now returns it instead of a 404.**
+  `GET /v1/projects/{id}` returns a shared project to a colleague with `access: "shared"` and a
+  `hasSavedSnapshot` flag; to its builder, `access` is `"owner"`. It is the only project route that
+  admits a colleague — every other one still answers 404. When your one-app-at-a-time place is
+  taken, the 409 response now also carries `isSharedView`. It tells a client to free the place with
+  `POST /v1/build-sessions/shared-view/release` rather than trying to stop a project the caller does
+  not own. Every change here is an addition, and existing callers need no change.
+
+### Known limitations
+
+- **A colleague's changes cannot be told apart from the builder's.** Both reach the project's
+  database through its one login, so a record a colleague deletes through the app cannot be traced
+  to them. The audit log records who was given access and when, which is the closest record there
+  is.
+- **An open shared-app page does not notice when its app closes.** When the app closes because
+  nobody used it, because it reached four hours, or because the share was removed, the page does not
+  watch for it: the app simply stops responding in the frame. Refresh starts it again, unless the
+  share was removed.
+- **"Shared with me" cannot be searched yet.** The tab lists projects and loads more of them,
+  nothing else.
+- **A shared app's container that loses its record in the coordination store is found by nothing
+  automatic.** The only view the platform has of which containers exist in Azure still lists build
+  workspaces alone. Such a container would keep running until someone deletes it by hand. Every
+  other shared app is closed by the worker's five-minute sweep.
+
+### Deploying this release
+
+- **Run migration 0041 before starting the new backend and worker.** It creates the
+  `project_shares` table and its two indexes and changes nothing that already exists, so it is safe
+  to run while the previous image is still up. The new images need it: without the table, deleting a
+  project fails and the worker's five-minute sweep fails on every pass, closing nothing. Rolling the
+  schema back means downgrading to `0040_description_embedding`, which drops the table and every
+  share in it.
+- **Deploy the backend and the worker together, and do not revert either while shared apps are
+  open.** The previous image's sweep does not recognise a shared app's container. It deletes the
+  container's record and leaves the container running, and nothing finds that container again. Put
+  the worker on this image no later than the backend. If either is reverted, delete by hand any
+  `shr-` container apps left in the sandbox environment.
+- **Rebuild the portal image after the backend is on the new version.** The portal's `nginx.conf`
+  now routes `/a/shr-…` to a shared app and keeps that app's `/_sup` path closed, as it already did
+  for build workspaces and published apps. With the old routing a shared app has no route. The
+  previous backend has none of the sharing routes, so the new portal should not go out before it.
+- **No new settings and no new sandbox image are needed.** A shared app is kept open by the
+  supervisor's `/_sup/served` request count, which has been in the sandbox image since 1.6.12. The
+  thirty-searches-a-minute limit and the four-hour ceiling are fixed in code, not set by
+  configuration.
+
+## [1.7.0-beta.14] - 2026-09-11
+
+Four defects reported from production on 2026-09-11 — three on the build screen and one at sign-in —
+traced from the chat database, the platform's metrics and a live log stream. One build failure could
+not be explained from any of them, so a build that fails without a named reason now records what
+ended it.
+
+### Changed
+
+- **A build that fails for a reason the platform cannot name now records what ended it.** Such a
+  failure used to record only that it failed, so its cause could be found only in the backend log.
+  A turn that ends with "The assistant hit a problem", or with the model-service ending below, now
+  stores the kind of error, its status and where in the platform's code it surfaced — never the
+  error's text — so the next unexplained failure can be traced from the database. Endings that
+  already name their reason are unchanged, and nothing new is sent to the browser.
+
+### Fixed
+
+- **A finished build no longer leaves the preview on "Putting this page together…".** When a build
+  ended while the app was still compiling, the pane kept its compile cover up with nothing left to
+  take it down, so the app never appeared even though opening it in a new tab showed it working.
+  Thirty seconds after the build ends the cover now steps aside and the app's own "on screen" signal
+  decides what shows. An app that has not sent that signal gets the ordinary wait, never a blank
+  frame.
+- **A build that stopped at its request limit is no longer labelled "The build failed."** The
+  build's closing message said the app was working while the transcript line above it said the
+  build had failed. That line now reads "This build stopped after doing as much as it does in one
+  go." A build that reaches its time limit reads the same way.
+- **A build cut short by the assistant's service says so, instead of "The assistant hit a
+  problem".** When the model service is still failing after its own retries, never answers, or ends
+  a reply with an error, the build now ends with "The assistant's service stopped responding partway
+  through…", says whether a copy of the app was kept, and asks for the message to be sent again in a
+  minute. The transcript line reads "The assistant could not get an answer from its service, so this
+  build stopped." rather than "The build failed.", and a Plan chat gets the same ending without the
+  part about the app. A request the platform itself built wrong keeps the ordinary ending. Pressing
+  Stop while that ending is saving the app still ends the build.
+- **Signing in no longer fails on every attempt once the organization's verification has expired.**
+  Microsoft reused a signed-in session whose multi-factor check had expired and then refused it, so
+  every attempt ended in "Sign-in failed. Please try again." and retrying could never help. The
+  platform now sends the person back to Microsoft once to verify again. If that also fails, or
+  Microsoft cannot be reached for that second try, the sign-in page says the organization needs the
+  sign-in confirmed again, and its button starts a fresh sign-in.
+
+### Known limitations
+
+- **The second trip to Microsoft has not yet been tried against the organization's own sign-in
+  policy.** Its tests use a stand-in for Microsoft. A fresh sign-in makes Microsoft authenticate the
+  person again, but whether that includes the verification step is the policy's decision, so
+  someone can still reach "Your organization needs you to confirm your sign-in again." after it.
+- **A connection to the assistant's service that breaks partway through a reply still reads "The
+  assistant hit a problem".** The same kind of error can come from the workspace, so it is not yet
+  told apart from a platform fault. The record described above names it when it happens.
+
+### Deploying this release
+
+- **This release needs a new backend image and a rebuilt portal bundle, and nothing else.** It adds
+  no migration, no setting and no sandbox image change. The two can go out in either order: until
+  the portal is rebuilt, a sign-in that needs confirming shows the ordinary "Sign-in failed. Please
+  try again.", and the backend still sends the person back to Microsoft once on its own.
+- **Rolling back to 1.7.0-beta.13 is an image swap.** Turns recorded by this release keep their new
+  ending and error record in the database; the older code shows "The build failed." for the new
+  model-service ending and never reads the record.
+- **Coming from 1.7.0-beta.12 or older, follow 1.7.0-beta.13's steps as well.** Its migration and
+  its new setting come with this image.
 
 ## [1.7.0-beta.13] - 2026-09-11
 
@@ -128,34 +364,27 @@ checks whether something like your app already exists before it creates a new pr
   stays available throughout. The typed name and description are preserved on "Go back". Nothing is
   ever blocked: a failed, slow or unconfigured search simply creates the project as it did before.
 
+### Changed
+
+- **Editing an app's description follows the same rule as creating one.** The description editor on
+  an existing project asks the same question, takes 15 to 120 words, and no longer lets a
+  description be cleared. A project created before this release keeps whatever description it had
+  until someone edits it.
+
 ### Removed
 
 - **The "Generate Description" button is gone.** It asked an AI to write a description from the app's
-  code, but the column it read stopped being written months ago, so it answered "Nothing to generate
+  code, but the column it read has not been written since July, so it answered "Nothing to generate
   from yet — build the app first" on every app, including fully built ones. The button, its endpoint
   and the unused `app_registry.current_code` column behind it are all removed.
 
-### Fixed
+### Known limitations
 
-- **A finished build no longer leaves the preview on "Putting this page together…".** When a build
-  ended while the app was still compiling, the pane kept its compile cover up with nothing left to
-  take it down, so the app never appeared even though opening it in a new tab showed it working.
-  Thirty seconds after the build ends the cover now steps aside and the app's own "on screen" signal
-  decides what shows. An app that has not sent that signal gets the ordinary wait, never a blank frame.
-- **A build that stopped at its request limit is no longer labelled "The build failed."** The
-  transcript now says what the assistant's own message says: "This build stopped after doing as much
-  as it does in one go." A build that reaches its time limit reads the same way.
-- **Signing in no longer fails on every attempt once the organization's verification has expired.**
-  Microsoft reused a signed-in session whose multi-factor check had expired and then refused it, so
-  every attempt ended in "Sign-in failed. Please try again." and retrying could never help. The
-  platform now sends the person back to Microsoft once to verify again. If that also fails, the sign-in
-  page says the organization needs the sign-in confirmed again, and its button starts a fresh sign-in.
-- **A build interrupted by the assistant's service says so, and every failed build records why.** When
-  the model service stops answering partway through, the build now ends with "The assistant's service
-  stopped responding partway through…" and says to send the message again in a minute, instead of "The
-  assistant hit a problem". Pressing Stop while that ending is saving the app still ends the build.
-  Every failed build also stores the kind of error that ended it and where in the platform's code it
-  surfaced, never the error's text, so the next unexplained failure can be traced from the database.
+- **Apps published before this release are found by their words only.** Nothing goes back and reads
+  existing descriptions for their meaning: a description gains that only when a project is created,
+  or when its description is edited, while semantic search is turned on. Until then those apps still
+  appear in word search, but the meaning-based half of search and of the duplicate check does not
+  see them.
 
 ### Deploying this release
 
@@ -168,14 +397,22 @@ checks whether something like your app already exists before it creates a new pr
   quietly falls back to matching words only and the two features above lose their meaning-based half.
   Set it alongside the existing `FOUNDRY__*` settings, then confirm it took by running one search whose
   words do not appear in the app it should find.
-- **The fixes above need only the backend image and the portal bundle.** They add no migration and no
-  setting of their own.
 
 ## [1.7.0-beta.12] - 2026-09-10
 
 The white preview pane, reported from production on 2026-09-10: pressing Build showed a blank white
 rectangle where the app should be, while every status on the screen said the app was fine. Cut as a
 hotfix.
+
+### Changed
+
+- **A new chat is a Plan chat by default.** A first prompt is usually a rough description rather
+  than a brief; you now get a plan to read and a "Build this plan" button. Build is one click away
+  and unchanged.
+- **The preview pane has fewer states, and one author owns the words.** Ten states become six:
+  fetch facts that changed nothing for the citizen become the ordinary wait, a refused start is a
+  note on the saved card carrying the server's own sentence, and a held workspace always offers its
+  take-back control.
 
 ### Fixed
 
@@ -186,8 +423,9 @@ hotfix.
   nothing behind it. The page itself now reports, from inside the browser, when it has something on
   screen, and the pane reveals the app only on that word. Until then it shows a labelled wait; if
   the page never reports, the pane says so instead of showing nothing; and a page that goes blank
-  after it appeared is asked again every fifteen seconds and covered again. Apps started on an
-  older sandbox image show the waiting card until they are relaunched.
+  after it appeared is asked again every fifteen seconds and covered again. An app started on an
+  older sandbox image never sends that signal, so it shows the wait and then the slow-to-load card
+  until it is relaunched.
 - **"Putting the latest change together…" appears again while a change compiles.** The dev
   server's own connection handshake was read as unreadable traffic on every container, so the
   compile signal never settled, the cover never rose, and an alarm fired against healthy sandboxes.
@@ -209,30 +447,38 @@ hotfix.
   alone, and warned about work the platform could restore at any moment. The rail now says "Your
   work is safe. Save it to keep a version you can come back to." and the exit guards stand down;
   Save stays manual.
+- **A failed sign-in stops being permanent.** When signing in failed, the failure stayed in the
+  address bar, and the sign-in screen had no way to forget it: reloading, hard-reloading, and
+  closing and reopening the tab each brought "Sign-in failed. Please try again." straight back,
+  while the browser's network panel filled with the two red errors any signed-out visitor produces.
+  Nothing was wrong with the account — one person spent a call being told to refresh a page that
+  could not clear itself, and it only came right when they happened to reach the sign-in screen by
+  some other route. The message is now shown once and then cleared, so a reload lands on a clean
+  sign-in screen and the button works.
+- **A failed sign-in now says which failure it was.** Every way of failing produced the same
+  sentence, and one whole class of them — an account from outside the organization, a callback that
+  did not validate — wrote nothing to the server log at all, so there was nothing to look up. The
+  message now carries a short reference code and every failure records one log line under that same
+  code: a screenshot is enough to find the attempt and its real cause.
+- **A plan chat no longer spends your daily token limit re-reading the same instructions on every
+  message.** Build chats have always asked the model service to keep the instructions, the tools
+  and the conversation so far between requests; plan chats never asked, so every message re-sent
+  all of that at full weight. From the second message on, the repeated part counts at a tenth, and
+  the model service keeps it for up to an hour between messages so a person can stop and think
+  without losing the saving. A plan chat that ends after its first message costs slightly more
+  than before, because writing the cache once carries its own small surcharge.
 
-### Changed
+### Deploying this release
 
-- **A new chat is a Plan chat by default.** A first prompt is usually a rough description rather
-  than a brief; you now get a plan to read and a "Build this plan" button. Build is one click away
-  and unchanged.
-- **The preview pane has fewer states, and one author owns the words.** Ten states become six:
-  fetch facts that changed nothing for the citizen become the ordinary wait, a refused start is a
-  note on the saved card carrying the server's own sentence, and a held workspace always offers its
-  take-back control.
-- **The sandbox image carries a platform-owned `instrumentation-client.ts`** and keeps it out of
-  every workspace snapshot, so a platform fix reaches the next launch. Deploying this release means
-  pushing the sandbox image, pointing `SANDBOX__IMAGE_REF` at it, restarting the backend, and
-  rebuilding the portal.
-- **The backend log records the build lifecycle under one correlation id,** including how long an
-  app took to first serve after its container was created, and the root status that decides whether
-  the page proof is in force.
-- **Model calls no longer send a sampling setting the deployed model strips and warns about on
-  every call.**
+- **This release needs a new sandbox image, and it goes out first.** The image now carries a
+  platform-owned `instrumentation-client.ts` and keeps it out of every workspace snapshot, so a
+  platform fix reaches the next launch. Push the sandbox image, point `SANDBOX__IMAGE_REF` at it,
+  restart the backend, and rebuild the portal.
 
 ## [1.7.0-beta.11] - 2026-09-10
 
-Eleven defects reported from production on 2026-09-09 and 2026-09-10, traced from the backend log
-and the citizens' own screenshots.
+Nine defects reported from production on 2026-09-09, traced from the backend log and the citizens'
+own screenshots.
 
 ### Fixed
 
@@ -284,19 +530,6 @@ and the citizens' own screenshots.
 - **A build that fails to compile is reported while you are watching it.** The check ran once when a
   workspace came up and never again, so "Getting your app ready…" could sit over a build that had
   already finished or already failed until you left the screen and came back.
-- **A failed sign-in stops being permanent.** When signing in failed, the failure stayed in the
-  address bar, and the sign-in screen had no way to forget it: reloading, hard-reloading, and
-  closing and reopening the tab each brought "Sign-in failed. Please try again." straight back,
-  while the browser's network panel filled with the two red errors any signed-out visitor produces.
-  Nothing was wrong with the account — one person spent a call being told to refresh a page that
-  could not clear itself, and it only came right when they happened to reach the sign-in screen by
-  some other route. The message is now shown once and then cleared, so a reload lands on a clean
-  sign-in screen and the button works.
-- **A failed sign-in now says which failure it was.** Every way of failing produced the same
-  sentence, and one whole class of them — an account from outside the organization, a callback that
-  did not validate — wrote nothing to the server log at all, so there was nothing to look up. The
-  message now carries a short reference code and every failure records one log line under that same
-  code: a screenshot is enough to find the attempt and its real cause.
 
 ## [1.7.0-beta.10] - 2026-09-08
 
@@ -306,14 +539,15 @@ after it destroys something, and what it costs you to be told.
 ### Added
 
 - **A published app offers its link.** Sharing one meant reading a URL off the screen and typing it
-  somewhere else; there is now a control that copies it, and it says plainly when there is nothing
-  to copy yet.
+  somewhere else; there is now a control beside the address that copies it. When the browser cannot
+  reach the clipboard, it says so and prints the address to copy by hand.
 - **A rejected submission shows the reviewer's reason where the decision is.** It was already on
   the wire and shown nowhere, so a citizen learned only that the answer was no.
 - **The wait while your app starts says what it is doing, and how long it has been doing it.** The
-  card was a still, silent thing for up to two minutes. It now names the step and counts the wait —
-  measured against the clock, so leaving the tab and coming back tells the truth rather than
-  reporting the seconds the browser felt like giving it.
+  card was a still, silent thing for up to two minutes. It now says the platform is setting up
+  somewhere for the app to run, tells a screen reader it is busy, and counts the wait — measured
+  against the clock, so leaving the tab and coming back tells the truth rather than reporting the
+  seconds the browser felt like giving it.
 - **Switching an app off remembers what it was.** Turning an app back on used to make it approved,
   whatever it had been — an approval nobody gave. It now goes back exactly where it came from.
 
@@ -321,8 +555,9 @@ after it destroys something, and what it costs you to be told.
 
 - **The kill switch reaches the apps that most need it.** It only ever worked on approved apps,
   and most of the catalog is a draft, so the only lever left for an app that had to stop was the
-  one that destroys the owner's work. Draft and rejected apps can now be switched off — and
-  switching one off actually stops the work in flight rather than only changing a label.
+  one that destroys the owner's work. Draft and rejected apps can now be switched off, and a
+  switched-off app refuses new work instead of only changing its label. Save alone still works,
+  so the owner's unsaved work is not lost to the switch.
 - **An administrator's delete asks why, and works at all.** The delete required a written reason
   and the screen behind it could not collect one, so every attempt was refused. It now asks, in the
   same words the citizen's own delete asks for, and keeps what you typed if the answer is no.
@@ -330,8 +565,7 @@ after it destroys something, and what it costs you to be told.
   best-effort by design — the rows are already gone, so a failure must not undo a delete that
   worked. What was missing is the other half: an administrator's delete kept no record at all of a
   database, a file or an image left behind, and nothing automatic collects those. It now names them
-  on the record. The record also stopped inventing them: deleting a project while starting a
-  workspace in another one used to file a permanent note about a container that was never running.
+  on the record.
 - **A deleted project keeps its description** on the record that outlives it, read before the
   delete rather than after.
 - **An encrypted PDF is counted honestly.** A 120 KB file could declare one page, carry twenty
@@ -340,10 +574,12 @@ after it destroys something, and what it costs you to be told.
 - **Generating a description is bounded by generations, not by presses.** Pressing it on a project
   with nothing built yet is refused and costs nothing, and those refusals no longer count against
   the handful of generations a quarter of an hour allows.
-- **You are no longer billed for the platform's own reasoning**, and the counter and the guardrail
-  now read the same measured number instead of two different estimates. The per-chat ceiling is
-  raised to what the model actually accepts, the estimator that guessed at it is gone, and when a
-  chat really is full it is said in our words rather than the provider's.
+- **Generating a description no longer counts against your daily allowance.** The counter and the
+  guardrail now read the one measured number instead of two separate estimates. The per-chat
+  ceiling rises from 200,000 to 500,000 tokens — half of the 1,000,000 the deployment actually
+  serves, so a chat is ended by the platform's own limit, with a sentence that says what to do,
+  long before the provider would refuse it. The estimator that guessed at a chat's size is gone,
+  and when a chat really is full it is said in our words rather than the provider's.
 - **A closed dialog gives the keyboard back.** Closing any dialog left focus at the top of the
   document, so a keyboard user was returned to nowhere with no idea where they had come from. The
   administrator's delete dialog also gains the trap and the Escape key the rest of them already
@@ -362,16 +598,56 @@ after it destroys something, and what it costs you to be told.
 - **The project screen stops claiming a build outcome it did not check**, and asks the app itself
   whether it compiled — only when it is actually running. A never-saved project stops reporting
   that the platform lost track of it.
-- **A hand-over asks one question at a time**, and Cancel during a save that is already away no
-  longer tells you it was cancelled when it was not.
+- **Cancel on a project rename no longer claims it cancelled something it didn't.** A rename
+  already saving would still go through while the dialog closed as if it had been stopped; Cancel
+  now stays put until the rename lands. A hand-over that succeeds also tells a screen reader what
+  became of the other project.
+- **Sending another message no longer reloads the app you were just looking at.** Every message
+  tore the running preview down and reloaded it fresh, discarding whatever the citizen had typed
+  into their own app. The app now stays on screen while the next change is made.
+- **Nothing is drawn over your app's own navigation any more.** A working notice, a completion
+  banner and a restore notice used to share one rectangle at the top of the preview — exactly
+  where the app's own menu sits — leaving its first items unreadable. That rectangle is gone.
+- **Leaving the workspace for your projects returns you to the page and search you left.** The
+  workspace's own back control and the brand link in the navigation bar both used to reset the
+  list to page one; both now reopen it where you left it, and the rename pencil no longer sits
+  live over the previous project while the next one loads.
+- **Deleting a project or an app now deletes the image it was published from.** Both deletes left
+  the image behind in the container registry while the delete dialog said the files were gone for
+  good. If the registry itself refuses, the delete still completes and the image left behind is
+  named on the audit record.
 - **The workspace narration stops leaking developer vocabulary** into what a citizen reads.
 
-### Changed
+### Removed
 
-- **Deleting an app deletes the image it was built from.** The citizen's own delete already removed
-  it; the administrator's harsher one left it in the registry.
 - **The orphaned legacy build stack is gone** — around 7,100 lines with no caller left, removed with
   its tests and the contracts that described it.
+
+### Known limitations
+
+- **Two hand-over questions can appear on screen together.** Taking the workspace back from the
+  preview while a message is waiting on a refusal shows the same question twice, one over the
+  other. Pressing "Switch without saving" on the message's copy sends the message that was
+  waiting.
+
+### Deploying this release
+
+- **This release changes the database.** Run `alembic upgrade head` before starting the new
+  backend. Migration `0037_deleted_project_description` copies a deleted project's description
+  onto its tombstone row, left blank for projects deleted before this shipped since their text is
+  already gone by then. Migration `0038_app_previous_status` adds the column that remembers a
+  switched-off app's earlier status and backfills every already-disabled app to `approved`, so
+  re-enabling one keeps resolving exactly as it did before this release. Neither migration removes
+  or renames anything the previous image reads.
+- **No new setting, but confirm the registry credential before go-live.** Deleting an image reuses
+  `DEPLOY__ACR_USERNAME` and `DEPLOY__ACR_PASSWORD`, which the backend already holds, and asks for
+  delete rights on one repository at a time. Try one real delete against a throwaway repository
+  first. If the credential may not delete, the delete still completes and the image left behind
+  is named on the audit record.
+- **Rolling back to the previous release strands an app switched off under this one.** The
+  previous release's re-enable resolves only to `approved` and refuses a row with no approved
+  submission, so a draft or rejected app switched off here has no way back until this release
+  returns.
 
 ## [1.7.0-beta.9] - 2026-09-06
 
