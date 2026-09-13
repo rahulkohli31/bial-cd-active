@@ -505,7 +505,7 @@ def test_cookie_secure_false_outside_production_boots(environment: str) -> None:
     )
 
 
-# --- Foundry (optional integration) + Gotenberg (optional knob) --------------
+# --- Foundry (optional integration) ------------------------------------------
 
 
 def test_foundry_optional_defaults_none() -> None:
