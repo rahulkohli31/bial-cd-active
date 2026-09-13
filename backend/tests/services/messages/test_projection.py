@@ -24,6 +24,7 @@ from pydantic_ai.messages import (
     ModelResponse,
     RetryPromptPart,
     TextPart,
+    ThinkingPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
@@ -569,6 +570,45 @@ async def test_a_plan_turn_that_only_reads_has_a_non_empty_activity_group(db_ses
     assert [item.text for item in items if isinstance(item, AssistantTextItem)] == [
         "Three steps, and you already have the shell."
     ]
+
+
+async def test_a_reasoning_block_is_never_projected_to_the_citizen(db_session) -> None:
+    """The redactor exempts a `ThinkingPart`'s `content` — it has to, because the provider
+    verifies the signature against it and a masked block gets the next turn rejected. That
+    exemption rests entirely on reasoning never being projected.
+
+    It used to be inert: the deployment returned signed-but-EMPTY blocks, so there was nothing
+    to leak. Asking for a summarized display makes the content real, which makes this the live
+    guarantee it was always written as — and a guarantee that only a comment states is not one."""
+    user, _project, conversation = await _thread(db_session)
+    await _step(
+        db_session,
+        user,
+        conversation,
+        uuid.uuid4(),
+        [
+            ModelResponse(
+                parts=[
+                    ThinkingPart(
+                        content="The connection string is postgresql://bial:hunter2@db/app.",
+                        signature="sig-abc",
+                    ),
+                    TextPart(content="I wired the form up to the database."),
+                ]
+            )
+        ],
+    )
+
+    rows = await _rows(db_session, user, conversation)
+    # LIVENESS: the row really is on disk carrying the reasoning, so the absence below is the
+    # projection declining to render it rather than a fixture that never wrote anything.
+    stored = json.dumps([row.payload for row in rows])
+    assert "hunter2" in stored, "the fixture never stored the reasoning it is about to assert on"
+
+    rendered = json.dumps(project_rows(rows), default=str)
+    assert "hunter2" not in rendered
+    assert "postgresql://" not in rendered
+    assert "I wired the form up to the database." in rendered
 
 
 async def test_hidden_rows_render_nothing_but_stay_auditable(db_session) -> None:

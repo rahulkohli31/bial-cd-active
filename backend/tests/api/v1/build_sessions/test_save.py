@@ -312,7 +312,7 @@ async def test_save_state_with_no_sandbox_configured_degrades_to_all_null(
 
     Asserts the manager is never even called, not just that the response happens to be
     all-null — `project_save_state` on a project with no app ALSO returns an all-null
-    `SaveState` by a different path (`_existing_app_id` returns `None`), so a same-shaped
+    `SaveState` by a different path (`existing_app_id` returns `None`), so a same-shaped
     response alone would not prove the route's own `if sandbox is None` short-circuit is
     what produced it."""
     user, project = await _user_project(db_session, "save9@rvaiglobal.com")

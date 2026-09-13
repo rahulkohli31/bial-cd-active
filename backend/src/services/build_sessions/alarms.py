@@ -264,25 +264,25 @@ whether this container was ever any use to anybody at all."""
 # --- the two pinned alarms ----------------------------------------------------------------
 
 
-SERVING_PROOF_NEVER_ARRIVED: Final = "serving_proof_never_arrived"
-"""A container reached teardown with the serving stamp never set, although `dev_start` had
-succeeded. WARNING.
+SERVING_PROOF_ABSENT_AT_TEARDOWN: Final = "serving_proof_absent_at_teardown"
+"""A container reached teardown with no serving proof on record. WARNING.
 
-THIS CATCHES THE INVERSE OF THE BUG THE STAMP WAS BUILT FOR. The stamp stops the platform
-claiming that a scheduled container is running; this stops the opposite failure — an app that
-served nobody, ever — from being indistinguishable in the logs from a flawless build. It is an
-alarm rather than merely the `served: bool` field on the teardown line above because a field
-nobody greps raises nothing.
+THE EMPTY SENTINEL PROVES NOTHING ON ITS OWN. A container that never served leaves it behind,
+and so does one that DID serve and had the proof retracted — the out-of-turn observer clears it,
+on this module's own sweep or a relaunch that finds the app up but not painting, and neither one
+tears the container down. Both histories reach teardown identically, so this alarm says the proof
+is absent and stops there; it does not say the container never served. It is an alarm rather than
+merely the `served: bool` field on the teardown line above because a field nobody greps raises
+nothing.
 
 Fields: `lifetime_ms`, `reason` (the teardown reason, so the reap of a genuinely idle container
 reads differently from a turn that finalised over a dead app).
 
 WHAT TO DO: the container is already gone, so this is not a page — it is the number to watch.
-Read the same build's `sandbox_dev_started` and `app_first_serve_not_observed` lines: a
-`dev_compile` that never left compiling points at the generated app (a build error the citizen
-was never shown), while a compiled route that never answered points at the container's ingress.
-If it fires more than rarely, the generated-app template is shipping something that does not
-boot, and that is what wants looking at, not this code."""
+Read the same build's trace for `app_first_served`: present, and the container served before its
+proof was retracted; absent, and it never did. If it fires more than rarely with no
+`app_first_served` anywhere in the trace, the generated-app template is shipping something that
+does not boot, and that is what wants looking at, not this code."""
 
 
 SERVING_PROOF_STAMP_REFUSED: Final = "serving_proof_stamp_refused"

@@ -39,7 +39,7 @@ import structlog
 from src.services.build_sessions.alarms import (
     APP_FIRST_SERVED_EVENT,
     APP_SERVING_LOST_EVENT,
-    SERVING_PROOF_NEVER_ARRIVED,
+    SERVING_PROOF_ABSENT_AT_TEARDOWN,
     SERVING_PROOF_STAMP_REFUSED,
 )
 from src.services.build_sessions.durable_copy import CopyVerdict, confirm_durable_copy
@@ -232,7 +232,7 @@ async def _reach_the_container(
 #
 # WHAT IT MAY NEVER DO IS DECIDE ANYTHING. A container that has not yet served is not therefore
 # reapable, and this section is structured so that it CANNOT become evidence in that judgement:
-# both entry points (`_observe_the_serving_proof` and `_sound_the_alarm_if_it_never_served`)
+# both entry points (`_observe_the_serving_proof` and `_sound_the_alarm_if_the_proof_is_absent`)
 # return `None`, so there is no value for the reap decision to read; each of their call sites is
 # a statement on its own line beside a `return False` / a teardown that is character for
 # character the one that was already there; and nothing here marks a registry `ending`, tears
@@ -332,8 +332,8 @@ def _what_this_record_is_missing(
 
     ABSENT IS NOT EMPTY. A hash written before the field existed reads as PRE-CUTOVER, which the
     whole rollout treats as PROVEN: there is nothing to prove about it and nothing to retract, so
-    it is left exactly as it is. Only the empty sentinel means "this container has never served",
-    and only a real instant means "it did"."""
+    it is left exactly as it is. The empty sentinel proves nothing either way — a retracted proof
+    reads identically — so only a real instant means the proof still stands."""
     if reg.get(REGISTRY_FIELD_STATE) != REGISTRY_STATE_READY:
         # `ending`: the reaper has already committed to destroying this container. Stamping one
         # on its way out would hand the pane a proof for a container about to stop existing.
@@ -424,8 +424,8 @@ async def _make_the_stamp_agree(
         if not status.shows_a_page:
             # Still nothing to show. Nothing is recorded here, on purpose: this pass repeats every
             # five minutes for the life of the container, so a line per pass would be a standing
-            # alarm rather than a notice. That this container served nobody is recorded ONCE,
-            # where it becomes final — `SERVING_PROOF_NEVER_ARRIVED`, at teardown.
+            # alarm rather than a notice. That the proof is still absent is recorded ONCE, where
+            # it becomes final — `SERVING_PROOF_ABSENT_AT_TEARDOWN`, at teardown.
             return
         created = an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT)
         if await mark_serving(redis, user_uuid, app_name=answered.app_name, when=now):
@@ -506,29 +506,30 @@ async def _record_a_refused_stamp(
     )
 
 
-def _sound_the_alarm_if_it_never_served(reg: dict[str, str], *, user_uuid: uuid.UUID) -> None:
-    """A container is about to stop existing having served nobody, ever — say so, once.
+def _sound_the_alarm_if_the_proof_is_absent(reg: dict[str, str], *, user_uuid: uuid.UUID) -> None:
+    """A container is about to stop existing with no proof it ever served a page — say so, once.
 
-    THE INVERSE OF THE BUG THE STAMP WAS BUILT FOR. The stamp stops the platform reporting a
-    scheduled container as running; this catches the other failure, an app that never answered
-    anything at all, which is today indistinguishable in the logs from a flawless build.
+    THE EMPTY SENTINEL PROVES NOTHING ON ITS OWN. A container that never served leaves it behind,
+    and so does one that DID serve: the out-of-turn observer retracts a standing proof it can no
+    longer back — this module's own sweep, or a relaunch that finds the app up but not painting —
+    and neither one tears the container down. Both histories land on this branch identically, so
+    the alarm says the proof is absent and stops there; it does not say the container never served.
 
     ONLY THE EMPTY SENTINEL FIRES IT. An absent field is a pre-cutover record, which says nothing
     either way about whether that container served, and alarming on silence would fill the log
     with the fleet that was already running at deploy time.
 
-    THE REAPER CANNOT SEE WHETHER `dev_start` SUCCEEDED — that happened in another process, and
-    the registry hash does not record it — so `reason` says which teardown this was and the
-    alarm's own runbook sends the operator to the same build's `sandbox_dev_started` line to
-    separate "never started" from "started and never compiled"."""
+    THE REAPER CANNOT SEE WHICH HISTORY THIS WAS — that happened in another process, and the
+    registry hash does not record it — so `reason` says which teardown this was and the alarm's
+    own runbook sends the operator to the same build's `app_first_served` line to find out."""
     # `stamp_is_proven` rather than a bare `!= ""`: absent AND an instant both mean there is
     # nothing to sound an alarm about, and which of the three readings mean what is decided in
-    # exactly one place. This line used to re-type that rule as a comparison.
+    # exactly one place.
     if stamp_is_proven(reg):
         return
     created = an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT)
     _log.warning(
-        SERVING_PROOF_NEVER_ARRIVED,
+        SERVING_PROOF_ABSENT_AT_TEARDOWN,
         user_id=str(user_uuid),
         app_name=reg.get(REGISTRY_FIELD_APP_NAME, ""),
         lifetime_ms=elapsed_ms(created, datetime.now(UTC)),
@@ -738,7 +739,7 @@ async def reap_user(
     # THE RECORD IS STILL IN HAND, and this is the last moment it will be: `reg` was read
     # before the mark-ending flip and the delete below is about to remove it for good. The
     # container's whole life is over, so whether it ever served anybody is now a settled fact.
-    _sound_the_alarm_if_it_never_served(reg, user_uuid=user_uuid)
+    _sound_the_alarm_if_the_proof_is_absent(reg, user_uuid=user_uuid)
     await delete_registry(redis, user_uuid)  # registry cleared
     # ...and the liveness lease goes WITH the record it belonged to. Only here, after a
     # teardown that actually succeeded: the failure arm above keeps lock + registry so a

@@ -42,7 +42,13 @@ from src.services.build_sessions.locks import (
     renew_liveness_lease,
     write_starting_marker,
 )
-from src.services.redis.keys import REGISTRY_STATE_READY, registry_key
+from src.services.build_sessions.manager import app_name_for
+from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_NAME,
+    REGISTRY_FIELD_STATE,
+    REGISTRY_STATE_READY,
+    registry_key,
+)
 from src.services.usage import ist_today
 from tests.api.v1.connectors.conftest import (
     DECLINE_REMARKS,
@@ -52,7 +58,7 @@ from tests.api.v1.connectors.conftest import (
     seed_decision,
     seed_request,
 )
-from tests.factories import ProjectFactory, UserFactory
+from tests.factories import AppRegistryFactory, ProjectFactory, UserFactory
 
 _CONNECTOR = CONNECTORS[KEY]
 
@@ -82,6 +88,24 @@ async def _approved(db) -> tuple:
     await seed_decision(db, user.id, ConnectorRequestStatus.APPROVED, admin)
     project = await ProjectFactory.create(db, user.id)
     return user, project
+
+
+async def _app_of(db, user, project):
+    """The app row a project gets the first time anything is built in it. The lock and the lease
+    carry no identity of their own, so this is what a live session is recognised by."""
+    return await AppRegistryFactory.create(db, user_id=user.id, project_id=project.id)
+
+
+async def _registry_names(fake_redis, user, app) -> None:
+    """The registry hash a live container writes — the one place whose work is inside it is
+    recorded."""
+    await fake_redis.hset(
+        registry_key(user.id),
+        mapping={
+            REGISTRY_FIELD_APP_NAME: app_name_for(app.id),
+            REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
+        },
+    )
 
 
 async def _put(client, user, project_id, body: dict, *, key: str = KEY, csrf: bool = True):
@@ -608,7 +632,7 @@ async def test_approving_a_person_switches_their_rows_on_without_writing_to_them
     assert await _tuple_version() == before_ctid
 
 
-# --- R11a: the settings are locked while a session is live -------------------------------------
+# --- the settings are locked while a session is live -------------------------------------
 #
 # A CONTAINER RECEIVES ITS ENVIRONMENT EXACTLY ONCE, AT BIRTH. The attach arm — which is the
 # steady state for every message after the first — forwards none, so a connector switched on
@@ -669,24 +693,131 @@ async def test_the_other_two_live_signals_refuse_as_well(
     outlives a lock a crashed builder left standing. The STARTING marker covers the gap between
     "a start was asked for" and "the lock was taken" — which is precisely the window in which the
     container's environment is being assembled, and therefore the worst possible moment to accept
-    a change."""
-    user, project = await _approved(db_session)
+    a change.
+
+    Each is read twice — for the project it names and for one it does not — because narrowing the
+    refusal to the live project must not quietly narrow it to the LOCK. The lock is the only one
+    of the three a per-app guard elsewhere in the tree reads, and reusing that guard whole would
+    drop these two silently."""
+    user, building = await _approved(db_session)
+    elsewhere = await ProjectFactory.create(db_session, user.id)
+    building_app = await _app_of(db_session, user, building)
+    await _app_of(db_session, user, elsewhere)
     if signal == "lease":
         # A lease is only written against a container that exists — `renew_liveness_lease`
         # refuses otherwise, and logs that the build is unprotected. So the registry hash comes
         # first, which is also the order production creates them in.
-        await fake_redis.hset(
-            registry_key(user.id),
-            mapping={"app_name": "sbx-abc", "state": REGISTRY_STATE_READY},
-        )
+        await _registry_names(fake_redis, user, building_app)
         assert await renew_liveness_lease(fake_redis, user.id) is True
     else:
-        await write_starting_marker(fake_redis, user.id, project.id)
+        # The marker carries the project id outright, which is how a cold start is attributed
+        # before any registry entry naming an app exists.
+        await write_starting_marker(fake_redis, user.id, building.id)
 
-    resp = await _put(client, user, project.id, {"enabled": True})
+    resp = await _put(client, user, building.id, {"enabled": True})
+    elsewhere_resp = await _put(client, user, elsewhere.id, {"enabled": True})
 
     assert resp.status_code == 409
     assert resp.json()["error"]["code"] == "session_is_live"
+    assert elsewhere_resp.status_code == 200, elsewhere_resp.text
+
+
+# --- and it is THIS project's session that locks it ---------------------------------------------
+#
+# A citizen gets ONE workspace, and all three signals are keyed on the person, so a build anywhere
+# lights every one of them. Only the project that session is running in has an environment a
+# change could contradict; refusing on the signals alone told a citizen with a build in one
+# project to stop it before they could switch data on in any of their others.
+
+
+async def test_a_build_in_one_project_leaves_another_projects_settings_alone(
+    client, db_session, fake_redis
+) -> None:
+    """★ THE NARROWING. One person, two projects, one live session — the project that is not in
+    it is settable, and the setting is actually stored rather than swallowed."""
+    user, building = await _approved(db_session)
+    elsewhere = await ProjectFactory.create(db_session, user.id)
+    await _registry_names(fake_redis, user, await _app_of(db_session, user, building))
+    await _app_of(db_session, user, elsewhere)
+    await acquire_lock(fake_redis, user.id)
+
+    resp = await _put(client, user, elsewhere.id, {"enabled": True})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["enabled"] is True
+    assert len(await _stored_rows(db_session, elsewhere.id)) == 1
+    assert await _stored_rows(db_session, building.id) == []
+
+
+async def test_the_project_the_build_is_running_in_is_still_refused(
+    client, db_session, fake_redis
+) -> None:
+    """★ The other half of the same state: the project whose container is being built keeps the
+    refusal it always had, in the same words and under the same code."""
+    user, building = await _approved(db_session)
+    await _registry_names(fake_redis, user, await _app_of(db_session, user, building))
+    await acquire_lock(fake_redis, user.id)
+
+    resp = await _put(client, user, building.id, {"enabled": True})
+
+    code, message = _refusal(resp)
+    assert resp.status_code == 409, resp.text
+    assert code == "session_is_live"
+    assert message == router._SESSION_IS_LIVE.format(
+        project=building.name, name=_CONNECTOR.display_name
+    )
+    assert await _stored_rows(db_session, building.id) == []
+
+
+async def test_the_refusal_names_the_project_whose_session_is_in_the_way(
+    client, db_session, fake_redis
+) -> None:
+    """★ The switch is reachable from a list of a person's projects, so a refusal that says only
+    "you have a build running" leaves the citizen to work out which workspace to go and finish.
+
+    Turn red by dropping the project from the sentence: the connector name alone identifies what
+    the citizen was changing, never where the work that blocks it is."""
+    user, building = await _approved(db_session)
+    building.name = "Visitor Log"
+    await db_session.flush()
+    await _registry_names(fake_redis, user, await _app_of(db_session, user, building))
+    await acquire_lock(fake_redis, user.id)
+
+    code, message = _refusal(await _put(client, user, building.id, {"enabled": True}))
+
+    assert code == "session_is_live"
+    assert "“Visitor Log”" in message, "the citizen is told WHICH project is holding the workspace"
+    assert _CONNECTOR.display_name in message, "and which connector they were switching"
+
+
+async def test_a_project_nothing_has_ever_been_built_in_is_settable_while_another_builds(
+    client, db_session, fake_redis
+) -> None:
+    """A project with no app row has never had a container of its own, so the app a live registry
+    names cannot be its. Switching data on is the first thing a citizen does in a project, and it
+    must not wait for a build somewhere else to finish."""
+    user, building = await _approved(db_session)
+    fresh = await ProjectFactory.create(db_session, user.id)
+    await _registry_names(fake_redis, user, await _app_of(db_session, user, building))
+    await acquire_lock(fake_redis, user.id)
+
+    assert (await _put(client, user, fresh.id, {"enabled": True})).status_code == 200
+
+
+async def test_a_live_session_that_names_no_app_refuses_every_project(
+    client, db_session, fake_redis
+) -> None:
+    """★ FAIL-CLOSED, and the reason the narrowing does not reopen the window it exists to close.
+    The lock is taken before the container is provisioned, so in between the registry names
+    nothing and the platform cannot say whose work is starting. Ambiguity refuses — for the
+    project with an app row and the one without alike."""
+    user, one = await _approved(db_session)
+    another = await ProjectFactory.create(db_session, user.id)
+    await _app_of(db_session, user, one)
+    await acquire_lock(fake_redis, user.id)
+
+    assert (await _put(client, user, one.id, {"enabled": True})).status_code == 409
+    assert (await _put(client, user, another.id, {"enabled": True})).status_code == 409
 
 
 async def test_a_redis_that_answers_badly_refuses_the_change_rather_than_allowing_it(
@@ -696,7 +827,7 @@ async def test_a_redis_that_answers_badly_refuses_the_change_rather_than_allowin
     configured means no sandbox coordination, so there is no live session to protect and the write
     is allowed — that is the supported dev posture. A CONFIGURED Redis that raises is the opposite
     situation: the platform cannot tell whether a session is live, and a guess in that state is
-    the half-configured container the whole R11a lock exists to prevent.
+    the half-configured container the whole lock exists to prevent.
 
     Refusing costs nothing real, which is why this is the right posture rather than a cautious
     one: if Redis cannot answer, `acquire_lock` cannot take a lock either, so no build the refusal
@@ -709,8 +840,8 @@ async def test_a_redis_that_answers_badly_refuses_the_change_rather_than_allowin
     async def _redis_that_is_having_a_bad_day(*args, **kwargs):
         raise RedisError("connection reset by peer")
 
-    # Patched on the FIRST of the three liveness reads: the three are `or`-ed, so a failure in any
-    # one of them has to refuse — short-circuiting past a broken check would be the bug.
+    # Patched on the lock, the first of the three `or`-ed liveness reads: a failure in any one of
+    # them has to refuse — short-circuiting past a broken check would be the bug.
     monkeypatch.setattr(router, "lock_is_held", _redis_that_is_having_a_bad_day)
 
     resp = await _put(client, user, project.id, {"enabled": True})

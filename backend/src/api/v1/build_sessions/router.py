@@ -156,9 +156,29 @@ class BuildConflictEnvelope(CamelModel):
     error: _ConflictError | ReclaimBlockedError
 
 
-def _conflict_response(exc: BuildSessionConflictError) -> JSONResponse:
+_BUILD_SESSION_ACTIVE = "A build session is already active."
+
+_PROJECT_IS_HOLDING_IT = (
+    "“{project}” has a chat or a build running. Finish or stop it, then close the project."
+)
+
+
+def _conflict_response(
+    exc: BuildSessionConflictError, *, project_name: str | None = None
+) -> JSONResponse:
+    """The one 409 both conflicting routes answer with — same code, same shape, two sentences.
+
+    NAMING THE PROJECT IS THE RELEASE ROUTE'S ALONE. Its gate compares the app the live session
+    holds against the one this project owns, so the project it refuses IS the project holding
+    the workspace, and saying which one is the whole of what the citizen can act on. Relaunch
+    conflicts on the per-user slot and knows no project, so it keeps the bare sentence rather
+    than naming one it has not compared."""
     error: dict[str, str] = {
-        "message": "A build session is already active.",
+        "message": (
+            _BUILD_SESSION_ACTIVE
+            if project_name is None
+            else _PROJECT_IS_HOLDING_IT.format(project=project_name)
+        ),
         "code": "build_session_already_active",
     }
     if exc.session_id is not None:
@@ -783,14 +803,14 @@ async def release_project(
     # under one is the strand this module exists to prevent.
     if sandbox is None:
         raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG)
-    await owned_project_or_404(db, user.id, project_id)
+    project_name = (await owned_project_or_404(db, user.id, project_id)).name
     with build_coordination_or_503():
         try:
             released = await manager.release_project_sandbox(
                 db, user, project_id, sandbox_client=sandbox
             )
         except BuildSessionConflictError as exc:
-            return _conflict_response(exc)
+            return _conflict_response(exc, project_name=project_name)
         except SandboxError as exc:
             # The container would not go away. Say so rather than reporting a release that did
             # not happen — the caller is about to start something that needs the slot.

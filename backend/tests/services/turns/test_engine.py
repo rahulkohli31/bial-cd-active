@@ -1420,7 +1420,10 @@ async def test_a_plan_run_asks_for_adaptive_thinking_at_medium_effort(
     assert PLAN_EFFORT == "medium"
     # ADAPTIVE, NOT A TOKEN BUDGET, and the reason is the deployed model rather than taste —
     # see `test_the_deployed_model_takes_adaptive_thinking_and_refuses_a_budget` below.
-    assert ADAPTIVE_THINKING == {"type": "adaptive"}
+    # The DISPLAY is part of the pin, not decoration: without it this deployment returns a
+    # signed thinking block carrying no text, so every turn still succeeds and the reasoning is
+    # simply never there — a silence no other assertion in this file can hear.
+    assert ADAPTIVE_THINKING == {"type": "adaptive", "display": "summarized"}
 
 
 async def test_a_build_run_asks_for_the_same_thinking_at_high_effort(
@@ -1760,6 +1763,12 @@ def test_the_deployed_model_takes_adaptive_thinking_and_refuses_a_budget() -> No
     survived: dict[str, Any] = dict(prepared)
     assert survived["anthropic_thinking"] == ADAPTIVE_THINKING
     assert survived["anthropic_effort"] == PLAN_EFFORT
+    # AGAINST A LITERAL, not against the constant, and that is the whole value of the line: the
+    # assertion above compares what survived to `ADAPTIVE_THINKING` itself, so it answers the
+    # same either way if the constant is what changes. This is what goes red if the display
+    # stops being asked for, or if this model's profile starts stripping it the way it already
+    # strips an unsupported sampling setting.
+    assert survived["anthropic_thinking"] == {"type": "adaptive", "display": "summarized"}
     # …and the output clamp with them, which is the other reason these settings exist: without it
     # the provider default of 4096 cuts a long plan off mid-argument.
     assert survived["max_tokens"] == MAX_OUTPUT_TOKENS

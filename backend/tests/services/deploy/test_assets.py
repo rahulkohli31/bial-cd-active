@@ -14,9 +14,12 @@ failing test attached.
 
 from __future__ import annotations
 
+import re
 from importlib import resources
 
 import pytest
+
+from src.services.orchestrator.errors import DRIFT_RECOVERED_NOTICE
 
 _ASSETS = "src.services.deploy.assets"
 _ASSET_NAMES = (
@@ -49,12 +52,6 @@ def test_every_asset_is_non_empty(name: str) -> None:
 # --- the Dockerfile's security decisions ------------------------------------------
 
 
-def test_install_scripts_are_disabled() -> None:
-    """`package.json` is agent-editable, so a `postinstall` hook is arbitrary code
-    execution inside the build agent."""
-    assert b"npm ci --ignore-scripts" in _read("Dockerfile")
-
-
 def _instructions(name: str) -> str:
     """The asset with comment and blank lines removed. Needed because these files EXPLAIN
     their own hardening in prose, so a naive substring search matches the comment that says
@@ -64,6 +61,105 @@ def _instructions(name: str) -> str:
         for line in _read(name).decode().splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     )
+
+
+def _shell_lines(name: str) -> list[str]:
+    """The instructions with the shell's line continuations joined, so an instruction spread
+    over several physical lines reads as the single command the shell actually runs."""
+    return _instructions(name).replace("\\\n", " ").splitlines()
+
+
+def _dependency_install() -> str:
+    """The deps stage's install, as that one logical line."""
+    return next(line for line in _shell_lines("Dockerfile") if line.startswith("RUN npm"))
+
+
+_QUOTED = re.compile(r'"[^"]*"')
+
+
+def _npm_installs(name: str) -> list[str]:
+    """Every npm install the asset runs, in order, with quoted text blanked first. The
+    dependency stage logs the arm it is about to take, so the words `npm install` also appear
+    inside an echo argument — read raw, that sentence is indistinguishable from a command and
+    is credited with whichever flags happen to follow it."""
+    blanked = _QUOTED.sub('""', "\n".join(_shell_lines(name)))
+    return [
+        match.group().strip() for match in re.finditer(r"npm (?:ci|install)[^&|()\n]*", blanked)
+    ]
+
+
+def test_install_scripts_are_disabled_on_every_install_arm() -> None:
+    """`package.json` is agent-editable, so a `postinstall` hook is arbitrary code execution
+    inside the build agent. The fallback arm resolves straight from that file rather than from
+    the vetted lock, which makes it the arm that can least afford to lose the flag."""
+    installs = _npm_installs("Dockerfile")
+
+    # Pins the extraction as well as the flag: a loop over an empty list asserts nothing.
+    assert [install.split()[1] for install in installs] == ["ci", "install"]
+    for install in installs:
+        assert "--ignore-scripts" in install, f"install runs scripts: {install}"
+
+
+def test_a_drifted_lockfile_falls_back_instead_of_failing_the_build() -> None:
+    """An agent that edits a version by hand leaves the lock behind, and `npm ci` refuses a
+    lock it cannot satisfy — with no fallback that app cannot be published at all. The fallback
+    stays CONDITIONAL: `npm ci` honours the lock in every build where the lock is honourable."""
+    first_arm, separator, fallback = _dependency_install().partition("||")
+
+    assert first_arm.strip().startswith("RUN npm ci ")
+    assert separator == "||", "an unconditional install would never honour the lockfile"
+    assert "npm install" in fallback
+
+
+def test_the_fallback_says_so_in_the_build_log_before_it_runs() -> None:
+    """Both arms end in a successful install, from different versions, so the transcript is
+    otherwise identical. Reading the log is the whole diagnosis for a dependency problem, so
+    the log has to name the arm that ran."""
+    fallback = _dependency_install().partition("||")[2]
+    announcement, separator, command = fallback.partition("&& npm install")
+
+    assert "echo " in announcement
+    assert "npm install" in announcement, "the logged line does not name the arm it takes"
+    assert separator == "&& npm install", "the announcement must precede the install"
+    assert command.strip().startswith("--ignore-scripts")
+
+
+def test_the_classifier_filters_the_exact_sentence_the_fallback_prints() -> None:
+    """Two files, one string. The recovery notice is the first line a container build prints, so
+    the classifier has to drop it or it titles every later failure of that build. Matching on a
+    copy of the sentence would let this file and the Dockerfile drift apart silently, and the
+    symptom would be a citizen told to fix a lockfile that installed cleanly."""
+    announcement = _dependency_install().partition("||")[2].partition("&& npm install")[0]
+
+    assert DRIFT_RECOVERED_NOTICE in announcement, (
+        "the Dockerfile no longer prints the sentence the classifier filters on: " + announcement
+    )
+
+
+def test_only_a_drifted_lockfile_takes_the_fallback() -> None:
+    """`npm ci` also refuses when a tarball does not match the hash the lock vetted. Falling
+    back there would answer a supply-chain signal by fetching the package again — the one check
+    that would catch a swapped tarball, downgraded to a suggestion.
+
+    So the fallback is gated on npm's drift codes, and the guard must run BEFORE the install."""
+    fallback = _dependency_install().partition("||")[2]
+    guard = fallback.partition("&& npm install")[0]
+
+    assert "grep" in guard, f"the fallback is ungated: {fallback}"
+    for drift_only in ("EUSAGE", "Invalid:"):
+        assert drift_only in guard, f"the gate does not name {drift_only}: {guard}"
+
+
+def test_a_failure_that_is_not_drift_keeps_npms_own_diagnosis() -> None:
+    """The first arm's output is held back so a RECOVERED drift does not litter the log of a
+    build that later fails for an unrelated reason. Held back is not discarded: a build that is
+    going to fail has to carry the reason it failed."""
+    line = _dependency_install()
+
+    assert "2>/tmp/npm-ci.err" in line, "the first arm's diagnosis is streamed, not captured"
+    last_arm = line.rpartition("||")[2]
+    assert "cat /tmp/npm-ci.err" in last_arm, f"the captured diagnosis is never replayed: {line}"
+    assert "exit 1" in last_arm, "a build with no usable dependencies must still fail"
 
 
 def test_the_build_does_not_go_through_an_agent_editable_script() -> None:

@@ -45,6 +45,7 @@ from src.core.errors import AppApiError
 from src.schemas import CamelModel
 from src.services.redis import build_coordination_or_503, get_redis
 from src.services.redis.keys import REGISTRY_FIELD_APP_NAME
+from src.services.turns.copy import still_open_text
 
 if TYPE_CHECKING:  # the runtime import stays lazy, as everywhere else in this module
     from src.services.build_sessions import SandboxReclaimBlockedError
@@ -84,11 +85,11 @@ def reclaim_blocked_response(exc: SandboxReclaimBlockedError) -> JSONResponse:
     """Format the blocked-reclaim 409. Every entry point that can raise it comes through here,
     so they cannot drift into differently-worded answers.
 
-    Names the PROJECT, not the mechanism. `dirty=None` (the container would not answer) reads
-    as unsaved on purpose: claiming work is safe when nobody could check is the one wrong answer
-    here. Two message shapes because only one situation is about saving — a project whose agent
-    is mid-build cannot be released until the build stops, so "has unsaved changes" would point
-    at a Save button the server will refuse.
+    Names the PROJECT, not the mechanism. A project whose agent is mid-build gets a sentence of
+    its own: there is no settled tree to describe, and any claim about saved work would point at
+    a Save button the server refuses until the build stops. The idle answer is three-valued, and
+    its three sentences live in `turns/copy.py` with the turn ending that also says them, so
+    neither surface can be corrected alone.
 
     The hand-over dialog needs this same answer before the citizen chooses, and asking by
     SENDING is legitimate because every refusal on the send path is side-effect-free before
@@ -98,8 +99,7 @@ def reclaim_blocked_response(exc: SandboxReclaimBlockedError) -> JSONResponse:
     if exc.building:
         message = f"“{exc.project_name}” is still being built."
     else:
-        unsaved = "has unsaved changes" if exc.dirty else "may have unsaved changes"
-        message = f"“{exc.project_name}” is still open and {unsaved}."
+        message = still_open_text(exc.project_name, dirty=exc.dirty)
     return JSONResponse(
         status_code=status.HTTP_409_CONFLICT,
         content={
@@ -140,12 +140,12 @@ async def refuse_while_build_session_live(
         redis = get_redis()
         if not await lock_is_held(redis, user_id):
             return  # nothing is building — proceed
-        if app_id is not None and not await _the_live_session_is_this_app(redis, user_id, app_id):
+        if app_id is not None and not await the_live_session_is_this_app(redis, user_id, app_id):
             return  # something IS building, but not this app — proceed
         raise AppApiError(status.HTTP_409_CONFLICT, conflict_message, code=conflict_code)
 
 
-async def _the_live_session_is_this_app(
+async def the_live_session_is_this_app(
     redis: aioredis.Redis, user_id: uuid.UUID, app_id: uuid.UUID
 ) -> bool:
     """Does the live session the lock represents belong to `app_id`?

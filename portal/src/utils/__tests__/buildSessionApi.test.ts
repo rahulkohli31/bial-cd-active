@@ -311,7 +311,7 @@ describe('asReclaimBlocked', () => {
   // red on the same commit.
   const WIRE_409 = {
     error: {
-      message: '“Lost & Found” is still open and has unsaved changes.',
+      message: '“Lost & Found” is still open and has changes that are not saved yet.',
       code: 'sandbox_reclaim_blocked',
       projectId: 'p-a',
       projectName: 'Lost & Found',
@@ -342,7 +342,7 @@ describe('asReclaimBlocked', () => {
 
   it('carries dirty=null through the wire as unknown, not clean', async () => {
     const fetchImpl = jsonFetch(409, {
-      error: { ...WIRE_409.error, dirty: null, message: '“A” is still open and may have unsaved changes.' },
+      error: { ...WIRE_409.error, dirty: null, message: '“A” is still open and may have changes that are not saved yet.' },
     })
     const err = await relaunchPreview({ projectId: 'p-b' }, { fetchImpl }).catch((e: unknown) => e)
     expect(asReclaimBlocked(err)?.dirty).toBeNull()
@@ -651,7 +651,7 @@ describe('handOverWorkspace — the stop → save → release ordering', () => {
   it('carries a reclaim refusal out to the caller rather than swallowing it', async () => {
     const fetchImpl = jsonFetch(409, {
       error: {
-        message: '“Lost & Found” is still open and has unsaved changes.',
+        message: '“Lost & Found” is still open and has changes that are not saved yet.',
         code: 'sandbox_reclaim_blocked',
         projectId: 'p-a',
         projectName: 'Lost & Found',

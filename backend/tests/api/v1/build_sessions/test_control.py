@@ -16,9 +16,11 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import PreviewReadyEvent, StepEvent
+from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions.manager import StopOutcome
+from src.services.build_sessions.snapshot import RecoveryOutcome, RecoveryWrite
 from tests.api.v1.build_sessions.conftest import a_live_session, auth_headers
-from tests.factories import ProjectFactory, UserFactory
+from tests.factories import AppRegistryFactory, ProjectFactory, UserFactory
 
 
 async def _user_project(db: AsyncSession, email: str):
@@ -282,3 +284,111 @@ async def test_stop_active_build_answers_without_redis(
     read = await _stop_state(client, user, project)
     assert read.status_code == 200, read.text
     assert read.json() == {"state": "nothing_was_running"}
+
+
+# --- release answers for ONE project, not for the person ----------------------------
+
+
+async def test_releasing_an_idle_project_is_not_refused_because_another_one_is_live(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """Over the wire, with one workspace and two projects: only the project actually holding
+    the container may refuse its release.
+
+    Refusing for every project a person owns leaves them no way to free the slot but to wait,
+    since giving up an idle project is the way out of the reclaim refusal.
+
+    Mutation-check: refuse on any entry in `_active_by_user` and the first release below is a
+    409 for a project that holds nothing."""
+    user, live_project = await _user_project(db_session, "ctl-rel1@rvaiglobal.com")
+    idle_project = await ProjectFactory.create(db_session, user.id)
+    await AppRegistryFactory.create(db_session, user_id=user.id, project_id=idle_project.id)
+    await a_live_session(wire, db_session, user, live_project.id)
+
+    idle = await client.post(
+        f"/v1/build-sessions/projects/{idle_project.id}/release", headers=auth_headers(user)
+    )
+
+    assert idle.status_code == 200, idle.text
+    assert idle.json()["released"] is False  # nothing of this project's was up to give up
+    # ...and the project that IS holding the workspace still refuses, which is what keeps this
+    # from admitting a second container for one person.
+    held = await client.post(
+        f"/v1/build-sessions/projects/{live_project.id}/release", headers=auth_headers(user)
+    )
+    assert held.status_code == 409, held.text
+    assert wire.sbx.torn_down == []  # neither container was taken
+
+
+async def test_the_release_refusal_names_the_project_holding_the_workspace(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """★ A citizen who asked to close a workspace from a project list is told which project is
+    still working, so "finish or stop it" points somewhere.
+
+    Turn red by putting the bare "a build session is already active" back: it names no project,
+    and the code beside it is for the client rather than the person reading."""
+    user, project = await _user_project(db_session, "ctl-rel2@rvaiglobal.com")
+    project.name = "Visitor Log"
+    await db_session.flush()
+    await a_live_session(wire, db_session, user, project.id)
+
+    refused = await client.post(
+        f"/v1/build-sessions/projects/{project.id}/release", headers=auth_headers(user)
+    )
+
+    assert refused.status_code == 409, refused.text
+    error = refused.json()["error"]
+    assert error["code"] == "build_session_already_active", "the client still branches on this"
+    assert "“Visitor Log”" in error["message"]
+
+
+# --- the window between a turn's terminal and its release ------------------------------
+
+
+async def test_a_finished_turn_keeps_the_workspace_until_its_recovery_copy_is_written(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire, monkeypatch
+) -> None:
+    """The two halves of the turn seam, over the wire and at once: the release still refuses
+    while the finished turn writes its recovery copy, and the next message waits for that write
+    instead of being refused.
+
+    The ordering is the point. Admitting the next message by freeing the slot ahead of the
+    recovery copy would buy the same green test and cost the citizen the one copy standing
+    between them and a lost session — the release would be admitted mid-write and tear the
+    container down underneath it.
+
+    Mutation check: move the `_active_by_user` pop above the recovery write in
+    `finish_turn_sandbox` and the release below answers 200."""
+    user, project = await _user_project(db_session, "ctl-finish1@rvaiglobal.com")
+    session = await a_live_session(wire, db_session, user, project.id)
+    wire.sbx.attach_handle = session.handle  # the pardoned container answers the next message
+
+    entered, gate = asyncio.Event(), asyncio.Event()
+
+    async def gated_recovery_copy(*_args: object, **_kwargs: object) -> RecoveryWrite:
+        entered.set()
+        await gate.wait()
+        return RecoveryWrite(outcome=RecoveryOutcome.WRITTEN, reason="written")
+
+    monkeypatch.setattr(manager_module, "write_recovery_copy", gated_recovery_copy)
+    finishing = asyncio.create_task(
+        wire.manager.finish_turn_sandbox(session, wire.sbx, touched=True)
+    )
+    await entered.wait()
+
+    held = await client.post(
+        f"/v1/build-sessions/projects/{project.id}/release", headers=auth_headers(user)
+    )
+    assert held.status_code == 409, held.text
+    assert wire.sbx.torn_down == []  # nothing was taken out from under the write
+
+    # ...and the next message, arriving in that same window, waits rather than bouncing.
+    next_message = asyncio.create_task(a_live_session(wire, db_session, user, project.id))
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert not next_message.done()
+
+    gate.set()
+    await finishing
+    assert (await next_message).session_id != session.session_id

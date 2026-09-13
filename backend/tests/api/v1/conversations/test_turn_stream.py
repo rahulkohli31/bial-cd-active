@@ -1893,3 +1893,87 @@ async def test_an_unknown_conversation_with_no_parentage_is_still_a_404(
     resp = await _post_turn(client, _headers(user), SimpleNamespace(id=uuid.uuid4()))
 
     assert resp.status_code == 404
+
+
+# --- the seam between a turn's terminal and its release ---------------------------------
+
+
+@contextlib.contextmanager
+def _holding_the_workspace(app, user_id: uuid.UUID, *, still_letting_go: bool):
+    """A session of the shape production ACTUALLY makes — no `conversation_id`, because no
+    allocator has set one since `_start_locked` was deleted — which is what makes the per-user
+    gate, not the per-conversation one, the check these two tests reach.
+
+    `still_letting_go` is the whole difference under test: a turn that is over and writing its
+    recovery copy carries the event `finish_turn_sandbox` binds on entry and sets when the slot
+    is freed; a turn that is genuinely working carries nothing."""
+    from src.api.v1.build_sessions.deps import session_manager_dependency
+    from src.services.build_sessions.manager import BuildSession, SessionManager
+    from src.services.sandbox import SandboxHandle
+
+    manager = SessionManager()
+    app.dependency_overrides[session_manager_dependency] = lambda: manager
+    session = BuildSession(
+        session_id=uuid.uuid7(),
+        user_id=user_id,
+        project_id=uuid.uuid4(),
+        app_id=uuid.uuid4(),
+        prompt="",
+        lock_token="tok",
+        handle=SandboxHandle(
+            fqdn="x.example",
+            token="t",
+            app_name="sbx-x",
+            preview_url="https://x.example/",
+            ready=True,
+        ),
+    )
+    if still_letting_go:
+        session.turn_finish = asyncio.Event()
+    manager._sessions[session.session_id] = session
+    manager._active_by_user[user_id] = session.session_id
+    try:
+        yield session
+    finally:
+        manager._sessions.pop(session.session_id, None)
+        manager._active_by_user.pop(user_id, None)
+
+
+async def test_a_message_sent_the_instant_a_turn_ends_is_admitted_not_refused(
+    client, db_session, set_chat_model, _fresh_engine, app
+) -> None:
+    """The measured symptom: three of every four iteration messages in a campaign were refused
+    seconds after the previous turn had visibly finished. The slot is freed a moment AFTER the
+    terminal is written — the recovery copy is written in between — and this gate refused
+    everything that arrived in the gap.
+
+    Mutation check: drop the `is_letting_go_of_the_workspace` clause from the gate and this
+    goes red."""
+    user, conv = await _auth_with_conversation(db_session)
+    set_chat_model(_streaming_text("the message sent on the heels of the last one"))
+
+    with _holding_the_workspace(app, user.id, still_letting_go=True):
+        admitted = await _post_turn(client, _headers(user), conv)
+
+    assert admitted.status_code == 202, admitted.text
+    await _settle(_fresh_engine, conv.id)
+
+
+async def test_a_turn_that_is_genuinely_working_still_refuses_the_next_message(
+    client, db_session, set_chat_model, _fresh_engine, app
+) -> None:
+    """THE DANGEROUS DIRECTION, and the reason the gate asks about letting go rather than being
+    deleted: a session that has not committed its terminal is a turn still working, and a second
+    one admitted beside it is two containers for one person — the thing the single slot exists
+    to prevent. Refused at once, and before the turn claims anything."""
+    from src.services.turns.copy import ALREADY_BUILDING_HERE_CODE
+
+    user, conv = await _auth_with_conversation(db_session)
+    set_chat_model(_streaming_text("should never stream"))
+
+    with _holding_the_workspace(app, user.id, still_letting_go=False):
+        refused = await _post_turn(client, _headers(user), conv)
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["error"]["code"] == ALREADY_BUILDING_HERE_CODE
+    assert _fresh_engine.peek(conv.id) is None  # nothing was started

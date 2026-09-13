@@ -403,8 +403,20 @@ async def start_turn(
     # container exactly as a Build turn does, by design, so a Plan send that
     # slipped past this gate would take a workspace another of the user's chats was mid-build
     # in, which is the one thing this check exists to prevent.
+    #
+    # A SESSION THAT IS ONLY LETTING GO IS NOT WORKING, and asking that is what keeps this gate
+    # from pre-empting the wait built for exactly this case. A turn's terminal is written a
+    # moment BEFORE the slot is freed — the recovery copy is written in between, deliberately,
+    # since losing it is worse than a wait — so a message sent the instant the turn ends arrives
+    # while an ended session still holds the workspace. Refusing it here answered 409 to three
+    # of every four iteration messages in a measured campaign. The claim inside the turn is
+    # where the (bounded) waiting happens, and it still refuses if the release never comes.
     active = manager.active_session_for(user.id)
-    if active is not None and active.conversation_id != conversation_id:
+    if (
+        active is not None
+        and active.conversation_id != conversation_id
+        and not manager.is_letting_go_of_the_workspace(active)
+    ):
         raise AppApiError(409, BUILD_IN_FLIGHT_MSG, code=ALREADY_BUILDING_HERE_CODE)
 
     # BOTH KINDS, not just Build, and the guard above cannot answer this one.

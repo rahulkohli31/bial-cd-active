@@ -271,7 +271,7 @@ runs synchronously on the control-plane event loop — this is the belt to the r
 MAX_OUTPUT_TOKENS = 64_000
 """Per-model-step output clamp."""
 
-ADAPTIVE_THINKING: Final[BetaThinkingConfigParam] = {"type": "adaptive"}
+ADAPTIVE_THINKING: Final[BetaThinkingConfigParam] = {"type": "adaptive", "display": "summarized"}
 """How reasoning is asked for, and it is not a token budget.
 
 The deployed model REFUSES a numeric budget outright: its provider profile disallows budget
@@ -279,6 +279,11 @@ thinking, and the library raises before the request rather than letting the prov
 400, directing callers to adaptive thinking plus an effort level. So the two knobs are this and
 the effort below — a shape the owner's ruling ("medium for planning, high for building") maps
 onto directly, rather than two token counts nobody could defend.
+
+`display` IS LOAD-BEARING AND MUST STAY NAMED. The SDK's own type stub documents it as
+defaulting to `summarized`; this deployment behaves as `omitted` when it is absent, returning a
+signed thinking block whose text is empty. The signature alone is enough to replay the block on
+the next turn, so nothing fails — the reasoning is simply never there to store or read back.
 
 Asserted against the REAL provider model in test, never a double: the refusal lives in
 `AnthropicModel.prepare_request`, which a stub never executes, so a test that trusted a fake

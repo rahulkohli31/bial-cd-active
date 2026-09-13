@@ -21,7 +21,7 @@ from src.api.v1.build_sessions.schemas import (
     RELAUNCH_PREVIEW_STAY_SECONDS,
 )
 from src.services.build_sessions import locks, pass_history, reaper
-from src.services.build_sessions.alarms import SERVING_PROOF_NEVER_ARRIVED
+from src.services.build_sessions.alarms import SERVING_PROOF_ABSENT_AT_TEARDOWN
 from src.services.build_sessions.pass_history import CopyAttempt
 from src.services.build_sessions.snapshot import reset_divert_streaks_for_tests
 from src.services.redis import (
@@ -1376,9 +1376,9 @@ async def test_every_sparing_arm_that_holds_a_record_takes_the_reading(
 async def test_a_teardown_of_a_container_that_never_served_anybody_sounds_the_alarm(
     fake_redis: aioredis.Redis,
 ) -> None:
-    """THE INVERSE OF THE SHIPPED BUG. The stamp stops the platform reporting a scheduled
-    container as running; this catches the other failure — an app that never answered anything
-    at all — which is today indistinguishable in the logs from a flawless build.
+    """THIS CONTAINER'S OWN HISTORY: created, never served, torn down idle — one of the two the
+    empty sentinel can mean. The alarm cannot tell that apart from a container that DID serve
+    and had the proof retracted, so it still has to fire here, on the signal alone.
 
     Read off the record while it is still in hand: `reg` was taken before the mark-ending flip
     and the delete is about to remove it for good."""
@@ -1387,7 +1387,12 @@ async def test_a_teardown_of_a_container_that_never_served_anybody_sounds_the_al
     with structlog.testing.capture_logs() as logs:
         assert await reaper.reap_user(fake_redis, USER, FakeSandboxClient()) is True
 
-    assert [e for e in logs if e.get("event") == SERVING_PROOF_NEVER_ARRIVED]
+    fired = [e for e in logs if e.get("event") == SERVING_PROOF_ABSENT_AT_TEARDOWN]
+    assert fired
+    # THE EMITTED NAME, not just the docstring beside it — this is the text an operator actually
+    # greps, and a container that never served is exactly the history this alarm's name must
+    # also cover without overclaiming it.
+    assert "never" not in fired[0]["event"]
 
 
 async def test_a_teardown_of_a_container_that_did_serve_is_silent(
@@ -1414,7 +1419,7 @@ async def test_a_teardown_of_a_container_that_did_serve_is_silent(
         assert await reaper.reap_user(fake_redis, served_user, FakeSandboxClient()) is True
         assert await reaper.reap_user(fake_redis, pre_cutover_user, FakeSandboxClient()) is True
 
-    assert [e for e in logs if e.get("event") == SERVING_PROOF_NEVER_ARRIVED] == []
+    assert [e for e in logs if e.get("event") == SERVING_PROOF_ABSENT_AT_TEARDOWN] == []
 
 
 # --- the fleet sweep's re-ask cadence ---------------------------------------------------------

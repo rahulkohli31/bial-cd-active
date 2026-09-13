@@ -1579,6 +1579,7 @@ async def reclamation_report(
                 "escalate": report.escalate,
                 "notOurs": report.not_ours,
                 "storeFault": report.store_fault,
+                "untagged": report.untagged,
             },
         )
         await db.commit()
@@ -1592,6 +1593,7 @@ async def reclamation_report(
             destroy=report.destroy,
             escalate=report.escalate,
             not_ours=report.not_ours,
+            untagged=report.untagged,
             store_fault=report.store_fault,
             candidates=[
                 ReclamationCandidate(

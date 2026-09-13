@@ -228,6 +228,51 @@ async def test_the_pass_reports_the_evidence_behind_every_verdict(
     assert candidate.reason  # non-empty prose, not a code
 
 
+# --- the destroy flag's precondition, made legible without a write ----------------
+
+
+async def test_an_untagged_container_is_counted_without_a_write(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """The destroy flag's precondition, read off the same enumeration the pass already did.
+
+    MUTATION-CHECK: hard-code `untagged=0` in `run_reclamation_pass` and this goes red."""
+    fleet = _Fleet([a_fleet_member("sbx-ghost"), _orphan("sbx-a")])
+
+    report = await pass_mod.run_reclamation_pass(control_plane=fleet)
+
+    assert report.untagged == 1
+
+
+async def test_a_fully_tagged_fleet_reports_zero_untagged(fake_redis: aioredis.Redis) -> None:
+    report = await pass_mod.run_reclamation_pass(
+        control_plane=_Fleet([_orphan("sbx-a"), _orphan("sbx-b")])
+    )
+
+    assert report.untagged == 0
+
+
+async def test_a_store_fault_still_counts_what_the_fleet_listing_saw(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """`untagged` reads the ARM listing, not the coordination store — so a fleet too thin on
+    registry claims to trust for verdicts still answers the one question that never depended on
+    Redis, while the fault it cannot ignore is still raised."""
+    fleet = _Fleet(
+        [
+            a_fleet_member("sbx-ghost-a"),
+            a_fleet_member("sbx-ghost-b"),
+            _orphan("sbx-a"),
+            _orphan("sbx-b"),
+        ]
+    )
+
+    report = await pass_mod.run_reclamation_pass(control_plane=fleet)
+
+    assert report.store_fault is True
+    assert report.untagged == 2
+
+
 # --- the pass record: the only thing that can detect a dead worker ----------------
 
 
@@ -463,6 +508,7 @@ async def test_the_threshold_alarm_fires_once_per_pass_not_once_per_container(
             store_fault=False,
             candidates=(),
             owners={},
+            untagged=0,
         )
 
     monkeypatch.setattr(pass_mod, "run_reclamation_pass", _report)
@@ -519,6 +565,7 @@ async def _a_quiet_report(**_: object) -> pass_mod.PassReport:
         store_fault=False,
         candidates=(),
         owners={},
+        untagged=0,
     )
 
 

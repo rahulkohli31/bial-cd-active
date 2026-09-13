@@ -31,6 +31,7 @@ from src.services.build_sessions.reclaim import (
 )
 from src.services.redis import get_redis, registry_scan_patterns
 from src.services.redis.keys import REGISTRY_FIELD_APP_NAME
+from src.services.sandbox.base import TAG_KIND
 
 _log = structlog.get_logger()
 
@@ -54,6 +55,13 @@ class PassReport:
     #: A container with incomplete identity never appears here — and never reaches a destroy tier
     #: either, so the two absences agree by construction.
     owners: Mapping[str, tuple[uuid.UUID, uuid.UUID]]
+    #: Enumerated containers carrying no `TAG_KIND` at all — the population the tag backfill exists
+    #: to stamp, and the fleet's own answer to whether it is safe to arm the destroy flag. Reads
+    #: this pass's OWN enumeration rather than a second listing, so it is exact where the backfill
+    #: endpoint's count would be a moment stale. Not `escalate`: an untagged container always
+    #: escalates, but a tagged-and-ownerless one and a foreign control plane's container escalate
+    #: too, so that count cannot tell the three apart and this one exists to.
+    untagged: int
 
 
 async def _who_the_store_thinks_owns_what(
@@ -186,4 +194,5 @@ async def run_reclamation_pass(*, control_plane: FleetLister | None = None) -> P
             for m in fleet
             if m.identity.user_id is not None and m.identity.app_id is not None
         },
+        untagged=sum(1 for m in fleet if not m.tags.get(TAG_KIND)),
     )

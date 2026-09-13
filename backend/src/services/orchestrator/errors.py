@@ -28,6 +28,26 @@ _FALLBACK_TITLE = "The build reported an error with no readable diagnostic."
 # Absolute sandbox paths → workspace-relative. The app lives at /workspace/app.
 _WORKSPACE_ROOTS = ("/workspace/app/", "/workspace/")
 
+# npm's two lines for a dependency stage that could not install, in specificity order: the
+# first names the package that drifted, the second only names the class of misuse. Spliced into
+# the marker table below AND read by `is_dependency_failure`, so one list decides both the title
+# and the class rather than the two drifting apart. THE `npm error` PREFIX IS LOAD-BEARING and
+# not decoration: the diagnosis itself reads `… does not satisfy …`, which is also how tsc words
+# an unmet generic constraint, so matching on the diagnosis alone would route a compile failure
+# into the dependency sentence — where the citizen would be told to fix something that is fine.
+_DEPENDENCY_MARKERS: Final = (
+    "npm error Invalid:",
+    "npm error code EUSAGE",
+)
+
+# The sentence the dependency stage echoes when it RECOVERS a drifted lockfile
+# (`services/deploy/assets/Dockerfile`). A recovered drift is not the failure, so this is noise
+# below — but it is the earliest line the stage prints, which makes it the line the fallback
+# would otherwise title every later failure of that build on. `tests/services/deploy/
+# test_assets.py` pins this string to the one the Dockerfile prints, so the filter cannot fall
+# out of step with the build.
+DRIFT_RECOVERED_NOTICE: Final = "lockfile drifted from package.json"
+
 # `next build` opens with a banner and progress spinners, so its FIRST line is reliably
 # "▲ Next.js 16.2.10" — noise. Scan for the line that actually names the failure, in
 # SPECIFICITY order (a later `Type error:` beats an earlier generic `TypeError:`), the same
@@ -56,10 +76,20 @@ _NEXT_BUILD_MARKERS = (
     "ReferenceError:",
     "TypeError:",
     "SyntaxError:",
-    # Last and broadest: catches the shapes with no dedicated marker, notably
+    # Broad: catches the shapes with no dedicated marker, notably
     # "Error: useSearchParams() should be wrapped in a suspense boundary" — a headline
     # member of the class `tsc --noEmit` is blind to.
     "Error:",
+    # LAST, BELOW EVERY COMPILE MARKER, and that position is the load-bearing part. The deps
+    # stage tolerates a lockfile that has drifted from `package.json`: `npm ci` refuses, prints
+    # its `Invalid: … does not satisfy …` block, and the fallback install succeeds. So that
+    # block is in the log of every drifted app's build — including the ones that go on to fail
+    # for a reason that has nothing to do with dependencies. Ranked any higher, it would outrank
+    # the real diagnostic and tell a citizen to fix a manifest that is already working.
+    #
+    # A build that genuinely died installing carries no compile marker at all, so these still
+    # win the only case they are meant to win.
+    *_DEPENDENCY_MARKERS,
 )
 # A header, not a diagnostic — the useful line is the one after it.
 _FAILED_TO_COMPILE = "Failed to compile"
@@ -84,7 +114,34 @@ _NEXT_BUILD_NOISE_PREFIXES = (
     "┌",
     "> ",
     "$ ",
-    "npm ",
+    # NOT THE WHOLE `npm ` FAMILY. npm prints its progress, its warnings and its DIAGNOSIS under
+    # one prefix, so dropping the family drops the only line naming a failed install, and the
+    # surviving candidate becomes the builder's own trailer rule — a real dependency failure
+    # titled `------`, with nothing for the repair run to read either. Only the chatter is listed;
+    # `npm error` stays visible so an install that fails outside the markers above still says why.
+    "npm notice",
+    "npm warn",
+    "npm WARN",
+    "npm info",
+    "npm http",
+    "npm timing",
+    # npm's install SUMMARY, which it prints on success and which carries no `npm ` prefix. The
+    # deps stage is the first thing a container build runs, so without these the line announcing
+    # that the install WORKED becomes the stated cause of a failure three stages later.
+    "added ",
+    "removed ",
+    "changed ",
+    "up to date",
+    "audited ",
+    "found 0 vulnerabilities",
+    "packages are looking for funding",
+    # BuildKit closes a failed step with a rule, then the Dockerfile excerpt, and the local
+    # builder adds a dashboard link after it. None of the three carries a step marker or matches
+    # any prefix above, so they outlive every filter here and the rule is the first of them.
+    "------",
+    "View build details:",
+    "Dockerfile:",
+    DRIFT_RECOVERED_NOTICE,
     "Creating an optimized production build",
     "Compiled successfully",
     "Linting and checking validity of types",
@@ -104,6 +161,31 @@ _NEXT_BUILD_NOISE_PREFIXES = (
     "Route (app)",
     "First Load JS",
 )
+
+
+# A container build wraps every line in BuildKit's step marker: `#10 ` where the builder is
+# narrating its own progress, `#10 5.696 ` where the step's program printed something. The
+# timing stamp is the only thing separating the two. Until the marker comes off, no noise
+# prefix and no `startswith` below can reach the text, which is how a failed dependency install
+# came to be titled `#0 building with "desktop-linux" instance using docker driver`.
+_BUILDKIT_STEP_RE = re.compile(r"^#\d+ (?:(?P<stamp>\d+\.\d+) )?")
+
+
+def _spoken_by_the_build(lines: list[str]) -> list[str]:
+    """The step marker off every line, and the builder's own narration dropped.
+
+    Layer transfers, CACHED and DONE are chatter no noise prefix lists, and they would
+    otherwise be the first lines to survive every filter and become the title. Anything
+    carrying no marker at all passes through untouched — which is every log that did not come
+    from a container build."""
+    spoken: list[str] = []
+    for line in lines:
+        marker = _BUILDKIT_STEP_RE.match(line)
+        if marker is None:
+            spoken.append(line)
+        elif marker.group("stamp") is not None:
+            spoken.append(line[marker.end() :])
+    return spoken
 
 
 def _relativize_paths(text: str) -> str:
@@ -138,6 +220,7 @@ def _first_meaningful_line(text: str, source: ErrorSource) -> str:
             if "error TS" in line:
                 return _clip_title(line)
     elif source == ErrorSource.NEXT_BUILD:
+        lines = _spoken_by_the_build(lines)
         for marker in _NEXT_BUILD_MARKERS:
             for line in lines:
                 if marker in line:
@@ -200,6 +283,16 @@ def from_next_build(raw: str) -> BuildError:
     says an app can actually be built and shipped. `ErrorSource.NEXT_BUILD` sat unused since the
     taxonomy was written — this is the arm `declutter`'s docstring anticipated."""
     return declutter(raw, ErrorSource.NEXT_BUILD)
+
+
+def is_dependency_failure(error: BuildError) -> bool:
+    """Whether the build died installing the app's pieces rather than compiling its code.
+
+    Keyed on the TITLE the marker table already picked, so a package name quoted anywhere else
+    in the log cannot reclassify the failure. Callers need the class because the two halves of
+    a `BuildError` egress to different readers here: this title is a package name and two
+    version numbers, which is an operator's sentence and never a citizen's."""
+    return any(marker in error.title for marker in _DEPENDENCY_MARKERS)
 
 
 # --- the CLIENT arm -----------------------------------------------------------

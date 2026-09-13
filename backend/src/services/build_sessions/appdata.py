@@ -66,7 +66,7 @@ async def resolve_app_for_project(
     refusal, which is the point, and must not be written to route around it.)
 
     SAVE IS DELIBERATELY NOT GATED, and that omission is load-bearing rather than an
-    oversight. `save_project_snapshot` reads its app id through `_existing_app_id`, never
+    oversight. `save_project_snapshot` reads its app id through `existing_app_id`, never
     through this function, so it is structurally out of reach of this refusal — and it must
     stay that way. Save is the only thing that writes a citizen's work to durable storage
     and containers are ephemeral (the reaper destroys idle ones), so refusing it in the one

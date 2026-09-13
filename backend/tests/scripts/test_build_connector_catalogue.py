@@ -39,7 +39,6 @@ from typing import Any
 import pytest
 
 from scripts.build_connector_catalogue import (
-    marked_for_gloss,
     CONNECTOR_KEY,
     DATA_DIR,
     GROUPS,
@@ -51,8 +50,11 @@ from scripts.build_connector_catalogue import (
     ascii_only,
     build,
     group_of,
+    load_abbreviations,
     load_definitions,
     load_profile,
+    marked_for_gloss,
+    recorded_caveats,
     simple_type,
 )
 from tests.subprocess_env import child_env
@@ -63,6 +65,8 @@ PROFILE: dict[str, Any] = load_profile()
 COLUMNS: dict[str, dict[str, Any]] = {str(c["name"]): c for c in PROFILE["columns"]}
 DEFINITIONS: tuple[tuple[str, str], ...] = load_definitions()
 DESCRIBED: tuple[str, ...] = tuple(name for name, _ in DEFINITIONS)
+CAVEATS: dict[str, str] = recorded_caveats()
+ABBREVIATIONS: tuple[tuple[str, str], ...] = load_abbreviations()
 
 
 def shipped() -> str:
@@ -652,8 +656,17 @@ def test_an_opaque_code_renders_its_whole_gloss_unclipped() -> None:
         if " -- " in line
     }
     assert glossed, "no column renders a gloss at all"
+
+    def expected(name: str) -> str:
+        # A COLUMN THE CLIENT COULD NOT DEFINE CARRIES ITS WARNING ON THE SAME LINE, after the
+        # whole definition rather than in place of any of it: the warning is about the sentence
+        # beside it, and a reader who sees only one of the two is misled either way.
+        rendered = ascii_only(definitions[name])
+        caveat = CAVEATS.get(name, "")
+        return f"{rendered} {ascii_only(caveat)}" if caveat else rendered
+
     for name, gloss in glossed.items():
-        assert gloss == ascii_only(definitions[name]), name
+        assert gloss == expected(name), name
     # The three whose whole point is what the first clause would have thrown away.
     assert "SECONDS" in glossed["OTP"] and "negative is early" in glossed["OTP"]
     assert "decimal string" in glossed["BAGS"]
@@ -664,7 +677,7 @@ def test_an_opaque_code_renders_its_whole_gloss_unclipped() -> None:
     # property is asserted instead: the longest definition arrives whole, which is what clipping
     # would break. OTP and BAGS stay literal because they pin MEASURED facts, not prose.
     longest = max(glossed, key=lambda name: len(definitions[name]))
-    assert glossed[longest] == ascii_only(definitions[longest])
+    assert glossed[longest] == expected(longest)
 
 
 def test_a_self_describing_name_gets_no_gloss() -> None:
@@ -688,15 +701,99 @@ def test_a_self_describing_name_gets_no_gloss() -> None:
     assert all(len(name) <= 5 or name in marked for name in glossed), sorted(
         name for name in glossed if len(name) > 5 and name not in marked
     )
-    assert len(marked) < 20, f"{len(marked)} marks is a tier system, not an exception: {marked}"
+    # TWO KINDS OF MARK, AND ONLY ONE OF THEM IS A JUDGEMENT. A column the client could not define
+    # is marked by a rule with no discretion in it -- every not-an-answer, no exceptions -- so it
+    # cannot grow into a tier system and is counted apart from the ones somebody chose.
+    caveated = set(CAVEATS)
+    assert caveated <= marked, sorted(caveated - marked)
+    chosen = marked - caveated
+    assert len(chosen) < 20, f"{len(chosen)} marks is a tier system, not an exception: {chosen}"
+
+
+def glossary_section() -> str:
+    """The abbreviation block, cut out of the artefact by its own heading and the next one."""
+    after_heading = SHIPPED.split("ABBREVIATIONS -- ", 1)
+    assert len(after_heading) == 2, "the artefact renders no abbreviation glossary"
+    return after_heading[1].split("HOW TO READ THE COLUMN LINES", 1)[0]
+
+
+def test_every_column_the_client_could_not_define_says_so() -> None:
+    """★ A GUESS READS EXACTLY AS CONFIDENTLY AS AN ANSWER.
+
+    Nine columns came back as a refusal to define them. Our sentence for each is inferred off the
+    profile and nothing in the shape of a line distinguishes it from the client's own text, so the
+    block has to say which it is -- on all nine, not on the four whose names happen to be short
+    enough to look opaque."""
+    lines = column_lines(SHIPPED)
+    assert len(CAVEATS) == 9, sorted(CAVEATS)
+    for name, caveat in CAVEATS.items():
+        assert ascii_only(caveat) in lines[name], name
+
+
+def test_a_long_name_the_client_could_not_define_renders_its_values_and_its_warning() -> None:
+    """★ THE READING THE CLIENT DECLINED TO CONFIRM.
+
+    `DOM_INT_OPS = 'DOM', 'INT'` rendered as a bare value list, because a definition was shown
+    only where the NAME looked opaque and this name does not. An agent reads that line as the
+    domestic/international split, which is the one thing nobody has confirmed it is."""
+    lines = column_lines(SHIPPED)
+    for name in ("DOM_INT_OPS", "DOM_INT_REVENUE"):
+        assert "= 'DOM', 'INT'" in lines[name], lines[name]
+        assert ascii_only(CAVEATS[name]) in lines[name], lines[name]
+
+
+def test_a_column_the_client_defined_carries_no_warning() -> None:
+    """The warning is about OUR text. Attached to theirs it would teach the agent to discount a
+    definition the airport stands behind."""
+    lines = column_lines(SHIPPED)
+    warning = ascii_only(next(iter(CAVEATS.values())))
+    for defined in ("ACTUAL_OFF_BLOCK_TIME_AOBT", "AIBT_AOBT_TIME", "TAT", "BAGS"):
+        assert warning not in lines[defined], defined
+    assert SHIPPED.count(warning) == len(CAVEATS)
+
+
+def test_every_abbreviation_the_client_gave_reaches_the_block() -> None:
+    """★ A TRANSCRIPTION CAN LOSE A ROW AND LOOK FINE.
+
+    The sheet these come from is not in this repository, so the committed file is the only record
+    of it and this count is the only thing standing between a dropped row and a code the block
+    quietly stops explaining."""
+    section = glossary_section()
+    expanded = dict(re.findall(r"^  ([A-Z0-9]+) = (.+)$", section, flags=re.MULTILINE))
+    unexpanded = [
+        code.strip()
+        for line in re.findall(
+            r"^  \(no expansion supplied for (.+)\)$", section, flags=re.MULTILINE
+        )
+        for code in line.split(",")
+    ]
+    assert len(expanded) + len(unexpanded) == len(ABBREVIATIONS), (
+        "the glossary the block renders is not the glossary the client gave"
+    )
+    for code, text in ABBREVIATIONS:
+        if text:
+            assert expanded.get(code) == ascii_only(text), code
+        else:
+            assert code in unexpanded, code
+
+
+def test_the_glossary_renders_no_line_that_parses_as_a_column() -> None:
+    """★ MOST OF THESE CODES ARE ALSO COLUMN NAMES.
+
+    Unindented, `OTP = On-Time Performance` is a column line to everything that reads this block,
+    and it displaces the real OTP line -- whose unit is the fact keeping a chart from being 60x
+    out."""
+    also_columns = [code for code, _ in ABBREVIATIONS if code in COLUMNS]
+    assert len(also_columns) >= 20, also_columns
+    assert column_lines(glossary_section()) == {}
 
 
 def test_a_timestamp_stored_as_text_is_not_offered_as_a_code_list() -> None:
     """Thirteen columns hold more distinct values than any vocabulary plausibly has because they
     are timestamps written as text. Telling the agent to `SELECT DISTINCT` 125,028 of them would
     be advice to read the whole table for nothing."""
-    # THE VALUE CLAUSE IS THE ASSERTION, not the gloss beside it: the gloss is the client's text and
-    # moves every review round, while "free text, not a code list" is the decision under test.
+    # THE VALUE CLAUSE IS THE ASSERTION, not the gloss beside it: the gloss is the client's text
+    # and moves every review round, while "free text, not a code list" is the decision under test.
     line = column_lines(SHIPPED)["ACGT"]
     assert line.split(" -- ")[0] == "ACGT = free text, not a code list", line
     assert int(COLUMNS["ACGT"]["distinct_max"]) > NOT_A_VOCABULARY_ABOVE

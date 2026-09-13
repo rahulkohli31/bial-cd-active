@@ -470,6 +470,12 @@ class ReclamationReportResponse(CamelModel):
     destroy: int
     escalate: int
     not_ours: int
+    #: Enumerated containers carrying no identity tag at all. `SANDBOX_RECLAIM_DESTROY`'s
+    #: precondition is this reading zero across the fleet — before this field, checking it meant
+    #: running the tag-backfill endpoint, a write, to find out. Not the same number as `escalate`:
+    #: an untagged container always escalates, but so does a tagged-and-ownerless one and a
+    #: foreign control plane's container, so that count cannot answer this question alone.
+    untagged: int
     #: The pass REFUSED to judge: too little of the live fleet is claimed by the coordination
     #: store, so the spare-list is not trustworthy enough to sentence anything by. Every verdict
     #: below is meaningless when this is true, which is why it is reported and not hidden.
