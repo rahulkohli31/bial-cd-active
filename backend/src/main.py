@@ -24,26 +24,12 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
 
 from src.config import settings
+from src.core.log_config import configure_logging
 from src.schemas import DetailBody, error_responses
 from src.services.cors.middleware import ScopedCORSMiddleware
 from src.services.redis import get_redis
 
-# Configure structlog process-wide at import: a human ConsoleRenderer in dev,
-# one-line JSON in production (for log aggregation).
-structlog.configure(
-    processors=[
-        structlog.contextvars.merge_contextvars,
-        structlog.processors.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.JSONRenderer()
-        if settings.is_production
-        else structlog.dev.ConsoleRenderer(),
-    ],
-    wrapper_class=structlog.make_filtering_bound_logger(0),
-    context_class=dict,
-    logger_factory=structlog.PrintLoggerFactory(),
-    cache_logger_on_first_use=True,
-)
+configure_logging(production=settings.is_production)
 
 
 _log = structlog.get_logger()

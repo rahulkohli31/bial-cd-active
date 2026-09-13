@@ -1977,9 +1977,8 @@ class TurnEngine:
                     # THE CAUSE, NOT JUST THE FACT. `AttachmentPlacementError`'s own message is
                     # written for the citizen and says only that the file could not be placed;
                     # the storage or supervisor error underneath it is the half an operator
-                    # needs. Bound as a field rather than through `exc_info=True`: this
-                    # process's processor chain renders neither a traceback nor frame locals,
-                    # and the frame it would try to render holds the supervisor bearer.
+                    # needs. Bound as a field because `exc_info=True` renders only the class
+                    # chain and raise site (`core/log_config.py`), never the message.
                     reason=str(exc.__cause__ or exc),
                 )
                 # The sentence is already citizen-facing — `place` words its own refusals for

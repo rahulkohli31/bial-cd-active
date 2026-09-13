@@ -37,8 +37,11 @@ from taskiq.api import run_receiver_task
 from taskiq.cli.scheduler.run import SchedulerLoop
 
 from src.broker import broker
+from src.config import settings
+from src.core.log_config import configure_logging
 from src.scheduler import schedule_sources, scheduler
 
+configure_logging(production=settings.is_production)
 _log = structlog.get_logger()
 
 # How long to wait before retrying after the receiver dies. `run_receiver_task`'s own loop
