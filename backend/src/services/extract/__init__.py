@@ -1,15 +1,13 @@
-"""Untrusted-file extraction: office (docx/xlsx → Markdown) + deck (pptx → PDF). Public
-surface via explicit re-exports."""
+"""Untrusted-archive safety: the zip-bomb bound and the parse-error contract.
 
-from src.services.extract.deck import DeckConvertError as DeckConvertError
-from src.services.extract.deck import DeckResult as DeckResult
-from src.services.extract.deck import convert_deck_to_pdf as convert_deck_to_pdf
-from src.services.extract.deck import deck_attachments_enabled as deck_attachments_enabled
-from src.services.extract.office import EXCEL_MEDIA_TYPE as EXCEL_MEDIA_TYPE
-from src.services.extract.office import OFFICE_MEDIA_TYPES as OFFICE_MEDIA_TYPES
-from src.services.extract.office import PPTX_MEDIA_TYPE as PPTX_MEDIA_TYPE
-from src.services.extract.office import WORD_MEDIA_TYPE as WORD_MEDIA_TYPE
-from src.services.extract.office import ExtractResult as ExtractResult
-from src.services.extract.office import OfficeExtractError as OfficeExtractError
-from src.services.extract.office import extract_office as extract_office
+WHAT THIS PACKAGE USED TO BE: the server-side extraction machinery — docx/xlsx flattened to
+Markdown, pptx rendered to PDF by a converter that was never deployed. Both are gone. A
+file is stored as itself now and read by a script in the citizen's own sandbox, which is what
+lets an answer be about the whole file rather than its first thousand rows.
+
+WHAT SURVIVED IS NOT OFFICE-SPECIFIC. `assert_zip_not_bomb` bounds an archive that declares more
+than it carries, and `FileParseError` is the governor's whole error contract. Both moved to the
+upload lane, which is the only place archives arrive."""
+
 from src.services.extract.zip_safety import FileParseError as FileParseError
+from src.services.extract.zip_safety import assert_zip_not_bomb as assert_zip_not_bomb

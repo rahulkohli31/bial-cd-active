@@ -43,7 +43,11 @@ from pydantic_ai.models.function import (
 from pydantic_ai.usage import RequestUsage
 from sqlalchemy import func, select
 
-from src.api.v1.conversations._shared import MAX_MESSAGE_TEXT_CHARS
+from src.api.v1.conversations._shared import (
+    MAX_ATTACHMENT_BLOCKS,
+    MAX_FILES_PER_MESSAGE,
+    MAX_MESSAGE_TEXT_CHARS,
+)
 from src.api.v1.conversations._shared import chat_model as chat_model_dep
 from src.api.v1.conversations.transition import PLAN_TOO_LONG_CODE
 from src.db.models.conversation import ChatKind, Conversation
@@ -534,11 +538,19 @@ def shared_storage(fake_storage, monkeypatch):
     return fake_storage
 
 
-async def _upload(client, user, attachment_id: str, media_type: str, data: bytes) -> None:
+async def _upload(
+    client, user, conversation_id: uuid.UUID, attachment_id: str, media_type: str, data: bytes
+) -> None:
+    """Upload one file AGAINST a conversation, which the door now requires.
+
+    The id was always available at this call site; what changed is that the server wants it, so a
+    file's owner is knowable at the door rather than stamped on afterwards by the send route.
+    """
     resp = await client.post(
         "/v1/attachments",
         headers=_headers(user),
         json={
+            "conversationId": str(conversation_id),
             "attachmentId": attachment_id,
             "mediaType": media_type,
             "base64": base64.b64encode(data).decode(),
@@ -556,76 +568,67 @@ async def _send_with(client, user, conversation_id: uuid.UUID, ids: list[str], t
     )
 
 
-async def test_three_documents_on_one_message_are_refused_by_count_not_by_tokens(
-    client, db_session, shared_storage
-) -> None:
-    """★ THE REFUSAL THAT HAD TO BE ITS OWN SENTENCE.
-
-    Documents are the one attachment big enough to end a message alone, and nothing counts them
-    on the way in any more — left uncaught, an over-long one is sent, fails at the provider, and
-    comes back as "chat too long, start a new chat": WRONG ADVICE, since the new chat refuses
-    the identical message and loops the citizen with no way out. `MAX_ATTACHMENT_BLOCKS` still
-    advertises eight attachments, warning them of nothing.
-
-    THE NUMBER IS NOT A TOKEN SUM: the old per-page arithmetic is deleted from `_shared.py`
-    rather than recomputed at the raised ceiling, so the limit is removed outright. The third
-    document is refused BY COUNT, before anything is sent, naming the DOCUMENT limit with an
-    action that works. Delete the count check and this goes red on the copy — the request still
-    fails, but it fails telling the citizen something untrue."""
-    user, _project, conversation = await _a_conversation(db_session)
-    for index in range(3):
-        await _upload(client, user, f"doc_{index}", "application/pdf", pdf_with_pages(2))
-
-    resp = await _send_with(client, user, conversation.id, ["doc_0", "doc_1", "doc_2"])
-
-    assert resp.status_code == 413, resp.text
-    body = resp.json()["error"]
-    assert body["code"] == "too_many_documents"
-    assert body["message"] == (
-        "You can send up to 2 documents in one message. Take one out and send again."
-    )
-    # Emphatically NOT the too-long copy, whose advice does not work here.
-    assert body["code"] != CHAT_TOO_LONG_CODE
-    assert "new chat" not in body["message"]
-    # And nothing was written — the refusal is side-effect-free like every other one above the
-    # persist, so the citizen can fix the message and send it again.
-    rows = await db_session.scalar(
-        select(func.count()).select_from(Message).where(Message.conversation_id == conversation.id)
-    )
-    assert rows == 0
-
-
-async def test_two_documents_on_one_message_are_allowed(
+async def test_five_files_of_any_mix_send_and_the_sixth_is_refused(
     client, db_session, shared_storage, _fresh_engine
 ) -> None:
-    """The boundary, from the permitted side. A cap that refused two would satisfy the test
-    above and quietly make the product worse than it was."""
-    user, _project, conversation = await _a_conversation(db_session)
-    for index in range(2):
-        await _upload(client, user, f"pair_{index}", "application/pdf", pdf_with_pages(2))
+    """★ ONE NUMBER GOVERNS EVERY ATTACHMENT.
 
-    resp = await _send_with(client, user, conversation.id, ["pair_0", "pair_1"])
+    This replaces three tests built on the per-DOCUMENT cap of two, which is removed: a citizen
+    attaching five files should not have to know which of them the platform files as expensive.
+    The page cap and the flat charge are what actually protect the budget and both stay; the
+    document count was the belt beside those braces.
 
-    assert resp.status_code == 202, resp.text
-    await _settle(_fresh_engine, conversation.id)
+    THE MIX IS THE POINT. Five files here are images and text blocks together, because the two
+    lists used to be bounded separately at eight apiece — sixteen files on one message against a
+    composer that offers five. Counting them apart is what made the stricter number the one that
+    was not the trust boundary.
 
-
-async def test_eight_images_still_send_the_document_cap_is_not_an_attachment_cap(
-    client, db_session, shared_storage, _fresh_engine
-) -> None:
-    """`MAX_ATTACHMENT_BLOCKS` is 8 and stays 8. The limit counts DOCUMENTS, so a message
-    carrying eight screenshots is unaffected — vision content costs roughly a thousand tokens an
-    image however many megabytes it is, and eight of those is nowhere near the wall. Count
-    binaries instead of documents and this goes red."""
+    Mutation receipt: restore either per-list bound in place of the sum and the sixth file sends.
+    """
     user, _project, conversation = await _a_conversation(db_session)
     png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
-    for index in range(8):
-        await _upload(client, user, f"shot_{index}", "image/png", png)
+    for index in range(4):
+        await _upload(client, user, conversation.id, f"mix_{index}", "image/png", png)
 
-    resp = await _send_with(client, user, conversation.id, [f"shot_{index}" for index in range(8)])
-
-    assert resp.status_code == 202, resp.text
+    at_the_cap = await client.post(
+        f"/v1/conversations/{conversation.id}/turns",
+        headers=_headers(user),
+        json={
+            "message": {
+                "text": "five files",
+                "attachmentTexts": ['<attachment name="a.csv" type="text">x</attachment>'],
+                "attachmentIds": [f"mix_{index}" for index in range(4)],
+            }
+        },
+    )
+    assert at_the_cap.status_code == 202, at_the_cap.text
     await _settle(_fresh_engine, conversation.id)
+
+    await _upload(client, user, conversation.id, "mix_4", "image/png", png)
+    over = await client.post(
+        f"/v1/conversations/{conversation.id}/turns",
+        headers=_headers(user),
+        json={
+            "message": {
+                "text": "six files",
+                "attachmentTexts": ['<attachment name="a.csv" type="text">x</attachment>'],
+                "attachmentIds": [f"mix_{index}" for index in range(5)],
+            }
+        },
+    )
+    assert over.status_code == 422, over.text
+
+
+def test_the_server_file_count_is_the_composer_s_number() -> None:
+    """AE19 — the composer's limit and the server's are the same number.
+
+    They were not: the composer offered five and the server admitted eight, so the stricter of
+    the two was the one that is not the trust boundary. The portal mirror is
+    `MAX_FILES_PER_MESSAGE` in `portal/src/utils/attachmentInput.ts`; this asserts the value it
+    has to agree with, so a change here without a change there fails on a stated number rather
+    than in a browser."""
+    assert MAX_FILES_PER_MESSAGE == 5
+    assert MAX_ATTACHMENT_BLOCKS == MAX_FILES_PER_MESSAGE
 
 
 async def test_uploading_a_document_computes_and_stores_no_token_figure(
@@ -646,7 +649,7 @@ async def test_uploading_a_document_computes_and_stores_no_token_figure(
     anything at all."""
     user, _project, conversation = await _a_conversation(db_session)
     await _stuff_the_conversation(db_session, user, conversation, tokens=60_000)
-    await _upload(client, user, "spec", "application/pdf", pdf_with_pages(30))
+    await _upload(client, user, conversation.id, "spec", "application/pdf", pdf_with_pages(30))
 
     # Nothing about an upload writes usage — no charge is computed at admission any more.
     assert (

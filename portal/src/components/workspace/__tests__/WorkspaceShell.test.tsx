@@ -187,6 +187,7 @@ describe('WorkspaceShell — the grid is the shell\'s own', () => {
 describe('WorkspaceShell — the reclaim dialog is mounted here, its handlers stay with the publisher', () => {
   const blocked: ReclaimBlocked = {
     projectId: 'p-other', projectName: 'Other Project', dirty: true, building: false, agentWorking: false,
+    isSharedView: false,
   }
 
   function SurfaceWithRefusal({ onResolve }: { onResolve: (save: boolean) => Promise<void> }) {

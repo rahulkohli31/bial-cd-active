@@ -11,7 +11,7 @@ blob. The ordering here is the whole point:
      user_id = …`) — that enumeration IS the ownership boundary, because the app-purge
      cores are keyed by id with no `user_id` predicate.
   2. GATHER every object-store key to sweep (each app's snapshot bundle + conversation
-     attachment blobs + deck-PDF siblings) while the rows still resolve them.
+     attachment blobs) while the rows still resolve them.
   3. DELETE all rows (apps, conversations, the project) INSIDE the caller's transaction.
   4. Return the gathered keys; the caller commits, re-enumerates each app's
      `submissions/{app_id}/` prefix (`resweep_submission_prefixes`), and sweeps the union.

@@ -21,6 +21,7 @@ from _router import (
     PUB_KEY,
     ROUTER_IMAGE,
     SBX_KEY,
+    SHR_KEY,
     Router,
     _free_port,
     _run,
@@ -75,7 +76,7 @@ def test_config_passes_nginx_t_after_substitution(router: Router) -> None:
     assert b"syntax is ok" in proc.stderr
 
 
-@pytest.mark.parametrize("key", [SBX_KEY, PUB_KEY])
+@pytest.mark.parametrize("key", [SBX_KEY, PUB_KEY, SHR_KEY])
 def test_keyed_request_reaches_its_app_with_the_prefix_intact(router: Router, key: str) -> None:
     """The prefix is real end to end: the router forwards it unchanged rather than
     stripping it, because the app is configured to live at it."""
@@ -234,11 +235,15 @@ def test_a_top_level_reader_still_gets_the_way_back(router: Router, dest: str | 
     assert "not available" in body.lower()
 
 
-@pytest.mark.parametrize("target", ["/_sup/health", "/_sup", f"/a/{SBX_KEY}/_sup/health"])
+@pytest.mark.parametrize(
+    "target", ["/_sup/health", "/_sup", f"/a/{SBX_KEY}/_sup/health", f"/a/{SHR_KEY}/_sup/health"]
+)
 def test_supervisor_surface_is_refused_at_the_router(router: Router, target: str) -> None:
     """The supervisor is bearer-guarded downstream, but this router claims as an invariant that
     it is unreachable from a browser, and an invariant should be enforced where it is claimed
-    rather than depend on a check designed for a different threat."""
+    rather than depend on a check designed for a different threat. The `shr-` case (#198) is
+    the one the issue names explicitly: a shared-runtime container's supervisor must be exactly
+    as unreachable as a build sandbox's or a published app's."""
     status, _, body = router.request(target, headers={"Cookie": f"bial_app={SBX_KEY}"})
     assert status == 404
     assert "REQ=" not in body

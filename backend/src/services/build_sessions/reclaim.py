@@ -29,7 +29,7 @@ import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
-from src.services.sandbox.base import KIND_BUILD_SANDBOX, FleetMember
+from src.services.sandbox.base import KIND_BUILD_SANDBOX, KIND_SHARED_SANDBOX, FleetMember
 
 # --- the clocks -------------------------------------------------------------------------
 #
@@ -99,6 +99,7 @@ class Tier(enum.StrEnum):
     CLAIMED_BUT_EXPIRED = "claimed_but_expired"
     UNREADABLE = "unreadable"
     NOT_OURS = "not_ours"
+    SHARED_SANDBOX = "shared_sandbox"
 
 
 @dataclass(frozen=True)
@@ -208,7 +209,16 @@ def _the_registry_looks_wrong(fleet_size: int, claim_count: int) -> bool:
     for a sane denominator) and wrong in the safe direction — a false positive only escalates to
     a human. It cannot catch the registry hash surviving while lock, stay and lease evict (the
     registry key alone has no TTL); the staging interval, the durable-copy gate and the per-pass
-    ceiling catch that instead."""
+    ceiling catch that instead.
+
+    WATCH THIS ON THE DAY `shr-` (#198) JOINS THE FLEET THIS CLASSIFIER SEES. `claims` is
+    sourced from the SAME per-user build-sandbox registry keyspace `sbx-` claims live in
+    (`reclamation_pass.py::_registry_claims`); a shared-runtime sandbox with no matching claim
+    mechanism of its own would inflate `fleet_size` here without inflating `claim_count`,
+    depressing the ratio and escalating the ENTIRE fleet — `sbx-` included — on a population
+    this function was never told to expect. Whoever widens `list_sandbox_fleet`'s ARM filter
+    (still `sbx-`-only as of #198 slice 2) past this comment must wire a matching claim source
+    for `shr-` in the same change, not after."""
     if fleet_size < STORE_FAULT_MIN_FLEET:
         return False
     return claim_count < math.ceil(fleet_size * STORE_FAULT_MIN_CLAIM_RATIO)
@@ -222,6 +232,22 @@ def _judge_one(
     now: dt.datetime,
 ) -> ContainerVerdict:
     identity = member.identity
+
+    # OURS, but not this classifier's business (#198) — distinct from the NOT_OURS branch just
+    # below, and checked FIRST so it never falls into it. A shared-runtime sandbox is neither a
+    # build sandbox nor a published app nor somebody else's workload; it is this platform's own
+    # third lineage, with its own claim/liveness signals (a Slice-3 concern) that this
+    # build-sandbox-only classifier does not read. Escalating rather than either destroying it
+    # on a policy this classifier has no basis for, or — the actual defect this branch exists to
+    # prevent — falling through to NOT_OURS and going invisible to every report this pass makes,
+    # the exact blind spot the orphan inventory exists to close for `sbx-` (see `inventory.py`).
+    if identity.kind == KIND_SHARED_SANDBOX:
+        return ContainerVerdict(
+            member.name,
+            Tier.SHARED_SANDBOX,
+            Verdict.ESCALATE,
+            "a shared-runtime sandbox; this classifier does not yet judge this kind",
+        )
 
     # Positively somebody else's. Distinct from "carries no identity" — that is the orphan
     # population and it escalates; this is a published app or a co-tenant workload and it is simply

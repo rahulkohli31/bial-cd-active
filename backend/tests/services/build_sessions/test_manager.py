@@ -817,7 +817,17 @@ async def test_restore_falls_back_to_fresh_when_snapshot_vanishes_mid_restore(
     manager = SessionManager()
 
     class VanishingSnapshot(FakeSandboxClient):
-        async def restore_from_snapshot(self, user_id, app_name, *, app_env, source_key=None):
+        async def restore_from_snapshot(
+            self,
+            user_id,
+            app_name,
+            *,
+            app_env,
+            source_key=None,
+            kind="build_sandbox",
+            shared_project_id=None,
+            shared_owner_id=None,
+        ):
             raise StorageNotFoundError("snapshot vanished", provider="fake", key="k")
 
     client = VanishingSnapshot()
@@ -959,7 +969,17 @@ async def test_restore_retries_a_transient_sandbox_error_then_succeeds(
             super().__init__()
             self.attempts = 0
 
-        async def restore_from_snapshot(self, user_id, app_name, *, app_env, source_key=None):
+        async def restore_from_snapshot(
+            self,
+            user_id,
+            app_name,
+            *,
+            app_env,
+            source_key=None,
+            kind="build_sandbox",
+            shared_project_id=None,
+            shared_owner_id=None,
+        ):
             self.attempts += 1
             if self.attempts == 1:
                 raise SandboxError("npm install failed under set -e")
@@ -994,7 +1014,17 @@ async def test_persistent_restore_failure_fails_closed_and_never_provisions_fres
             super().__init__()
             self.attempts = 0
 
-        async def restore_from_snapshot(self, user_id, app_name, *, app_env, source_key=None):
+        async def restore_from_snapshot(
+            self,
+            user_id,
+            app_name,
+            *,
+            app_env,
+            source_key=None,
+            kind="build_sandbox",
+            shared_project_id=None,
+            shared_owner_id=None,
+        ):
             self.attempts += 1
             raise SandboxError("npm install failed under set -e")
 
@@ -1032,7 +1062,17 @@ async def test_restore_retries_a_transient_storage_error_then_fails_closed(
             super().__init__()
             self.attempts = 0
 
-        async def restore_from_snapshot(self, user_id, app_name, *, app_env, source_key=None):
+        async def restore_from_snapshot(
+            self,
+            user_id,
+            app_name,
+            *,
+            app_env,
+            source_key=None,
+            kind="build_sandbox",
+            shared_project_id=None,
+            shared_owner_id=None,
+        ):
             self.attempts += 1
             raise StorageAuthError("the bundle pull was denied", provider="fake", key="k")
 
@@ -1990,7 +2030,17 @@ async def test_relaunch_restore_failure_releases_the_lock_and_leaves_no_orphan(
     manager = SessionManager()
 
     class DoomedRestore(FakeSandboxClient):
-        async def restore_from_snapshot(self, user_id, app_name, *, app_env, source_key=None):
+        async def restore_from_snapshot(
+            self,
+            user_id,
+            app_name,
+            *,
+            app_env,
+            source_key=None,
+            kind="build_sandbox",
+            shared_project_id=None,
+            shared_owner_id=None,
+        ):
             raise SandboxError("npm install failed under set -e")
 
     client = DoomedRestore()

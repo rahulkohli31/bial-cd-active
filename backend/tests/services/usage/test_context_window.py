@@ -203,6 +203,21 @@ async def test_a_document_occupies_nothing_until_the_provider_has_counted_it(db_
     assert exc.occupied == 153_342
 
 
+# R9a — THE ATTACHMENT READER'S OUTPUT, AND WHY THERE IS NO TEST FOR IT HERE.
+#
+# A test lived here that proved the reader's manifest was charged to the conversation: the file's
+# BYTES never enter the window, which is the whole point of the code lane, but the manifest does,
+# and a measure that skipped tool returns would let a chat carrying five of them report itself as
+# empty prose.
+#
+# It was written against `occupied_window`, and R8 deleted the estimator underneath it — the
+# window is what the PROVIDER reported for the last turn now, not a walk over parts. That makes
+# the property it guarded true by construction rather than by a structural walk: the manifest was
+# in the request the provider counted, so it is in the number that comes back. There is nothing
+# attachment-specific left to under-count, and a test asserting otherwise would be asserting
+# against the estimator's return, which the block at the bottom of this file already forbids.
+
+
 async def test_the_largest_reported_prompt_wins_not_the_last(db_session) -> None:
     """★ THE UNDER-COUNT THIS RULE COULD STILL HAVE HAD, AND THE MUTATION THAT CATCHES IT.
 

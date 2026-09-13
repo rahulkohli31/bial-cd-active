@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime
 import uuid
 
+from pydantic_ai.messages import ModelRequest, UserPromptPart
 from sqlalchemy import func, select
 
 from src.db.models.attachment import Attachment
@@ -18,7 +19,8 @@ from src.services.attachments import (
     NEVER_SENT_RECLAIM_WINDOW,
     reclaim_orphaned_attachments,
 )
-from src.services.extract.office import PPTX_MEDIA_TYPE
+from src.services.media.lanes import EXCEL_MEDIA_TYPE
+from src.services.messages.store import dump_for_row
 from tests.factories import ConversationFactory, MessageFactory, UserFactory
 from tests.fakes import FakeStorage
 
@@ -37,9 +39,8 @@ async def _add_attachment(
     size: int = 10,
     media_type: str = "image/png",
     conversation_id: uuid.UUID | None = None,
-    with_pdf_sibling: bool = False,
 ) -> str:
-    """Persist an attachment row AND its stored blob(s); return the storage key."""
+    """Persist an attachment row AND its stored blob; return the storage key."""
     key = f"att/{user_id}/{attachment_id}"
     db.add(
         Attachment(
@@ -55,8 +56,6 @@ async def _add_attachment(
     )
     await db.flush()
     storage.objects[key] = b"x" * size
-    if with_pdf_sibling:
-        storage.objects[key + ".pdf"] = b"pdf"
     return key
 
 
@@ -90,6 +89,50 @@ async def _file_message(db, *, user_id: uuid.UUID, attachment_id: str) -> None:
             ]
         ),
     )
+
+
+async def test_a_sent_code_lane_file_is_never_reclaimed_as_an_orphan(db_session) -> None:
+    """★ THE DATA-LOSS BUG THIS MARKER EXISTS TO CLOSE.
+
+    A code-lane file never becomes `BinaryContent`, so `_externalize_binaries` never ran for it and
+    the message it was sent with recorded nothing. This scan reads stored payloads to decide what
+    is still referenced — so a spreadsheet in an active conversation looked exactly like a file
+    nobody ever sent, and 48 hours after upload its row and its blob were deleted underneath a
+    citizen still using it.
+
+    The store now writes `ATTACHMENT_FILE_REF_KIND` for the code lane, and this scan reads both
+    kinds. Mutation receipt: drop either half — the write in `dump_for_row` or the second kind in
+    `_collect_ref_ids` — and this goes red with the file reclaimed.
+    """
+    storage = FakeStorage()
+    user = await UserFactory.create(db_session)
+    key = await _add_attachment(
+        db_session,
+        storage,
+        user_id=user.id,
+        attachment_id="att_sheet",
+        created_at=_OLD,
+        media_type=EXCEL_MEDIA_TYPE,
+    )
+    conv = await ConversationFactory.create(db_session, user.id)
+    await MessageFactory.create(
+        db_session,
+        user.id,
+        conv.id,
+        payload=dump_for_row(
+            [ModelRequest(parts=[UserPromptPart(content="what is in this?")])],
+            file_attachment_ids=["att_sheet"],
+        ),
+    )
+
+    result = await reclaim_orphaned_attachments(db_session, storage, user_id=user.id, now=_NOW)
+
+    assert result.reclaimed == 0, "a live code-lane attachment was reclaimed as never-sent"
+    assert key in storage.objects
+    row = await db_session.scalar(
+        select(Attachment).where(Attachment.attachment_id == "att_sheet")
+    )
+    assert row is not None
 
 
 async def test_legacy_unreferenced_orphan_is_reclaimed(db_session) -> None:
@@ -186,27 +229,11 @@ async def test_reclaim_reduces_sum_size(db_session) -> None:
     assert int(after or 0) == 0
 
 
-async def test_deck_orphan_sweeps_both_keys(db_session) -> None:
-    # A deck upload owns `{storage_key}` AND `{storage_key}.pdf`; reclamation must sweep both,
-    # or it deletes the row and leaks the rendered PDF forever.
-    storage = FakeStorage()
-    user = await UserFactory.create(db_session)
-    key = await _add_attachment(
-        db_session,
-        storage,
-        user_id=user.id,
-        attachment_id="att_deck",
-        created_at=_OLD,
-        media_type=PPTX_MEDIA_TYPE,
-        with_pdf_sibling=True,
-    )
-    assert key in storage.objects and key + ".pdf" in storage.objects
-
-    result = await reclaim_orphaned_attachments(db_session, storage, user_id=user.id, now=_NOW)
-    assert result.reclaimed == 1
-    assert result.swept_keys == 2
-    assert key not in storage.objects
-    assert key + ".pdf" not in storage.objects
+# THE DECK-SIBLING SWEEP IS GONE. A .pptx upload used to own `{storage_key}` AND a
+# derived `{storage_key}.pdf` from the converter, so reclamation had to remove both or leak the
+# rendered PDF forever. Nothing derives anything from an attachment now - a deck is stored as
+# itself and read in the sandbox - so `_blob_keys_for` returns one key per row and there is no
+# second key to sweep.
 
 
 async def test_cross_user_isolation(db_session) -> None:

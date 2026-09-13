@@ -61,7 +61,11 @@ const paneProps: Record<string, unknown>[] = []
 vi.mock('../../utils/builderHistory', () => ({
   loadBuilds: h.loadBuilds, getBuild: h.getBuild, deriveTitle: (t: string) => (t || '').slice(0, 40),
 }))
-vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
+vi.mock('../../utils/conversationApi', () => ({
+  // The send path creates the chat before its first upload; stubbed so no network is reached.
+  createConversation: async () => ({ id: 'conv-created' }),
+  listProjectConversations: h.listProjectConversations,
+}))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 // A recording wrapper, not a stub — see the module docblock for why.
 vi.mock('../../components/LivePreview', async (orig) => {

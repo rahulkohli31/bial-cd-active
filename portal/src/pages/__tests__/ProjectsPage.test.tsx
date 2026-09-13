@@ -33,6 +33,8 @@ vi.mock('../../utils/projectApi', () => ({
   deleteProject: h.deleteProject,
 }))
 vi.mock('../../utils/conversationApi', () => ({
+  // The send path creates the chat before its first upload; stubbed so no network is reached.
+  createConversation: async () => ({ id: 'conv-created' }),
   listProjectConversations: h.listProjectConversations,
   CONVERSATION_LIST_CAP: 200,
 }))
@@ -133,8 +135,10 @@ const mkProject = (id: string, name: string, over: Partial<Project> = {}): Proje
   isServing: false,
   appStatus: null,
   hasRelaunchableSnapshot: null,
+  hasSavedSnapshot: null,
   createdAt: '2026-07-10T00:00:00Z',
   updatedAt: '2026-07-10T00:00:00Z',
+  access: 'owner',
   ...over,
 })
 

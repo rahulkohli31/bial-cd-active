@@ -73,6 +73,25 @@ SCHEMA_VERSION: Final = 2
 # `kind: "binary"`; the externalized reference uses this kind so the two can never be confused.
 ATTACHMENT_REF_KIND: Final = "bial-attachment-ref"
 
+ATTACHMENT_FILE_REF_KIND: Final = "bial-attachment-file-ref"
+"""A code-lane attachment's durable reference — the file CODE reads, not the model.
+
+WHY A SECOND KIND EXISTS AT ALL. `ATTACHMENT_REF_KIND` is written by `_externalize_binaries`,
+which fires on a serialized `BinaryContent` — and a code-lane file deliberately never becomes one.
+Its bytes must not reach the model, so nothing put it in the payload, so the message carried no
+record that the file had ever been sent. Three things read that record and all three were blind:
+`reclaim_orphaned_attachments` classified a live spreadsheet as a never-sent orphan and deleted
+its row and blob 48 hours after upload; `gather_and_delete_conversation` never swept its blob; and
+the projection emitted no chip, so it vanished on reload.
+
+WHAT MAKES IT SAFE IS THAT IT IS DROPPED, NEVER SWAPPED. `ATTACHMENT_REF_KIND` is replaced with
+real bytes on the way into history; this one is REMOVED. The file is reached through the workspace
+and the shipped reader, so the model has no use for a marker — and carrying one to the TypeAdapter
+would hit the same `CachePoint` coercion `_assert_no_marker_left` exists to prevent.
+
+So: written at persist time, read by every discovery scan, gone before the model sees anything.
+"""
+
 # How many times to re-pick a seq when a concurrent writer took the slot (the established
 # two-writer discipline — see `build_sessions/outcome.py`'s original). Two retries covers a
 # genuinely concurrent turn; more would mean a caller in a tight loop.
@@ -237,7 +256,37 @@ def _externalize_binaries(node: Any) -> Any:
     return node
 
 
-def dump_for_row(messages: Sequence[ModelMessage]) -> list[Any]:
+def _append_file_refs(payload: list[Any], attachment_ids: Sequence[str]) -> None:
+    """Record code-lane attachments on the FIRST user prompt of this batch.
+
+    AFTER THE DUMP, NEVER ON THE TYPED MESSAGE, and the type system is what says so:
+    `UserPromptPart.content` is a `Sequence[str | ... | CachePoint]` with no room for a marker
+    dict, which is precisely why `_externalize_binaries` also runs on the serialized tree rather
+    than on the objects. A marker is a PAYLOAD concept; it has no life before serialization and
+    none after `load_history` drops it again.
+    """
+    if not attachment_ids:
+        return
+    for message in payload:
+        if not isinstance(message, dict) or message.get("kind") != "request":
+            continue
+        for part in message.get("parts", []):
+            if not isinstance(part, dict) or part.get("part_kind") != "user-prompt":
+                continue
+            content = part.get("content")
+            if isinstance(content, str):
+                content = [content]
+            if not isinstance(content, list):
+                return
+            part["content"] = content + [
+                {"kind": ATTACHMENT_FILE_REF_KIND, "attachment_id": ref} for ref in attachment_ids
+            ]
+            return
+
+
+def dump_for_row(
+    messages: Sequence[ModelMessage], *, file_attachment_ids: Sequence[str] = ()
+) -> list[Any]:
     """A native batch → the JSONB payload: verify binaries are attributed (fail-first) → dump
     (json mode) → strip instructions → externalize binaries → redact. Externalize FIRST so the
     redactor never scans base64 blobs.
@@ -250,7 +299,10 @@ def dump_for_row(messages: Sequence[ModelMessage]) -> list[Any]:
     for message in dumped:
         if isinstance(message, dict) and "instructions" in message:
             message["instructions"] = None
-    return [_redact_tree(_externalize_binaries(message)) for message in dumped]
+    payload = [_redact_tree(_externalize_binaries(message)) for message in dumped]
+    # The code lane's own reference, appended once the tree is plain JSON (see above).
+    _append_file_refs(payload, file_attachment_ids)
+    return payload
 
 
 # --- load seam ----------------------------------------------------------------
@@ -285,8 +337,17 @@ def _swap_refs(node: Any, resolved: dict[str, tuple[str, str]]) -> Any:
     never trusted for bytes) out of the already-resolved map. Purely in-memory; the walk is
     exhaustive over dicts/lists and `load_history` verifies completeness."""
     if isinstance(node, list):
-        return [_swap_refs(item, resolved) for item in node]
+        swapped = [_swap_refs(item, resolved) for item in node]
+        # A dropped file-ref marker leaves a hole; the list is the only place one can appear,
+        # because that is where a user prompt's content items live.
+        return [item for item in swapped if item is not None]
     if isinstance(node, dict):
+        if node.get("kind") == ATTACHMENT_FILE_REF_KIND:
+            # DROPPED, NOT SWAPPED — see the constant. The model reaches this file through the
+            # workspace and the reader; its bytes must never enter the prompt, and an unknown dict
+            # surviving to the TypeAdapter coerces to `CachePoint`. Returning `None` lets the
+            # list-comprehension caller filter it out.
+            return None
         if node.get("kind") == ATTACHMENT_REF_KIND:
             attachment_id = _reference_id(node)
             entry = resolved.get(attachment_id)
@@ -313,7 +374,7 @@ def _assert_no_marker_left(node: Any) -> None:
         for item in node:
             _assert_no_marker_left(item)
     elif isinstance(node, dict):
-        if node.get("kind") == ATTACHMENT_REF_KIND:
+        if node.get("kind") in (ATTACHMENT_REF_KIND, ATTACHMENT_FILE_REF_KIND):
             raise MarkerSwapIncompleteError("an attachment reference survived the swap walk")
         for value in node.values():
             _assert_no_marker_left(value)
@@ -592,6 +653,7 @@ async def append_batch(
     kind: ChatKind,
     visibility: MessageVisibility = MessageVisibility.VISIBLE,
     meta: dict[str, Any] | None = None,
+    file_attachment_ids: Sequence[str] = (),
 ) -> StoredBatch:
     """Durably append one batch with a server-owned gap-free seq. OWNS its commit: every
     caller sits at a durability seam where "returned" must mean "on disk". Two-writer
@@ -600,7 +662,7 @@ async def append_batch(
     come back via `.returning()`, never a refresh across the commit.
 
     `meta` is for system entries — redacted here too, same egress discipline as the payload."""
-    payload = dump_for_row(messages)
+    payload = dump_for_row(messages, file_attachment_ids=file_attachment_ids)
     safe_meta = _redact_tree(meta) if meta is not None else None
     for _ in range(_SEQ_RETRIES + 1):
         seq = await _head_seq(db, conversation_id) + 1

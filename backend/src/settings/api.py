@@ -103,10 +103,6 @@ class ApiSettings(CoreSettings):
     # Pydantic AI's TestModel and make no live call, and None means "AI chat not configured".
     foundry: FoundryConfig | None = None
 
-    # Gotenberg sidecar base URL for pptx->PDF deck conversion. None disables deck conversion, so
-    # dev/test boot without a Gotenberg sidecar.
-    GOTENBERG_URL: str | None = None
-
     # WHERE A CONNECTOR'S DATA ACTUALLY LIVES, and which managed identity may read it. Unset
     # means no build and no published app is handed the coordinates or the identity, and the
     # control plane copies nothing — every path in that feature already answers `{}` or `None`

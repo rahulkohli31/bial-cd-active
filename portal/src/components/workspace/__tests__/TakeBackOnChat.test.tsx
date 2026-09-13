@@ -35,7 +35,11 @@ vi.mock('../../../utils/builderHistory', () => ({
   loadBuilds: h.loadBuilds, newBuild: h.newBuild, createBuild: h.createBuild,
   getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t: string) => (t || '').slice(0, 40),
 }))
-vi.mock('../../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
+vi.mock('../../../utils/conversationApi', () => ({
+  // The send path creates the chat before its first upload; stubbed so no network is reached.
+  createConversation: async () => ({ id: 'conv-created' }),
+  listProjectConversations: h.listProjectConversations,
+}))
 vi.mock('../../layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../../utils/attachmentStore', async (orig) => ({
   ...(await orig<typeof import('../../../utils/attachmentStore')>()),
@@ -121,7 +125,14 @@ describe('★ the take-back never starts a turn', () => {
       fireEvent.click(takeBackButton())
       fireEvent.click(await screen.findByRole('button', { name: button }))
 
-      await waitFor(() => expect(h.handOverWorkspace).toHaveBeenCalledWith('pA', name === 'saving first', {}, expect.any(Function)))
+      await waitFor(() =>
+        expect(h.handOverWorkspace).toHaveBeenCalledWith(
+          expect.objectContaining({ projectId: 'pA' }),
+          name === 'saving first',
+          {},
+          expect.any(Function),
+        ),
+      )
       // LIVENESS, paired with the absence below: the app really did come up, so a zero turn count
       // is a take-back that worked without a turn rather than a press that did nothing at all.
       await waitFor(() => expect(h.relaunchPreview).toHaveBeenCalledTimes(2))

@@ -1,34 +1,38 @@
-"""Hand-rolled PDF fixtures for the upload page-cap admission.
+"""Hand-rolled PDF fixtures for the upload door.
 
-WRITTEN BY HAND, NOT BY `pypdf`, AND THAT IS THE POINT. The thing under test is a `pypdf`
-page count; building the fixture with the same library would only prove that pypdf agrees
-with itself, and a bug in how the reader is driven would be invisible. These emit raw PDF
-syntax — a classic cross-reference table, a catalog, a page-tree node and N page objects —
-so the byte-level page count is a fact of the fixture rather than of the reader.
+WRITTEN BY HAND, NOT BY A LIBRARY, AND THAT IS THE POINT. What the door does to a PDF is now two
+byte scans over the file's tail, so every property under test — where the trailer sits, whether it
+declares encryption, whether the file ends where it says it does — has to be a fact of the FIXTURE
+rather than of whatever wrote it. These emit raw PDF syntax: a header, a catalog, a page-tree node,
+N page objects, and either a classic cross-reference table or a PDF 1.5 cross-reference stream.
 
-The ENCRYPTED three — `locked_pdf`, `restricted_pdf`, `ouroboros_pdf` — are the exception,
-and are built by `pypdf` for the opposite reason: a standard-security encryption dictionary
-is a key derivation rather than syntax, so hand-writing one would be testing the fixture. In
-each of them the page count is still set here, explicitly, so it stays a fact of the fixture.
+THE ENCRYPTED ONES ARE HAND-WRITTEN TOO, WHICH THEY COULD NOT BE BEFORE. Three fixtures here used
+to be built by `pypdf`, because the thing under test was a page count taken through `pypdf` and a
+standard-security encryption dictionary is a key derivation rather than syntax. Nothing derives a
+key any more: the check reads the trailer's `/Encrypt` ENTRY, which is syntax, and syntax is
+hand-writable. The library went with the page cap.
 
-They are generated rather than committed because a 31-page binary in the tree is a blob
-nobody can review, and the hostile one is 8 KB of syntax whose whole meaning is what it
-does to a parser.
+They are generated rather than committed because a binary in the tree is a blob nobody can review,
+and the interesting ones are a few hundred bytes whose whole meaning is their structure.
 """
 
 from __future__ import annotations
 
+import struct
 import zlib
-from typing import cast
 
 _HEADER = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
 """Magic + the binary comment. The upload route's existing check reads the first 18 bytes,
-so every fixture here passes it — which is the precondition for the page cap to matter."""
+so every fixture here passes it — which is the precondition for the door's own scans to matter."""
 
 
-def _assemble(objects: list[bytes]) -> bytes:
+def _assemble(objects: list[bytes], *, trailer_extra: bytes = b"") -> bytes:
     """`objects[i]` is the body of object `i + 1`; object 1 is the catalog. Emits the
-    classic `xref` table + trailer that a conforming reader needs."""
+    classic `xref` table + trailer that a conforming reader needs.
+
+    `trailer_extra` is appended inside the trailer dictionary — which is how an encrypted
+    document declares itself, and the only difference between a locked fixture and a plain one.
+    """
     out = bytearray(_HEADER)
     offsets: list[int] = []
     for number, body in enumerate(objects, start=1):
@@ -42,7 +46,11 @@ def _assemble(objects: list[bytes]) -> bytes:
     out += b"0000000000 65535 f \n"
     for offset in offsets:
         out += b"%010d 00000 n \n" % offset
-    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (size, xref_at)
+    out += b"trailer\n<< /Size %d /Root 1 0 R%s >>\nstartxref\n%d\n%%%%EOF\n" % (
+        size,
+        trailer_extra,
+        xref_at,
+    )
     return bytes(out)
 
 
@@ -57,46 +65,207 @@ def pdf_with_pages(pages: int) -> bytes:
     return _assemble(objects)
 
 
-def pdf_bigger_on_the_inside(*, pages: int, declares: int) -> bytes:
-    """A PDF whose catalog DECLARES `declares` pages and whose page tree yields `pages`.
+def scanned_pdf(pages: int = 2) -> bytes:
+    """A page-image PDF: every page is one embedded image XObject and there is NO text at all.
 
-    One page object, listed in `/Kids` `pages` times — which is legal, cheap (six bytes a
-    page) and exactly how a hostile upload buys twenty thousand pages inside a 120 KB file.
-    A reader that trusts `/Count` sees a short document; one that walks the tree sees the
-    real one. Hand-assembled like the rest of this module precisely because the gap between
-    the two numbers has to be a fact of the FIXTURE and not of the reader under test.
+    ★ A FIRST-CLASS SUPPORTED CASE, and the fixture that keeps the door's checks structural.
+    A scanned invoice has a header, an EOF marker and a page tree like any other document, and the
+    model reads it as vision. Anything at this door that reached for the file's TEXT would refuse
+    it — so this is the file that would go red if either scan were ever "improved" into a text
+    probe.
     """
-    kids = b" ".join([b"3 0 R"] * pages)
-    return _assemble(
-        [
-            b"<< /Type /Catalog /Pages 2 0 R >>",
-            b"<< /Type /Pages /Kids [%s] /Count %d >>" % (kids, declares),
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
-        ]
+    image = zlib.compress(bytes(64 * 64))
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [%s] /Count %d >>"
+        % (b" ".join(b"%d 0 R" % (index + 3) for index in range(pages)), pages),
+    ]
+    objects += [
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /XObject << /Im0 %d 0 R >> >> >>" % (pages + 3)
+    ] * pages
+    objects.append(
+        b"<< /Type /XObject /Subtype /Image /Width 64 /Height 64 /ColorSpace /DeviceGray "
+        b"/BitsPerComponent 8 /Filter /FlateDecode /Length %d >>\nstream\n"
+        % len(image)
+        + image
+        + b"\nendstream"
     )
+    return _assemble(objects)
 
 
 def unreadable_pdf() -> bytes:
-    """Magic-valid bytes with no object structure at all — the file that passes the
-    18-byte prefix check and then fails to parse. The shape a truncated upload takes."""
+    """Magic-valid bytes with no object structure and no terminator — the file that passes the
+    18-byte prefix check and is plainly not a document. The shape a failed transfer takes."""
     return _HEADER + b"this file claims to be a PDF and is not\n"
 
 
+def truncated_pdf(pages: int = 3) -> bytes:
+    """A REAL PDF, CUT SHORT. Not rubbish — a valid document whose last quarter never arrived, so
+    the cross-reference table and the `%%EOF` terminator are simply missing.
+
+    This is what a dropped upload actually looks like, and it is the case the door's structural
+    scan exists for: refused here, it costs the citizen one clear sentence; admitted, it is stored,
+    counted against their conversation, and fails in front of the model turns later."""
+    whole = pdf_with_pages(pages)
+    return whole[: int(len(whole) * 0.75)]
+
+
+def pdf_pointing_past_its_own_end() -> bytes:
+    """A file that LOOKS complete — trailer, `startxref`, `%%EOF` all present — whose `startxref`
+    names a byte offset beyond the end of the file.
+
+    The second, subtler shape of a cut transfer: enough of the tail survived (or was re-appended)
+    that the terminator is there, while the body it points into is not. Positive evidence, which
+    is the only kind the structural scan acts on."""
+    whole = pdf_with_pages(2)
+    head, _, _ = whole.rpartition(b"startxref\n")
+    return head + b"startxref\n%d\n%%%%EOF\n" % (len(whole) * 4)
+
+
+def incrementally_updated_pdf(updates: int = 3) -> bytes:
+    """A signed-or-annotated document: a base PDF with `updates` incremental sections appended,
+    each with its own xref table, trailer and `%%EOF`.
+
+    ★ THE FAIL-OPEN DIRECTION, and the reason the structural scan refuses only on evidence. A long
+    update chain is exactly what signing and annotating produce, and it pushes the ORIGINAL trailer
+    far from the end of the file — so a scan that demanded to recognise the whole structure would
+    refuse a perfectly good document at the door. Only the last section's terminator is looked for,
+    and this file has it."""
+    out = bytearray(pdf_with_pages(2))
+    for _ in range(updates):
+        xref_at = len(out)
+        out += b"xref\n0 1\n0000000000 65535 f \n"
+        out += b"trailer\n<< /Size 5 /Root 1 0 R /Prev %d >>\nstartxref\n%d\n%%%%EOF\n" % (
+            xref_at // 2,
+            xref_at,
+        )
+    return bytes(out)
+
+
+def encrypted_pdf(pages: int = 3) -> bytes:
+    """A SHORT, VALID, PASSWORD-PROTECTED PDF in the classic trailer form.
+
+    ★ THE ONE THING THE DOOR READS IS THE TRAILER'S `/Encrypt` ENTRY, which the spec requires to
+    be an indirect reference — so the fixture only has to DECLARE encryption, and declaring is
+    syntax. The standard-security dictionary below is real in shape (filter, revision, key length,
+    permission mask) and its key derivation is never exercised by anything, which is the whole
+    reason this fixture can be hand-written now and could not be before.
+
+    Deliberately SHORT: the point is that the document's length is fine and the citizen still
+    cannot get past a refusal, so the refusal has to talk about the password and nothing else."""
+    kids = b" ".join(b"%d 0 R" % (index + 3) for index in range(pages))
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [%s] /Count %d >>" % (kids, pages),
+    ]
+    objects += [b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"] * pages
+    objects.append(
+        b"<< /Filter /Standard /V 2 /R 3 /Length 128 /P -3904 "
+        b"/O <" + b"ab" * 32 + b"> /U <" + b"cd" * 32 + b"> >>"
+    )
+    return _assemble(objects, trailer_extra=b" /Encrypt %d 0 R" % len(objects))
+
+
+def encrypted_xref_stream_pdf(pages: int = 3) -> bytes:
+    """AN ENCRYPTED PDF WITH NO `trailer` KEYWORD ANYWHERE IN IT — PDF 1.5+, cross-reference
+    stream, which is what Word and Acrobat emit.
+
+    ★ THIS IS THE FALSE-NEGATIVE FIXTURE, and the reason the door's lock scan is keyed on the
+    `/Encrypt` entry rather than on the word `trailer`. A trailer-keyword scan finds nothing at all
+    in a file of this shape — so it would wave through the encrypted document a citizen is most
+    likely to actually have, while correctly refusing the hand-made one above. The two must both
+    be refused or the check is theatre.
+
+    The catalog, page tree and pages live inside a compressed object stream, so none of them
+    appear as literal bytes; the only plaintext dictionary in the file is the XRef stream's own,
+    and that is where `/Encrypt` sits."""
+    bodies = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [%s] /Count %d >>"
+        % (b" ".join(b"%d 0 R" % (index + 3) for index in range(pages)), pages),
+    ]
+    bodies += [b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"] * pages
+    count = len(bodies)
+    objstm_number = count + 1
+    encrypt_number = count + 2
+    xref_number = count + 3
+
+    pairs = bytearray()
+    payload = bytearray()
+    for number, body in enumerate(bodies, start=1):
+        pairs += b"%d %d " % (number, len(payload))
+        payload += body + b" "
+    compressed = zlib.compress(bytes(pairs) + bytes(payload), 9)
+
+    out = bytearray(b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n")
+    objstm_at = len(out)
+    out += (
+        b"%d 0 obj\n<< /Type /ObjStm /N %d /First %d /Filter /FlateDecode /Length %d >>\n"
+        b"stream\n" % (objstm_number, count, len(pairs), len(compressed))
+    )
+    out += compressed
+    out += b"\nendstream\nendobj\n"
+    encrypt_at = len(out)
+    out += (
+        b"%d 0 obj\n<< /Filter /Standard /V 2 /R 3 /Length 128 /P -3904 "
+        b"/O <" + b"ab" * 32 + b"> /U <" + b"cd" * 32 + b"> >>\nendobj\n"
+    ) % encrypt_number
+
+    def entry(kind: int, first: int, second: int) -> bytes:
+        return bytes([kind]) + struct.pack(">I", first) + struct.pack(">H", second)
+
+    entries = bytearray(entry(0, 0, 65535))
+    for index in range(count):
+        entries += entry(2, objstm_number, index)  # type 2: inside the object stream
+    entries += entry(1, objstm_at, 0)
+    entries += entry(1, encrypt_at, 0)
+    xref_at = len(out)
+    entries += entry(1, xref_at, 0)
+    xref_payload = zlib.compress(bytes(entries), 9)
+    out += (
+        b"%d 0 obj\n<< /Type /XRef /Size %d /W [1 4 2] /Root 1 0 R /Encrypt %d 0 R"
+        b" /Filter /FlateDecode /Length %d >>\nstream\n"
+        % (xref_number, xref_number + 1, encrypt_number, len(xref_payload))
+    )
+    out += xref_payload
+    out += b"\nendstream\nendobj\nstartxref\n%d\n%%%%EOF\n" % xref_at
+    return bytes(out)
+
+
+def pdf_mentioning_encrypt_in_its_content() -> bytes:
+    """A perfectly ordinary, UNENCRYPTED document whose page content is prose about encryption —
+    so the literal bytes `/Encrypt` appear in the file, uncompressed, near the end.
+
+    ★ THE FALSE-POSITIVE FIXTURE. A bare substring scan calls this locked and tells its owner to
+    remove a password that does not exist — advice that leads nowhere, about a file that is fine.
+    The door's scan matches the trailer's `/Encrypt <num> <gen> R` INDIRECT REFERENCE, which is the
+    form the spec requires and the form running prose does not take."""
+    text = (
+        b"BT /F1 12 Tf 72 720 Td (A PDF declares encryption with the /Encrypt trailer key.) Tj ET"
+    )
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n" % len(text) + text + b"\nendstream",
+    ]
+    return _assemble(objects)
+
+
 def xref_bomb_pdf(entries: int = 8_000_000) -> bytes:
-    """A tiny PDF that costs a reader seconds per kilobyte: a Flate-compressed cross-reference
+    """A tiny PDF that costs a PARSER seconds per kilobyte: a Flate-compressed cross-reference
     STREAM declaring `entries` entries, whose payload is a few kilobytes of zeros.
 
-    The document itself is one blank page. What is hostile is the index: the reader must walk
-    every declared entry before it can resolve the catalog. The cost is LINEAR IN `entries` and
-    FLAT IN MEMORY — the entries decode as free objects, so nothing is retained — which is what
-    makes it the right fixture here rather than an inflate bomb: the memory ceiling cannot catch
-    it, and `entries` is the only thing that has to change to buy a minute instead of a second.
-    At the default it is ~32 KB of upload for ~6 seconds of parsing: inside the 4 MB size cap,
-    inside the memory ceiling, unbounded in the only axis neither of them watches.
+    The document itself is one blank page. What was hostile is the index: a reader must walk every
+    declared entry before it can resolve the catalog, at a cost LINEAR IN `entries` and FLAT IN
+    MEMORY. At the default it is ~32 KB of upload for ~6 seconds of parsing — inside every size
+    cap, unbounded in the only axis they watch.
 
-    It is the file the governor exists for: read in-process it blocks the event loop serving
-    every other citizen; read in the governor it is killed and the request answers.
-    """
+    ★ IT IS KEPT AS THE RECEIPT THAT NOTHING PARSES ANY MORE. This file is why the door used to
+    spawn a killable, memory-capped child for every PDF; with the page cap gone, nothing here
+    opens a PDF at all, and the fixture's job is now to prove that removing the governor did not
+    reopen what the governor was for."""
     out = bytearray(_HEADER)
 
     def add(number: int, body: bytes) -> None:
@@ -116,162 +285,3 @@ def xref_bomb_pdf(entries: int = 8_000_000) -> bytes:
     out.extend(payload)
     out.extend(b"\nendstream\nendobj\nstartxref\n%d\n%%%%EOF\n" % xref_at)
     return bytes(out)
-
-
-def objstm_pdf(pages: int) -> bytes:
-    """A valid PDF whose catalog, page-tree node and page objects all live in a COMPRESSED
-    object stream, reached through a cross-reference STREAM (PDF 1.5, and what every modern
-    producer emits).
-
-    This is the fixture behind the refusal to reuse `extract/deck.py::count_pdf_pages`: none
-    of the page dictionaries appear as literal bytes anywhere in the file, so a `/Type /Page`
-    byte scan finds nothing at all while a real reader finds every page.
-    """
-    import struct
-
-    bodies = [
-        b"<< /Type /Catalog /Pages 2 0 R >>",
-        b"<< /Type /Pages /Kids [%s] /Count %d >>"
-        % (b" ".join(b"%d 0 R" % (index + 3) for index in range(pages)), pages),
-    ]
-    bodies += [b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"] * pages
-    count = len(bodies)
-    objstm_number = count + 1
-    xref_number = count + 2
-
-    pairs = bytearray()
-    payload = bytearray()
-    for number, body in enumerate(bodies, start=1):
-        pairs += b"%d %d " % (number, len(payload))
-        payload += body + b" "
-    compressed = zlib.compress(bytes(pairs) + bytes(payload), 9)
-
-    out = bytearray(b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n")
-    objstm_at = len(out)
-    out += (
-        b"%d 0 obj\n<< /Type /ObjStm /N %d /First %d /Filter /FlateDecode /Length %d >>\n"
-        b"stream\n" % (objstm_number, count, len(pairs), len(compressed))
-    )
-    out += compressed
-    out += b"\nendstream\nendobj\n"
-
-    def entry(kind: int, first: int, second: int) -> bytes:
-        return bytes([kind]) + struct.pack(">I", first) + struct.pack(">H", second)
-
-    entries = bytearray(entry(0, 0, 65535))
-    for index in range(count):
-        entries += entry(2, objstm_number, index)  # type 2: inside the object stream
-    entries += entry(1, objstm_at, 0)
-    xref_at = len(out)
-    entries += entry(1, xref_at, 0)
-    xref_payload = zlib.compress(bytes(entries), 9)
-    out += (
-        b"%d 0 obj\n<< /Type /XRef /Size %d /W [1 4 2] /Root 1 0 R /Filter /FlateDecode"
-        b" /Length %d >>\nstream\n" % (xref_number, xref_number + 1, len(xref_payload))
-    )
-    out += xref_payload
-    out += b"\nendstream\nendobj\nstartxref\n%d\n%%%%EOF\n" % xref_at
-    return bytes(out)
-
-
-def locked_pdf(pages: int = 3, password: str = "letmein") -> bytes:
-    """A SHORT, VALID, PASSWORD-PROTECTED PDF — the shape that makes unfollowable advice.
-
-    ★ THE ONLY FIXTURE HERE THAT MAY BE REFUSED FOR BEING ENCRYPTED, and the name says so:
-    `restricted_pdf` below is encrypted too and must be ACCEPTED. What separates them is not
-    `/Encrypt` — both carry it — but whether an empty password opens the file. This one's does
-    not (`decrypt("")` answers `NOT_DECRYPTED`), so nothing can be read out of it at all.
-
-    Deliberately under the page cap: the point of the fixture is that the document's LENGTH is
-    fine and the citizen still cannot get past a refusal that talks about length. Built with
-    pypdf rather than hand-assembled because the encryption dictionary is the part under test,
-    and hand-writing one would be testing the fixture rather than the reader.
-    """
-    import io
-
-    from pypdf import PdfWriter
-
-    plain = PdfWriter()
-    for _ in range(pages):
-        plain.add_blank_page(width=200, height=200)
-    unlocked = io.BytesIO()
-    plain.write(unlocked)
-
-    locked = PdfWriter(clone_from=io.BytesIO(unlocked.getvalue()))
-    locked.encrypt(password)
-    out = io.BytesIO()
-    locked.write(out)
-    return out.getvalue()
-
-
-def restricted_pdf(*, pages: int = 3, declares: int | None = None, owner: str = "") -> bytes:
-    """AN ENCRYPTED PDF THAT IS NOT LOCKED — permission-restricted, EMPTY user password.
-
-    The ordinary encrypted document in an office: the producer set permissions (no printing,
-    no copying) and left the user password empty, so every reader opens it without asking
-    anyone anything. pypdf attempts the empty password on construction, so it parses, and
-    `decrypt("")` answers `OWNER_PASSWORD` when `owner` is empty too and `USER_PASSWORD` when
-    it is not — never `NOT_DECRYPTED`. Both must be ACCEPTED; refusing on `/Encrypt` alone
-    would refuse most of the encrypted PDFs a citizen owns.
-
-    `declares` under-reports the catalog's `/Count` — the same "bigger on the inside" shape as
-    `pdf_bigger_on_the_inside`, now wearing an encryption dictionary. That pairing is the whole
-    of the defect: pypdf's `get_num_pages()` returns `/Count` unwalked for ANY encrypted file,
-    and stays that way after a successful decryption, so the two fixtures differing only in
-    `/Encrypt` were counted as 20,000 pages and as 1.
-
-    Built by pypdf, unlike its plain twin, because a standard-security encryption dictionary is
-    a key derivation rather than syntax and hand-writing one would test the fixture. The page
-    count stays a fact of the fixture even so: `/Kids` is assigned here, explicitly, as one page
-    reference repeated `pages` times.
-    """
-    import io
-
-    from pypdf import PdfWriter
-    from pypdf.generic import ArrayObject, DictionaryObject, NameObject, NumberObject
-
-    writer = PdfWriter()
-    page = writer.add_blank_page(width=200, height=200)
-    tree = cast(DictionaryObject, writer.root_object["/Pages"])
-    tree[NameObject("/Kids")] = ArrayObject([page.indirect_reference] * pages)
-    tree[NameObject("/Count")] = NumberObject(pages if declares is None else declares)
-    writer.encrypt("", owner_password=owner)
-    out = io.BytesIO()
-    writer.write(out)
-    return out.getvalue()
-
-
-def ouroboros_pdf() -> bytes:
-    """A PAGE TREE THAT EATS ITS OWN TAIL: root `/Pages` → a second `/Pages` → root, forever.
-
-    There is no leaf anywhere in it, so a walk that does not carry a cycle guard never returns
-    — which is the reason the count is taken with pypdf's own traversal instead of a
-    hand-rolled one. pypdf tracks the ancestor path and raises `Detected cyclic page
-    references.`, and the dispatch turns that into the same 400 a truncated file gets.
-
-    Encrypted, because the plain version proves nothing new: the unencrypted path always walked.
-    Before the walk-based fix this file was never walked at all — the declared `/Count 1` was
-    handed straight back — so this fixture is red-if-reverted in exactly one direction, and if the
-    guard ever goes it hangs until the governor kills it rather than answering.
-    """
-    import io
-
-    from pypdf import PdfWriter
-    from pypdf.generic import ArrayObject, DictionaryObject, NameObject, NumberObject
-
-    writer = PdfWriter()
-    writer.add_blank_page(width=200, height=200)
-    tree = cast(DictionaryObject, writer.root_object["/Pages"])
-
-    tail = DictionaryObject()
-    tail[NameObject("/Type")] = NameObject("/Pages")
-    tail[NameObject("/Count")] = NumberObject(1)
-    tail_ref = writer._add_object(tail)
-    tail[NameObject("/Kids")] = ArrayObject([tree.indirect_reference])
-
-    tree[NameObject("/Kids")] = ArrayObject([tail_ref])
-    tree[NameObject("/Count")] = NumberObject(1)
-    writer.encrypt("", owner_password="")
-    out = io.BytesIO()
-    writer.write(out)
-    return out.getvalue()

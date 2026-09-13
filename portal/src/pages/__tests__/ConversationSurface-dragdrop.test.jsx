@@ -10,6 +10,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, fireEvent, createEvent, cleanup } from '@testing-library/react'
+import { MAX_FILE_SIZE, MAX_FILE_SIZE_MB } from '../../utils/attachmentInput'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), getBuild: vi.fn(),
@@ -25,7 +26,11 @@ vi.mock('../../utils/usage', () => ({ notifyUsageChanged: h.notifyUsageChanged }
 vi.mock('../../utils/builderHistory', () => ({
   loadBuilds: h.loadBuilds, getBuild: h.getBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
-vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
+vi.mock('../../utils/conversationApi', () => ({
+  // The send path creates the chat before its first upload; stubbed so no network is reached.
+  createConversation: async () => ({ id: 'conv-created' }),
+  listProjectConversations: h.listProjectConversations,
+}))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
 vi.mock('../../utils/turnStreamApi', async (orig) => ({
@@ -82,10 +87,12 @@ describe('BuilderPage — composer drag-and-drop', () => {
   })
 
   it('rejects an oversized dropped file with the same toast as the picker', async () => {
+    // Sized and asserted from the CONSTANT, so a change to the cap moves the fixture and the
+    // expectation together rather than turning this red for the wrong reason.
     const composer = await renderReady()
-    const big = new File([new Uint8Array(4 * 1024 * 1024 + 1)], 'huge.png', { type: 'image/png' })
+    const big = new File([new Uint8Array(MAX_FILE_SIZE + 1)], 'huge.png', { type: 'image/png' })
     dropFiles(composer, [big])
-    expect(await screen.findByText(/exceeds the 4 MB limit/i)).toBeTruthy()
+    expect(await screen.findByText(new RegExp(`exceeds the ${MAX_FILE_SIZE_MB} MB limit`, 'i'))).toBeTruthy()
     expect(screen.queryByText('huge.png')).toBeNull()
   })
 })

@@ -29,6 +29,7 @@ from src.services.build_sessions.reclaim import (
 )
 from src.services.sandbox.base import (
     KIND_BUILD_SANDBOX,
+    KIND_SHARED_SANDBOX,
     TAG_APP_ID,
     TAG_CONTROL_PLANE,
     TAG_CREATED_AT,
@@ -312,6 +313,22 @@ def test_a_published_app_is_not_ours_and_is_never_counted_as_an_orphan() -> None
     assert plan.by_name["sbx-mislabelled"].verdict is Verdict.NOT_OURS
 
 
+def test_a_shared_sandbox_escalates_rather_than_vanishing_as_not_ours() -> None:
+    """#198: a `shr-` container is OURS — unlike a published app or a co-tenant workload, it is
+    not "simply not our business" — but this classifier has no claim/age policy for it yet
+    (that ships with the shared-runtime provisioning slice). It must land in ESCALATE, the
+    always-reported, never-destroyed bucket, not fall into NOT_OURS and go invisible to every
+    report this pass makes — the exact blind spot the orphan inventory exists to close."""
+    live, claims = _healthy_padding()
+    shared = a_fleet_member("shr-colleague", tags=_tags() | {TAG_KIND: KIND_SHARED_SANDBOX})
+
+    plan = _judge([*live, shared], claims=claims)
+
+    verdict = plan.by_name["shr-colleague"]
+    assert verdict.tier is Tier.SHARED_SANDBOX
+    assert verdict.verdict is Verdict.ESCALATE
+
+
 # --- the store-fault guard ----------------------------------------------------------
 
 
@@ -384,6 +401,7 @@ def test_every_container_lands_in_exactly_one_bucket() -> None:
         a_fleet_member("sbx-fresh", tags=_tags()),
         a_fleet_member("sbx-newborn", tags=_tags(age=dt.timedelta(seconds=4))),
         a_fleet_member("sbx-theirs", tags=_tags(control_plane="elsewhere")),
+        a_fleet_member("shr-colleague", tags=_tags() | {TAG_KIND: KIND_SHARED_SANDBOX}),
     ]
 
     plan = _judge(fleet, claims=claims)
