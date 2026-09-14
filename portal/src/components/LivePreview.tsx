@@ -80,6 +80,9 @@ const HEARTBEAT_MS = 15000
 const MOUNTED_TYPE = 'bial:app-mounted'
 const PAINTING_TYPE = 'bial:app-painting'
 const PING_TYPE = 'bial:ping'
+// The starter page's question and this pane's answer, matched by value in `sandbox/template/app/page.tsx`.
+const TURN_ASK_TYPE = 'bial:turn-ask'
+const TURN_TYPE = 'bial:turn'
 
 // The path an address frames, without its trailing slash, for the identity half of the beacon
 // check below. Malformed fails closed to null, exactly as `originOf` does.
@@ -532,6 +535,8 @@ export default function LivePreview({
   // reason `previewOriginRef` is one.
   const framedPathRef = useRef(framedPathOf(previewUrl))
   framedPathRef.current = framedPathOf(previewUrl)
+  const turnRunningRef = useRef(turnRunning)
+  turnRunningRef.current = turnRunning
   useEffect(() => {
     const onMsg = (e: MessageEvent) => {
       if (!previewOriginRef.current || e.origin !== previewOriginRef.current) return
@@ -569,6 +574,12 @@ export default function LivePreview({
           vouchedKeyRef.current = null
           setVouchedKey((current) => (current === sentBy ? null : current))
         }
+        return
+      }
+      // The starter page asking whether a build is running, so it can say so. Answered only to this
+      // pane's own frame, at the origin the gate above already matched — never '*'.
+      if (isRecord(e.data) && e.data.type === TURN_ASK_TYPE) {
+        frameWindow.postMessage({ type: TURN_TYPE, running: turnRunningRef.current }, e.origin)
         return
       }
       onFrameMessageRef.current?.(e.data)

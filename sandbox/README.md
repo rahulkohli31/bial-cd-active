@@ -23,8 +23,9 @@ So: **image → portal → backend → worker.** Build with context `sandbox/` a
 is on `:latest`). A template or supervisor change under a reused tag is silently untested — the
 preview comes up on the old image and reports healthy.
 
-**It is a STARTER, not a CRUD template.** `app/page.tsx` is a placeholder heading that says to
-replace it, and `db/schema.ts` is `export {};` with an empty migration journal beside it — there is
+**It is a STARTER, not a CRUD template.** `app/page.tsx` is a placeholder screen that asks the
+framing portal whether a build is running and says so, until the agent replaces it with the app's
+own home page. `db/schema.ts` is `export {};` with an empty migration journal beside it — there is
 deliberately no demonstration data model to work around or delete.
 
 The design goal is **a fast, predictable starting point**, not a fixed one. The container plumbing,
