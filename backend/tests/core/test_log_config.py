@@ -38,7 +38,7 @@ def _log_a_failure(form: str) -> None:
             "instance": exc,
             "tuple": (type(exc), exc, exc.__traceback__),
         }[form]
-        log.error("recovery_write_did_not_land", exc_info=exc_info)
+        log.error("autosave_failed", exc_info=exc_info)
 
 
 @pytest.mark.parametrize("form", ["true", "instance", "tuple"])
