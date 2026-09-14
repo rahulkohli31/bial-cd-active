@@ -199,8 +199,8 @@ Fields: `app_name`, `serving_since`, `ms_since_container_created` (computed from
 hash's own `created_at`, so nobody has to subtract two timestamps by hand — this is the number
 the 2026-09-10 measurement had to be reconstructed from a screen recording to get), `observer`
 (`turn_watcher` | `turn_verify` | `relaunch_wait` | `relaunch_continuation` |
-`restore_continuation` | `reconciler` — WHICH watcher won, the only way to tell a normal build
-from one the five-minute backstop rescued), `cold`.
+`restore_continuation` | `discard_continuation` | `reconciler` — WHICH watcher won, the only way
+to tell a normal build from one the five-minute backstop rescued), `cold`.
 
 THE VOCABULARY IS WHAT THE CODE EMITS, and it has already drifted once. An `attach_snapshot`
 stood here for an observer that was designed and then deliberately NOT built: the attach seam's

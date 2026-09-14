@@ -34,6 +34,7 @@ from src.services.build_sessions.manager import BuildSession as BuildSession
 from src.services.build_sessions.manager import (
     BuildSessionConflictError as BuildSessionConflictError,
 )
+from src.services.build_sessions.manager import DiscardOutcome as DiscardOutcome
 from src.services.build_sessions.manager import NoLiveSandboxError as NoLiveSandboxError
 from src.services.build_sessions.manager import (
     NoSnapshotToRelaunchError as NoSnapshotToRelaunchError,
@@ -65,4 +66,7 @@ from src.services.build_sessions.manager import shr_name_for as shr_name_for
 from src.services.build_sessions.reaper import reap_user as reap_user
 from src.services.build_sessions.reaper import reconcile_user as reconcile_user
 from src.services.build_sessions.reaper import sweep_all as sweep_all
+from src.services.build_sessions.snapshot import (
+    NothingSavedToGoBackToError as NothingSavedToGoBackToError,
+)
 from src.services.build_sessions.snapshot import write_snapshot as write_snapshot

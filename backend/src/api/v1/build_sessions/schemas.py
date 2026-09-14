@@ -306,6 +306,14 @@ class RelaunchPreviewRequest(CamelModel):
     prefer_saved: bool = False
 
 
+class DiscardRequest(CamelModel):
+    """`POST /v1/build-sessions/projects/{project_id}/discard` body. `conversation_id` names the
+    chat the Discard was pressed in, so its line comes back in the answer; absent on the project
+    page."""
+
+    conversation_id: uuid.UUID | None = None
+
+
 class RelaunchPreviewResponse(CamelModel):
     """`POST /v1/build-sessions/relaunch` → 200. No `session_id`/`created_at`: relaunch
     registers NO in-process build session (it must not occupy the build slot), so

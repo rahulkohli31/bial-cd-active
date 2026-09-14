@@ -27,8 +27,10 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Any
 
 import sqlalchemy as sa
+import structlog
 from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -46,6 +48,7 @@ from src.api.v1.build_sessions.schemas import (
     ClientErrorReportRequest,
     ClientErrorReportResponse,
     CompileStateResponse,
+    DiscardRequest,
     ParkedTree,
     ParkedTreesResponse,
     PreviewLifeState,
@@ -63,6 +66,7 @@ from src.api.v1.live_build import ReclaimBlockedError, reclaim_blocked_response
 from src.core.errors import AppApiError
 from src.core.integrity_types import WorkspaceState
 from src.db.models.app_registry import AppRegistry
+from src.db.models.conversation import Conversation
 from src.schemas import AUTH_401, CamelModel, ErrorEnvelope, error_responses
 from src.services.audit.log import append_audit
 from src.services.build_sessions import (
@@ -70,8 +74,10 @@ from src.services.build_sessions import (
     BuildSessionConflictError,
     NoLiveSandboxError,
     NoSnapshotToRelaunchError,
+    NothingSavedToGoBackToError,
     SandboxReclaimBlockedError,
     SandboxUnreachableError,
+    SaveState,
     SessionManager,
     SharedProjectHasNoAppError,
     SnapshotUnavailableError,
@@ -99,8 +105,10 @@ from src.services.redis import (
 )
 from src.services.sandbox import SandboxError
 from src.services.sandbox.base import CompileState
+from src.services.storage import StorageError
 
 router = APIRouter(prefix="/build-sessions", tags=["build_sessions"])
+_log = structlog.get_logger()
 
 # The user-approved wording, VERBATIM. Note there is deliberately no trailing period,
 # unlike its neighbours: this exact string is the approved copy and reaches the portal
@@ -637,6 +645,31 @@ class SaveStateResponse(CamelModel):
     saved_head: str | None = None
 
 
+class DiscardNotice(CamelModel):
+    """The line a discard wrote into the conversation it came from, so the page can show it where
+    a reload would."""
+
+    seq: int
+    saved_at: datetime | None = None
+
+
+class DiscardResponse(SaveStateResponse):
+    """The save state after a discard, plus `notice` for the conversation the request came from —
+    `None` when it came from outside one."""
+
+    notice: DiscardNotice | None = None
+
+
+def _save_state_fields(state: SaveState) -> dict[str, Any]:
+    return {
+        "app_id": str(state.app_id) if state.app_id else None,
+        "dirty": state.dirty,
+        "container_head": state.container_head,
+        "saved_head": state.saved_head,
+        "recovery_at": state.recovery_at,
+    }
+
+
 @router.post(
     "/projects/{project_id}/save",
     response_model=SaveResponse,
@@ -681,6 +714,75 @@ async def save_project(
             "wait for it to finish, or stop it first.",
         ) from None
     return SaveResponse(app_id=str(outcome.app_id), head_sha=outcome.head_sha)
+
+
+@router.post(
+    "/projects/{project_id}/discard",
+    response_model=DiscardResponse,
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        (403, ErrorEnvelope, "CSRF check failed"),
+        AUTH_401,
+        (404, ErrorEnvelope, "Project or conversation not found"),
+        (409, ErrorEnvelope, "There is nothing to discard right now"),
+        (503, ErrorEnvelope, "The sandbox or the file store is unavailable"),
+    ),
+)
+async def discard_unsaved_changes(
+    project_id: uuid.UUID,
+    body: DiscardRequest,
+    user: CurrentUser,
+    db: DbSession,
+    manager: SessionManagerDep,
+    sandbox: OptionalSandbox,
+) -> DiscardResponse:
+    """Put the app back to the version its owner last saved — the Discard button.
+
+    What it replaces is parked, never deleted. Every conversation of the project that spoke since
+    that save gets a note its next reply reads; `notice` is the one written into the conversation
+    the request came from, so the page shows it without a reload."""
+    if sandbox is None:
+        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG)
+    await owned_project_or_404(db, user.id, project_id)
+    if body.conversation_id is not None:
+        found = await db.scalar(
+            sa.select(Conversation.id).where(
+                Conversation.id == body.conversation_id,
+                Conversation.user_id == user.id,
+                Conversation.project_id == project_id,
+            )
+        )
+        if found is None:
+            raise AppApiError(status.HTTP_404_NOT_FOUND, "Conversation not found.")
+    try:
+        outcome = await manager.discard_unsaved_changes(
+            db, user, project_id, sandbox_client=sandbox, conversation_id=body.conversation_id
+        )
+    except NoLiveSandboxError:
+        raise AppApiError(
+            status.HTTP_409_CONFLICT,
+            "Your workspace is not running, so there is nothing to discard. Your saved version "
+            "is intact.",
+        ) from None
+    except BuildSessionConflictError:
+        raise AppApiError(
+            status.HTTP_409_CONFLICT, "Wait for the reply to finish, then discard."
+        ) from None
+    except NothingSavedToGoBackToError:
+        raise AppApiError(
+            status.HTTP_409_CONFLICT, "There is no saved version to go back to yet."
+        ) from None
+    except (StorageError, SandboxError) as exc:
+        _log.warning("workspace_discard_failed", project_id=str(project_id), exc_info=exc)
+        raise AppApiError(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Your changes could not be discarded just now. Try again in a moment.",
+        ) from None
+    seq = outcome.notes.get(body.conversation_id) if body.conversation_id is not None else None
+    return DiscardResponse(
+        **_save_state_fields(outcome.state),
+        notice=DiscardNotice(seq=seq, saved_at=outcome.saved_at) if seq is not None else None,
+    )
 
 
 @router.post(
@@ -1147,13 +1249,7 @@ async def save_state(
     if sandbox is None:
         return SaveStateResponse()
     state = await manager.project_save_state(db, user, project_id, sandbox_client=sandbox)
-    return SaveStateResponse(
-        app_id=str(state.app_id) if state.app_id else None,
-        dirty=state.dirty,
-        container_head=state.container_head,
-        saved_head=state.saved_head,
-        recovery_at=state.recovery_at,
-    )
+    return SaveStateResponse(**_save_state_fields(state))
 
 
 # --- the app's own client-error report ----------------

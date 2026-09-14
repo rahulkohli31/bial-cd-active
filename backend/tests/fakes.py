@@ -298,6 +298,8 @@ class FakeSandboxClient(SandboxClient):
         self.teardown_error: Exception | None = None
         # Optional per-command exec script; defaults to a clean exit-0 result.
         self.exec_handler: Callable[[list[str]], ExecResult] | None = None
+        # Every bundle a discard reset the container to, in order.
+        self.reset_to: list[bytes] = []
         self.warmed: list[str] = []
         self.warm_status: int | None = 200
         self.compile_report: CompileReport = CompileReport(
@@ -427,6 +429,9 @@ class FakeSandboxClient(SandboxClient):
 
     async def files(self, handle: SandboxHandle, op: FileOp) -> FileResult:
         return FileResult(ok=True, detail={})
+
+    async def reset_to_bundle(self, handle: SandboxHandle, bundle: bytes) -> None:
+        self.reset_to.append(bundle)
 
     async def dev_start(
         self, handle: SandboxHandle, *, cmd: list[str] | None = None, cwd: str | None = None

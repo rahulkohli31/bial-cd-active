@@ -842,3 +842,14 @@ class SandboxClient(abc.ABC):
         supervisor image — and must not be read as "definitely no new traffic", which would let
         the sweep reap a container it simply failed to probe."""
         return None
+
+    async def reset_to_bundle(self, handle: SandboxHandle, bundle: bytes) -> None:
+        """Put a git bundle's tree into a live container in place of its own — the Discard button.
+
+        The container, its dev server and its registry entry stay; hot reload shows the tree.
+        Untracked files go, ignored ones (`node_modules`, `.next`) stay, and dependencies are
+        reinstalled only when the lockfile changed.
+
+        DELIBERATELY NOT abstract, same reason as `someone_has_to_go_first`. The default refuses:
+        a client that cannot reset must never report a discard that did not happen."""
+        raise SandboxError("this sandbox client cannot reset a workspace in place")
