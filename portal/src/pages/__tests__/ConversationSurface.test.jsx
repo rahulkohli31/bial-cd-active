@@ -21,6 +21,7 @@ const h = vi.hoisted(() => ({
   resolvePlanOptions: vi.fn(),
   stop: vi.fn(), getStatus: vi.fn(), relaunchPreview: vi.fn(),
   fetchSaveState: vi.fn(), fetchPreviewState: vi.fn(), saveProject: vi.fn(),
+  discardUnsavedChanges: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
@@ -55,6 +56,7 @@ vi.mock('../../utils/buildSessionApi', async (orig) => ({
   // The WRITER of the bundle. It is the subject of the deployment-nudge scenario at the
   // bottom, and leaving it real would put this suite on the network there too.
   saveProject: (...a) => h.saveProject(...a),
+  discardUnsavedChanges: (...a) => h.discardUnsavedChanges(...a),
 }))
 
 import {
@@ -62,6 +64,7 @@ import {
   planReply, turnStreaming, PLAN_CARD_ID, findStartAppControl,
 } from './_builderSession.jsx'
 import { ApiError } from '../../utils/apiError'
+import { discardNoticeText } from '../../utils/conversationApi'
 import { DEFAULT_CONTEXT_SOFT } from '../../utils/contextLimits'
 
 const deps = () => {
@@ -438,5 +441,129 @@ describe('★ a Save from the chat raises the deployment nudge', () => {
     // nudge for someone else's project is one every mount here correctly ignores.
     await waitFor(() => expect(nudges).toHaveLength(1))
     expect(nudges[0].projectId).toBe('p1')
+  })
+})
+
+/**
+ * ★ THE SAVE CHIP ON A CHAT FOLLOWS THE WORKSPACE, NOT ONLY THE TURNS.
+ *
+ * A save-state read describes the tree it was taken against, and it went stale two ways here: a
+ * read already on the wire when Save was pressed landed afterwards and lit Save again, and a
+ * workspace that came up after the page loaded was never read at all.
+ */
+describe('★ the Save chip on a chat follows the workspace, not only the turns', () => {
+  it('a read already on the wire when Save is pressed does not light Save again', async () => {
+    // Mutation check: drop the sequence bump from `handleSave` and the late read relights Save.
+    h.fetchSaveState.mockResolvedValue({ dirty: true })
+    renderBuilder({ deps: deps().deps })
+    await screen.findByTestId('save-project')
+
+    let answerLate = null
+    h.fetchSaveState.mockImplementation(() => new Promise((resolve) => { answerLate = resolve }))
+    await send('add a date filter')
+    await waitFor(() => expect(answerLate).toBeTypeOf('function'))
+
+    fireEvent.click(screen.getByTestId('save-project'))
+    await waitFor(() => expect(h.saveProject).toHaveBeenCalledWith('p1'))
+    expect(await screen.findByText('Saved')).toBeTruthy()
+
+    answerLate({ dirty: true })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(screen.getByText('Saved')).toBeTruthy()
+    expect(screen.queryByText(/^Save$/)).toBeNull()
+  })
+
+  it('a workspace that comes up after the page loaded is read again', async () => {
+    // Mutation check: remove the re-read on arrival and only the mount read ever happens.
+    h.fetchPreviewState.mockResolvedValue({
+      state: 'asleep', alive: false, previewUrl: null,
+      occupyingProjectName: null, occupyingProjectId: null, restorable: true,
+    })
+    h.fetchSaveState.mockResolvedValue({ dirty: null })
+    renderBuilder({ deps: deps().deps })
+    const launch = await findStartAppControl()
+    await waitFor(() => expect(h.fetchSaveState).toHaveBeenCalledTimes(1))
+
+    h.fetchPreviewState.mockResolvedValue({
+      state: 'alive', alive: true, previewUrl: 'https://app/',
+      occupyingProjectName: null, occupyingProjectId: null, restorable: null,
+    })
+    h.fetchSaveState.mockResolvedValue({ dirty: true })
+    fireEvent.click(launch)
+
+    await waitFor(() => expect(h.fetchSaveState).toHaveBeenCalledTimes(2))
+    expect(await screen.findByTestId('save-project')).toBeTruthy()
+  })
+
+  it('★ a Discard sends this chat, shows the line its next reply reads, and settles Save', async () => {
+    // Mutation check: drop the chat's id, the appended line, or the returned save state.
+    const SAVED = 'a'.repeat(40)
+    h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: SAVED, recoveryAt: null })
+    h.discardUnsavedChanges.mockResolvedValue({
+      saveState: { appId: 'a1', dirty: false, containerHead: SAVED, savedHead: SAVED, recoveryAt: null },
+      notice: { seq: 9, savedAt: '2026-09-13T14:32:00Z' },
+    })
+    renderBuilder({ deps: deps().deps })
+    await send('add a date filter')
+
+    const control = await screen.findByTestId('discard-changes')
+    await waitFor(() => expect(control.getAttribute('aria-disabled')).toBe('false'))
+    fireEvent.click(control)
+    fireEvent.click(await screen.findByTestId('discard-dialog-confirm'))
+
+    await waitFor(() => expect(h.discardUnsavedChanges).toHaveBeenCalledWith('p1', 'build-X'))
+    expect(await screen.findByText(discardNoticeText('2026-09-13T14:32:00Z'))).toBeTruthy()
+    expect(await screen.findByText('Saved')).toBeTruthy()
+    expect(screen.getByTestId('discard-changes').getAttribute('aria-disabled')).toBe('true')
+  })
+
+  it('a from-scratch chat showing only the welcome greeting discards with no conversation', async () => {
+    // Mutation check: revert the `!m.ephemeral` filter in `handleDiscard` and this sends the
+    // chat's buildId instead of null.
+    const SAVED = 'a'.repeat(40)
+    h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: SAVED, recoveryAt: null })
+    h.discardUnsavedChanges.mockResolvedValue({
+      saveState: { appId: 'a1', dirty: false, containerHead: SAVED, savedHead: SAVED, recoveryAt: null },
+      notice: null,
+    })
+    renderBuilder({ deps: deps().deps })
+    await screen.findByText(/Tell me what you'd like to build/i)
+
+    const control = await screen.findByTestId('discard-changes')
+    await waitFor(() => expect(control.getAttribute('aria-disabled')).toBe('false'))
+    fireEvent.click(control)
+    fireEvent.click(await screen.findByTestId('discard-dialog-confirm'))
+
+    await waitFor(() => expect(h.discardUnsavedChanges).toHaveBeenCalledWith('p1', null))
+    expect(await screen.findByText('Saved')).toBeTruthy()
+    expect(screen.queryByText(/you discarded the unsaved changes/i)).toBeNull()
+  })
+
+  it('a Discard waits while this chat is replying', async () => {
+    // Mutation check: publish `replying: false` from this page and the control stays pressable.
+    h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: 'a'.repeat(40), recoveryAt: null })
+    h.readTurnStream.mockImplementation(() => new Promise(() => {}))
+    renderBuilder({ deps: deps().deps })
+    await send('add a date filter')
+
+    const control = await screen.findByTestId('discard-changes')
+    await waitFor(() => expect(control.getAttribute('title')).toBe('Wait for the reply to finish'))
+    expect(control.getAttribute('aria-disabled')).toBe('true')
+  })
+
+  it('a page that opens on a running workspace reads it once', async () => {
+    // Mutation check: let the first preview answer re-read too and every page load asks twice.
+    h.fetchPreviewState.mockResolvedValue({
+      state: 'alive', alive: true, previewUrl: 'https://app/',
+      occupyingProjectName: null, occupyingProjectId: null, restorable: null,
+    })
+    h.fetchSaveState.mockResolvedValue({ dirty: true })
+    renderBuilder({ deps: deps().deps })
+
+    // Liveness: the running answer has landed and framed the app, so the count below is final.
+    await waitFor(() => expect(document.querySelector('iframe')).not.toBeNull())
+    expect(await screen.findByTestId('save-project')).toBeTruthy()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(h.fetchSaveState).toHaveBeenCalledTimes(1)
   })
 })

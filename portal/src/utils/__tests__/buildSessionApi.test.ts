@@ -12,6 +12,7 @@ import {
   sameSaveState,
   canBePutBack,
   handOverWorkspace,
+  discardUnsavedChanges,
   STOP_CEILING_MS,
   STOP_POLL_MS,
 } from '../buildSessionApi'
@@ -855,6 +856,65 @@ describe('fetchSaveState — the recovery instant, parsed like its siblings', ()
     const state = await fetchSaveState('p1', saveFetch({ appId: 'a1', dirty: true, recoveryAt: 1757500723 }))
     expect(state.recoveryAt).toBeNull()
     expect(state.dirty).toBe(true)
+  })
+})
+
+describe('discardUnsavedChanges — the Discard button', () => {
+  const DISCARDED = {
+    appId: 'a1',
+    dirty: false,
+    containerHead: 'aaa',
+    savedHead: 'aaa',
+    recoveryAt: null,
+  }
+
+  it('POSTs to the discard route with the CSRF header and the conversationId body', async () => {
+    const fetchImpl = jsonFetch(200, { ...DISCARDED, notice: null })
+    await discardUnsavedChanges('p1', 'conv-1', { fetchImpl })
+
+    expect(fetchImpl.mock.calls[0][0]).toBe('/api/build-sessions/projects/p1/discard')
+    expect(optsOf(fetchImpl).method).toBe('POST')
+    expect(headerOf(fetchImpl, 'X-CSRF-Token')).toBe(CSRF)
+    expect(JSON.parse(optsOf(fetchImpl).body as string)).toEqual({ conversationId: 'conv-1' })
+  })
+
+  it('sends an empty body when pressed outside a chat', async () => {
+    const fetchImpl = jsonFetch(200, { ...DISCARDED, notice: null })
+    await discardUnsavedChanges('p1', null, { fetchImpl })
+    expect(JSON.parse(optsOf(fetchImpl).body as string)).toEqual({})
+  })
+
+  it('a 200 parses the save state and the notice', async () => {
+    const fetchImpl = jsonFetch(200, {
+      ...DISCARDED,
+      notice: { seq: 7, savedAt: '2026-09-10T10:38:43Z' },
+    })
+    const out = await discardUnsavedChanges('p1', 'conv-1', { fetchImpl })
+    expect(out.saveState).toEqual(DISCARDED)
+    expect(out.notice).toEqual({ seq: 7, savedAt: '2026-09-10T10:38:43Z' })
+  })
+
+  it('a malformed notice parses to null', async () => {
+    const notARecord = jsonFetch(200, { ...DISCARDED, notice: 'nope' })
+    expect((await discardUnsavedChanges('p1', null, { fetchImpl: notARecord })).notice).toBeNull()
+
+    const noSeq = jsonFetch(200, { ...DISCARDED, notice: { savedAt: '2026-09-10T10:38:43Z' } })
+    expect((await discardUnsavedChanges('p1', null, { fetchImpl: noSeq })).notice).toBeNull()
+  })
+
+  it('a non-string savedAt on an otherwise valid notice reads as null', async () => {
+    const fetchImpl = jsonFetch(200, { ...DISCARDED, notice: { seq: 3, savedAt: 12345 } })
+    const out = await discardUnsavedChanges('p1', null, { fetchImpl })
+    expect(out.notice).toEqual({ seq: 3, savedAt: null })
+  })
+
+  it('a 409 rejects with the server message', async () => {
+    const fetchImpl = jsonFetch(409, {
+      error: { message: 'There is no saved version to go back to yet.' },
+    })
+    await expect(discardUnsavedChanges('p1', null, { fetchImpl })).rejects.toThrow(
+      'There is no saved version to go back to yet.',
+    )
   })
 })
 

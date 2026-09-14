@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Any, Final, Literal
 
 import sqlalchemy as sa
@@ -69,6 +70,10 @@ TURN_TERMINAL_KIND: Final = "turn_terminal"
 """`meta.kind` of the durable turn-terminal row. Named here, beside the arm that reads it, and
 imported by the engine that writes it — one spelling, because a writer and a reader that each
 hold their own string literal are one typo away from a row nobody projects."""
+
+WORKSPACE_DISCARDED_KIND: Final = "workspace_discarded"
+"""`meta.kind` of the row a discard writes into each conversation that spoke since the save. Its
+payload is the note the model reads; the citizen sees `WorkspaceDiscardedItem` instead."""
 
 # THERE IS NO DETAILS-EXPANDER CAP HERE ANY MORE, because there is no expander material to
 # cap. A step used to carry the raw arguments and the raw result of its tool call, redacted and
@@ -305,6 +310,15 @@ class PlanOptionsItem(CamelModel):
     state: Literal["pending", "refine", "build"]
 
 
+class WorkspaceDiscardedItem(CamelModel):
+    """The user put the app back to its saved version. `saved_at` is when that version was
+    saved, `None` when the row carries no readable time."""
+
+    type: Literal["workspace_discarded"] = "workspace_discarded"
+    seq: int
+    saved_at: datetime | None = None
+
+
 DisplayItem = (
     UserTextItem
     | AssistantTextItem
@@ -313,7 +327,18 @@ DisplayItem = (
     | BuildInProgressItem
     | PlanOptionsItem
     | TurnTerminalItem
+    | WorkspaceDiscardedItem
 )
+
+
+def _an_instant(value: object) -> datetime | None:
+    """An ISO instant stored in `meta`, or `None` for anything that is not one."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def _stringify(value: Any) -> str:
@@ -1194,6 +1219,10 @@ def project_rows(rows: Sequence[Message]) -> list[DisplayItem]:
                 continue
             if row.visibility is MessageVisibility.HIDDEN:
                 continue  # hidden system rows render nothing
+            if kind == WORKSPACE_DISCARDED_KIND:
+                saved_at = _an_instant(meta.get("savedAt"))
+                items.append(WorkspaceDiscardedItem(seq=row.seq, saved_at=saved_at))
+                continue
             if kind == PLATFORM_TEXT_KIND:
                 # THE WORDS COME OUT OF `meta`, because the payload is empty on purpose — see
                 # the constant above. The citizen reads the sentence exactly as they always

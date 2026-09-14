@@ -18,6 +18,7 @@ import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-li
 import { MemoryRouter, Routes, Route, Link, useLocation } from 'react-router-dom'
 import WorkspaceShell from '../WorkspaceShell'
 import { rememberProjectsSearch } from '../../../utils/projectsListMemory'
+import { formatStamp } from '../../../utils/publishPresentation'
 import {
   useAppPaneVisible,
   usePublishAddress,
@@ -48,8 +49,13 @@ vi.mock('../../PublishStatusChip', () => ({
 vi.mock('../../LivePreview', () => ({
   default: () => <div data-testid="live-preview" />,
 }))
+vi.mock('../../../hooks/usePublishState', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../hooks/usePublishState')>()),
+  usePublishState: () => ({ deployment: { savedAt: '2026-09-13T14:32:00Z' } }),
+}))
 
 const APP_URL = 'https://app-a.example.azurecontainerapps.io/'
+const SAVED_AT = '2026-09-13T14:32:00Z'
 
 const EMPTY_PANE: PaneView = {
   iterating: false, reconnecting: false,
@@ -86,29 +92,41 @@ interface SurfaceProps {
   heading: WorkspaceHeading
   /** Absent means "no app to point at" — the pane is asked for but nothing is framed. */
   appUrl?: string | null
-  save?: Omit<SaveSlot, 'canSave'>
-  actions?: WorkspaceActions
+  /** Unset fields take `QUIET_SAVE`'s value. */
+  save?: Partial<Omit<SaveSlot, 'canSave' | 'canDiscard'>>
+  /** Unset handlers are `null`. */
+  actions?: Partial<WorkspaceActions>
   paneVisible?: boolean
+}
+
+const QUIET_SAVE: Omit<SaveSlot, 'canSave' | 'canDiscard'> = {
+  dirty: null,
+  saving: false,
+  error: null,
+  discarding: false,
+  replying: false,
+  hasSavedVersion: false,
 }
 
 /** A mounted surface, publishing exactly what the row reads and nothing else. */
 function Surface({
   heading,
   appUrl = APP_URL,
-  save = { dirty: null, saving: false, error: null },
-  actions = { save: null, rename: null, share: null },
+  save = {},
+  actions = {},
   paneVisible = true,
 }: SurfaceProps) {
+  const slot = { ...QUIET_SAVE, ...save }
   useWorkspaceProject(heading.projectId)
   usePublishHeading(heading)
   usePublishAddress({ url: appUrl, status: appUrl ? 'ready' : null, serving: appUrl !== null }, heading.projectId)
   // A FRESH OBJECT PER RENDER, which is what the real conversation surface publishes — the pane
   // cell is identity-compared, so this is what makes a keystroke reach the channel at all.
   usePublishPaneView({ ...EMPTY_PANE })
-  usePublishSave(save, actions)
+  usePublishSave(slot, { save: null, discard: null, rename: null, share: null, ...actions })
   // The row's own `save` slot carries no recovery instant — it is not the row's question — so the
   // reading published here names the flag it does have and no copy it cannot vouch for.
-  usePublishSaveState({ dirty: save.dirty, recoveryAt: null })
+  usePublishSaveState({ dirty: slot.dirty, recoveryAt: null })
   useAppPaneVisible(paneVisible)
   return <div data-testid="surface" />
 }
@@ -400,7 +418,7 @@ describe('the app-scoped controls appear only when there is an app to point at',
 })
 
 describe('the Save control', () => {
-  const withSave = (save: Omit<SaveSlot, 'canSave'>, onSave: (() => void) | null = null) =>
+  const withSave = (save: Partial<Omit<SaveSlot, 'canSave' | 'canDiscard'>>, onSave: (() => void) | null = null) =>
     render(
       <Workspace
         project={{ heading: PROJECT_HEADING, save, actions: { save: onSave, rename: null, share: null } }}
@@ -550,6 +568,112 @@ describe('the Save control', () => {
     // One element carries the sentence — `getNodeText` reads only direct text children, so a
     // duplicate anywhere in the control would make this two.
     expect(screen.getAllByText('Saving…')).toHaveLength(1)
+  })
+})
+
+describe('the Discard control', () => {
+  const OPEN_WORK = { dirty: true, saving: false, error: null, discarding: false, replying: false, hasSavedVersion: true }
+  const withDiscard = (
+    save: Partial<Omit<SaveSlot, 'canSave' | 'canDiscard'>>,
+    handlers: Partial<WorkspaceActions> = {},
+  ) =>
+    render(
+      <Workspace
+        project={{
+          heading: PROJECT_HEADING,
+          save: { ...OPEN_WORK, ...save },
+          actions: { save: () => {}, discard: async () => {}, ...handlers },
+        }}
+      />,
+    )
+  const discard = () => screen.getByTestId('discard-changes')
+
+  it.each([
+    ['unsaved work over a saved version', {}, null],
+    ['work that was never saved', { hasSavedVersion: false }, 'Nothing saved yet to go back to'],
+    ['everything saved', { dirty: false }, 'No unsaved changes'],
+    ['a save running', { saving: true }, 'Wait for the save to finish'],
+    ['a reply running', { replying: true }, 'Wait for the reply to finish'],
+    ['a discard running', { discarding: true }, 'Discarding your changes'],
+  ] as const)('★ with %s it sits left of Save and says whether it can be pressed', (_, save, refusal) => {
+    // Mutation check: switch to a real `disabled`, or drop the saved-version gate, and a row goes red.
+    withDiscard(save)
+    const control = discard()
+    expect(control.nextElementSibling?.contains(screen.getByTestId('save-project'))).toBe(true)
+    expect(control.hasAttribute('disabled')).toBe(false)
+    expect(control.getAttribute('aria-disabled')).toBe(String(refusal !== null))
+    expect(control.getAttribute('title')).toBe(refusal ?? 'Go back to the version you last saved')
+    if (refusal === null) {
+      expect(control.className).toMatch(/hover:text-danger/)
+      expect(control.className).not.toMatch(/cursor-not-allowed/)
+    } else {
+      expect(control.className).toMatch(/cursor-not-allowed/)
+      expect(control.className).not.toMatch(/hover:/)
+      fireEvent.click(control)
+      expect(screen.queryByTestId('discard-dialog-confirm')).toBeNull()
+    }
+  })
+
+  it.each([
+    ['a discard starting', { discarding: true }, {}, 'refused'],
+    ['a reply starting', { replying: true }, {}, 'refused'],
+    ['the saved version going away', { hasSavedVersion: false }, {}, 'refused'],
+    ['the discard action going away', {}, { discard: null }, 'hidden'],
+  ] as const)('★ %s alone reaches the row', (_, save, handlers, expected) => {
+    // Mutation check: leave the field out of `sameSave` and the row keeps its earlier answer.
+    const view = withDiscard({})
+    expect(discard().getAttribute('aria-disabled')).toBe('false')
+
+    view.rerender(
+      <Workspace
+        project={{
+          heading: PROJECT_HEADING,
+          save: { ...OPEN_WORK, ...save },
+          actions: { save: () => {}, discard: async () => {}, ...handlers },
+        }}
+      />,
+    )
+
+    if (expected === 'hidden') expect(screen.queryByTestId('discard-changes')).toBeNull()
+    else expect(discard().getAttribute('aria-disabled')).toBe('true')
+  })
+
+  it('shows the wait while a discard runs, and Save cannot be pressed under it', () => {
+    const onSave = vi.fn()
+    withDiscard({ discarding: true }, { save: onSave })
+    expect(discard().textContent).toContain('Discarding…')
+    expect(screen.getByTestId('discard-spinner')).toBeTruthy()
+    const save = screen.getByTestId('save-project')
+    expect(save.getAttribute('aria-disabled')).toBe('true')
+    fireEvent.click(save)
+    expect(onSave).not.toHaveBeenCalled()
+  })
+
+  it('★ is hidden whenever Save is, and when nothing can discard', () => {
+    withDiscard({ dirty: null })
+    expect(screen.queryByTestId('discard-changes')).toBeNull()
+    expect(title().textContent).toBe('Visitor Log — Airport Office')
+
+    cleanup()
+    withDiscard({}, { discard: null })
+    expect(screen.queryByTestId('discard-changes')).toBeNull()
+    expect(screen.getByTestId('save-project')).toBeTruthy()
+  })
+
+  it('★ asks first, dated from the last save, and only a confirm discards', async () => {
+    const onDiscard = vi.fn(async () => {})
+    withDiscard({}, { discard: onDiscard })
+
+    fireEvent.click(discard())
+    expect(screen.getByText(new RegExp(formatStamp(SAVED_AT)))).toBeTruthy()
+    fireEvent.click(screen.getByTestId('discard-dialog-cancel'))
+    await waitFor(() => expect(screen.queryByTestId('discard-dialog-confirm')).toBeNull())
+    expect(onDiscard).not.toHaveBeenCalled()
+
+    fireEvent.click(discard())
+    fireEvent.click(screen.getByTestId('discard-dialog-confirm'))
+    await waitFor(() => expect(screen.queryByTestId('discard-dialog-confirm')).toBeNull())
+    expect(onDiscard).toHaveBeenCalledTimes(1)
   })
 })
 
@@ -799,7 +923,7 @@ describe('the row does not wake with the composer', () => {
  * layout engine actually runs.
  *
  * WHAT IS DELIBERATELY NOT HERE: an overflow menu. Of the two remedies available — a collapsing
- * menu, or a scroller on the row — the lighter one shipped: the row scrolls, and all nine
+ * menu, or a scroller on the row — the lighter one shipped: the row scrolls, and all ten
  * occupants stay on it. `every occupant is still on the row` below is what makes a future
  * re-introduction of the menu go red rather than quietly ship.
  */
@@ -819,15 +943,15 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
     return svg === null ? null : `${svg.getAttribute('width')}×${svg.getAttribute('height')}`
   }
 
-  /** The project screen with an app framed, unsaved work, and the rail collapsed — the one state
-   *  in which all nine of the row's occupants are on screen at once. */
+  /** The project screen with an app framed, unsaved work over a saved version, and the rail
+   *  collapsed — the one state in which all ten of the row's occupants are on screen at once. */
   const everything = () => {
     render(
       <Workspace
         project={{
           heading: PROJECT_HEADING,
-          save: { dirty: true, saving: false, error: null },
-          actions: { save: () => {}, rename: () => {}, share: null },
+          save: { dirty: true, hasSavedVersion: true },
+          actions: { save: () => {}, discard: async () => {}, rename: () => {} },
         }}
       />,
     )
@@ -840,6 +964,7 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
   const reload = () => screen.getByRole('button', { name: 'Reload your app' })
   const newTab = () => screen.getByRole('link', { name: 'Open your app in a new tab' })
   const save = () => screen.getByTestId('save-project')
+  const discard = () => screen.getByTestId('discard-changes')
   const railToggle = () => screen.getByRole('button', { name: 'Show details' })
 
   it('★ the row owns a horizontal scroller, so overflow is reachable instead of clipped', () => {
@@ -858,7 +983,7 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
 
   it('★ every occupant is still on the row — nothing was moved into a menu', () => {
     // The guard on the remedy that was NOT taken. Either a collapsing menu or a scrolling ancestor
-    // would have fixed the clipping; the scroller shipped, so all nine stay put. If an overflow
+    // would have fixed the clipping; the scroller shipped, so all ten stay put. If an overflow
     // menu is ever added, this goes red before anyone has to notice the row lost a control.
     everything()
     expect(back()).toBeTruthy()
@@ -868,6 +993,7 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
     expect(devices()).toHaveLength(3)
     expect(reload()).toBeTruthy()
     expect(newTab()).toBeTruthy()
+    expect(discard()).toBeTruthy()
     expect(save()).toBeTruthy()
     expect(railToggle()).toBeTruthy()
   })
@@ -885,9 +1011,12 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
       expect(cls(control)).toMatch(/\bitems-center\b/)
       expect(cls(control)).toMatch(/\bjustify-center\b/)
     }
-    // Save is past 44px wide on its own words in every state, so only its HEIGHT needs a floor.
-    expect(cls(save())).toContain('narrow:min-h-[44px]')
-    expect(cls(save())).not.toContain('narrow:min-w-[44px]')
+    // Save and Discard are past 44px wide on their own words in every state, so only their HEIGHT
+    // needs a floor.
+    for (const worded of [save(), discard()]) {
+      expect(cls(worded)).toContain('narrow:min-h-[44px]')
+      expect(cls(worded)).not.toContain('narrow:min-w-[44px]')
+    }
   })
 
   it('★ the hit areas grow by padding — every glyph keeps the size the canvas drew it at', () => {
@@ -901,6 +1030,7 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
     expect(glyph(newTab())).toBe('15×15')
     expect(glyph(railToggle())).toBe('15×15')
     expect(glyph(save())).toBe('14×14')
+    expect(glyph(discard())).toBe('14×14')
   })
 
   it('★ above the stacking threshold every control keeps exactly the geometry it shipped with', () => {
@@ -908,7 +1038,9 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
     // what a 1200px viewport does — and what is left must be the pre-existing class list, with no
     // 44px floor leaking up into the desktop row.
     everything()
-    const desktop = [back(), pencil(), ...devices(), reload(), newTab(), railToggle(), save()].map(aboveThreshold)
+    const desktop = [back(), pencil(), ...devices(), reload(), newTab(), railToggle(), discard(), save()].map(
+      aboveThreshold,
+    )
     for (const list of desktop) expect(list).not.toMatch(/min-[hw]-\[44px\]/)
 
     // …and the sizes those controls are actually drawn at up there, named so a silent change to

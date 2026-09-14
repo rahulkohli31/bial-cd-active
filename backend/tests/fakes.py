@@ -298,6 +298,8 @@ class FakeSandboxClient(SandboxClient):
         self.teardown_error: Exception | None = None
         # Optional per-command exec script; defaults to a clean exit-0 result.
         self.exec_handler: Callable[[list[str]], ExecResult] | None = None
+        # Every bundle a discard reset the container to, in order.
+        self.reset_to: list[bytes] = []
         self.warmed: list[str] = []
         self.warm_status: int | None = 200
         self.compile_report: CompileReport = CompileReport(
@@ -428,6 +430,9 @@ class FakeSandboxClient(SandboxClient):
     async def files(self, handle: SandboxHandle, op: FileOp) -> FileResult:
         return FileResult(ok=True, detail={})
 
+    async def reset_to_bundle(self, handle: SandboxHandle, bundle: bytes) -> None:
+        self.reset_to.append(bundle)
+
     async def dev_start(
         self, handle: SandboxHandle, *, cmd: list[str] | None = None, cwd: str | None = None
     ) -> int:
@@ -490,6 +495,52 @@ class FakeSandboxClient(SandboxClient):
 
 
 ProgressSinkFn = Callable[[ProgressEnvelope], Awaitable[None]]
+
+
+class DevServerDownUntilStarted(FakeSandboxClient):
+    """A container whose dev server is down until something starts it.
+
+    The base double reports a serving app on every `dev_status`, so it cannot tell a path that
+    starts the app from one that forgets to. A restore is a new container, so it forgets any
+    earlier start."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.dev_started: list[str] = []
+        self._serving: set[str] = set()
+
+    async def restore_from_snapshot(
+        self,
+        user_id: str,
+        app_name: str,
+        *,
+        app_env: dict[str, str],
+        source_key: str | None = None,
+        kind: Literal["build_sandbox", "shared_sandbox"] = "build_sandbox",
+        shared_project_id: uuid.UUID | None = None,
+        shared_owner_id: uuid.UUID | None = None,
+    ) -> SandboxHandle:
+        self._serving.discard(app_name)
+        return await super().restore_from_snapshot(
+            user_id,
+            app_name,
+            app_env=app_env,
+            source_key=source_key,
+            kind=kind,
+            shared_project_id=shared_project_id,
+            shared_owner_id=shared_owner_id,
+        )
+
+    async def dev_start(
+        self, handle: SandboxHandle, *, cmd: list[str] | None = None, cwd: str | None = None
+    ) -> int:
+        self.dev_started.append(handle.app_name)
+        self._serving.add(handle.app_name)
+        return await super().dev_start(handle, cmd=cmd, cwd=cwd)
+
+    async def dev_status(self, handle: SandboxHandle) -> DevStatus:
+        up = handle.app_name in self._serving
+        return DevStatus(running=up, ready=up, port=3000, root_status=200 if up else None)
 
 
 class FakeBrain:

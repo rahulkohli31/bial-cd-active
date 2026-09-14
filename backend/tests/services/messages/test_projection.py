@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from typing import get_args
 
 import sqlalchemy as sa
@@ -45,6 +46,7 @@ from src.services.messages.projection import (
     PROPOSE_SLICE_TOOL,
     TELL_THE_USER_TOOL,
     TURN_TERMINAL_KIND,
+    WORKSPACE_DISCARDED_KIND,
     AssistantTextItem,
     BannerItem,
     BuildInProgressItem,
@@ -53,6 +55,7 @@ from src.services.messages.projection import (
     StepItem,
     TurnTerminalItem,
     UserTextItem,
+    WorkspaceDiscardedItem,
     _friendly_area,
     _user_text_and_refs,
     classify_command,
@@ -1963,6 +1966,27 @@ async def test_the_terminal_row_is_invisible_to_the_model(db_session) -> None:
         db_session, user_id=user.id, conversation_id=conversation.id, rehydrate=_no_refs
     )
     assert [type(m).__name__ for m in history] == ["ModelRequest", "ModelResponse"]
+
+
+async def test_a_discard_renders_as_its_own_line_whatever_its_saved_time_says(db_session) -> None:
+    """The row's payload is the model's note; the citizen sees `WorkspaceDiscardedItem`. A
+    `savedAt` that is not an instant renders the line without a time rather than failing."""
+    user, _, conversation = await _thread(db_session)
+    for saved_at in ("2026-09-13T14:32:00+00:00", "yesterday"):
+        await append_batch(
+            db_session,
+            user_id=user.id,
+            conversation_id=conversation.id,
+            messages=[ModelRequest(parts=[UserPromptPart(content="the code went back")])],
+            entry_kind=MessageEntryKind.SYSTEM_EVENT,
+            kind=ChatKind.BUILD,
+            meta={"kind": WORKSPACE_DISCARDED_KIND, "savedAt": saved_at},
+        )
+
+    assert project_rows(await _rows(db_session, user, conversation)) == [
+        WorkspaceDiscardedItem(seq=0, saved_at=datetime(2026, 9, 13, 14, 32, tzinfo=UTC)),
+        WorkspaceDiscardedItem(seq=1, saved_at=None),
+    ]
 
 
 # --- The renderer's own ceilings are gone ----------------------------------------------------

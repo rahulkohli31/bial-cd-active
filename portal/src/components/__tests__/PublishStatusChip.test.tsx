@@ -23,11 +23,21 @@ const h = vi.hoisted(() => ({
   usePublishState: vi.fn(),
   // The stub records what the chip handed the questionnaire, so a test can drive either
   // success back through the real `onConfirm` the chip supplied.
-  modal: { current: null as null | { rejectionNote?: string | null; onConfirm: (a: never) => Promise<void> } },
+  modal: {
+    current: null as null | {
+      rejectionNote?: string | null
+      alreadyApproved?: boolean
+      onConfirm: (a: never) => Promise<void>
+    },
+  },
 }))
 vi.mock('../../hooks/usePublishState', () => ({ usePublishState: h.usePublishState }))
 vi.mock('../DataClassificationModal', () => ({
-  default: (props: { rejectionNote?: string | null; onConfirm: (a: never) => Promise<void> }) => {
+  default: (props: {
+    rejectionNote?: string | null
+    alreadyApproved?: boolean
+    onConfirm: (a: never) => Promise<void>
+  }) => {
     h.modal.current = props
     return <div data-testid="data-classification-modal" />
   },
@@ -669,6 +679,29 @@ describe('one press, one request, and the server says which success it was', () 
 
     expect(await screen.findByTestId('data-classification-modal')).toBeTruthy()
     expect(h.modal.current?.rejectionNote).toBe('Say more about the data.')
+  })
+
+  it('tells the questionnaire when an approval already pins what is saved', async () => {
+    // Only this state means the press publishes; the sibling approved state sends the
+    // current work back. Mutation check: hardcode either value and one half goes red.
+    wire(view('approved_ready_to_publish', { approval: approval({ status: 'approved', approvedCommitSha: SHA }) }))
+    mount()
+    await openChip()
+    fireEvent.click(screen.getByTestId('publish-action'))
+    await screen.findByTestId('data-classification-modal')
+    expect(h.modal.current?.alreadyApproved).toBe(true)
+
+    cleanup()
+    wire(
+      view('approved_needs_review_again', {
+        approval: approval({ status: 'approved', approvedCommitSha: APPROVED_SHA }),
+      }),
+    )
+    mount()
+    await openChip()
+    fireEvent.click(screen.getByTestId('publish-action'))
+    await screen.findByTestId('data-classification-modal')
+    expect(h.modal.current?.alreadyApproved).toBe(false)
   })
 
   it('announces the started sentence when the deploy actually began', async () => {

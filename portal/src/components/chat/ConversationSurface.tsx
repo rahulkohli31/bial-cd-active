@@ -36,7 +36,7 @@ import type { BuildHandoff } from './OfferStrip'
 import ScrollToLatest from './ScrollToLatest'
 import SessionBanners from './SessionBanners'
 import TurnBanner from './TurnBanner'
-import { createConversation, listProjectConversations } from '../../utils/conversationApi'
+import { createConversation, discardNoticeText, listProjectConversations } from '../../utils/conversationApi'
 import type { ConversationHeader } from '../../utils/conversationApi'
 import { ApiError } from '../../utils/apiError'
 import { markAppVisible } from '../../utils/observe'
@@ -86,7 +86,7 @@ import type { TurnFrame, PlanOptionsItem, StepItem, DiagnosticFrame, StreamOutco
 import { contextState } from '../../utils/contextLimits'
 import { atLimitSendState, narrativeEnvelopes, turnPhase } from '../../utils/turnNarrative'
 import type { TurnNarrative } from '../../utils/turnNarrative'
-import { fetchSaveState, saveProject, handOverWorkspace, asReclaimBlocked, fetchPreviewState, fetchCompileState, checkWorkspace, samePreviewState } from '../../utils/buildSessionApi'
+import { discardUnsavedChanges, fetchSaveState, saveProject, handOverWorkspace, asReclaimBlocked, fetchPreviewState, fetchCompileState, checkWorkspace, samePreviewState } from '../../utils/buildSessionApi'
 import type { HandoverStep, ReclaimBlocked, PreviewState } from '../../utils/buildSessionApi'
 import { resolvePlanOptions } from '../../utils/turnStreamApi'
 import { wireMessageFromParts, buildUserParts, partsToText, countAttachments, releaseUploadedAttachments } from '../../utils/attachmentStore'
@@ -470,9 +470,13 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // apart by a render and let a consumer combine halves of two different readings — `SaveReading`
   // in `workspaceChannel.ts` records why that is the bug and not a nicety.
   const [saveReading, setSaveReading] = useState<SaveReading>(NO_SAVE_READING)
+  // Only the newest save-state answer may land: each read, and each Save, takes the next number.
+  const saveReadSeq = useRef(0)
   // The tri-state on its own, for the two consumers that genuinely only want the flag.
   const saveDirty = saveReading.dirty
   const [saving, setSaving] = useState(false)
+  const [discarding, setDiscarding] = useState(false)
+  const [hasSavedVersion, setHasSavedVersion] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   // `projectHasSavedBuild` arrives as a PROP, read once when the route resolved, and nothing
   // refetches it. But a Save is precisely the act that writes the snapshot bundle that flag
@@ -546,20 +550,24 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
    *  reload or a second tab — both of which lose in-memory state while the commits stay put. */
   const refreshSaveState = useCallback(async (activeProjectId: string | null) => {
     if (!activeProjectId) return
+    const read = ++saveReadSeq.current
     try {
       const state = await fetchSaveState(activeProjectId)
       // BOTH HALVES OF THE ONE ANSWER. Taking `state.dirty` alone was the whole of the reported
       // bug: the recovery instant arrived on the wire, was dropped here, and every surface
       // downstream was left announcing unsaved changes about a freshly built app the platform
       // could put back at any moment.
-      if (projectIdRef.current === activeProjectId) {
+      if (projectIdRef.current === activeProjectId && read === saveReadSeq.current) {
         setSaveReading({ dirty: state.dirty, recoveryAt: state.recoveryAt })
+        setHasSavedVersion(state.savedHead !== null)
       }
     } catch {
       // UNKNOWN, never "clean". A failed check must not report the work as safe — and it drops the
       // recovery instant with it rather than leaving the previous one standing beside a tri-state
       // that no longer came from the same read. A reading nobody has is not a reading.
-      if (projectIdRef.current === activeProjectId) setSaveReading(NO_SAVE_READING)
+      if (projectIdRef.current === activeProjectId && read === saveReadSeq.current) {
+        setSaveReading(NO_SAVE_READING)
+      }
     }
   }, [])
 
@@ -581,9 +589,12 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
         // bundle and destroys no recovery copy, and with `dirty` false nothing reads the instant
         // anyway. Inventing one here — or clearing one that still exists — would be this surface
         // reporting a fact it did not read.
+        // A read still on the wire describes the tree before this save, so it must not land after it.
+        saveReadSeq.current += 1
         setSaveReading((held) => ({ ...held, dirty: false }))
         // There is now a snapshot to relaunch from — say so without waiting for a reload.
         setSavedBuildProjectId(activeProjectId)
+        setHasSavedVersion(true)
       }
     } catch (err) {
       // Surfaced, never swallowed: a Save that silently fails leaves the user believing their
@@ -596,6 +607,45 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       }
     } finally {
       setSaving(false)
+    }
+  }
+
+  /** Put the saved version back. The answer is the save state after it, applied like Save's, and
+   *  the line this chat now carries — the same line its model reads on the next turn. A chat with
+   *  no messages yet has nothing for that line to correct, so it sends no conversation. */
+  const handleDiscard = async () => {
+    const activeProjectId = projectIdRef.current
+    if (!activeProjectId || discarding) return
+    setDiscarding(true)
+    setSaveError(null)
+    try {
+      const conversationId = buildId && messagesRef.current.some((m) => !m.ephemeral) ? buildId : null
+      const { saveState, notice } = await discardUnsavedChanges(activeProjectId, conversationId)
+      announceDeploymentChanged(activeProjectId)
+      if (projectIdRef.current === activeProjectId) {
+        saveReadSeq.current += 1
+        setSaveReading({ dirty: saveState.dirty, recoveryAt: saveState.recoveryAt })
+        setHasSavedVersion(saveState.savedHead !== null)
+        if (notice !== null) {
+          seqRef.current = Math.max(seqRef.current, notice.seq + 1)
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `srv_${notice.seq}_d_live`,
+              role: 'assistant',
+              parts: [{ type: 'text', text: discardNoticeText(notice.savedAt) }],
+              seq: notice.seq,
+              createdAt: new Date().toISOString(),
+            },
+          ])
+        }
+      }
+    } catch (err) {
+      if (projectIdRef.current === activeProjectId) {
+        setSaveError(err instanceof Error ? err.message : 'Could not discard your changes. Try again.')
+      }
+    } finally {
+      setDiscarding(false)
     }
   }
 
@@ -814,9 +864,13 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // shell's two exit guards arm on, and it is KEPT across an unmount, while these two are cleared
   // with their publisher. THE ROW WANTS THE FLAG ALONE, deliberately: its chip reports whether a
   // version exists, which is the question `dirty` answers, and a recovery copy is not one.
+  // Scoped to this project — see `turnRunning` on the pane view below, which reads the same value.
+  const turnRunningHere =
+    generatingChatId !== null &&
+    (generatingChatId === buildId || builds.some((b) => b.id === generatingChatId))
   usePublishSave(
-    { dirty: saveDirty, saving, error: saveError },
-    { save: handleSave, rename: null, share: null },
+    { dirty: saveDirty, saving, error: saveError, discarding, replying: turnRunningHere, hasSavedVersion },
+    { save: handleSave, discard: handleDiscard, rename: null, share: null },
   )
 
   // A genuine unmount must cancel the in-flight turn-stream reader — a chat switch already
@@ -2180,6 +2234,18 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // places `previewState` speaks for the workspace.
   const [polledPreview, setPolledPreview] = useState<{ projectId: string; state: PreviewState } | null>(null)
   const previewState = polledPreview?.projectId === projectId ? polledPreview.state : null
+  // A workspace that has just come up holds a tree no earlier save-state read saw — a start, a
+  // relaunch or a restore, none of which ends a turn. Only a move INTO `alive` asks; the first
+  // reading of a page is the mount read's job.
+  const previewLife = previewState?.state ?? null
+  const lastPreviewLife = useRef<typeof previewLife>(null)
+  useEffect(() => {
+    const before = lastPreviewLife.current
+    lastPreviewLife.current = previewLife
+    if (previewLife === 'alive' && before !== null && before !== 'alive') {
+      void refreshSaveState(projectId)
+    }
+  }, [previewLife, projectId, refreshSaveState])
   const address = resolvePreviewAddress({
     turnPreviewUrl: turnPreview.url,
     turnStatus: turnBuildStatus,
@@ -2841,9 +2907,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
        turn running on project A. `builds` is this project's conversations; the open chat is
        checked separately because a brand-new one is not in that list yet. */
     workspaceLost,
-    turnRunning:
-      generatingChatId !== null &&
-      (generatingChatId === buildId || builds.some((b) => b.id === generatingChatId)),
+    turnRunning: turnRunningHere,
     onFrameMessage: handleFrameMessage,
     /* This stop-clock. IT TRAVELS AS A PAYLOAD RATHER THAN A PROP so it survives this page being
        replaced: without it `project_to_app_visible_ms` stops being produced and

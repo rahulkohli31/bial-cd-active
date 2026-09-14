@@ -368,6 +368,9 @@ export default function AppStatusPanel({ projectId, label }: AppStatusPanelProps
           // A citizen who presses after a rejection reads WHY before anything else happens —
           // the note belongs in the flow they are in, not only on a panel beside it.
           rejectionNote={approval?.status === 'rejected' ? approval.rejectionNote : null}
+          // The one state where the approval pins what is saved; the server publishes it
+          // whatever the declaration scores.
+          alreadyApproved={state === 'approved_ready_to_publish'}
           onConfirm={async (answers) => {
             // Refusals THROW and the modal renders them itself, beside the button, with the
             // answers still on screen. Only the two successes and the unsaved-work question

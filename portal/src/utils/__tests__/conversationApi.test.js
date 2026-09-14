@@ -8,9 +8,11 @@ import {
   createConversation as mod_createConversation,
   createConversationStore,
   deriveTitle,
+  discardNoticeText,
 } from '../conversationApi'
 import { toStepItem } from '../turnStreamApi'
 import { OUTCOME_COPY, outcomeSummary } from '../messageTypes'
+import { formatStamp } from '../publishPresentation'
 
 // authFetch deps injection — no real token/network.
 const deps = (fetchImpl) => ({ fetchImpl, getToken: () => 'tok', refresh: vi.fn() })
@@ -280,6 +282,74 @@ describe('messagesFromProjection — the loud fallback arm', () => {
     } finally {
       spy.mockRestore()
     }
+  })
+})
+
+describe('discardNoticeText', () => {
+  it('names the saved instant when it is usable', () => {
+    const savedAt = '2026-09-10T10:38:43Z'
+    expect(discardNoticeText(savedAt)).toBe(
+      `You discarded the unsaved changes. Your app is back to the version you saved on ${formatStamp(savedAt)}.`,
+    )
+  })
+
+  it('falls back to the neutral sentence for null', () => {
+    expect(discardNoticeText(null)).toBe(
+      'You discarded the unsaved changes. Your app is back to the version you last saved.',
+    )
+  })
+
+  it('falls back to the neutral sentence for an unparseable instant', () => {
+    expect(discardNoticeText('not-a-date')).toBe(
+      'You discarded the unsaved changes. Your app is back to the version you last saved.',
+    )
+  })
+})
+
+describe('messagesFromProjection — workspace_discarded', () => {
+  it('renders the notice sentence naming when the restored version was saved', () => {
+    const savedAt = '2026-09-10T10:38:43Z'
+    const messages = messagesFromProjection([{ type: 'workspace_discarded', seq: 5, savedAt }])
+    expect(messages).toEqual([
+      {
+        id: 'srv_5_d_0',
+        role: 'assistant',
+        parts: [{ type: 'text', text: discardNoticeText(savedAt) }],
+        seq: 5,
+      },
+    ])
+    expect(messages[0].parts[0].text).toContain(formatStamp(savedAt))
+  })
+
+  it('falls back to the neutral sentence when savedAt is null', () => {
+    const messages = messagesFromProjection([{ type: 'workspace_discarded', seq: 5, savedAt: null }])
+    expect(messages[0].parts[0].text).toBe(
+      'You discarded the unsaved changes. Your app is back to the version you last saved.',
+    )
+  })
+
+  it('seals any open reply before the notice, and starts a fresh one after it', () => {
+    const messages = messagesFromProjection([
+      { type: 'assistant_text', seq: 1, text: 'working...' },
+      { type: 'workspace_discarded', seq: 2, savedAt: null },
+      { type: 'assistant_text', seq: 3, text: 'anything else?' },
+    ])
+    expect(messages).toHaveLength(3)
+    expect(messages.map((m) => m.role)).toEqual(['assistant', 'assistant', 'assistant'])
+  })
+
+  it('an unknown item type still reaches the unknown fallback', () => {
+    const onUnknown = vi.fn()
+    const messages = messagesFromProjection(
+      [
+        { type: 'workspace_discarded', seq: 1, savedAt: null },
+        { type: 'something_else_entirely', seq: 2 },
+      ],
+      onUnknown,
+    )
+    expect(onUnknown).toHaveBeenCalledTimes(1)
+    expect(onUnknown.mock.calls[0][0]).toMatchObject({ type: 'something_else_entirely' })
+    expect(messages).toHaveLength(1)
   })
 })
 

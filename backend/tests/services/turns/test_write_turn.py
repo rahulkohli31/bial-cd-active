@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import uuid
@@ -45,7 +46,7 @@ from pydantic_ai.models.function import (
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.v1.build_sessions.schemas import BuildError, ErrorSource
+from src.api.v1.build_sessions.schemas import BuildError, ErrorSource, PreviewLifeState
 from src.api.v1.conversations.schemas import (
     StepFrame,
     TextDeltaFrame,
@@ -60,6 +61,7 @@ from src.db.models.conversation import ChatKind
 from src.db.models.message import Message, MessageEntryKind
 from src.db.models.token_usage import TokenUsage
 from src.services.agent.mode_prompts import PromptContext, workspace_note
+from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions.alarms import HMR_PROTOCOL_DRIFT_EVENT
 from src.services.build_sessions.manager import (
     RecoveryNews,
@@ -71,7 +73,7 @@ from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.errors import from_client, from_tsc
 from src.services.orchestrator.selfheal import HealthState, VerifyOutcome
 from src.services.sandbox import DevStatus, SandboxError, SandboxHandle, ServedPage
-from src.services.sandbox.base import CompileReport, CompileState
+from src.services.sandbox.base import CompileReport, CompileState, ExecResult
 from src.services.sandbox.client import _ALREADY_RUNNING_PID
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import recovery_key, snapshot_key
@@ -100,7 +102,7 @@ from src.services.turns.engine import (
 )
 from src.services.turns.guard import _mid_reply
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
-from tests.fakes import FakeSandboxClient
+from tests.fakes import DevServerDownUntilStarted, FakeSandboxClient, a_git_bundle
 from tests.transcript import rendered_text
 
 _CTX = PromptContext(user_name="Ada", project_name="Visitors", project_description=None)
@@ -2824,6 +2826,69 @@ async def test_an_unrecoverable_workspace_also_frees_the_slot(
         "no workspace was taken, so the leak this test is about could not have happened"
     )
     assert manager.active_session_for(user.id) is None
+
+
+def _the_repository_is_gone(cmd: list[str]) -> ExecResult:
+    """A container back on its baked image: no repository, and a tree to set aside."""
+    if cmd[0] == "sh" and "rev-parse" in cmd[-1]:
+        return ExecResult(stdout="@@@@0@@", stderr="", exit=0)
+    if cmd[0] == "base64":
+        return ExecResult(
+            stdout=base64.b64encode(a_git_bundle("e" * 40)).decode(), stderr="", exit=0
+        )
+    return ExecResult(stdout="", stderr="", exit=0)
+
+
+async def test_a_turn_held_by_a_restore_leaves_a_serving_preview_behind(
+    _fresh_engine,
+    db_session,
+    session_factory,
+    fake_redis: aioredis.Redis,
+    fake_storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ The held turn is the last thing the citizen saw, so it must leave their app running.
+
+    Mutation check: remove the restore's `dev_start` and the preview is still STARTING after the
+    turn."""
+    monkeypatch.setattr(manager_module, "READINESS_POLL_S", 0)
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt-restored@rvaiglobal.com")
+    manager, client = SessionManager(), DevServerDownUntilStarted()
+    model, counts = _scripted([[_WROTE_A_FILE, _DECLARED_DONE], [_WROTE_A_FILE, _DECLARED_DONE]])
+
+    async def a_turn():
+        return await _run(
+            engine,
+            db_session,
+            session_factory,
+            model,
+            user=user,
+            project=project,
+            conv=conv,
+            manager=manager,
+            client=client,
+        )
+
+    _, first = await a_turn()
+    assert first.write_session is not None
+    app_id = first.write_session.app_id
+    client.attach_handle = first.write_session.handle
+    await fake_storage.put(
+        recovery_key(app_id), a_git_bundle("a" * 40), metadata={"head_sha": "a" * 40}
+    )
+    client.exec_handler = _the_repository_is_gone
+    requests_before = counts["requests"]
+
+    _, second = await a_turn()
+    for watcher in list(manager._tasks):
+        with contextlib.suppress(Exception):
+            await watcher
+
+    assert second.end_reason == "workspace_restored"
+    assert counts["requests"] == requests_before, "a held turn must not run the agent"
+    preview = await manager.project_preview_state(db_session, user, project.id)
+    assert preview.state is PreviewLifeState.ALIVE
 
 
 # --- the verify seam's own frame waits for a PAGE ---------------------------------------------

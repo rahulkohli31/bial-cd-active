@@ -179,7 +179,8 @@ def test_the_app_still_builds_with_its_full_route_surface() -> None:
     paths = list(app.openapi().get("paths", {}))
     build_session_paths = [p for p in paths if "build-session" in p]
 
-    # 19 build-session paths. Beyond the CRUD/turn set, this counts `projects/{project_id}/
+    # 20 build-session paths. Beyond the CRUD/turn set, this counts `projects/{project_id}/
+    # discard` (the saved version put back in the running container), `projects/{project_id}/
     # client-error` (the app's own in-browser error report), `projects/{project_id}/
     # compile-state` (the compile signal for a tab with no live turn — the turn stream's
     # producer stops at the terminal), `projects/{project_id}/workspace-check` (the idle-tab
@@ -205,8 +206,21 @@ def test_the_app_still_builds_with_its_full_route_surface() -> None:
     # removed together with the harness, the module-level build agent, and the run-build
     # dependency it was the sole door into, once the workspace moved onto the chat turn and
     # took away its only browser client.
-    assert len(build_session_paths) == 19, (
-        f"the C3 build-session route surface changed: expected 19 paths, found "
+    assert len(build_session_paths) == 20, (
+        f"the C3 build-session route surface changed: expected 20 paths, found "
         f"{len(build_session_paths)}. If a route was deliberately added or removed, amend C3 "
         f"and update this number in the same change.\n{sorted(build_session_paths)}"
     )
+
+
+def test_the_error_signature_module_reaches_nothing_in_services() -> None:
+    """The turn engine and the log configuration of every process import this, so it has to stay a
+    leaf: loading it must not pull in a single `src.services` module. Mutation check: add an import
+    from `src.services` to `core/error_signature.py` and this goes red."""
+    result = _import_in_fresh_interpreter(
+        "import importlib, sys;"
+        " importlib.import_module('src.core.error_signature');"
+        " print(sorted(m for m in sys.modules if m.startswith('src.services')))"
+    )
+    assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    assert result.stdout.strip() == "[]", result.stdout

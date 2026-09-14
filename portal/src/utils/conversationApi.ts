@@ -14,6 +14,7 @@ import { readApiError } from './apiError'
 import { toPlanOptionsItem, toStepItem } from './turnStreamApi'
 import { outcomeSummary } from './messageTypes'
 import type { BuildOutcomeStatus, ChatMessage, MessagePart } from './messageTypes'
+import { formatStamp, isUsableInstant } from './publishPresentation'
 
 /** The in-memory header shape pages expect, normalized from the server's raw doc.
  *
@@ -151,6 +152,14 @@ function bannerStatus(banner: unknown): BuildOutcomeStatus {
   return 'ended'
 }
 
+/** The Discard notice's sentence, dated only when the instant can be rendered. */
+export function discardNoticeText(savedAt: string | null): string {
+  if (isUsableInstant(savedAt)) {
+    return `You discarded the unsaved changes. Your app is back to the version you saved on ${formatStamp(savedAt)}.`
+  }
+  return 'You discarded the unsaved changes. Your app is back to the version you last saved.'
+}
+
 /**
  * Server projection items → the in-memory message shape the pages render
  * ({id, role, parts, seq}). The reload read returns DISPLAY ITEMS derived
@@ -167,6 +176,8 @@ function bannerStatus(banner: unknown): BuildOutcomeStatus {
  *     resolution state so live and reload agree;
  *   - `turn_terminal` — the durable record of HOW a turn ended, rendered as the outcome
  *     sentence when the ending needs explaining and silent when it does not (see its arm).
+ *   - `workspace_discarded` — the app was put back to its last saved version; rendered as a
+ *     plain sentence naming when that version was saved.
  *
  * @param onUnknown Injected so a test can assert the surfaced item rather than scrape the console.
  *   A parameter with a default rather than module state: every existing call site is unchanged and
@@ -368,6 +379,16 @@ export function messagesFromProjection(
       // no snapshot verdict — so synthesising one would answer the pane's question with a guess,
       // on every stopped Plan turn as well. The reload fix above supplies only the sentence, never
       // a build part.
+    } else if (item.type === 'workspace_discarded') {
+      seal()
+      messages.push({
+        id: `srv_${item.seq}_d_${index}`,
+        role: 'assistant',
+        parts: [
+          { type: 'text', text: discardNoticeText(typeof item.savedAt === 'string' ? item.savedAt : null) },
+        ],
+        seq: item.seq,
+      })
     } else {
       // THE LOUD FALLBACK ARM. Until this existed the chain simply ended, so an item type
       // this client did not recognise vanished with no error, no warning and no trace — on the

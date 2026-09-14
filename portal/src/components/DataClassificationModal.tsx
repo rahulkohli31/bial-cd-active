@@ -118,6 +118,13 @@ interface Props {
    * nothing to say — a caller passing `undefined` gets the same nothing.
    */
   rejectionNote?: string | null
+  /**
+   * An administrator has already approved the version this dialog asks about, so the
+   * server publishes it whatever the answers score — the approval pins that exact commit
+   * and outranks the declaration. The dialog has to know, or it promises a review the
+   * server will not perform and compels an explanation for a decision already taken.
+   */
+  alreadyApproved?: boolean
   onConfirm: (answers: DataClassificationAnswers) => Promise<void>
   onCancel: () => void
 }
@@ -125,6 +132,7 @@ interface Props {
 export default function DataClassificationModal({
   projectId,
   rejectionNote = null,
+  alreadyApproved = false,
   onConfirm,
   onCancel,
 }: Props): React.ReactElement {
@@ -283,8 +291,11 @@ export default function DataClassificationModal({
   // A weighted Yes anywhere means this submission is a review request, not a publish —
   // the action's label says so, and the same condition compels the explanation: a routed
   // app is never unexplained, and an explanation is never compelled on a declaration
-  // that was going to pass anyway.
-  const sendForReview = total > AUTO_DEPLOY_MAX_SCORE
+  // that was going to pass anyway. An APPROVAL OF THIS VERSION outranks the score, exactly
+  // as the server does: it publishes the pinned commit, so routing it again is an outcome
+  // this dialog cannot deliver and must not name.
+  const sensitiveRecorded = total > AUTO_DEPLOY_MAX_SCORE
+  const sendForReview = sensitiveRecorded && !alreadyApproved
   const notesRequired = sendForReview
   const notesBlank = notes.trim() === ''
   const confirmDisabled =
@@ -376,12 +387,18 @@ export default function DataClassificationModal({
   // handles some sensitive data but isn't refused — every nonzero total is both.
   let warning: string | null = null
   if (allAnswered) {
-    warning = notesRequired
-      ? "This app handles sensitive data — please explain how it's handled below."
+    if (notesRequired) {
+      warning = "This app handles sensitive data — please explain how it's handled below."
+    } else if (sensitiveRecorded) {
+      // Approved, and the data is still sensitive: saying nothing was flagged would
+      // contradict the Yes answers on the same screen.
+      warning = 'This app handles sensitive data, and an administrator approved this version.'
+    } else {
       // "Nothing flagged" has to be true of the RECORDED answers, not just the
       // developer's: the check's own Yes verdicts count, and this line used to say
       // nothing was flagged while the check had flagged two things on the same screen.
-      : 'Nothing sensitive was recorded — by you or by the automatic check.'
+      warning = 'Nothing sensitive was recorded — by you or by the automatic check.'
+    }
   }
 
   return (
@@ -591,13 +608,15 @@ export default function DataClassificationModal({
             <p data-testid="dc-score" className="mt-4 flex items-baseline gap-2 text-xs text-neutral">
               <span className="text-lg font-bold text-tertiary tabular-nums">{total}</span>
               <span>
-                {/* The SAME predicate the action label and the explanation prompt use —
-                    read off `sendForReview` rather than re-compared against the threshold,
-                    so this sentence cannot end up contradicting the button two rows below
-                    it if the rule ever moves. */}
+                {/* The SAME predicates the action label and the explanation prompt use —
+                    read off `sendForReview`/`sensitiveRecorded` rather than re-compared
+                    against the threshold, so this sentence cannot end up contradicting the
+                    button two rows below it if the rule ever moves. */}
                 {sendForReview
                   ? 'sensitive data recorded — this app will be sent to an administrator for review'
-                  : 'nothing sensitive recorded — this can publish without review'}
+                  : sensitiveRecorded
+                    ? 'sensitive data recorded — an administrator approved this version, so it publishes'
+                    : 'nothing sensitive recorded — this can publish without review'}
               </span>
             </p>
           )}

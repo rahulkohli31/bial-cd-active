@@ -33,6 +33,7 @@ from src.services.sandbox.base import (
     FleetMember,
     SandboxError,
     SandboxGoneError,
+    SandboxHandle,
     SandboxNotReadyError,
     identity_from_tags,
 )
@@ -466,6 +467,61 @@ async def test_restore_reconciles_deps_from_the_lockfile(
     # so an absent lockfile on either side can never fake a match and skip the reconcile.
     assert "|| echo baked-lock-missing" in script
     assert "|| echo snap-lock-missing" in script
+    await client.aclose()
+
+
+def _live_handle() -> SandboxHandle:
+    fqdn = f"{APP_NAME}.westeurope.azurecontainerapps.io"
+    return SandboxHandle(
+        fqdn=fqdn, token="tok", app_name=APP_NAME, preview_url=f"https://{fqdn}/", ready=True
+    )
+
+
+def _supervisor_answering(exit_code: int, captured: dict[str, object]) -> Handler:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/files":
+            return httpx.Response(200, json={"ok": True, "created": "app.bundle.b64"})
+        if request.url.path == "/_sup/exec":
+            captured["cmd"] = json.loads(request.content)["cmd"]
+            return httpx.Response(200, json={"stdout": "", "stderr": "", "exit": exit_code})
+        return httpx.Response(404)
+
+    return handler
+
+
+async def test_a_discard_resets_the_tree_in_place_and_reinstalls_only_for_a_new_lockfile(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """★ The Discard script: the saved tree replaces the live one inside the same container.
+
+    `reset --hard` puts HEAD on exactly the saved commit and `clean -fd` removes what the discarded
+    work added; without `-x` the ignored `node_modules` and `.next` stay. The reinstall runs only
+    when the reset changed the lockfile, measured before the fetch and after the clean."""
+    captured: dict[str, object] = {}
+    client = _client(FakeAca(), _supervisor_answering(0, captured))
+
+    await client.reset_to_bundle(_live_handle(), a_git_bundle())
+
+    cmd = captured["cmd"]
+    assert isinstance(cmd, list)
+    script = cmd[-1]
+    assert isinstance(script, str)
+    assert script.startswith("set -e; ")
+    assert script.index("baked_lock=") < script.index("git fetch -q /tmp/bial-app.bundle HEAD")
+    assert script.index("git fetch") < script.index("git reset -q --hard FETCH_HEAD;")
+    assert script.index("git reset -q --hard FETCH_HEAD;") < script.index("git clean -q -fd;")
+    assert script.index("git clean -q -fd;") < script.index("snap_lock=")
+    assert script.index('[ "$baked_lock" = "$snap_lock" ]') < script.index("npm install")
+    assert "git checkout" not in script
+    assert "-x" not in script.split("git clean", 1)[1].split(";", 1)[0]
+    await client.aclose()
+
+
+async def test_a_discard_script_that_fails_is_a_sandbox_error(fake_redis: aioredis.Redis) -> None:
+    client = _client(FakeAca(), _supervisor_answering(128, {}))
+
+    with pytest.raises(SandboxError, match="exit 128"):
+        await client.reset_to_bundle(_live_handle(), a_git_bundle())
     await client.aclose()
 
 

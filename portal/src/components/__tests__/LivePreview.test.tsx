@@ -2000,3 +2000,79 @@ describe('★ a document nothing vouches for is covered, and a document nothing 
     expect(container.querySelector('iframe')).toBeNull()
   })
 })
+
+describe('the starter page asking whether a build is running', () => {
+  /**
+   * Put the starter page's question to the pane and return every answer it posted back. The spy is
+   * taken on the frame's current window each call, because a remount replaces the window an answer
+   * would land in.
+   */
+  function askAboutTheBuild(
+    container: HTMLElement,
+    source?: Window | null,
+    origin: string = SANDBOX_ORIGIN,
+  ) {
+    const win = frameOf(container).contentWindow
+    if (!win) throw new Error('askAboutTheBuild(): the pane framed no window to answer')
+    const answered = vi.spyOn(win, 'postMessage').mockImplementation(() => {})
+    try {
+      postToPane(source === undefined ? win : source, { type: 'bial:turn-ask' }, origin)
+      return [...answered.mock.calls]
+    } finally {
+      answered.mockRestore()
+    }
+  }
+
+  it('answers its own frame with whether a build is running, at the preview origin', () => {
+    const { container, rerender } = render(
+      <LivePreview previewUrl={SANDBOX_URL} status="ready" turnRunning />,
+    )
+    expect(askAboutTheBuild(container)).toEqual([
+      [{ type: 'bial:turn', running: true }, SANDBOX_ORIGIN],
+    ])
+
+    rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" turnRunning={false} />)
+    expect(askAboutTheBuild(container)).toEqual([
+      [{ type: 'bial:turn', running: false }, SANDBOX_ORIGIN],
+    ])
+  })
+
+  it('stays silent to any other window or origin', () => {
+    const { container } = render(
+      <LivePreview previewUrl={SANDBOX_URL} status="ready" turnRunning />,
+    )
+    expect(askAboutTheBuild(container, window)).toEqual([])
+    expect(askAboutTheBuild(container, undefined, 'https://another-app.example')).toEqual([])
+    // Liveness for both silences: the same pane does answer its own frame.
+    expect(askAboutTheBuild(container)).toHaveLength(1)
+  })
+
+  it('keeps the question out of the client-error relay', () => {
+    const onFrameMessage = vi.fn()
+    const { container } = render(
+      <LivePreview previewUrl={SANDBOX_URL} status="ready" onFrameMessage={onFrameMessage} />,
+    )
+    expect(askAboutTheBuild(container)).toHaveLength(1)
+    expect(onFrameMessage).not.toHaveBeenCalled()
+
+    const clientError = { type: 'bial:client-error', message: 'ReferenceError: x is not defined' }
+    postToPane(frameOf(container).contentWindow, clientError)
+    expect(onFrameMessage).toHaveBeenCalledWith(clientError)
+  })
+
+  it('uses the same two message types as the starter page', async () => {
+    // Matched by value across the portal and the sandbox template: a rename on either side still
+    // compiles, and the starter page simply never hears an answer.
+    const { readFileSync } = await import('node:fs')
+    const path = await import('node:path')
+    const pane = (await import('../LivePreview?raw')).default as string
+    const starter = readFileSync(
+      path.resolve(process.cwd(), '../sandbox/template/app/page.tsx'),
+      'utf8',
+    )
+    expect(pane).toMatch(/const TURN_ASK_TYPE = 'bial:turn-ask'/)
+    expect(pane).toMatch(/const TURN_TYPE = 'bial:turn'/)
+    expect(starter).toMatch(/const TURN_ASK_TYPE = "bial:turn-ask"/)
+    expect(starter).toMatch(/const TURN_TYPE = "bial:turn"/)
+  })
+})

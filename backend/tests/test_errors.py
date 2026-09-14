@@ -69,12 +69,11 @@ def test_unhandled_handler_returns_generic_500() -> None:
 
 
 def _rendered(exc: BaseException) -> str:
-    """The two renderings the configured loggers actually produce from `exc_info`, joined.
+    """Every rendering of `exc_info` a logger could produce, joined.
 
-    `src/main.py` configures a `ConsoleRenderer` in development and a `JSONRenderer` in
-    production; the first writes the formatted traceback (which embeds `str(exc)` for every
-    exception in the chain), the second serialises the exception object with `repr`. A leak in
-    either is a leak, so both are searched at once.
+    The configured chain (`core/log_config.py`) logs an exception as its signature, but anything
+    else handed the exception — a formatted traceback, which embeds `str(exc)` for every exception
+    in the chain, or its `repr` — must not leak either, so both are searched at once.
     """
     return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)) + repr(exc)
 

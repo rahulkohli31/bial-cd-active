@@ -71,10 +71,8 @@ log the place its payload lives."""
 # WHAT THEY BIND, AND WHAT THEY MUST NOT. `app_id` and the file's SUFFIX. Never the display name
 # (citizen-supplied text), never the path, and never `handle` — it carries the live supervisor
 # bearer, which is the rule `SandboxSession` states for itself. Explicit fields rather than
-# `exc_info=True` for the same reason every other diagnostic here does: `main.py`'s processor
-# chain has neither `format_exc_info` nor `dict_tracebacks`, so in production `exc_info=True`
-# renders the literal `"exc_info": true`, and in dev `ConsoleRenderer` prints this frame's locals
-# — the session among them.
+# `exc_info=True`: the configured chain (`core/log_config.py`) reduces an exception to its class
+# chain and raise site, which names the failure but carries none of these facts.
 
 
 def _suffix_of(path: str) -> str:

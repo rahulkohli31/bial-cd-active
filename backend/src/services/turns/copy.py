@@ -299,7 +299,7 @@ daily budget and the run bounds use, so the reassurance is verified rather than 
 
 NOT A CLAIM ABOUT 2026-09-11. That incident's generic failure is still unexplained: Foundry's
 metrics for the minute show only status 200, no errors and no client-closed requests. The terminal
-row's `error` field (`engine.py::_error_signature`) is what records the real cause next time."""
+row's `error` field (`core.error_signature`) is what records the real cause next time."""
 
 MODEL_UNAVAILABLE_PLAN_TEXT: Final = (
     "The assistant's service stopped responding partway through. "

@@ -602,3 +602,49 @@ async def promote_parked(app_id: uuid.UUID, *, key: str) -> Promotion:
         await _store_it(store, recovery_key(app_id), _BundledTree(head_sha=head_sha, data=data))
     _log.warning("parked_tree_promoted", app_id=str(app_id), key=key, head_sha=head_sha)
     return Promotion(True, f"the recovery slot now holds {head_sha}")
+
+
+class NothingSavedToGoBackToError(Exception):
+    """A discard was asked for, and this app has no saved version to go back to."""
+
+    def __init__(self, app_id: uuid.UUID) -> None:
+        super().__init__(f"app {app_id} has no saved version")
+        self.app_id = app_id
+
+
+@dataclass(frozen=True)
+class SavedVersion:
+    """The version a discard put back, and where the tree it replaced was parked."""
+
+    head_sha: str
+    saved_at: datetime | None
+    parked_at: str
+
+
+async def discard_back_to_saved(
+    sandbox_client: SandboxClient,
+    handle: SandboxHandle,
+    app_id: uuid.UUID,
+    *,
+    taken_at: datetime,
+) -> SavedVersion:
+    """Put the saved version back into the live container, keeping the tree it replaces.
+
+    Under the per-app lock, so a Save or an autosave waits: park the live tree in quarantine,
+    write the saved bundle into the recovery slot, then reset the container. The store moves
+    first: if the reset fails, the container still holds work descending from the saved head, and
+    the next turn finds it intact. The slot is overwritten, never emptied — an empty slot reads as
+    an app that was never built."""
+    store = _the_store_first()
+    async with _serialized_per_app(app_id):
+        meta = await store.head(snapshot_key(app_id))
+        if meta is None:
+            raise NothingSavedToGoBackToError(app_id)
+        data = await store.get(snapshot_key(app_id))
+        saved = _BundledTree(head_sha=parse_bundle_head_sha(data), data=data)
+        parked = Destination.quarantine(app_id, taken_at).key
+        live = await _bundle_the_tree(sandbox_client, handle, _SaveStepTimings())
+        await _store_it(store, parked, live)
+        await _store_it(store, recovery_key(app_id), saved)
+        await sandbox_client.reset_to_bundle(handle, saved.data)
+    return SavedVersion(head_sha=saved.head_sha, saved_at=meta.last_modified, parked_at=parked)

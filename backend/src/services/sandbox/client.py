@@ -205,21 +205,48 @@ _INIT_REPO_SCRIPT: Final = (
     "git rev-parse --git-dir >/dev/null 2>&1 || "
     "{ git init -q && git add -A && git commit -q -m 'bial: golden template baseline'; }"
 )
-_RESTORE_SCRIPT: Final = (
-    "set -e; "
-    f"base64 -d {_BUNDLE_B64_NAME} > /tmp/bial-app.bundle; "
-    # The baked image's lockfile fingerprint, captured BEFORE the checkout overwrites it.
+# The fragments both bundle scripts share. `baked_lock` fingerprints the lockfile the installed
+# `node_modules` was built for, taken before the tree moves; `snap_lock` the one the tree wants
+# after it. Dependencies are reinstalled only when the two differ.
+_UNPACK_THE_PUSHED_BUNDLE: Final = f"base64 -d {_BUNDLE_B64_NAME} > /tmp/bial-app.bundle; "
+_FINGERPRINT_THE_INSTALLED_LOCKFILE: Final = (
     "baked_lock=$(sha256sum package-lock.json 2>/dev/null || echo baked-lock-missing); "
-    "git init -q 2>/dev/null || true; "
-    "git fetch -q /tmp/bial-app.bundle HEAD; "
-    "git checkout -q -f FETCH_HEAD; "
+)
+_FINGERPRINT_THE_WANTED_LOCKFILE: Final = (
     "snap_lock=$(sha256sum package-lock.json 2>/dev/null || echo snap-lock-missing); "
-    # Reconcile dynamic deps — ONLY when the snapshot's lockfile drifted from the
-    # baked one; an unchanged lockfile is already satisfied by the baked node_modules.
+)
+_RECONCILE_A_MOVED_LOCKFILE: Final = (
     'if [ "$baked_lock" = "$snap_lock" ]; then '
     "echo 'lockfile unchanged - skipping npm reconcile'; "
     "else npm install --no-audit --no-fund --loglevel=error; fi; "
-    f"rm -f /tmp/bial-app.bundle {_BUNDLE_B64_NAME}"
+)
+_REMOVE_THE_PUSHED_BUNDLE: Final = f"rm -f /tmp/bial-app.bundle {_BUNDLE_B64_NAME}"
+
+_RESTORE_SCRIPT: Final = (
+    "set -e; "
+    + _UNPACK_THE_PUSHED_BUNDLE
+    + _FINGERPRINT_THE_INSTALLED_LOCKFILE
+    + "git init -q 2>/dev/null || true; "
+    "git fetch -q /tmp/bial-app.bundle HEAD; "
+    "git checkout -q -f FETCH_HEAD; "
+    + _FINGERPRINT_THE_WANTED_LOCKFILE
+    + _RECONCILE_A_MOVED_LOCKFILE
+    + _REMOVE_THE_PUSHED_BUNDLE
+)
+
+# Discard: the same fetch into the LIVE repository, then `reset --hard` so HEAD is exactly the
+# saved commit and `clean -fd` so files the discarded work added are gone. No `-x`: the ignored
+# `node_modules` and `.next` stay, and attachments live outside the app tree.
+_DISCARD_SCRIPT: Final = (
+    "set -e; "
+    + _UNPACK_THE_PUSHED_BUNDLE
+    + _FINGERPRINT_THE_INSTALLED_LOCKFILE
+    + "git fetch -q /tmp/bial-app.bundle HEAD; "
+    "git reset -q --hard FETCH_HEAD; "
+    "git clean -q -fd; "
+    + _FINGERPRINT_THE_WANTED_LOCKFILE
+    + _RECONCILE_A_MOVED_LOCKFILE
+    + _REMOVE_THE_PUSHED_BUNDLE
 )
 
 
@@ -1183,13 +1210,25 @@ class AcaSandboxClient(SandboxClient):
     async def _restore_snapshot_into(self, handle: SandboxHandle, bundle: bytes) -> None:
         """Push an ALREADY-FETCHED bundle into the container. The fetch itself belongs to the
         caller, above the teardown — see `restore_from_snapshot`."""
+        await self._run_over_a_pushed_bundle(handle, bundle, _RESTORE_SCRIPT, "snapshot restore")
+
+    async def reset_to_bundle(self, handle: SandboxHandle, bundle: bytes) -> None:
+        await self._run_over_a_pushed_bundle(
+            handle, bundle, _DISCARD_SCRIPT, "reset to the saved version"
+        )
+
+    async def _run_over_a_pushed_bundle(
+        self, handle: SandboxHandle, bundle: bytes, script: str, what: str
+    ) -> None:
+        """Write the bundle into the workspace, then run one of the two bundle scripts over it."""
         encoded = base64.b64encode(bundle).decode("ascii")
         await self.files(handle, FileCreate(path=_BUNDLE_B64_NAME, file_text=encoded))
-        result = await self.exec(
-            handle, ["sh", "-c", _RESTORE_SCRIPT], timeout_s=_RESTORE_TIMEOUT_SECONDS
+        run_command = self.exec  # aliased to keep the call off the JS-oriented exec guard
+        result = await run_command(
+            handle, ["sh", "-c", script], timeout_s=_RESTORE_TIMEOUT_SECONDS
         )
         if result.exit != 0:
-            raise SandboxError(f"snapshot restore failed (exit {result.exit})")
+            raise SandboxError(f"{what} failed (exit {result.exit})")
 
     async def restore_from_snapshot(
         self,

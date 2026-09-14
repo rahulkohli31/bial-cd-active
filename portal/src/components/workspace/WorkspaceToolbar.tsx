@@ -13,15 +13,15 @@
  * it re-shaped the row under the reader on a cold `/chat/{id}` open (bookmark, reload, hand-over
  * from a plan chat). It deliberately does NOT read the `pane` cell (republished every keystroke,
  * cleared on unmount) — either fact alone disqualifies it. `heading` comes from the ROUTES so a
- * cold open still renders the row's full height and back control while data resolves. Save reads
- * its values/action from the `save`/`actions` cells at press time, so a handler whose identity
- * changes every render costs nothing and no stale closure is reachable.
+ * cold open still renders the row's full height and back control while data resolves. Save and
+ * Discard read their values from the `save` cell and their actions from `actions` at press time, so
+ * a handler whose identity changes every render costs nothing and no stale closure is reachable.
  *
  * NOT HERE: the history-drawer control. Four boards draw its icon, but the drawer is a later
  * feature by the owner's decision — an affordance for a drawer nobody can open is worse than
  * no affordance, so it is neither built nor left as a disabled stub.
  */
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import {
   ChevronLeft,
   ChevronRight,
@@ -31,11 +31,14 @@ import {
   Pencil,
   RotateCcw,
   Save,
+  Undo2,
   UserPlus,
 } from 'lucide-react'
 import PublishStatusChip from '../PublishStatusChip'
 import { BusyGlyph, useElapsedSeconds, ELAPSED_AFTER_MS } from '../ui/Waiting'
+import { usePublishState } from '../../hooks/usePublishState'
 import { chatKindFor } from '../../utils/chatKind'
+import DiscardChangesDialog from './DiscardChangesDialog'
 import { useRailSlot, useWorkspaceActions, useWorkspaceAddress, useWorkspaceHeading, useWorkspacePaneVisible, useWorkspaceSave } from './workspaceChannel'
 import type { SaveSlot, WorkspaceActions } from './workspaceChannel'
 import { DEVICES, type DeviceName } from './devices'
@@ -324,6 +327,7 @@ export default function WorkspaceToolbar({
           </>
         )}
 
+        <DiscardControl save={save} readActions={readActions} projectId={heading.projectId} />
         <SaveControl save={save} readActions={readActions} />
 
         {/* THE COLLAPSE, ON THE ROW RATHER THAN ON THE PANE OR IN THE RAIL. A collapsed rail is
@@ -364,7 +368,7 @@ export default function WorkspaceToolbar({
  * moving; a production save was measured at forty seconds.
  */
 function SaveControl({ save, readActions }: { save: SaveSlot; readActions: () => WorkspaceActions }) {
-  const { dirty, saving, error, canSave } = save
+  const { dirty, saving, discarding, error, canSave } = save
   // Before the early return: hooks may not sit behind a conditional, and `dirty === null` is a
   // real render path here rather than an edge case.
   const elapsed = useElapsedSeconds(saving)
@@ -426,14 +430,14 @@ function SaveControl({ save, readActions }: { save: SaveSlot; readActions: () =>
           type="button"
           data-testid="save-project"
           // `aria-disabled`, NEVER `disabled`: a disabled control throws focus to the document body.
-          aria-disabled={saving || dirty === false}
+          aria-disabled={saving || discarding || dirty === false}
           // THE THIRD REGISTER, and a silent one: `aria-busy` is what a reader consults when asked
           // rather than something it speaks, so it costs the wait's sentence nothing. `undefined`
           // when idle — `aria-busy={false}` would ship a permanent `aria-busy="false"` on a control
           // that is not waiting, which is a state where the honest answer is no answer.
           aria-busy={saving || undefined}
           onClick={() => {
-            if (saving || dirty === false) return
+            if (saving || discarding || dirty === false) return
             readActions().save?.()
           }}
           className={`${shell} transition ${saving ? 'opacity-70' : ''}`}
@@ -447,4 +451,81 @@ function SaveControl({ save, readActions }: { save: SaveSlot; readActions: () =>
       )}
     </span>
   )
+}
+
+/** Why Discard cannot be pressed right now, or `null` when it can. */
+function discardRefusal({ discarding, saving, replying, dirty, hasSavedVersion }: SaveSlot): string | null {
+  if (discarding) return 'Discarding your changes'
+  if (saving) return 'Wait for the save to finish'
+  if (replying) return 'Wait for the reply to finish'
+  if (dirty === false) return 'No unsaved changes'
+  if (!hasSavedVersion) return 'Nothing saved yet to go back to'
+  return null
+}
+
+/**
+ * DISCARD, immediately left of Save and drawn in the same shell. It is on screen whenever Save is a
+ * pressable control, and pressable only with unsaved work over a saved version; every other state
+ * is dimmed and says why in its tooltip. `aria-disabled`, never `disabled`, for Save's reason.
+ */
+function DiscardControl({
+  save,
+  readActions,
+  projectId,
+}: {
+  save: SaveSlot
+  readActions: () => WorkspaceActions
+  projectId: string | null
+}) {
+  const [confirming, setConfirming] = useState(false)
+  if (save.dirty === null || !save.canDiscard) return null
+
+  const refusal = discardRefusal(save)
+  const look = refusal === null ? 'text-tertiary transition hover:text-danger' : 'cursor-not-allowed text-neutral opacity-50'
+  const close = () => setConfirming(false)
+  const confirm = async () => {
+    await readActions().discard?.()
+    setConfirming(false)
+  }
+  return (
+    <>
+      <button
+        type="button"
+        data-testid="discard-changes"
+        aria-disabled={refusal !== null}
+        aria-busy={save.discarding || undefined}
+        title={refusal ?? 'Go back to the version you last saved'}
+        onClick={() => {
+          if (refusal === null) setConfirming(true)
+        }}
+        className={`inline-flex items-center gap-[7px] whitespace-nowrap rounded-[9px] border border-bial-border bg-white px-[13px] py-1.5 text-[12.5px] font-semibold narrow:min-h-[44px] ${look}`}
+      >
+        <span role="status" aria-live="polite" className="inline-flex items-center gap-[7px]">
+          {save.discarding ? <BusyGlyph size={14} testId="discard-spinner" /> : <Undo2 size={14} />}
+          {save.discarding ? 'Discarding…' : null}
+        </span>
+        {!save.discarding && 'Discard'}
+      </button>
+      {confirming &&
+        (projectId === null ? (
+          <DiscardChangesDialog savedAt={null} onClose={close} onConfirm={confirm} />
+        ) : (
+          <DiscardConfirmation projectId={projectId} onClose={close} onConfirm={confirm} />
+        ))}
+    </>
+  )
+}
+
+/** The dialog, dated from the same deployment read as the rail's LAST SAVED row. */
+function DiscardConfirmation({
+  projectId,
+  onClose,
+  onConfirm,
+}: {
+  projectId: string
+  onClose: () => void
+  onConfirm: () => Promise<void>
+}) {
+  const { deployment } = usePublishState(projectId)
+  return <DiscardChangesDialog savedAt={deployment?.savedAt ?? null} onClose={onClose} onConfirm={onConfirm} />
 }

@@ -35,6 +35,7 @@ _MUTATING_POSTS = [
     # is `projects/{project_id}/stop-active-build`, below.
     "/v1/build-sessions/internal/reap",
     "/v1/build-sessions/projects/{project_id}/save",
+    "/v1/build-sessions/projects/{project_id}/discard",
     "/v1/build-sessions/projects/{project_id}/client-error",
     "/v1/build-sessions/projects/{project_id}/workspace-check",
     "/v1/build-sessions/internal/apps/{app_id}/parked",

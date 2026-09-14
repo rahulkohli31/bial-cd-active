@@ -43,6 +43,7 @@ from typing import Final, Literal
 import redis.asyncio as aioredis
 import sqlalchemy as sa
 import structlog
+from pydantic_ai.messages import ModelRequest, UserPromptPart
 from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -58,7 +59,9 @@ from src.api.v1.build_sessions.schemas import (
 from src.config import settings
 from src.db.base import async_session_factory
 from src.db.models.app_registry import AppRegistry
+from src.db.models.conversation import Conversation
 from src.db.models.harness_counter import HarnessCounter
+from src.db.models.message import Message, MessageEntryKind
 from src.db.models.project import Project
 from src.db.models.user import User
 from src.services.build_sessions.alarms import (
@@ -68,6 +71,7 @@ from src.services.build_sessions.alarms import (
     BUILD_WORKSPACE_CLAIMED_EVENT,
     PREVIEW_STATE_REPORTED_UNKNOWN_EVENT,
     RECOVERY_WRITE_DID_NOT_LAND_EVENT,
+    SANDBOX_DEV_STARTED_EVENT,
     SANDBOX_TORN_DOWN_EVENT,
     SERVING_PROOF_STAMP_REFUSED,
     WORKSPACE_LOST_WHILE_IDLE_EVENT,
@@ -120,11 +124,15 @@ from src.services.build_sessions.snapshot import (
     SNAPSHOT_EXECS,
     Destination,
     RecoveryOutcome,
+    SavedVersion,
     consecutive_diverts,
+    discard_back_to_saved,
     write_recovery_copy,
     write_snapshot,
 )
 from src.services.lake.copy import schedule_window_copy
+from src.services.messages.projection import WORKSPACE_DISCARDED_KIND
+from src.services.messages.store import SeqContentionError, append_batch
 from src.services.orchestrator.constants import READINESS_POLL_S
 from src.services.redis import RedisNotConfiguredError, get_redis
 from src.services.redis.keys import (
@@ -695,6 +703,16 @@ class SaveState:
 
 
 @dataclass(frozen=True)
+class DiscardOutcome:
+    """What a discard leaves: the save state after it, when the version it put back was saved,
+    and the seq of the note written into each conversation, by conversation id."""
+
+    state: SaveState
+    saved_at: datetime | None
+    notes: dict[uuid.UUID, int]
+
+
+@dataclass(frozen=True)
 class PreviewState:
     """What is (or is not) serving this project right now. `alive` is DERIVED rather than
     stored: as a field, `False` meant "never built" and "another project took the slot" and
@@ -920,6 +938,69 @@ async def _snapshot_written_at(app_id: uuid.UUID) -> datetime | None:
     return meta.last_modified if meta else None
 
 
+def _discard_note(saved_at: datetime | None) -> str:
+    """What a conversation's next reply is told after a discard: the code went back, so read it
+    again rather than trusting what the conversation says about it."""
+    when = f" on {saved_at.astimezone(UTC):%d %b %Y at %H:%M} UTC" if saved_at else ""
+    return (
+        "<system-note>The user discarded every unsaved change to this app. Its files are now "
+        f"exactly the version they saved{when}. Anything changed after that save, including "
+        "changes made earlier in this conversation, no longer exists. Read the files again "
+        "before relying on what they contain.</system-note>"
+    )
+
+
+async def _note_the_discard(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    *,
+    origin: uuid.UUID | None,
+    saved: SavedVersion,
+) -> dict[uuid.UUID, int]:
+    """Write the discard note into the conversation it came from and into every other one of the
+    project that spoke since the save; return each note's seq by conversation id.
+
+    Owner- and project-scoped, so an origin from anywhere else matches nothing. A conversation
+    whose seq cannot be allocated goes without: the discard has already happened, and failing it
+    now would tell the user their changes are still there."""
+    spoke = sa.exists().where(Message.conversation_id == Conversation.id)
+    if saved.saved_at is not None:
+        spoke = spoke.where(Message.created_at > saved.saved_at)
+    told = [spoke] if origin is None else [spoke, Conversation.id == origin]
+    conversations = (
+        await db.execute(
+            sa.select(Conversation.id, Conversation.kind).where(
+                Conversation.user_id == user_id,
+                Conversation.project_id == project_id,
+                sa.or_(*told),
+            )
+        )
+    ).all()
+    note = ModelRequest(parts=[UserPromptPart(content=_discard_note(saved.saved_at))])
+    notes: dict[uuid.UUID, int] = {}
+    for conversation_id, kind in conversations:
+        try:
+            stored = await append_batch(
+                db,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                messages=[note],
+                entry_kind=MessageEntryKind.SYSTEM_EVENT,
+                kind=kind,
+                meta={
+                    "kind": WORKSPACE_DISCARDED_KIND,
+                    "savedAt": saved.saved_at.isoformat() if saved.saved_at else None,
+                    "savedHead": saved.head_sha,
+                },
+            )
+        except SeqContentionError:
+            _log.warning("discard_note_not_written", conversation_id=str(conversation_id))
+            continue
+        notes[conversation_id] = stored.seq
+    return notes
+
+
 async def _sandbox_name_for_existing_app(
     db: AsyncSession, user_id: uuid.UUID, project_id: uuid.UUID
 ) -> str | None:
@@ -970,11 +1051,13 @@ def _registry_serves_and_is_ready(reg: dict[str, str], app_name: str) -> bool:
     )
 
 
-# WHICH watcher won the race to see the app answer. Only the two this module can emit are
+# WHICH watcher won the race to see the app answer. Only the ones this module can emit are
 # spelled here; `alarms.APP_FIRST_SERVED_EVENT` holds the whole vocabulary, the rest of which
 # belongs to the turn watcher and the reconciler. A closed Literal so a typo cannot mint an
 # observer that never existed.
-_ServingObserver = Literal["relaunch_wait", "relaunch_continuation"]
+_ServingObserver = Literal[
+    "relaunch_wait", "relaunch_continuation", "restore_continuation", "discard_continuation"
+]
 
 
 async def _record_the_first_serve(
@@ -1772,6 +1855,45 @@ class SessionManager:
         # settle its indicator, and one that did not exist a moment ago.
         saved = await container_state(sandbox_client, handle)
         return SaveOutcome(app_id=app_id, head_sha=saved.head if saved else None)
+
+    async def discard_unsaved_changes(
+        self,
+        db: AsyncSession,
+        user: User,
+        project_id: uuid.UUID,
+        *,
+        sandbox_client: SandboxClient,
+        conversation_id: uuid.UUID | None,
+    ) -> DiscardOutcome:
+        """THE DISCARD — the project's app goes back to the version its owner last saved.
+
+        Refuses while ANY session holds the container, not only a writing one as Save does: a Plan
+        reply reading files must not have them reset under it. The start lock keeps a turn from
+        attaching mid-discard. The conversation the discard came from, and every other one of the
+        project that spoke since the save, gets a note its next reply reads."""
+        app_id = await existing_app_id(db, user.id, project_id)
+        if app_id is None:
+            raise NoLiveSandboxError(project_id)
+        async with self._start_lock_for(user.id):
+            if self._live_session_holds(user.id, app_id):
+                raise BuildSessionConflictError(self._active_by_user.get(user.id))
+            handle = await self._attach_for_read(user.id, app_id, sandbox_client)
+            saved = await discard_back_to_saved(
+                sandbox_client, handle, app_id, taken_at=datetime.now(UTC)
+            )
+        await self._boot_the_tree_we_put_back(sandbox_client, handle, user.id, arm="discard")
+        notes = await _note_the_discard(
+            db, user.id, project_id, origin=conversation_id, saved=saved
+        )
+        _log.info(
+            "workspace_discarded",
+            app_id=str(app_id),
+            saved_head=saved.head_sha,
+            parked_at=saved.parked_at,
+            conversations_noted=len(notes),
+        )
+        state = await self._save_state_of(sandbox_client, handle, app_id)
+        return DiscardOutcome(state=state, saved_at=saved.saved_at, notes=notes)
 
     async def project_compile_state(
         self,
@@ -2896,6 +3018,7 @@ class SessionManager:
             app_name=app_name,
             already_waited_s=already_waited_s,
             cold=cold,
+            observer="relaunch_continuation",
         )
 
     def _keep_watching_for_a_first_serve(
@@ -2908,6 +3031,7 @@ class SessionManager:
         app_name: str,
         already_waited_s: float,
         cold: bool,
+        observer: _ServingObserver,
     ) -> None:
         """Detach the bounded continuation and return immediately.
 
@@ -2929,6 +3053,7 @@ class SessionManager:
                 app_name=app_name,
                 already_waited_s=already_waited_s,
                 cold=cold,
+                observer=observer,
             )
         )
         self._tasks.add(watcher)
@@ -2944,6 +3069,7 @@ class SessionManager:
         app_name: str,
         already_waited_s: float,
         cold: bool,
+        observer: _ServingObserver,
     ) -> None:
         """Keep asking whether the app has started SHOWING A PAGE, for one more cold budget, then
         stop — either way with a line saying which. NEVER RAISES: nothing awaits this task, so
@@ -3003,7 +3129,7 @@ class SessionManager:
                         redis,
                         user_id,
                         app_name=app_name,
-                        observer="relaunch_continuation",
+                        observer=observer,
                         cold=cold,
                     )
                     return
@@ -3020,7 +3146,7 @@ class SessionManager:
                 APP_FIRST_SERVE_NOT_OBSERVED_EVENT,
                 waited_ms=int((already_waited_s + (loop.time() - started_at)) * 1000),
                 budget_ms=int((already_waited_s + _COLD_READY_BUDGET_SECONDS) * 1000),
-                arm="relaunch_continuation",
+                arm=observer,
                 dev_running=dev_running,
                 dev_compile=dev_compile,
                 app_name=app_name,
@@ -3524,6 +3650,7 @@ class SessionManager:
                             app_name=app_name_for(app_id),
                             already_waited_s=time.monotonic() - readiness_started_at,
                             cold=not attached,
+                            observer="relaunch_continuation",
                         )
                     else:
                         something_watched_it_paint = dev.shows_a_page
@@ -4032,7 +4159,45 @@ class SessionManager:
         )
         self._sessions[session.session_id] = session
         self._active_by_user[user_id] = session.session_id
+        if resolved.restored:
+            # Past the lock scope on purpose: a failure here must not reach the compensation
+            # that tears down the container the restore has just built.
+            await self._boot_the_tree_we_put_back(sandbox_client, handle, user_id, arm="restore")
         return session
+
+    async def _boot_the_tree_we_put_back(
+        self,
+        sandbox_client: SandboxClient,
+        handle: SandboxHandle,
+        user_id: uuid.UUID,
+        *,
+        arm: Literal["restore", "discard"],
+    ) -> None:
+        """Start the app a restore or a discard just put back, then watch for its first page.
+
+        A restore's turn ends before the engine starts anything, and a discard can put back a tree
+        whose server the discarded work had crashed; either way nothing else starts it, and the
+        preview waits for a page that never comes. `dev_start` is idempotent over a running
+        server. A refused start is logged rather than raised: the detached watcher, and the
+        reconciler under it, still report whatever the container does next."""
+        try:
+            await sandbox_client.dev_start(handle)
+        except SandboxError:
+            _log.warning(
+                "put_back_tree_dev_start_failed", arm=arm, app_name=handle.app_name, exc_info=True
+            )
+        else:
+            _log.info(SANDBOX_DEV_STARTED_EVENT, arm=arm, already_running=handle.ready)
+        self._keep_watching_for_a_first_serve(
+            sandbox_client,
+            handle,
+            get_redis(),
+            user_id,
+            app_name=handle.app_name,
+            already_waited_s=0.0,
+            cold=True,
+            observer="restore_continuation" if arm == "restore" else "discard_continuation",
+        )
 
     async def _resolve_sandbox(
         self,

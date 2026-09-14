@@ -940,6 +940,21 @@ export async function checkWorkspace(
   }
 }
 
+/** Untrusted body → `SaveState`. Every field is whitelisted one at a time and narrowed the same
+ *  way: anything that is not literally the expected type falls back to `null` rather than being
+ *  coerced — a fabricated value here would claim a state nobody actually checked. Shared by
+ *  `fetchSaveState` and `discardUnsavedChanges`, which read the identical shape. */
+function toSaveState(body: unknown): SaveState {
+  if (!isRecord(body)) throw new ApiError('The server returned a save state we could not read.', 500)
+  return {
+    appId: typeof body.appId === 'string' ? body.appId : null,
+    dirty: typeof body.dirty === 'boolean' ? body.dirty : null,
+    containerHead: typeof body.containerHead === 'string' ? body.containerHead : null,
+    savedHead: typeof body.savedHead === 'string' ? body.savedHead : null,
+    recoveryAt: typeof body.recoveryAt === 'string' ? body.recoveryAt : null,
+  }
+}
+
 /** Is there unsaved work? Compared by COMMIT server-side, so it survives a reload and a
  *  second tab — neither of which a local dirty flag would. */
 export async function fetchSaveState(
@@ -952,19 +967,41 @@ export async function fetchSaveState(
     deps,
   )
   if (!res.ok) throw await readApiError(res, 'Could not check for unsaved work')
-  const body: unknown = await res.json().catch(() => null)
-  if (!isRecord(body)) throw new ApiError('The server returned a save state we could not read.', 500)
+  return toSaveState(await res.json().catch(() => null))
+}
+
+export interface DiscardNotice {
+  seq: number
+  savedAt: string | null
+}
+
+export interface DiscardResult {
+  saveState: SaveState
+  notice: DiscardNotice | null
+}
+
+/** A notice that is not a record, or carries no numeric `seq`, is not a notice. */
+function toDiscardNotice(value: unknown): DiscardNotice | null {
+  if (!isRecord(value) || typeof value.seq !== 'number') return null
+  return { seq: value.seq, savedAt: typeof value.savedAt === 'string' ? value.savedAt : null }
+}
+
+/** Put the app back to the version its owner last saved. `conversationId` names the chat the
+ *  press came from, so that chat's own transcript gets a `notice` back without a reload — `null`
+ *  outside a chat sends an empty body rather than a null field. */
+export async function discardUnsavedChanges(
+  projectId: string,
+  conversationId: string | null,
+  deps: AuthFetchDeps = {},
+): Promise<DiscardResult> {
+  const body = await postJson(
+    `${BASE}/projects/${encodeURIComponent(projectId)}/discard`,
+    conversationId !== null ? { conversationId } : {},
+    'Could not discard your changes',
+    deps,
+  )
   return {
-    appId: typeof body.appId === 'string' ? body.appId : null,
-    // Anything that is not literally a boolean stays UNKNOWN. Coercing here is exactly how a
-    // missing field becomes a confident "all saved".
-    dirty: typeof body.dirty === 'boolean' ? body.dirty : null,
-    containerHead: typeof body.containerHead === 'string' ? body.containerHead : null,
-    savedHead: typeof body.savedHead === 'string' ? body.savedHead : null,
-    // Whitelisted one at a time like its siblings, and narrowed the same way: anything that is
-    // not literally a string is `null`. Defaulting the other way is not available here — a
-    // fabricated instant would tell a citizen their work can be brought back on the strength of
-    // a field the server never sent.
-    recoveryAt: typeof body.recoveryAt === 'string' ? body.recoveryAt : null,
+    saveState: toSaveState(body),
+    notice: isRecord(body) ? toDiscardNotice(body.notice) : null,
   }
 }
