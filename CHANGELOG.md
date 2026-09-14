@@ -4,6 +4,61 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.1] - 2026-09-14
+
+A patch for the production problems of 13 September: a workspace reset in the middle of a message
+that never came back, a Save button that kept asking to be pressed, and failures the logs could not
+explain. It also adds Discard, so unsaved changes can be thrown away and the app put back to the
+version its owner last saved.
+
+### Added
+
+- **Discard, beside Save.** Both workspace screens gain Discard, immediately left of Save. It puts
+  the app back to the version last saved, inside the workspace that is already running, so there is
+  no new start to wait for. It asks first and names when that version was saved. It can be pressed
+  only with unsaved changes over a saved version; otherwise it is dimmed and its tooltip says why:
+  nothing saved yet, no unsaved changes, or a save or a reply still running. What it replaces is set
+  aside rather than deleted, and a later restart cannot bring the discarded work back.
+- **The assistant is told about a discard.** The chat Discard was pressed in, and every other chat of
+  the project that spoke since the save, gets a line saying the changes were discarded and which
+  saved version the app is back to. The citizen sees it at once and after a reload; the assistant
+  reads it before its next reply, so it does not describe code that no longer exists.
+
+### Fixed
+
+- **A workspace put back in the middle of a message now starts its app.** When a message found the
+  workspace wiped, the platform restored the app into a fresh workspace and said so, but never
+  started it, so the preview said "Getting your app ready" indefinitely. Reloading did not help;
+  only opening a different project did. The restored app is now started and watched until its first
+  page arrives.
+- **Save stops asking once it has saved.** In a chat, a status check already on its way when Save was
+  pressed could land afterwards and light Save again. A workspace that came up after the page loaded
+  (a start, a relaunch or a restore) was never checked, so Save kept whatever it said before.
+- **A logged failure names itself.** A failure the platform recovered from was logged as
+  `"exc_info": true`, with no cause, and the worker had no logging setup at all. Both processes now
+  write an `exc_signature` field with the error's type and the place in the code it came from,
+  never its message, which can hold credentials. The autosave failures seen on 13 September will
+  say what failed the next time they happen.
+
+### Known limitations
+
+- **Why the workspace lost its repository on 13 September is not yet known.** This release brings
+  the app back and makes the next failure readable; the cause is still being investigated.
+- **The preview is not reloaded after a discard.** It relies on the app's own live refresh. If the
+  discard changed the app's dependencies, press Reload.
+- **A discard that changes the app's dependencies installs them before it answers,** so it can take
+  as long as a Save.
+- **Discard on the project screen cannot see a reply running in a chat.** The button stays pressable
+  there, and the platform refuses the discard with "Wait for the reply to finish, then discard."
+
+### Deploying this release
+
+- **Deploy the backend and the worker, then the portal.** The portal's Discard calls
+  `POST /v1/build-sessions/projects/{project_id}/discard`, which only the new backend has. No
+  migration, no new settings, and no new sandbox image.
+- **Log lines no longer carry `exc_info`.** Saved searches and alerts that looked for it need
+  `exc_signature` instead.
+
 ## [1.7.0] - 2026-09-13
 
 The release. Everything cut as a 1.7.0 beta since 1.6.19 ships as 1.7.0: the sandbox-first
