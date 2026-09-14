@@ -106,6 +106,7 @@ const NOTHING_SAVED: ClassificationReview = {
 interface RenderProps {
   onConfirm?: (answers: DataClassificationAnswers) => Promise<void>
   onCancel?: () => void
+  alreadyApproved?: boolean
 }
 
 /** Render with the mount-time ensure-POST settled, so gating reflects a landed review. */
@@ -113,6 +114,7 @@ async function renderModal(props: RenderProps = {}): Promise<ReturnType<typeof r
   const utils = render(
     <DataClassificationModal
       projectId="p1"
+      alreadyApproved={props.alreadyApproved ?? false}
       onConfirm={props.onConfirm ?? vi.fn()}
       onCancel={props.onCancel ?? vi.fn()}
     />,
@@ -217,6 +219,27 @@ describe('DataClassificationModal', () => {
 
     fireEvent.change(screen.getByTestId('dc-notes'), { target: { value: 'Vendor contact list only.' } })
     expect(confirmButton().disabled).toBe(false)
+  })
+
+  it('an approved version publishes whatever the answers score, and says so', async () => {
+    // The approval pins this exact commit and the server honours it over the score, so a
+    // label promising review names an outcome that cannot happen. The unapproved case is
+    // the Credentials/Secrets test above; mutation check: drop `&& !alreadyApproved` and
+    // this one goes red while that one stays green.
+    await renderModal({ alreadyApproved: true })
+    answerAll('no', ['credentialsSecrets'])
+    fireEvent.click(screen.getByTestId('dc-question-credentialsSecrets-yes'))
+
+    const button = confirmButton()
+    expect(button.textContent).toContain('Publish')
+    expect(button.textContent).not.toContain('Send for review')
+    expect(button.disabled).toBe(false) // the explanation is blank, and not demanded
+
+    expect(screen.getByTestId('dc-notes').getAttribute('aria-required')).toBe('false')
+    expect(screen.getByTestId('dc-score').textContent).toMatch(/an administrator approved this version/i)
+    expect(screen.getByTestId('dc-warning').textContent).toMatch(
+      /handles sensitive data, and an administrator approved/i,
+    )
   })
 
   it('with no weighted Yes the action reads Publish and no explanation is demanded', async () => {
