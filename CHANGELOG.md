@@ -21,6 +21,18 @@ says whether a build is running.
 - **The starter page asks the preview whether a build is running.** It asks every two seconds, and
   the preview answers only the app frame it is showing, at that frame's address.
 
+### Fixed
+
+- **An approved app publishes when Publish is pressed.** After an administrator approved a version,
+  pressing Publish brought the pre-publish questions back saying the app would be sent for review,
+  and refused to continue until the explanation was written again — while the platform published it
+  anyway. The questions now say the administrator approved this version, the button reads Publish,
+  and nothing further is asked for.
+- **Discard works in a chat nothing has been said in yet.** Pressing Discard in a chat opened but
+  never sent answered "Conversation not found" instead of putting the saved version back.
+- **The line logged when a discard starts the app says whether it was already running,** rather
+  than always claiming it was.
+
 ### Known limitations
 
 - **The project screen always answers "not building".** Going back to the project screen while a
@@ -30,9 +42,10 @@ says whether a build is running.
 
 ### Deploying this release
 
-- **Deploy the portal, then build a new sandbox image.** The answer ships in the portal and the
-  starter page ships in the sandbox image. A new image served to the old portal gets no answer, so
-  it shows "Nothing here yet" even mid-build. No backend change, no migration and no new settings.
+- **Deploy the backend, then the portal, then build a new sandbox image.** The answer ships in the
+  portal and the starter page ships in the sandbox image. A new image served to the old portal gets
+  no answer, so it shows "Nothing here yet" even mid-build. The backend carries only the discard's
+  log line above — no migration and no new settings.
 
 ## [1.7.1] - 2026-09-14
 
