@@ -517,6 +517,28 @@ describe('★ the Save chip on a chat follows the workspace, not only the turns'
     expect(screen.getByTestId('discard-changes').getAttribute('aria-disabled')).toBe('true')
   })
 
+  it('a from-scratch chat showing only the welcome greeting discards with no conversation', async () => {
+    // Mutation check: revert the `!m.ephemeral` filter in `handleDiscard` and this sends the
+    // chat's buildId instead of null.
+    const SAVED = 'a'.repeat(40)
+    h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: SAVED, recoveryAt: null })
+    h.discardUnsavedChanges.mockResolvedValue({
+      saveState: { appId: 'a1', dirty: false, containerHead: SAVED, savedHead: SAVED, recoveryAt: null },
+      notice: null,
+    })
+    renderBuilder({ deps: deps().deps })
+    await screen.findByText(/Tell me what you'd like to build/i)
+
+    const control = await screen.findByTestId('discard-changes')
+    await waitFor(() => expect(control.getAttribute('aria-disabled')).toBe('false'))
+    fireEvent.click(control)
+    fireEvent.click(await screen.findByTestId('discard-dialog-confirm'))
+
+    await waitFor(() => expect(h.discardUnsavedChanges).toHaveBeenCalledWith('p1', null))
+    expect(await screen.findByText('Saved')).toBeTruthy()
+    expect(screen.queryByText(/you discarded the unsaved changes/i)).toBeNull()
+  })
+
   it('a Discard waits while this chat is replying', async () => {
     // Mutation check: publish `replying: false` from this page and the control stays pressable.
     h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: 'a'.repeat(40), recoveryAt: null })

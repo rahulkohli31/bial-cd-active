@@ -14,7 +14,7 @@ import { readApiError } from './apiError'
 import { toPlanOptionsItem, toStepItem } from './turnStreamApi'
 import { outcomeSummary } from './messageTypes'
 import type { BuildOutcomeStatus, ChatMessage, MessagePart } from './messageTypes'
-import { formatStamp } from './publishPresentation'
+import { formatStamp, isUsableInstant } from './publishPresentation'
 
 /** The in-memory header shape pages expect, normalized from the server's raw doc.
  *
@@ -152,13 +152,9 @@ function bannerStatus(banner: unknown): BuildOutcomeStatus {
   return 'ended'
 }
 
-/**
- * The Discard notice's sentence. `formatStamp` returns its input unchanged for an unparseable
- * instant rather than signalling failure, so validity is checked here first — otherwise a
- * malformed `savedAt` would print the raw wire value instead of falling back.
- */
+/** The Discard notice's sentence, dated only when the instant can be rendered. */
 export function discardNoticeText(savedAt: string | null): string {
-  if (savedAt !== null && !Number.isNaN(new Date(savedAt).getTime())) {
+  if (isUsableInstant(savedAt)) {
     return `You discarded the unsaved changes. Your app is back to the version you saved on ${formatStamp(savedAt)}.`
   }
   return 'You discarded the unsaved changes. Your app is back to the version you last saved.'

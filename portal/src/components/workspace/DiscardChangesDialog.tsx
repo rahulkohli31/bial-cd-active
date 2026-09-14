@@ -9,13 +9,9 @@ import { useState } from 'react'
 import { AlertTriangle } from 'lucide-react'
 import { BusyGlyph } from '../ui/Waiting'
 import { Dialog, DialogContent, DialogTitle } from '../ui/dialog'
-import { formatStamp } from '../../utils/publishPresentation'
+import { formatStamp, isUsableInstant } from '../../utils/publishPresentation'
 
 const BODY_ID = 'discard-changes-body'
-
-function hasUsableInstant(value: string | null): value is string {
-  return value !== null && !Number.isNaN(new Date(value).getTime())
-}
 
 export interface DiscardChangesDialogProps {
   /** When the version it goes back to was saved (ISO-8601), or null when unknown. */
@@ -31,7 +27,7 @@ export default function DiscardChangesDialog({
 }: DiscardChangesDialogProps): React.JSX.Element {
   const [busy, setBusy] = useState(false)
 
-  const body = hasUsableInstant(savedAt)
+  const body = isUsableInstant(savedAt)
     ? `Your app goes back to the version you saved on ${formatStamp(savedAt)}. Everything changed since then is removed.`
     : 'Your app goes back to the version you last saved. Everything changed since then is removed.'
 

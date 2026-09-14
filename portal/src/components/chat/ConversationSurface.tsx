@@ -619,7 +619,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     setDiscarding(true)
     setSaveError(null)
     try {
-      const conversationId = messagesRef.current.length > 0 && buildId ? buildId : null
+      const conversationId = buildId && messagesRef.current.some((m) => !m.ephemeral) ? buildId : null
       const { saveState, notice } = await discardUnsavedChanges(activeProjectId, conversationId)
       announceDeploymentChanged(activeProjectId)
       if (projectIdRef.current === activeProjectId) {

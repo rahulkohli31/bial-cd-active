@@ -295,6 +295,11 @@ export function formatStamp(iso: string): string {
   })
 }
 
+/** Whether `formatStamp` can render this instant; it hands an unparseable one back unchanged. */
+export function isUsableInstant(value: string | null): value is string {
+  return value !== null && !Number.isNaN(new Date(value).getTime())
+}
+
 export interface VersionRowData {
   heading: string
   stamp: string | null
