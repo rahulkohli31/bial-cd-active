@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.2] - 2026-09-14
+
+The preview's starter page stops telling people to describe an app they have already described.
+Until an app's first screen is written, the preview shows an app window being put together, and
+says whether a build is running.
+
+### Changed
+
+- **A new starter page.** Every new app starts from a page showing an empty app window. While no
+  build is running, the window's parts float around it, with "Nothing here yet" and a line saying
+  to describe the app on the left. While a build is running, the parts fly into place and the page
+  says "Building your app…". The old page said "Describe what you want to build" even mid-build.
+  The agent replaces the page with the app's own home page, as before. With reduced motion turned
+  on, nothing moves.
+- **The starter page asks the preview whether a build is running.** It asks every two seconds, and
+  the preview answers only the app frame it is showing, at that frame's address.
+
+### Known limitations
+
+- **The project screen always answers "not building".** Going back to the project screen while a
+  build is still running shows "Nothing here yet" until the app's first screen is written.
+- **Opened in its own tab, the starter page always shows "Nothing here yet".** Only the preview can
+  tell it a build is running.
+
+### Deploying this release
+
+- **Deploy the portal, then build a new sandbox image.** The answer ships in the portal and the
+  starter page ships in the sandbox image. A new image served to the old portal gets no answer, so
+  it shows "Nothing here yet" even mid-build. No backend change, no migration and no new settings.
+
 ## [1.7.1] - 2026-09-14
 
 A patch for the production problems of 13 September: a workspace reset in the middle of a message
