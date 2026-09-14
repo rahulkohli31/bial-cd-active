@@ -41,7 +41,7 @@ import {
 import type { ReclaimRequest } from './workspaceChannel'
 import { announceDeploymentChanged } from '../../hooks/usePublishState'
 import { resolvePreviewAddress } from '../../utils/previewAddress'
-import { fetchCompileState, handOverWorkspace, saveProject } from '../../utils/buildSessionApi'
+import { discardUnsavedChanges, fetchCompileState, handOverWorkspace, saveProject } from '../../utils/buildSessionApi'
 import type { HandoverStep, ReclaimBlocked } from '../../utils/buildSessionApi'
 import type { CompileState } from '../../utils/compileState'
 import type { Project } from '../../utils/projectApi'
@@ -315,6 +315,25 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
     }
   }, [project.id, saving, workspace])
 
+  const [discarding, setDiscarding] = useState(false)
+
+  /** Put the saved version back. A refusal shares Save's error slot beside the controls, and the
+   *  same two reads a Save makes stale are refreshed the same way. */
+  const discard = useCallback(async () => {
+    if (discarding) return
+    setDiscarding(true)
+    setSaveError(null)
+    try {
+      await discardUnsavedChanges(project.id, null)
+      workspace.refresh()
+      announceDeploymentChanged(project.id)
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Could not discard your changes. Try again.')
+    } finally {
+      setDiscarding(false)
+    }
+  }, [project.id, discarding, workspace])
+
   // ONE OBJECT, BOTH FACTS. `workspace.save` is a single `GET save-state` response, so the pair
   // published here is by construction one reading — and a project screen holding no reading at all
   // publishes the "nobody has said" pair rather than a bare `null` that has lost the second half.
@@ -329,8 +348,21 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   // telling them, correctly, that they had unsaved changes and offering nothing to do about it.
   // The toolbar row is where the control lives; this is the producer behind it.
   usePublishSave(
-    { dirty: workspace.save?.dirty ?? null, saving, error: saveError },
-    { save: workspace.save ? save : null, rename: startRename, share: startShare },
+    {
+      dirty: workspace.save?.dirty ?? null,
+      saving,
+      error: saveError,
+      discarding,
+      // No reply runs on this screen; one running in a chat is refused by the server in its words.
+      replying: false,
+      hasSavedVersion: (workspace.save?.savedHead ?? null) !== null,
+    },
+    {
+      save: workspace.save ? save : null,
+      discard: workspace.save ? discard : null,
+      rename: startRename,
+      share: startShare,
+    },
   )
   usePublishReclaim(request)
   // TWO COLUMNS ARE THE REST STATE of the project screen — not something contingent on a build

@@ -281,7 +281,13 @@ export interface SaveSlot {
   /** TRI-STATE. `true` definitely dirty, `false` definitely clean, `null` "could not tell". */
   dirty: boolean | null
   saving: boolean
+  /** A Save or a Discard that failed, in the server's words. */
   error: string | null
+  discarding: boolean
+  /** A reply is running. Discard waits for it: the files are the reply's to read or change. */
+  replying: boolean
+  /** A saved version exists for Discard to go back to. */
+  hasSavedVersion: boolean
   /**
    * WHETHER AN ACTION IS PUBLISHED AT ALL — derived from `actions` by `usePublishSave`, never
    * passed separately, so the two cannot disagree.
@@ -291,9 +297,20 @@ export interface SaveSlot {
    * draw a button that does nothing.
    */
   canSave: boolean
+  /** `canSave`'s twin for Discard, derived the same way. */
+  canDiscard: boolean
 }
 
-export const NO_SAVE: SaveSlot = { dirty: null, saving: false, error: null, canSave: false }
+export const NO_SAVE: SaveSlot = {
+  dirty: null,
+  saving: false,
+  error: null,
+  discarding: false,
+  replying: false,
+  hasSavedVersion: false,
+  canSave: false,
+  canDiscard: false,
+}
 
 /**
  * ONE READING OF THE SAVE STATE — TWO FACTS THAT TRAVEL TOGETHER OR NOT AT ALL.
@@ -341,13 +358,16 @@ export const NO_SAVE_READING: SaveReading = { dirty: null, recoveryAt: null }
  */
 export interface WorkspaceActions {
   save: (() => void) | null
+  /** Put the app back to its saved version. Settles once the attempt is over, success or not, so
+   *  the confirmation it was pressed from can stay busy until then. */
+  discard: (() => Promise<void>) | null
   rename: (() => void) | null
   /** Open the share panel (#198) — `null` wherever nothing on screen can share (a chat, or
    *  a shared viewer's own restricted screen, which never registers this channel at all). */
   share: (() => void) | null
 }
 
-export const NO_ACTIONS: WorkspaceActions = { save: null, rename: null, share: null }
+export const NO_ACTIONS: WorkspaceActions = { save: null, discard: null, rename: null, share: null }
 
 /**
  * The address, plus the ONE thing that can invalidate it after its publisher is gone.
@@ -370,7 +390,14 @@ const sameHeading = (a: WorkspaceHeading, b: WorkspaceHeading) =>
   a.chatKind === b.chatKind
 
 const sameSave = (a: SaveSlot, b: SaveSlot) =>
-  a.dirty === b.dirty && a.saving === b.saving && a.error === b.error && a.canSave === b.canSave
+  a.dirty === b.dirty &&
+  a.saving === b.saving &&
+  a.error === b.error &&
+  a.discarding === b.discarding &&
+  a.replying === b.replying &&
+  a.hasSavedVersion === b.hasSavedVersion &&
+  a.canSave === b.canSave &&
+  a.canDiscard === b.canDiscard
 
 /** BOTH FIELDS, and the second one is not optional: a comparator blind to `recoveryAt` would
  *  hold the first reading forever and freeze every sentence and every guard decision derived
@@ -646,10 +673,17 @@ export function usePublishHeading(heading: WorkspaceHeading): void {
  * the publisher's own session, and a Save button left standing after that publisher died does
  * nothing. The reading on the SEPARATE `saveReading` cell is the one that is KEPT.
  */
-export function usePublishSave(save: Omit<SaveSlot, 'canSave'>, actions: WorkspaceActions): void {
+export function usePublishSave(
+  save: Omit<SaveSlot, 'canSave' | 'canDiscard'>,
+  actions: WorkspaceActions,
+): void {
   // A FRESH OBJECT EVERY RENDER IS FREE HERE — the cell is value-compared, so an unchanged save
   // state wakes nobody however many times it is republished.
-  usePublish(useWorkspaceChannel()?.save, { ...save, canSave: actions.save !== null }, NO_SAVE)
+  usePublish(
+    useWorkspaceChannel()?.save,
+    { ...save, canSave: actions.save !== null, canDiscard: actions.discard !== null },
+    NO_SAVE,
+  )
   usePublish(useWorkspaceChannel()?.actions, actions, NO_ACTIONS)
 }
 

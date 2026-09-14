@@ -21,6 +21,7 @@ const h = vi.hoisted(() => ({
   resolvePlanOptions: vi.fn(),
   stop: vi.fn(), getStatus: vi.fn(), relaunchPreview: vi.fn(),
   fetchSaveState: vi.fn(), fetchPreviewState: vi.fn(), saveProject: vi.fn(),
+  discardUnsavedChanges: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
@@ -55,6 +56,7 @@ vi.mock('../../utils/buildSessionApi', async (orig) => ({
   // The WRITER of the bundle. It is the subject of the deployment-nudge scenario at the
   // bottom, and leaving it real would put this suite on the network there too.
   saveProject: (...a) => h.saveProject(...a),
+  discardUnsavedChanges: (...a) => h.discardUnsavedChanges(...a),
 }))
 
 import {
@@ -62,6 +64,7 @@ import {
   planReply, turnStreaming, PLAN_CARD_ID, findStartAppControl,
 } from './_builderSession.jsx'
 import { ApiError } from '../../utils/apiError'
+import { discardNoticeText } from '../../utils/conversationApi'
 import { DEFAULT_CONTEXT_SOFT } from '../../utils/contextLimits'
 
 const deps = () => {
@@ -490,6 +493,40 @@ describe('★ the Save chip on a chat follows the workspace, not only the turns'
 
     await waitFor(() => expect(h.fetchSaveState).toHaveBeenCalledTimes(2))
     expect(await screen.findByTestId('save-project')).toBeTruthy()
+  })
+
+  it('★ a Discard sends this chat, shows the line its next reply reads, and settles Save', async () => {
+    // Mutation check: drop the chat's id, the appended line, or the returned save state.
+    const SAVED = 'a'.repeat(40)
+    h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: SAVED, recoveryAt: null })
+    h.discardUnsavedChanges.mockResolvedValue({
+      saveState: { appId: 'a1', dirty: false, containerHead: SAVED, savedHead: SAVED, recoveryAt: null },
+      notice: { seq: 9, savedAt: '2026-09-13T14:32:00Z' },
+    })
+    renderBuilder({ deps: deps().deps })
+    await send('add a date filter')
+
+    const control = await screen.findByTestId('discard-changes')
+    await waitFor(() => expect(control.getAttribute('aria-disabled')).toBe('false'))
+    fireEvent.click(control)
+    fireEvent.click(await screen.findByTestId('discard-dialog-confirm'))
+
+    await waitFor(() => expect(h.discardUnsavedChanges).toHaveBeenCalledWith('p1', 'build-X'))
+    expect(await screen.findByText(discardNoticeText('2026-09-13T14:32:00Z'))).toBeTruthy()
+    expect(await screen.findByText('Saved')).toBeTruthy()
+    expect(screen.getByTestId('discard-changes').getAttribute('aria-disabled')).toBe('true')
+  })
+
+  it('a Discard waits while this chat is replying', async () => {
+    // Mutation check: publish `replying: false` from this page and the control stays pressable.
+    h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: 'a'.repeat(40), recoveryAt: null })
+    h.readTurnStream.mockImplementation(() => new Promise(() => {}))
+    renderBuilder({ deps: deps().deps })
+    await send('add a date filter')
+
+    const control = await screen.findByTestId('discard-changes')
+    await waitFor(() => expect(control.getAttribute('title')).toBe('Wait for the reply to finish'))
+    expect(control.getAttribute('aria-disabled')).toBe('true')
   })
 
   it('a page that opens on a running workspace reads it once', async () => {

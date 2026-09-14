@@ -36,7 +36,7 @@ import type { BuildHandoff } from './OfferStrip'
 import ScrollToLatest from './ScrollToLatest'
 import SessionBanners from './SessionBanners'
 import TurnBanner from './TurnBanner'
-import { createConversation, listProjectConversations } from '../../utils/conversationApi'
+import { createConversation, discardNoticeText, listProjectConversations } from '../../utils/conversationApi'
 import type { ConversationHeader } from '../../utils/conversationApi'
 import { ApiError } from '../../utils/apiError'
 import { markAppVisible } from '../../utils/observe'
@@ -86,7 +86,7 @@ import type { TurnFrame, PlanOptionsItem, StepItem, DiagnosticFrame, StreamOutco
 import { contextState } from '../../utils/contextLimits'
 import { atLimitSendState, narrativeEnvelopes, turnPhase } from '../../utils/turnNarrative'
 import type { TurnNarrative } from '../../utils/turnNarrative'
-import { fetchSaveState, saveProject, handOverWorkspace, asReclaimBlocked, fetchPreviewState, fetchCompileState, checkWorkspace, samePreviewState } from '../../utils/buildSessionApi'
+import { discardUnsavedChanges, fetchSaveState, saveProject, handOverWorkspace, asReclaimBlocked, fetchPreviewState, fetchCompileState, checkWorkspace, samePreviewState } from '../../utils/buildSessionApi'
 import type { HandoverStep, ReclaimBlocked, PreviewState } from '../../utils/buildSessionApi'
 import { resolvePlanOptions } from '../../utils/turnStreamApi'
 import { wireMessageFromParts, buildUserParts, partsToText, countAttachments, releaseUploadedAttachments } from '../../utils/attachmentStore'
@@ -475,6 +475,8 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // The tri-state on its own, for the two consumers that genuinely only want the flag.
   const saveDirty = saveReading.dirty
   const [saving, setSaving] = useState(false)
+  const [discarding, setDiscarding] = useState(false)
+  const [hasSavedVersion, setHasSavedVersion] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   // `projectHasSavedBuild` arrives as a PROP, read once when the route resolved, and nothing
   // refetches it. But a Save is precisely the act that writes the snapshot bundle that flag
@@ -557,6 +559,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       // could put back at any moment.
       if (projectIdRef.current === activeProjectId && read === saveReadSeq.current) {
         setSaveReading({ dirty: state.dirty, recoveryAt: state.recoveryAt })
+        setHasSavedVersion(state.savedHead !== null)
       }
     } catch {
       // UNKNOWN, never "clean". A failed check must not report the work as safe — and it drops the
@@ -591,6 +594,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
         setSaveReading((held) => ({ ...held, dirty: false }))
         // There is now a snapshot to relaunch from — say so without waiting for a reload.
         setSavedBuildProjectId(activeProjectId)
+        setHasSavedVersion(true)
       }
     } catch (err) {
       // Surfaced, never swallowed: a Save that silently fails leaves the user believing their
@@ -603,6 +607,45 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       }
     } finally {
       setSaving(false)
+    }
+  }
+
+  /** Put the saved version back. The answer is the save state after it, applied like Save's, and
+   *  the line this chat now carries — the same line its model reads on the next turn. A chat with
+   *  no messages yet has nothing for that line to correct, so it sends no conversation. */
+  const handleDiscard = async () => {
+    const activeProjectId = projectIdRef.current
+    if (!activeProjectId || discarding) return
+    setDiscarding(true)
+    setSaveError(null)
+    try {
+      const conversationId = messagesRef.current.length > 0 && buildId ? buildId : null
+      const { saveState, notice } = await discardUnsavedChanges(activeProjectId, conversationId)
+      announceDeploymentChanged(activeProjectId)
+      if (projectIdRef.current === activeProjectId) {
+        saveReadSeq.current += 1
+        setSaveReading({ dirty: saveState.dirty, recoveryAt: saveState.recoveryAt })
+        setHasSavedVersion(saveState.savedHead !== null)
+        if (notice !== null) {
+          seqRef.current = Math.max(seqRef.current, notice.seq + 1)
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `srv_${notice.seq}_d_live`,
+              role: 'assistant',
+              parts: [{ type: 'text', text: discardNoticeText(notice.savedAt) }],
+              seq: notice.seq,
+              createdAt: new Date().toISOString(),
+            },
+          ])
+        }
+      }
+    } catch (err) {
+      if (projectIdRef.current === activeProjectId) {
+        setSaveError(err instanceof Error ? err.message : 'Could not discard your changes. Try again.')
+      }
+    } finally {
+      setDiscarding(false)
     }
   }
 
@@ -821,9 +864,13 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // shell's two exit guards arm on, and it is KEPT across an unmount, while these two are cleared
   // with their publisher. THE ROW WANTS THE FLAG ALONE, deliberately: its chip reports whether a
   // version exists, which is the question `dirty` answers, and a recovery copy is not one.
+  // Scoped to this project — see `turnRunning` on the pane view below, which reads the same value.
+  const turnRunningHere =
+    generatingChatId !== null &&
+    (generatingChatId === buildId || builds.some((b) => b.id === generatingChatId))
   usePublishSave(
-    { dirty: saveDirty, saving, error: saveError },
-    { save: handleSave, rename: null, share: null },
+    { dirty: saveDirty, saving, error: saveError, discarding, replying: turnRunningHere, hasSavedVersion },
+    { save: handleSave, discard: handleDiscard, rename: null, share: null },
   )
 
   // A genuine unmount must cancel the in-flight turn-stream reader — a chat switch already
@@ -2860,9 +2907,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
        turn running on project A. `builds` is this project's conversations; the open chat is
        checked separately because a brand-new one is not in that list yet. */
     workspaceLost,
-    turnRunning:
-      generatingChatId !== null &&
-      (generatingChatId === buildId || builds.some((b) => b.id === generatingChatId)),
+    turnRunning: turnRunningHere,
     onFrameMessage: handleFrameMessage,
     /* This stop-clock. IT TRAVELS AS A PAYLOAD RATHER THAN A PROP so it survives this page being
        replaced: without it `project_to_app_visible_ms` stops being produced and
