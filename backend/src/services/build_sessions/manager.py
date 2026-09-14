@@ -4187,7 +4187,7 @@ class SessionManager:
                 "put_back_tree_dev_start_failed", arm=arm, app_name=handle.app_name, exc_info=True
             )
         else:
-            _log.info(SANDBOX_DEV_STARTED_EVENT, arm=arm, already_running=False)
+            _log.info(SANDBOX_DEV_STARTED_EVENT, arm=arm, already_running=handle.ready)
         self._keep_watching_for_a_first_serve(
             sandbox_client,
             handle,

@@ -10,6 +10,7 @@ import base64
 import contextlib
 import uuid
 from collections.abc import AsyncIterator, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -18,12 +19,14 @@ import sqlalchemy as sa
 from pydantic import SecretStr
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from src.config import settings
 from src.db.models.conversation import Conversation
 from src.db.models.message import Message, MessageEntryKind
 from src.db.models.user import User
 from src.services.build_sessions import manager as manager_module
+from src.services.build_sessions.alarms import SANDBOX_DEV_STARTED_EVENT
 from src.services.build_sessions.manager import (
     BuildSessionConflictError,
     SessionManager,
@@ -176,6 +179,32 @@ async def test_a_discard_puts_the_saved_version_back_in_the_running_container(
     assert client.provisioned == [app_name_for(app_id)]
     assert client.restored == []
     assert client.dev_started == [app_name_for(app_id)]
+
+
+@pytest.mark.parametrize("found_serving", [True, False])
+async def test_the_start_line_says_whether_the_discard_found_the_app_running(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    manager: SessionManager,
+    found_serving: bool,
+) -> None:
+    """`already_running` is what the attach read from the container, not a constant.
+
+    Mutation check: hard-code either value in `_boot_the_tree_we_put_back`; one case goes red."""
+    user, project_id, _, client = await _a_saved_app_with_later_work(
+        db_session, manager, f"discard-start-{str(found_serving).lower()}@rvaiglobal.com"
+    )
+    assert client.attach_handle is not None
+    client.attach_handle = replace(client.attach_handle, ready=found_serving)
+
+    with capture_logs() as logs:
+        await manager.discard_unsaved_changes(
+            db_session, user, project_id, sandbox_client=client, conversation_id=None
+        )
+
+    started = [e for e in logs if e.get("event") == SANDBOX_DEV_STARTED_EVENT]
+    assert [(e["arm"], e["already_running"]) for e in started] == [("discard", found_serving)]
 
 
 async def test_the_discarded_work_is_parked_and_a_restart_cannot_bring_it_back(
@@ -372,12 +401,12 @@ async def test_a_conversation_that_is_not_this_users_is_never_written_to(
     fake_storage: FakeStorage,
     manager: SessionManager,
 ) -> None:
-    user, project_id, _, client = await _a_saved_app_with_later_work(
-        db_session, manager, "discard9@rvaiglobal.com"
-    )
     """Filed under this very project, so the owner predicate alone keeps it out.
 
     Mutation check: drop `Conversation.user_id` from the note query and the stranger is told."""
+    user, project_id, _, client = await _a_saved_app_with_later_work(
+        db_session, manager, "discard9@rvaiglobal.com"
+    )
     stranger = await UserFactory.create(db_session, email="discard9-stranger@rvaiglobal.com")
     theirs = await ConversationFactory.create(db_session, stranger.id, project_id=project_id)
     await _a_turn(db_session, stranger, theirs)
