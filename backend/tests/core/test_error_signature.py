@@ -9,7 +9,10 @@ from pydantic_ai.exceptions import ModelAPIError
 
 from src.core.error_signature import error_signature
 
-_OVERLOADED_BODY = {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}
+_OVERLOADED_BODY = {
+    "type": "error",
+    "error": {"type": "overloaded_error", "message": "Overloaded"},
+}
 
 
 def test_the_signature_is_the_class_chain_the_status_and_the_provider_type_never_the_text() -> (
