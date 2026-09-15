@@ -59,6 +59,24 @@ _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
 # Long enough that a real name survives whole; short enough that the segment can never approach a
 # filesystem limit once a disambiguating prefix is added.
 _MAX_STEM = 96
+# Every C0 control, DEL, and the Unicode line/paragraph separators: the characters that let a
+# display name write extra LINES into prose that quotes it.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f\u2028\u2029]+")
+
+
+def collapse_to_one_line(display_name: str) -> str:
+    """A citizen's file name, safe to render inside the platform's own prose.
+
+    ★ UNTRUSTED TEXT IN A TRUSTED VOICE. The note lists each file as a bullet and then, in the
+    same list, instructs the agent; a name carrying a newline and a `- ` writes further bullets
+    of its own, in the voice the note presents as the platform speaking. Collapsed rather than
+    rejected or truncated: the name is the citizen's own, and they have to recognise it.
+
+    The upload door stores what this returns, so a name is one line from the moment it arrives.
+    Rendering applies it a second time — for rows stored before the door did, and so neither side
+    can drift.
+    """
+    return _CONTROL_CHARS.sub(" ", display_name).strip()
 
 
 class AttachmentPlacementError(RuntimeError):
@@ -393,8 +411,8 @@ class AttachmentDelivery:
             "",
         ]
         lines += [
-            f"- {file.display_name} — {file.model_path} (on disk: {file.container_path}; "
-            f"{file.size:,} bytes)"
+            f'- "{collapse_to_one_line(file.display_name)}" — {file.model_path} '
+            f"(on disk: {file.container_path}; {file.size:,} bytes)"
             for file in self.files
         ]
         lines += [

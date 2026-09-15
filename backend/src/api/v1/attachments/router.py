@@ -46,6 +46,7 @@ from src.core.errors import AppApiError
 from src.db.models.attachment import MAX_ATTACHMENT_NAME, Attachment
 from src.db.models.conversation import Conversation
 from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses
+from src.services.attachments.materialize import collapse_to_one_line
 from src.services.extract.zip_safety import FileParseError, assert_zip_not_bomb
 from src.services.media import (
     ALLOWED_MEDIA,
@@ -207,7 +208,12 @@ def _attachment_name(value: Any) -> str:
         raise AppApiError(400, "name must be a string.")
     if len(value) > MAX_ATTACHMENT_NAME:
         raise AppApiError(400, f"name must be at most {MAX_ATTACHMENT_NAME} characters.")
-    return value
+    # ★ CONTROL CHARACTERS ARE COLLAPSED, because this string is later rendered inside the
+    # platform's OWN instructions to the model. The turn note lists each attached file as a
+    # bullet and then, in the same list, tells the agent how to read them; a name carrying a
+    # newline and a `- ` writes further bullets of its own, in the one voice the note presents as
+    # trustworthy. The name's content is untrusted, so it is kept — as one line.
+    return collapse_to_one_line(value)
 
 
 def _sniff_media_type(data: bytes) -> str | None:
