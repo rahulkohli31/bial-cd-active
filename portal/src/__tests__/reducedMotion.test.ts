@@ -27,6 +27,7 @@
 import { describe, it, expect } from 'vitest'
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import path from 'node:path'
+import { nestingDepthAt } from './_cssNesting'
 import { stripComments } from './_stripComments'
 
 // `import.meta.url` is a jsdom http URL under this vitest config, so anchor on the cwd — the same
@@ -95,13 +96,12 @@ function reduceMotionBlock(css: string): ReduceMotionBlock {
   }
   if (depth !== 0) throw new Error('the reduce-motion block is never closed')
 
-  let nestingDepth = 0
-  for (const c of source.slice(0, startsAt)) {
-    if (c === '{') nestingDepth += 1
-    else if (c === '}') nestingDepth -= 1
+  return {
+    body: source.slice(bodyFrom, cursor - 1),
+    startsAt,
+    utilitiesAt,
+    nestingDepth: nestingDepthAt(source, startsAt),
   }
-
-  return { body: source.slice(bodyFrom, cursor - 1), startsAt, utilitiesAt, nestingDepth }
 }
 
 /** Selectors the block actually turns OFF — a selector listed on a rule that does not set
