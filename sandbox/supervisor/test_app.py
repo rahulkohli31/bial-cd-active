@@ -27,12 +27,19 @@ import pytest
 # Seed the module-level fail-fast config BEFORE importing app.py.
 os.environ.setdefault("SUPERVISOR_TOKEN", "test-token-not-a-real-secret")
 os.environ.setdefault("APP_USER", pwd.getpwuid(os.getuid()).pw_name)
-_WS = tempfile.mkdtemp(prefix="bial-sup-ws-")
+# SIBLINGS UNDER ONE PARENT, exactly as the container lays them out (`/workspace/app` beside
+# `/workspace/attachments`). Two unrelated temp directories made every cross-root case
+# unreachable, so the guard's own tests could not tell a real containment rule from a lucky
+# fixture — and a change of default root would have stayed green while every attachment
+# started travelling into snapshots.
+_BASE = tempfile.mkdtemp(prefix="bial-sup-")
+_WS = os.path.join(_BASE, "app")
+_ATT = os.path.join(_BASE, "attachments")
+os.makedirs(_WS, exist_ok=True)
+os.makedirs(_ATT, exist_ok=True)
 os.environ["WORKSPACE"] = _WS
-_ATT = tempfile.mkdtemp(prefix="bial-sup-att-")
 os.environ["ATTACHMENTS_DIR"] = _ATT
-atexit.register(shutil.rmtree, _ATT, ignore_errors=True)
-atexit.register(shutil.rmtree, _WS, ignore_errors=True)  # don't leak the temp workspace per run
+atexit.register(shutil.rmtree, _BASE, ignore_errors=True)  # don't leak the temp tree per run
 
 from urllib.parse import unquote  # noqa: E402
 
@@ -152,6 +159,32 @@ def test_exec_closes_child_stdin_so_a_prompt_cannot_hang(monkeypatch: pytest.Mon
     assert captured["stdin"] == subprocess.DEVNULL
 
 
+def test_output_that_is_not_text_comes_back_instead_of_failing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ A FILE THAT IS NOT TEXT MUST NOT READ AS A BROKEN WORKSPACE.
+
+    `cat` on a spreadsheet emits bytes no decoder can take as UTF-8, and under the default
+    `errors="strict"` that decode raises inside this handler: the request 500s, and the read
+    surface above it turns a transport failure into a dead turn — so a citizen's own file reads
+    as an outage. Replacement characters are the honest answer: the command ran, and what it
+    printed is not text.
+
+    Mutation-check: drop `errors="replace"` from `exec_cmd` and this goes red.
+    """
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("app.subprocess.run", fake_run)
+    resp = client.post("/exec", json={"cmd": ["cat", "roster.xlsx"]}, headers=AUTH)
+
+    assert resp.status_code == 200
+    assert captured["errors"] == "replace"
+
+
 def test_a_manufactured_tty_is_refused_before_it_can_hang(monkeypatch: pytest.MonkeyPatch) -> None:
     """A manufactured pty defeats every `isTTY` check, so it must be refused before it reaches
     `subprocess.run` — the only layer that can catch it. Refused as a normal exit-1 with a
@@ -251,6 +284,35 @@ def test_files_view_is_1indexed_tab_separated() -> None:
     assert r.json()["content"] == "1\talpha\n2\tbeta\n3\tgamma"
 
 
+def test_viewing_a_file_that_is_not_text_shows_it_instead_of_failing() -> None:
+    """★ A FILE THAT IS NOT TEXT IS NOT AN OUTAGE.
+
+    A strict decode raises inside this handler, so viewing a PNG — or any compiled asset an
+    agent opens by mistake — takes the request down, and the model is told its workspace is
+    broken rather than that the file is not readable as text.
+
+    Mutation receipt: drop the replacing decode from the view arm and this goes red.
+    """
+    (WORKSPACE / "logo.png").write_bytes(bytes([0x89, 0x50, 0x4E, 0x47, 0xFF, 0xFE]))
+    r = client.post("/files", json={"action": "view", "path": "logo.png"}, headers=AUTH)
+    assert r.status_code == 200
+    assert chr(0xFFFD) in r.json()["content"]
+
+
+def test_editing_a_file_that_is_not_text_is_refused_rather_than_crashing() -> None:
+    """Editing refuses where viewing replaces: writing replacement characters back into the
+    file would destroy the bytes the decode could not read. The 422 names the reason, where a
+    crash says only that something went wrong."""
+    (WORKSPACE / "logo2.png").write_bytes(bytes([0x89, 0x50, 0x4E, 0x47, 0xFF, 0xFE]))
+    r = client.post(
+        "/files",
+        json={"action": "str_replace", "path": "logo2.png", "old_str": "a", "new_str": "b"},
+        headers=AUTH,
+    )
+    assert r.status_code == 422
+    assert "not a text file" in r.json()["detail"]
+
+
 def test_files_view_range_clamps_end_to_last_line() -> None:
     _write("v2.txt", "a\nb\nc")
     r = client.post(
@@ -333,7 +395,7 @@ def test_a_relative_path_still_means_the_app_tree() -> None:
     assert not (ATTACHMENTS / "note.txt").exists()
 
 
-def test_neither_root_is_a_doorway_to_the_other_or_to_anywhere_else() -> None:
+def test_a_path_that_climbs_out_of_both_roots_is_refused() -> None:
     """The guard is applied twice, not relaxed. `..` is resolved BEFORE the check, so a path that
     starts inside one root and climbs out of it is refused even though its prefix looked legal."""
     for path in (
@@ -348,6 +410,27 @@ def test_neither_root_is_a_doorway_to_the_other_or_to_anywhere_else() -> None:
             headers=AUTH,
         )
         assert r.status_code == 400, f"{path} was not refused"
+
+
+def test_either_root_can_name_the_other_and_that_is_deliberate() -> None:
+    """★ WRITTEN DOWN BECAUSE THE GUARD USED TO CLAIM THE OPPOSITE.
+
+    In the container the roots are siblings, so a `..` from one lands in the other and
+    resolves. That is intended: both belong to the same workspace, and the read surface names
+    the attachments root directly anyway. The separation exists so a snapshot of the app tree
+    carries no attachment — a property of what is archived, not of what this guard opens.
+
+    Unreachable until the fixtures became siblings, which is why the claim survived so long.
+    """
+    crossing = str(WORKSPACE / ".." / ATTACHMENTS.name / "crossed.bin")
+    r = client.post(
+        "/files",
+        json={"action": "create_bytes", "path": crossing, "file_b64": "AAEC"},
+        headers=AUTH,
+    )
+
+    assert r.status_code == 200, r.text
+    assert (ATTACHMENTS / "crossed.bin").read_bytes() == bytes([0x00, 0x01, 0x02])
 
 
 # --- /files: create_bytes --------------------------------------------
