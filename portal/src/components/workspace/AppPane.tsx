@@ -86,8 +86,8 @@ function AppPane({ device, reloadNonce }: AppPaneProps) {
   // declared, so `frameIt` is false, `NoFrame` renders instead of the host, and this section's
   // `flex-1` went on claiming half the window for a card offering to start an app the citizen did
   // not ask for. That is exactly the layout `PlanChat` forbids: the board draws one
-  // centred column across the full width, and `ConversationSurface`'s `mx-auto max-w-3xl` cannot
-  // centre inside a rail that is only half the screen.
+  // centred column across the full width, and a column cannot centre on a window it only owns
+  // half of.
   //
   // ZERO IN BOTH DIRECTIONS, because this column sits in a flex row above the stacking threshold
   // and a flex COLUMN below it — a width alone leaves a full-height band under a stacked rail.

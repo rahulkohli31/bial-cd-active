@@ -32,6 +32,7 @@ import ChatThread from './ChatThread'
 import ChatRuntimeProvider from './runtime/ChatRuntimeProvider'
 import Composer, { type ComposerSubmission } from './Composer'
 import { SendRefusal } from './sendRefusal'
+import { cn } from '@/lib/utils'
 import type { BuildHandoff } from './OfferStrip'
 import ScrollToLatest from './ScrollToLatest'
 import SessionBanners from './SessionBanners'
@@ -3047,10 +3048,11 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
           width is the one the citizen can drag.
 
           A PLAN CHAT IS THE OTHER HALF OF THE SAME RULE. It declares no pane, so the shell gives
-          it the whole window — and a transcript run edge to edge across 1440px is unreadable. So
-          it centres itself in one column at a comfortable measure, which is exactly what the
-          board draws. A build chat does not: it sits beside the app it is changing, and the two
-          are meant to read as one screen. */}
+          it the whole window — and a transcript run edge to edge across 1440px is unreadable. The
+          measure that answers that sits one level in, on the thread's own column and on
+          `chat-footer-column`, never on this panel or on anything between it and the scroller —
+          see the comment on the panel's className. A build chat needs neither: it sits beside the
+          app it is changing, and the two are meant to read as one screen. */}
       {/* ONE RUNTIME, AROUND EVERYTHING THAT READS IT. It used to be built inside
           `ChatThread`, whose provider therefore wrapped only the transcript — fine while the
           composer was entirely hand-rolled and read nothing from it, and wrong the moment the
@@ -3068,15 +3070,14 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
         id="chat-panel"
         data-testid="chat-panel"
         data-chat-kind={kind}
-        className={`flex min-w-0 flex-1 flex-col overflow-hidden bg-white ${
-          isPlanChat
-            ? // ONE CENTRED COLUMN. `mx-auto` on a `max-w` inside the full-width rail, rather
-              // than a narrower rail — the rail's width is the citizen's to drag, and pinning it
-              // for one chat kind would take that away and reintroduce the measured breakpoint
-              // the shell exists without.
-              'mx-auto w-full max-w-3xl'
-            : 'border-r border-bial-border'
-        }`}
+        // THE PANEL IS THE SCROLLER'S BOX, NOT THE COLUMN. A `max-w` here would centre the
+        // transcript's scroll container too, putting its scrollbar beside the text instead of at
+        // the window's edge. The column is centred one level in instead — by the thread's own
+        // viewport and by the footer wrapper below.
+        className={cn(
+          'flex min-w-0 flex-1 flex-col overflow-hidden bg-white',
+          !isPlanChat && 'border-r border-bial-border',
+        )}
       >
         {/* THE BORDERED HEADER IS SURRENDERED TO THE TOOLBAR ROW. It held one
             breadcrumb link back to the project and nothing else — the only thing in the product
@@ -3095,104 +3096,114 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
           />
         </div>
 
-        {/* The polite region for turn activity, permanently mounted so its text is announced when
-            it arrives rather than being injected together with its region. */}
-        <Announcer message={announcement} />
+        {/* EVERYTHING BELOW THE TRANSCRIPT SHARES THE TRANSCRIPT'S MEASURE — `max-w-thread`, the
+            same key the thread centres its messages with, so the composer cannot end up broader
+            than the text above it. No `overflow` class belongs here: the thread's viewport is the
+            only scroller in the chat slot, which `ConversationSurface.test.jsx`'s one-scroller
+            count would catch. */}
+        <div
+          data-testid="chat-footer-column"
+          className={cn('flex w-full flex-col', isPlanChat && 'mx-auto max-w-thread')}
+        >
+          {/* The polite region for turn activity, permanently mounted so its text is announced when
+              it arrives rather than being injected together with its region. */}
+          <Announcer message={announcement} />
 
-        {/* Session lifecycle banners — right where the operator is looking. */}
-        <SessionBanners
-          feedDisconnected={showSession && session.feedDisconnected}
-          quota={showSession ? session.quota : null}
-          onReconnect={() => session.reconnect()}
-        />
+          {/* Session lifecycle banners — right where the operator is looking. */}
+          <SessionBanners
+            feedDisconnected={showSession && session.feedDisconnected}
+            quota={showSession ? session.quota : null}
+            onReconnect={() => session.reconnect()}
+          />
 
-        {/* The one banner slot: the state the app is in NOW, newest wins. A workspace sentence
-            ENDS the turn, so nothing later in the same turn can be more current — which is why
-            precedence is one expression here rather than fifteen mirrored `setTurnError` calls. */}
-        {/* The unsaved-build warning is LAST in the precedence and that is deliberate: it is a
-            standing fact about the newest build, so anything the platform has to say about the
-            turn happening NOW is more current and outranks it. It comes back on its own once the
-            newer sentence is cleared, because it is derived from the transcript rather than set. */}
-        <TurnBanner text={workspaceSays ?? turnError ?? unsavedBuildWarning} />
+          {/* The one banner slot: the state the app is in NOW, newest wins. A workspace sentence
+              ENDS the turn, so nothing later in the same turn can be more current — which is why
+              precedence is one expression here rather than fifteen mirrored `setTurnError` calls. */}
+          {/* The unsaved-build warning is LAST in the precedence and that is deliberate: it is a
+              standing fact about the newest build, so anything the platform has to say about the
+              turn happening NOW is more current and outranks it. It comes back on its own once the
+              newer sentence is cleared, because it is derived from the transcript rather than set. */}
+          <TurnBanner text={workspaceSays ?? turnError ?? unsavedBuildWarning} />
 
-        {/* ASSERTIVE, and reserved for the things that genuinely interrupt: a refused send, a
-            failed handoff, a failed relaunch or save. Permanently mounted for the same reason the
-            polite regions are — a region injected together with its text is frequently not
-            announced at all. */}
-        <div aria-live="assertive" role="alert">
-          {urgentText ? (
-            <div
-              data-testid="urgent-banner"
-              className="mx-3 mb-1 rounded-lg border border-danger/20 bg-danger/5 px-2.5 py-1.5 text-[11px] text-danger"
-            >
-              {urgentText}
-            </div>
-          ) : null}
-        </div>
-
-        {/* Arm (d)'s way out. It sits beside the composer's gate note rather than inside it: the
-            note says what is happening, and this is the one thing a citizen can DO about a gate
-            that otherwise has nothing to offer them. */}
-        {gateCheck === 'unreachable' && (
-          <div className="px-3 pb-1">
-            <button
-              type="button"
-              onClick={retryGateCheck}
-              data-testid="gate-retry"
-              className="text-[11px] text-primary underline underline-offset-2 hover:text-primary-600"
-            >
-              Retry
-            </button>
+          {/* ASSERTIVE, and reserved for the things that genuinely interrupt: a refused send, a
+              failed handoff, a failed relaunch or save. Permanently mounted for the same reason the
+              polite regions are — a region injected together with its text is frequently not
+              announced at all. */}
+          <div aria-live="assertive" role="alert">
+            {urgentText ? (
+              <div
+                data-testid="urgent-banner"
+                className="mx-3 mb-1 rounded-lg border border-danger/20 bg-danger/5 px-2.5 py-1.5 text-[11px] text-danger"
+              >
+                {urgentText}
+              </div>
+            ) : null}
           </div>
-        )}
 
-        {/* A PLAN CHAT SAYS EVERYTHING THE PANE WOULD HAVE SAID, from the same computed
-            workspace value the pane renders, so there is one author for every workspace sentence
-            in the product and "no pane" cannot mean "says nothing". It goes to the composer's
-            footer slot rather than being drawn here: `PlanChat` and `PlanReady` both put it BELOW
-            the box, and above it the standing sentence sat between the transcript and the control
-            the citizen was reaching for. */}
+          {/* Arm (d)'s way out. It sits beside the composer's gate note rather than inside it: the
+              note says what is happening, and this is the one thing a citizen can DO about a gate
+              that otherwise has nothing to offer them. */}
+          {gateCheck === 'unreachable' && (
+            <div className="px-3 pb-1">
+              <button
+                type="button"
+                onClick={retryGateCheck}
+                data-testid="gate-retry"
+                className="text-[11px] text-primary underline underline-offset-2 hover:text-primary-600"
+              >
+                Retry
+              </button>
+            </div>
+          )}
 
-        <Composer
-          conversationId={buildId ?? null}
-          // THE BOARD WRITES A DIFFERENT ONE PER KIND, and it is a hint rather than a mode: a
-          // build chat asks for a change to the app, a plan chat asks for a change to the plan.
-          // One sentence for both said neither.
-          placeholder={kind === 'plan' ? 'Tell me what to change…' : 'Ask for another change…'}
-          onSubmit={handleSubmit}
-          isRunning={isRunning}
-          gate={gate}
-          contextWarning={contextWarning}
-          footerNote={isPlanChat ? <PlanChatWorkspaceLine /> : undefined}
-          // BOTH ways a build can be live here. `isRunning` is a turn this tab is streaming;
-          // `buildActiveHere` is a LEGACY build session adopted on a reload, which sets no
-          // streaming flag at all. Gating on the turn alone left a reloaded mid-build tab with a
-          // running build and no way to stop it — the exact hole the deleted bubble's own
-          // session-scoped condition used to cover. `resolveTarget` returns `null` when there is
-          // no turn id, which is precisely how the control reaches `onStopSession`.
-          stop={
-            isRunning || buildActiveHere
-              ? {
-                  running: true,
-                  resolveTarget: stopTarget,
-                  onStopTurn: stopTurn,
-                  onStopSession: handleStopSession,
-                }
-              : undefined
-          }
-          offer={
-            offer
-              ? {
-                  toolCallId: offer.toolCallId,
-                  conversationId: buildId ?? null,
-                  spent: offer.state !== 'pending',
-                  onBuild: handleBuildIt,
-                  onKeepPlanning: handleKeepPlanning,
-                }
-              : undefined
-          }
-          onUrgent={setUrgent}
-        />
+          {/* A PLAN CHAT SAYS EVERYTHING THE PANE WOULD HAVE SAID, from the same computed
+              workspace value the pane renders, so there is one author for every workspace sentence
+              in the product and "no pane" cannot mean "says nothing". It goes to the composer's
+              footer slot rather than being drawn here: `PlanChat` and `PlanReady` both put it BELOW
+              the box, and above it the standing sentence sat between the transcript and the control
+              the citizen was reaching for. */}
+
+          <Composer
+            conversationId={buildId ?? null}
+            // THE BOARD WRITES A DIFFERENT ONE PER KIND, and it is a hint rather than a mode: a
+            // build chat asks for a change to the app, a plan chat asks for a change to the plan.
+            // One sentence for both said neither.
+            placeholder={kind === 'plan' ? 'Tell me what to change…' : 'Ask for another change…'}
+            onSubmit={handleSubmit}
+            isRunning={isRunning}
+            gate={gate}
+            contextWarning={contextWarning}
+            footerNote={isPlanChat ? <PlanChatWorkspaceLine /> : undefined}
+            // BOTH ways a build can be live here. `isRunning` is a turn this tab is streaming;
+            // `buildActiveHere` is a LEGACY build session adopted on a reload, which sets no
+            // streaming flag at all. Gating on the turn alone left a reloaded mid-build tab with a
+            // running build and no way to stop it — the exact hole the deleted bubble's own
+            // session-scoped condition used to cover. `resolveTarget` returns `null` when there is
+            // no turn id, which is precisely how the control reaches `onStopSession`.
+            stop={
+              isRunning || buildActiveHere
+                ? {
+                    running: true,
+                    resolveTarget: stopTarget,
+                    onStopTurn: stopTurn,
+                    onStopSession: handleStopSession,
+                  }
+                : undefined
+            }
+            offer={
+              offer
+                ? {
+                    toolCallId: offer.toolCallId,
+                    conversationId: buildId ?? null,
+                    spent: offer.state !== 'pending',
+                    onBuild: handleBuildIt,
+                    onKeepPlanning: handleKeepPlanning,
+                  }
+                : undefined
+            }
+            onUrgent={setUrgent}
+          />
+        </div>
       </div>
       </ChatRuntimeProvider>
     </div>
