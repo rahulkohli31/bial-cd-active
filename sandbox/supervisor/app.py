@@ -299,10 +299,15 @@ def _resolve(path: str) -> Path:
     so no relative path can change meaning because `/workspace/attachments` came into existence —
     an app that happens to contain its own `attachments/` directory still resolves there.
 
-    STILL FAIL-CLOSED, and this is the part worth being careful about: the guard is not relaxed,
-    it is applied twice. A path must resolve INSIDE one of the two roots or it is refused, and
-    `..` is resolved before the check, so neither root can be used as a doorway to the other or to
-    anything outside both.
+    STILL FAIL-CLOSED: a path must resolve INSIDE one of the two roots or it is refused, and
+    `..` is resolved before that check, so nothing outside both roots can be reached. That is
+    the whole of what this function guarantees.
+
+    IT IS NOT A WALL BETWEEN THE TWO ROOTS, and claiming one would be false: in the container
+    they are siblings, so `../attachments/roster.csv` from the app root resolves and is allowed.
+    Deliberately — both roots are the same workspace, and the read surface names the attachments
+    root directly anyway. What the separation buys is that a SNAPSHOT of the app tree carries no
+    attachment: a fact about what is archived, not about what this guard will open.
     """
     p = (WORKSPACE / path).resolve() if not Path(path).is_absolute() else Path(path).resolve()
     for root in (WORKSPACE.resolve(), ATTACHMENTS.resolve()):
