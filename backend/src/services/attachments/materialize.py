@@ -190,7 +190,11 @@ async def code_lane_attachments(
     `/workspace/attachments` is a sibling of the app tree so no snapshot or restore carries it,
     which means a recycled container comes back empty and every turn re-places what the
     conversation holds. The ids arm covers the two cases the link cannot — a row unlinked by
-    `ON DELETE SET NULL`, and a pre-ordering row that was never linked at all.
+    `ON DELETE SET NULL`, and a pre-ordering row that was never linked at all — and BOTH OF
+    THOSE ARE UNLINKED ROWS, which is why the arm says so. Admitting any owned id the message
+    named let a chat deliver a file counted against a different chat: the per-conversation cap
+    is enforced at the upload door, so a set assembled here from other conversations' rows is
+    counted nowhere, and each row joins `sent` permanently the moment it arrives.
 
     Ordered by the primary key, which is a UUIDv7: attach order is upload order, so the numbering
     the collision rule falls back to is stable across turns rather than dependent on how the
@@ -199,7 +203,13 @@ async def code_lane_attachments(
     wanted = list(dict.fromkeys(attachment_ids))
     reachable = Attachment.conversation_id == conversation_id
     if wanted:
-        reachable = sa.or_(reachable, Attachment.attachment_id.in_(wanted))
+        reachable = sa.or_(
+            reachable,
+            sa.and_(
+                Attachment.attachment_id.in_(wanted),
+                Attachment.conversation_id.is_(None),
+            ),
+        )
     rows = list(
         (
             await db.execute(
