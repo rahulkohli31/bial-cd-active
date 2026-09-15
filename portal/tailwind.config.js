@@ -212,6 +212,14 @@ export default {
         manrope: ['Manrope', 'sans-serif'],
         worksans: ['"Work Sans"', 'sans-serif'],
       },
+      // THE CHAT'S READING MEASURE, named because two elements have to agree on it: the
+      // transcript column inside the thread's scroll viewport, and the composer below it. They
+      // are in different files, and a composer wider than the text above it reads as a
+      // misalignment rather than a design. The upstream v4 source carried this as
+      // `--thread-max-width`; a theme key is the v3 spelling of the same single source.
+      maxWidth: {
+        thread: '44rem',
+      },
       // `--radius` has been declared in index.css since the shadcn token prep and was never
       // wired to a Tailwind key, so every `rounded-lg` in a copied component silently fell
       // back to Tailwind's STOCK radius. That is not a visible error — it is a component

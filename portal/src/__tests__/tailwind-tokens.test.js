@@ -53,6 +53,38 @@ describe('tailwind custom tokens', () => {
     }
     expect(offenders, `unknown bial-* tokens (they render as NOTHING):\n${offenders.join('\n')}`).toEqual([])
   })
+
+  // The same failure as rule 1, on the other kind of custom key. `max-w-thread` is the project's
+  // own, and two files depend on it resolving to the SAME number — the thread's transcript column
+  // and the chat's footer column, which have to share one measure or the composer sits wider than
+  // the text above it. Delete the theme key and both render with no max-width at all: no build
+  // error, no console warning, every suite green, and the plan chat runs edge to edge.
+  it('every custom max-w-* class used in src/ actually exists in the config', () => {
+    const config = readFileSync(CONFIG, 'utf8')
+    const declared = new Set(
+      (config.match(/maxWidth:\s*\{([\s\S]*?)\}/)?.[1].match(/([a-zA-Z][\w-]*):/g) ?? []).map((k) =>
+        k.replace(':', ''),
+      ),
+    )
+    expect(declared.size, 'could not read the maxWidth namespace out of tailwind.config.js').toBeGreaterThan(0)
+
+    // Tailwind's own scale, which needs no declaration. Arbitrary values (`max-w-[44rem]`) carry
+    // their own measure and are matched out by the `[a-z]` start of the token pattern.
+    const STOCK = new Set([
+      'none', 'xs', 'sm', 'md', 'lg', 'xl', 'full', 'min', 'max', 'fit', 'prose',
+      'screen', 'px', 'none',
+    ])
+    const offenders = []
+    for (const file of sourceFiles(ROOT)) {
+      const text = stripComments(readFileSync(file, 'utf8'))
+      for (const [, token] of text.matchAll(/\bmax-w-([a-z][a-z0-9-]*)\b/g)) {
+        if (/^(?:\d|screen-|[0-9])/.test(token)) continue
+        if (STOCK.has(token) || /^(?:screen|[0-9]+xl)$/.test(token)) continue
+        if (!declared.has(token)) offenders.push(`${rel(file)} → max-w-${token}`)
+      }
+    }
+    expect(offenders, `unknown max-w-* tokens (they render as NOTHING):\n${offenders.join('\n')}`).toEqual([])
+  })
 })
 
 // Rule 2 — Tailwind v4 syntax. Every entry below is a token actually present in `thread`,

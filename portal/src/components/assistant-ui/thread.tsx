@@ -38,7 +38,7 @@
 //
 // THE v4→v3 REWRITE APPLIED HERE:
 //   `@container`                       → dropped (v4 only; nothing depended on it)
-//   `max-w-(--thread-max-width)`       → `max-w-[44rem]`; the CSS variable goes with it
+//   `max-w-(--thread-max-width)`       → `max-w-thread`, a v3 theme key; the variable goes with it
 //   `wrap-break-word`                  → `break-words`
 //   `-mb-7.5` / `pb-7.5` / `min-h-7.5` → the action bar's reserved space, rewritten as
 //                                        arbitrary rem values; v3 has no fractional spacing
@@ -133,7 +133,7 @@ const ThreadRoot: FC = () => {
         data-testid="thread-viewport"
         className="relative flex min-h-0 flex-1 flex-col overflow-y-auto scroll-smooth"
       >
-        <div className="mx-auto flex w-full max-w-[44rem] flex-1 flex-col px-4 pt-4">
+        <div className="mx-auto flex w-full max-w-thread flex-1 flex-col px-4 pt-4">
           <div data-testid="thread-messages" className="flex flex-col gap-y-6 pb-4 empty:hidden">
             <ThreadPrimitive.Messages>{() => <ThreadMessage />}</ThreadPrimitive.Messages>
           </div>
