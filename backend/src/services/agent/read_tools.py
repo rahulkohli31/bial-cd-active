@@ -41,7 +41,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Final, Protocol, cast
 
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.toolsets.function import FunctionToolset
@@ -52,6 +52,7 @@ from src.core.redaction import (
     leaves_a_credential_value_open,
     scrub_untrusted,
 )
+from src.services.media import CODE_LANE_MEDIA, canonical_suffix, is_opc_archive
 
 if TYPE_CHECKING:
     # Annotation-only, deliberately: `LiveSandboxWorkspace` holds a `SandboxSession`, but this
@@ -117,6 +118,11 @@ IGNORED_DIRS = frozenset({".git", "node_modules", ".next", "dist", ".turbo"})
 # a directory of that name, silently reading somebody's chat files when they asked for their own
 # source. The leading dot makes it a reserved namespace the generated template never writes into.
 ATTACHMENTS_PREFIX = ".attachments/"
+#: The attached kinds that are archives rather than text. Derived from the lane definition, so a
+#: sixth format admitted there cannot be forgotten here; the delimited kinds are absent on purpose.
+_NOT_TEXT_SUFFIXES: Final[tuple[str, ...]] = tuple(
+    sorted(canonical_suffix(media) for media in CODE_LANE_MEDIA if is_opc_archive(media))
+)
 _CONTAINER_ATTACHMENTS_ROOT = "/workspace/attachments"
 
 
@@ -518,6 +524,9 @@ class LiveSandboxWorkspace:
         above this does its own line windowing. Handing it pre-numbered text would number it
         twice and quietly corrupt every line the model tried to quote back."""
         self._vet(rel_path)
+        refusal = _refuse_a_binary_attachment(rel_path)
+        if refusal is not None:
+            raise WorkspacePathError(refusal)
         result = await self._read(["cat", "--", to_container_path(rel_path)])
         if result.exit != 0:
             # `cat`'s stderr is the honest reason (missing, a directory, unreadable) and it is
@@ -747,6 +756,29 @@ def _refuse_an_attachment_operand(token: str) -> str | None:
         f"and attachments live outside it. Use the `{ATTACHMENT_READ_TOOL}` tool if you have it, "
         "passing that same path; otherwise say the file could not be read rather than describing "
         "it from its name."
+    )
+
+
+def _refuse_a_binary_attachment(token: str) -> str | None:
+    """Why an attached spreadsheet, document or deck cannot be read as text, or None.
+
+    ★ THE ANSWER WOULD BE BYTES. These kinds are zip archives: `cat` returns their compressed
+    contents, which decode to replacement characters and fill the model's window with nothing it
+    can use. Until the supervisor replaced undecodable bytes, the same read took the whole turn
+    down instead — so this is the difference between a useless answer and a teachable one.
+
+    The delimited kinds are deliberately absent: a `.csv` in the attachments root IS text, and
+    reading it straight is a reasonable thing for an agent to do.
+    """
+    if not is_an_attachment_path(token):
+        return None
+    if not token.lower().endswith(_NOT_TEXT_SUFFIXES):
+        return None
+    return (
+        f"`{token}` is a spreadsheet, document or deck — an archive, not text — so reading it "
+        f"here returns bytes rather than content. Use the `{ATTACHMENT_READ_TOOL}` tool if you "
+        "have it, passing that same path; otherwise say the file could not be read rather than "
+        "describing it from its name."
     )
 
 
