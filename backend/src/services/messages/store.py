@@ -90,6 +90,14 @@ and the shipped reader, so the model has no use for a marker — and carrying on
 would hit the same `CachePoint` coercion `_assert_no_marker_left` exists to prevent.
 
 So: written at persist time, read by every discovery scan, gone before the model sees anything.
+
+IT IS A ONE-WAY DOOR, stated here because this is where a reader looks. A server that does
+not know this kind does not skip it — the type adapter refuses the whole payload, so every
+conversation holding a sent code-lane file stops loading on a rollback, not just the one
+message. The version gate above cannot carry the warning either: it is per conversation, so
+raising the version would strand every conversation a new server touched rather than only
+these. `scripts/strip_attachment_file_refs.py` is the way back — it removes the markers, at
+the cost of the chips those files draw.
 """
 
 # How many times to re-pick a seq when a concurrent writer took the slot (the established
