@@ -57,42 +57,12 @@ export interface FilePartImageOrDocument {
   size?: number
 }
 
-/** A HYBRID: original .docx/.xlsx bytes live in the object store (chip
- * re-downloads them) but are NEVER sent to the model — the server-extracted
- * Markdown (`text`) is sent as a sticky text block instead. */
-export interface FilePartOffice {
-  type: 'file'
-  kind: 'office'
-  format: 'word' | 'excel'
-  attachmentId: string
-  key: string
-  name: string
-  mediaType: string
-  size: number
-  text: string
-  truncated: boolean
-  /** Human-readable truncation detail for the chip tooltip; only set when
-   * `truncated` is true. */
-  truncationNote?: string
-}
-
-/** A .pptx: original bytes live in the object store (chip re-downloads them);
- * the model sees a sticky vision `document` block referencing the INTERNAL
- * converted PDF by `pdfFileId` (never the .pptx, never base64) — the PDF is
- * invisible to the user, only the .pptx is ever surfaced. */
-export interface FilePartDeck {
-  type: 'file'
-  kind: 'deck'
-  attachmentId: string
-  key: string
-  name: string
-  mediaType: string
-  size: number
-  pdfFileId: string
-  pageCount: number
-}
-
-export type FilePart = FilePartImageOrDocument | FilePartOffice | FilePartDeck
+/** THE ONE FILE-PART SHAPE. Two more lived here — an `office` part carrying server-extracted
+ *  Markdown, and a `deck` part naming an internally converted PDF — for pipelines this
+ *  platform no longer runs: a file's own bytes are stored and read where they can be read.
+ *  Nothing produces either shape, and `chip_kind_for` cannot name them, so a part arriving
+ *  from history carries one of the three kinds above. */
+export type FilePart = FilePartImageOrDocument
 
 /**
  * HOW A BUILD ENDED — three terminals, not two.
