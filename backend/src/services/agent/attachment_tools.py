@@ -104,7 +104,14 @@ class AttachmentReader:
         # The same `to_container_path` `read_file` and `search_files` use, for the same reason and
         # with the same one-prefix scope — `read_attachment` refuses anything that is not an
         # attachment path, so this only ever rewrites the prefix it was built for.
-        argv = ["python3", READER_PATH, to_container_path(path)]
+        # ★ `-I` ISOLATES THE INTERPRETER, and that is a security property rather than a tidy-up.
+        # A bare `python3` runs `site`, which imports `usercustomize` and executes every `.pth`
+        # file under `$HOME/.local` — and the container's `$HOME` belongs to the account the app's
+        # own build runs as. Any Build turn, any `npm` lifecycle script and the generated app
+        # itself could therefore rewrite what the reader does, AFTER the turn note has told the
+        # model this is the trusted shipped copy. `-I` also ignores `PYTHONPATH` and the current
+        # directory, so the app tree cannot shadow a stdlib module the reader imports.
+        argv = ["python3", "-I", READER_PATH, to_container_path(path)]
         run_command = self.session.sandbox_client.exec  # aliased off the JS-oriented exec guard
         try:
             result = await run_command(self.session.handle, argv, timeout_s=_READ_TIMEOUT_SECONDS)
