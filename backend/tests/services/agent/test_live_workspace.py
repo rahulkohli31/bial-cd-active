@@ -292,16 +292,46 @@ async def test_the_attachments_prefix_reaches_the_second_root() -> None:
     nothing to exclude — but a sibling is unreachable unless the read surface can address it.
 
     Mutation receipt: drop `to_container_path` from `read_file` and the argv carries the bare
-    `.attachments/roster.xlsx`, which resolves inside the app tree and finds nothing.
+    `.attachments/roster.csv`, which resolves inside the app tree and finds nothing.
     """
     fake = FakeSandbox()
     workspace = _live(fake, stdout="badge,name\n")
 
-    await workspace.read_file(".attachments/roster.xlsx")
+    await workspace.read_file(".attachments/roster.csv")
 
     argv = fake.command_calls[-1]
-    assert "/workspace/attachments/roster.xlsx" in argv
-    assert ".attachments/roster.xlsx" not in argv
+    assert "/workspace/attachments/roster.csv" in argv
+    assert ".attachments/roster.csv" not in argv
+
+
+async def test_reading_an_attached_workbook_names_the_reader_instead_of_returning_bytes() -> None:
+    """★ AN ARCHIVE IS NOT TEXT, and `cat` on one answers with neither content nor an error.
+
+    A spreadsheet, document or deck is a zip: its bytes decode to replacement characters, so the
+    window fills with nothing the model can use and the file reads as empty rather than as
+    unreadable. Refused here with the tool that CAN open it named — the same shape the command
+    door already takes for the same paths.
+
+    Mutation receipt: drop the refusal from `read_file` and `cat` runs on the archive.
+    """
+    fake = FakeSandbox()
+    workspace = _live(fake, stdout="PK")
+
+    with pytest.raises(WorkspacePathError) as caught:
+        await workspace.read_file(".attachments/roster.xlsx")
+
+    assert "read_attachment" in str(caught.value)
+    assert not fake.command_calls
+
+
+async def test_an_attached_delimited_file_is_still_read_as_text() -> None:
+    """The refusal above is scoped to the archive kinds. A `.tsv` in the attachments root IS
+    text, and an agent reading it straight is doing something reasonable — refusing it would take
+    away a capability to fix a problem it does not have."""
+    fake = FakeSandbox()
+    workspace = _live(fake, stdout="badge\tname\n")
+
+    assert await workspace.read_file(".attachments/movements.tsv") == "badge\tname\n"
 
 
 async def test_an_ordinary_app_path_is_not_translated() -> None:
