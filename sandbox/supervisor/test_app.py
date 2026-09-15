@@ -27,12 +27,19 @@ import pytest
 # Seed the module-level fail-fast config BEFORE importing app.py.
 os.environ.setdefault("SUPERVISOR_TOKEN", "test-token-not-a-real-secret")
 os.environ.setdefault("APP_USER", pwd.getpwuid(os.getuid()).pw_name)
-_WS = tempfile.mkdtemp(prefix="bial-sup-ws-")
+# SIBLINGS UNDER ONE PARENT, exactly as the container lays them out (`/workspace/app` beside
+# `/workspace/attachments`). Two unrelated temp directories made every cross-root case
+# unreachable, so the guard's own tests could not tell a real containment rule from a lucky
+# fixture — and a change of default root would have stayed green while every attachment
+# started travelling into snapshots.
+_BASE = tempfile.mkdtemp(prefix="bial-sup-")
+_WS = os.path.join(_BASE, "app")
+_ATT = os.path.join(_BASE, "attachments")
+os.makedirs(_WS, exist_ok=True)
+os.makedirs(_ATT, exist_ok=True)
 os.environ["WORKSPACE"] = _WS
-_ATT = tempfile.mkdtemp(prefix="bial-sup-att-")
 os.environ["ATTACHMENTS_DIR"] = _ATT
-atexit.register(shutil.rmtree, _ATT, ignore_errors=True)
-atexit.register(shutil.rmtree, _WS, ignore_errors=True)  # don't leak the temp workspace per run
+atexit.register(shutil.rmtree, _BASE, ignore_errors=True)  # don't leak the temp tree per run
 
 from urllib.parse import unquote  # noqa: E402
 
@@ -388,7 +395,7 @@ def test_a_relative_path_still_means_the_app_tree() -> None:
     assert not (ATTACHMENTS / "note.txt").exists()
 
 
-def test_neither_root_is_a_doorway_to_the_other_or_to_anywhere_else() -> None:
+def test_a_path_that_climbs_out_of_both_roots_is_refused() -> None:
     """The guard is applied twice, not relaxed. `..` is resolved BEFORE the check, so a path that
     starts inside one root and climbs out of it is refused even though its prefix looked legal."""
     for path in (
@@ -403,6 +410,27 @@ def test_neither_root_is_a_doorway_to_the_other_or_to_anywhere_else() -> None:
             headers=AUTH,
         )
         assert r.status_code == 400, f"{path} was not refused"
+
+
+def test_either_root_can_name_the_other_and_that_is_deliberate() -> None:
+    """★ WRITTEN DOWN BECAUSE THE GUARD USED TO CLAIM THE OPPOSITE.
+
+    In the container the roots are siblings, so a `..` from one lands in the other and
+    resolves. That is intended: both belong to the same workspace, and the read surface names
+    the attachments root directly anyway. The separation exists so a snapshot of the app tree
+    carries no attachment — a property of what is archived, not of what this guard opens.
+
+    Unreachable until the fixtures became siblings, which is why the claim survived so long.
+    """
+    crossing = str(WORKSPACE / ".." / ATTACHMENTS.name / "crossed.bin")
+    r = client.post(
+        "/files",
+        json={"action": "create_bytes", "path": crossing, "file_b64": "AAEC"},
+        headers=AUTH,
+    )
+
+    assert r.status_code == 200, r.text
+    assert (ATTACHMENTS / "crossed.bin").read_bytes() == bytes([0x00, 0x01, 0x02])
 
 
 # --- /files: create_bytes --------------------------------------------
