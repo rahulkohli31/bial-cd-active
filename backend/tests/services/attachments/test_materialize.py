@@ -654,6 +654,53 @@ async def test_a_row_with_no_conversation_link_is_still_found_by_its_id(db_sessi
     assert [f.attachment_id for f in found] == ["loose"]
 
 
+async def test_a_file_counted_against_another_chat_is_not_delivered_into_this_one(
+    db_session,
+) -> None:
+    """★ THE DOOR COUNTS PER CONVERSATION, SO DELIVERY HAS TO AGREE WITH IT.
+
+    A message may name any id its sender owns, and the ids arm admitted every one — so a chat
+    could be handed files counted against a different chat, and permanently, because a row joins
+    the sent set on the turn it arrives. The arm exists for rows carrying no link at all, and the
+    test above holds that those are still reachable.
+
+    Mutation receipt: drop the `conversation_id IS NULL` clause and the other chat's file is
+    delivered here too.
+    """
+    storage = FakeStorage()
+    user = await UserFactory.create(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    mine = await ConversationFactory.create(db_session, user.id, project_id=project.id)
+    elsewhere = await ConversationFactory.create(db_session, user.id, project_id=project.id)
+    await _stored(
+        db_session,
+        storage,
+        user_id=user.id,
+        attachment_id="counted_elsewhere",
+        media_type=EXCEL_MEDIA_TYPE,
+        name="other.xlsx",
+        conversation_id=elsewhere.id,
+    )
+    await _stored(
+        db_session,
+        storage,
+        user_id=user.id,
+        attachment_id="loose",
+        media_type=EXCEL_MEDIA_TYPE,
+        name="loose.xlsx",
+        conversation_id=None,
+    )
+
+    found = await code_lane_attachments(
+        db_session,
+        user_id=user.id,
+        conversation_id=mine.id,
+        attachment_ids=["counted_elsewhere", "loose"],
+    )
+
+    assert [f.attachment_id for f in found] == ["loose"]
+
+
 async def test_reading_a_new_chats_files_writes_nothing(db_session) -> None:
     """★ READING MUST NEVER WRITE, because the chat does not exist yet.
 
