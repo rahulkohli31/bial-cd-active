@@ -27,11 +27,13 @@ copy that has been broken can be restored.
 
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import re
 import signal
 import sys
+import tempfile
 
 # BOUND THE PARALLELISM BEFORE polars IS IMPORTED, which is what makes the memory ceiling below
 # mean anything. `RLIMIT_AS` counts VIRTUAL address space, and polars reserves a stack per worker
@@ -158,6 +160,23 @@ _MERGE_SCAN_LIMIT = 10_000
 _MERGE_SCAN_MATCHES = 100_000
 
 
+_MERGE_REF = re.compile(r"^([A-Z]+)(\d+):([A-Z]+)(\d+)$")
+
+
+def _tops_a_banner(merged: list[str]) -> bool:
+    """Whether the sheet opens with a merged title spanning columns.
+
+    A merge further down the sheet, or one a single column wide, is ordinary formatting and
+    says nothing about where the headings are. A merge that starts on row 1 and covers more
+    than one column is a title bar — and the row beneath it is the real header.
+    """
+    for ref in merged:
+        match = _MERGE_REF.match(ref)
+        if match and match.group(2) == "1" and match.group(1) != match.group(3):
+            return True
+    return False
+
+
 def _merged_ranges(path: Path, sheet_path: str) -> list[str]:
     """The sheet's merged ranges, read from its XML as BYTES rather than as a tree.
 
@@ -247,8 +266,15 @@ def read_xlsx(path: Path) -> dict[str, Any]:
         ) from None
 
     sheets = []
-    for name in formulas.sheetnames:
-        fsheet, vsheet = formulas[name], values[name]
+    # ONLY THE TABS THAT HOLD CELLS. A chart moved onto its own sheet (Excel's ordinary
+    # "Move Chart -> New sheet", which the upload door cannot see) is a chartsheet, and a
+    # chartsheet carries no `max_row` — so the first attribute read below raised, the broad
+    # arm caught it, and the whole workbook came back unreadable because one tab held a
+    # picture. `worksheets` is openpyxl's own name for the grid-bearing sheets; a chart tab
+    # has no cells to describe.
+    for fsheet in formulas.worksheets:
+        name = fsheet.title
+        vsheet = values[name]
         # THE DECLARED `<dimension>` IS READ BEFORE IT IS DISCARDED, and discarding it is what
         # stops the damage. A read-only row is truncated to `max_column`, so a 50-row, 3-column
         # sheet declaring `A1:A1` did not merely report one row and one column — its other columns
@@ -259,15 +285,25 @@ def read_xlsx(path: Path) -> dict[str, Any]:
         vsheet.reset_dimensions()
         fsheet.reset_dimensions()
 
-        # ONE PASS FOR BOTH ROWS. A read-only sheet has no random `cell(row=, column=)` access —
-        # that is the API's way of saying it never holds the grid — so the header and the probe
-        # row are taken from the same forward walk rather than looked up per column.
-        frows = fsheet.iter_rows(min_row=1, max_row=2, values_only=True)
-        header_values = list(next(frows, ()) or ())
-        probe_values = list(next(frows, ()) or ())
-        vrows = vsheet.iter_rows(min_row=1, max_row=2, values_only=True)
-        next(vrows, ())
-        cached_values = list(next(vrows, ()) or ())
+        # ★ A MERGED TITLE ACROSS THE TOP IS A BANNER, NOT A HEADER. Read as one it makes the
+        # reader confidently wrong about every column at once: the real headings sit on the row
+        # below, so the names come back empty, every type is judged from a row of text, and a
+        # formula column reports `isFormula: false` — defeating the second pass that exists to
+        # catch exactly that. It is an ordinary corporate layout, and on a streamed read the
+        # merge record is the only evidence of it left.
+        merged = _merged_ranges(path, _sheet_part(fsheet))
+        header_row = 2 if _tops_a_banner(merged) else 1
+
+        # ONE PASS FOR EVERY ROW READ. A read-only sheet has no random `cell(row=, column=)`
+        # access — that is the API's way of saying it never holds the grid — so the header and
+        # the probe row are taken from the same forward walk rather than looked up per column.
+        frows = fsheet.iter_rows(min_row=1, max_row=header_row + 1, values_only=True)
+        seen_rows = [list(row or ()) for row in frows]
+        header_values = seen_rows[header_row - 1] if len(seen_rows) >= header_row else []
+        probe_values = seen_rows[header_row] if len(seen_rows) > header_row else []
+        vrows = vsheet.iter_rows(min_row=1, max_row=header_row + 1, values_only=True)
+        seen_cached = [list(row or ()) for row in vrows]
+        cached_values = seen_cached[header_row] if len(seen_cached) > header_row else []
         width = max(len(header_values), len(probe_values))
 
         rows, cols = declared_rows, max(declared_cols, width)
@@ -341,6 +377,9 @@ def read_xlsx(path: Path) -> dict[str, Any]:
                 "name": _clip(name),
                 "rows": rows,
                 "columns": cols,
+                # WHICH ROW THE NAMES CAME FROM, because it is not always the first one and
+                # an agent reading a column list has no other way to tell.
+                "headerRow": header_row,
                 # BOUNDED LIKE EVERY OTHER LIST HERE. A wide sheet — genuinely wide, or one
                 # declaring 16,384 columns — otherwise emits one clipped cell per column with no
                 # ceiling, and this manifest is returned to the model verbatim: a 7.7 MB workbook
@@ -348,13 +387,71 @@ def read_xlsx(path: Path) -> dict[str, Any]:
                 # header. It was the only list in the manifest that did not state its own whole.
                 "header": _listing(header),
                 "columnDetail": _listing(columns),
-                "mergedRanges": _listing(_merged_ranges(path, _sheet_part(fsheet))),
+                "mergedRanges": _listing(merged),
             }
         )
 
     formulas.close()
     values.close()
     return {"sheets": _listing(sheets), "media": _zip_media(path)}
+
+
+_ENCODING_SAMPLE_BYTES = 64 * 1024
+_TRANSCODE_CHUNK = 1024 * 1024
+
+
+def _text_encoding(path: Path) -> str:
+    """Which encoding a delimited file is actually written in.
+
+    ★ GETTING THIS WRONG IS THE CONFIDENTLY-WRONG CLASS ITSELF. Read as UTF-8, a UTF-16 file
+    comes back `ok: true` with column names built out of interleaved NUL bytes, so the agent
+    describes columns that do not exist. A cp1252 file — what Excel writes by default on
+    Windows — failed to parse at all, and the advice that came back ("re-save it") produces
+    the same bytes a second time.
+
+    A BOM is definitive. Without one: a sample that is a quarter NUL bytes is UTF-16 from a
+    tool that omitted the mark, and which half carries them gives the endianness; otherwise
+    UTF-8 is tried, where a character cut in half by the sample boundary is not a failure;
+    and anything still undecodable is read as cp1252, the estate's own default.
+    """
+    with path.open("rb") as handle:
+        sample = handle.read(_ENCODING_SAMPLE_BYTES)
+    if sample.startswith(codecs.BOM_UTF8):
+        return "utf-8-sig"
+    if sample.startswith(codecs.BOM_UTF16_LE) or sample.startswith(codecs.BOM_UTF16_BE):
+        return "utf-16"
+    if sample.count(0) > len(sample) // 4:
+        return "utf-16-le" if sample[1::2].count(0) >= sample[0::2].count(0) else "utf-16-be"
+    try:
+        codecs.getincrementaldecoder("utf-8")().decode(sample)
+    except UnicodeDecodeError:
+        return "cp1252"
+    return "utf-8"
+
+
+def _as_utf8(path: Path, encoding: str) -> Path:
+    """The same file rewritten as UTF-8, for a scanner that reads nothing else.
+
+    polars takes no encoding on a lazy scan, so decoding here is the only way to read what
+    the estate produces. Streamed a megabyte at a time, so a file at the upload cap costs
+    kilobytes of memory rather than its own size twice; the caller removes the copy.
+    """
+    handle, name = tempfile.mkstemp(prefix="attachment-", suffix=".utf8")
+    os.close(handle)
+    target = Path(name)
+    # REPLACING, NOT STRICT. cp1252 leaves five byte values undefined and a truncated file
+    # ends mid-character; either would raise here and turn a readable file back into a
+    # refusal, which is the failure this whole path exists to remove. The manifest names the
+    # encoding, so a citizen can see which reading produced their column names.
+    decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+    with path.open("rb") as source, target.open("w", encoding="utf-8", newline="") as out:
+        while True:
+            chunk = source.read(_TRANSCODE_CHUNK)
+            if not chunk:
+                out.write(decoder.decode(b"", True))
+                break
+            out.write(decoder.decode(chunk))
+    return target
 
 
 def read_delimited(path: Path, separator: str) -> dict[str, Any]:
@@ -366,8 +463,10 @@ def read_delimited(path: Path, separator: str) -> dict[str, Any]:
     """
     import polars as pl
 
+    encoding = _text_encoding(path)
+    source = path if encoding == "utf-8" else _as_utf8(path, encoding)
     try:
-        lazy = pl.scan_csv(path, separator=separator, infer_schema_length=10_000)
+        lazy = pl.scan_csv(source, separator=separator, infer_schema_length=10_000)
         frame = lazy.collect()
     # ★ A FAILURE THAT ALREADY HAS A NAME KEEPS IT, and this clause must stay ABOVE the broad one
     # — placed below it the guard is valid, dead and silent, and nothing in the selected ruff set
@@ -388,6 +487,9 @@ def read_delimited(path: Path, separator: str) -> dict[str, Any]:
             f"This file could not be read as delimited text ({type(exc).__name__}).",
             "Check it opens in a spreadsheet program, re-save it, and attach it again.",
         ) from None
+    finally:
+        if source is not path:
+            source.unlink(missing_ok=True)
 
     columns = [
         {
@@ -403,7 +505,15 @@ def read_delimited(path: Path, separator: str) -> dict[str, Any]:
         for row in _sample(frame.head(MAX_SAMPLE_ROWS).to_dicts())
     ]
     # `rows` is the TRUE height, not the sample's length — the number the old extractor never said.
-    return {"rows": frame.height, "columns": _listing(columns), "sampleRows": sample}
+    # THE ENCODING IS STATED, because a file read through a fallback is a fact about the
+    # answer: a citizen whose file was read as cp1252 can tell from this whether the accents
+    # in their column names came back as they meant them.
+    return {
+        "rows": frame.height,
+        "encoding": encoding,
+        "columns": _listing(columns),
+        "sampleRows": sample,
+    }
 
 
 # --- documents and decks ----------------------------------------------------------------------
