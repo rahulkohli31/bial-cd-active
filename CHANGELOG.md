@@ -20,6 +20,15 @@ says whether a build is running.
   on, nothing moves.
 - **The starter page asks the preview whether a build is running.** It asks every two seconds, and
   the preview answers only the app frame it is showing, at that frame's address.
+- **A planning chat's scrollbar sits at the edge of the window.** It used to be drawn beside the
+  writing, partway across the screen, because the whole panel was narrowed to keep the text a
+  readable width. The text is still the same width; only the part that scrolls now runs the full
+  width of the window, the way it does in other chat apps. The box you type in lines up with the
+  writing above it, which it did not before.
+- **Scrollbars everywhere in the platform are thinner and quieter.** Every scrolling area draws a
+  slim grey bar on an invisible track instead of the browser's own, which on Windows is a wide grey
+  strip with buttons. The bar is dark enough to stay clearly visible against every surface it is
+  drawn over.
 
 ### Fixed
 

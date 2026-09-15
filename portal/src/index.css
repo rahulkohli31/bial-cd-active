@@ -82,6 +82,30 @@ body {
   width: 100%;
 }
 
+/* THE PORTAL'S SCROLLBARS — two properties, no utility class, every scroll surface at once. That
+ * is deliberate: a class only reaches the surfaces that remember to carry it.
+ *
+ * `scrollbar-width` does not inherit, hence the universal selector; `scrollbar-color` is written
+ * beside it so the pair reads as one decision. Together they are the whole styling: thinner than
+ * the platform default, a neutral thumb, an invisible track.
+ *
+ * THE THUMB'S ALPHA IS A CONTRAST FLOOR, not a taste setting. A browser's own scrollbar is exempt
+ * from WCAG 1.4.11; the moment an author colours one it is in scope, and 3:1 against the surface
+ * behind it is the bar. `0.85` of this token measures 3.6:1 on white, 3.3:1 on the page ground and
+ * 3.5:1 on the muted surface — the quieter values this started at were 1.6:1. Lowering it to taste
+ * re-breaks an accessibility requirement, silently, because nothing about it looks wrong.
+ *
+ * DO NOT ADD `::-webkit-scrollbar` RULES BESIDE THESE. Measured in Chrome, not assumed: an element
+ * carrying either standard property ignores every `::-webkit-scrollbar` rule aimed at it — a
+ * `::-webkit-scrollbar-thumb` painted red stayed grey, and reverting the two properties on the
+ * same element brought the red back. So a webkit block under this rule is unreachable on every
+ * engine that implements the standard properties: dead the moment it is written, and convincing
+ * enough to read that someone will re-add it. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: hsl(var(--muted-foreground) / 0.85) transparent;
+}
+
 @media (prefers-reduced-motion: reduce) {
   /* THE PORTAL'S REDUCED-MOTION GUARANTEE. Two mechanisms carry it, and these are both of them.
    *

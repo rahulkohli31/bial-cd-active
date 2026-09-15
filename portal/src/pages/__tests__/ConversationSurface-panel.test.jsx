@@ -156,14 +156,59 @@ describe('a plan chat is one centred column; a build chat sits beside its app', 
     expect(panel.className).not.toMatch(/mx-auto/)
   })
 
-  it('★ a plan chat centres its column rather than running edge to edge', async () => {
+  it('★ a plan chat centres its column one level in, leaving the panel full width', async () => {
     // It declares no pane, so the shell hands it the whole window — and a transcript run across
-    // 1440px is unreadable. Centring is the panel's own answer; the RAIL's width stays the
-    // citizen's to drag, which is why this is not solved by pinning the rail narrower.
+    // 1440px is unreadable, so something has to carry a measure. THE PANEL IS NOT THAT SOMETHING.
+    // Centring the panel centres the transcript's scroll container with it, which parks the
+    // scrollbar beside the text in the middle of the window instead of at its edge. The measure
+    // belongs to the column inside the scroller (the thread's own `max-w`) and to the footer
+    // column below it, which is what these two assertions are: a full-width box, a centred
+    // column.
     const panel = await renderReady('plan')
     expect(panel.getAttribute('data-chat-kind')).toBe('plan')
-    expect(panel.className).toMatch(/mx-auto/)
-    expect(panel.className).toMatch(/max-w-/)
+    expect(panel.className).not.toMatch(/mx-auto/)
+    expect(panel.className).not.toMatch(/max-w-/)
+
+    // LIVENESS for the two absences above: the centring did not vanish, it moved here. Without
+    // this the pair would pass just as happily on a panel that lost its measure altogether.
+    const footer = screen.getByTestId('chat-footer-column')
+    expect(footer.className).toMatch(/mx-auto/)
+    // `max-w-thread` is the shared key, so this also pins that the composer and the transcript
+    // column are measured from the same place rather than two copies of one number.
+    expect(footer.className).toMatch(/max-w-thread/)
+  })
+
+  it('★ nothing between the panel and the scroller constrains the scroller’s width', async () => {
+    // THE ASSERTION THAT ACTUALLY PINS THE FIX, and the reason the two above are not enough.
+    // The scroll container is two levels below the panel, so a `max-w` on ANY element in
+    // between puts the scrollbar back beside the text while the panel itself stays innocent
+    // and every other test here stays green. Walk the chain instead of naming one element:
+    // a future wrapper inserted in the middle is exactly how this regresses.
+    const panel = await renderReady('plan')
+    const viewport = screen.getByTestId('thread-viewport')
+
+    const constrained = []
+    for (let el = viewport; el && el !== panel.parentElement; el = el.parentElement) {
+      if (/max-w-|mx-auto/.test(el.className)) constrained.push(el.dataset.testid ?? el.className)
+    }
+    expect(constrained).toEqual([])
+
+    // LIVENESS: the walk reached the panel. Without this the loop could visit nothing at all —
+    // a renamed testid, a viewport outside the panel — and report a clean chain.
+    let reachedPanel = false
+    for (let el = viewport; el; el = el.parentElement) if (el === panel) reachedPanel = true
+    expect(reachedPanel).toBe(true)
+  })
+
+  it('★ a build chat leaves the footer column unmeasured — its rail is already the measure', async () => {
+    // The same wrapper renders for both kinds, so the kind has to be readable off it. A build
+    // chat sits in a rail the citizen drags; a second `max-w` inside it would reintroduce the
+    // dead band the panel's own `w-72` used to make.
+    await renderReady('build')
+    const footer = screen.getByTestId('chat-footer-column')
+    expect(footer.className).toMatch(/flex/)
+    expect(footer.className).not.toMatch(/mx-auto/)
+    expect(footer.className).not.toMatch(/max-w-/)
   })
 
   it("★ carries the board's footer line on a plan chat, verbatim — and not on a build chat", async () => {
