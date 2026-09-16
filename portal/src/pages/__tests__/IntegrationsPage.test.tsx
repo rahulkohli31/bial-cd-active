@@ -288,6 +288,39 @@ describe('the disclosure lists what is switched on, and only that', () => {
     expect(disclosure().textContent).toContain('1')
   })
 
+  it('★ says so when the list is shorter than the number above it', async () => {
+    // The server caps what it sends and counts separately, so these two numbers can disagree by
+    // design. A reader counting rows against the heading and coming up short would conclude the
+    // page had lost some of their applications.
+    h.listConnectors.mockResolvedValue([
+      entry({
+        onProjectCount: 205,
+        onProjects: [{ projectId: 'p1', name: 'Flight Delay Reason Capture' }],
+      }),
+    ])
+    render(<IntegrationsPage />)
+    await openDisclosure()
+
+    expect(disclosure().textContent).toContain('205')
+    expect(screen.getByTestId('connector-more-on-orbit').textContent).toContain('Showing the first 1')
+  })
+
+  it('★ …and stays quiet when it is not', async () => {
+    // The other half. A note that appeared whenever the two numbers were merely READ from
+    // different places would be noise on every card.
+    h.listConnectors.mockResolvedValue([
+      entry({
+        onProjectCount: 1,
+        onProjects: [{ projectId: 'p1', name: 'Flight Delay Reason Capture' }],
+      }),
+    ])
+    render(<IntegrationsPage />)
+    await openDisclosure()
+
+    expect(screen.getByTestId('connector-app-p1')).toBeTruthy()
+    expect(screen.queryByTestId('connector-more-on-orbit')).toBeNull()
+  })
+
   it('an approval with nothing switched on gets an honest empty line, not a spinner', async () => {
     h.listConnectors.mockResolvedValue([entry({ onProjectCount: 0, onProjects: [] })])
     render(<IntegrationsPage />)

@@ -121,11 +121,19 @@ def _known_connector(connector_key: str) -> Connector:
     return CONNECTORS[connector_key]
 
 
+# HOW MANY OF THEM THE DISCLOSURE WILL ACTUALLY DRAW. Nothing about the switch bounds this:
+# one row per project a person has turned the connector on for, in a response that is otherwise
+# a fixed handful of registry strings. The number on the card is a COUNT rather than this list's
+# length, so the cap shortens the list without ever making the card lie about the total — and a
+# client that receives fewer rows than the count can say so.
+_ON_PROJECTS_CAP: Final = 200
+
+
 async def _on_projects(
     db: DbSession, user_id: uuid.UUID, connector_key: str
 ) -> list[ConnectorOnProject]:
     """This person's projects with the connector switched on — the Integrations card's
-    disclosure, and the number on the card above it.
+    disclosure, capped at `_ON_PROJECTS_CAP`. The number on the card is `_on_project_count`.
 
     Scoped through `projects`, which is `project_connectors`' ownership anchor: the `user_id`
     predicate is on the join target, and dropping it would list every citizen's projects.
@@ -147,10 +155,29 @@ async def _on_projects(
             ProjectConnector.enabled.is_(True),
         )
         .order_by(Project.id.desc())
+        .limit(_ON_PROJECTS_CAP)
     )
     return [
         ConnectorOnProject(project_id=project_id, name=name) for project_id, name in rows.all()
     ]
+
+
+async def _on_project_count(db: DbSession, user_id: uuid.UUID, connector_key: str) -> int:
+    """How many there are, which is NOT the length of the list above once the cap bites.
+
+    Read only where it is sent — an approved person — because it is the only state whose card
+    carries the number."""
+    total = await db.scalar(
+        sa.select(sa.func.count())
+        .select_from(Project)
+        .join(ProjectConnector, ProjectConnector.project_id == Project.id)
+        .where(
+            Project.user_id == user_id,
+            ProjectConnector.connector_key == connector_key,
+            ProjectConnector.enabled.is_(True),
+        )
+    )
+    return int(total or 0)
 
 
 def _consent_lines(connector: Connector) -> list[ConsentLine]:
@@ -210,7 +237,9 @@ async def _entry(
         approved_at=row.decided_at if approved else None,
         approved_by_name=access.decided_by_name if approved else None,
         on_projects=on_projects,
-        on_project_count=len(on_projects) if approved else None,
+        on_project_count=(
+            await _on_project_count(db, user_id, connector_key) if approved else None
+        ),
         decided_at=row.decided_at if declined else None,
         decided_by_name=access.decided_by_name if declined else None,
         decision_remarks=row.decision_remarks if declined else None,

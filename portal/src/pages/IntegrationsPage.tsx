@@ -39,9 +39,10 @@ import { DURATION, LAYOUT_EASE } from '../lib/motion'
  * THE LIST FILTERS ON THE APPLICATION'S OWN SWITCH, never on whether the person is still
  * approved. So a withdrawn grant leaves those applications listed and the access pill above them
  * is the one place that says the person-level access is gone — rows quietly disappearing would
- * leave the page short for a reason it never gives. That is also why the count beside the
- * disclosure is the LENGTH of the list rather than `onProjectCount`, which the server sends only
- * in the approved state.
+ * leave the page short for a reason it never gives. The count beside the disclosure prefers
+ * `onProjectCount` and falls back to the list's length, because the server sends the number only
+ * in the approved state — and because the list itself is capped, so its length is the count only
+ * while the cap has not bitten.
  *
  * IT OWNS THE API, THE LOCK AND THE RELOAD. Every state change re-reads from the server rather
  * than patching a card from a write's answer: the person's state is a derivation over their
@@ -210,7 +211,7 @@ function ConnectorCard({
 }: ConnectorCardProps): React.JSX.Element {
   const [open, setOpen] = useState(false)
   const status = statusLine(entry)
-  const count = entry.onProjects.length
+  const count = entry.onProjectCount ?? entry.onProjects.length
   // NOT `state === 'approved'`. A grant can be withdrawn while applications keep their switch up,
   // and those applications are exactly the ones somebody needs to reach. Without access AND with
   // nothing switched on there is no list to disclose, so there is no disclosure either.
@@ -358,6 +359,19 @@ function ConnectorCard({
                         ))}
                       </ul>
                     )}
+                    {entry.onProjectCount !== null &&
+                      entry.onProjectCount > entry.onProjects.length && (
+                        // A SHORTER LIST THAN THE NUMBER ABOVE IT, SAID OUT LOUD. The server caps
+                        // what it sends; a reader counting rows against the heading and coming up
+                        // short would conclude the page had lost some of their applications.
+                        <p
+                          data-testid={`connector-more-on-${entry.key}`}
+                          className="mt-3 text-[11.5px] leading-[1.6] text-neutral"
+                        >
+                          Showing the first {entry.onProjects.length}. The rest are switched on
+                          too — each one’s own Settings has its switch.
+                        </p>
+                      )}
                     <p className="mt-3 text-[11.5px] leading-[1.6] text-neutral">
                       {DISCLOSURE_FOOTER}
                     </p>

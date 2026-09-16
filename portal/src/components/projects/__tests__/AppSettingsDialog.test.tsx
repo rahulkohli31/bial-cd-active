@@ -230,9 +230,9 @@ describe('Integrations is the data this one application may read', () => {
   }
 
   const entry = (state: string) => ({
-    key: 'dice',
-    displayName: 'Flight Fact Data',
-    dataNoun: 'flight data',
+    key: 'orbit',
+    displayName: 'ORBIT',
+    dataNoun: 'stand and gate data',
     state,
     enabled: false,
     effectivelyOn: false,

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from src.api.v1.connectors import router as router_module
 from src.core.connectors import CONNECTORS
 from src.db.models.connector_access import ConnectorRequestStatus
 from src.db.models.project_connector import ConnectorWindowKind, ProjectConnector
@@ -287,6 +288,31 @@ async def test_the_project_count_counts_only_switched_on_projects(client, db_ses
     entry = await _only(client, user)
 
     assert entry["onProjectCount"] == 2
+
+
+async def test_the_disclosure_is_bounded_and_the_count_beside_it_is_not(
+    client, db_session
+) -> None:
+    """★ NOTHING ABOUT A SWITCH BOUNDS THIS LIST — it is one row per project a person has turned
+    the connector on for, riding in a response that is otherwise a handful of registry strings.
+
+    The cap is what keeps that bounded, and the COUNT is what stops the cap turning into a lie:
+    they are read separately on purpose, so a card saying `On in N applications` states the real
+    N while the disclosure under it draws a page of them. Computing the number from the list's own
+    length would have made the cap silently rewrite the total instead."""
+    user = await UserFactory.create(db_session)
+    admin = await UserFactory.create(db_session, display_name="Rahul Menon")
+    await seed_decision(db_session, user.id, ConnectorRequestStatus.APPROVED, admin)
+
+    # Two past the cap, so the list is short by exactly the amount that proves it was applied.
+    over = router_module._ON_PROJECTS_CAP + 2
+    for _ in range(over):
+        await _switch_on(db_session, user.id)
+
+    entry = await _only(client, user)
+
+    assert len(entry["onProjects"]) == router_module._ON_PROJECTS_CAP
+    assert entry["onProjectCount"] == over
 
 
 async def test_the_project_count_is_zero_not_null_for_an_approved_person(
