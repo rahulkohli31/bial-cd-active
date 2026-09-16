@@ -886,6 +886,47 @@ async def test_a_takedown_after_a_failed_restart_still_refuses_a_restart(
     assert wire.aca.created == []
 
 
+async def test_a_takedown_buried_under_a_later_failure_still_refuses_a_restart(
+    wire, client, db_session
+) -> None:
+    """★ THE STAMP IS NOT ALWAYS ON EITHER END. Nothing stops an owner publishing again after a
+    take-down, and that attempt can fail — which leaves the stamp on a row that is neither the
+    newest nor the last published one. Read the newest row and it is unstamped; read the last
+    published row and it is unstamped too; and between them sits a take-down nobody reversed, so
+    both readings hand back a container its owner removed from production.
+
+    The answer is the comparison the lists already make, not a field on either end of it."""
+    user = await UserFactory.create(db_session)
+    app_row = await AppRegistryFactory.create(db_session, user_id=user.id)
+    published = await _deployment(db_session, app_id=app_row.id, user_id=user.id)
+    await _deployment(
+        db_session,
+        app_id=app_row.id,
+        user_id=user.id,
+        status=DeploymentStatus.FAILED,
+        failure_code="restart_failed",
+        unpublished_at=datetime.now(UTC),
+    )
+    # The owner tried to publish again afterwards, and it did not come up. An attempt, not a
+    # publication — so it neither restores production nor reverses the take-down.
+    await _deployment(
+        db_session,
+        app_id=app_row.id,
+        user_id=user.id,
+        status=DeploymentStatus.FAILED,
+        failure_code="build_failed",
+    )
+
+    resp = await client.post(_RESTART.format(pid=app_row.project_id), headers=auth_headers(user))
+
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "taken_offline"
+    assert wire.aca.created == []
+    # And the version that WOULD have come back is the one the take-down removed — which is what
+    # makes this a resurrection rather than a stale refusal.
+    assert published.image_digest is not None
+
+
 async def test_the_deployment_read_calls_a_failed_restart_live_not_did_not_start(
     client, db_session
 ) -> None:

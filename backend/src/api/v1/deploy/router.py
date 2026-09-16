@@ -1126,14 +1126,8 @@ async def restart_project(
     if await store.in_flight(db, app_id=app_row.id) is not None:
         raise AppApiError(status.HTTP_409_CONFLICT, _BUSY_MSG, code="deploy_in_flight")
 
-    # THE TAKEDOWN AXIS IS READ OFF THE NEWEST ROW, because `unpublish` stamps whichever row
-    # was newest when it ran — so an app taken offline after its last publish carries the stamp
-    # on a row that is not the published one.
-    newest = await store.latest_for_app(db, app_id=app_row.id)
-    if newest is None:
+    if await store.latest_for_app(db, app_id=app_row.id) is None:
         raise AppApiError(status.HTTP_409_CONFLICT, _RESTART_NEVER_DEPLOYED, code="never_deployed")
-    if newest.unpublished_at is not None:
-        raise AppApiError(status.HTTP_409_CONFLICT, _RESTART_TAKEN_OFFLINE, code="taken_offline")
 
     # WHAT IS LIVE IS THE LAST ATTEMPT THAT PUBLISHED, NOT THE LAST ATTEMPT. A restart claims a
     # row of its own, so a restart that fails or times out leaves a `failed` row newer than the
@@ -1148,6 +1142,14 @@ async def restart_project(
     row = await store.latest_published(db, app_id=app_row.id)
     if row is None or row.image_digest is None:
         raise AppApiError(status.HTTP_409_CONFLICT, _RESTART_NOT_LIVE, code="not_live")
+
+    # AND THE TAKEDOWN AXIS IS A COMPARISON, not a field on either end of it. The stamp lands on
+    # whichever row was newest when the owner pressed Take down, and attempts keep arriving after
+    # — so it can settle on a row that is neither the newest nor the published one, and testing
+    # either alone hands back a container its owner removed. Same collapse the lists make.
+    taken_down = await store.latest_takedown(db, app_id=app_row.id)
+    if taken_down is not None and taken_down >= row.id:
+        raise AppApiError(status.HTTP_409_CONFLICT, _RESTART_TAKEN_OFFLINE, code="taken_offline")
 
     try:
         started = await service.restart(

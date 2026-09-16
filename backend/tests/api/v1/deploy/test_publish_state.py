@@ -381,11 +381,15 @@ def test_a_failed_publish_still_reports_that_it_did_not_start() -> None:
     assert compute_publish_state(app, deployment, _LIVE_SHA) is PublishState.DID_NOT_START
 
 
-@pytest.mark.parametrize("code", ["restart_failed", "restart_not_ready"])
-def test_a_takedown_that_landed_on_the_failed_restart_is_not_reported_as_live(code: str) -> None:
-    """★ OFFLINE OUTRANKS THE ATTEMPT. `unpublish` stamps whichever row was newest when it ran,
-    which after a failed restart is that failure — so without the stamp check this arm would
-    announce a container the owner has just removed as live."""
+@pytest.mark.parametrize("code", ["restart_failed", "restart_not_ready", "build_failed"])
+def test_a_takedown_says_taken_offline_whatever_attempt_it_landed_on(code: str) -> None:
+    """★ OFFLINE OUTRANKS THE ATTEMPT, AND IT HAS TO NAME ITSELF. `unpublish` stamps whichever row
+    was newest when it ran, which after a failed restart is that failure.
+
+    "not live" is not enough, and asserting only that is what hid the real answer: `DID_NOT_START`
+    satisfies it, and it is a dead end — the production surface reads "Could not restart" about an
+    application the owner has just removed themselves, and offers neither Publish nor Take down
+    beside it. The only lever left was a full re-publish, or an administrator."""
     app = _app()
     deployment = _deployment(
         status=DeploymentStatus.FAILED,
@@ -393,7 +397,7 @@ def test_a_takedown_that_landed_on_the_failed_restart_is_not_reported_as_live(co
         head_sha=_LIVE_SHA,
         unpublished_at=datetime(2026, 9, 17, 1, 0, tzinfo=UTC),
     )
-    assert compute_publish_state(app, deployment, _LIVE_SHA) is not PublishState.LIVE_CURRENT
+    assert compute_publish_state(app, deployment, _LIVE_SHA) is PublishState.TAKEN_OFFLINE
 
 
 def test_a_failed_restart_with_no_head_claims_nothing_about_a_version() -> None:

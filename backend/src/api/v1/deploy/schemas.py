@@ -345,6 +345,14 @@ def compute_publish_state(
         # DRAFT, or APPROVED-but-never-deployed already returned above: nothing else
         # reaches here with no deployment row.
         return PublishState.DRAFT
+    if deployment.unpublished_at is not None:
+        # AN OWNER TOOK IT DOWN, and that is a fact about PRODUCTION — not about the attempt the
+        # stamp happened to land on. It sits above all three status arms because a take-down can
+        # land on any of them: a restart that was failing at the time left a FAILED row, and
+        # reading the attempt first told the owner "Could not restart" about an application they
+        # had just removed from production themselves, with neither Publish nor Take down offered
+        # beside it. The same distinction the restart arm below draws, made once and earlier.
+        return PublishState.TAKEN_OFFLINE
     if deployment.status is DeploymentStatus.RUNNING:
         return PublishState.STARTING_UP
     if deployment.status is DeploymentStatus.FAILED:
@@ -358,13 +366,7 @@ def compute_publish_state(
         #
         # The failure is not swallowed: the row still carries its code and its citizen sentence,
         # and the production surface states them beside a status that is true.
-        if (
-            deployment.failure_code in _RESTART_FAILURE_CODES
-            and deployment.head_sha is not None
-            # An owner who took the app down while a restart was failing stamped THIS row, and
-            # offline outranks whatever the attempt was trying to do.
-            and deployment.unpublished_at is None
-        ):
+        if deployment.failure_code in _RESTART_FAILURE_CODES and deployment.head_sha is not None:
             return _live_state(app, deployment, saved_head)
         # THE FAILURE_CODE BULLET: this check sits ABOVE the generic failure arm on
         # purpose. A drift-routed publish is modelled as a FAILED row with a distinct
@@ -375,9 +377,7 @@ def compute_publish_state(
         if deployment.failure_code in _ROUTED_FAILURE_CODES:
             return PublishState.IN_REVIEW
         return PublishState.DID_NOT_START
-    # `DeploymentStatus.SUCCEEDED` — the only member left.
-    if deployment.unpublished_at is not None:
-        return PublishState.TAKEN_OFFLINE
+    # `DeploymentStatus.SUCCEEDED` — the only member left, and un-stamped, so it is serving.
     return _live_state(app, deployment, saved_head)
 
 

@@ -283,9 +283,8 @@ async def latest_published(db: AsyncSession, *, app_id: uuid.UUID) -> Deployment
     what is in production — which is exactly the collapse `liveness.live_app_ids` already makes
     for the lists, and the reason a route asking "what is live" must ask it the same way.
 
-    The takedown axis is deliberately NOT read here: `unpublish` stamps whichever row was
-    newest at the time, so a caller has to check that against the newest row rather than this
-    one."""
+    The takedown axis is deliberately NOT read here — see `latest_takedown`, which is the other
+    half of the same question."""
     row: Deployment | None = await db.scalar(
         sa.select(Deployment)
         .where(
@@ -297,6 +296,25 @@ async def latest_published(db: AsyncSession, *, app_id: uuid.UUID) -> Deployment
         .limit(1)
     )
     return row
+
+
+async def latest_takedown(db: AsyncSession, *, app_id: uuid.UUID) -> uuid.UUID | None:
+    """The id of the newest row an owner's take-down has stamped, or `None` if none has.
+
+    COMPARE IT AGAINST `latest_published`, NEVER AGAINST THE NEWEST ROW. `unpublish` stamps
+    whichever row was newest when it ran, and attempts keep arriving afterwards — so the stamp
+    can end up on a row that is neither the newest nor the published one, and a caller testing
+    either of those alone reads a taken-down app as serving. The collapse that answers is a
+    comparison: the app is off when the newest stamp is not older than the newest publish, which
+    is the same `last_unpublished.id < last_success.id` that `liveness.live_app_ids` applies to
+    the lists. UUIDv7 ids are time-sortable, which is what makes the comparison creation order."""
+    stamped: uuid.UUID | None = await db.scalar(
+        sa.select(Deployment.id)
+        .where(Deployment.app_id == app_id, Deployment.unpublished_at.is_not(None))
+        .order_by(Deployment.id.desc())
+        .limit(1)
+    )
+    return stamped
 
 
 async def in_flight(db: AsyncSession, *, app_id: uuid.UUID) -> uuid.UUID | None:
