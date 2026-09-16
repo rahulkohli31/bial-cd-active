@@ -32,7 +32,6 @@ import {
   ChevronsLeft,
   ChevronsRight,
 } from 'lucide-react'
-import Navbar from '../components/layout/Navbar'
 import {
   listProjects,
   listProjectCounts,
@@ -177,11 +176,14 @@ export default function ProjectsPage(): React.JSX.Element {
 
   const [view, setView] = useState<View>(() => readStored(VIEW_KEY, ['list', 'grid'] as const, 'list'))
   const [density, setDensity] = useState<Density>(() => readStored(DENSITY_KEY, ['S', 'M', 'L'] as const, 'M'))
-  // NOT PERSISTED, NOT IN THE URL — unlike `view`/`density` (a habit) and `page`/`q` (a place
-  // in a list this page is the only way back to), which tab is open is neither: a shared link
-  // to this page is about the citizen's OWN projects either way, and there is nothing here a
-  // colleague would paste around expecting it to land on someone else's "shared with me".
-  const [tab, setTab] = useState<'mine' | 'shared'>('mine')
+  // INTERIM, AND IT GOES WITH THE DEDICATED SHARED PAGE. Which list is on screen is the ADDRESS
+  // now, not a control on this one — the navigation has an entry per list, so a tab beside them
+  // would be a second way to answer a question the navigation has already answered. The pathname
+  // is safe to read as list identity in a way `?tab=shared` was not: `/shared-applications`
+  // lands every reader on their OWN shared list, so there is nothing here to paste around that
+  // could promise somebody else's.
+  const tab: 'mine' | 'shared' =
+    useLocation().pathname === '/shared-applications' ? 'shared' : 'mine'
 
   // COMMITTED query state — WHAT WAS ASKED FOR, and it lives in the address bar.
   //
@@ -522,32 +524,17 @@ export default function ProjectsPage(): React.JSX.Element {
   const lastOnPage = useMemo(() => firstOnPage + items.length - 1, [firstOnPage, items.length])
 
   return (
-    <div className="min-h-screen font-manrope flex flex-col bg-bial-bg">
-      <Navbar />
+    <div className="min-h-full font-manrope flex flex-col bg-bial-bg">
 
       <main className="flex-1 max-w-6xl mx-auto w-full px-6 py-8">
-        <h1 ref={headingRef} tabIndex={-1} className="text-2xl font-extrabold text-tertiary outline-none">Your apps</h1>
-        <p className="text-sm text-neutral mt-1">
-          Each project is one tool — its app, its description, and its chats.
-        </p>
-
-        {/* "Shared with me" (#198) is a second list, not a filter on this one — a colleague's
-            project has no page/size/search state of its own to fold into `Committed`, and
-            "mine" keeps every line below untouched by adding a sibling arm instead. */}
-        <ToggleGroup
-          type="single"
-          value={tab}
-          onValueChange={(v) => v && setTab(v as 'mine' | 'shared')}
-          aria-label="Project list"
-          className="mt-4"
-        >
-          <ToggleGroupItem value="mine" className={ACTIVE.trim()}>
-            My projects
-          </ToggleGroupItem>
-          <ToggleGroupItem value="shared" className={ACTIVE.trim()}>
-            Shared with me
-          </ToggleGroupItem>
-        </ToggleGroup>
+        <h1 ref={headingRef} tabIndex={-1} className="text-2xl font-extrabold text-tertiary outline-none">
+          {tab === 'shared' ? 'Shared with you' : 'Your apps'}
+        </h1>
+        {tab === 'mine' && (
+          <p className="text-sm text-neutral mt-1">
+            Each project is one tool — its app, its description, and its chats.
+          </p>
+        )}
 
         {tab === 'shared' ? (
           <div className="mt-6">
@@ -1030,7 +1017,7 @@ export default function ProjectsPage(): React.JSX.Element {
 
       {/* This channel only ever carries a failure (a successful delete is silent — the
           row is just gone), so it is deliberately NOT wired to a dismiss timer the way
-          Navbar's and AdminPage's toasts once were. A confirmation may fade on its own;
+          AdminPage's toast is. A confirmation may fade on its own;
           something that went wrong waits for the reader to dismiss it, and the reader is the
           only thing that clears this one. The AlertCircle marks it as a failure the same way
           the other two sites now mark theirs, so the appearance carries the fact even

@@ -58,7 +58,6 @@ vi.mock('../../../utils/deployApi', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../utils/deployApi')>()),
   getDeployment: api.getDeployment,
 }))
-vi.mock('../../layout/Navbar', () => ({ default: () => <div data-testid="navbar" /> }))
 vi.mock('../../projects/ProjectDescriptionEditor', () => ({
   default: () => <div data-testid="description-editor" />,
 }))

@@ -53,7 +53,6 @@ vi.mock('../../utils/projectApi', async (importOriginal) => ({
 vi.mock('../../components/workspace/ProjectWorkspace', () => ({
   default: () => <div data-testid="project-workspace-stub" />,
 }))
-vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 
 const makeProject = (over: Partial<Project> = {}): Project => ({
   id: 'pA',

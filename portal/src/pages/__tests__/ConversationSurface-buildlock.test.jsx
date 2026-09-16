@@ -60,7 +60,6 @@ vi.mock('../../utils/conversationApi', () => ({
   listProjectConversations: h.listProjectConversations,
   uuidv7: (...a) => h.uuidv7(...a),
 }))
-vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../components/LivePreview', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
 

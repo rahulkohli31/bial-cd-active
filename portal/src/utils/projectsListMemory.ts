@@ -5,17 +5,22 @@
  * `page`, `pageSize` and `q` live in the URL, so opening `/projects?page=2&q=ramp`, pressing
  * the browser's own Back, reloading, or pasting the address all land on the same view. What that
  * does NOT cover is the product's OWN "back to the list" controls — the workspace toolbar's back
- * chevron and the navbar's brand mark — because neither of them IS `/projects`: they are
+ * chevron, the navigation's destinations and its brand mark — because none of them IS
+ * `/projects`: they are
  * components mounted on a *different* address (`/projects/:id`, `/chat/:id`) that have to name a
  * destination without ever having read the list's own query string themselves. Before this,
  * both hardcoded a bare `/projects`, so leaving a filtered, paged list and pressing either control
  * bounced back to page one with the search cleared — the address bar became addressable in one
  * direction (reading it in) and stayed silent in the other (writing it back out).
  *
- * `Navbar` is mounted on `/projects` too — `ProjectsPage` renders its own instance — so it is the
- * one place already positioned to WRITE this on every render where the address bar reads
- * `/projects`. `WorkspaceShell`'s back control and `Navbar`'s own brand link both READ it when
- * constructing a destination.
+ * `AppShell` frames every route, so it is the one place already positioned to WRITE this on every
+ * render where the address bar reads `/projects`. `WorkspaceShell`'s back control, the navigation's
+ * list entry and its brand link all READ it when constructing a destination — at CLICK time, so a
+ * search typed a moment ago is what they land on.
+ *
+ * A READER WITHOUT A WRITER IS DEAD CODE THAT LOOKS ALIVE: every read still resolves, every test
+ * that only exercises a read still passes, and the list silently reopens at page one with the
+ * search cleared. That is why the write has a scenario of its own in `AppShell.test.tsx`.
  *
  * `sessionStorage`, for the same reason `chatProjectMemory.ts` gives: this is tab-scoped knowledge
  * about where the citizen was looking, not a record worth keeping past the tab. Storage access is
@@ -37,7 +42,7 @@ export function recallProjectsSearch(): string {
 }
 
 /** Record the CURRENT `/projects` address's search string. Called only while the address bar is
- *  actually `/projects` — see `Navbar`'s own effect. */
+ *  actually `/projects` — see `AppShell`'s own effect. */
 export function rememberProjectsSearch(search: string): void {
   try {
     sessionStorage.setItem(KEY, search)

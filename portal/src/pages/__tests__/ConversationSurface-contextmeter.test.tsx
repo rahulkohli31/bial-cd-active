@@ -42,7 +42,6 @@ vi.mock('../../utils/conversationApi', async (orig) => ({
   createConversation: async () => ({ id: 'conv-created' }),
   listProjectConversations: h.listProjectConversations,
 }))
-vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({
   ...(await orig<typeof import('../../utils/attachmentStore')>()),
   buildUserParts: h.buildUserParts,

@@ -66,7 +66,6 @@ vi.mock('../../utils/conversationApi', () => ({
   createConversation: async () => ({ id: 'conv-created' }),
   listProjectConversations: h.listProjectConversations,
 }))
-vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 // A recording wrapper, not a stub — see the module docblock for why.
 vi.mock('../../components/LivePreview', async (orig) => {
   const actual = await orig<typeof import('../../components/LivePreview')>()

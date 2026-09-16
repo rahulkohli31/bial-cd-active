@@ -33,7 +33,6 @@ import {
   type WorkspaceHeading,
 } from '../workspaceChannel'
 
-vi.mock('../../layout/Navbar', () => ({ default: () => <div data-testid="navbar" /> }))
 /**
  * The stub lives INSIDE the row (an ordinary child, no memo between them) so its count is the
  * row's own renders — a wrapper around `WorkspaceToolbar` would only see renders its parent
@@ -795,8 +794,8 @@ describe('the back control carries the projects list state back', () => {
      query string itself. Before this it hardcoded a bare `/projects`, so leaving a filtered,
      paged list and pressing Back landed on page one with the search cleared:
      `projectsListMemory.ts`'s own docblock calls this "addressable in one direction and silent
-     in the other". `Navbar` is the one place that remembers what the address bar carried, since
-     `ProjectsPage` mounts its own instance of it — this suite only has to seed that memory. */
+     in the other". This suite seeds that memory directly rather than mounting whatever writes
+     it on `/projects`. */
 
   function WhereFull() {
     return <span data-testid="where-full">{useLocation().pathname + useLocation().search}</span>

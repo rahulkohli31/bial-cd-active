@@ -38,7 +38,6 @@ vi.mock('../../utils/conversationApi', () => ({
   listProjectConversations: h.listProjectConversations,
   CONVERSATION_LIST_CAP: 200,
 }))
-vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 
 import ProjectsPage, { PROJECT_GONE_NOTICE } from '../ProjectsPage'
 import { ApiError } from '../../utils/apiError'

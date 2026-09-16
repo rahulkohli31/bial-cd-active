@@ -64,8 +64,8 @@ describe('vendored ui primitives', () => {
     // orphans", and covers them too.
     //
     // `dropdown-menu` LEFT THIS LIST for the same reason, and the reversal is deliberate: the
-    // avatar menu in `Navbar.tsx` was hand-rolled, so the primitive really was an orphan; it is
-    // now that menu's implementation, which is a consumer the second test below enforces.
+    // profile menu was hand-rolled once, so the primitive really was an orphan; it is now that
+    // menu's implementation, which is a consumer the second test below enforces.
     const removed = ['avatar', 'collapsible']
     expect(primitives().filter((name) => removed.includes(name))).toEqual([])
 

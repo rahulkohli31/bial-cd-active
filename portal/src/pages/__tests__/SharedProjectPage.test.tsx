@@ -33,7 +33,6 @@ vi.mock('../../utils/buildSessionApi', async (importOriginal) => ({
   giveUpSharedView: h.giveUpSharedView,
   handOverWorkspace: h.handOverWorkspace,
 }))
-vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 
 /** The exact shape `asReclaimBlocked` reads off a thrown error — a real `sandbox_reclaim_
  *  blocked` 409, not a scripted mock of the narrower. */

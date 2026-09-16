@@ -1,6 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import Navbar from '../components/layout/Navbar'
 import UsersLimitsPanel from '../components/admin/UsersLimitsPanel'
 import GlobalLimitsPanel from '../components/admin/GlobalLimitsPanel'
 import FeedbackPanel from '../components/admin/FeedbackPanel'
@@ -45,7 +44,7 @@ const TABS = [
  */
 export default function AdminPage() {
   const navigate = useNavigate()
-  // Read the SAME cookie-session profile the Navbar uses (getStoredUser → cached /auth/me,
+  // Read the SAME cookie-session profile the navigation uses (getStoredUser → cached /auth/me,
   // which now carries `isAdmin`). The old `localStorage['bial_user']` is a purged legacy key
   // (LEGACY_KEYS), so it was always `{}` here → the superadmin got Access Denied.
   const user = getStoredUser()
@@ -60,7 +59,7 @@ export default function AdminPage() {
 
   /**
    * A NEW FETCH SITE, NOT A PRECEDENT BEING FOLLOWED — worth saying plainly, because it looks
-   * like one. This page performs no fetching today: `/admin/apps/counts` is called by `Navbar`
+   * like one. This page performs no fetching today: `/admin/apps/counts` is called by `NavItems`
    * for the nav badge and again by `AppRegistryPanel` for its own tab badge, so the App Registry
    * tab's badge is itself panel-lifted and simply absent until that tab is opened. The
    * Integrations badge is fetched HERE instead, so it is right the moment the console opens —
@@ -108,8 +107,7 @@ export default function AdminPage() {
 
   if (!user?.isAdmin) {
     return (
-      <div className="min-h-screen bg-bial-bg flex flex-col font-manrope">
-        <Navbar />
+      <div className="min-h-full bg-bial-bg flex flex-col font-manrope">
         <div className="flex-1 flex items-center justify-center px-6">
           <div className="text-center max-w-sm">
             <div className="w-14 h-14 rounded-2xl bg-red-100 flex items-center justify-center mx-auto mb-4">
@@ -132,8 +130,7 @@ export default function AdminPage() {
   }
 
   return (
-    <div className="min-h-screen bg-bial-bg flex flex-col font-manrope">
-      <Navbar />
+    <div className="min-h-full bg-bial-bg flex flex-col font-manrope">
 
       <div className="flex-1 px-6 py-8 max-w-7xl mx-auto w-full">
         <div className="mb-6">

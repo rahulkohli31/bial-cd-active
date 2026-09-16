@@ -16,7 +16,7 @@ import { useState, type ReactNode } from 'react'
 import { render, screen, fireEvent, cleanup } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import WorkspaceShell from '../WorkspaceShell'
-import { useWorkspaceExit } from '../UnsavedWorkGuard'
+import { WorkspaceExitHost, useWorkspaceExit } from '../UnsavedWorkGuard'
 import {
   useAppPaneVisible,
   usePublishAddress,
@@ -34,39 +34,28 @@ import {
 } from '../workspaceChannel'
 import type { ReclaimBlocked } from '../../../utils/buildSessionApi'
 
-// THE NAVBAR STUB CONSULTS THE EXIT HOOK, exactly as the real one does — the seam this file is
-// answerable for is whether the SHELL provides a guard to the chrome sitting ABOVE its Outlet.
-// A `<div/>` stub could not see it, and the real navbar would drag a profile fetch, a usage poll,
-// and a feedback modal into every scenario here. That the real navbar routes its links through
-// the hook is `Navbar.test.jsx`'s to prove; this proves there is something for it to route
-// through.
-vi.mock('../../layout/Navbar', () => ({
-  // NAMED: `default: () => …` is an anonymous arrow, and the hooks lint rule reads a component's
-  // identity off its name — a hook inside one it can't recognise is an error, rightly so.
-  default: function StubNavbar() {
-    const exit = useWorkspaceExit()
-    return (
-      <div data-testid="navbar">
-        <button type="button" onClick={() => exit(() => {})}>leave to projects</button>
-      </div>
-    )
-  },
-}))
-
 /**
  * Mount `child` as the shell's outlet content, the way a route element is. Every probe below
  * reads the channel from INSIDE the outlet — the same channel through the same context, but not
  * the pane host's tree position. That property is asserted where it lives: `App.test.jsx` for
  * the shell, `AppPaneHost.test.tsx` for the frame.
+ *
+ * `chrome` is what sits OUTSIDE the shell, where the navigation really is — the exits the guard
+ * exists for are rendered by the shell that FRAMES this one, not by it. `WorkspaceExitHost` is
+ * mounted above both, exactly as `App.tsx` mounts it, because that is the only arrangement in
+ * which the workspace's guard and the controls that leave it can see each other at all.
  */
-function renderShell(child: ReactNode) {
+function renderShell(child: ReactNode, chrome?: ReactNode) {
   return render(
     <MemoryRouter initialEntries={['/projects/p1']}>
-      <Routes>
-        <Route element={<WorkspaceShell />}>
-          <Route path="/projects/:projectId" element={<>{child}</>} />
-        </Route>
-      </Routes>
+      <WorkspaceExitHost>
+        {chrome}
+        <Routes>
+          <Route element={<WorkspaceShell />}>
+            <Route path="/projects/:projectId" element={<>{child}</>} />
+          </Route>
+        </Routes>
+      </WorkspaceExitHost>
     </MemoryRouter>,
   )
 }
@@ -109,11 +98,10 @@ describe('WorkspaceShell — one height model, one frame, one grid', () => {
   it('is a full-height frame that does not scroll, so no surface below it has a viewport opinion', () => {
     renderShell(<div data-testid="surface" />)
 
-    // The chat model, taken as the shell's own: full height, navbar, no document scroll. What the
+    // The chat model, taken as the shell's own: full height, no document scroll. What the
     // project surface loses by this — its document scroll — it declares for itself instead.
     expect(shellRoot().className).toMatch(/h-screen/)
     expect(shellRoot().className).toMatch(/overflow-hidden/)
-    expect(screen.getAllByTestId('navbar')).toHaveLength(1)
   })
 
   it('renders the surface inside a column that may not overflow the frame', () => {
@@ -135,7 +123,7 @@ describe('WorkspaceShell — one height model, one frame, one grid', () => {
     // mounts happens to emit, so it was blind to `ChatRoute`'s loading arm — a `min-h-screen` box
     // in a column already 100vh minus the navbar, which overflowed and pushed its spinner below
     // centre on every cold chat open. Surfaces OUTSIDE the shell (`Dashboard`, `LoginPage`,
-    // `AdminPage`, `HelpPage`) are correctly not on the list — they are their own document.
+    // `AdminPage`) are correctly not on the list — they are their own document.
     const offending = IN_SHELL_SURFACES.flatMap((file) =>
       readFileSync(`src/${file}`, 'utf8')
         .split('\n')
@@ -501,6 +489,18 @@ describe('the workspace channel — what survives its publisher\'s unmount, and 
  * recoverable case: neither stops anybody over a `true` the platform holds a recovery copy of.
  */
 describe('WorkspaceShell — the in-place unsaved-work guard', () => {
+  /** Stands in for the chrome that exits through the guard — a navigation destination, the brand
+   *  link, Sign out. Mounted OUTSIDE the shell, where all three really are: a stand-in placed
+   *  inside it would read the guard down a path no shipped control takes. */
+  function ChromeExitLink() {
+    const exit = useWorkspaceExit()
+    return (
+      <button type="button" onClick={() => exit(() => {})}>
+        leave to projects
+      </button>
+    )
+  }
+
   function SurfaceWithSaveState({
     dirty,
     running,
@@ -526,7 +526,7 @@ describe('WorkspaceShell — the in-place unsaved-work guard', () => {
   }
 
   it('★ intercepts a navbar link when the workspace holds unsaved work', async () => {
-    renderShell(<SurfaceWithSaveState dirty running />)
+    renderShell(<SurfaceWithSaveState dirty running />, <ChromeExitLink />)
 
     fireEvent.click(await screen.findByRole('button', { name: /leave to projects/i }))
 
@@ -534,7 +534,7 @@ describe('WorkspaceShell — the in-place unsaved-work guard', () => {
   })
 
   it('lets the same link through when the workspace is clean', async () => {
-    renderShell(<SurfaceWithSaveState dirty={false} running />)
+    renderShell(<SurfaceWithSaveState dirty={false} running />, <ChromeExitLink />)
 
     fireEvent.click(await screen.findByRole('button', { name: /leave to projects/i }))
 
@@ -544,7 +544,7 @@ describe('WorkspaceShell — the in-place unsaved-work guard', () => {
   it('★ warns about nothing on a STOPPED project, where the check was never asked', async () => {
     // The fourth case. A stopped project's save state is `null` because `fetchSaveState` may only
     // be called on a live workspace — not because a check failed.
-    renderShell(<SurfaceWithSaveState dirty={null} running={false} />)
+    renderShell(<SurfaceWithSaveState dirty={null} running={false} />, <ChromeExitLink />)
 
     fireEvent.click(await screen.findByRole('button', { name: /leave to projects/i }))
 
@@ -559,7 +559,7 @@ describe('WorkspaceShell — the in-place unsaved-work guard', () => {
     //
     // MUTATION RECEIPT: delete the `recoveryAt` line from the shell's `useUnsavedWorkGuard` call
     // and this goes red on its own (the guard then defaults to `null` and stops them again).
-    renderShell(<SurfaceWithSaveState dirty running recoveryAt="2026-09-10T10:38:43Z" />)
+    renderShell(<SurfaceWithSaveState dirty running recoveryAt="2026-09-10T10:38:43Z" />, <ChromeExitLink />)
 
     fireEvent.click(await screen.findByRole('button', { name: /leave to projects/i }))
 
@@ -573,7 +573,7 @@ describe('WorkspaceShell — the in-place unsaved-work guard', () => {
   it('★ still intercepts the same link when the work is NOT recoverable', async () => {
     // Same publish, same link, one field different — the assertion that stops the fix from
     // becoming "never warn about anything".
-    renderShell(<SurfaceWithSaveState dirty running recoveryAt={null} />)
+    renderShell(<SurfaceWithSaveState dirty running recoveryAt={null} />, <ChromeExitLink />)
 
     fireEvent.click(await screen.findByRole('button', { name: /leave to projects/i }))
 

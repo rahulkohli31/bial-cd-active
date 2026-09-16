@@ -121,7 +121,7 @@ async function fetchMe(): Promise<UserProfile | null> {
     // re-validated here.
     const profile = (await res.json().catch(() => null)) as UserProfile | null
     // `/auth/me` returns the snake-cased `is_admin`; expose it as the camelCase `isAdmin`
-    // the UI reads (Navbar admin link + AdminPage gate). Fail-closed to false.
+    // the UI reads (the navigation's Admin entry + AdminPage's gate). Fail-closed to false.
     if (profile) profile.isAdmin = profile.is_admin === true
     cachedUser = profile
     return cachedUser

@@ -45,8 +45,12 @@ const GOLD_SURFACE = /\b(?:hover:|focus-visible:|active:|data-\[state=on\]:)?(?:
 /** The same, for the brand orange. `bg-accent-light` (#FFF4E0) is a separate token and a real
  *  board colour — the BUILD pill's ground — so the trailing `(?![-\w])` excludes it. A plain
  *  `\b` would NOT: `-` is a non-word character, so `\b` matches happily inside `bg-accent-light`
- *  and inside `text-secondary-800`, and both rules would fire on the two pairs the boards draw. */
-const ORANGE_SURFACE = /\b(?:hover:|focus-visible:|active:|data-\[state=on\]:)?(?:bg|shadow|ring|border)-accent(?![-\w])/g
+ *  and inside `text-secondary-800`, and both rules would fire on the two pairs the boards draw.
+ *
+ *  `stroke` is in the list because the token meter is an SVG arc: painting amber through a stroke
+ *  rather than a background is the same claim on the same colour, and a rule that could not see
+ *  it would let the accent back onto an action the moment somebody drew one. */
+const ORANGE_SURFACE = /\b(?:hover:|focus-visible:|active:|data-\[state=on\]:)?(?:bg|shadow|ring|border|stroke)-accent(?![-\w])/g
 
 /**
  * The gold family's board role is a LABEL, never a fill. One site survives, on a screen the
@@ -61,8 +65,8 @@ const GOLD_ALLOWED = {
 
 /** The canvas uses `accent` on exactly two controls, and one of them lives in this tree. */
 const ORANGE_ALLOWED = {
-  // The header token meter's fill. The board's own worked example draws it amber at 54%.
-  'components/layout/Navbar.tsx': ['bg-accent'],
+  // The navigation token ring's arc. The board's own worked example draws it amber at 54%.
+  'components/layout/TokenRing.tsx': ['stroke-accent'],
   // The 6px unsaved dot on the Save control — the canvas's other, and last, use of the accent.
   'components/workspace/WorkspaceToolbar.tsx': ['bg-accent'],
 }

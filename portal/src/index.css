@@ -107,7 +107,7 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  /* THE PORTAL'S REDUCED-MOTION GUARANTEE. Two mechanisms carry it, and these are both of them.
+  /* THE PORTAL'S REDUCED-MOTION GUARANTEE. Three mechanisms carry it, and these are all of them.
    *
    * 1. THIS BLOCK. A media query needs no component to opt in and cannot be out of date the way
    *    a subscribed boolean can, so everything expressible as "stop moving" lives here. It covers
@@ -125,11 +125,18 @@ body {
    *    The branch used to be copied into `ToolActivityLine`, `OfferStrip` and `StopTurnControl`,
    *    and all three copies had that same defect; it is written once now, and every wait in the
    *    portal renders through `BusyGlyph` / `WaitingLine`.
+   * 3. `MotionConfig reducedMotion="user"` at the root, in `src/main.tsx` — the only layer that
+   *    reaches the `motion` library, whose animation is JS-driven and therefore invisible to the
+   *    block above. It covers the left navigation's reveal, the travelling active highlight, the
+   *    pin's shared layout move, the drawer backdrop and the token ring's fill, at once and
+   *    without any of them carrying a branch. Under the preference each of those becomes an
+   *    instant change of state: the panel still appears and still disappears, it simply does not
+   *    travel.
    *
-   * THERE IS NO THIRD MECHANISM. No motion library owns any of this and nothing reads the
-   * preference at any other layer. This file and `tailwind.config.js` once both claimed coverage
-   * that did not exist, so if a fourth consumer or a new mechanism appears, correct this text
-   * with it — `src/__tests__/reducedMotion.test.ts` asserts it.
+   * THERE IS NO FOURTH MECHANISM. Nothing reads the preference at any other layer, and no
+   * component carries its own branch. This file and `tailwind.config.js` once both claimed
+   * coverage that did not exist, so if another consumer or a new mechanism appears, correct this
+   * text with it — `src/__tests__/reducedMotion.test.ts` asserts it.
    *
    * SOURCE ORDER IS THE MECHANISM. These rules beat Tailwind's own `.animate-spin` only because
    * they sit AFTER `@tailwind utilities` at equal specificity, and outside any `@layer`. Moving

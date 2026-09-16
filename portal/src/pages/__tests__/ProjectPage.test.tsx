@@ -76,7 +76,6 @@ vi.mock('../../utils/buildSessionApi', async (importOriginal) => ({
   checkWorkspace: vi.fn(async () => { throw new Error('a container exec on the project screen') }),
   relaunchPreview: h.relaunchPreview,
 }))
-vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 // Nothing on this page frames a preview; the stub keeps a transitive import from mounting one.
 vi.mock('../../components/LivePreview', () => ({ default: () => null }))
 // `chatKindFor` reads the kind catalogue off the cached bootstrap profile — without this mock,

@@ -52,6 +52,8 @@ vi.mock('../../projects/ProjectDescriptionEditor', () => ({
 
 const WorkspaceShell = (await import('../WorkspaceShell')).default
 const ProjectWorkspace = (await import('../ProjectWorkspace')).default
+const ProfileCluster = (await import('../../layout/ProfileCluster')).default
+const { WorkspaceExitHost } = await import('../UnsavedWorkGuard')
 
 const PROJECT: Project = {
   id: 'pB',
@@ -82,24 +84,33 @@ function Route_({ children }: { children: React.ReactNode }) {
   return <>{children}</>
 }
 
+/**
+ * THE PROFILE CLUSTER IS MOUNTED BESIDE THE WORKSPACE, NOT INSIDE IT, because that is where it
+ * is: the navigation frames the workspace rather than living in it. `WorkspaceExitHost` above
+ * both is what lets the workspace's guard and the sign-out control see each other — the same
+ * arrangement `App.tsx` ships, and the only one in which either half of this scenario is real.
+ */
 function Workspace() {
   return (
     <MemoryRouter initialEntries={['/projects/pB']}>
-      <Where />
-      <Routes>
-        <Route element={<WorkspaceShell />}>
-          <Route
-            path="/projects/:projectId"
-            element={
-              <Route_>
-                <ProjectWorkspace project={PROJECT} onProjectUpdate={() => {}} />
-              </Route_>
-            }
-          />
-        </Route>
-        <Route path="/login" element={<div data-testid="login" />} />
-        <Route path="/projects" element={<div data-testid="projects-list" />} />
-      </Routes>
+      <WorkspaceExitHost>
+        <Where />
+        <ProfileCluster />
+        <Routes>
+          <Route element={<WorkspaceShell />}>
+            <Route
+              path="/projects/:projectId"
+              element={
+                <Route_>
+                  <ProjectWorkspace project={PROJECT} onProjectUpdate={() => {}} />
+                </Route_>
+              }
+            />
+          </Route>
+          <Route path="/login" element={<div data-testid="login" />} />
+          <Route path="/projects" element={<div data-testid="projects-list" />} />
+        </Routes>
+      </WorkspaceExitHost>
     </MemoryRouter>
   )
 }
@@ -128,26 +139,25 @@ afterEach(cleanup)
 const guardDialog = () => screen.queryByText(/save your changes before you go/i)
 
 /**
- * Sign out through the navbar's avatar menu. It is a Radix `DropdownMenu`, so the trigger opens
- * on POINTERDOWN (a `click` does nothing) and `Sign out` is a `role="menuitem"`, not a button —
- * `Navbar.test.jsx` carries the full note.
+ * Sign out through the navigation's profile menu. It is a Radix `DropdownMenu`, so the trigger
+ * opens on POINTERDOWN — a `click` does nothing — and `Sign out` carries `role="menuitem"`,
+ * which wins over the underlying element, so a `getByRole('button')` finds nothing.
  */
-const signOutFromTheAvatarMenu = async () => {
-  const trigger = screen.getByText('Asha', { selector: 'p' }).closest('button')
-  fireEvent.pointerDown(trigger as HTMLElement)
+const signOutFromTheProfileMenu = async () => {
+  fireEvent.pointerDown(screen.getByTestId('profile-cluster'))
   fireEvent.click(await screen.findByRole('menuitem', { name: 'Sign out' }))
 }
 
 describe('★ no exit discards unsaved work in silence', () => {
   it('SIGNING OUT asks first — the most final button on the screen, and it did not', async () => {
-    // Every nav LINK in the bar was routed through the guard and the one control that ends the
+    // Every navigation DESTINATION is routed through the guard and the one control that ends the
     // session entirely was not. Mutation receipt: call `handleLogout` directly again and this
     // goes red while the sign-out-when-clean scenario below stays green.
     dirtyAndAlive()
     render(<Workspace />)
     await waitFor(() => expect(screen.getByTestId('rail-save-state')).toBeTruthy())
 
-    await signOutFromTheAvatarMenu()
+    await signOutFromTheProfileMenu()
 
     await waitFor(() => expect(guardDialog()).toBeTruthy())
     expect(api.logout).not.toHaveBeenCalled()
@@ -160,7 +170,7 @@ describe('★ no exit discards unsaved work in silence', () => {
     render(<Workspace />)
     await waitFor(() => expect(api.fetchPreviewState).toHaveBeenCalled())
 
-    await signOutFromTheAvatarMenu()
+    await signOutFromTheProfileMenu()
 
     await waitFor(() => expect(api.logout).toHaveBeenCalledTimes(1))
     await waitFor(() => expect(screen.getByTestId('login')).toBeTruthy())

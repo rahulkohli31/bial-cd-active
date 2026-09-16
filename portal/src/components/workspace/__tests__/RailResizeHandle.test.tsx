@@ -23,7 +23,6 @@ import {
 } from '../workspaceChannel'
 import { RAIL_MAX, RAIL_MIN } from '../railWidth'
 
-vi.mock('../../layout/Navbar', () => ({ default: () => <div data-testid="navbar" /> }))
 vi.mock('../../PublishStatusChip', () => ({ default: () => <span data-testid="publish-chip-stub" /> }))
 vi.mock('../../LivePreview', () => ({ default: () => <div data-testid="live-preview" /> }))
 

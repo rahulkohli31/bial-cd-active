@@ -35,6 +35,7 @@ import {
   UserPlus,
 } from 'lucide-react'
 import PublishStatusChip from '../PublishStatusChip'
+import { NavMenuButton } from '../layout/NavReveal'
 import { BusyGlyph, useElapsedSeconds, ELAPSED_AFTER_MS } from '../ui/Waiting'
 import { usePublishState } from '../../hooks/usePublishState'
 import { chatKindFor } from '../../utils/chatKind'
@@ -105,8 +106,8 @@ export default function WorkspaceToolbar({
          screens — so what overflowed this row was not merely off to the right, it was CLIPPED,
          with nothing anywhere to bring it back. The right-hand cluster goes first, which puts Save
          itself outside the viewport and outside reach.
-         `/projects`, `/marketplace` and `/help` overflow 360px too and a finger drags to the rest;
-         the workspace was the one route where that was not true.
+         `/projects` and `/marketplace` overflow 360px too and a finger drags to the rest; the
+         workspace was the one route where that was not true.
          SCOPED TO THE ROW, NOT TO THE ROOT, because the row's own box never exceeds the root's
          width — only its CONTENTS do — so this is the narrowest element that can own the scroll,
          and the root keeps the containment the two columns depend on.
@@ -115,6 +116,12 @@ export default function WorkspaceToolbar({
          one stole height from it. */
       className="flex h-[54px] flex-shrink-0 items-center gap-2.5 overflow-x-auto overflow-y-hidden border-b border-bial-border bg-white px-5"
     >
+      {/* THE NAVIGATION'S ONLY VISIBLE DOOR INSIDE AN APPLICATION, and it leads the row because
+          it answers "where am I in the platform" — the question everything else in this row is
+          not about. The edge gesture and `⌘\` reach the same panel faster for people who learn
+          them; this is the one that does not have to be learned. */}
+      <NavMenuButton className="flex-shrink-0 narrow:min-h-[44px] narrow:min-w-[44px]" />
+
       <button
         type="button"
         onClick={onBack}

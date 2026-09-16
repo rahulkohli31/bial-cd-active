@@ -21,6 +21,9 @@ export default defineConfig({
         manualChunks: {
           markdown: ['streamdown', 'remark-gfm', 'remark-breaks'],
           'assistant-ui': ['@assistant-ui/react'],
+          // Same reasoning one dependency later: the animation runtime is imported by the shell,
+          // so it would otherwise land in the chunk first paint blocks on.
+          motion: ['motion/react'],
         },
       },
     },

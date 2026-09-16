@@ -42,10 +42,9 @@ vi.mock('../../../utils/adminConnectorApi', () => ({
 }))
 vi.mock('../../../utils/auth', () => ({ getStoredUser: h.getStoredUser }))
 
-// The console's other four panels and its navbar are stubbed for the whole-page tests below:
-// this file is about the Integrations tab, and mounting the app registry (which fetches on
-// mount) would put an unrelated failure on screen beside the thing under test.
-vi.mock('../../layout/Navbar', () => ({ default: () => <nav data-testid="navbar" /> }))
+// The console's other four panels are stubbed for the whole-page tests below: this file is
+// about the Integrations tab, and mounting the app registry (which fetches on mount) would put
+// an unrelated failure on screen beside the thing under test.
 vi.mock('../AppRegistryPanel', () => ({ default: () => <div data-testid="apps-panel" /> }))
 vi.mock('../UsersLimitsPanel', () => ({ default: () => <div data-testid="users-panel" /> }))
 vi.mock('../GlobalLimitsPanel', () => ({ default: () => <div data-testid="limits-panel" /> }))

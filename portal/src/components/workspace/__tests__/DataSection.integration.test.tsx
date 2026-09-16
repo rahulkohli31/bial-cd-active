@@ -11,9 +11,9 @@
  * MUTATION RECEIPT: delete `dataSection.current?.reload()` from `WorkspaceRail`'s `onClose` and
  * the first test here goes red on all three of the switch, the chip and the count.
  *
- * IT IS ALSO WHERE "THE SAME DIALOG" IS PROVED. `Navbar.test.jsx` opens `integrations-dialog`
- * from the profile menu and finds `ORBIT` and `Request access` in it; this opens the same testid
- * from the rail and finds the same body. One component, two doors, no new route (R5).
+ * IT IS ALSO WHERE "THE SAME DIALOG" IS PROVED. `AppShell.test.tsx` opens it from the
+ * navigation's Integrations entry; this opens the same testid from the rail and finds the same
+ * body. One component, two doors, no new route.
  *
  * AND WHERE THE APP PANE'S ABSENCE IS PINNED. The `NoAccess` board draws a paragraph inside the
  * pane about flight data; none of it is built (owner ruling), so the last test here is a SOURCE
@@ -246,8 +246,8 @@ describe('the rail re-reads when the dialog closes over it', () => {
 })
 
 describe('one dialog, two doors', () => {
-  it('opens the SAME dialog the profile menu opens — no new route, no navigation', async () => {
-    // `Navbar.test.jsx` opens this testid from the menu item and finds `ORBIT` in it. Same
+  it('opens the SAME dialog the navigation opens — no new route, no navigation', async () => {
+    // `AppShell.test.tsx` opens this testid from the navigation's Integrations entry. Same
     // component, same body, reached from the rail.
     renderRail()
 

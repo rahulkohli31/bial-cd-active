@@ -27,7 +27,7 @@ import { cn } from "@/lib/utils"
  *    that other shells nest inside `overflow-hidden` columns, and portalled content cannot be
  *    clipped by an ancestor a future layout adds. It also means the content is NOT inside the
  *    `<nav>` — anything that dismisses by "is this node inside the nav?" would fight Radix's
- *    own `DismissableLayer` (see `Navbar.tsx`, which deleted exactly such a handler).
+ *    own `DismissableLayer` (see `ProfileCluster.tsx`, which keeps no such handler).
  *
  * 4. THE REGISTRY'S `[&>svg]:size-4` IS NOT HERE. Every lucide icon in this portal is sized
  *    at the call site (`<LogOut size={13} />`, `<MessageSquare size={17} />`), and a CSS

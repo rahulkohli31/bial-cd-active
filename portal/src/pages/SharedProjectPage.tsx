@@ -18,7 +18,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { ArrowLeft, RefreshCw } from 'lucide-react'
-import Navbar from '../components/layout/Navbar'
 import { BusyGlyph } from '../components/ui/Waiting'
 import ReclaimWorkspaceDialog from '../components/projects/ReclaimWorkspaceDialog'
 import { getProject } from '../utils/projectApi'
@@ -209,8 +208,7 @@ export default function SharedProjectPage(): React.JSX.Element {
   const busy = launching || refreshing
 
   return (
-    <div className="min-h-screen font-manrope flex flex-col bg-bial-bg">
-      <Navbar />
+    <div className="min-h-full font-manrope flex flex-col bg-bial-bg">
 
       <div className="flex items-center gap-3 px-6 py-3 border-b border-bial-border bg-white">
         <button

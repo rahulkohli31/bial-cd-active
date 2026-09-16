@@ -1,7 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import LoginPage from './pages/LoginPage'
-import HelpPage from './pages/HelpPage'
 import AdminPage from './pages/AdminPage'
 import ChatRoute from './pages/ChatRoute'
 import MarketplacePage from './pages/MarketplacePage'
@@ -9,6 +8,8 @@ import ProjectsPage from './pages/ProjectsPage'
 import ProjectPage from './pages/ProjectPage'
 import SharedProjectPage from './pages/SharedProjectPage'
 import WorkspaceShell from './components/workspace/WorkspaceShell'
+import AppShell from './components/layout/AppShell'
+import { WorkspaceExitHost } from './components/workspace/UnsavedWorkGuard'
 import { isAuthenticated, bootstrapSession } from './utils/auth'
 import { BusyGlyph } from './components/ui/Waiting'
 
@@ -100,6 +101,25 @@ function RequireAuth({ children }: { children: ReactNode }) {
   )
 }
 
+/**
+ * Signed in, and inside the frame. Every authenticated address renders through one shell, so the
+ * navigation is a property of the product rather than something each page remembers to draw.
+ *
+ * THE EXIT HOST IS ABOVE THE SHELL, not inside the workspace. The controls that leave a workspace
+ * are mostly in the navigation, which frames the workspace rather than living inside it — so the
+ * guard has to be reachable from above. The workspace registers into this host; everything that
+ * can navigate away reads from it.
+ */
+function Shell({ children }: { children: ReactNode }) {
+  return (
+    <RequireAuth>
+      <WorkspaceExitHost>
+        <AppShell>{children}</AppShell>
+      </WorkspaceExitHost>
+    </RequireAuth>
+  )
+}
+
 export default function App() {
   return (
     <BrowserRouter basename={import.meta.env.BASE_URL}>
@@ -119,9 +139,18 @@ export default function App() {
         <Route path="/teamspace" element={<Navigate to="/projects" replace />} />
 
         {/* Project-first: a project is the thing you open, name, and return to. */}
-        <Route path="/projects" element={<RequireAuth><ProjectsPage /></RequireAuth>} />
+        <Route path="/projects" element={<Shell><ProjectsPage /></Shell>} />
+        {/* SHARED APPLICATIONS HAS AN ADDRESS OF ITS OWN NOW, and this route is the interim half
+            of that: the list itself is still the one `ProjectsPage` draws, selected by pathname
+            rather than by the tab control it used to carry. The dedicated page replaces the
+            element here and the pathname branch goes with it.
+
+            A DEDICATED PATH IS SAFE IN A WAY `?tab=shared` WAS NOT. The tab was deliberately kept
+            out of the URL because a link a colleague pasted around would have promised them
+            someone else's "shared with me"; this address lands every reader on their own. */}
+        <Route path="/shared-applications" element={<Shell><ProjectsPage /></Shell>} />
         {/* Cross-user by design: every signed-in BIAL user sees the same catalog. */}
-        <Route path="/marketplace" element={<RequireAuth><MarketplacePage /></RequireAuth>} />
+        <Route path="/marketplace" element={<Shell><MarketplacePage /></Shell>} />
         {/* THE WORKSPACE. A pathless layout route wrapping both addresses inside a project, so
             the shell — and above all the running app it holds — is preserved across a move
             between them: React Router renders the same layout element at the same position
@@ -140,7 +169,7 @@ export default function App() {
             and the Vite dev proxy (`vite.config.js`) — so a route declared here would be shadowed
             before React Router ever saw it, in dev and in the container alike. A deployed app is
             reached on the apps hostname at `/a/<key>/` (nginx SITE 2), never from here. */}
-        <Route element={<RequireAuth><WorkspaceShell /></RequireAuth>}>
+        <Route element={<Shell><WorkspaceShell /></Shell>}>
           <Route path="/projects/:projectId" element={<ProjectPage />} />
           {/* One flat chat URL for both kinds: `ChatRoute` mounts the same surface whatever the
               conversation is, and the project is a breadcrumb resolved from the chat rather than
@@ -152,10 +181,9 @@ export default function App() {
             OUTSIDE `WorkspaceShell`. That layout exists to carry a builder's own running app
             across chat/rail/toolbar surfaces a shared recipient must never reach; this route
             gets its own minimal chrome instead of a share of that one. */}
-        <Route path="/shared/:projectId" element={<RequireAuth><SharedProjectPage /></RequireAuth>} />
+        <Route path="/shared/:projectId" element={<Shell><SharedProjectPage /></Shell>} />
 
-        <Route path="/help" element={<RequireAuth><HelpPage /></RequireAuth>} />
-        <Route path="/admin" element={<RequireAuth><AdminPage /></RequireAuth>} />
+        <Route path="/admin" element={<Shell><AdminPage /></Shell>} />
         {/* The standalone App Builder / Sandbox scheme is fully retired: `/workspace*`,
             `/sandbox`, and `/builder` have no routes. Stray old bookmarks fall through
             to this catch-all rather than dead redirect shims. */}

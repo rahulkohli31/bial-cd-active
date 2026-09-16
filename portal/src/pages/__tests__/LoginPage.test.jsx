@@ -12,10 +12,10 @@ function renderAt(path) {
   )
 }
 
-// Navbar's handleLogout hands this exact shape to `navigate('/login', { state })` on a failed
-// revoke; a real in-SPA `initialEntries` array entry (not a path string) is how MemoryRouter
-// seeds that router state without going through Navbar. `pathname`/`search` are split out so
-// a query string in `path` still reaches `useSearchParams()`.
+// `ProfileCluster`'s handleLogout hands this exact shape to `navigate('/login', { state })` on
+// a failed revoke; a real in-SPA `initialEntries` array entry (not a path string) is how
+// MemoryRouter seeds that router state without signing out for real. `pathname`/`search` are
+// split out so a query string in `path` still reaches `useSearchParams()`.
 function renderAtWithState(path, state) {
   const [pathname, search = ''] = path.split('?')
   return render(
@@ -142,7 +142,7 @@ describe('LoginPage — Entra "Sign in with Microsoft" only', () => {
     expect(screen.queryByTestId('login-notice')).toBeNull()
   })
 
-  // Rendering half of the fix — Navbar.test.jsx proves the state reaches this route at all.
+  // Rendering half of the fix — `AppShell.test.tsx` proves the state reaches this route at all.
   it('shows the sign-out warning carried as router state', () => {
     renderAtWithState('/login', { signoutWarning: 'Sign-out may be incomplete on this device.' })
     expect(screen.getByTestId('login-notice').textContent).toBe(

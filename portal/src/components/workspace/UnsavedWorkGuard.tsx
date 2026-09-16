@@ -39,7 +39,16 @@
  * `BrowserRouter` — migrating for one hook is out of scope; the workspace's own exits are
  * served by an exit function the shell's chrome consults instead.
  */
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react'
 import { AlertTriangle } from 'lucide-react'
 import { BusyGlyph, useElapsedSeconds, ELAPSED_AFTER_MS } from '../ui/Waiting'
 import { canBePutBack, saveProject } from '../../utils/buildSessionApi'
@@ -310,19 +319,57 @@ function UnsavedWorkDialog({
 }
 
 /**
- * THE ONE EXIT FUNCTION, provided by the shell, consulted by the workspace's chrome. A
- * CONTEXT, NOT A PROP — structural: navbar/breadcrumb exits aren't this guard's descendants
- * (navbar is a sibling of the grid, and renders on workspace-less pages too), so a prop
- * would force every such page to pass a guard it doesn't have. `null` OUTSIDE A WORKSPACE IS
- * ORDINARY, not an error — `useWorkspaceExit` then hands back a function that just goes,
- * leaving every other page's navigation unchanged.
+ * THE ONE EXIT FUNCTION, owned by the workspace and consulted by every control that leaves it.
+ *
+ * A CONTEXT, NOT A PROP, and the context is PROVIDED ABOVE THE WORKSPACE RATHER THAN BY IT. Its
+ * consumers sit on both sides of the workspace: the toolbar's back control is a descendant, while
+ * the left navigation, the brand link and Sign out are all rendered by the shell that FRAMES the
+ * workspace, so a provider inside it could never reach them. A guard those controls cannot see is
+ * not a weaker guard, it is no guard at all on the routes a citizen actually leaves by — and the
+ * failure is silent, because every one of them still navigates perfectly.
+ *
+ * THE VALUE IS STABLE AND THE GUARD IS REGISTERED INTO IT. The workspace mounts and unmounts as a
+ * citizen moves in and out of an application, but the function the navigation holds must not
+ * change identity every time that happens, so the host hands out one delegate for the life of the
+ * app and the workspace writes its guard behind it.
+ *
+ * NO WORKSPACE IS ORDINARY, not an error: with nothing registered the delegate simply goes,
+ * leaving every other page's navigation exactly as it was.
  */
 const WorkspaceExitContext = createContext<((go: () => void) => void) | null>(null)
+const WorkspaceExitRegistrar = createContext<((guard: Guard | null) => void) | null>(null)
 
-export const WorkspaceExitProvider = WorkspaceExitContext.Provider
+type Guard = (go: () => void) => void
+
+/** Wraps the whole authenticated app: everything that can leave a workspace reads from here. */
+export function WorkspaceExitHost({ children }: { children: ReactNode }) {
+  const registered = useRef<Guard | null>(null)
+  const register = useCallback((guard: Guard | null) => {
+    registered.current = guard
+  }, [])
+  const exit = useCallback<Guard>((go) => (registered.current ?? runStraightThrough)(go), [])
+  return (
+    <WorkspaceExitRegistrar.Provider value={register}>
+      <WorkspaceExitContext.Provider value={exit}>{children}</WorkspaceExitContext.Provider>
+    </WorkspaceExitRegistrar.Provider>
+  )
+}
+
+/**
+ * The workspace publishes its guard. A LAYOUT EFFECT, not an ordinary one: an effect that ran
+ * after paint would leave a window in which the navigation is on screen, clickable, and still
+ * holding the passthrough.
+ */
+export function useRegisterWorkspaceExit(guard: Guard): void {
+  const register = useContext(WorkspaceExitRegistrar)
+  useLayoutEffect(() => {
+    register?.(guard)
+    return () => register?.(null)
+  }, [register, guard])
+}
 
 /** Run an exit through the workspace's guard, or straight through when there is none. */
-export function useWorkspaceExit(): (go: () => void) => void {
+export function useWorkspaceExit(): Guard {
   const guard = useContext(WorkspaceExitContext)
   return guard ?? runStraightThrough
 }

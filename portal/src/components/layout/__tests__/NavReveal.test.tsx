@@ -1,0 +1,287 @@
+/**
+ * THE REVEAL IS MOSTLY TIMING, SO THE TIMING IS WHAT IS ASSERTED.
+ *
+ * The chat panel begins at the very edge this zone sits on, so a pointer crosses it constantly.
+ * "Opens on hover" and "opens once the pointer has rested there" are the same code path with one
+ * number changed, and only the second is usable. Every timing test below therefore asserts the
+ * NEGATIVE half first — not open yet — because that is the half a "wait long enough and look"
+ * test silently drops, and it is the half that tells the two apart.
+ *
+ * THE OTHER HALF IS WHAT MUST NOT HAPPEN: no click swallowed while hidden, no reflow of the panes
+ * when it arrives, no edge zone at all while the chat is away, and no keyboard trap.
+ */
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { render, screen, cleanup, fireEvent, act, waitFor } from '@testing-library/react'
+import { MemoryRouter } from 'react-router-dom'
+import { MotionGlobalConfig } from 'motion/react'
+
+const h = vi.hoisted(() => ({
+  fetchUsageToday: vi.fn(),
+  onUsageChanged: vi.fn(),
+  isAuthenticated: vi.fn(() => true),
+  getStoredUser: vi.fn(),
+  logout: vi.fn(),
+  fetchAppStatusCounts: vi.fn(),
+}))
+
+vi.mock('../../../utils/usage', () => ({
+  fetchUsageToday: h.fetchUsageToday,
+  onUsageChanged: h.onUsageChanged,
+}))
+vi.mock('../../../utils/auth', () => ({
+  isAuthenticated: h.isAuthenticated,
+  getStoredUser: h.getStoredUser,
+  logout: h.logout,
+}))
+vi.mock('../../../utils/attachmentApi', () => ({ revokeAllAttachmentUrls: vi.fn() }))
+vi.mock('../../../utils/appRegistryApi', () => ({ fetchAppStatusCounts: h.fetchAppStatusCounts }))
+
+import NavReveal, { NavMenuButton, useNavReveal } from '../NavReveal'
+import { EDGE_ZONE_PX, GRACE_MS, REST_MS } from '../../../lib/motion'
+
+MotionGlobalConfig.skipAnimations = true
+
+const USER = { email: 'asha@bial.aero', display_name: 'Asha Rao', isAdmin: false }
+
+/** Comfortably inside a delay, so a slow machine cannot turn "not yet" into a false failure. */
+const EARLY = 120
+
+/** Stands in for the application underneath — and for the toolbar's menu button, which reaches
+ *  the reveal through context exactly as the real toolbar does. */
+function Underneath({ chatHidden = false }: { chatHidden?: boolean }) {
+  const reveal = useNavReveal()
+  const setChatHidden = reveal?.setChatHidden
+  // The workspace is the only writer of the collapsed state, so the test reports it the same way.
+  if (setChatHidden) queueMicrotask(() => setChatHidden(chatHidden))
+  return (
+    <div data-testid="content">
+      <NavMenuButton />
+      <button type="button" data-testid="underneath" onClick={() => undefined}>
+        the chat
+      </button>
+    </div>
+  )
+}
+
+function renderReveal(props: { chatHidden?: boolean } = {}) {
+  return render(
+    <MemoryRouter initialEntries={['/chat/c1']}>
+      <NavReveal hideable onOpenIntegrations={() => undefined}>
+        <Underneath {...props} />
+      </NavReveal>
+    </MemoryRouter>,
+  )
+}
+
+/** Move the pointer to an x position and let React settle. */
+const pointerAt = (clientX: number) =>
+  act(() => { document.dispatchEvent(new PointerEvent('pointermove', { clientX, bubbles: true })) })
+
+/**
+ * A REAL CLOCK, DELIBERATELY — and worth knowing before anyone "fixes" it into a fake one.
+ * `motion` captures `requestAnimationFrame` at import, before a fake clock could be installed, so
+ * under fake timers `AnimatePresence` never finishes its exit and the panel stays mounted for
+ * ever. A faked clock can prove the panel OPENS on time but can never prove it LEAVES, which is
+ * half of what this file is for. Both were measured before choosing.
+ */
+const after = (ms: number) =>
+  act(async () => { await new Promise((resolve) => setTimeout(resolve, ms)) })
+
+const isOpen = () => screen.queryByTestId('nav-floating') !== null
+const settles = (open: boolean) => waitFor(() => expect(isOpen()).toBe(open))
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  window.localStorage.clear()
+  h.isAuthenticated.mockReturnValue(true)
+  h.getStoredUser.mockReturnValue(USER)
+  h.fetchUsageToday.mockResolvedValue(null)
+  h.onUsageChanged.mockReturnValue(() => {})
+  h.fetchAppStatusCounts.mockResolvedValue({ draft: 0, pending: 0, approved: 0, rejected: 0, disabled: 0 })
+})
+afterEach(() => cleanup())
+
+describe('three ways in, and one of them is always visible', () => {
+  it('the menu button opens with NO delay — the rest belongs to the edge zone alone', () => {
+    renderReveal()
+    fireEvent.click(screen.getByTestId('nav-menu-button'))
+    expect(isOpen()).toBe(true)
+  })
+
+  it('⌘\\ opens and closes it from anywhere inside the application', async () => {
+    renderReveal()
+    act(() => { fireEvent.keyDown(document, { key: '\\', metaKey: true }) })
+    expect(isOpen()).toBe(true)
+    act(() => { fireEvent.keyDown(document, { key: '\\', metaKey: true }) })
+    await settles(false)
+  })
+
+  it('Ctrl+\\ works too, for the people not on a Mac', () => {
+    renderReveal()
+    act(() => { fireEvent.keyDown(document, { key: '\\', ctrlKey: true }) })
+    expect(isOpen()).toBe(true)
+  })
+})
+
+describe('the edge zone tells intent from a pass-by', () => {
+  it('a pointer that crosses without stopping opens nothing', async () => {
+    renderReveal()
+    pointerAt(EDGE_ZONE_PX - 1)
+    pointerAt(400)
+    await after(REST_MS * 2)
+    expect(isOpen()).toBe(false)
+  })
+
+  it('a pointer that rests there opens the panel, and not before the delay', async () => {
+    renderReveal()
+    pointerAt(EDGE_ZONE_PX - 1)
+    await after(EARLY)
+    expect(isOpen()).toBe(false)
+    await settles(true)
+  })
+
+  it('a pointer just outside the zone is not in it', async () => {
+    renderReveal()
+    pointerAt(EDGE_ZONE_PX + 1)
+    await after(REST_MS * 2)
+    expect(isOpen()).toBe(false)
+  })
+
+  it('while hidden the strip passes clicks straight through to what is under it', () => {
+    renderReveal()
+    const zone = screen.getByTestId('nav-edge-zone')
+    // `pointer-events: none` IS the mechanism, and jsdom dispatches events regardless of CSS — so
+    // the honest assertion is on the property that makes the click land underneath, not on a
+    // synthetic click that would "pass" against a strip that really did swallow it.
+    expect(zone.className).toMatch(/pointer-events-none/)
+    expect(screen.getByTestId('underneath')).not.toBeNull()
+  })
+})
+
+describe('it leaves on its own terms', () => {
+  it('stays for the grace period after the pointer leaves, so a wobble does not slam it', async () => {
+    renderReveal()
+    fireEvent.click(screen.getByTestId('nav-menu-button'))
+    fireEvent.pointerLeave(screen.getByTestId('nav-floating'))
+    await after(EARLY)
+    expect(isOpen()).toBe(true)
+    await settles(false)
+  })
+
+  it('stays indefinitely while the pointer is on the panel itself', async () => {
+    renderReveal()
+    fireEvent.click(screen.getByTestId('nav-menu-button'))
+    fireEvent.pointerLeave(screen.getByTestId('nav-floating'))
+    await after(EARLY)
+    fireEvent.pointerEnter(screen.getByTestId('nav-floating'))
+    await after(GRACE_MS * 2)
+    expect(isOpen()).toBe(true)
+  })
+
+  it('Escape closes it and gives focus back to where it came from', async () => {
+    renderReveal()
+    const underneath = screen.getByTestId('underneath')
+    underneath.focus()
+    act(() => { fireEvent.keyDown(document, { key: '\\', metaKey: true }) })
+    expect(isOpen()).toBe(true)
+
+    // FOCUS HAS TO ACTUALLY MOVE FIRST, or this proves nothing: with focus never leaving the
+    // composer, "it came back" and "it never went" are the same DOM, and the assertion passes
+    // against a build that restores nothing at all.
+    act(() => { screen.getByTestId('nav-projects').focus() })
+    expect(document.activeElement).not.toBe(underneath)
+
+    act(() => { fireEvent.keyDown(document, { key: 'Escape' }) })
+    await settles(false)
+    // A keyboard user dumped on `<body>` has lost their place entirely — which is the composer in
+    // almost every real case. Awaited, because the restore deliberately waits for the panel to
+    // finish leaving: handing focus back while the panel is still on screen loses it again the
+    // moment the panel is removed.
+    await waitFor(() => expect(document.activeElement).toBe(underneath))
+  })
+
+  it('focus landing on a navigation item holds it open — a panel that vanishes under the keyboard is a trap', async () => {
+    renderReveal()
+    fireEvent.click(screen.getByTestId('nav-menu-button'))
+    fireEvent.pointerLeave(screen.getByTestId('nav-floating'))
+    fireEvent.focus(screen.getByTestId('nav-projects'))
+    await after(GRACE_MS * 2)
+    expect(isOpen()).toBe(true)
+  })
+})
+
+describe('nothing reflows when it arrives', () => {
+  it('the panel is fixed and outside the content, so the panes keep their widths', () => {
+    renderReveal()
+    const content = screen.getByTestId('content')
+    const parentBefore = content.parentElement
+    const classBefore = content.className
+    fireEvent.click(screen.getByTestId('nav-menu-button'))
+    // jsdom measures nothing, so the claim is asserted through the MECHANISM that makes it true:
+    // the panel is `fixed`, and the content it floats over is untouched — same parent, same
+    // classes, nothing new in its flow. A panel that pushed the panes would have to change one of
+    // those, and a measured-width assertion here would be measuring numbers jsdom invented.
+    expect(screen.getByTestId('nav-floating').className).toMatch(/(^|\s)fixed(\s|$)/)
+    expect(content.parentElement).toBe(parentBefore)
+    expect(content.className).toBe(classBefore)
+  })
+})
+
+describe('with the chat hidden the edge zone is not installed at all', () => {
+  it('resting the pointer at the edge opens nothing', async () => {
+    renderReveal({ chatHidden: true })
+    await act(async () => { await Promise.resolve() })
+    expect(screen.queryByTestId('nav-edge-zone')).toBeNull()
+    pointerAt(EDGE_ZONE_PX - 1)
+    await after(REST_MS * 2)
+    expect(isOpen()).toBe(false)
+  })
+
+  it('but the button and the shortcut still work — liveness on the same fixture', async () => {
+    renderReveal({ chatHidden: true })
+    await act(async () => { await Promise.resolve() })
+    fireEvent.click(screen.getByTestId('nav-menu-button'))
+    expect(isOpen()).toBe(true)
+    act(() => { fireEvent.keyDown(document, { key: '\\', metaKey: true }) })
+    await settles(false)
+    act(() => { fireEvent.keyDown(document, { key: '\\', metaKey: true }) })
+    expect(isOpen()).toBe(true)
+  })
+})
+
+describe('pin is a preference about a screen, not a property of an application', () => {
+  it('docks the panel and remembers the choice', () => {
+    renderReveal()
+    fireEvent.click(screen.getByTestId('nav-menu-button'))
+    fireEvent.click(screen.getByTestId('nav-pin'))
+    expect(screen.getByTestId('nav-docked')).not.toBeNull()
+    expect(screen.queryByTestId('nav-floating')).toBeNull()
+    expect(window.localStorage.getItem('bial:nav-pinned')).toBe('1')
+  })
+
+  it('survives a reload, and applies to a different application', () => {
+    window.localStorage.setItem('bial:nav-pinned', '1')
+    render(
+      <MemoryRouter initialEntries={['/projects/another-one']}>
+        <NavReveal hideable onOpenIntegrations={() => undefined}>
+          <Underneath />
+        </NavReveal>
+      </MemoryRouter>,
+    )
+    expect(screen.getByTestId('nav-docked')).not.toBeNull()
+  })
+
+  it('while pinned there is no edge zone — there is nothing left to reveal', () => {
+    window.localStorage.setItem('bial:nav-pinned', '1')
+    renderReveal()
+    expect(screen.queryByTestId('nav-edge-zone')).toBeNull()
+  })
+
+  it('⌘\\ undocks a pinned panel rather than toggling one that is already there', () => {
+    window.localStorage.setItem('bial:nav-pinned', '1')
+    renderReveal()
+    act(() => { fireEvent.keyDown(document, { key: '\\', metaKey: true }) })
+    expect(screen.queryByTestId('nav-docked')).toBeNull()
+    expect(window.localStorage.getItem('bial:nav-pinned')).toBe('0')
+  })
+})
