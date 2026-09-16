@@ -59,7 +59,7 @@ from src.api.v1.live_build import refuse_while_build_session_live
 from src.core.errors import AppApiError
 from src.core.redaction import redact_secrets
 from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
-from src.db.models.deployment import Deployment, DeploymentStatus
+from src.db.models.deployment import Deployment
 from src.db.models.user import User
 from src.schemas import ADMIN_AUTH, AUTH_401, ErrorEnvelope, error_responses
 from src.services.approvals.submit import submit_app_for_review
@@ -1126,17 +1126,27 @@ async def restart_project(
     if await store.in_flight(db, app_id=app_row.id) is not None:
         raise AppApiError(status.HTTP_409_CONFLICT, _BUSY_MSG, code="deploy_in_flight")
 
-    # The NEWEST attempt, whatever its status, for the reason the kill-switch resolves the
-    # same way: a deploy that died at the readiness check still left a container running.
-    row = await store.latest_for_app(db, app_id=app_row.id)
-    if row is None:
+    # THE TAKEDOWN AXIS IS READ OFF THE NEWEST ROW, because `unpublish` stamps whichever row
+    # was newest when it ran — so an app taken offline after its last publish carries the stamp
+    # on a row that is not the published one.
+    newest = await store.latest_for_app(db, app_id=app_row.id)
+    if newest is None:
         raise AppApiError(status.HTTP_409_CONFLICT, _RESTART_NEVER_DEPLOYED, code="never_deployed")
-    if row.unpublished_at is not None:
+    if newest.unpublished_at is not None:
         raise AppApiError(status.HTTP_409_CONFLICT, _RESTART_TAKEN_OFFLINE, code="taken_offline")
+
+    # WHAT IS LIVE IS THE LAST ATTEMPT THAT PUBLISHED, NOT THE LAST ATTEMPT. A restart claims a
+    # row of its own, so a restart that fails or times out leaves a `failed` row newer than the
+    # container still serving — and reading the newest row here refused every retry with "this
+    # app isn't running", which is false about a container the lists are simultaneously showing
+    # as live. A restart failure is an ATTEMPT fact; only a publish is a production one.
+    #
     # A missing digest belongs with the refusals rather than the guesses: without it the
     # platform cannot name the image that is live, and composing one from a mutable tag is
-    # exactly the "newer bits" this route is written to prevent.
-    if row.status is not DeploymentStatus.SUCCEEDED or row.image_digest is None:
+    # exactly the "newer bits" this route is written to prevent — which is why the read itself
+    # requires one rather than this branch testing for it afterwards.
+    row = await store.latest_published(db, app_id=app_row.id)
+    if row is None or row.image_digest is None:
         raise AppApiError(status.HTTP_409_CONFLICT, _RESTART_NOT_LIVE, code="not_live")
 
     try:

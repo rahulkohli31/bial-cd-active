@@ -47,7 +47,13 @@ export interface AppStatusPanelProps {
    * own. Two components in one panel each polling the same endpoint is how a screen comes to
    * show two answers to one question, and it was exactly the arrangement here before this.
    */
-  actions?: (ctx: { state: PublishState; refresh: () => Promise<void> }) => React.ReactNode
+  actions?: (ctx: {
+    state: PublishState
+    /** The ending of the LAST attempt, which is not always a fact about production — a
+     *  restart that failed leaves one on a row newer than the container still serving. */
+    failureCode: string | null
+    refresh: () => Promise<void>
+  }) => React.ReactNode
 }
 
 /** The panel's own small-caps label. It was the rail's to draw; there is no rail. */
@@ -367,7 +373,7 @@ export default function AppStatusPanel({ projectId, actions }: AppStatusPanelPro
       {/* THE FOOT, where anything the owner may do to a LIVE application goes. Below the
           state's own action rather than beside it: one of them changes which version is
           serving, and the others do not. */}
-      {actions?.({ state, refresh })}
+      {actions?.({ state, failureCode: deployment?.failureCode ?? null, refresh })}
 
       {showModal && (
         <DataClassificationModal

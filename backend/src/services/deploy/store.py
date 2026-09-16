@@ -273,6 +273,32 @@ async def latest_for_app(db: AsyncSession, *, app_id: uuid.UUID) -> Deployment |
     return row
 
 
+async def latest_published(db: AsyncSession, *, app_id: uuid.UUID) -> Deployment | None:
+    """The most recent attempt that actually PUBLISHED something — succeeded, with a digest
+    naming the image it put there.
+
+    WHY THIS IS NOT `latest_for_app`. `deployments` is append-only and a RESTART claims a row
+    of its own, so a restart that fails leaves a `failed` row newer than the one that published
+    the container still serving. The newest row is then an ATTEMPT fact and says nothing about
+    what is in production — which is exactly the collapse `liveness.live_app_ids` already makes
+    for the lists, and the reason a route asking "what is live" must ask it the same way.
+
+    The takedown axis is deliberately NOT read here: `unpublish` stamps whichever row was
+    newest at the time, so a caller has to check that against the newest row rather than this
+    one."""
+    row: Deployment | None = await db.scalar(
+        sa.select(Deployment)
+        .where(
+            Deployment.app_id == app_id,
+            Deployment.status == DeploymentStatus.SUCCEEDED,
+            Deployment.image_digest.is_not(None),
+        )
+        .order_by(Deployment.id.desc())
+        .limit(1)
+    )
+    return row
+
+
 async def in_flight(db: AsyncSession, *, app_id: uuid.UUID) -> uuid.UUID | None:
     """The running deployment id for this app, if any. Used to block unpublish while a
     deploy is in progress — letting it through would race the in-flight pipeline's

@@ -72,7 +72,10 @@ export interface Presentation {
  * person reading them: the first has never had a working version, the second had one a minute
  * ago. The code is the only thing that tells them apart.
  */
-const RESTART_FAILED_CODES: ReadonlySet<string> = new Set(['restart_failed', 'restart_not_ready'])
+export const RESTART_FAILED_CODES: ReadonlySet<string> = new Set([
+  'restart_failed',
+  'restart_not_ready',
+])
 
 /**
  * THE map: one publish state in, one presentation out, ending in `assertNever` so an unlabelled

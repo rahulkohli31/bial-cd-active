@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { AlertTriangle, PowerOff, RotateCcw } from 'lucide-react'
 import { restartApp, takeAppDown } from '../../utils/deployApi'
 import { ApiError } from '../../utils/apiError'
-import { canBeRestarted } from '../../utils/publishPresentation'
+import { canBeRestarted, RESTART_FAILED_CODES } from '../../utils/publishPresentation'
 import { BusyGlyph } from '../ui/Waiting'
 import AppStatusPanel from './AppStatusPanel'
 
@@ -80,8 +80,24 @@ export default function ProductionTab({ projectId, onSettled }: ProductionTabPro
     <div data-testid="production-tab" className="flex flex-col gap-5">
       <AppStatusPanel
         projectId={projectId}
-        actions={({ state, refresh }) => (
+        actions={({ state, failureCode, refresh }) => (
           <>
+            {/* A RESTART THAT FAILED ON AN APPLICATION THAT IS STILL SERVING. The status
+                above says Live, and it is right — the previous revision never stopped. But
+                the attempt ended, and saying nothing would leave an owner who pressed
+                Restart four minutes ago with no idea whether it ever finished. The state
+                word is not the place for it: that would be the screen claiming the
+                application is down while the list beside it shows it up. */}
+            {failureCode !== null && RESTART_FAILED_CODES.has(failureCode) && canBeRestarted(state) && (
+              <p
+                data-testid="production-restart-failed"
+                className="mt-3 flex items-start gap-2 rounded-xl bg-status-amber-bg p-3 text-xs text-status-amber-fg"
+              >
+                <AlertTriangle size={14} className="mt-0.5 flex-shrink-0" />
+                The last restart did not finish. The version that was already running is
+                still running, so nothing was lost — you can try again.
+              </p>
+            )}
             {refusal !== null && (
               <p
                 role="alert"

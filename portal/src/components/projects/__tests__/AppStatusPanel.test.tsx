@@ -597,6 +597,20 @@ describe('the actions slot', () => {
     expect(screen.getByTestId('slot').textContent).toBe('live_current')
   })
 
+  it('★ hands down the attempt\'s failure code, which is not the same fact as the state', () => {
+    // A restart that failed leaves its ending on a row newer than the container still serving,
+    // so the state reads live and the code reads `restart_failed` at the same moment. A slot
+    // given only the state cannot tell an owner their restart never finished.
+    wire({ deployment: view('live_current', { failureCode: 'restart_not_ready' }) })
+    render(
+      <AppStatusPanel
+        projectId="p1"
+        actions={({ failureCode }) => <span data-testid="slot">{failureCode}</span>}
+      />,
+    )
+    expect(screen.getByTestId('slot').textContent).toBe('restart_not_ready')
+  })
+
   it('hands down a refresh that really re-reads', () => {
     const refresh = vi.fn()
     wire({ deployment: view('draft'), refresh })

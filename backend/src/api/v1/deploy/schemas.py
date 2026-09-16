@@ -18,7 +18,11 @@ from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
 from src.db.models.deployment import Deployment, DeploymentStatus
 from src.schemas import CamelModel
 from src.services.deploy.classification import CLASSIFICATION_KEYS
-from src.services.deploy.service import FAIL_ROUTED_FOR_REVIEW
+from src.services.deploy.service import (
+    FAIL_RESTART,
+    FAIL_RESTART_NOT_READY,
+    FAIL_ROUTED_FOR_REVIEW,
+)
 
 
 class DataClassificationAnswers(CamelModel):
@@ -259,6 +263,38 @@ class SavedState(StrEnum):
 # second reason to route rather than fail.
 _ROUTED_FAILURE_CODES: frozenset[str] = frozenset({FAIL_ROUTED_FOR_REVIEW})
 
+# THE CODES A FAILED RESTART SETTLES UNDER, and the reason they need naming here: a restart
+# claims a row of its own, so one that fails leaves a `failed` row newer than the attempt that
+# published the container still serving. Read as a production fact it says the app did not
+# start, while `liveness.live_app_ids` — which reads the last attempt that actually published —
+# goes on showing the same app live. Two readers, one app, opposite answers.
+#
+# Same shape as the routed codes above, for the same reason: an attempt's ending is not always
+# a statement about production. `service.py` owns the strings; this is a reader's copy, exactly
+# as the routed set is.
+_RESTART_FAILURE_CODES: frozenset[str] = frozenset({FAIL_RESTART, FAIL_RESTART_NOT_READY})
+
+
+def _live_state(app: AppRegistry, deployment: Deployment, saved_head: str | None) -> PublishState:
+    """WHICH of the three live readings applies — the drift comparison, and nothing else.
+
+    AGAINST THE COMMIT THAT ACTUALLY WENT LIVE, never `approved_commit_sha`: that pin is NULL
+    for every app published unattended under ladder rule 7, so comparing against it would read
+    every one of those apps as unknown. `saved_head` is the primary signal; `source_commit_sha`
+    (the last SUBMITTED commit, moved only by submit/withdraw, never by a Save) is the secondary
+    one that still fires `live_newer_work` even when the saved head could not be read at all —
+    four saves and no new submission is exactly the case a submitted-commit check alone reads as
+    unknown."""
+    if saved_head is not None:
+        return (
+            PublishState.LIVE_CURRENT
+            if saved_head == deployment.head_sha
+            else PublishState.LIVE_NEWER_WORK
+        )
+    if app.source_commit_sha is not None and app.source_commit_sha != deployment.head_sha:
+        return PublishState.LIVE_NEWER_WORK
+    return PublishState.LIVE_DRIFT_UNKNOWN
+
 
 def compute_publish_state(
     app: AppRegistry, deployment: Deployment | None, saved_head: str | None
@@ -312,6 +348,24 @@ def compute_publish_state(
     if deployment.status is DeploymentStatus.RUNNING:
         return PublishState.STARTING_UP
     if deployment.status is DeploymentStatus.FAILED:
+        # A FAILED RESTART IS NOT A FAILED PUBLISH, and this arm sits above the generic one for
+        # the reason the routed arm does. A restart claims a row of its own and runs only on an
+        # app that was already serving, so a failure here leaves the PREVIOUS revision standing
+        # — `head_sha` was copied onto this row from the version that published it, which is
+        # what lets the drift comparison below still answer. Reading it as `did_not_start` told
+        # an owner their app had not started while the lists beside it showed the same app
+        # live, and withheld Take down from the one surface that offers it.
+        #
+        # The failure is not swallowed: the row still carries its code and its citizen sentence,
+        # and the production surface states them beside a status that is true.
+        if (
+            deployment.failure_code in _RESTART_FAILURE_CODES
+            and deployment.head_sha is not None
+            # An owner who took the app down while a restart was failing stamped THIS row, and
+            # offline outranks whatever the attempt was trying to do.
+            and deployment.unpublished_at is None
+        ):
+            return _live_state(app, deployment, saved_head)
         # THE FAILURE_CODE BULLET: this check sits ABOVE the generic failure arm on
         # purpose. A drift-routed publish is modelled as a FAILED row with a distinct
         # code (`routed_for_review`) rather than a fourth `DeploymentStatus` — without
@@ -324,23 +378,7 @@ def compute_publish_state(
     # `DeploymentStatus.SUCCEEDED` — the only member left.
     if deployment.unpublished_at is not None:
         return PublishState.TAKEN_OFFLINE
-    # THE DRIFT COMPARISON: against the commit that actually WENT LIVE, never
-    # `approved_commit_sha` — that pin is NULL for every app published unattended under
-    # ladder rule 7, so comparing against it would read every one of those apps as
-    # unknown. `saved_head` is the primary signal; `source_commit_sha` (the last
-    # SUBMITTED commit, moved only by submit/withdraw, never by a Save) is the
-    # secondary one that still fires `live_newer_work` even when the saved head could
-    # not be read at all (four saves and no new submission is exactly the case a
-    # submitted-commit check alone reads as unknown).
-    if saved_head is not None:
-        return (
-            PublishState.LIVE_CURRENT
-            if saved_head == deployment.head_sha
-            else PublishState.LIVE_NEWER_WORK
-        )
-    if app.source_commit_sha is not None and app.source_commit_sha != deployment.head_sha:
-        return PublishState.LIVE_NEWER_WORK
-    return PublishState.LIVE_DRIFT_UNKNOWN
+    return _live_state(app, deployment, saved_head)
 
 
 class DeploymentResponse(CamelModel):

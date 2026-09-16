@@ -20,6 +20,7 @@ const h = vi.hoisted(() => ({
   takeAppDown: vi.fn(),
   refresh: vi.fn(),
   state: 'live_current' as string,
+  failureCode: null as string | null,
 }))
 
 vi.mock('../../../utils/deployApi', async (importOriginal) => ({
@@ -38,10 +39,14 @@ vi.mock('../AppStatusPanel', () => ({
     actions,
   }: {
     projectId: string
-    actions?: (ctx: { state: string; refresh: () => Promise<void> }) => React.ReactNode
+    actions?: (ctx: {
+      state: string
+      failureCode: string | null
+      refresh: () => Promise<void>
+    }) => React.ReactNode
   }) => (
     <div data-testid="status-panel-stub" data-project={projectId}>
-      {actions?.({ state: h.state, refresh: h.refresh })}
+      {actions?.({ state: h.state, failureCode: h.failureCode, refresh: h.refresh })}
     </div>
   ),
 }))
@@ -55,6 +60,7 @@ const mount = (over: Partial<React.ComponentProps<typeof ProductionTab>> = {}) =
 beforeEach(() => {
   vi.clearAllMocks()
   h.state = 'live_current'
+  h.failureCode = null
   h.restartApp.mockResolvedValue({ deploymentId: 'd2' })
   h.takeAppDown.mockResolvedValue({ message: 'done' })
   h.refresh.mockResolvedValue(undefined)
@@ -203,4 +209,58 @@ describe('no control is offered where the endpoint would refuse it', () => {
       expect(screen.getByTestId('production-takedown')).toBeTruthy()
     },
   )
+})
+
+/**
+ * ★ A RESTART THAT FAILED ON AN APPLICATION THAT IS STILL SERVING.
+ *
+ * `deployments` is append-only and a restart claims a row of its own, so a restart that fails
+ * leaves a failed row newer than the attempt that published the container still running. The
+ * server reports the state as LIVE — which is true, the previous revision never stopped — and
+ * carries the attempt's ending alongside it. Saying nothing would leave an owner who pressed
+ * Restart four minutes ago with no idea whether it ever finished.
+ */
+describe('a restart that did not finish', () => {
+  it.each(['restart_failed', 'restart_not_ready'])('says so under %s, beside a live status', (code) => {
+    h.failureCode = code
+    mount()
+    const notice = screen.getByTestId('production-restart-failed')
+    expect(notice.textContent).toMatch(/last restart did not finish/i)
+    // THE HALF THAT ANSWERS THE FEAR: nothing was lost, and the app never went down.
+    expect(notice.textContent).toMatch(/still running/i)
+  })
+
+  it('★ leaves both controls offered — the application is serving, so both still apply', () => {
+    // The defect this replaced withheld Take down as well as Restart, because it reported the
+    // application as not live. An owner whose restart timed out could not take it down at all.
+    h.failureCode = 'restart_not_ready'
+    mount()
+    expect(screen.getByTestId('production-restart')).toBeTruthy()
+    expect(screen.getByTestId('production-takedown')).toBeTruthy()
+  })
+
+  it('★ says nothing about a restart when the failure was a PUBLISH', () => {
+    // The paired negative. A build that never came up is a different event with a different
+    // remedy, and the state word carries that one on its own.
+    h.failureCode = 'build_failed'
+    mount()
+    expect(screen.getByTestId('production-restart')).toBeTruthy()
+    expect(screen.queryByTestId('production-restart-failed')).toBeNull()
+  })
+
+  it('says nothing on an application that is not serving', () => {
+    // Where nothing is running, "the version that was already running is still running" is
+    // false — and the state word is the whole answer.
+    h.failureCode = 'restart_failed'
+    h.state = 'taken_offline'
+    mount()
+    expect(screen.getByTestId('status-panel-stub')).toBeTruthy()
+    expect(screen.queryByTestId('production-restart-failed')).toBeNull()
+  })
+
+  it('says nothing when the last attempt ended cleanly', () => {
+    mount()
+    expect(screen.getByTestId('production-restart')).toBeTruthy()
+    expect(screen.queryByTestId('production-restart-failed')).toBeNull()
+  })
 })

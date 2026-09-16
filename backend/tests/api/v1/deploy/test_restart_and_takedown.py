@@ -223,11 +223,13 @@ async def _deployment(
     status: DeploymentStatus = DeploymentStatus.SUCCEEDED,
     unpublished_at: datetime | None = None,
     image_digest: str | None = _LIVE_DIGEST,
+    failure_code: str | None = None,
 ) -> Deployment:
     row = Deployment(
         app_id=app_id,
         user_id=user_id,
         status=status,
+        failure_code=failure_code,
         step="live" if status is DeploymentStatus.SUCCEEDED else "building",
         head_sha=_LIVE_HEAD,
         image_digest=image_digest,
@@ -794,3 +796,142 @@ async def test_the_reconciler_does_not_resurrect_an_app_its_owner_took_down(
     row = await db_session.get(Deployment, live.id, populate_existing=True)
     assert row is not None
     assert row.unpublished_at is not None
+
+
+# --- a restart that failed must not strand the app it left running -----------------------
+
+
+async def test_a_second_restart_is_accepted_after_the_first_one_failed(
+    wire, client, db_session
+) -> None:
+    """★ THE TRAP THIS EXISTS FOR.
+
+    `deployments` is append-only and a restart claims a row of its own, so a restart that fails
+    leaves a `failed` row NEWER than the attempt that published the container still serving.
+    Resolving "what is live" from the newest row refused every retry with "this app isn't
+    running in production right now" — about a container the projects list was simultaneously
+    showing as live, because `liveness.live_app_ids` reads the last attempt that PUBLISHED.
+
+    The owner's only remaining lever was a full publish, which for anything but the self-publish
+    lineage means another review round. The commonest way in is benign: the readiness budget is
+    180 seconds and a slow-but-healthy restart exceeds it, settling `restart_not_ready` while
+    the previous revision keeps serving — and that timeout's own citizen message invites the
+    retry this refused.
+    """
+    user = await UserFactory.create(db_session)
+    app_row = await AppRegistryFactory.create(db_session, user_id=user.id)
+    published = await _deployment(db_session, app_id=app_row.id, user_id=user.id)
+    await _deployment(
+        db_session,
+        app_id=app_row.id,
+        user_id=user.id,
+        status=DeploymentStatus.FAILED,
+        failure_code="restart_not_ready",
+    )
+
+    resp = await client.post(_RESTART.format(pid=app_row.project_id), headers=auth_headers(user))
+
+    assert resp.status_code == 202, resp.text
+    await wire.pipeline.drain()
+    # AND IT RUNS THE PUBLISHED VERSION, not whatever the failed attempt was carrying: the
+    # digest comes off the row that actually put a container there.
+    assert wire.aca.created[0]["image"].endswith(f"@{published.image_digest}")
+
+
+async def test_a_failed_PUBLISH_still_refuses_a_restart(wire, client, db_session) -> None:
+    """The paired negative, and the reason the fix keys on the failure CODE rather than on
+    "there exists an older success". A publish that never came up is a production fact: nothing
+    newer is serving, and offering to recycle it would be offering to recycle nothing."""
+    user = await UserFactory.create(db_session)
+    app_row = await AppRegistryFactory.create(db_session, user_id=user.id)
+    await _deployment(
+        db_session,
+        app_id=app_row.id,
+        user_id=user.id,
+        status=DeploymentStatus.FAILED,
+        failure_code="build_failed",
+        image_digest=None,
+    )
+
+    resp = await client.post(_RESTART.format(pid=app_row.project_id), headers=auth_headers(user))
+
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "not_live"
+    assert wire.aca.created == []
+
+
+async def test_a_takedown_after_a_failed_restart_still_refuses_a_restart(
+    wire, client, db_session
+) -> None:
+    """OFFLINE OUTRANKS THE ATTEMPT. `unpublish` stamps whichever row was newest when it ran —
+    here, the failed restart — so the takedown axis is read off the NEWEST row while the live
+    version is read off the last published one. Reading both off the same row gets one of these
+    two cases wrong whichever row is chosen."""
+    user = await UserFactory.create(db_session)
+    app_row = await AppRegistryFactory.create(db_session, user_id=user.id)
+    await _deployment(db_session, app_id=app_row.id, user_id=user.id)
+    await _deployment(
+        db_session,
+        app_id=app_row.id,
+        user_id=user.id,
+        status=DeploymentStatus.FAILED,
+        failure_code="restart_failed",
+        unpublished_at=datetime.now(UTC),
+    )
+
+    resp = await client.post(_RESTART.format(pid=app_row.project_id), headers=auth_headers(user))
+
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "taken_offline"
+    assert wire.aca.created == []
+
+
+async def test_the_deployment_read_calls_a_failed_restart_LIVE_not_did_not_start(
+    client, db_session
+) -> None:
+    """★ THE OTHER HALF OF THE SAME DISAGREEMENT, at the surface rather than the route.
+
+    `compute_publish_state` read the newest row and answered `did_not_start`, so the Production
+    tab told an owner their app had not started — beside a list showing it live — and withheld
+    Take down, which is gated on a live state. The row keeps its failure code, so the surface
+    can still say the restart did not finish; what it may not do is say the app is down.
+    """
+    user = await UserFactory.create(db_session)
+    app_row = await AppRegistryFactory.create(db_session, user_id=user.id)
+    await _deployment(db_session, app_id=app_row.id, user_id=user.id)
+    await _deployment(
+        db_session,
+        app_id=app_row.id,
+        user_id=user.id,
+        status=DeploymentStatus.FAILED,
+        failure_code="restart_failed",
+    )
+
+    resp = await client.get(
+        f"/v1/projects/{app_row.project_id}/deployment", headers=auth_headers(user)
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["publishState"].startswith("live_"), body["publishState"]
+    # NOT SWALLOWED: the attempt's own ending still rides on the row, which is what lets the
+    # production surface state it beside a status that is true.
+    assert body["failureCode"] == "restart_failed"
+
+
+async def test_the_published_read_skips_a_success_that_published_no_image(db_session) -> None:
+    """★ `latest_published` answers "what is in production", and a row with no digest cannot
+    name the image that is there. Composing one from a mutable tag is exactly the "newer bits" a
+    restart exists to prevent, so such a row is not an answer — it is skipped, and the route's
+    refusal is what the citizen gets."""
+    from src.services.deploy import store
+
+    user = await UserFactory.create(db_session)
+    app_row = await AppRegistryFactory.create(db_session, user_id=user.id)
+    published = await _deployment(db_session, app_id=app_row.id, user_id=user.id)
+    await _deployment(db_session, app_id=app_row.id, user_id=user.id, image_digest=None)
+
+    found = await store.latest_published(db_session, app_id=app_row.id)
+
+    assert found is not None
+    assert found.id == published.id
