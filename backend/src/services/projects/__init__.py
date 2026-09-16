@@ -22,6 +22,9 @@ from src.services.projects.shares import (
     MIN_COLLEAGUE_QUERY_CHARS as MIN_COLLEAGUE_QUERY_CHARS,
 )
 from src.services.projects.shares import SharedProjectEntry as SharedProjectEntry
+from src.services.projects.shares import SharedSort as SharedSort
+from src.services.projects.shares import SharedWithMePage as SharedWithMePage
+from src.services.projects.shares import SharerFacet as SharerFacet
 from src.services.projects.shares import ShareWithRecipient as ShareWithRecipient
 from src.services.projects.shares import create_share as create_share
 from src.services.projects.shares import list_shared_with_me as list_shared_with_me

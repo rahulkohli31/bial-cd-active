@@ -28,13 +28,10 @@ from src.api.v1.live_build import refuse_while_build_session_live
 from src.api.v1.offset_pagination import PageQuery, clean_page
 from src.api.v1.pagination import (
     DEFAULT_PAGE_SIZE,
-    CursorQuery,
     LimitQuery,
     SearchQuery,
     clean_limit,
     clean_search,
-    parse_cursor,
-    split_keyset,
 )
 from src.config import settings
 from src.core.alarms import TEARDOWN_ARTEFACT_SURVIVED_EVENT
@@ -64,7 +61,12 @@ from src.schemas import (
     ShareRequest,
     error_responses,
 )
-from src.schemas.shares import ColleagueResult, SharedProjectResponse, ShareResponse
+from src.schemas.shares import (
+    ColleagueResult,
+    SharedProjectResponse,
+    SharedProjectSharer,
+    ShareResponse,
+)
 from src.services.appdb.provision import ensure_project_database
 from src.services.appdb.teardown import salt_the_earth, teardown_handles
 from src.services.audit.log import append_audit
@@ -84,6 +86,7 @@ from src.services.embeddings import EmbedderDep, write_description_embedding
 from src.services.projects import (
     MIN_COLLEAGUE_QUERY_CHARS,
     ProjectAccess,
+    SharedSort,
     create_share,
     delete_project_cascade,
     find_possible_duplicates,
@@ -548,30 +551,84 @@ async def search_project_colleagues(
     )
 
 
+def _clean_shared_sort(value: str | None) -> SharedSort:
+    """Normalize `?sort=`; absent → `recentlyShared`, unrecognized → 422 (never a silent
+    default).
+
+    Each branch RETURNS THE LITERAL rather than the argument, the same way `clean_sort` does:
+    equality against a string does not narrow `str` to a `Literal` for the checkers, and a
+    `cast` over an `in` test would assert the correspondence instead of demonstrating it.
+    """
+    if value is None or value == "recentlyShared":
+        return "recentlyShared"
+    if value == "name":
+        return "name"
+    raise AppApiError(422, "sort must be one of: recentlyShared, name.")
+
+
+def _parse_shared_by(value: str | None) -> uuid.UUID | None:
+    """The `?sharedBy=` colleague id, or `None` for no filter.
+
+    Parsed here rather than typed as `uuid.UUID | None` on the signature for the reason
+    `clean_limit` gives: a FastAPI type refusal emits `{detail:[...]}`, which would put two
+    different 422 bodies on one endpoint and `error_responses(...)` structurally cannot document
+    both."""
+    if value is None:
+        return None
+    try:
+        return uuid.UUID(value)
+    except ValueError:
+        raise AppApiError(422, "sharedBy must be a colleague id.") from None
+
+
 @router.get(
     "/shared",
-    responses=error_responses(AUTH_401, (422, ErrorEnvelope, "Invalid pagination cursor")),
+    responses=error_responses(
+        AUTH_401, (422, ErrorEnvelope, "Invalid page, limit, sort, sharedBy, or over-long q")
+    ),
 )
 async def list_projects_shared_with_me(
     user: CurrentUser,
     db: DbSession,
-    cursor: CursorQuery = None,
+    page: PageQuery = 1,
     limit: LimitQuery = DEFAULT_PAGE_SIZE,
+    q: SearchQuery = None,
+    shared_by: Annotated[str | None, Query(alias="sharedBy")] = None,
+    sort: Annotated[
+        str | None,
+        # The closed set is named in the schema even though the type is `str | None`, so a
+        # generated client can see the two legal values rather than a free-form string —
+        # validation itself lives in `_clean_shared_sort`, which keeps this platform's 422 shape.
+        Query(description="Order. One of: recentlyShared (default), name."),
+    ] = None,
 ) -> SharedProjectListResponse:
-    """Projects a colleague has shared with the caller (#198 R12) — KEYSET paginated, not the
-    numbered-offset shape `list_projects`/`project_counts` above use for the caller's OWN
-    projects; see `services/projects/shares.py::list_shared_with_me` for why that
-    justification does not carry over to a list every sharer writes into.
+    """One NUMBERED page of the applications a colleague has shared with the caller (#198 R12),
+    with the "Shared by" filter's own options beside it.
+
+    `q` searches DESCRIPTIONS ONLY, which is this product's deliberate scope and the same one the
+    marketplace search has. `sharedBy` filters by the colleague's id, never their name — two
+    colleagues can share a display name, and `display_name` is nullable besides. `sort` is
+    `recentlyShared` (newest grant first) or `name`.
+
+    A page past the end is an empty `items` with the real `total`, not a 404 — which is what lets
+    a reader whose last page emptied under a revoke step back to a page that still exists.
+
+    It pages by OFFSET, against `pagination.py`'s keyset default and for a list that genuinely has
+    many writers; `services/projects/shares.py::list_shared_with_me` carries the argument and the
+    cost.
 
     DECLARED BEFORE `/{project_id}` for the same reason `/colleagues` above is.
     """
-    parsed_cursor = parse_cursor(cursor)
+    cleaned_page = clean_page(page)
     cleaned_limit = clean_limit(limit)
-    # `limit + 1`: the extra row is how `split_keyset` knows there is a next page without a
-    # second COUNT query — the platform's standard keyset idiom (`pagination.py`).
-    entries = await list_shared_with_me(db, user.id, limit=cleaned_limit + 1, cursor=parsed_cursor)
-    page, next_cursor, has_more = split_keyset(
-        entries, cleaned_limit, key=lambda entry: entry.share_id
+    shared = await list_shared_with_me(
+        db,
+        user.id,
+        page=cleaned_page,
+        page_size=cleaned_limit,
+        search=clean_search(q),
+        shared_by=_parse_shared_by(shared_by),
+        sort=_clean_shared_sort(sort),
     )
     return SharedProjectListResponse(
         items=[
@@ -579,13 +636,25 @@ async def list_projects_shared_with_me(
                 project_id=entry.project.id,
                 project_name=entry.project.name,
                 project_description=entry.project.description,
+                project_updated_at=entry.project.updated_at,
+                shared_by_user_id=entry.shared_by.id,
                 shared_by_display_name=entry.shared_by.display_name,
                 shared_at=entry.shared_at,
             )
-            for entry in page
+            for entry in shared.entries
         ],
-        next_cursor=next_cursor,
-        has_more=has_more,
+        sharers=[
+            SharedProjectSharer(
+                user_id=sharer.user_id,
+                display_name=sharer.display_name,
+                share_count=sharer.share_count,
+            )
+            for sharer in shared.sharers
+        ],
+        page=cleaned_page,
+        page_size=cleaned_limit,
+        total=shared.total,
+        total_pages=math.ceil(shared.total / cleaned_limit) if shared.total else 0,
     )
 
 

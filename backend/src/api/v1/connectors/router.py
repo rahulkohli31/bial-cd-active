@@ -46,6 +46,7 @@ from src.api.v1.connectors.schemas import (
     AccessRequestBody,
     ConnectorEntry,
     ConnectorListResponse,
+    ConnectorOnProject,
     ConnectorProjectEntry,
     ConnectorProjectListResponse,
     ConnectorWindow,
@@ -122,27 +123,36 @@ def _known_connector(connector_key: str) -> Connector:
     return CONNECTORS[connector_key]
 
 
-async def _on_project_count(db: DbSession, user_id: uuid.UUID, connector_key: str) -> int:
-    """How many of this person's projects have the connector switched on — `On in 2 projects ›`.
+async def _on_projects(
+    db: DbSession, user_id: uuid.UUID, connector_key: str
+) -> list[ConnectorOnProject]:
+    """This person's projects with the connector switched on — the Integrations card's
+    disclosure, and the number on the card above it.
 
     Scoped through `projects`, which is `project_connectors`' ownership anchor: the `user_id`
-    predicate is on the join target, and dropping it would count every citizen's projects.
+    predicate is on the join target, and dropping it would list every citizen's projects.
 
-    COUNTING `enabled` IS COUNTING EFFECTIVE STATE HERE, and only here. Effective on is
-    `enabled AND the owner is approved` (`core.connectors.resolve_window`), and this
-    number is rendered on the APPROVED row only — the second conjunct is already true for every
-    row it counts. It is not a licence to read `enabled` and call it "on" anywhere else."""
-    counted = await db.scalar(
-        sa.select(sa.func.count())
-        .select_from(ProjectConnector)
-        .join(Project, Project.id == ProjectConnector.project_id)
+    THE FILTER IS `enabled` AND DELIBERATELY NOT EFFECTIVE STATE. Effective on is
+    `enabled AND the owner is approved` (`core.connectors.resolve_window`); folding approval in
+    here would make a withdrawn grant silently empty this list while the projects it named still
+    read the connector's switch as up. The card's `state` is the one place the person-level fact
+    is stated, so the rows stay and say what they are.
+
+    Newest project first — `id` is a UUIDv7 — matching the order the projects listing and the
+    drill-down both use, so the same projects do not reshuffle between screens."""
+    rows = await db.execute(
+        sa.select(Project.id, Project.name)
+        .join(ProjectConnector, ProjectConnector.project_id == Project.id)
         .where(
             Project.user_id == user_id,
             ProjectConnector.connector_key == connector_key,
             ProjectConnector.enabled.is_(True),
         )
+        .order_by(Project.id.desc())
     )
-    return int(counted or 0)
+    return [
+        ConnectorOnProject(project_id=project_id, name=name) for project_id, name in rows.all()
+    ]
 
 
 def _consent_lines(connector: Connector) -> list[ConsentLine]:
@@ -168,6 +178,9 @@ async def _entry(
     of that rule, correct only for as long as nobody adds a fifth status."""
     access = await current_access(db, user_id=user_id, connector_key=connector_key)
     state = access.state
+    # Read in every state, because it is a fact about the projects rather than about the person
+    # — see `ConnectorEntry.on_projects`. Only the COUNT beside it is state-conditional.
+    on_projects = await _on_projects(db, user_id, connector_key)
     if state is ConnectorPersonState.NEVER_ASKED:
         return ConnectorEntry(
             key=connector_key,
@@ -176,6 +189,7 @@ async def _entry(
             ask_subtitle=connector.ask_subtitle,
             consent_lines_requester=_consent_lines(connector),
             state=state,
+            on_projects=on_projects,
         )
 
     row = access.request
@@ -197,9 +211,8 @@ async def _entry(
         asked_at=asked_at,
         approved_at=row.decided_at if approved else None,
         approved_by_name=access.decided_by_name if approved else None,
-        on_project_count=(
-            await _on_project_count(db, user_id, connector_key) if approved else None
-        ),
+        on_projects=on_projects,
+        on_project_count=len(on_projects) if approved else None,
         decided_at=row.decided_at if declined else None,
         decided_by_name=access.decided_by_name if declined else None,
         decision_remarks=row.decision_remarks if declined else None,
@@ -216,7 +229,12 @@ async def list_connectors(user: CurrentUser, db: DbSession) -> ConnectorListResp
     `askedAt` while you wait, `approvedAt` / `approvedByName` / `onProjectCount` once an
     administrator has said yes, and `decidedAt` / `decidedByName` / `decisionRemarks` if they
     said no. Access is granted to a PERSON, so one answer covers every project you own,
-    including the ones you have not made yet."""
+    including the ones you have not made yet.
+
+    `onProjects` rides this same read rather than a second route — a card and its disclosure are
+    one round trip, and there is no second endpoint to keep in step. It names the projects with
+    the connector switched on, and that is ALL it names: no record counts, no last-read dates,
+    no windows. This read says who may reach the data, never what was read or for how long."""
     return ConnectorListResponse(
         connectors=[
             await _entry(db, user.id, key, connector) for key, connector in CONNECTORS.items()

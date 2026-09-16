@@ -76,6 +76,21 @@ class ConsentLine(CamelModel):
     body: str
 
 
+class ConnectorOnProject(CamelModel):
+    """One project behind the Integrations card's disclosure — a name, and nothing else.
+
+    NO WINDOW, NO RECORD COUNT, NO LAST-READ DATE. The page answers who may read the data, never
+    what was read or for how long, so this is deliberately NOT `ConnectorProjectEntry`: that shape
+    carries a window because the drill-down it feeds offers one, and reusing it here would put a
+    usage-shaped fact on a page that is not allowed to state one.
+
+    NO `enabled` EITHER. Every project on this list has the switch up — that is the list's whole
+    definition — so a field that is always `true` would be a second, weaker statement of it."""
+
+    project_id: uuid.UUID
+    name: str
+
+
 class ConnectorEntry(CamelModel):
     """One registry connector as the asking person sees it. See the module docblock.
 
@@ -111,7 +126,20 @@ class ConnectorEntry(CamelModel):
     #: `approved` only: how many of the caller's own projects have this connector switched on,
     #: for `On in 2 projects ›`. `None` — not `0` — in every other state: "we did not count"
     #: and "none" are different answers, and only one of them belongs on a row with no access.
+    #: It is the LENGTH of `on_projects`, never a second count of the same rows, so the sentence
+    #: and the list under it cannot disagree.
     on_project_count: int | None = None
+    #: The caller's own projects with this connector switched on — the Integrations card's
+    #: disclosure, listed rather than counted.
+    #:
+    #: IT IS A FACT ABOUT THE PROJECTS, NOT ABOUT THE PERSON, so it is present in every state and
+    #: filters on the project's own switch alone — never on `effectivelyOn`, which folds the
+    #: person's approval in. Were a grant withdrawn while switches stayed up, those projects stay
+    #: listed and `state` is the one place that says access is gone; rows vanishing instead would
+    #: leave the page silently short for a reason it never gives. A person who has never been
+    #: approved has switched nothing on, so their list is empty as a CONSEQUENCE of the filter
+    #: rather than as a special case.
+    on_projects: list[ConnectorOnProject]
     #: `declined` only. The administrator's words reach the citizen VERBATIM and are rendered as
     #: plain text on every surface, never through a markdown component: one user writes this and
     #: another reads it.
