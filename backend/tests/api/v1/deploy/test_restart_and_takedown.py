@@ -838,7 +838,7 @@ async def test_a_second_restart_is_accepted_after_the_first_one_failed(
     assert wire.aca.created[0]["image"].endswith(f"@{published.image_digest}")
 
 
-async def test_a_failed_PUBLISH_still_refuses_a_restart(wire, client, db_session) -> None:
+async def test_a_failed_publish_still_refuses_a_restart(wire, client, db_session) -> None:
     """The paired negative, and the reason the fix keys on the failure CODE rather than on
     "there exists an older success". A publish that never came up is a production fact: nothing
     newer is serving, and offering to recycle it would be offering to recycle nothing."""
@@ -886,7 +886,7 @@ async def test_a_takedown_after_a_failed_restart_still_refuses_a_restart(
     assert wire.aca.created == []
 
 
-async def test_the_deployment_read_calls_a_failed_restart_LIVE_not_did_not_start(
+async def test_the_deployment_read_calls_a_failed_restart_live_not_did_not_start(
     client, db_session
 ) -> None:
     """★ THE OTHER HALF OF THE SAME DISAGREEMENT, at the surface rather than the route.

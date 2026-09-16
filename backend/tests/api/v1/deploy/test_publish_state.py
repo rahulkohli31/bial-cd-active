@@ -364,14 +364,12 @@ def test_a_failed_restart_reports_the_live_state_it_left_standing(code: str) -> 
     """★ The drift comparison still answers, because a restart copies the live `head_sha` onto
     its own row — so the reading is the full one, not a fallback to "couldn't check"."""
     app = _app()
-    deployment = _deployment(
-        status=DeploymentStatus.FAILED, failure_code=code, head_sha=_LIVE_SHA
-    )
+    deployment = _deployment(status=DeploymentStatus.FAILED, failure_code=code, head_sha=_LIVE_SHA)
     assert compute_publish_state(app, deployment, _LIVE_SHA) is PublishState.LIVE_CURRENT
     assert compute_publish_state(app, deployment, _SAVED_SHA) is PublishState.LIVE_NEWER_WORK
 
 
-def test_a_failed_PUBLISH_still_reports_that_it_did_not_start() -> None:
+def test_a_failed_publish_still_reports_that_it_did_not_start() -> None:
     """★ THE PAIRED NEGATIVE, and the reason the arm keys on the failure CODE. A build that
     never came up IS a production fact: nothing is serving, and reading it as live would put a
     "Live" pill over an application that has never run. Its row carries a `head_sha` too, so the

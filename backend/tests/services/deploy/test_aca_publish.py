@@ -35,7 +35,7 @@ from src.services.deploy.aca_publish import (
 )
 from src.services.deploy.config import DeployConfig
 from src.services.deploy.names import image_reference, published_app_name, revision_suffix
-from src.services.sandbox.aca import AcaError, AcaTransientError
+from src.services.sandbox.aca import LRO_POLLING_INTERVAL_SECONDS, AcaError, AcaTransientError
 from src.services.sandbox.base import (
     KIND_PUBLISHED_APP,
     SANDBOX_NAME_PREFIX,
@@ -78,7 +78,9 @@ def _client(monkeypatch: pytest.MonkeyPatch, container_apps: object = None) -> A
     monkeypatch.setattr(
         publish_module,
         "ContainerAppsAPIClient",
-        lambda credential, subscription_id: SimpleNamespace(
+        # `**kwargs` swallows the constructor's polling interval, which the test below is what
+        # actually pins — a stub that refused it would fail this whole file for one reason.
+        lambda credential, subscription_id, **kwargs: SimpleNamespace(
             container_apps=container_apps, container_apps_revisions=container_apps
         ),
     )
@@ -159,6 +161,25 @@ def _ingress(envelope: aca_models.ContainerApp) -> aca_models.Ingress:
 def _tcp_port(probe: aca_models.ContainerAppProbe) -> int | None:
     assert probe.tcp_socket is not None
     return probe.tcp_socket.port
+
+
+def test_the_publish_client_polls_arm_on_the_same_interval_the_sandbox_does(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both clients have to be set, because the SDK's 30-second default is per-CLIENT and shows
+    at no call site. Publishing is where it costs the most: every step of a deploy waits on an
+    operation ARM may have finished half a minute earlier."""
+    built: dict[str, object] = {}
+
+    def _record(credential: object, subscription_id: str, **kwargs: object) -> SimpleNamespace:
+        built.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(publish_module, "DefaultAzureCredential", lambda: SimpleNamespace())
+    monkeypatch.setattr(publish_module, "ContainerAppsAPIClient", _record)
+    AcaPublishedApps(_config())
+
+    assert built["polling_interval"] == LRO_POLLING_INTERVAL_SECONDS
 
 
 # --- the probe: the trap that fails as a success ------------------------------------
