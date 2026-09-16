@@ -53,6 +53,21 @@ dev = [
     "ruff>=0.16.5",
     "ty>=0.0.77",
 ]
+# The attachment reader's libraries, at the versions `sandbox/Dockerfile.sandbox` installs.
+#
+# THEY ARE HERE SO THE READER'S OWN TESTS CAN RUN. `sandbox/tests` is the whole test suite for
+# the 450-line script that replaced the deleted extractor, and it skipped itself into silence:
+# four module-level `importorskip`s, none of these libraries in this environment, and no lane
+# anywhere that installs them — measured at "1 skipped in 0.06s" while the code it covers shipped.
+#
+# The versions match the image EXACTLY, and a test asserts it: a suite that passes against a
+# different openpyxl than the container runs is a suite that can be green about the wrong thing.
+reader = [
+    "openpyxl==3.1.5",
+    "polars==1.44.1",
+    "python-docx==1.2.0",
+    "python-pptx==1.0.2",
+]
 worker = [
     # NOT pinned to `redis>=7,<8`, deliberately. An earlier plan draft called for that, to dodge
     # redis-py 8's 5s default socket_timeout killing blocking reads (taskiq-redis #127). It is
@@ -72,7 +87,7 @@ worker = [
 # the BUILT IMAGE cannot diverge — the image's sync line names the groups explicitly, and an
 # image missing `--group worker` ships no broker and dies at container start, AFTER the
 # human-gated Azure provisioning is already done.
-default-groups = ["api", "dev", "worker"]
+default-groups = ["api", "dev", "reader", "worker"]
 
 [tool.ruff]
 target-version = "py314"
