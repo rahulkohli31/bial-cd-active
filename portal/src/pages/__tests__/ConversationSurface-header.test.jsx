@@ -173,7 +173,7 @@ describe('regression guard — builds/refreshBuilds survive the dropdown removal
     // The refusal renders in the surface's assertive slot — where every other interrupting
     // refusal lands, so a citizen has one place to look rather than one per control.
     const alert = await within(b.container).findByTestId('urgent-banner')
-    expect(alert.textContent).toMatch(/already building this project/i)
+    expect(alert.textContent).toMatch(/already building this application/i)
     expect(alert.textContent).toMatch(/First build/) // named the holder, not "another build chat"
     // B never started its own build — only A's transition fired.
     expect(h.buildFromPlan).toHaveBeenCalledTimes(1)

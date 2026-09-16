@@ -566,7 +566,7 @@ describe('create and delete', () => {
     fireEvent.change(await screen.findByLabelText(/why are you deleting/i), {
       target: { value: 'no longer needed by ground ops' },
     })
-    fireEvent.click(screen.getByRole('button', { name: /delete project/i }))
+    fireEvent.click(screen.getByRole('button', { name: /delete application/i }))
 
     await waitFor(() => expect(h.deleteProject).toHaveBeenCalled())
     expect(screen.queryByRole('alert')).toBeNull()
@@ -586,7 +586,7 @@ describe('create and delete', () => {
     fireEvent.change(await screen.findByLabelText(/why are you deleting/i), {
       target: { value: 'no longer needed by ground ops' },
     })
-    fireEvent.click(screen.getByRole('button', { name: /delete project/i }))
+    fireEvent.click(screen.getByRole('button', { name: /delete application/i }))
 
     expect(await screen.findByTestId('projects-toast-marker')).toBeTruthy()
     // This channel carries only failures and schedules no dismiss. Nothing here proves a
@@ -726,7 +726,7 @@ describe('create and delete', () => {
     fireEvent.change(await screen.findByLabelText(/why are you deleting/i), {
       target: { value: 'no longer needed by ground ops' },
     })
-    fireEvent.click(screen.getByRole('button', { name: /delete project/i }))
+    fireEvent.click(screen.getByRole('button', { name: /delete application/i }))
 
     // ★ STILL THERE. The request has not answered, so nothing has been deleted yet, so the
     // row is exactly where the citizen left it.
@@ -792,7 +792,7 @@ describe('create and delete', () => {
     fireEvent.change(await screen.findByLabelText(/why are you deleting/i), {
       target: { value: 'no longer needed by ground ops' },
     })
-    fireEvent.click(screen.getByRole('button', { name: /delete project/i }))
+    fireEvent.click(screen.getByRole('button', { name: /delete application/i }))
 
     await waitFor(() => expect(h.listProjects).toHaveBeenCalled())
     expect(screen.queryByRole('alert')).toBeNull()

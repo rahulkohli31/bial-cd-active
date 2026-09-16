@@ -191,7 +191,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
 
     await lastCard(b.container) // wait for the offer to be on screen before reading the refusal
     const warning = await within(b.container).findByTestId('urgent-banner')
-    expect(/already building this project/i.test(warning.textContent)).toBe(true)
+    expect(/already building this application/i.test(warning.textContent)).toBe(true)
     expect(/First build/.test(warning.textContent)).toBe(true) // named the holder, not "some other tab"
     // B never started a build — only A's handoff fired.
     expect(h.buildFromPlan).toHaveBeenCalledTimes(1)
@@ -247,7 +247,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     await buildFrom(b.container, 'me too')
 
     await lastCard(b.container) // wait for the offer to be on screen before reading the refusal
-    expect(/already building this project/i.test((await within(b.container).findByTestId('urgent-banner')).textContent)).toBe(true)
+    expect(/already building this application/i.test((await within(b.container).findByTestId('urgent-banner')).textContent)).toBe(true)
     expect(h.buildFromPlan).toHaveBeenCalledTimes(2) // only A's two starts — B never started
   })
 
@@ -267,7 +267,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     await buildFrom(b.container, 'me too')
 
     await lastCard(b.container) // wait for the offer to be on screen before reading the refusal
-    expect(/already building this project/i.test((await within(b.container).findByTestId('urgent-banner')).textContent)).toBe(true)
+    expect(/already building this application/i.test((await within(b.container).findByTestId('urgent-banner')).textContent)).toBe(true)
     expect(h.buildFromPlan).toHaveBeenCalledTimes(1) // only A's transition — B never started
   })
 
@@ -282,7 +282,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     await flushChannel()
     await buildFrom(b.container, 'wait for me')
     await lastCard(b.container) // wait for the offer to be on screen before reading the refusal
-    expect(/already building this project/i.test((await within(b.container).findByTestId('urgent-banner')).textContent)).toBe(true)
+    expect(/already building this application/i.test((await within(b.container).findByTestId('urgent-banner')).textContent)).toBe(true)
     expect(h.buildFromPlan).toHaveBeenCalledTimes(1)
 
     // A's build ends → its claim retracts once `endGenerating` runs (see "a second build

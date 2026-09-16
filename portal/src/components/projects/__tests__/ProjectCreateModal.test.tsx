@@ -59,7 +59,7 @@ const wordsOf = (n: number = MIN_PROJECT_DESCRIPTION_WORDS): string =>
 const nameInput = () => screen.getByPlaceholderText(/vip movement tracker/i) as HTMLInputElement
 const descriptionInput = () =>
   screen.getByPlaceholderText(/who uses it, and what do they do with it/i) as HTMLTextAreaElement
-const createBtn = () => screen.getByRole('button', { name: /create project/i }) as HTMLButtonElement
+const createBtn = () => screen.getByRole('button', { name: /create app/i }) as HTMLButtonElement
 const cancelBtn = () => screen.getByRole('button', { name: /cancel/i }) as HTMLButtonElement
 const infoBtn = () => screen.getByRole('button', { name: /show an example description/i }) as HTMLButtonElement
 
@@ -337,7 +337,7 @@ describe('ProjectCreateModal — duplicate check before create (#191 slice 4, R3
     expect(h.createProject).not.toHaveBeenCalled()
   })
 
-  it('"Create project anyway" creates the project and reports the resolution', async () => {
+  it('"Create App anyway" creates the application and reports the resolution', async () => {
     h.checkDuplicateProjects.mockResolvedValue(oneMatch)
     h.createProject.mockResolvedValue(makeProject())
     const onCreated = vi.fn()
@@ -346,7 +346,7 @@ describe('ProjectCreateModal — duplicate check before create (#191 slice 4, R3
 
     fireEvent.click(createBtn())
     await screen.findByText('This might already exist')
-    fireEvent.click(screen.getByRole('button', { name: /create project anyway/i }))
+    fireEvent.click(screen.getByRole('button', { name: /create app anyway/i }))
 
     await waitFor(() => expect(h.createProject).toHaveBeenCalled())
     expect(onCreated).toHaveBeenCalled()
@@ -366,7 +366,7 @@ describe('ProjectCreateModal — duplicate check before create (#191 slice 4, R3
 
     expect(h.reportDuplicateCheckResolution).toHaveBeenCalledWith('opened_existing')
     // Creating anyway is still on offer beneath the matches after opening one (R36).
-    expect(screen.getByRole('button', { name: /create project anyway/i })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /create app anyway/i })).toBeTruthy()
   })
 
   it('the close button still closes the whole modal from the duplicate screen', async () => {

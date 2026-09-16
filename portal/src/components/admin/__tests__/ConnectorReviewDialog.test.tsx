@@ -161,7 +161,7 @@ describe('what the dialog says', () => {
     const clock = `${String(asked.getHours()).padStart(2, '0')}:${String(asked.getMinutes()).padStart(2, '0')}`
     expect(
       dialog.getByText(
-        `Asked on 4 Sep at ${clock}. One decision, covering every project they own.`,
+        `Asked on 4 Sep at ${clock}. One decision, covering every application they own.`,
       ),
     ).toBeTruthy()
     // THE PRONOUN DEPARTURE. The board reads `every project SHE owns` and `Give PRIYA access`

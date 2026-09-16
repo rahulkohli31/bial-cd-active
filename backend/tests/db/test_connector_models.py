@@ -519,9 +519,9 @@ def test_the_requester_consent_lines_are_the_ask_dialog_verbatim() -> None:
             ),
         ),
         ConsentLine(
-            lead="Every project you own.",
+            lead="Every application you own.",
             body=(
-                "Including ones you have not made yet. You switch it on per project, "
+                "Including ones you have not made yet. You switch it on per application, "
                 "and pick the days each one reads."
             ),
         ),
@@ -539,13 +539,14 @@ def test_the_approver_consent_lines_are_the_decide_dialog_verbatim() -> None:
             body="and nothing else in Flight Fact Data.",
         ),
         ConsentLine(
-            lead="Every project they own.",
-            body="including ones they have not made yet. They switch it on per project.",
+            lead="Every application they own.",
+            body="including ones they have not made yet. They switch it on per application.",
         ),
         ConsentLine(
             lead="Up to 30 days of history while they build.",
             body=(
-                "each project picks its own range; a published app reads the dates its users pick."
+                "each application picks its own range; "
+                "a published app reads the dates its users pick."
             ),
         ),
     )

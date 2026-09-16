@@ -379,7 +379,7 @@ project_router = APIRouter(prefix="/projects/{project_id}/connectors", tags=["co
 # reaches a row. See that function for why the filter is not decoration.
 _BOARD_PRESET_DAYS: Final = (7, 14, 30)
 
-_PROJECT_NOT_FOUND = "Project not found."
+_PROJECT_NOT_FOUND = "Application not found."
 _NEEDS_APPROVAL = "You do not have access to {name} yet. Ask for it under Integrations."
 
 # `resolve_window` answers `None` for exactly one input — a missing row — so a `None` beside a row

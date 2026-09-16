@@ -1329,7 +1329,7 @@ async def take_project_down(
         current = await db.get(Deployment, row.id, populate_existing=True)
         if current is None:
             _log.info("app_takedown_app_deleted_mid_flight", app_id=str(app_row.id))
-            raise AppApiError(status.HTTP_404_NOT_FOUND, "Project not found.")
+            raise AppApiError(status.HTTP_404_NOT_FOUND, "Application not found.")
         # Lost the race; the other caller's timestamp is what is on record, so report that
         # rather than this call's own unwritten one. Still a 200 — the world is as the owner
         # asked for it to be, and the repeat-click branch above answers 200 for exactly this

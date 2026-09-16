@@ -58,15 +58,15 @@ const CASCADE_ID = 'delete-project-cascade'
  * about the most data. Deleting the project drops that database outright: no export, no
  * snapshot, no undo.
  */
-const IRREVERSIBLE = 'The database and files behind the app are destroyed permanently. This cannot be undone.'
+const IRREVERSIBLE = 'The database and files behind it are destroyed permanently. This cannot be undone.'
 
 function cascadeCopy(chatCount: number | null): string {
-  if (chatCount === null) return `This deletes the project, its app, and all of its chats. ${IRREVERSIBLE}`
-  if (chatCount === 0) return `This deletes the project and its app. ${IRREVERSIBLE}`
+  if (chatCount === null) return `This deletes the application and all of its chats. ${IRREVERSIBLE}`
+  if (chatCount === 0) return `This deletes the application. ${IRREVERSIBLE}`
   if (chatCount >= CONVERSATION_LIST_CAP) {
-    return `This deletes the project, its app, and all ${CONVERSATION_LIST_CAP} or more of its chats. ${IRREVERSIBLE}`
+    return `This deletes the application and all ${CONVERSATION_LIST_CAP} or more of its chats. ${IRREVERSIBLE}`
   }
-  return `This deletes the project, its app, and all ${chatCount} chat${chatCount === 1 ? '' : 's'}. ${IRREVERSIBLE}`
+  return `This deletes the application and all ${chatCount} chat${chatCount === 1 ? '' : 's'}. ${IRREVERSIBLE}`
 }
 
 export interface ProjectDeleteDialogProps {
@@ -214,7 +214,7 @@ export default function ProjectDeleteDialog({
             onClick={() => void confirm()}
             className="flex-1 flex items-center justify-center gap-2 bg-red-600 hover:bg-red-700 text-white font-semibold py-2.5 rounded-xl transition text-sm disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {busy ? <BusyGlyph size={15} /> : null} Delete project
+            {busy ? <BusyGlyph size={15} /> : null} Delete application
           </button>
           <button
             type="button"

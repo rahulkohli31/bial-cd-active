@@ -272,7 +272,7 @@ export default function ConnectorReviewDialog({
             </DialogTitle>
             {/* `they own`, not the board's `she owns` — see the pronoun paragraph above. */}
             <DialogDescription className="mt-[5px] text-xs leading-[1.6] text-neutral">
-              Asked on {asked}. One decision, covering every project they own.
+              Asked on {asked}. One decision, covering every application they own.
             </DialogDescription>
           </div>
           <button

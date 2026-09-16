@@ -45,6 +45,18 @@ const QUOTED = /'([^'\\\n]+)'|"([^"\\\n]+)"|`([^`$\\\n]+)`/g
 const JSX_TEXT = />([^<>{}]+)</g
 
 /**
+ * …and the same text when what PRECEDES it is an expression rather than a tag:
+ * `{busy ? <Spinner/> : null} Create application`. Every button in this tree whose label follows a
+ * conditional glyph is written that way, and it is how "Create project" survived on the primary
+ * button of the very dialog whose title a sweep had just corrected — the two sat 300px apart.
+ *
+ * A closing brace is not rare in code, so this one reads with a stricter eye than the scan above.
+ * Anything carrying a bracket, a colon, a pipe or a keyword is code, and code is read by nobody.
+ */
+const JSX_TEXT_AFTER_EXPRESSION = /\}([^<>{}]+)</g
+const LOOKS_LIKE_CODE = /[();:|&?[\]]|\b(?:const|let|return|case|function|interface|export|import|extends|as)\b/
+
+/**
  * A JSX expression carrying nothing but a space — `{' '}` — which is how a line of copy too long
  * for one source line is joined back together. It splits one sentence into two text nodes, and it
  * hid "Couldn't load more projects." through an entire sweep. Removed before the scan so the
@@ -83,22 +95,50 @@ function sourceFiles(dir: string, ext: string, found: string[] = []): string[] {
 const SENTENCE = /'([^'\\\n]+)'|"([^"\\\n]+)"/g
 
 /**
- * WHAT A LITERAL LOOKS LIKE WHEN IT IS NOT COPY, and this is the whole of the calibration now that
- * the length floor is gone. A route, a storage key, a testid, a class fragment, an identifier and a
- * template hole all carry one of these characters; a sentence a person reads carries none of them.
- * Cheaper than parsing, and it costs a miss rather than a false alarm — a piece of copy that
- * happens to contain a full stop is simply not checked. It subsumes a Tailwind-specific test this
- * used to carry: every class list in this tree contains a hyphen.
+ * …and the backticked ones, which is where the longest copy in this product lives: anything built
+ * around a count or a name is a template literal, and the delete dialog's four cascade sentences —
+ * the most consequential prose here — are all of them. Read with the holes blanked, because the
+ * sentence a person sees is the prose around them.
  */
-const NOT_A_SENTENCE = /[/.\-_${}:]/
+const TEMPLATE = /`([^`\\]*)`/g
+const HOLE = /\$\{[^{}]*\}/g
+
+/** Tailwind, which is the one thing in a component file that looks like a sentence and is not. */
+const CLASSES =
+  /\b(?:flex|grid|text-|bg-|border|rounded|px-|py-|mt-|mb-|gap-|w-|h-|min-|max-|hover:|focus)/
+
+/**
+ * WHETHER A LITERAL IS SOMETHING A PERSON READS, decided on SHAPE rather than on punctuation.
+ *
+ * The punctuation blacklist this replaces rejected any literal containing a full stop — which is
+ * most copy in the product — so the guard was quietly reading a fraction of what it claimed to,
+ * and a walkthrough found sentences on screen that it had passed. A blacklist that grows to cover
+ * keys eventually covers prose too; shape does not drift that way:
+ *
+ *   - a route is never read aloud, and it announces itself with a leading slash;
+ *   - a class list is never read, and Tailwind names itself;
+ *   - ONE TOKEN WITH NO SPACE is an identifier, a key or a testid — `bial:nav-pinned`,
+ *     `app-menu-row`, `projectId` — UNLESS it is a bare word, because a bare word is how a
+ *     pluralising count is written: `count === 1 ? 'project' : 'projects'`;
+ *   - everything else is prose, and gets read.
+ */
+function isCopy(text: string): boolean {
+  if (text.startsWith('/')) return false
+  if (CLASSES.test(text)) return false
+  if (!/\s/.test(text)) return /^[A-Za-z]+$/.test(text)
+  return true
+}
 
 export function sentencesIn(source: string): string[] {
   const clean = stripComments(source)
   const found: string[] = []
   for (const match of clean.matchAll(SENTENCE)) {
     const text = match[1] ?? match[2] ?? ''
-    if (NOT_A_SENTENCE.test(text)) continue
-    found.push(text)
+    if (isCopy(text)) found.push(text)
+  }
+  for (const [, literal] of clean.matchAll(TEMPLATE)) {
+    const text = literal.replace(HOLE, ' ').trim()
+    if (text.length > 0 && isCopy(text)) found.push(text)
   }
   return found
 }
@@ -120,6 +160,11 @@ export function copyIn(source: string): string[] {
     // semicolons, no assignments and no `case` labels; that is enough to tell the two apart
     // without parsing, and erring here costs a miss rather than a false alarm.
     if (/[;=]|\bconst\b|\breturn\b|\bcase\b/.test(text)) continue
+    if (text.length > 0 && /[a-z]{3}/i.test(text)) found.push(text)
+  }
+  for (const [, value] of clean.matchAll(JSX_TEXT_AFTER_EXPRESSION)) {
+    const text = value.trim()
+    if (LOOKS_LIKE_CODE.test(text)) continue
     if (text.length > 0 && /[a-z]{3}/i.test(text)) found.push(text)
   }
   return found
@@ -181,13 +226,44 @@ describe('the noun a person reads is "application"', () => {
     ])
   })
 
+  it('★ reads a sentence built around a count, which is where the gravest copy here lives', () => {
+    // FOUND BY A WALKTHROUGH, NOT BY THIS GUARD. Anything phrased around a number is a template
+    // literal, and the delete dialog's cascade — the sentence a person reads immediately before an
+    // irreversible one — is four of them. The holes are blanked; the prose around them is the copy.
+    const fixture = 'const s = `This deletes the project and all ${n} chat${n === 1 ? "" : "s"}.`'
+    expect(sentencesIn(fixture).filter((copy) => RETIRED_NOUN.test(copy))).toEqual([
+      'This deletes the project and all   chat .',
+    ])
+  })
+
+  it('★ reads a button label that follows an expression rather than a tag', () => {
+    // The shape no `>`-anchored scan can reach. It is how every button with a conditional glyph is
+    // written, and it kept "Create project" on the primary button of a dialog titled "Create App".
+    const fixture = `<button>{busy ? <Glyph/> : null} Create project</button>`
+    expect(copyIn(fixture).filter((copy) => RETIRED_NOUN.test(copy))).toEqual(['Create project'])
+  })
+
+  it('★ a sentence is still read when it ends in a full stop', () => {
+    // THE REGRESSION THIS GUARD SHIPPED ONCE. Calibrating on punctuation rather than shape meant
+    // any literal containing a `.` was skipped — which is most copy — so the scan stayed green
+    // while reading a fraction of what it claimed to. A blacklist written to exclude keys
+    // eventually excludes prose; the test is what the literal LOOKS like, not what it contains.
+    const fixture = `setError('Could not load this project.')`
+    expect(sentencesIn(fixture).filter((copy) => RETIRED_NOUN.test(copy))).toEqual([
+      'Could not load this project.',
+    ])
+  })
+
   it('leaves keys, classes and routes alone', () => {
     // The calibration that lets this guard live in a component tree: every one of these contains
     // the retired noun or looks like prose, and none of them is read by anybody.
     const fixture = `
       const KEY = 'bial.projects.view'
       const cls = 'flex items-center gap-2 text-sm text-neutral'
-      const card = 'rounded-xl border border-bial-border px-3 py-2'
+      // A hyphen is a word boundary, so a class TOKEN carrying the noun reads as the noun —
+      // which is the whole reason Tailwind is named here rather than left to the shape test.
+      const card = 'rounded-xl border border-project-accent px-3 py-2'
+      const handle = 'project-home'
       navigate('/projects')
     `
     expect(sentencesIn(fixture).filter((copy) => RETIRED_NOUN.test(copy))).toEqual([])

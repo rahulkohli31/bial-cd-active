@@ -1843,7 +1843,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       if (!blocker) return null
       const other = builds.find((b) => b.id === blocker.conversationId)
       const which = other?.title ? `“${other.title}”` : 'another build chat'
-      return `${which} is already building this project. Only one build runs at a time — wait for it to finish, or stop it first.`
+      return `${which} is already building this application. Only one build runs at a time — wait for it to finish, or stop it first.`
     },
     [projectId, builds],
   )
