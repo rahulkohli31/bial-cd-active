@@ -1,25 +1,21 @@
 """The Plan chat's one way to read an attached file.
 
-WHY THIS IS ITS OWN TOOLSET RATHER THAN A WIDER `run_command`. Plan already executes inside the
-container, but only through `check_the_guest_list`: eight read-only binaries, exec-style argv, no
-shell, no runtime, no package manager. `python3` is deliberately absent, so Plan cannot invoke the
-shipped reader the way Build does.
+Registered on the Plan arm alone, by `toolsets_for_kind` — the one place permitted to read a
+chat kind. Build does not get it and the asymmetry is deliberate: Build holds an unrestricted
+`run_command` and can read, EDIT and re-run the reader as it would any other file, so a
+fixed-shape tool beside that would be a second, weaker way to do what it already does better.
 
-The obvious fix — add `python3` to the guest list, or let a path outside the app root be named —
-is the one that must not be taken. That surface is SHARED with the reviewer agent, which runs on
-the control plane over untrusted project contents, and `check_the_guest_list(argv)` takes argv and
-nothing else precisely so no body below it can ask which agent is calling. Widening it for
-attachments widens it there too, and the signature is the proof that it cannot be done selectively.
+WHY THIS EXISTS
 
-So the capability goes where the architecture already sanctions a per-kind difference:
-`toolsets_for_kind` is the one place permitted to read `ChatKind`, and this toolset is registered
-on the Plan arm alone — the same way `_PLAN_OPTIONS_TOOLSET` already is. The reviewer never
-receives it, by construction rather than by a check.
+Plan already executes inside the container, but only through `check_the_guest_list`: eight
+read-only binaries, exec-style argv, no shell, no runtime, no package manager. `python3` is
+deliberately absent, so Plan cannot invoke the shipped reader the way Build does.
 
-BUILD DOES NOT GET THIS, and that asymmetry is R15 rather than an oversight: Build holds an
-unrestricted `run_command` and can read, EDIT and re-run the reader as it would any other file.
-Handing it a fixed-shape tool as well would give it a second, weaker way to do what it can already
-do better, and would make the reader look opaque at exactly the moment it stops being so.
+The obvious fix — add `python3` to the guest list, or allow a path outside the app root — is
+the one that must not be taken. That surface is SHARED with the reviewer agent, which runs on
+the control plane over untrusted project contents, and `check_the_guest_list(argv)` takes argv
+and nothing else precisely so no body below it can ask which agent is calling. Widening it for
+attachments widens it there too, and the signature is the proof it cannot be done selectively.
 """
 
 from __future__ import annotations
@@ -46,7 +42,7 @@ from src.services.orchestrator.deps import SandboxSession
 
 logger = structlog.get_logger()
 
-# Where the canonical reader is baked. Fixed and known, never discovered: R11a's whole point is
+# Where the canonical reader is baked. Fixed and known, never discovered, because the point is
 # that an agent is TOLD where this is, because an agent that has to find a reader writes one
 # instead — the single failure this design exists to prevent.
 READER_PATH = "/usr/local/lib/bial/read_attachment.py"

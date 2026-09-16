@@ -78,7 +78,7 @@ def test_an_office_file_must_carry_its_own_opc_part() -> None:
 
 
 def test_a_password_protected_office_file_is_refused_at_the_door() -> None:
-    """★ R6. An encrypted Office file is not a damaged ZIP — it is an OLE2 compound document
+    """★ AN ENCRYPTED OFFICE FILE IS NOT A DAMAGED ZIP — it is an OLE2 compound document
     wrapping the encrypted package, and it announces itself in its first eight bytes. So a locked
     workbook gets the same sentence a locked PDF gets, instead of being accepted, stored, charged,
     and failing inside the sandbox several turns later where nothing can explain it.
