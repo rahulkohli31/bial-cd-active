@@ -388,65 +388,78 @@ class DeployService:
         guarded terminal write for a case that only differs in the colour a client paints
         it."""
         async with self._beating(deployment_id):
+            # THE PROMISE IN THE DOCSTRING, MADE TRUE RATHER THAN INTENDED. The arms below
+            # settle the row by WRITING to it, and a write is exactly what fails when the
+            # database is the thing that has gone — so the success arm sat outside the `except`
+            # that was meant to catch it, and a `_fail` that raised escaped its own handler.
+            # Either way the exception leaves this task, the row stays `running`, and an owner
+            # watches a Deploy button 409 until the stale-claim window expires. The reconciler
+            # settles it against ARM, which is the only thing that knows what really happened;
+            # what this guarantees is that it gets the chance to.
             try:
-                # THE ONE FORK, AND IT IS A PRODUCT RULE RATHER THAN A CONVENIENCE. A restart
-                # recycles the revision already running and must never fall through to the
-                # publish pipeline, which ships the newest SAVED commit — that would make the
-                # button a way past the review the publish gate exists to route work through.
-                if live is not None:
-                    url = await self._restart(
-                        deployment_id=deployment_id,
+                try:
+                    # THE ONE FORK, AND IT IS A PRODUCT RULE RATHER THAN A CONVENIENCE. A restart
+                    # recycles the revision already running and must never fall through to the
+                    # publish pipeline, which ships the newest SAVED commit — that would make the
+                    # button a way past the review the publish gate exists to route work through.
+                    if live is not None:
+                        url = await self._restart(
+                            deployment_id=deployment_id,
+                            app_id=app_id,
+                            project_id=project_id,
+                            user_id=user_id,
+                            live=live,
+                        )
+                    else:
+                        url = await self._deploy(
+                            deployment_id=deployment_id,
+                            app_id=app_id,
+                            project_id=project_id,
+                            user_id=user_id,
+                            expected_commit_sha=expected_commit_sha,
+                            recheck=recheck,
+                        )
+                except _DeployFailedError as failure:
+                    await self._fail(
+                        deployment_id,
                         app_id=app_id,
-                        project_id=project_id,
                         user_id=user_id,
-                        live=live,
+                        conversation_id=conversation_id,
+                        code=failure.code,
+                        detail=failure.detail,
+                        citizen_message=failure.citizen_message,
+                        model_detail=failure.model_detail,
+                    )
+                except asyncio.CancelledError:
+                    # Shutdown. Leave the row alone — the reconciler resolves it against ARM,
+                    # which is the only source that knows whether the app actually came up.
+                    raise
+                except Exception as exc:
+                    _log.exception("deploy_pipeline_crashed", deployment_id=str(deployment_id))
+                    await self._fail(
+                        deployment_id,
+                        app_id=app_id,
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                        code=FAIL_INTERNAL,
+                        detail=type(exc).__name__,
+                        citizen_message=(
+                            "Something went wrong on the platform while deploying your app. "
+                            "Nothing was changed — please try again."
+                        ),
                     )
                 else:
-                    url = await self._deploy(
-                        deployment_id=deployment_id,
+                    await self._succeed(
+                        deployment_id,
                         app_id=app_id,
-                        project_id=project_id,
                         user_id=user_id,
-                        expected_commit_sha=expected_commit_sha,
-                        recheck=recheck,
+                        conversation_id=conversation_id,
+                        url=url,
                     )
-            except _DeployFailedError as failure:
-                await self._fail(
-                    deployment_id,
-                    app_id=app_id,
-                    user_id=user_id,
-                    conversation_id=conversation_id,
-                    code=failure.code,
-                    detail=failure.detail,
-                    citizen_message=failure.citizen_message,
-                    model_detail=failure.model_detail,
-                )
             except asyncio.CancelledError:
-                # Shutdown. Leave the row alone — the reconciler resolves it against ARM,
-                # which is the only source that knows whether the app actually came up.
                 raise
-            except Exception as exc:
-                _log.exception("deploy_pipeline_crashed", deployment_id=str(deployment_id))
-                await self._fail(
-                    deployment_id,
-                    app_id=app_id,
-                    user_id=user_id,
-                    conversation_id=conversation_id,
-                    code=FAIL_INTERNAL,
-                    detail=type(exc).__name__,
-                    citizen_message=(
-                        "Something went wrong on the platform while deploying your app. "
-                        "Nothing was changed — please try again."
-                    ),
-                )
-            else:
-                await self._succeed(
-                    deployment_id,
-                    app_id=app_id,
-                    user_id=user_id,
-                    conversation_id=conversation_id,
-                    url=url,
-                )
+            except Exception:
+                _log.exception("deploy_settle_crashed", deployment_id=str(deployment_id))
 
     async def _deploy(
         self,
