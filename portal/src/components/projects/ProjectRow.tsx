@@ -43,6 +43,7 @@ import AppRowMenu from './AppRowMenu'
 export interface ProjectRowProps {
   project: Project
   onOpen: () => void
+  onSettings: () => void
   onDelete: () => void
 }
 
@@ -135,7 +136,7 @@ function ClampedName({ name, onOpen }: { name: string; onOpen: () => void }): Re
   )
 }
 
-export default function ProjectRow({ project, onOpen, onDelete }: ProjectRowProps): React.JSX.Element {
+export default function ProjectRow({ project, onOpen, onSettings, onDelete }: ProjectRowProps): React.JSX.Element {
   const status = statusFor(project)
 
   return (
@@ -165,7 +166,7 @@ export default function ProjectRow({ project, onOpen, onDelete }: ProjectRowProp
 
       {/* SIBLING of the name button, not a descendant — z-10 lifts it above the stretched
           ::after so it is clickable rather than covered. */}
-      <AppRowMenu appName={project.name} onOpen={onOpen} onDelete={onDelete} where="row" />
+      <AppRowMenu appName={project.name} onOpen={onOpen} onSettings={onSettings} onDelete={onDelete} where="row" />
     </div>
   )
 }

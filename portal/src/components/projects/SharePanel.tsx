@@ -29,8 +29,12 @@ import {
 const MIN_QUERY_CHARS = 3
 const DEBOUNCE_MS = 300
 
-export interface SharePanelProps {
+export interface SharePanelBodyProps {
   projectId: string
+}
+
+export interface SharePanelProps extends SharePanelBodyProps {
+  /** Named in the dialog's own title. The body never spells the application's name. */
   projectName: string
   onClose: () => void
 }
@@ -39,7 +43,20 @@ function errorMessage(err: unknown, fallback: string): string {
   return err instanceof Error ? err.message : fallback
 }
 
-export default function SharePanel({ projectId, projectName, onClose }: SharePanelProps): React.JSX.Element {
+/**
+ * EVERYTHING SHARING DOES, with no frame around it — the consent sentence, the colleague search,
+ * and the list of people who already have access, with their grants revocable in place.
+ *
+ * IT IS A BODY RATHER THAN A DIALOG because it has two homes now: the workspace opens it as a
+ * dialog of its own, and an application's settings mount it as a tab. One body means an owner
+ * cannot be shown two different grant lists, or the consent sentence in one place and not the
+ * other.
+ *
+ * THE CONSENT SENTENCE TRAVELS WITH THE BODY, deliberately. It is binding in substance — it is
+ * what a citizen is told before they hand a colleague the ability to write into an application's
+ * real data — so it cannot be something a frame remembers to add.
+ */
+export function SharePanelBody({ projectId }: SharePanelBodyProps): React.JSX.Element {
   const [shares, setShares] = useState<ProjectShare[]>([])
   const [sharesLoading, setSharesLoading] = useState(true)
   const [sharesError, setSharesError] = useState<string | null>(null)
@@ -149,39 +166,15 @@ export default function SharePanel({ projectId, projectName, onClose }: SharePan
   }
 
   return (
-    <Dialog
-      open
-      onOpenChange={(next) => {
-        if (!next) onClose()
-      }}
-    >
-      <DialogContent
-        hideClose
-        overlayClassName="bg-slate-900/15 backdrop-blur-[3px] [-webkit-backdrop-filter:blur(3px)]"
-        className="font-manrope bg-white rounded-2xl shadow-2xl w-full max-w-md p-6 gap-0 border-0"
-      >
-        <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <DialogTitle className="text-base font-bold text-tertiary truncate">
-              Share &ldquo;{projectName}&rdquo;
-            </DialogTitle>
-            {/* R6 + R7, said once, plainly, before anyone is added. */}
-            <p className="text-xs text-neutral mt-1 leading-relaxed">
-              Anyone you add can open and use this app. Anything they enter is saved into the
-              project&rsquo;s real data.
-            </p>
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close"
-            className="flex-shrink-0 p-1.5 text-neutral hover:text-tertiary rounded-lg hover:bg-bial-bg transition"
-          >
-            <X size={18} />
-          </button>
-        </div>
+    <>
+      {/* Said once, plainly, before anyone is added — and binding in substance, so it sits with
+          the body rather than with either frame. */}
+      <p className="text-xs text-neutral leading-relaxed">
+        Anyone you add can open and use this app. Anything they enter is saved into the
+        project&rsquo;s real data.
+      </p>
 
-        <label className="block mt-5">
+      <label className="block mt-5">
           <span className="text-xs font-semibold text-tertiary">Add a colleague</span>
           <input
             autoFocus
@@ -284,6 +277,46 @@ export default function SharePanel({ projectId, projectName, onClose }: SharePan
               })}
             </ul>
           )}
+        </div>
+    </>
+  )
+}
+
+/**
+ * The workspace's own door to sharing: the same body, in a dialog of its own.
+ *
+ * The TITLE names the application and the close control lives here, because both belong to the
+ * frame. Mounted conditionally like every dialog in this portal, which is why `ui/dialog.tsx`
+ * carries a focus backstop — Radix's own restore never runs for a subtree React deletes outright.
+ */
+export default function SharePanel({ projectId, projectName, onClose }: SharePanelProps): React.JSX.Element {
+  return (
+    <Dialog
+      open
+      onOpenChange={(next) => {
+        if (!next) onClose()
+      }}
+    >
+      <DialogContent
+        hideClose
+        overlayClassName="bg-slate-900/15 backdrop-blur-[3px] [-webkit-backdrop-filter:blur(3px)]"
+        className="font-manrope bg-white rounded-2xl shadow-2xl w-full max-w-md p-6 gap-0 border-0"
+      >
+        <div className="flex items-start justify-between gap-3">
+          <DialogTitle className="min-w-0 text-base font-bold text-tertiary truncate">
+            Share &ldquo;{projectName}&rdquo;
+          </DialogTitle>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="flex-shrink-0 p-1.5 text-neutral hover:text-tertiary rounded-lg hover:bg-bial-bg transition"
+          >
+            <X size={18} />
+          </button>
+        </div>
+        <div className="mt-1">
+          <SharePanelBody projectId={projectId} />
         </div>
       </DialogContent>
     </Dialog>

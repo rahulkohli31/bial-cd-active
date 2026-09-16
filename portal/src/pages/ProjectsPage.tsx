@@ -46,6 +46,7 @@ import ProjectRow from '../components/projects/ProjectRow'
 import SharedProjectCard from '../components/projects/SharedProjectCard'
 import ProjectCreateModal from '../components/projects/ProjectCreateModal'
 import ProjectDeleteDialog from '../components/projects/ProjectDeleteDialog'
+import AppSettingsDialog from '../components/projects/AppSettingsDialog'
 import { useKeysetList } from '../hooks/useKeysetList'
 import { Input } from '../components/ui/input'
 import { Skeleton } from '../components/ui/skeleton'
@@ -172,6 +173,10 @@ export default function ProjectsPage(): React.JSX.Element {
   const navigate = useNavigate()
   const [showCreate, setShowCreate] = useState(false)
   const [deleting, setDeleting] = useState<Project | null>(null)
+  // THE SETTINGS DIALOG IS AN OVERLAY OVER THIS LIST, not a route. Opening it changes no
+  // address, so a citizen who came from a search and a page is still on that search and that
+  // page when they close it.
+  const [settingsFor, setSettingsFor] = useState<Project | null>(null)
   const [toast, setToast] = useState<string | null>(null)
 
   const [view, setView] = useState<View>(() => readStored(VIEW_KEY, ['list', 'grid'] as const, 'list'))
@@ -869,6 +874,7 @@ export default function ProjectsPage(): React.JSX.Element {
                     key={project.id}
                     project={project}
                     onOpen={() => openProject(project.id)}
+                    onSettings={() => setSettingsFor(project)}
                     onDelete={() => setDeleting(project)}
                   />
                 ))}
@@ -880,6 +886,7 @@ export default function ProjectsPage(): React.JSX.Element {
                     key={project.id}
                     project={project}
                     onOpen={() => openProject(project.id)}
+                    onSettings={() => setSettingsFor(project)}
                     onDelete={() => setDeleting(project)}
                   />
                 ))}
@@ -1017,6 +1024,27 @@ export default function ProjectsPage(): React.JSX.Element {
       </main>
 
       {showCreate && <ProjectCreateModal onClose={() => setShowCreate(false)} onCreated={handleCreated} />}
+      {settingsFor !== null && (
+        <AppSettingsDialog
+          project={settingsFor}
+          onProjectUpdate={(updated) => {
+            // The list is the source of truth for what a row says, so a rename saved in the
+            // dialog has to reach it — and the dialog itself has to keep showing the stored
+            // values rather than the ones it opened with.
+            setSettingsFor(updated)
+            setReloadNonce((n) => n + 1)
+          }}
+          onClose={() => setSettingsFor(null)}
+          // DELETE HANDS OFF TO THE SAME CONFIRMATION THE MENU OPENS, and the settings dialog
+          // closes on the way: two dialogs stacked over one another is two focus traps, and the
+          // one underneath is not the one being answered.
+          onDelete={() => {
+            setDeleting(settingsFor)
+            setSettingsFor(null)
+          }}
+        />
+      )}
+
       {deleting !== null && (
         <ProjectDeleteDialog
           project={deleting}

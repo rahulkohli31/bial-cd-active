@@ -88,10 +88,11 @@ export function AppStatusBadge({
 export interface ProjectCardProps {
   project: Project
   onOpen: () => void
+  onSettings: () => void
   onDelete: () => void
 }
 
-export default function ProjectCard({ project, onOpen, onDelete }: ProjectCardProps): React.JSX.Element {
+export default function ProjectCard({ project, onOpen, onSettings, onDelete }: ProjectCardProps): React.JSX.Element {
   const hasDescription = typeof project.description === 'string' && project.description.trim().length > 0
   // The card is a plain container (no role="button"). The primary open affordance is a
   // real <button> on the title whose stretched ::after covers the whole card, so the card stays
@@ -114,6 +115,7 @@ export default function ProjectCard({ project, onOpen, onDelete }: ProjectCardPr
         <AppRowMenu
           appName={project.name || 'Untitled project'}
           onOpen={onOpen}
+          onSettings={onSettings}
           onDelete={onDelete}
           where="tile"
         />

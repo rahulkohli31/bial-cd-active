@@ -39,7 +39,7 @@ describe('ProjectCard', () => {
   it('opens via the title control, without also firing delete', () => {
     const onOpen = vi.fn()
     const onDelete = vi.fn()
-    render(<ProjectCard project={mkProject('Roster')} onOpen={onOpen} onDelete={onDelete} />)
+    render(<ProjectCard project={mkProject('Roster')} onOpen={onOpen} onSettings={vi.fn()} onDelete={onDelete} />)
 
     fireEvent.click(screen.getByRole('button', { name: 'Roster' }))
     expect(onOpen).toHaveBeenCalledTimes(1)
@@ -49,7 +49,7 @@ describe('ProjectCard', () => {
   it('deletes from the menu, without also triggering open', async () => {
     const onOpen = vi.fn()
     const onDelete = vi.fn()
-    render(<ProjectCard project={mkProject('Roster')} onOpen={onOpen} onDelete={onDelete} />)
+    render(<ProjectCard project={mkProject('Roster')} onOpen={onOpen} onSettings={vi.fn()} onDelete={onDelete} />)
 
     fireEvent.pointerDown(screen.getByTestId('app-menu-tile'))
     fireEvent.click(await screen.findByRole('menuitem', { name: 'Delete' }))
@@ -60,13 +60,13 @@ describe('ProjectCard', () => {
 
   it('opening the menu does not trigger the tile\'s open action', () => {
     const onOpen = vi.fn()
-    render(<ProjectCard project={mkProject('Roster')} onOpen={onOpen} onDelete={vi.fn()} />)
+    render(<ProjectCard project={mkProject('Roster')} onOpen={onOpen} onSettings={vi.fn()} onDelete={vi.fn()} />)
     fireEvent.pointerDown(screen.getByTestId('app-menu-tile'))
     expect(onOpen).not.toHaveBeenCalled()
   })
 
   it('exposes open and the menu as two separate button tab stops', () => {
-    render(<ProjectCard project={mkProject('Roster')} onOpen={vi.fn()} onDelete={vi.fn()} />)
+    render(<ProjectCard project={mkProject('Roster')} onOpen={vi.fn()} onSettings={vi.fn()} onDelete={vi.fn()} />)
     const open = screen.getByRole('button', { name: 'Roster' })
     const menu = screen.getByTestId('app-menu-tile')
     // Both are real, natively keyboard-activatable <button>s (Enter/Space for free) — and they
@@ -79,7 +79,7 @@ describe('ProjectCard', () => {
 
   it('does not nest the menu inside any interactive element', () => {
     const { container } = render(
-      <ProjectCard project={mkProject('Roster')} onOpen={vi.fn()} onDelete={vi.fn()} />,
+      <ProjectCard project={mkProject('Roster')} onOpen={vi.fn()} onSettings={vi.fn()} onDelete={vi.fn()} />,
     )
     const menu = screen.getByTestId('app-menu-tile')
     // Nothing in the card claims the button role beyond the two real <button>s themselves.
@@ -90,7 +90,7 @@ describe('ProjectCard', () => {
   })
 
   it('offers the menu without a hover — a hover-only control has no keyboard or touch route', () => {
-    render(<ProjectCard project={mkProject('Roster')} onOpen={vi.fn()} onDelete={vi.fn()} />)
+    render(<ProjectCard project={mkProject('Roster')} onOpen={vi.fn()} onSettings={vi.fn()} onDelete={vi.fn()} />)
     expect(screen.getByTestId('app-menu-tile').className).not.toMatch(/opacity-0/)
   })
 
@@ -103,6 +103,7 @@ describe('ProjectCard', () => {
       <ProjectCard
         project={mkProject('A Very Long Project Name That Has To Clip In This Tile')}
         onOpen={vi.fn()}
+        onSettings={vi.fn()}
         onDelete={vi.fn()}
       />,
     )
@@ -114,7 +115,7 @@ describe('ProjectCard', () => {
 
   it('opens nothing extra when the name is NOT clipped', () => {
     stubClip(false)
-    render(<ProjectCard project={mkProject('Visitor Log')} onOpen={vi.fn()} onDelete={vi.fn()} />)
+    render(<ProjectCard project={mkProject('Visitor Log')} onOpen={vi.fn()} onSettings={vi.fn()} onDelete={vi.fn()} />)
 
     fireEvent.focus(screen.getByRole('button', { name: 'Visitor Log' }))
 
@@ -134,7 +135,7 @@ describe('ProjectCard', () => {
     'host each visitor came to see, with a weekly export for the security desk.'
 
   it('★ keeps the WHOLE description in the accessible tree, clipped only visually', () => {
-    render(<ProjectCard project={mkProject('Roster', { description: LONG })} onOpen={vi.fn()} onDelete={vi.fn()} />)
+    render(<ProjectCard project={mkProject('Roster', { description: LONG })} onOpen={vi.fn()} onSettings={vi.fn()} onDelete={vi.fn()} />)
 
     // Found by its complete text — a JavaScript truncation would fail this outright, and an
     // ellipsis appended in JS would fail it too.
@@ -149,7 +150,7 @@ describe('ProjectCard', () => {
     // crashed, so the second half proves the tile is alive and the affordance it DOES have works.
     stubClip(true)
     const onOpen = vi.fn()
-    render(<ProjectCard project={mkProject('Roster', { description: LONG })} onOpen={onOpen} onDelete={vi.fn()} />)
+    render(<ProjectCard project={mkProject('Roster', { description: LONG })} onOpen={onOpen} onSettings={vi.fn()} onDelete={vi.fn()} />)
 
     const description = screen.getByText(LONG)
     expect(description.className).not.toMatch(/cursor-pointer/)
@@ -163,7 +164,7 @@ describe('ProjectCard', () => {
   })
 
   it('falls back to "Untitled project" for an empty name, in the menu\'s label too', () => {
-    render(<ProjectCard project={mkProject('')} onOpen={vi.fn()} onDelete={vi.fn()} />)
+    render(<ProjectCard project={mkProject('')} onOpen={vi.fn()} onSettings={vi.fn()} onDelete={vi.fn()} />)
     expect(screen.getByRole('button', { name: 'Untitled project' })).toBeTruthy()
     // A page of tiles must not be a page of controls all called "More actions for".
     expect(screen.getByRole('button', { name: 'More actions for Untitled project' })).toBeTruthy()
@@ -178,6 +179,7 @@ describe('ProjectCard', () => {
           updatedAt: '2026-09-15T09:00:00Z',
         }}
         onOpen={vi.fn()}
+        onSettings={vi.fn()}
         onDelete={vi.fn()}
       />,
     )

@@ -1,4 +1,4 @@
-import { MoreHorizontal, ExternalLink, Trash2 } from 'lucide-react'
+import { MoreHorizontal, ExternalLink, Settings, Trash2 } from 'lucide-react'
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -18,21 +18,22 @@ import {
  * ALWAYS VISIBLE, NEVER HOVER-ONLY. The tile's delete control used to appear on hover, which is
  * an affordance a keyboard has no route to and a touch screen never triggers at all.
  *
- * WHAT IS NOT HERE YET. Restart and Take down arrive with the endpoints they call, and Settings
- * arrives with the dialog it opens; a menu item that does nothing is a defect rather than a
- * placeholder, which is why each lands with its own unit rather than being stubbed now.
+ * WHAT IS NOT HERE YET. Restart and Take down arrive with the endpoints they call, and Share
+ * with the door that reaches it from here; a menu item that does nothing is a defect rather than
+ * a placeholder, which is why each lands with its own unit rather than being stubbed now.
  */
 
 export interface AppRowMenuProps {
   /** Named in the trigger's accessible label, so a page of menus is not a page of "More". */
   appName: string
   onOpen: () => void
+  onSettings: () => void
   onDelete: () => void
   /** Distinguishes the row's menu from the tile's in the DOM — one testid each. */
   where: 'row' | 'tile'
 }
 
-export default function AppRowMenu({ appName, onOpen, onDelete, where }: AppRowMenuProps) {
+export default function AppRowMenu({ appName, onOpen, onSettings, onDelete, where }: AppRowMenuProps) {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -55,6 +56,13 @@ export default function AppRowMenu({ appName, onOpen, onDelete, where }: AppRowM
         >
           <ExternalLink size={15} />
           Open
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          onSelect={onSettings}
+          className="gap-2 rounded-sm px-2 py-1.5 text-sm text-primary-900 focus:bg-surface-muted"
+        >
+          <Settings size={15} />
+          Settings
         </DropdownMenuItem>
         {/* A hairline, not the vendored `DropdownMenuSeparator`: the primitive was trimmed to
             the four parts this portal uses, and re-vendoring a fifth for one rule is a wider

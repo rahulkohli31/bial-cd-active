@@ -59,7 +59,7 @@ describe('ProjectRow — the description', () => {
     // obvious remedy — and this goes red on the first assertion, because the truncation lands
     // in the DOM and a screen reader loses exactly what a sighted reader loses.
     stubClip(true)
-    render(<ProjectRow project={project({ description: LONG })} onOpen={vi.fn()} onDelete={vi.fn()} />)
+    render(<ProjectRow project={project({ description: LONG })} onOpen={vi.fn()} onSettings={vi.fn()} onDelete={vi.fn()} />)
 
     const description = screen.getByText(LONG)
     expect(description.textContent).toBe(LONG)
@@ -73,7 +73,7 @@ describe('ProjectRow — the description', () => {
     // them: the row is alive and the affordance it does have works.
     stubClip(true)
     const onOpen = vi.fn()
-    render(<ProjectRow project={project({ description: LONG })} onOpen={onOpen} onDelete={vi.fn()} />)
+    render(<ProjectRow project={project({ description: LONG })} onOpen={onOpen} onSettings={vi.fn()} onDelete={vi.fn()} />)
 
     const description = screen.getByText(LONG)
     expect(description.className).not.toMatch(/cursor-pointer/)
@@ -91,7 +91,7 @@ describe('ProjectRow — the description', () => {
     // stretched ::after, so it wires `onOpen` back explicitly rather than relying on an
     // overlay jsdom cannot see.
     const onOpen = vi.fn()
-    render(<ProjectRow project={project({ description: LONG })} onOpen={onOpen} onDelete={vi.fn()} />)
+    render(<ProjectRow project={project({ description: LONG })} onOpen={onOpen} onSettings={vi.fn()} onDelete={vi.fn()} />)
 
     fireEvent.click(screen.getByText(LONG))
 
@@ -108,6 +108,7 @@ describe('ProjectRow — the name keeps its tooltip', () => {
       <ProjectRow
         project={project({ name: 'A Very Long Project Name That Has To Clip' })}
         onOpen={vi.fn()}
+        onSettings={vi.fn()}
         onDelete={vi.fn()}
       />,
     )
@@ -120,7 +121,7 @@ describe('ProjectRow — the name keeps its tooltip', () => {
 
   it('opens nothing on a name that already fits', () => {
     stubClip(false)
-    render(<ProjectRow project={project()} onOpen={vi.fn()} onDelete={vi.fn()} />)
+    render(<ProjectRow project={project()} onOpen={vi.fn()} onSettings={vi.fn()} onDelete={vi.fn()} />)
 
     fireEvent.focus(screen.getByRole('button', { name: 'Visitor Log' }))
 
@@ -139,12 +140,12 @@ describe('ProjectRow — the ref never remounts across a clipped transition', ()
     // again.
     stubClip(true)
     const { rerender } = render(
-      <ProjectRow project={project({ name: 'Clipped today' })} onOpen={vi.fn()} onDelete={vi.fn()} />,
+      <ProjectRow project={project({ name: 'Clipped today' })} onOpen={vi.fn()} onSettings={vi.fn()} onDelete={vi.fn()} />,
     )
     const before = screen.getByRole('button', { name: 'Clipped today' })
 
     stubClip(false)
-    rerender(<ProjectRow project={project({ name: 'Fits now' })} onOpen={vi.fn()} onDelete={vi.fn()} />)
+    rerender(<ProjectRow project={project({ name: 'Fits now' })} onOpen={vi.fn()} onSettings={vi.fn()} onDelete={vi.fn()} />)
     const after = screen.getByRole('button', { name: 'Fits now' })
 
     expect(after).toBe(before) // same DOM node, not a fresh mount
@@ -158,7 +159,7 @@ describe('ProjectRow — a project with no description', () => {
     // no `onClick` — a dead strip across the newest, emptiest projects, the ones most likely
     // to be clicked into.
     const onOpen = vi.fn()
-    render(<ProjectRow project={project({ description: null })} onOpen={onOpen} onDelete={vi.fn()} />)
+    render(<ProjectRow project={project({ description: null })} onOpen={onOpen} onSettings={vi.fn()} onDelete={vi.fn()} />)
 
     fireEvent.click(screen.getByText('No description yet'))
 
@@ -171,7 +172,7 @@ describe('ProjectRow — no nested interactive elements, still', () => {
     // The tooltip restructuring wraps the name in TooltipProvider/Tooltip/TooltipTrigger —
     // worth re-confirming the invariant survives the extra nesting. A browser would forgive a
     // nested button and jsdom would not notice, so the DOM relationship is what is asserted.
-    render(<ProjectRow project={project()} onOpen={vi.fn()} onDelete={vi.fn()} />)
+    render(<ProjectRow project={project()} onOpen={vi.fn()} onSettings={vi.fn()} onDelete={vi.fn()} />)
 
     const menu = screen.getByTestId('app-menu-row')
     const open = screen.getByRole('button', { name: 'Visitor Log' })
@@ -183,7 +184,7 @@ describe('ProjectRow — no nested interactive elements, still', () => {
   it('reaches Delete through the menu, and not by one click on the row', async () => {
     const onOpen = vi.fn()
     const onDelete = vi.fn()
-    render(<ProjectRow project={project()} onOpen={onOpen} onDelete={onDelete} />)
+    render(<ProjectRow project={project()} onOpen={onOpen} onSettings={vi.fn()} onDelete={onDelete} />)
 
     // There is no bare delete control any more: an irreversible action does not get a
     // one-click route from a list.
@@ -197,7 +198,7 @@ describe('ProjectRow — no nested interactive elements, still', () => {
 
   it('opens the menu by keyboard, without opening the project', async () => {
     const onOpen = vi.fn()
-    render(<ProjectRow project={project()} onOpen={onOpen} onDelete={vi.fn()} />)
+    render(<ProjectRow project={project()} onOpen={onOpen} onSettings={vi.fn()} onDelete={vi.fn()} />)
     const trigger = screen.getByTestId('app-menu-row')
     trigger.focus()
     expect(document.activeElement).toBe(trigger)
@@ -215,6 +216,7 @@ describe('ProjectRow — no nested interactive elements, still', () => {
           updatedAt: '2026-09-14T09:00:00Z',
         }}
         onOpen={vi.fn()}
+        onSettings={vi.fn()}
         onDelete={vi.fn()}
       />,
     )
@@ -230,6 +232,7 @@ describe('ProjectRow — no nested interactive elements, still', () => {
       <ProjectRow
         project={{ ...project(), createdAt: at, updatedAt: at }}
         onOpen={vi.fn()}
+        onSettings={vi.fn()}
         onDelete={vi.fn()}
       />,
     )
