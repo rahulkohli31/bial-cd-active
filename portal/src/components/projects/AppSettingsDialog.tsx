@@ -237,7 +237,11 @@ export default function AppSettingsDialog({
             </TabsContent>
 
             <TabsContent value="production" className="mt-0">
-              <ProductionTab projectId={project.id} onSettled={onProductionSettled} />
+              <ProductionTab
+                projectId={project.id}
+                appName={project.name || 'Untitled application'}
+                onSettled={onProductionSettled}
+              />
             </TabsContent>
           </motion.div>
         </Tabs>

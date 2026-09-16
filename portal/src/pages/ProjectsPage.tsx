@@ -67,6 +67,18 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 export const PROJECT_GONE_NOTICE = 'That application is no longer available.'
 
 /**
+ * WHAT A RESTART SAYS WHEN IT IS ACCEPTED, and it is authored here because the route does not
+ * write one: it answers 202 with a deployment id the moment the work is claimed, and the work
+ * then runs for minutes. The row's busy state ends at that 202, so without this the only signal
+ * an owner got was a control going briefly dim and then nothing at all — for the one action on
+ * this list whose effect they cannot see from here.
+ *
+ * It promises the recycle has STARTED rather than finished, because that is all a 202 knows.
+ */
+const RESTART_ACCEPTED =
+  'Restarting. It keeps serving the version it is already running until the new one is up.'
+
+/**
  * The three summary tiles, and the filter each one applies.
  *
  * EACH TILE COUNTS A SET AND THEN SELECTS IT. `filter` is the value the server's own
@@ -187,7 +199,7 @@ export default function ProjectsPage(): React.JSX.Element {
   >(null)
 
   const runProduction = useCallback(
-    (project: Project, run: (id: string) => Promise<unknown>) => {
+    (project: Project, run: (id: string) => Promise<unknown>, accepted?: string) => {
       setActingIds((ids) => new Set(ids).add(project.id))
       void (async () => {
         try {
@@ -199,7 +211,7 @@ export default function ProjectsPage(): React.JSX.Element {
           const said =
             typeof settled === 'object' && settled !== null && 'message' in settled
               ? String((settled as { message: unknown }).message)
-              : ''
+              : (accepted ?? '')
           if (said !== '') setToast({ text: said, tone: 'confirmation', subject: project.name })
         } catch (caught) {
           // THE SERVER'S STATED REASON. Every refusal on these two routes names something the
@@ -391,7 +403,7 @@ export default function ProjectsPage(): React.JSX.Element {
   const liveControls = (project: Project): AppRowMenuProps['live'] =>
     project.isServing
       ? {
-          onRestart: () => runProduction(project, restartApp),
+          onRestart: () => runProduction(project, restartApp, RESTART_ACCEPTED),
           // ASKED ABOUT, NOT PERFORMED. Restart interrupts the application for a moment; a
           // take-down ends it for everyone at BIAL until somebody publishes again, and the two
           // sat next to each other in one menu at the same single click.

@@ -211,6 +211,30 @@ describe('it leaves on its own terms', () => {
     await settles(false)
   })
 
+  it('★ Escape after an EDGE open returns focus to where the person was, not where they once were', async () => {
+    // THE STALE-TARGET BUG. Escape arms the restore for any open, but only the button and the
+    // shortcut recorded where focus was — so a panel summoned at the edge restored to whatever
+    // the last BUTTON press had stored, pulling the caret out of the composer and putting it on
+    // a control the person had not touched since.
+    renderReveal()
+
+    // A deliberate open and close, purely to leave a recorded target behind.
+    const button = screen.getByTestId('nav-menu-button')
+    act(() => { button.focus() })
+    fireEvent.click(button)
+    act(() => { fireEvent.keyDown(document, { key: 'Escape' }) })
+    await settles(false)
+
+    // Now the person is typing, and reaches the edge with the pointer.
+    const underneath = screen.getByTestId('underneath')
+    act(() => { underneath.focus() })
+    await summonByGesture()
+
+    act(() => { fireEvent.keyDown(document, { key: 'Escape' }) })
+    await settles(false)
+    await waitFor(() => expect(document.activeElement).toBe(underneath))
+  })
+
   it('★ but a panel that was ASKED for does not withdraw when the pointer wanders off', async () => {
     // THE BARGAIN IS THE GESTURE'S, NOT THE BUTTON'S. Resting at the edge is a guess at intent, so
     // it withdraws when the pointer leaves. Pressing the button is not a guess — and because

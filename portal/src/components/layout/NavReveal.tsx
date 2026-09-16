@@ -291,6 +291,11 @@ export default function NavReveal({ hideable, children }: Props) {
         restTimer.current = setTimeout(() => {
           restTimer.current = null
           openedBy.current = 'gesture'
+          // THIS DOOR RECORDS WHERE FOCUS WAS TOO. Escape arms the restore for ANY open, so a
+          // panel summoned at the edge without recording anything left the restore pointing at
+          // whatever the last BUTTON press had stored — and Escape then pulled the caret out of
+          // the composer and put it on a control the person never touched.
+          rememberFocus()
           setState('open')
         }, REST_MS)
         return
@@ -305,7 +310,7 @@ export default function NavReveal({ hideable, children }: Props) {
     }
     document.addEventListener('pointermove', onMove)
     return () => document.removeEventListener('pointermove', onMove)
-  }, [zoneLive, state])
+  }, [zoneLive, state, rememberFocus])
 
   const holdOpen = useCallback(() => {
     if (graceTimer.current) { clearTimeout(graceTimer.current); graceTimer.current = null }

@@ -62,7 +62,7 @@ import ProductionTab from '../ProductionTab'
 import { ApiError } from '../../../utils/apiError'
 
 const mount = (over: Partial<React.ComponentProps<typeof ProductionTab>> = {}) =>
-  render(<ProductionTab projectId="p1" {...over} />)
+  render(<ProductionTab projectId="p1" appName="Ramp Ops" {...over} />)
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -100,20 +100,44 @@ describe('a live application', () => {
     expect(line).toMatch(/publish again/i)
   })
 
-  it.each([
-    ['production-restart', 'restartApp'],
-    ['production-takedown', 'takeAppDown'],
-  ] as const)('runs %s and re-reads through the panel', async (testid, call) => {
+  it('runs production-restart and re-reads through the panel', async () => {
     mount()
-    fireEvent.click(screen.getByTestId(testid))
-    await waitFor(() => expect(h[call]).toHaveBeenCalledWith('p1'))
+    fireEvent.click(screen.getByTestId('production-restart'))
+    await waitFor(() => expect(h.restartApp).toHaveBeenCalledWith('p1'))
     await waitFor(() => expect(h.refresh).toHaveBeenCalled())
+  })
+
+  it('runs production-takedown once confirmed, and re-reads through the panel', async () => {
+    // Restart interrupts the application for a moment; a take-down ends it for everyone until
+    // somebody publishes again. Only one of the two is asked about, and it is this one.
+    mount()
+    fireEvent.click(screen.getByTestId('production-takedown'))
+    fireEvent.click(screen.getByTestId('take-down-confirm'))
+    await waitFor(() => expect(h.takeAppDown).toHaveBeenCalledWith('p1'))
+    await waitFor(() => expect(h.refresh).toHaveBeenCalled())
+  })
+
+  it('★ asks before it ends the application, and names it — the same question the list asks', async () => {
+    // TWO DOORS TO ONE ACT. The row menu on the list asks; this button did the same thing on a
+    // single press. A question that only one door puts is a question people learn to ignore.
+    mount()
+    fireEvent.click(screen.getByTestId('production-takedown'))
+
+    expect(screen.getByText(/Take “Ramp Ops” out of production\?/)).toBeTruthy()
+    expect(h.takeAppDown).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByTestId('take-down-cancel'))
+    await waitFor(() => expect(screen.queryByTestId('take-down-confirm')).toBeNull())
+    expect(h.takeAppDown).not.toHaveBeenCalled()
+    // Liveness: the control is still there to press again.
+    expect(screen.getByTestId('production-takedown')).toBeTruthy()
   })
 
   it('tells the list when an operation settles, so its chip stops being stale', async () => {
     const onSettled = vi.fn()
     mount({ onSettled })
     fireEvent.click(screen.getByTestId('production-takedown'))
+    fireEvent.click(screen.getByTestId('take-down-confirm'))
     await waitFor(() => expect(onSettled).toHaveBeenCalled())
   })
 
@@ -164,6 +188,7 @@ describe('a live application', () => {
     mount()
     fireEvent.click(screen.getByTestId('production-restart'))
     fireEvent.click(screen.getByTestId('production-takedown'))
+    fireEvent.click(screen.getByTestId('take-down-confirm'))
     expect(h.takeAppDown).not.toHaveBeenCalled()
   })
 

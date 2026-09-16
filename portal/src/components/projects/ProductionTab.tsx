@@ -5,6 +5,7 @@ import { ApiError } from '../../utils/apiError'
 import { canBeRestarted, canBeTakenDown, RESTART_FAILED_CODES } from '../../utils/publishPresentation'
 import { BusyGlyph } from '../ui/Waiting'
 import AppStatusPanel from './AppStatusPanel'
+import TakeDownDialog from './TakeDownDialog'
 
 /**
  * SETTINGS › PRODUCTION — where an application stands, and what an owner may do about it.
@@ -30,13 +31,23 @@ type Pending = 'restart' | 'takedown' | null
 
 export interface ProductionTabProps {
   projectId: string
+  /** Named in the take-down question, because "are you sure?" about an unnamed thing is not one. */
+  appName: string
   /** Told when an operation settles, so the row underneath can stop showing a stale chip. */
   onSettled?: () => void
 }
 
-export default function ProductionTab({ projectId, onSettled }: ProductionTabProps) {
+export default function ProductionTab({ projectId, appName, onSettled }: ProductionTabProps) {
   const [pending, setPending] = useState<Pending>(null)
   const [refusal, setRefusal] = useState<string | null>(null)
+  /**
+   * The take-down's confirmation, and the `refresh` it will need on the other side of the answer.
+   *
+   * ONE ACT, ONE FRICTION. The row menu on the list asks before it ends an application for
+   * everyone at BIAL; this button did the same thing on a single press. Two doors to one act with
+   * two different frictions teaches a person that the question is decoration.
+   */
+  const [confirming, setConfirming] = useState<(() => Promise<void>) | null>(null)
   const alive = useRef(true)
   /**
    * WHAT ACTUALLY HOLDS THE DOOR, as opposed to what draws the label.
@@ -154,7 +165,7 @@ export default function ProductionTab({ projectId, onSettled }: ProductionTabPro
                     type="button"
                     data-testid="production-takedown"
                     aria-disabled={pending !== null}
-                    onClick={() => act('takedown', refresh)}
+                    onClick={() => setConfirming(() => refresh)}
                     className="inline-flex items-center gap-2 rounded-xl border border-danger/40 px-3 py-2 text-xs font-semibold text-danger transition hover:bg-red-50 aria-disabled:opacity-50"
                   >
                     {pending === 'takedown' ? <BusyGlyph size={14} /> : <PowerOff size={14} />}
@@ -172,6 +183,17 @@ export default function ProductionTab({ projectId, onSettled }: ProductionTabPro
           </>
         )}
       />
+      {confirming !== null && (
+        <TakeDownDialog
+          appName={appName}
+          onClose={() => setConfirming(null)}
+          onConfirm={() => {
+            const refresh = confirming
+            setConfirming(null)
+            act('takedown', refresh)
+          }}
+        />
+      )}
     </div>
   )
 }

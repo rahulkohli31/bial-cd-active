@@ -1158,6 +1158,24 @@ describe('ProjectsPage — the production actions', () => {
     expect(notice.textContent).toContain('Ramp Ops')
   })
 
+  it('★ a restart that was accepted says so — the route answers with no words of its own', async () => {
+    // The route returns 202 with a deployment id the moment the work is claimed, and the work
+    // then runs for MINUTES. The row's busy state ends at that 202, so without an authored
+    // sentence the only signal was a control going briefly dim and then nothing at all.
+    h.restartApp.mockResolvedValue({ deploymentId: 'd9' })
+    h.listProjects.mockResolvedValue(page([serving('p1', 'Ramp Ops')]))
+    renderPage()
+    await screen.findByText('Ramp Ops')
+    await openRowMenu()
+    fireEvent.click(await screen.findByTestId('menu-restart'))
+
+    const notice = await screen.findByTestId('projects-toast')
+    expect(notice.getAttribute('data-tone')).toBe('confirmation')
+    expect(notice.textContent).toContain('Ramp Ops')
+    // It promises the recycle STARTED, not that it finished — a 202 knows nothing more.
+    expect(notice.textContent).toMatch(/Restarting/)
+  })
+
   it('re-reads the list once the operation returns, so the chip stops being stale', async () => {
     h.listProjects.mockResolvedValue(page([serving('p1', 'Ramp Ops')]))
     renderPage()
