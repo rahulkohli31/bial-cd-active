@@ -167,14 +167,74 @@ describe('ProjectRow — a project with no description', () => {
 })
 
 describe('ProjectRow — no nested interactive elements, still', () => {
-  it('keeps Delete out of the name button, even with the tooltip wrapper added', () => {
+  it('keeps the menu out of the name button, even with the tooltip wrapper added', () => {
     // The tooltip restructuring wraps the name in TooltipProvider/Tooltip/TooltipTrigger —
-    // worth re-confirming the invariant survives the extra nesting.
+    // worth re-confirming the invariant survives the extra nesting. A browser would forgive a
+    // nested button and jsdom would not notice, so the DOM relationship is what is asserted.
     render(<ProjectRow project={project()} onOpen={vi.fn()} onDelete={vi.fn()} />)
 
-    const del = screen.getByLabelText('Delete Visitor Log')
+    const menu = screen.getByTestId('app-menu-row')
     const open = screen.getByRole('button', { name: 'Visitor Log' })
-    expect(open.contains(del)).toBe(false)
-    expect(del.contains(open)).toBe(false)
+    expect(open.contains(menu)).toBe(false)
+    expect(menu.contains(open)).toBe(false)
+    expect(menu.parentElement?.closest('button')).toBeNull()
+  })
+
+  it('reaches Delete through the menu, and not by one click on the row', async () => {
+    const onOpen = vi.fn()
+    const onDelete = vi.fn()
+    render(<ProjectRow project={project()} onOpen={onOpen} onDelete={onDelete} />)
+
+    // There is no bare delete control any more: an irreversible action does not get a
+    // one-click route from a list.
+    expect(screen.queryByLabelText('Delete Visitor Log')).toBeNull()
+
+    fireEvent.pointerDown(screen.getByTestId('app-menu-row'))
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Delete' }))
+    expect(onDelete).toHaveBeenCalledTimes(1)
+    expect(onOpen).not.toHaveBeenCalled()
+  })
+
+  it('opens the menu by keyboard, without opening the project', async () => {
+    const onOpen = vi.fn()
+    render(<ProjectRow project={project()} onOpen={onOpen} onDelete={vi.fn()} />)
+    const trigger = screen.getByTestId('app-menu-row')
+    trigger.focus()
+    expect(document.activeElement).toBe(trigger)
+    fireEvent.keyDown(trigger, { key: 'Enter' })
+    expect(await screen.findByRole('menuitem', { name: 'Open' })).toBeTruthy()
+    expect(onOpen).not.toHaveBeenCalled()
+  })
+
+  it('renders both dates, each absolute, each in its own column', () => {
+    render(
+      <ProjectRow
+        project={{
+          ...project(),
+          createdAt: '2026-08-12T09:00:00Z',
+          updatedAt: '2026-09-14T09:00:00Z',
+        }}
+        onOpen={vi.fn()}
+        onDelete={vi.fn()}
+      />,
+    )
+    expect(screen.getByText('12 Aug 2026')).toBeTruthy()
+    expect(screen.getByText('14 Sep 2026')).toBeTruthy()
+  })
+
+  it('shows the same date twice for a project created and updated in one minute', () => {
+    // Same value in both columns, and the row keeps its height: the failure this guards is a
+    // column that collapses or wraps when the two strings are identical.
+    const at = '2026-09-14T09:00:00Z'
+    render(
+      <ProjectRow
+        project={{ ...project(), createdAt: at, updatedAt: at }}
+        onOpen={vi.fn()}
+        onDelete={vi.fn()}
+      />,
+    )
+    const both = screen.getAllByText('14 Sep 2026')
+    expect(both).toHaveLength(2)
+    for (const cell of both) expect(cell.className).toMatch(/whitespace-nowrap/)
   })
 })

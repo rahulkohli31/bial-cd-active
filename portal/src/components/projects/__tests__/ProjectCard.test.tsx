@@ -46,39 +46,52 @@ describe('ProjectCard', () => {
     expect(onDelete).not.toHaveBeenCalled()
   })
 
-  it('deletes via the delete control, without also triggering open', () => {
+  it('deletes from the menu, without also triggering open', async () => {
     const onOpen = vi.fn()
     const onDelete = vi.fn()
     render(<ProjectCard project={mkProject('Roster')} onOpen={onOpen} onDelete={onDelete} />)
 
-    fireEvent.click(screen.getByRole('button', { name: /delete roster/i }))
+    fireEvent.pointerDown(screen.getByTestId('app-menu-tile'))
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Delete' }))
     expect(onDelete).toHaveBeenCalledTimes(1)
-    // Delete is a sibling of the open control, so activating it never opens the project.
+    // The menu is a sibling of the open control, so reaching Delete never opens the project.
     expect(onOpen).not.toHaveBeenCalled()
   })
 
-  it('exposes open and delete as two separate button tab stops', () => {
+  it('opening the menu does not trigger the tile\'s open action', () => {
+    const onOpen = vi.fn()
+    render(<ProjectCard project={mkProject('Roster')} onOpen={onOpen} onDelete={vi.fn()} />)
+    fireEvent.pointerDown(screen.getByTestId('app-menu-tile'))
+    expect(onOpen).not.toHaveBeenCalled()
+  })
+
+  it('exposes open and the menu as two separate button tab stops', () => {
     render(<ProjectCard project={mkProject('Roster')} onOpen={vi.fn()} onDelete={vi.fn()} />)
     const open = screen.getByRole('button', { name: 'Roster' })
-    const del = screen.getByRole('button', { name: /delete roster/i })
+    const menu = screen.getByTestId('app-menu-tile')
     // Both are real, natively keyboard-activatable <button>s (Enter/Space for free) — and they
     // are distinct elements, not one wrapping the other.
     expect(open.tagName).toBe('BUTTON')
-    expect(del.tagName).toBe('BUTTON')
-    expect(open).not.toBe(del)
-    expect(open.contains(del)).toBe(false)
+    expect(menu.tagName).toBe('BUTTON')
+    expect(open).not.toBe(menu)
+    expect(open.contains(menu)).toBe(false)
   })
 
-  it('does not nest the delete control inside any interactive element', () => {
+  it('does not nest the menu inside any interactive element', () => {
     const { container } = render(
       <ProjectCard project={mkProject('Roster')} onOpen={vi.fn()} onDelete={vi.fn()} />,
     )
-    const del = screen.getByRole('button', { name: /delete roster/i })
+    const menu = screen.getByTestId('app-menu-tile')
     // Nothing in the card claims the button role beyond the two real <button>s themselves.
     expect(container.querySelector('[role="button"]')).toBeNull()
-    // Delete's only <button> ancestor is itself: no interactive element wraps it, so its
+    // The menu's only <button> ancestor is itself: no interactive element wraps it, so its
     // accessible name can never be absorbed by an outer role="button".
-    expect(del.parentElement?.closest('button')).toBeNull()
+    expect(menu.parentElement?.closest('button')).toBeNull()
+  })
+
+  it('offers the menu without a hover — a hover-only control has no keyboard or touch route', () => {
+    render(<ProjectCard project={mkProject('Roster')} onOpen={vi.fn()} onDelete={vi.fn()} />)
+    expect(screen.getByTestId('app-menu-tile').className).not.toMatch(/opacity-0/)
   })
 
   it('opens a tooltip on a really clipped name, with the full text', async () => {
@@ -149,10 +162,25 @@ describe('ProjectCard', () => {
     expect(onOpen).toHaveBeenCalledTimes(1)
   })
 
-  it('falls back to "Untitled project" for an empty name and still labels delete', () => {
+  it('falls back to "Untitled project" for an empty name, in the menu\'s label too', () => {
     render(<ProjectCard project={mkProject('')} onOpen={vi.fn()} onDelete={vi.fn()} />)
     expect(screen.getByRole('button', { name: 'Untitled project' })).toBeTruthy()
-    // The delete label degrades to a generic noun rather than an empty "Delete ".
-    expect(screen.getByRole('button', { name: 'Delete project' })).toBeTruthy()
+    // A page of tiles must not be a page of controls all called "More actions for".
+    expect(screen.getByRole('button', { name: 'More actions for Untitled project' })).toBeTruthy()
+  })
+
+  it('shows both dates as the board draws them — created, then updated', () => {
+    render(
+      <ProjectCard
+        project={{
+          ...mkProject('Roster'),
+          createdAt: '2026-08-28T09:00:00Z',
+          updatedAt: '2026-09-15T09:00:00Z',
+        }}
+        onOpen={vi.fn()}
+        onDelete={vi.fn()}
+      />,
+    )
+    expect(screen.getByText('28 Aug → 15 Sep')).toBeTruthy()
   })
 })

@@ -19,6 +19,7 @@
 import { ChevronRight, Database } from 'lucide-react'
 import type { ConnectorEntry } from '../../utils/connectorApi'
 import { assertNever } from '../../utils/assertNever'
+import { MONTHS } from '../../utils/monthNames'
 
 /**
  * The connector's teal tile. Two sizes because the board draws two: 26px in a list row, 24px
@@ -38,22 +39,16 @@ export function ConnectorGlyph({ size = 'row' }: { size?: 'row' | 'title' }): Re
 }
 
 /**
- * SPELLED OUT RATHER THAN LEFT TO `Intl`, and this is the reason.
+ * RE-EXPORTED, defined in `utils/monthNames.ts` — see that module for why the months are spelled
+ * out rather than left to `Intl`.
  *
- * The board draws `2 Sep` and `5 Sep, 08:30`. `toLocaleDateString(undefined, …)` produces neither
- * reliably: en-GB and en-IN — the locales BIAL's own browsers are set to — abbreviate September as
- * `Sept` under current CLDR, and en-US puts the month first (`Sep 2`). So the one form the board
- * specifies is not any runtime's default, and a suite that pinned it would be pinning the machine
- * it ran on. The portal's copy is English throughout; the day and the clock stay LOCAL (the reader
- * is in Bangalore and the server stamps UTC), only the shape is fixed.
- *
- * EXPORTED for `WindowChip.tsx`, which sets `1 – 30 Sep` on the date chip. It reuses this LIST
- * rather than `dayMonth` below, and the difference matters: the functions here take an ISO
- * INSTANT and read it in local time, while a window's bounds are calendar DAYS (`2026-09-01`) that
- * `new Date()` would parse as UTC midnight — the day before, anywhere west of Greenwich. The chip
- * splits its own strings on the hyphen and comes back here only for the month's three letters.
+ * `WindowChip.tsx` sets `1 – 30 Sep` on the date chip and reuses this LIST rather than `dayMonth`
+ * below, and the difference matters: the functions here take an ISO INSTANT and read it in local
+ * time, while a window's bounds are calendar DAYS (`2026-09-01`) that `new Date()` would parse as
+ * UTC midnight — the day before, anywhere west of Greenwich. The chip splits its own strings on
+ * the hyphen and comes back here only for the month's three letters.
  */
-export const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+export { MONTHS }
 
 /**
  * `2 Sep` — the board's form for a decision's date, which carries no year and no time.

@@ -121,6 +121,16 @@ function answersWithTheRequestedPage(
 }
 
 /** Radix's Select is a button, not a `<select>`: `fireEvent.change` on it silently no-ops. */
+/**
+ * Delete an application the way a citizen now must: through the row's `⋯` menu. Two steps on
+ * purpose — a list does not hand out a one-click route to an irreversible action. The trigger is
+ * Radix, so it opens on POINTERDOWN rather than click.
+ */
+async function deleteFromRowMenu(): Promise<void> {
+  fireEvent.pointerDown(screen.getByTestId('app-menu-row'))
+  fireEvent.click(await screen.findByRole('menuitem', { name: 'Delete' }))
+}
+
 async function pickRowsPerPage(option: string): Promise<void> {
   fireEvent.click(screen.getByRole('combobox', { name: 'Rows per page' }))
   fireEvent.click(await screen.findByRole('option', { name: option }))
@@ -312,17 +322,49 @@ describe('a row', () => {
     expect(screen.getByText('Nothing built yet')).toBeTruthy()
   })
 
-  it('keeps Delete OUT of the open button', async () => {
+  it('keeps the row menu OUT of the open button', async () => {
     h.listProjects.mockResolvedValue(page([mkProject('p1', 'Visitor Log')]))
     renderPage()
     await screen.findByText('Visitor Log')
 
-    const del = screen.getByLabelText('Delete Visitor Log')
+    const menu = screen.getByTestId('app-menu-row')
     const open = screen.getByRole('button', { name: 'Visitor Log' })
     // Neither contains the other. A row that nests them is a button inside a button.
-    expect(open.contains(del)).toBe(false)
-    expect(del.contains(open)).toBe(false)
-    expect(del.closest('button')).toBe(del)
+    expect(open.contains(menu)).toBe(false)
+    expect(menu.contains(open)).toBe(false)
+    expect(menu.closest('button')).toBe(menu)
+  })
+
+  it('gives the list the two date columns it was missing', async () => {
+    h.listProjects.mockResolvedValue(
+      page([
+        {
+          ...mkProject('p1', 'Visitor Log'),
+          createdAt: '2026-08-12T09:00:00Z',
+          updatedAt: '2026-09-14T09:00:00Z',
+        },
+      ]),
+    )
+    renderPage()
+    await screen.findByText('Visitor Log')
+
+    // The headings and the cells, because a column is both — a heading over nothing, or a date
+    // under no heading, is half a column.
+    expect(screen.getByText('Created')).toBeTruthy()
+    expect(screen.getByText('Details updated')).toBeTruthy()
+    expect(screen.getByText('12 Aug 2026')).toBeTruthy()
+    expect(screen.getByText('14 Sep 2026')).toBeTruthy()
+  })
+
+  it('offers no one-click delete anywhere in the list', async () => {
+    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Visitor Log')]))
+    renderPage()
+    await screen.findByText('Visitor Log')
+
+    // Absence PAIRED WITH LIVENESS: the row really rendered, so this is the control being gone
+    // rather than the list failing to draw.
+    expect(screen.queryByLabelText('Delete Visitor Log')).toBeNull()
+    expect(screen.getByTestId('app-menu-row')).toBeTruthy()
   })
 
   it('opens the project from the name', async () => {
@@ -508,7 +550,7 @@ describe('create and delete', () => {
     renderPage()
     await screen.findByText('Alpha')
 
-    fireEvent.click(screen.getByLabelText('Delete Alpha'))
+    await deleteFromRowMenu()
     // The dialog gates on a 5-50 word reason, which the page forwards to the
     // API. Its own bounds are asserted in ProjectDeleteDialog.test.tsx; here it just has to
     // be valid so the delete runs.
@@ -531,7 +573,7 @@ describe('create and delete', () => {
     renderPage()
     await screen.findByText('Alpha')
 
-    fireEvent.click(screen.getByLabelText('Delete Alpha'))
+    await deleteFromRowMenu()
     fireEvent.change(await screen.findByLabelText(/why are you deleting/i), {
       target: { value: 'no longer needed by ground ops' },
     })
@@ -671,7 +713,7 @@ describe('create and delete', () => {
     renderPage()
     await screen.findByText('Alpha')
 
-    fireEvent.click(screen.getByLabelText('Delete Alpha'))
+    await deleteFromRowMenu()
     fireEvent.change(await screen.findByLabelText(/why are you deleting/i), {
       target: { value: 'no longer needed by ground ops' },
     })
@@ -699,7 +741,9 @@ describe('create and delete', () => {
     // the Delete button Radix captured is unmounted by the refetch a beat after the dialog
     // closes, so restoring onto it would put the keyboard on a control that is removed a
     // moment later.
-    expect(document.activeElement?.textContent).toBe('Your apps')
+    // AWAITED, because the page deliberately places focus on the NEXT FRAME: doing it inside the
+    // close handler moves focus out of a trap that is still armed, and the trap takes it back.
+    await waitFor(() => expect(document.activeElement?.textContent).toBe('Your apps'))
   })
 
   it('an empty page with a non-zero total is NOT the first-run screen', async () => {
@@ -735,7 +779,7 @@ describe('create and delete', () => {
     await screen.findByText('Alpha')
     h.listProjects.mockClear()
 
-    fireEvent.click(screen.getByLabelText('Delete Alpha'))
+    await deleteFromRowMenu()
     fireEvent.change(await screen.findByLabelText(/why are you deleting/i), {
       target: { value: 'no longer needed by ground ops' },
     })

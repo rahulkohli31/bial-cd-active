@@ -1,13 +1,19 @@
 /**
- * One project as a LIST row: name · description · details updated · status, plus Delete.
+ * One project as a LIST row: name · description · created · details updated · status · `⋯`.
+ *
+ * TWO DATE COLUMNS, BOTH LEFT-ALIGNED AND BOTH ABSOLUTE. One right-aligned relative timestamp
+ * answered neither question a citizen brings to this list — when was this made, and when did I
+ * last touch it — and could not be scanned down the page, because relative strings share no left
+ * edge and no width. "Details updated" keeps its name: the field moves on a rename or a
+ * description edit and never on a build or a deploy, so a bare "Updated" would claim otherwise.
  *
  * NO NESTED INTERACTIVE ELEMENTS is the invariant, and this row is the shape that most
- * wants to break it. The whole row opens the project AND it carries a Delete button, which
+ * wants to break it. The whole row opens the project AND it carries a menu, which
  * is a button inside a button the moment anyone reaches for the obvious implementation.
  *
  * So the same construction the card already uses:
  *   - the NAME is a real `<button>`, and its stretched `::after` covers the row
- *   - DELETE is a SIBLING, layered above with `z-10`
+ *   - the MENU is a SIBLING, layered above with `z-10`
  *
  * Neither is a descendant of the other. Making the row itself `<div role="button">`, or
  * wrapping it in a link, is what breaks it. Native buttons carry Enter and Space for free,
@@ -27,12 +33,12 @@
  * carries — so its `onOpen` is what receives the click rather than the overlay. That is a
  * deliberate keep, not a leftover: see `ClampedDescription`.
  */
-import { Trash2 } from 'lucide-react'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../ui/tooltip'
 import { statusFor, TONE_CLASS } from '../../utils/appStatusLabel'
-import { relativeTime } from '../../utils/relativeTime'
+import { listDate } from '../../utils/projectDates'
 import { useClipped } from '../../hooks/useClipped'
 import type { Project } from '../../utils/projectApi'
+import AppRowMenu from './AppRowMenu'
 
 export interface ProjectRowProps {
   project: Project
@@ -141,25 +147,25 @@ export default function ProjectRow({ project, onOpen, onDelete }: ProjectRowProp
         <ClampedDescription text={project.description} onOpen={onOpen} />
       </div>
 
-      <p className="hidden sm:block text-xs text-neutral whitespace-nowrap w-28 text-right">
-        {relativeTime(project.updatedAt)}
+      {/* FIXED WIDTHS, LEFT-ALIGNED, TABULAR FIGURES — the three together are what make a column
+          of dates a ruler down the page rather than a ragged edge. Hidden below `sm`, where the
+          row has no width to spare and the name is what a citizen is scanning for. */}
+      <p className="hidden sm:block w-28 flex-shrink-0 text-xs text-neutral tabular-nums whitespace-nowrap">
+        {listDate(project.createdAt)}
+      </p>
+      <p className="hidden sm:block w-28 flex-shrink-0 text-xs text-neutral tabular-nums whitespace-nowrap">
+        {listDate(project.updatedAt)}
       </p>
 
       <span
-        className={`text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full whitespace-nowrap ${TONE_CLASS[status.tone]}`}
+        className={`w-[104px] flex-shrink-0 text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full whitespace-nowrap text-center ${TONE_CLASS[status.tone]}`}
       >
         {status.label}
       </span>
 
       {/* SIBLING of the name button, not a descendant — z-10 lifts it above the stretched
           ::after so it is clickable rather than covered. */}
-      <button
-        onClick={onDelete}
-        aria-label={`Delete ${project.name}`}
-        className="relative z-10 p-1.5 text-neutral hover:text-danger rounded-lg hover:bg-red-50 transition"
-      >
-        <Trash2 size={15} />
-      </button>
+      <AppRowMenu appName={project.name} onOpen={onOpen} onDelete={onDelete} where="row" />
     </div>
   )
 }

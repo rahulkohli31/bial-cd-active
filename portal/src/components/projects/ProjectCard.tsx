@@ -10,13 +10,13 @@
  * Purely presentational: the page owns navigation/deletion and injects them as
  * `onOpen`/`onDelete`, so this renders trivially in a test with no router.
  */
-import { Trash2 } from 'lucide-react'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../ui/tooltip'
 import type { Project } from '../../utils/projectApi'
 import { statusFor, TONE_CLASS } from '../../utils/appStatusLabel'
-import { relativeTime } from '../../utils/relativeTime'
+import { tileDateRange } from '../../utils/projectDates'
 import { useClipped } from '../../hooks/useClipped'
 import { Card } from '../ui/card'
+import AppRowMenu from './AppRowMenu'
 
 /**
  * The tile's name: clipped with an ellipsis, and revealed in full on hover ONLY when it is
@@ -109,18 +109,14 @@ export default function ProjectCard({ project, onOpen, onDelete }: ProjectCardPr
             <NameButton name={project.name || 'Untitled project'} onOpen={onOpen} />
           </h3>
         </div>
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation()
-            onDelete()
-          }}
-          title="Delete project"
-          aria-label={`Delete ${project.name || 'project'}`}
-          className="relative z-10 opacity-0 group-hover:opacity-100 focus:opacity-100 text-neutral hover:text-danger p-1 -m-1 transition flex-shrink-0"
-        >
-          <Trash2 size={15} />
-        </button>
+        {/* ALWAYS VISIBLE, not `opacity-0 group-hover:opacity-100` as the bare delete control
+            was: a hover-only control has no keyboard route and no touch route at all. */}
+        <AppRowMenu
+          appName={project.name || 'Untitled project'}
+          onOpen={onOpen}
+          onDelete={onDelete}
+          where="tile"
+        />
       </div>
 
       {hasDescription ? (
@@ -129,15 +125,14 @@ export default function ProjectCard({ project, onOpen, onDelete }: ProjectCardPr
         <p className="text-xs text-neutral/70 italic">No description yet</p>
       )}
 
-      {/* Status and the timestamp on one line, as the grid board draws it — and the SAME
-          timestamp the list row shows, so the two views cannot describe a project
-          differently. `updatedAt` tracks details, not activity, which is why the list
-          column is labelled "Details updated"; there is no room for that label here, so
-          the card shows the value and the list carries the honest heading. */}
+      {/* Status and BOTH dates on one line, as the grid board draws it — the same two facts
+          the list row's columns carry, so the two views cannot describe a project differently.
+          The tile has no room for column headings, so the range is written as created → updated
+          and the list carries the honest labels. */}
       <div className="mt-auto pt-1 flex items-center justify-between gap-2">
         <AppStatusBadge project={project} />
-        <span className="text-[11px] text-neutral whitespace-nowrap">
-          {relativeTime(project.updatedAt)}
+        <span className="text-[11px] text-neutral tabular-nums whitespace-nowrap">
+          {tileDateRange(project.createdAt, project.updatedAt)}
         </span>
       </div>
     </Card>

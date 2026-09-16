@@ -457,12 +457,19 @@ export default function ProjectsPage(): React.JSX.Element {
       // one branch.
       setDeleting(null)
       // FOCUS EXPLICITLY, rather than let Radix try, and it still has to be explicit now that
-      // the row survives until the refetch. The Delete button Radix captured is about to be
-      // unmounted by that refetch — a beat AFTER the dialog closes — so a restore onto it
-      // would put the keyboard on a control that is removed a moment later, which lands right
-      // back on the body. The heading is the nearest stable, always-mounted landmark, and it
-      // is unaffected when the row goes.
-      headingRef.current?.focus()
+      // the row survives until the refetch. The control Radix captured is about to be unmounted
+      // by that refetch — a beat AFTER the dialog closes — so a restore onto it would put the
+      // keyboard on a control that is removed a moment later, which lands right back on the
+      // body. The heading is the nearest stable, always-mounted landmark, and it is unaffected
+      // when the row goes.
+      //
+      // NEXT FRAME, NOT THIS ONE, and that is not a nicety. `setDeleting(null)` above does not
+      // unmount the dialog until React commits, so a focus() on this line moves focus OUT of a
+      // focus trap that is still armed — and the trap pulls it straight back in, after which
+      // the dialog unmounts and the keyboard lands on the body. Scheduling here also means
+      // this runs BEFORE `ui/dialog.tsx`'s backstop, which schedules its own frame during
+      // unmount: it then sees focus already placed and correctly does nothing.
+      requestAnimationFrame(() => headingRef.current?.focus())
     }
   }
 
@@ -845,14 +852,17 @@ export default function ProjectsPage(): React.JSX.Element {
                 {/* The column header the default list was missing. */}
                 <div className="flex items-center gap-4 px-4 py-2.5 bg-bial-bg/60 border-b border-bial-border text-[10px] font-bold uppercase tracking-wider text-neutral">
                   <span className="flex-1">Application</span>
+                  {/* LEFT-ALIGNED, and the heading sits over its own column at the same fixed
+                      width the cell uses — which is the whole of what makes the dates scan. */}
+                  <span className="hidden sm:block w-28 flex-shrink-0">Created</span>
                   {/* "Details updated", NOT "Last updated": `updatedAt` moves only when the
                       project ROW is written — a rename or a description edit — and never
                       when the app is built, previewed, published or deployed. Naming it for
                       what it tracks is what stops the column reading as "when the app
                       last changed". */}
-                  <span className="hidden sm:block w-28 text-right">Details updated</span>
-                  <span className="w-[104px] text-right">Status</span>
-                  <span className="w-7" aria-hidden />
+                  <span className="hidden sm:block w-28 flex-shrink-0">Details updated</span>
+                  <span className="w-[104px] flex-shrink-0 text-center">Status</span>
+                  <span className="w-[26px] flex-shrink-0" aria-hidden />
                 </div>
                 {items.map((project) => (
                   <ProjectRow
