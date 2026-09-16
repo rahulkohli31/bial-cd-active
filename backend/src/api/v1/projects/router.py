@@ -147,9 +147,8 @@ def _to_response(
     endpoint cannot forget it, and `_serving_now` is the one way to work it out.
 
     `access` DOES default, unlike `is_serving` — every call site except `get_project` deals
-    exclusively with the caller's own projects (#198), so defaulting to `"owner"` is the
-    answer for all of them and only the one route that can return a shared view needs to say
-    otherwise.
+    exclusively with the caller's own projects, so defaulting to `"owner"` is the answer for
+    all of them and only the one route that can return a shared view needs to say otherwise.
     """
     return ProjectResponse(
         id=project.id,
@@ -475,7 +474,7 @@ _COLLEAGUE_QUERY_MAX_CHARS = 100
 
 
 def _clean_colleague_query(q: str) -> str:
-    """Normalize a `?q=` colleague-search token (#198 R4): strip, refuse below the 3-char
+    """Normalize a `?q=` colleague-search token: strip, refuse below the 3-char
     minimum (a query this short against an anchored match is either near-useless or, for a
     two-letter name, still wide enough to be an annoyance rather than a search), refuse an
     over-long paste, refuse a NUL byte for the same reason `pagination.py::clean_search`
@@ -490,7 +489,7 @@ def _clean_colleague_query(q: str) -> str:
     return q
 
 
-# Per-user rate limit on colleague search (#198 R4) — modeled on `feedback/router.py`'s
+# Per-user rate limit on colleague search — modeled on `feedback/router.py`'s
 # `_feedback_limiter`: a door dependency (runs BEFORE the route body, unlike
 # `create_project`'s description-generation limiter, which had to skip refusals that spend
 # nothing — a search spends nothing EITHER way, so there is no such exception to make here).
@@ -522,7 +521,7 @@ _colleague_search_limiter = rate_limit(
 async def search_project_colleagues(
     user: CurrentUser, db: DbSession, q: Annotated[str, Query()]
 ) -> ColleagueSearchResponse:
-    """Find a colleague to share a project with (#198 R4/R5) — anchored match on the start of
+    """Find a colleague to share a project with — anchored match on the start of
     a display-name token or the start of an email local part, never a substring (see
     `services/projects/shares.py::search_colleagues` for why: a substring match on a tenant
     sharing one email domain would match every user in it). Returns display name + email
@@ -558,7 +557,7 @@ async def list_projects_shared_with_me(
     cursor: CursorQuery = None,
     limit: LimitQuery = DEFAULT_PAGE_SIZE,
 ) -> SharedProjectListResponse:
-    """Projects a colleague has shared with the caller (#198 R12) — KEYSET paginated, not the
+    """Projects a colleague has shared with the caller — KEYSET paginated, not the
     numbered-offset shape `list_projects`/`project_counts` above use for the caller's OWN
     projects; see `services/projects/shares.py::list_shared_with_me` for why that
     justification does not carry over to a list every sharer writes into.
@@ -594,17 +593,17 @@ async def list_projects_shared_with_me(
     responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Project not found")),
 )
 async def get_project(project_id: uuid.UUID, user: CurrentUser, db: DbSession) -> ProjectResponse:
-    """The ONE endpoint in this router that admits a share (#198 R11) — every other route
-    here still calls `owned_project_or_404`, unchanged. `resolve_project_access` checks
-    ownership first, so a builder viewing their own project always gets `access="owner"`
-    (R11's "owner takes precedence over shared")."""
+    """The ONE endpoint in this router that admits a share — every other route here still
+    calls `owned_project_or_404`, unchanged. `resolve_project_access` checks ownership first,
+    so a builder viewing their own project always gets `access="owner"`: ownership takes
+    precedence over a share on the same project."""
     resolved = await resolve_project_access(db, user.id, project_id)
     project = resolved.project
     # OWNER-SCOPED CHILD LOOKUPS USE THE PROJECT'S OWNER, NEVER THE CALLER. For a shared
     # recipient the two differ, and `_project_app`/`restorable_presence`/`_serving_now` all
     # answer "does THIS PROJECT's app exist / is it live" — one right answer regardless of who
-    # is asking. Passing `user.id` here (the pre-#198 shape) would silently read as "no app"
-    # for every recipient, since `AppRegistry` is scoped to the OWNER's id, never the viewer's.
+    # is asking. Passing `user.id` here would silently read as "no app" for every recipient,
+    # since `AppRegistry` is scoped to the OWNER's id, never the viewer's.
     app_id, app_status = await _project_app(db, project.user_id, project.id)
     # This is the ONE surface that offers Relaunch, so the one that pays for the head-check.
     # No app row means no bundle can exist, and that is a CONFIRMED absent rather than an
@@ -616,9 +615,10 @@ async def get_project(project_id: uuid.UUID, user: CurrentUser, db: DbSession) -
     # exact predicate `preview-state` answers with, so a cold page load and the 45-second poll
     # can never disagree about whether a restore is on offer.
     relaunchable = False if app_id is None else await restorable_presence(app_id)
-    # R10's SECOND SENTENCE, computed ONLY for a shared viewer: an owner never reads this
-    # field (they have `has_relaunchable_snapshot` for their own Relaunch), and paying for a
-    # second object-store HEAD on every owner page load — the far more common reader of this
+    # `has_saved_snapshot` is computed ONLY for a shared viewer, who has no Relaunch button and
+    # so no other way to know whether the builder has anything to launch. An owner never reads
+    # this field (they have `has_relaunchable_snapshot` for their own Relaunch), and paying for
+    # a second object-store HEAD on every owner page load — the far more common reader of this
     # route — would be a real cost for a field nothing on that path consults.
     has_saved_snapshot = None
     if resolved.access is ProjectAccess.SHARED:
@@ -655,11 +655,11 @@ def _share_response(share: ProjectShare, colleague: User) -> ShareResponse:
 async def share_project(
     project_id: uuid.UUID, body: ShareRequest, user: CurrentUser, db: DbSession
 ) -> ShareResponse:
-    """Share a project the caller owns with a named colleague (#198 R1). Owner-only —
+    """Share a project the caller owns with a named colleague. Owner-only —
     `owned_project_or_404`, never the widened `resolve_project_access`: sharing IS a mutation
-    of the project's own access list, and R6 grants a recipient "Can use", never the ability
-    to share onward. Idempotent (R3) and refused for self-share (R2) or a project with
-    nothing saved yet (R10) — both enforced inside `create_share`, not duplicated here."""
+    of the project's own access list, and a share only ever grants "Can use", never the
+    ability to share onward. Idempotent, and refused for self-share or a project with nothing
+    saved yet — both enforced inside `create_share`, not duplicated here."""
     project = await owned_project_or_404(db, user.id, project_id)
     colleague = await db.get(User, body.shared_with_user_id)
     if colleague is None:
@@ -686,7 +686,7 @@ async def unshare_project(
     sandbox: OptionalSandbox,
     manager: SessionManagerDep,
 ) -> OkResponse:
-    """Revoke a project's share with a colleague (#198 R1, R25). Owner-only, same reasoning as
+    """Revoke a project's share with a colleague. Owner-only, same reasoning as
     `share_project`. `{"ok": true}` either way, whether or not the share still existed —
     revoking an already-gone share is a normal double-click/retry, not an error (mirrors
     `release_project_sandbox`'s own "released: false is a success" posture).
@@ -697,15 +697,21 @@ async def unshare_project(
     a dropped grant is a live billing leak AND a continuing information exposure. Revoked
     access must never wait on a container coming down.
 
+    TEARDOWN IS ALWAYS ATTEMPTED, NOT ONLY WHEN THIS CALL DROPPED THE ROW — so that retrying
+    after a 503 actually retries. `revoke_shared_preview` is its own idempotent check (it looks
+    at whether the recipient's live slot currently holds this project's shared container, not
+    at the membership row this endpoint just touched), so calling it again when the row was
+    already gone is a safe no-op rather than a wasted or incorrect teardown.
+
     Tearing down is skipped, not refused, when no sandbox is configured — the same posture
     `release_project_sandbox`'s own route takes; a sandbox-off deployment has nothing running
     for the row to have pointed at."""
     project = await owned_project_or_404(db, user.id, project_id)
-    revoked = await revoke_share(
+    await revoke_share(
         db, project=project, actor_id=user.id, colleague_id=body.shared_with_user_id
     )
     await db.commit()
-    if revoked and sandbox is not None:
+    if sandbox is not None:
         app_id, _app_status = await _project_app(db, project.user_id, project.id)
         if app_id is not None:
             with build_coordination_or_503():
@@ -731,7 +737,7 @@ async def unshare_project(
 async def list_project_shares(
     project_id: uuid.UUID, user: CurrentUser, db: DbSession
 ) -> ProjectSharesResponse:
-    """Who a project is currently shared with, and when (#198 R12) — the read that makes
+    """Who a project is currently shared with, and when — the read that makes
     `unshare_project` usable: an owner has to see who holds access before picking who to
     revoke it from. Owner-only, same reasoning as `share_project`."""
     project = await owned_project_or_404(db, user.id, project_id)
@@ -1075,8 +1081,8 @@ async def _reap_a_shared_views_container_or_shrug(
 ) -> str | None:
     """Take down ONE recipient's live view of a just-deleted project's shared app, best-effort.
     NEVER RAISES — `delete_project`'s own sibling to `_reap_the_project_sandbox_or_shrug`
-    above, for the cascade-delete decision (#198): a project's live shares are torn down along
-    with it, exactly as the owner's own sandbox is.
+    above: a project's live shares are torn down along with it, exactly as the owner's own
+    sandbox is.
 
     KEPT SEPARATE from that function rather than generalizing it: this runs once per LIVE
     SHARE — there can be several recipients — and the two containers it and its sibling tear
@@ -1240,7 +1246,7 @@ async def delete_project(
     # cascades its `project_databases` row away, so post-commit there is nothing left to
     # read them from — the same reason `app_container_ids` are plain UUIDs.
     handles = await teardown_handles(db, project.id)
-    # EVERY LIVE RECIPIENT, for the SAME reason and at the SAME point (#198): `project_shares`
+    # EVERY LIVE RECIPIENT, for the SAME reason and at the SAME point: `project_shares`
     # rows cascade away with the project (`ON DELETE CASCADE`), so post-commit there is nothing
     # left in the database naming who to tear a container down for. Plain UUIDs, not ORM rows —
     # `entry.recipient` would need a session read past the commit below.
@@ -1385,10 +1391,10 @@ async def delete_project(
     )
     if standing is not None:
         survivors.append(("sandbox_container", standing))
-    # ...and every recipient's shared view of it (#198) — the cascade-delete decision: a
-    # project's live shares end with it, not merely their access-grant rows. `app_id` is
-    # already known non-None here whenever `shared_recipient_ids` is non-empty: `create_share`
-    # (slice 1) refuses to create a share unless the owner's app exists with a saved snapshot.
+    # ...and every recipient's shared view of it — a project's live shares end with it, not
+    # merely their access-grant rows. `app_id` is already known non-None here whenever
+    # `shared_recipient_ids` is non-empty: `create_share` refuses to create a share unless the
+    # owner's app exists with a saved snapshot.
     if app_id is not None:
         for recipient_id in shared_recipient_ids:
             recipient_standing = await _reap_a_shared_views_container_or_shrug(

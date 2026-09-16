@@ -13,6 +13,8 @@ it is a documented constant to confirm against the resource's RBAC before go-liv
 
 from __future__ import annotations
 
+from urllib.parse import urlsplit
+
 from anthropic import AsyncAnthropicFoundry, Timeout
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.providers.anthropic import AnthropicProvider
@@ -36,8 +38,15 @@ class FoundryOnlyError(RuntimeError):
 
 
 def _assert_foundry_only(base_url: str) -> None:
-    """Fail closed unless `base_url` is an Azure Foundry endpoint."""
-    if _PUBLIC_ANTHROPIC_HOST in base_url or _FOUNDRY_HOST_SUFFIX not in base_url:
+    """Fail closed unless `base_url` is an Azure Foundry endpoint.
+
+    Checks the PARSED HOST, not a substring of the whole URL — a substring test is satisfiable
+    by a path segment or query string that happens to contain the suffix, without the request
+    actually going to that host. The only input here is `FOUNDRY__RESOURCE`, written by
+    whoever already holds `FOUNDRY__API_KEY`, so this is defence in depth rather than a hole
+    reachable by anyone else."""
+    host = urlsplit(base_url).hostname or ""
+    if host == _PUBLIC_ANTHROPIC_HOST or not host.endswith(_FOUNDRY_HOST_SUFFIX):
         raise FoundryOnlyError(
             "model access must go through Azure AI Foundry "
             f"(*{_FOUNDRY_HOST_SUFFIX}), never the public Anthropic API."

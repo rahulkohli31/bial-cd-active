@@ -1,16 +1,16 @@
 /**
- * Share a project with a colleague (#198 R1-R7, R12, R28) — a dialog reached from the
- * project's own workspace, never a route of its own.
+ * Share a project with a colleague — a dialog reached from the project's own workspace,
+ * never a route of its own.
  *
- * THE COLLEAGUE SEARCH HAS FOUR NAMED STATES (R28), never a raw error code on screen:
- * below 3 characters, in flight, no matches, and rate-limited. All four render as a plain
- * sentence under the search box, the same `role="status"` treatment `ProjectsPage`'s own
- * wait region uses, so a screen reader hears each one land.
+ * THE COLLEAGUE SEARCH HAS FOUR NAMED STATES, never a raw error code on screen: below 3
+ * characters, in flight, no matches, and rate-limited. All four render as a plain sentence
+ * under the search box, the same `role="status"` treatment `ProjectsPage`'s own wait region
+ * uses, so a screen reader hears each one land.
  *
- * THE GRANT IS "CAN USE", NEVER "VIEW ONLY" (R6, Key Decision 3) — a colleague who opens a
- * shared project can interact with the real, running app, and anything they enter is saved
- * into the project's actual data (R7). Both sentences are said here, once, rather than left
- * for the recipient to discover after the fact.
+ * THE GRANT IS "CAN USE", NEVER "VIEW ONLY" — a colleague who opens a shared project can
+ * interact with the real, running app, and anything they enter is saved into the project's
+ * actual data. Both sentences are said here, once, rather than left for the recipient to
+ * discover after the fact.
  */
 import { useEffect, useRef, useState } from 'react'
 import { X } from 'lucide-react'
@@ -47,7 +47,7 @@ export default function SharePanel({ projectId, projectName, onClose }: SharePan
   const [query, setQuery] = useState('')
   const [results, setResults] = useState<Colleague[]>([])
   const [searching, setSearching] = useState(false)
-  // ONE OF THE FOUR NAMED STATES (R28), or null once results are showing. Never a raw
+  // ONE OF THE FOUR NAMED STATES, or null once results are showing. Never a raw
   // `err.message` from the network — the two failure arms below write their own sentence,
   // so a colleague search never puts backend prose on screen.
   const [searchNotice, setSearchNotice] = useState<string | null>(null)
@@ -93,6 +93,10 @@ export default function SharePanel({ projectId, projectName, onClose }: SharePan
     // STATE 1 OF 4: below the minimum. Said plainly rather than left silent — a box that
     // shows nothing at all while you type "Al" looks broken, not merely unready.
     if (trimmed.length < MIN_QUERY_CHARS) {
+      // Also retires any in-flight request from before the query shrank — without this, that
+      // request's own `requestIdRef.current !== myId` check still passes when it lands, and it
+      // overwrites this state with stale results.
+      requestIdRef.current++
       setResults([])
       setSearching(false)
       setSearchNotice(trimmed.length === 0 ? null : `Type at least ${MIN_QUERY_CHARS} characters to search.`)
@@ -165,7 +169,7 @@ export default function SharePanel({ projectId, projectName, onClose }: SharePan
             <DialogTitle className="text-base font-bold text-tertiary truncate">
               Share &ldquo;{projectName}&rdquo;
             </DialogTitle>
-            {/* R6 + R7, said once, plainly, before anyone is added. */}
+            {/* What a share grants, said once, plainly, before anyone is added. */}
             <p className="text-xs text-neutral mt-1 leading-relaxed">
               Anyone you add can open and use this app. Anything they enter is saved into the
               project&rsquo;s real data.
@@ -192,7 +196,7 @@ export default function SharePanel({ projectId, projectName, onClose }: SharePan
           />
         </label>
 
-        {/* THE ONE REGION FOR ALL FOUR NAMED STATES (R28) — mounted unconditionally so a
+        {/* THE ONE REGION FOR ALL FOUR NAMED STATES — mounted unconditionally so a
             reader hears each one land, matching the wait-region convention `ProjectsPage`
             already establishes for this codebase. */}
         <div role="status" aria-live="polite" data-testid="colleague-search-status" className="mt-2 min-h-[1.125rem]">
@@ -224,6 +228,7 @@ export default function SharePanel({ projectId, projectName, onClose }: SharePan
                   <button
                     type="button"
                     aria-disabled={alreadyShared || busy}
+                    aria-label={`Share with ${colleague.displayName || colleague.emailLocalPart}`}
                     onClick={() => {
                       if (!alreadyShared && !busy) onShare(colleague)
                     }}
@@ -266,12 +271,13 @@ export default function SharePanel({ projectId, projectName, onClose }: SharePan
                       <p className="text-sm text-tertiary truncate">
                         {share.sharedWithDisplayName || share.sharedWithEmailLocalPart}
                       </p>
-                      {/* "Can use", never "view only" (R6, Key Decision 3). */}
+                      {/* "Can use", never "view only". */}
                       <p className="text-[11px] text-neutral truncate">Can use</p>
                     </div>
                     <button
                       type="button"
                       aria-disabled={busy}
+                      aria-label={`Remove ${share.sharedWithDisplayName || share.sharedWithEmailLocalPart}`}
                       onClick={() => {
                         if (!busy) onRevoke(share)
                       }}

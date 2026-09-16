@@ -930,7 +930,7 @@ async def release_project(
     raise _coordination_is_gone()
 
 
-# --- a colleague's shared-runtime view (#198) --------------------------------
+# --- a colleague's shared-runtime view ----------------------------------------
 
 
 async def _shared_preview_or_refuse(
@@ -942,7 +942,7 @@ async def _shared_preview_or_refuse(
     *,
     force_refresh: bool,
 ) -> SharedPreviewResponse | JSONResponse:
-    """The whole of Launch and Refresh (#198 R19-R22) — the two endpoints below differ only in
+    """The whole of Launch and Refresh — the two endpoints below differ only in
     which arm of `SessionManager.launch_shared_preview` they ask for, so the access gate, the
     exception mapping and the response shape live here once.
 
@@ -1017,9 +1017,9 @@ async def launch_shared_project(
     sandbox: OptionalSandbox,
     manager: SessionManagerDep,
 ) -> SharedPreviewResponse | JSONResponse:
-    """Open a project a colleague shared with you (#198 R19). Attaches to an already-live view
-    if one is up (a reopened tab, a second click); otherwise restores one from the owner's
-    latest SAVED snapshot — never their crash-recovery bundle (requirement 21)."""
+    """Open a project a colleague shared with you. Attaches to an already-live view if one is
+    up (a reopened tab, a second click); otherwise restores one from the owner's latest SAVED
+    snapshot — never their crash-recovery bundle."""
     return await _shared_preview_or_refuse(
         project_id, user, db, sandbox, manager, force_refresh=False
     )
@@ -1048,8 +1048,8 @@ async def refresh_shared_project(
     sandbox: OptionalSandbox,
     manager: SessionManagerDep,
 ) -> SharedPreviewResponse | JSONResponse:
-    """Re-restore a shared project from whatever is CURRENTLY saved (#198 R22) — unlike Launch,
-    never attaches to an already-live view even when one is up, since the owner may have saved
+    """Re-restore a shared project from whatever is CURRENTLY saved — unlike Launch, never
+    attaches to an already-live view even when one is up, since the owner may have saved
     something newer since it was brought up. `snapshotTakenAt` on the response is how the
     caller learns whether anything actually moved."""
     return await _shared_preview_or_refuse(
@@ -1073,9 +1073,9 @@ async def release_shared_view(
     manager: SessionManagerDep,
     sandbox: OptionalSandbox,
 ) -> ReleaseResponse | JSONResponse:
-    """Give up whatever colleague's shared view currently holds the caller's OWN slot (#198,
-    requirement 24's self-service exit) — no `project_id`, because the caller may not own one
-    that names it. The occupant `SandboxReclaimBlockedError` reports for a shared view is its
+    """Give up whatever colleague's shared view currently holds the caller's OWN slot — a
+    self-service exit that takes no `project_id`, because the caller may not own one that names
+    it. The occupant `SandboxReclaimBlockedError` reports for a shared view is its
     OWNER's project, which a recipient never owns, so `stopActiveBuild`/`release` (both gated on
     `owned_project_or_404`) can never be the hand-over dialog's remedy for this case; this route
     asks nothing but "is a shared view sitting in my slot right now" and needs no id to ask it.

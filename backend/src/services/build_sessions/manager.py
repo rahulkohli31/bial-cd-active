@@ -1581,11 +1581,11 @@ class SessionManager:
         never `slot_taken`, which is the ghost this unit replaces.
 
         `arm` NAMES THE DOOR on the `build_workspace_claimed` line, and is required for the same
-        reason: from inside here the two callers are indistinguishable, and "a citizen pressed
-        Launch" reads nothing like "a chat message allocated a workspace" to whoever is reading
-        the log. Two values, not the three the alarm's docstring lists — the standalone build
-        door was deleted with `_start_locked`, and a value nothing can emit is a value an alert
-        would wait for forever.
+        reason: from inside here the callers are otherwise indistinguishable, and "a citizen
+        pressed Launch" reads nothing like "a chat message allocated a workspace" to whoever is
+        reading the log. Matches `_ClaimArm` exactly — `relaunch`, `ensure_sandbox`,
+        `shared_launch` — and no other value, so an alert built against one of these three can
+        never wait on a value nothing emits.
 
         THE TWO WAYS THE LOCK CAN DENY, and why they leave here as different exceptions.
         `acquire_lock` returning `None` now means one thing only — the lock is genuinely

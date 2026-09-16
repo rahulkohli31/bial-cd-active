@@ -38,11 +38,9 @@ jobs:
   # enforced, not merely advisory.
   #
   # STATIC GATES ONLY, deliberately. They need no database, no Redis (tests fake it in
-  # process) and no secrets, so this job is hermetic and cannot flake. `pytest` is NOT here
-  # yet on purpose: the suite needs a `citizen_one_test` database built to the test-database
-  # runbook — including `REVOKE CONNECT` on the control-plane database, which several
-  # `appdb` tests assert against — and adding a red-by-default job would block every PR.
-  # Encoding that runbook as a service-container step is the follow-up.
+  # process) and no secrets, so this job is hermetic and cannot flake. `pytest` runs
+  # separately, below, against a real database — keeping the two jobs apart means a database
+  # outage or a flaky test never blocks the fast, hermetic checks from reporting.
   backend:
     runs-on: ubuntu-latest
     defaults:
@@ -86,3 +84,60 @@ jobs:
           heads=$(uv run alembic heads | grep -c '(head)')
           echo "alembic heads found: $heads"
           test "$heads" -eq 1
+
+  # `pytest`, against a REAL Postgres, not the static gates above. Builds the exact substrate
+  # `backend/.env.test.example` and `CONTRIBUTING.md`'s test-database runbook describe: a
+  # `pgvector/pgvector:pg18` service (the suite asserts native `uuidv7()`, a PG18 feature, and
+  # migration 0001 enables the `vector` extension), plus the dedicated `bial_appdb_maint` role
+  # the per-project database tests provision through — never the control-plane role, never
+  # `citizen_one_test` itself. `.env.test.example` is committed and copied as-is: its
+  # `DATABASE_URL`/`APP_DB__MAINTENANCE_DSN` ports already match the service port below, so
+  # nothing here rewrites it.
+  backend-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_USER: bial
+          POSTGRES_PASSWORD: bial
+          POSTGRES_DB: citizen_one_test
+        ports:
+          - 5544:5432
+        options: >-
+          --health-cmd "pg_isready -U bial -d citizen_one_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - name: Install dependencies
+        run: uv sync --frozen --all-groups
+
+      # The per-project database tests provision and drop REAL databases/roles through this
+      # role (never the control-plane identity, never `citizen_one_test`) — see
+      # `.env.test.example`'s own comment on `APP_DB__MAINTENANCE_DSN` for why. Created here,
+      # once per run, against the fresh service container.
+      - name: Create the app-database maintenance role
+        run: |
+          PGPASSWORD=bial psql -h localhost -p 5544 -U bial -d postgres -c \
+            "CREATE ROLE bial_appdb_maint LOGIN CREATEDB CREATEROLE NOSUPERUSER PASSWORD 'bial_appdb_maint';"
+
+      - name: Write .env.test
+        run: cp .env.test.example .env.test
+
+      - name: Run migrations
+        run: ENV_FILE=.env.test uv run alembic upgrade head
+
+      - name: pytest
+        run: ENV_FILE=.env.test uv run pytest -q

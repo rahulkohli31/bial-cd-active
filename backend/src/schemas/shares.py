@@ -1,4 +1,4 @@
-"""Request/response schemas for project sharing (#198 R1-R14).
+"""Request/response schemas for project sharing.
 
 Lives apart from `schemas/projects.py` the same way `schemas/marketplace.py` does — a related
 but distinct concern with its own exposure rules, not folded into the already-dense projects
@@ -23,7 +23,7 @@ class ShareRequest(CamelModel):
 
 
 class ColleagueResult(CamelModel):
-    """One search hit (R5) — display name AND the email LOCAL PART only, never the full
+    """One search hit — display name AND the email LOCAL PART only, never the full
     address: enough for an owner to tell two colleagues with the same name apart, not enough
     to hand out a directory of working email addresses through a picker. NOT the admin roster
     shape, which additionally carries token limits, usage and suspension state — none of
@@ -39,7 +39,7 @@ class ColleagueSearchResponse(CamelModel):
 
 
 class ShareResponse(CamelModel):
-    """One row of a project's OWN share panel (R12) — who it is shared with, and when.
+    """One row of a project's OWN share panel — who it is shared with, and when.
     Carries the SAME display-name/email-local-part pair `ColleagueResult` does: the owner
     reads this list to decide who to revoke, and needs to disambiguate the same way the
     search that created the share did."""
@@ -56,13 +56,13 @@ class ProjectSharesResponse(CamelModel):
 
 
 class SharedProjectResponse(CamelModel):
-    """One row of the recipient's "Shared with me" list (R12). `shared_by_display_name` only
-    — no email at all, matching the STRICTER attribution rule the marketplace's own
+    """One row of the recipient's "Shared with me" list. `shared_by_display_name` only — no
+    email at all, matching the STRICTER attribution rule the marketplace's own
     `MarketplaceEntry.builderDisplayName` already established for showing one citizen's
-    identity to another (display name only, `marketplace.py`'s own docstring). R5's fuller
-    "display name AND email local part" is specific to the colleague PICKER, where an owner
-    is choosing among possible strangers with the same name; a recipient is not choosing
-    anyone here, just being told who acted, so the narrower exposure applies."""
+    identity to another (display name only, `marketplace.py`'s own docstring). The colleague
+    PICKER's fuller "display name AND email local part" fits there because an owner is
+    choosing among possible strangers with the same name; a recipient is not choosing anyone
+    here, just being told who acted, so the narrower exposure applies."""
 
     project_id: uuid.UUID
     project_name: str
@@ -72,10 +72,9 @@ class SharedProjectResponse(CamelModel):
 
 
 class SharedProjectListResponse(CamelModel):
-    """Keyset-paginated (R12's own "separate search/pagination state"), unlike the owner's
-    own numbered-offset project list — see `services/projects/shares.py::list_shared_with_me`
-    for why offset's single-writer justification does not hold for a list every sharer
-    writes into."""
+    """Keyset-paginated, unlike the owner's own numbered-offset project list — see
+    `services/projects/shares.py::list_shared_with_me` for why offset's single-writer
+    justification does not hold for a list every sharer writes into."""
 
     items: list[SharedProjectResponse]
     next_cursor: str | None

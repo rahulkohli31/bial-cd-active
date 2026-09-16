@@ -1,21 +1,16 @@
-"""Project access resolution — owner-scoped, and (as of #198) the one place a share widens it.
+"""Project access resolution — owner-scoped, and the one place a share widens it.
 
-Project-first is the product model: every app and conversation belongs to exactly
-one project the caller owns, so `project_id` is REQUIRED at every create seam —
-there is no fallback project. A missing and a cross-user id are the same
-non-leaking 404. Shared by the projects CRUD router,
-app `provision`, and conversation `append_message`'s create branch.
+Project-first is the product model: every app and conversation belongs to exactly one project
+the caller owns, so `project_id` is REQUIRED at every create seam, and a missing or cross-user
+id is the same non-leaking 404. Shared by the projects CRUD router, app `provision`, and
+conversation `append_message`'s create branch.
 
-`resolve_project_access` (#198 R11) IS THE ONLY PLACE A USER-SCOPE PREDICATE MAY BE WIDENED
-beyond strict ownership — the platform's first legitimate exception to ADR-0004's "every query
-is scoped by a single user_id" rule. `owned_project_or_404` stays the binary owner-or-404 every
-existing caller already gets — it is now a one-line wrapper around the tri-state resolver below,
-so none of its ~20 existing call sites (build sessions, classification, deploy, conversations,
-turns — every one of them a MUTATING action) changed behaviour by one bit. Only a caller that
-explicitly wants to admit a shared viewer calls `resolve_project_access` directly, and as of
-this slice that is `get_project` alone — a read. Nothing here relaxes a mutation; requirement 6
-("Can use", never edit) is enforced by simply never widening a write path's own
-`owned_project_or_404` call.
+`resolve_project_access` is the only place a user-scope predicate may be widened beyond strict
+ownership. `owned_project_or_404` stays the binary owner-or-404 every existing (mutating) caller
+already gets — a one-line wrapper around the resolver below. Three call sites widen it directly:
+`get_project` (a read), and the shared Launch/Refresh pair in `build_sessions/router.py` (both
+mutations, but ones that only ever start the RECIPIENT's own container — a share grants "Can
+use", never a change to the project itself, on any of the routes that admit one).
 """
 
 from __future__ import annotations
@@ -35,7 +30,7 @@ from src.db.models.project_share import ProjectShare
 class ProjectAccess(enum.Enum):
     """OWNER takes precedence over SHARED by construction: `resolve_project_access` checks
     ownership FIRST and only asks about a share when that fails, so a builder can never be
-    handed the restricted recipient view of their own project (#198 R11)."""
+    handed the restricted recipient view of their own project."""
 
     OWNER = "owner"
     SHARED = "shared"
@@ -76,9 +71,10 @@ async def owned_project_or_404(
     db: AsyncSession, user_id: uuid.UUID, project_id: uuid.UUID
 ) -> Project:
     """Load a project scoped to its owner, or fail closed with a non-leaking 404. A share never
-    satisfies this — every existing caller of this function is a mutating action (build a
-    session, submit for review, deploy, append a turn, patch, delete), and #198 grants a
-    recipient "Can use", never a change to the project (R6)."""
+    satisfies this — every existing caller of this function is a mutating action on the
+    PROJECT itself (build a session, submit for review, deploy, append a turn, patch, delete),
+    and a share grants a recipient "Can use" their own copy of the running app, never a change
+    to the project."""
     resolved = await resolve_project_access(db, user_id, project_id)
     if resolved.access is not ProjectAccess.OWNER:
         raise AppApiError(404, "Project not found.")

@@ -1,5 +1,5 @@
 /**
- * Typed client for project sharing (#198) — colleague search, share/unshare, and the two
+ * Typed client for project sharing — colleague search, share/unshare, and the two
  * lists a share produces (a project's own share panel, and "Shared with me"). Mirrors
  * `projectApi.ts`'s shape: `fn(args, deps = {})`, camelCase wire, `ApiError` via
  * `readApiError`, response bodies narrowed from `unknown` — never cast, never `any`.
@@ -58,9 +58,13 @@ export interface ProjectShare {
 
 function toProjectShare(value: unknown): ProjectShare | null {
   if (!isRecord(value) || typeof value.id !== 'string' || value.id === '') return null
+  // `sharedWithUserId` is what Remove posts back to `:unshare` — a malformed or missing one
+  // must drop the whole row, the same as a malformed `id` does above, rather than render a
+  // Remove button that posts an empty id.
+  if (typeof value.sharedWithUserId !== 'string' || value.sharedWithUserId === '') return null
   return {
     id: value.id,
-    sharedWithUserId: typeof value.sharedWithUserId === 'string' ? value.sharedWithUserId : '',
+    sharedWithUserId: value.sharedWithUserId,
     sharedWithDisplayName: optionalString(value.sharedWithDisplayName),
     sharedWithEmailLocalPart:
       typeof value.sharedWithEmailLocalPart === 'string' ? value.sharedWithEmailLocalPart : '',

@@ -1,4 +1,4 @@
-"""The `project_shares` table — the platform's first junction table (#198).
+"""The `project_shares` table — the platform's first junction table.
 
 WHY THIS EXISTS. Every other list on the platform is scoped by a single `user_id` under
 `OwnedByUserMixin` (ADR-0004): one owner, one row, no exceptions. Sharing needs a genuine
@@ -20,8 +20,10 @@ app/conversation rows, which are enumerated and deleted explicitly so their obje
 can be swept in step). A share row has no object-store footprint of its own — nothing to sweep
 — so letting Postgres collapse it for free when either side of the relationship disappears is
 correct, not a shortcut. Deleting a project takes its shares with it; the RUNTIME container a
-recipient may have live is a separate concern the delete route tears down explicitly before the
-commit reaches this cascade (the shared runtime, once it exists).
+recipient may have live is a separate concern, torn down by the delete route AFTER the delete
+commits (best-effort, one attempt per live recipient, never raising — see
+`_reap_a_shared_views_container_or_shrug` in `api/v1/projects/router.py`), the same way the
+owner's own sandbox container is.
 
 Not composed from `OwnedByUserMixin`: that mixin is specifically the single-owner-column
 pattern the rest of the schema follows, and this table's two user references are not that
@@ -43,7 +45,7 @@ class ProjectShare(UUIDv7PrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "project_shares"
 
     __table_args__ = (
-        # ONE ROW PER (project, recipient) — the idempotent-re-share invariant (R3) AND the
+        # ONE ROW PER (project, recipient) — the idempotent-re-share invariant, and the
         # `ON CONFLICT` inference target `create_share` upserts against, so sharing the same
         # project with the same colleague twice never creates a second row.
         sa.UniqueConstraint(

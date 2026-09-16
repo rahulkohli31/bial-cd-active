@@ -1,5 +1,5 @@
-"""Sharing business logic (#198 R1-R11): create/revoke a share, search colleagues to share
-with, and list shares from either side of the relationship.
+"""Sharing business logic: create/revoke a share, search colleagues to share with, and list
+shares from either side of the relationship.
 
 Every function here takes an already-resolved `Project` the caller is known to own — the
 router's own `owned_project_or_404` establishes that before any of these run, so nothing in
@@ -25,13 +25,14 @@ from src.db.models.project_share import ProjectShare
 from src.db.models.user import User
 from src.services.audit.log import append_audit
 
-#: R4 — below this, the search is refused rather than run (a 1-2 character query against an
+#: Below this, the search is refused rather than run (a 1-2 character query against an
 #: anchored match is either near-useless or, for very short strings, still wide enough to
-#: annoy). No maximum is declared here beyond the schema's own paste-backstop character cap
-#: (`ColleagueSearchQuery` in `schemas/shares.py`) — an over-long query simply matches nothing.
+#: annoy). No maximum is declared here beyond the router's own paste-backstop character cap
+#: (`_COLLEAGUE_QUERY_MAX_CHARS` in `api/v1/projects/router.py`) — an over-long query simply
+#: matches nothing.
 MIN_COLLEAGUE_QUERY_CHARS = 3
 
-#: R4 — at most ten results, so the picker stays a picker rather than a second roster view.
+#: At most ten results, so the picker stays a picker rather than a second roster view.
 MAX_COLLEAGUE_RESULTS = 10
 
 
@@ -52,16 +53,16 @@ async def create_share(
     """Share `project` — which the caller must already own; enforced by the router's
     `owned_project_or_404` before this runs, not re-checked here — with `colleague_id`.
 
-    IDEMPOTENT (R3): re-sharing with the same colleague returns the existing row rather than
+    IDEMPOTENT: re-sharing with the same colleague returns the existing row rather than
     erroring, duplicating, or writing a second audit entry for a grant that already stood.
 
-    REFUSES SELF-SHARE (R2) and REFUSES A PROJECT WITH NOTHING SAVED (R10) — EXPLICITLY the
-    saved snapshot via `snapshot_presence`, never `restorable_presence`'s broader "saved OR
-    autosaved" answer: the shared runtime only ever restores from the saved version (R21), so
-    a share backed only by an autosave would hand a recipient nothing launchable. An UNKNOWN
+    REFUSES SELF-SHARE and REFUSES A PROJECT WITH NOTHING SAVED — EXPLICITLY the saved
+    snapshot via `snapshot_presence`, never `restorable_presence`'s broader "saved OR
+    autosaved" answer: the shared runtime only ever restores from the saved version, so a
+    share backed only by an autosave would hand a recipient nothing launchable. An UNKNOWN
     presence (`None` — the object store could not be reached) refuses too: this is a CREATE
-    gate, not Launch's own missing-snapshot disable (R10's second sentence), and the safer
-    direction when the platform cannot tell is closed, not open.
+    gate, not Launch's own separate missing-snapshot disable, and the safer direction when the
+    platform cannot tell is closed, not open.
     """
     # Lazy import: `build_sessions` itself imports `owned_project_or_404` from this package
     # at module level (`appdata.py`), so a module-level import here would deadlock the two
@@ -126,8 +127,9 @@ async def revoke_share(
     """Revoke `project`'s share with `colleague_id`. Returns whether a row actually existed —
     revoking an already-revoked (or never-existing) share is a normal double-click/retry, not
     an error, mirroring `release_project_sandbox`'s "released: false is a success" posture.
-    Tearing down the recipient's live container is the caller's job once the shared runtime
-    exists (R25) — this function only ever owns the membership row and its audit trail."""
+    Tearing down the recipient's live container is the caller's job (`unshare_project`,
+    unconditionally, whether or not this call found a row to delete) — this function only ever
+    owns the membership row and its audit trail."""
     result = cast(
         "sa.CursorResult[Any]",
         await db.execute(
@@ -163,11 +165,11 @@ def _escape_for_ilike(value: str) -> str:
 async def search_colleagues(
     db: AsyncSession, *, requester_id: uuid.UUID, query: str
 ) -> list[User]:
-    """Anchored colleague search (R4): matches the START of a display-name TOKEN (any word in
+    """Anchored colleague search: matches the START of a display-name TOKEN (any word in
     the name, not just the first) or the START of the email local part — NEVER a substring
     match, which on a tenant where every user shares one email domain would match every user
-    in it against any three characters of that shared domain. Excludes the requester (R2 —
-    "the user search excludes the requester so they never appear in their own results").
+    in it against any three characters of that shared domain. Excludes the requester, so they
+    never appear in their own results.
 
     ONE MECHANISM, ESCAPED ONCE — both arms are `ILIKE` prefix patterns now, not a Postgres
     POSIX regex for the name and an unescaped `ILIKE` for the email. The email arm used to
@@ -179,7 +181,7 @@ async def search_colleagues(
     literal space", not "starts the whole value".
 
     `query` has already cleared `MIN_COLLEAGUE_QUERY_CHARS` and the character-cap paste
-    backstop at the schema boundary (`ColleagueSearchQuery`) — this function trusts both.
+    backstop at the router boundary (`_clean_colleague_query`) — this function trusts both.
     """
     later_token_pattern = f"% {_escape_for_ilike(query)}%"
     rows = await db.scalars(
@@ -200,7 +202,7 @@ async def search_colleagues(
 
 @dataclass(frozen=True)
 class ShareWithRecipient:
-    """One row of a project's OWN share panel — who it is shared with, and when (R12)."""
+    """One row of a project's OWN share panel — who it is shared with, and when."""
 
     share: ProjectShare
     recipient: User
@@ -224,7 +226,7 @@ async def list_shares_for_project(
 @dataclass(frozen=True)
 class SharedProjectEntry:
     """One row of the recipient's "Shared with me" list — the project, who shared it, and
-    when (R12). `share_id` is the keyset cursor `list_shared_with_me` paginates on — the
+    when. `share_id` is the keyset cursor `list_shared_with_me` paginates on — the
     SHARE's own id, not the project's, since ordering is by grant recency and one project can
     (in principle) recur if it were ever unshared and re-shared."""
 

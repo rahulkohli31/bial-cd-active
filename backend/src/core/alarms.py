@@ -73,3 +73,15 @@ keyword-only for that row. This event is the only record that it happened.
 
 Fields: `project_id`, `reason` (the exception type — never the message, which can carry request
 content)."""
+
+SEMANTIC_SEARCH_STARTUP_STATE_EVENT: Final = "semantic_search_startup_state"
+"""Whether semantic search (embeddings) is on or off, logged once at application boot.
+
+Before this event, an unset `FOUNDRY__EMBEDDING_DEPLOYMENT` disabled semantic search and the
+duplicate check's vector arm with no signal anywhere: no startup log, no warning, nothing but a
+commented-out line in `backend/.env.example`. A deploy that silently forgot the setting looked
+completely healthy while its headline search feature was off. This line makes the state visible
+on every boot, on or off, so a missing setting is one grep away instead of a silent gap someone
+has to notice by searching for an app that should have surfaced and did not.
+
+Fields: `enabled` (bool)."""

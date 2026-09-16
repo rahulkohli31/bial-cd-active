@@ -45,7 +45,8 @@ disagreements are where the real bugs sit. Fix rather than suppress.
 
 **Backend — tests.** These need a `citizen_one_test` database built to the test-database
 runbook, including a `REVOKE CONNECT` on the control-plane database that several per-app
-database tests assert against. Build it out of band before your first run.
+database tests assert against. Build it out of band before your first local run — CI builds
+its own from scratch on every run (`.github/workflows/ci.yml`'s `backend-tests` job).
 
 ```sh
 cd backend && uv run pytest -q      # ~8 minutes

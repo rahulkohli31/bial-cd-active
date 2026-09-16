@@ -1,9 +1,7 @@
 /**
- * One build at a time, per project, as far as a browser can enforce it. A project's
- * `current_code` is last-write-wins across sessions; the backend has no lock (a real fix is
- * server-side). This closes the realistic window — two tabs of one browser — and leaves the
- * cross-device case documented and accepted. Planning chats are never blocked; only builds
- * write code.
+ * One build at a time, per project, as far as a browser can enforce it. This closes the
+ * realistic window — two tabs of one browser — and leaves the cross-device case documented
+ * and accepted. Planning chats are never blocked; only builds write code.
  *
  * WHY THIS EXISTS
  * DEMOTED TO ADVISORY. The AUTHORITATIVE one-build-per-user barrier lives server-side: the

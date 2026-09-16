@@ -1,5 +1,4 @@
-"""Writing a project's description embedding — the never-raises contract (#191 slice 3,
-R25/R26)."""
+"""Writing a project's description embedding — the never-raises contract."""
 
 from __future__ import annotations
 
@@ -11,7 +10,7 @@ from pydantic_ai.embeddings.test import TestEmbeddingModel
 from structlog.testing import capture_logs
 
 from src.core.alarms import EMBEDDING_WRITE_FAILED_EVENT
-from src.db.models.project import Project
+from src.db.models.project import DESCRIPTION_EMBEDDING_DIMENSIONS, Project
 from src.services.embeddings.write import write_description_embedding
 
 
@@ -46,11 +45,25 @@ async def test_noop_when_project_has_no_description() -> None:
 
 
 async def test_writes_the_embedding_on_success() -> None:
-    embedder = Embedder(TestEmbeddingModel())
+    # `dimensions=DESCRIPTION_EMBEDDING_DIMENSIONS`, not the default 8 a bare
+    # `TestEmbeddingModel()` produces: `description_embedding` is a `vector(1536)` column, and
+    # `write_description_embedding` now checks the returned width itself before assigning.
+    embedder = Embedder(TestEmbeddingModel(dimensions=DESCRIPTION_EMBEDDING_DIMENSIONS))
     project = _project(description="Ground staff log VIP movement requests.")
     await write_description_embedding(project, embedder)
     assert project.description_embedding is not None
-    assert len(project.description_embedding) > 0
+    assert len(project.description_embedding) == DESCRIPTION_EMBEDDING_DIMENSIONS
+
+
+async def test_a_wrong_width_result_degrades_instead_of_raising() -> None:
+    # The regression this guards: pgvector enforces `vector(1536)` only at flush time, well
+    # outside this function's own try/except, so an unchecked wrong-width result would not
+    # fail here — it would raise `DataError` later, at `db.commit()`, and 500 the caller's
+    # entire project write instead of degrading to keyword-only search.
+    embedder = Embedder(TestEmbeddingModel(dimensions=8))
+    project = _project(description="a description")
+    await write_description_embedding(project, embedder)
+    assert project.description_embedding is None
 
 
 async def test_embeds_as_a_document_not_a_query() -> None:

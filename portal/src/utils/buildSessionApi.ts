@@ -384,7 +384,7 @@ function toSharedPreviewResponse(value: unknown): SharedPreviewResponse {
 }
 
 /**
- * Open a project a colleague shared with you (#198). Attaches to an already-live view if one
+ * Open a project a colleague shared with you. Attaches to an already-live view if one
  * is up (a reopened tab, a second click); otherwise restores one from the owner's latest
  * SAVED snapshot.
  *

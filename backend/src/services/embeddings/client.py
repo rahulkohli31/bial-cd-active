@@ -1,4 +1,4 @@
-"""Foundry embedding-model wiring for Pydantic AI (#191 slice 3, R19-R23).
+"""Foundry embedding-model wiring for Pydantic AI.
 
 The embedding model is reachable ONLY through Azure AI Foundry — never the public OpenAI
 API — the same AE5-shaped guarantee `services/agent/model.py` already gives the Claude path.
@@ -22,6 +22,7 @@ diff in a way an env line is not.
 from __future__ import annotations
 
 from typing import Annotated
+from urllib.parse import urlsplit
 
 import structlog
 from fastapi import Depends
@@ -31,15 +32,12 @@ from pydantic_ai.embeddings.openai import OpenAIEmbeddingModel
 from pydantic_ai.providers.azure import AzureProvider
 
 from src.config import FoundryConfig, settings
-from src.core.alarms import EMBEDDING_GUARD_VIOLATION_EVENT
+from src.core.alarms import EMBEDDING_GUARD_VIOLATION_EVENT, SEMANTIC_SEARCH_STARTUP_STATE_EVENT
 from src.services.agent.model import FOUNDRY_ENTRA_SCOPE
 
 logger = structlog.get_logger()
 
-# The same suffix/host pair `services/agent/model.py` checks for the Claude path. The
-# trailing `/openai/` `AsyncAzureOpenAI` appends to the resource endpoint does not change
-# this: it is a SUBSTRING test, not an equality check against a bare resource endpoint, so it
-# applies verbatim regardless of which API is being reached on the resource.
+# The same suffix/host pair `services/agent/model.py` checks for the Claude path.
 _FOUNDRY_HOST_SUFFIX = ".services.ai.azure.com"
 _PUBLIC_OPENAI_HOST = "api.openai.com"
 
@@ -55,11 +53,18 @@ class EmbeddingFoundryOnlyError(RuntimeError):
 def _assert_foundry_only(base_url: str) -> None:
     """Fail closed unless `base_url` is an Azure Foundry endpoint.
 
+    Checks the PARSED HOST, not a substring of the whole URL — a substring test is satisfiable
+    by a path segment or query string that happens to contain the suffix, without the request
+    actually going to that host. The only input here is `FOUNDRY__RESOURCE`, written by
+    whoever already holds `FOUNDRY__API_KEY`, so this is defence in depth rather than a hole
+    reachable by anyone else.
+
     Logs `EMBEDDING_GUARD_VIOLATION_EVENT` before raising — every caller of this guard (the
     startup check and the per-write build path alike) gets the alarm on the same violation,
     not just whichever one happens to run first.
     """
-    if _PUBLIC_OPENAI_HOST in base_url or _FOUNDRY_HOST_SUFFIX not in base_url:
+    host = urlsplit(base_url).hostname or ""
+    if host == _PUBLIC_OPENAI_HOST or not host.endswith(_FOUNDRY_HOST_SUFFIX):
         logger.warning(EMBEDDING_GUARD_VIOLATION_EVENT, endpoint=base_url)
         raise EmbeddingFoundryOnlyError(
             "embedding access must go through Azure AI Foundry "
@@ -74,8 +79,7 @@ def _build_provider(config: FoundryConfig) -> AzureProvider:
     for this client to drift from. Without them, an unresponsive Foundry endpoint hangs on the
     OpenAI SDK's own default timeout (up to several minutes) with the caller's DB transaction
     still open the whole time — `write_description_embedding` runs before `db.commit()`, so a
-    wedged embed call would hold that connection, not just the one request (review of #191,
-    agc129).
+    wedged embed call would hold that connection, not just the one request.
 
     BUILDS AN EXPLICIT `AsyncAzureOpenAI` IN BOTH AUTH MODES, unlike before: `AzureProvider`'s
     own `azure_endpoint`/`api_key`/`api_version` constructor path has no `timeout=`/
@@ -117,38 +121,72 @@ def _build_provider(config: FoundryConfig) -> AzureProvider:
 
 def build_embedder(config: FoundryConfig) -> Embedder | None:
     """Resolve typed Foundry config to an `Embedder`, or `None` if embeddings aren't
-    configured at all (`embedding_deployment` unset — R20's documented optional-knob
-    exception: semantic search is off, callers fall back to keyword-only)."""
+    configured at all (`embedding_deployment` unset — the documented optional-knob
+    exception: semantic search is off, callers fall back to keyword-only).
+
+    Caches the built `AzureProvider` at module scope as a side effect (`_cached_provider`),
+    so `aclose_embedder` has the underlying HTTP client to close — see `embedder_dependency`
+    for why a fresh client per call is wrong in the first place."""
+    global _cached_provider
     if config.embedding_deployment is None:
         return None
     provider = _build_provider(config)
+    _cached_provider = provider
     model = OpenAIEmbeddingModel(config.embedding_deployment, provider=provider)
     return Embedder(model)
 
 
+_cached_embedder: Embedder | None = None
+_cached_provider: AzureProvider | None = None
+_embedder_resolved = False
+
+
 def embedder_dependency() -> Embedder | None:
-    """The shared embedder, or `None` when Foundry / the embedding deployment isn't
-    configured — a dependency (mirroring `conversations/_shared.py::chat_model`) so tests
-    inject a fake `Embedder` via `dependency_overrides` instead of hitting the real Foundry
-    resource, and so every consumer (the description write path, the marketplace's search
-    query, the duplicate check) resolves the SAME wiring rather than each building its own."""
-    if settings.foundry is None:
-        return None
-    return build_embedder(settings.foundry)
+    """The shared embedder, built ONCE for the life of the process and reused — a dependency
+    (mirroring `conversations/_shared.py::chat_model`) so tests inject a fake `Embedder` via
+    `dependency_overrides` instead of hitting the real Foundry resource, and so every consumer
+    (the description write path, the marketplace's search query, the duplicate check) resolves
+    the SAME wiring AND THE SAME underlying HTTP client — rather than each request building
+    its own fresh `AzureProvider` → `AsyncAzureOpenAI` → `httpx.AsyncClient` (its own TLS
+    handshake and connection pool) that nothing ever closes. `_embedder_resolved` distinguishes
+    "not built yet" from "built, and the answer was `None`" (embeddings unconfigured), since
+    `Embedder | None` alone cannot tell those apart. `aclose_embedder` closes the cached client
+    at shutdown."""
+    global _cached_embedder, _embedder_resolved
+    if not _embedder_resolved:
+        _cached_embedder = None if settings.foundry is None else build_embedder(settings.foundry)
+        _embedder_resolved = True
+    return _cached_embedder
+
+
+async def aclose_embedder() -> None:
+    """Close the shared embedder's underlying HTTP client, if a real one was ever built — a
+    no-op when embeddings aren't configured, or no request has resolved `EmbedderDep` yet."""
+    global _cached_embedder, _cached_provider, _embedder_resolved
+    if _cached_provider is not None:
+        await _cached_provider.client.close()
+    _cached_embedder = None
+    _cached_provider = None
+    _embedder_resolved = False
 
 
 EmbedderDep = Annotated[Embedder | None, Depends(embedder_dependency)]
 
 
 def assert_embedding_guard_at_startup(config: FoundryConfig | None) -> None:
-    """Run the Foundry-only guard once at application boot (R23), so a mis-wired
+    """Run the Foundry-only guard once at application boot, so a mis-wired
     `FOUNDRY__RESOURCE`/`FOUNDRY__EMBEDDING_DEPLOYMENT` fails the deploy rather than
     degrading silently into `EMBEDDING_WRITE_FAILED_EVENT` on the first real write.
 
-    A no-op — not an error — when Foundry or the embedding deployment isn't configured at
-    all: dev/test boot with neither, and that is a supported, deliberate configuration
-    (R20), not a wiring mistake to fail loudly over.
+    Logs `SEMANTIC_SEARCH_STARTUP_STATE_EVENT` in EITHER arm — on, or off — so the state is
+    always visible on boot rather than only discoverable by noticing search behaving oddly.
+
+    Off (`config is None or config.embedding_deployment is None`) is a no-op, not an error:
+    dev/test boot with neither, and that is a supported, deliberate configuration, not a
+    wiring mistake to fail loudly over.
     """
     if config is None or config.embedding_deployment is None:
+        logger.info(SEMANTIC_SEARCH_STARTUP_STATE_EVENT, enabled=False)
         return
     _build_provider(config)  # raises EmbeddingFoundryOnlyError on a bad wire, else discarded
+    logger.info(SEMANTIC_SEARCH_STARTUP_STATE_EVENT, enabled=True)

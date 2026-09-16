@@ -111,11 +111,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # client is provisioned on demand by SESSION-API, not opened here.
     if settings.redis is not None:
         await _probe_redis()
-    # The embedding client's Foundry-only guard (#191 slice 3, R23), run once here rather
-    # than left to the first request that needs it — a mis-wired FOUNDRY__RESOURCE /
-    # FOUNDRY__EMBEDDING_DEPLOYMENT fails the deploy instead of degrading silently into
-    # EMBEDDING_WRITE_FAILED_EVENT on the first citizen's save. A no-op when Foundry or the
-    # embedding deployment isn't configured (dev/test, or semantic search deliberately off).
+    # The embedding client's Foundry-only guard, run once here rather than left to the first
+    # request that needs it — a mis-wired FOUNDRY__RESOURCE / FOUNDRY__EMBEDDING_DEPLOYMENT
+    # fails the deploy instead of degrading silently into EMBEDDING_WRITE_FAILED_EVENT on the
+    # first citizen's save. A no-op when Foundry or the embedding deployment isn't configured
+    # (dev/test, or semantic search deliberately off).
     from src.services.embeddings import assert_embedding_guard_at_startup
 
     assert_embedding_guard_at_startup(settings.foundry)
@@ -130,6 +130,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from src.services.appdb import aclose_maintenance_engine
     from src.services.deploy.aca_publish import aclose_published_apps
     from src.services.deploy.images import aclose_image_builder
+    from src.services.embeddings import aclose_embedder
     from src.services.lake import aclose_lake
     from src.services.redis import aclose_redis
     from src.services.sandbox import aclose_sandbox
@@ -156,6 +157,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         aclose_published_apps,
         aclose_image_builder,
         aclose_lake,
+        aclose_embedder,
     ):
         try:
             await close()

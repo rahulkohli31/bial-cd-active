@@ -1,8 +1,8 @@
-"""Foundry embedding wiring for hybrid search (#191 slice 3). Public surface via explicit
-re-exports."""
+"""Foundry embedding wiring for hybrid search. Public surface via explicit re-exports."""
 
 from src.services.embeddings.client import EmbedderDep as EmbedderDep
 from src.services.embeddings.client import EmbeddingFoundryOnlyError as EmbeddingFoundryOnlyError
+from src.services.embeddings.client import aclose_embedder as aclose_embedder
 from src.services.embeddings.client import (
     assert_embedding_guard_at_startup as assert_embedding_guard_at_startup,
 )

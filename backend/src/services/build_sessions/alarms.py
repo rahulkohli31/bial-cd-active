@@ -153,9 +153,9 @@ BUILD_WORKSPACE_CLAIMED_EVENT: Final = "build_workspace_claimed"
 The first line of a build, and the only one that answers "did this citizen get a slot at all,
 and whose slot was it" — today inferrable only backwards, from a later failure.
 
-Fields: `arm` (`build` | `relaunch` | `ensure_sandbox` — which of the three doors into a
-container this was), `reclaimed` (did reconcile evict a prior holder to get here: one citizen's
-build ending another of their own is invisible otherwise), `lock_wait_ms`."""
+Fields: `arm` (`relaunch` | `ensure_sandbox` | `shared_launch` — which of the three doors into
+a container this was), `reclaimed` (did reconcile evict a prior holder to get here: one
+citizen's build ending another of their own is invisible otherwise), `lock_wait_ms`."""
 
 
 SANDBOX_CONTAINER_CREATED_EVENT: Final = "sandbox_container_created"
