@@ -179,15 +179,13 @@ beforeEach(() => vi.clearAllMocks())
 afterEach(() => cleanup())
 
 describe('what the row names on each address', () => {
-  it('the project screen: back and the project name, and NOT a second copy of the state', () => {
+  it('the project screen: back, the project name, and the state it is in', () => {
     render(<Workspace />)
 
     expect(screen.getByRole('button', { name: 'Back to My Applications' })).toBeTruthy()
     expect(title().textContent).toBe('Visitor Log — Airport Office')
     expect(title().tagName).toBe('H1')
-    // The rail's APP STATUS section already carries this state; a chip beside the title would
-    // repeat it.
-    expect(screen.queryByTestId('publish-chip-stub')).toBeNull()
+    expect(screen.getByTestId('publish-chip-stub').getAttribute('data-project')).toBe('pA')
     expect(screen.queryByTestId('toolbar-chat-kind')).toBeNull()
   })
 
@@ -696,25 +694,28 @@ describe('the Discard control', () => {
   })
 })
 
-describe('the status chip — where the state is said, and where it would be said twice', () => {
-  // The chip duplicates the rail's APP STATUS section, so it appears only where that section is
-  // NOT: on a chat (no rail section) or over a collapsed rail. On the open project screen it
-  // would be a second rendering of the same fact, which is what this row exists to prevent.
+describe('the status chip — the one place that says what state the application is in', () => {
+  // NOTHING ELSE ON THIS SCREEN SAYS IT. The rail beside the toolbar carries a composer and
+  // nothing else, so a chip gated on anything leaves a citizen unable to tell a draft from
+  // something live without changing the layout first.
 
-  it('★ names the project on a chat, where nothing else says the state', () => {
+  it('★ names the project on a chat', () => {
     render(<Workspace entry="/chat/c1" />)
     expect(screen.getByTestId('publish-chip-stub').getAttribute('data-project')).toBe('pA')
   })
 
-  it('★ comes back when the rail that was carrying it is hidden', () => {
+  it('★ stays put across the one layout change a citizen can make here', () => {
+    // Collapsing the chat is the gesture that used to be REQUIRED to see the state at all. It is
+    // now the gesture that must not change the answer — which is the half a "renders the chip"
+    // test on a single layout cannot see.
     render(<Workspace />)
-    expect(screen.queryByTestId('publish-chip-stub')).toBeNull()
+    expect(screen.getByTestId('publish-chip-stub').getAttribute('data-project')).toBe('pA')
 
     fireEvent.click(screen.getByRole('button', { name: 'Hide the chat' }))
     expect(screen.getByTestId('publish-chip-stub').getAttribute('data-project')).toBe('pA')
   })
 
-  it('is drawn ONCE where it is drawn at all — one mount, not two that could word a state differently', () => {
+  it('is drawn ONCE — one mount, not two that could word a state differently', () => {
     render(<Workspace entry="/chat/c1" />)
     expect(screen.getAllByTestId('publish-chip-stub')).toHaveLength(1)
   })

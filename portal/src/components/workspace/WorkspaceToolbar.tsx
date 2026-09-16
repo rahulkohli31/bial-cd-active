@@ -253,13 +253,11 @@ export default function WorkspaceToolbar({
         </h1>
       )}
 
-      {/* ONE PLACE SAYS THE STATE AT A TIME. Chat boards (which have no app-status section) and
-          `Collapsed` (whose section just went off screen) draw the chip beside the title;
-          `PreviewOff`, `Main`, `NewProject` and `NothingBuilt` draw only chevron + title, since
-          the rail is right there carrying the pill. Ungated, the project screen stated the same
-          word twice inside 300px — a `Draft` chip here and a `Draft` pill in the rail — the
-          classic way two renderings of one fact start to disagree. */}
-      {heading.projectId && (isChat || collapsed) && (
+      {/* THE STATE IS ON SCREEN WHEREVER THE APPLICATION IS, and this is the only place that says
+          it. The rail beside this carries a composer and nothing else, so anything gating the chip
+          on the rail's presence leaves a citizen with no way to tell a draft from something live
+          except by collapsing the chat. */}
+      {heading.projectId && (
         <span className="ms-2.5 flex-shrink-0">
           <PublishStatusChip projectId={heading.projectId} />
         </span>
