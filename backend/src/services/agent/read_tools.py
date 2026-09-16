@@ -1,35 +1,30 @@
 """The shared read-only tool surface.
 
-Four tools — `read_file`, `list_files`, `search_files`, `run_command` — as a
-`FunctionToolset` factory over a `ReadOnlyWorkspace` Protocol: a snapshot extraction
-answers about saved code, a live sandbox about the tree in front of the model. WHAT
-these tools allow is written once, here; WHICH workspace answers is a fact about the
-run, not the ability.
+Four tools — `read_file`, `list_files`, `search_files`, `run_command` — as a `FunctionToolset`
+factory over a `ReadOnlyWorkspace` Protocol: a snapshot extraction answers about saved code, a
+live sandbox about the tree in front of the model. WHAT these tools allow is written once,
+here; WHICH workspace answers is a fact about the run, not about the ability.
 
-WHY THIS EXISTS: `run_command` is contained fail-closed and layered — exec-style argv only, no
-shell, so pipes, redirection, and chaining are structurally impossible, and `sh`/`bash` are not
-on the guest list. argv[0] must be on `_GUEST_LIST` (POSIX read-only classics), with per-command
-deny flags catching each binary's write-capable forms (`sed -i`, `find -delete`/`-exec`/
-`-fprintf`, `tail -f`); `sed` additionally goes through a script validator because its danger
-lives in the script argument (`w`/`W` write files, GNU `e` executes) — only the numeric
-range-print form (`sed -n '40,80p' file`) is admitted. Every argv token is vetted against path
-escape (absolute, `~`, `..` segments). WHERE it runs depends on the workspace, and the two differ
-materially: on the LIVE container (the normal case) the command goes through the supervisor into
-the app's own environment — which holds `BIAL_DATABASE_URL` and a Blob SAS — with the
-supervisor's own timeout and secret redaction; on the snapshot fallback (only when no sandbox
-service is configured) it runs jailed on the control-plane server under `_minimal_env` (no DSN,
-no tokens). The policy above is identical either way; the surroundings are not, and the richer
-one is now the normal case. Output is capped, de-escaped, redacted, de-noised, and cut to
-head+tail with the loss stated — mirrors, never imports, `orchestrator/tools`'s
-`_redact_command_output` so this module adds no runtime edge into the sandbox tool module; a
-table-driven test pins the pair identical. `psql` is never on this allowlist.
+The four tool docstrings in `read_only_toolset` are PROMPT COPY: pydantic-ai sends each as the
+tool description, and two render into the Write prompt's `TOOL SURFACE` block. Write the first
+sentence as the prompt line. Refusals teach; there is no "no app exists" case, because a turn's
+workspace always comes from one pinned arm.
 
-THE FOUR TOOL DOCSTRINGS IN `read_only_toolset` ARE PROMPT COPY: pydantic-ai sends each
-as the tool description, and two also render into the Write prompt's `TOOL SURFACE`
-block — `test_prompt.py` catches drift. Write the first sentence as the prompt line.
+WHY THIS EXISTS
 
-Refusals teach (the destructive-SQL sentinel's voice); there is no "no app exists" case
-since a turn's workspace always comes from one pinned arm (`_pin_workspace`).
+`run_command` is contained fail-closed and in layers: exec-style argv only, so pipes,
+redirection and chaining are structurally impossible and no shell is on the guest list; argv[0]
+must be a POSIX read-only classic; per-command deny flags catch each binary's write-capable
+forms (`sed -i`, `find -delete`, `tail -f`); `sed` goes through a script validator because its
+danger lives in the script argument; and every token is vetted for path escape. `psql` is never
+on the allowlist.
+
+WHERE it runs differs materially. On the live container the command goes through the supervisor
+into the app's own environment — which holds a database URL and a Blob SAS — with the
+supervisor's timeout and redaction; on the snapshot fallback it runs jailed on the control
+plane under `_minimal_env`. The policy is identical either way and the richer environment is
+the normal case, so output is capped, redacted and cut to head+tail with the loss stated — a
+mirror of `orchestrator/tools`, pinned identical by a table-driven test rather than imported.
 """
 
 from __future__ import annotations

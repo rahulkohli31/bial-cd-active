@@ -25,10 +25,6 @@ from src.db.models.conversation import Conversation
 from src.db.models.message import Message
 from src.services.messages.store import ATTACHMENT_FILE_REF_KIND, ATTACHMENT_REF_KIND
 
-# NOTE: a deck part's internal Files-API `pdfFileId` release is deferred with the Foundry
-# hosting-mode decision (Azure-hosted Foundry has no Files API to release against; wire it
-# here if Anthropic-hosted mode is confirmed).
-
 
 def _collect_ref_ids(node: Any, ids: set[str]) -> None:
     """Walk one payload tree for attachment reference markers."""

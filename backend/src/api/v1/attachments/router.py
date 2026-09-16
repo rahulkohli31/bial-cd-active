@@ -1,25 +1,24 @@
 """Attachment HTTP endpoints — upload / download / delete, for all ten formats.
 
-THE DOOR ASKS THREE QUESTIONS AND NOTHING DOWNSTREAM ASKS ANY OF THEM AGAIN. Is this file one of
-the ten? Is it under `ATTACHMENT_MAX_BYTES`? Is it whole and unlocked? A file that passes is
-stored as itself, owner-scoped, and read where it can actually be read.
+The door asks three questions and nothing downstream asks any of them again: is this file one
+of the ten, is it under `ATTACHMENT_MAX_BYTES`, and is it whole and unlocked? A file that
+passes is stored as itself, owner-scoped, and read where it can actually be read. Object keys
+are scoped by `user_id` and re-guarded with `assert_owned`; the envelopes are the ported
+`{error:{message,code?}}` / `{ok:true}`.
 
-ONE SIZE FOR EVERY FORMAT, AND ONE PLACE THAT ASKS. There used to be four independently-declared
-per-file byte numbers — this route's, a duplicate inside a decoder that had no callers, the
+WHY THIS EXISTS
+
+ONE SIZE FOR EVERY FORMAT, AND ONE PLACE THAT ASKS. There were four independently-declared
+per-file byte numbers — this route's, a duplicate inside a decoder with no callers, the
 browser's, and the supervisor's write ceiling. Four numbers for one rule is a rule that will
-disagree with itself, and it was one release away from doing so. The others are gone; the browser
-keeps a copy because a citizen should learn a file is too large before uploading it, and a test
-holds the two equal.
+disagree with itself, and it was one release from doing so. The browser keeps a copy so a
+citizen learns a file is too large before uploading it, and a test holds the two equal.
 
-WHAT IS NOT ASKED, DELIBERATELY. Length. A PDF's page count used to be measured in a killable
+WHAT IS NOT ASKED, DELIBERATELY: length. A PDF's page count used to be measured in a killable
 subprocess and capped, because a document was charged a flat figure sized to that cap. Nothing
-prices a document up front any more — the window check reads what the provider reports for a
-completed turn — so the cap was bounding a cost that no longer exists, at the price of a
-dependency, a process governor and a refusal a citizen could not act on. The token cost of a long
-document is the client's to bear.
-
-Object keys are scoped by `user_id` and re-guarded with `assert_owned`; the envelopes are the
-ported `{error:{message,code?}}` / `{ok:true}`.
+prices a document up front now — the window check reads what the provider reports for a
+completed turn — so the cap bounded a cost that no longer exists, at the price of a
+dependency, a process governor and a refusal a citizen could not act on.
 """
 
 from __future__ import annotations
@@ -33,10 +32,9 @@ from typing import Annotated, Any, Final
 import sqlalchemy as sa
 import structlog
 from fastapi import APIRouter, Depends, Request, Response
-from fastapi.responses import JSONResponse
 
 from src.api.deps import CurrentUser, DbSession
-from src.api.v1.attachments.schemas import UploadResponse
+from src.api.v1.attachments.schemas import AttachmentRef, UploadResponse
 
 # The one media type admitted and charged as a document. Imported rather than re-spelled:
 # `_shared.resolve_binaries` is what decides a stored ref IS a document, so a second copy here
@@ -391,6 +389,9 @@ def _assert_pdf_is_whole_and_unlocked(data: bytes, name: str) -> None:
     "",
     status_code=201,
     response_model=UploadResponse,
+    # ABSENT, NOT NULL. The five legacy fields on `AttachmentRef` are never populated by this
+    # route, and the ported body this replaced carried the six real keys and nothing else.
+    response_model_exclude_none=True,
     dependencies=[Depends(_attachment_limiter)],
     responses=error_responses(
         (
@@ -415,7 +416,7 @@ def _assert_pdf_is_whole_and_unlocked(data: bytes, name: str) -> None:
 )
 async def upload_attachment(
     request: Request, user: CurrentUser, db: DbSession, storage: Storage
-) -> JSONResponse:
+) -> UploadResponse:
     # The wire ceiling — refuse a huge body before buffering it. Not the size cap; see the
     # constant for why the two are different questions.
     content_length = request.headers.get("content-length")
@@ -530,7 +531,10 @@ async def upload_attachment(
         db, storage, user.id, attachment_id, media_type, name, conversation_id, data
     )
     kind = chip_kind_for(media_type)
-    return JSONResponse(status_code=201, content={"attachment": {**ref, "kind": kind}})
+    # THE DECLARED SCHEMA IS THE ANSWER NOW. Returning a pre-built response meant FastAPI
+    # validated and filtered nothing, so `response_model` was documentation that could drift
+    # from the body beside it without anything saying so.
+    return UploadResponse(attachment=AttachmentRef.model_validate({**ref, "kind": kind}))
 
 
 async def _load_owned(db: DbSession, user_id: uuid.UUID, attachment_id: str) -> Attachment | None:
@@ -583,7 +587,7 @@ async def download_attachment(
 )
 async def delete_attachment(
     attachment_id: str, user: CurrentUser, db: DbSession, storage: Storage
-) -> JSONResponse:
+) -> OkResponse:
     if not _ID_RE.match(attachment_id):
         raise AppApiError(400, "Invalid attachment id.")
     att = await _load_owned(db, user.id, attachment_id)
@@ -616,4 +620,4 @@ async def delete_attachment(
                 key_count=len(survived),
             )
     # Delete is always idempotent and 200, even when the id is unknown (Express behavior).
-    return JSONResponse(content={"ok": True})
+    return OkResponse(ok=True)

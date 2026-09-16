@@ -62,7 +62,7 @@ async def test_it_reads_an_attachment_and_returns_the_manifest() -> None:
 
 
 async def test_it_refuses_a_path_that_is_not_an_attachment() -> None:
-    """★ THE SCOPE. R14 requires a capability scoped to attachments — never a widening of which
+    """★ THE SCOPE. The capability is scoped to attachments — never a widening of which
     paths the agent may name. A tool that would read any path is a second, unguarded `read_file`,
     and it runs `python3`, which the shared read surface deliberately does not offer.
 

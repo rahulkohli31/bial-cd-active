@@ -521,7 +521,7 @@ def test_a_name_cannot_write_its_own_line_in_the_note() -> None:
 def test_the_note_gives_commands_a_path_they_can_open() -> None:
     """★ BUILD WAS TOLD A PATH NOTHING ON ITS ARM COULD RESOLVE.
 
-    Build has no `read_attachment` tool (R15: it runs, and may edit, the reader through
+    Build has no `read_attachment` tool (it runs, and may edit, the reader through
     `run_command`), and `run_command` executes inside the app folder. The note offered only
     `.attachments/<name>` and a Run line taking `<path>`, so Build ran the reader on a path
     relative to the app folder and got `missing` for a file that was there.

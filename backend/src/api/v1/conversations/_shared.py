@@ -53,7 +53,18 @@ from src.services.storage import ObjectStorage, StorageUnconfiguredError, get_st
 # one to match the browser would silently break the server-materialised paths. If you are here
 # to collapse two numbers into one, that is the reason not to.
 MAX_MESSAGE_TEXT_CHARS = 64_000
-MAX_ATTACHMENT_TEXT_CHARS = 600_000
+
+# ★ THE BLOCK CEILING WAS SIZED FOR A PRODUCER THAT NO LONGER EXISTS. It was 600,000
+# characters because an office extraction arrived this way, and five of those made three
+# megabytes of model-visible text admitted on one turn with no magic-byte check, no lane
+# check, no stored row, no quota and nothing a reclaimer could ever see. Every attachment is
+# an uploaded file now, and the browser populates this list with nothing at all.
+#
+# So it is the typed-text ceiling: a block is prose in the prompt, and prose is what that
+# number bounds. The field itself outlives the producer by one deploy — the portal still puts
+# the key on the wire, so removing it here would refuse every message the shipped browser
+# sends.
+MAX_ATTACHMENT_TEXT_CHARS = MAX_MESSAGE_TEXT_CHARS
 
 # THE FILE COUNT IS THE ONE EXCEPTION TO THE PARAGRAPH ABOVE, and the per-conversation
 # count is why it moved.
@@ -163,12 +174,16 @@ StorageDep = Annotated[ObjectStorage | None, Depends(chat_storage)]
 class TurnMessage(CamelModel):
     """The new message — the ONLY content the browser sends.
 
-    `attachment_texts` are complete, client-built `<attachment …>…</attachment>` fence blocks:
-    inline text files (whose bytes are never uploaded) and office extractions (whose bytes are
-    stored but never model-visible). They are opaque text to this route — fencing/neutralizing
-    happened where the content was assembled, and redaction happens at the persistence seam.
-    `attachment_ids` are owned references to STORED binaries (image/PDF), resolved to base64
-    server-side at send."""
+    `attachment_ids` are owned references to STORED files: the model lane is resolved to base64
+    server-side at send, and the code lane is written into the container.
+
+    `attachment_texts` carries client-built `<attachment …>…</attachment>` fence blocks, and
+    NOTHING PRODUCES ONE ANY MORE. Text files were read in the browser and office files were
+    extracted server-side; both paths are gone, and the shipped composer sends an empty list on
+    every turn. It stays because that composer still sends the KEY, so the field is retired in
+    two steps rather than one: the browser stops sending it, then this goes. Until then the
+    blocks are opaque text bounded like typed prose — fencing happened where the content was
+    assembled, and redaction happens at the persistence seam."""
 
     text: str = Field(max_length=MAX_MESSAGE_TEXT_CHARS)
     attachment_texts: list[str] = Field(default_factory=list, max_length=MAX_ATTACHMENT_BLOCKS)
