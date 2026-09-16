@@ -35,9 +35,19 @@ import {
   SECONDARY_ACTIONS,
 } from '../../utils/publishPresentation'
 import type { ProvenanceRow } from '../../utils/publishPresentation'
+import type { PublishState } from '../../utils/deployApi'
 
 export interface AppStatusPanelProps {
   projectId: string
+  /**
+   * Whatever else an owner may do to the application whose status this is — rendered at the
+   * foot, and given the two facts it needs to decide: the state, and a way to ask again.
+   *
+   * IT IS A CALLBACK RATHER THAN A NODE so the tab below does not need a deployment read of its
+   * own. Two components in one panel each polling the same endpoint is how a screen comes to
+   * show two answers to one question, and it was exactly the arrangement here before this.
+   */
+  actions?: (ctx: { state: PublishState; refresh: () => Promise<void> }) => React.ReactNode
 }
 
 /** The panel's own small-caps label. It was the rail's to draw; there is no rail. */
@@ -204,7 +214,7 @@ function Row({ row }: { row: ProvenanceRow }) {
   )
 }
 
-export default function AppStatusPanel({ projectId }: AppStatusPanelProps) {
+export default function AppStatusPanel({ projectId, actions }: AppStatusPanelProps) {
   const {
     deployment,
     approval,
@@ -353,6 +363,11 @@ export default function AppStatusPanel({ projectId }: AppStatusPanelProps) {
           </button>
         </div>
       )}
+
+      {/* THE FOOT, where anything the owner may do to a LIVE application goes. Below the
+          state's own action rather than beside it: one of them changes which version is
+          serving, and the others do not. */}
+      {actions?.({ state, refresh })}
 
       {showModal && (
         <DataClassificationModal

@@ -578,3 +578,43 @@ describe('the unsaved-work question', () => {
     expect(screen.queryByTestId('status-unsaved')).toBeNull()
   })
 })
+
+/**
+ * ★ THE FOOT SLOT. Whatever else an owner may do to this application is rendered here, and it is
+ * handed the two facts it needs rather than fetching them: the state, and a way to ask again.
+ * That is what lets the Production tab offer Restart and Take down off ONE deployment read
+ * instead of opening a second one beside this panel's.
+ */
+describe('the actions slot', () => {
+  it('★ renders what it is given, with the state the panel read', () => {
+    wire({ deployment: view('live_current') })
+    render(
+      <AppStatusPanel
+        projectId="p1"
+        actions={({ state }) => <span data-testid="slot">{state}</span>}
+      />,
+    )
+    expect(screen.getByTestId('slot').textContent).toBe('live_current')
+  })
+
+  it('hands down a refresh that really re-reads', () => {
+    const refresh = vi.fn()
+    wire({ deployment: view('draft'), refresh })
+    render(
+      <AppStatusPanel
+        projectId="p1"
+        actions={({ refresh: ask }) => <button onClick={() => void ask()}>ask</button>}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'ask' }))
+    expect(refresh).toHaveBeenCalledTimes(1)
+  })
+
+  it('renders nothing extra when nobody passes one', () => {
+    // Liveness beside the absence: the panel is fully drawn, it simply has no foot.
+    wire({ deployment: view('draft') })
+    mount()
+    expect(screen.getByTestId('status-pill').textContent).toContain('Draft')
+    expect(screen.queryByTestId('slot')).toBeNull()
+  })
+})
