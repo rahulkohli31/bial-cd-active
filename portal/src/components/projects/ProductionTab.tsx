@@ -38,6 +38,15 @@ export default function ProductionTab({ projectId, onSettled }: ProductionTabPro
   const [pending, setPending] = useState<Pending>(null)
   const [refusal, setRefusal] = useState<string | null>(null)
   const alive = useRef(true)
+  /**
+   * WHAT ACTUALLY HOLDS THE DOOR, as opposed to what draws the label.
+   *
+   * `pending` is state, and state is read through the closure of the render that created the
+   * handler — so two presses inside one frame both see `null` and both start a request. A ref is
+   * read and written synchronously, which is the only thing that can settle a race decided before
+   * React re-renders. The state beside it exists to say "Restarting…" and nothing else.
+   */
+  const inFlight = useRef<Pending>(null)
 
   useEffect(() => {
     alive.current = true
@@ -52,7 +61,8 @@ export default function ProductionTab({ projectId, onSettled }: ProductionTabPro
       // restart as a no-op on the same operation, which is exactly why the interface must not
       // accept the press: a click that silently does nothing is the failure this plan avoids
       // everywhere else.
-      if (pending !== null) return
+      if (inFlight.current !== null) return
+      inFlight.current = which
       setRefusal(null)
       setPending(which)
       void (async () => {
@@ -68,12 +78,15 @@ export default function ProductionTab({ projectId, onSettled }: ProductionTabPro
           if (!alive.current) return
           setRefusal(err instanceof ApiError ? err.message : 'That did not work. Try again.')
         } finally {
+          // Cleared whether or not this component is still mounted: the ref outlives a tab hop,
+          // and leaving it set would refuse every press on the next mount for ever.
+          inFlight.current = null
           if (alive.current) setPending(null)
           onSettled?.()
         }
       })()
     },
-    [projectId, pending, onSettled],
+    [projectId, onSettled],
   )
 
   return (

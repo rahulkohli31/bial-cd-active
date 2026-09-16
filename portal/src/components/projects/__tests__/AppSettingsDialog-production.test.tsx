@@ -13,7 +13,7 @@
  * screen telling them so, which is why the sentences are asserted rather than the buttons alone.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/react'
 
 const h = vi.hoisted(() => ({
   restartApp: vi.fn(),
@@ -121,6 +121,32 @@ describe('a live application', () => {
     fireEvent.click(restart)
     fireEvent.click(restart)
     expect(h.restartApp).toHaveBeenCalledTimes(1)
+  })
+
+  it('★ …including two presses inside ONE tick, which is what a ref buys over state', async () => {
+    // THE HALF THE TEST ABOVE CANNOT SEE. It waits for the button to go disabled before pressing
+    // again, so a guard held in React state passes it — state is what disabled the button. A
+    // key-repeat on a focused button, or any tight double-click, lands both presses against the
+    // SAME render, where a state read through that render's closure still says "nothing pending"
+    // and two container operations start on one revision.
+    h.restartApp.mockReturnValue(new Promise(() => {}))
+    mount()
+    const restart = screen.getByTestId('production-restart')
+
+    // BOTH EVENTS IN ONE BATCH. React 18 flushes a discrete click synchronously, so two separate
+    // `fireEvent` calls DO re-render in between and a state guard survives them — which is why
+    // the test above cannot see this. Wrapping both in one `act` is the faithful model of two
+    // events arriving in the same task, and there the second handler still reads the first
+    // render's `pending`.
+    act(() => {
+      fireEvent.click(restart)
+      fireEvent.click(restart)
+    })
+
+    expect(h.restartApp).toHaveBeenCalledTimes(1)
+    // Liveness beside the count: the first press really did start, so this is a guard rather than
+    // a render that never wired the handler at all.
+    await waitFor(() => expect(restart.getAttribute('aria-disabled')).toBe('true'))
   })
 
   it('★ and neither does the OTHER control — one operation at a time, not one per button', () => {

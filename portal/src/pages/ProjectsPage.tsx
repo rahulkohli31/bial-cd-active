@@ -884,7 +884,12 @@ export default function ProjectsPage(): React.JSX.Element {
             // The list is the source of truth for what a row says, so a rename saved in the
             // dialog has to reach it — and the dialog itself has to keep showing the stored
             // values rather than the ones it opened with.
-            setSettingsFor(updated)
+            //
+            // ONLY WHILE IT IS STILL OPEN. The name commits on blur, so its answer can land after
+            // the dialog has gone — closed by the X, or by Delete handing off to the confirmation
+            // — and writing a project in from `null` re-opens a dialog nobody asked for, or
+            // stacks it over the confirmation being answered.
+            setSettingsFor((open) => (open === null ? null : updated))
             setReloadNonce((n) => n + 1)
           }}
           onClose={() => setSettingsFor(null)}

@@ -8,7 +8,7 @@
  */
 import { useEffect, useRef } from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, cleanup, within } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, cleanup, within, act } from '@testing-library/react'
 import {
   MemoryRouter,
   Routes,
@@ -26,6 +26,7 @@ const h = vi.hoisted(() => ({
   listProjectConversations: vi.fn(),
   restartApp: vi.fn(),
   takeAppDown: vi.fn(),
+  patchProject: vi.fn(),
 }))
 
 vi.mock('../../utils/projectApi', () => ({
@@ -33,6 +34,7 @@ vi.mock('../../utils/projectApi', () => ({
   listProjectCounts: h.listProjectCounts,
   createProject: h.createProject,
   deleteProject: h.deleteProject,
+  patchProject: h.patchProject,
 }))
 vi.mock('../../utils/deployApi', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -1214,6 +1216,39 @@ describe('ProjectsPage — the production actions', () => {
     await waitFor(() =>
       expect(screen.getByTestId('menu-restart').getAttribute('aria-disabled')).toBe('true'),
     )
+  })
+
+  it('★ a rename that lands after the dialog closed does not bring it back', async () => {
+    // THE NAME COMMITS ON BLUR, so its answer can arrive at any moment afterwards — including
+    // after the X, or after Delete handed off to its confirmation. Writing the returned project
+    // straight back into the page's dialog state re-opened a dialog nobody asked for, and over
+    // the confirmation it stacked a second focus trap in front of the one being answered.
+    let settle: ((value: Project) => void) | null = null
+    h.patchProject.mockReturnValue(new Promise<Project>((resolve) => { settle = resolve }))
+    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Ramp Ops')]))
+    renderPage()
+    await screen.findByText('Ramp Ops')
+
+    await openRowMenu()
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Settings…' }))
+    const dialog = await screen.findByTestId('app-settings-dialog')
+
+    const name = within(dialog).getByLabelText('Application name')
+    fireEvent.change(name, { target: { value: 'Ramp Operations Board' } })
+    fireEvent.blur(name)
+    await waitFor(() => expect(h.patchProject).toHaveBeenCalled())
+
+    fireEvent.click(within(dialog).getByLabelText('Close'))
+    await waitFor(() => expect(screen.queryByTestId('app-settings-dialog')).toBeNull())
+
+    await act(async () => {
+      settle?.(mkProject('p1', 'Ramp Operations Board'))
+      await Promise.resolve()
+    })
+
+    // Still gone. Paired with liveness, because "no dialog" is also what a crashed page looks like.
+    expect(screen.queryByTestId('app-settings-dialog')).toBeNull()
+    expect(screen.getByTestId('project-row')).toBeTruthy()
   })
 
   it('offers neither entry on an application that is not serving', async () => {
