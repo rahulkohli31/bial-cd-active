@@ -752,7 +752,7 @@ describe('create and delete', () => {
     // moment later.
     // AWAITED, because the page deliberately places focus on the NEXT FRAME: doing it inside the
     // close handler moves focus out of a trap that is still armed, and the trap takes it back.
-    await waitFor(() => expect(document.activeElement?.textContent).toBe('Your apps'))
+    await waitFor(() => expect(document.activeElement?.textContent).toBe('My Applications'))
   })
 
   it('an empty page with a non-zero total is NOT the first-run screen', async () => {
@@ -1222,7 +1222,7 @@ describe('ProjectsPage — the production actions', () => {
     await screen.findByText('Draft App')
     await openRowMenu()
     // Liveness beside the absence: the menu opened and carries its ordinary entries.
-    expect(screen.getByRole('menuitem', { name: 'Settings' })).toBeTruthy()
+    expect(screen.getByRole('menuitem', { name: 'Settings…' })).toBeTruthy()
     expect(screen.queryByTestId('menu-restart')).toBeNull()
     expect(screen.queryByTestId('menu-takedown')).toBeNull()
   })

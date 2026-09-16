@@ -122,7 +122,7 @@ export default function RailResizeHandle({ width, onResize, onCommit, controls }
       // have supplied these; hand-building the handle means hand-building them too.
       role="separator"
       aria-orientation="vertical"
-      aria-label="Resize the details column"
+      aria-label="Resize the chat column"
       aria-controls={controls}
       aria-valuenow={width}
       aria-valuemin={RAIL_MIN}

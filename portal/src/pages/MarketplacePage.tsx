@@ -248,7 +248,7 @@ export default function MarketplacePage(): React.JSX.Element {
         <header className="flex flex-col gap-2">
           <h1 className="text-2xl font-bold text-tertiary flex items-center gap-2">
             <Store size={22} />
-            Marketplace
+            App Marketplace
           </h1>
           <p className="text-sm text-neutral">
             Every app published across BIAL. Search before you build — someone may have made

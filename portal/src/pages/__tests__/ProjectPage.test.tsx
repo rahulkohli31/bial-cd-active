@@ -515,7 +515,7 @@ describe('ProjectPage — a dead address says something on the way out', () => {
     fireEvent.click(screen.getByRole('button', { name: 'press back' }))
 
     // LIVENESS: we are genuinely back on the list, and it is the list that is silent.
-    expect(await screen.findByRole('heading', { name: /your apps/i })).toBeTruthy()
+    expect(await screen.findByRole('heading', { name: /my applications/i })).toBeTruthy()
     expect(listSaid()).toBe('')
     expect(screen.queryByTestId('projects-notice-marker')).toBeNull()
   })

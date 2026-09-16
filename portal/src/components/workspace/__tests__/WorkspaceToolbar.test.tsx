@@ -17,6 +17,7 @@ import { useState } from 'react'
 import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, Link, useLocation } from 'react-router-dom'
 import WorkspaceShell from '../WorkspaceShell'
+import NavReveal from '../../layout/NavReveal'
 import { rememberProjectsSearch } from '../../../utils/projectsListMemory'
 import { formatStamp } from '../../../utils/publishPresentation'
 import {
@@ -140,10 +141,27 @@ function Where() {
   return <span data-testid="where">{useLocation().pathname}</span>
 }
 
-/** Both addresses under ONE shell, navigated by link exactly as the product navigates them. */
-function Workspace({ entry = '/projects/pA', project, chat }: { entry?: string; project?: SurfaceProps; chat?: SurfaceProps }) {
-  return (
-    <MemoryRouter initialEntries={[entry]}>
+/**
+ * Both addresses under ONE shell, navigated by link exactly as the product navigates them.
+ *
+ * `nav` puts the real `NavReveal` around it, which is what the shell does in the product. Most
+ * tests here are about the row alone and do not need it; the ones about what the row shows WHILE
+ * THE PANEL IS ON SCREEN cannot be written without it — the menu button renders nothing when
+ * there is no reveal to open.
+ */
+function Workspace({
+  entry = '/projects/pA',
+  project,
+  chat,
+  nav = false,
+}: {
+  entry?: string
+  project?: SurfaceProps
+  chat?: SurfaceProps
+  nav?: boolean
+}) {
+  const inside = (
+    <>
       <Where />
       <Routes>
         <Route element={<WorkspaceShell />}>
@@ -168,6 +186,11 @@ function Workspace({ entry = '/projects/pA', project, chat }: { entry?: string; 
         </Route>
         <Route path="/projects" element={<div data-testid="projects-list" />} />
       </Routes>
+    </>
+  )
+  return (
+    <MemoryRouter initialEntries={[entry]}>
+      {nav ? <NavReveal hideable>{inside}</NavReveal> : inside}
     </MemoryRouter>
   )
 }
@@ -1264,5 +1287,20 @@ describe('the token ring in the toolbar', () => {
     render(<Workspace />)
     fireEvent.click(screen.getByTestId('toolbar-collapse'))
     expect(row().contains(screen.getByTestId('usage-meter'))).toBe(true)
+  })
+
+  it('★ stands IN for the panel\'s counter rather than joining it', () => {
+    // The requirement is a reading that never stops being visible — ONE reading. Summoning the
+    // navigation puts the panel's own counter on screen, and without this both drew the same two
+    // numbers in one view: not a second opinion, a second chance to disagree.
+    h.usage.mockReturnValue(USAGE)
+    render(<Workspace nav />)
+    expect(row().querySelector('[data-testid="usage-meter"]')).not.toBeNull()
+
+    fireEvent.click(screen.getByTestId('nav-menu-button'))
+    // The reading did not disappear, it MOVED — the panel is what carries it now.
+    expect(screen.getByTestId('nav-panel')).toBeTruthy()
+    expect(row().querySelector('[data-testid="usage-meter"]')).toBeNull()
+    expect(screen.getAllByTestId('usage-meter')).toHaveLength(1)
   })
 })

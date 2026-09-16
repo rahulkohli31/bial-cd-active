@@ -44,7 +44,7 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
 } from '../ui/dropdown-menu'
-import { NavMenuButton } from '../layout/NavReveal'
+import { NavMenuButton, useNavReveal } from '../layout/NavReveal'
 import { BusyGlyph, useElapsedSeconds, ELAPSED_AFTER_MS } from '../ui/Waiting'
 import { usePublishState } from '../../hooks/usePublishState'
 import { chatKindFor } from '../../utils/chatKind'
@@ -115,6 +115,9 @@ export default function WorkspaceToolbar({
   const projectActions = !isChat && heading.projectName !== null ? heading.projectName : null
 
   const usage = useUsageToday()
+  // The panel carries a counter of its own, so the toolbar's is the STAND-IN for it — see
+  // where it is drawn below.
+  const navOnScreen = useNavReveal()?.open === true
 
   return (
     <div
@@ -336,8 +339,11 @@ export default function WorkspaceToolbar({
         {/* THE TOKEN COUNTER FOLLOWS THE CITIZEN INTO THE WORKSPACE, which is the one screen
             where tokens are actually spent. It lives in the navigation panel, and the panel is
             hidden here — so without this the reading the client requires to stay visible is
-            exactly absent where it matters most. Same hook, same figures, a smaller ring. */}
-        {usage && (
+            exactly absent where it matters most. Same hook, same figures, a smaller ring.
+            IT STANDS IN FOR THE PANEL'S, it does not join it: while the panel is on screen —
+            revealed over the work, or docked beside it — both drew the same figures twice in one
+            view, which is how two renderings of one number start to disagree. */}
+        {usage && !navOnScreen && (
           <span className="flex-shrink-0">
             <TokenRing usage={usage} compact />
           </span>

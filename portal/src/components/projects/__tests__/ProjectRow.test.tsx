@@ -216,7 +216,7 @@ describe('ProjectRow — no nested interactive elements, still', () => {
  */
 describe('ProjectRow — Restart and Take down', () => {
   it.each([
-    ['Restart app', 'menu-restart'],
+    ['Restart', 'menu-restart'],
     ['Take down', 'menu-takedown'],
   ])('offers %s only while the application is serving', async (label, testid) => {
     // Absence PAIRED WITH LIVENESS. The menu really opened and really carries its other

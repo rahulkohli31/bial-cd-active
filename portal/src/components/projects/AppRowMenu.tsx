@@ -75,7 +75,7 @@ export default function AppRowMenu({ appName, onOpen, onSettings, onDelete, live
           className="gap-2 rounded-sm px-2 py-1.5 text-sm text-primary-900 focus:bg-surface-muted"
         >
           <Settings size={15} />
-          Settings
+          Settings…
         </DropdownMenuItem>
         {live && (
           <>
@@ -94,7 +94,7 @@ export default function AppRowMenu({ appName, onOpen, onSettings, onDelete, live
               className="gap-2 rounded-sm px-2 py-1.5 text-sm text-primary-900 focus:bg-surface-muted aria-disabled:opacity-50"
             >
               <RotateCcw size={15} />
-              Restart app
+              Restart
             </DropdownMenuItem>
             <DropdownMenuItem
               data-testid="menu-takedown"

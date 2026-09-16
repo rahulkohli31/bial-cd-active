@@ -533,7 +533,7 @@ export default function ProjectsPage(): React.JSX.Element {
 
       <main className="flex-1 max-w-6xl mx-auto w-full px-6 py-8">
         <h1 ref={headingRef} tabIndex={-1} className="text-2xl font-extrabold text-tertiary outline-none">
-          Your apps
+          My Applications
         </h1>
         <p className="text-sm text-neutral mt-1">
           Each application is one tool — its screens, its description, and its chats.
