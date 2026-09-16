@@ -74,8 +74,14 @@ TIME_LIMIT_SECONDS = 30
 # pool is mostly reservation rather than memory in use: measured in this image, a 512 MB
 # `RLIMIT_AS` aborts polars before it reads a byte, and the process dies with an allocator panic
 # that reads as a broken container rather than a refused file. `RLIMIT_DATA` bounds the data the
-# process actually asks for, so polars runs and a genuinely oversized read still raises
-# `MemoryError` — verified both ways rather than assumed.
+# process actually asks for, so polars runs and an oversized read raises `MemoryError` on the
+# paths that allocate through Python.
+#
+# IT IS NOT A GUARANTEE ON EVERY PATH, and saying otherwise hid a real failure. polars
+# allocates through Rust, whose allocator ABORTS when it cannot satisfy a request rather than
+# raising anything Python can catch: the process dies on a signal with an empty stdout, which
+# breaks the one-object-and-exit-0 contract this reader otherwise keeps. Nothing in here can
+# catch it, so the caller names it — see `attachment_tools.read`.
 MEMORY_LIMIT_BYTES = 512 * 1024 * 1024
 
 # How much of any unbounded list is shown. The true total always rides beside it.
@@ -307,7 +313,12 @@ def read_xlsx(path: Path) -> dict[str, Any]:
         width = max(len(header_values), len(probe_values))
 
         rows, cols = declared_rows, max(declared_cols, width)
-        if not declared_rows or declared_cols < width:
+        # `width == 0` JOINS THE WALK, and that is the empty-workbook case. A new workbook
+        # declares `A1:A1`, so believing the record reports one row and one column for a
+        # sheet holding nothing — `ok: true` over an empty file, which the module docstring
+        # promises never to produce. It also covers a sheet whose first rows are blank and
+        # whose data starts further down, where 0 would be just as wrong.
+        if not declared_rows or declared_cols < width or width == 0:
             # WALKED ONLY WHEN THE RECORD IS ABSENT OR CAUGHT OUT. openpyxl's `write_only` writer
             # emits no dimension at all, and a record narrower than the row underneath it has
             # already been proved wrong — in both cases a walk is the only way to the real shape.
@@ -429,6 +440,29 @@ def _text_encoding(path: Path) -> str:
     return "utf-8"
 
 
+_CANDIDATE_SEPARATORS = (",", chr(9), ";", "|")
+
+
+def _separator(path: Path, encoding: str, default: str) -> str:
+    """The delimiter the file actually uses, not the one its extension implies.
+
+    ★ A SEMICOLON CSV IS THE LOCALE DEFAULT ACROSS MUCH OF EUROPE, and Excel writes it
+    whenever the machine's list separator says so. Read as comma-delimited it parses
+    perfectly into ONE column called `gate;owner;busy`, and an agent builds a schema from
+    that — a wrong answer with nothing in it that looks wrong.
+
+    Judged on the header line, where a delimiter repeats and a stray one in prose does not.
+    The extension's own separator wins a tie, so an ordinary file keeps the behaviour it had.
+    """
+    with path.open("rb") as handle:
+        head = handle.read(_ENCODING_SAMPLE_BYTES)
+    lines = head.decode(encoding, errors="replace").splitlines()
+    line = lines[0] if lines else ""
+    counts = {candidate: line.count(candidate) for candidate in _CANDIDATE_SEPARATORS}
+    best = max(_CANDIDATE_SEPARATORS, key=lambda candidate: counts[candidate])
+    return best if counts[best] > counts[default] else default
+
+
 def _as_utf8(path: Path, encoding: str) -> Path:
     """The same file rewritten as UTF-8, for a scanner that reads nothing else.
 
@@ -464,6 +498,7 @@ def read_delimited(path: Path, separator: str) -> dict[str, Any]:
     import polars as pl
 
     encoding = _text_encoding(path)
+    separator = _separator(path, encoding, separator)
     source = path if encoding == "utf-8" else _as_utf8(path, encoding)
     try:
         lazy = pl.scan_csv(source, separator=separator, infer_schema_length=10_000)
@@ -491,14 +526,21 @@ def read_delimited(path: Path, separator: str) -> dict[str, Any]:
         if source is not path:
             source.unlink(missing_ok=True)
 
+    # BOUNDED BEFORE IT IS BUILT, rather than after. `_listing` keeps 50 entries and throws
+    # the rest away — but the comprehension had already asked polars for a null count and a
+    # distinct count per column, two full scans each, for columns nobody would ever see.
+    # Measured at 10,000 columns: 34 seconds, which spends the whole deadline on a 0.11 MB
+    # file and answers `timeout` with advice to attach a smaller one. The schema is hoisted
+    # for the same reason — `frame.schema` rebuilds the whole mapping on every access.
+    schema = frame.schema
     columns = [
         {
             "name": _clip(name),
-            "type": str(frame.schema[name]),
+            "type": str(schema[name]),
             "nulls": int(frame[name].null_count()),
             "distinct": int(frame[name].n_unique()),
         }
-        for name in frame.columns
+        for name in frame.columns[:MAX_ITEMS]
     ]
     sample = [
         {_clip(k): _clip(v) for k, v in row.items()}
@@ -511,7 +553,12 @@ def read_delimited(path: Path, separator: str) -> dict[str, Any]:
     return {
         "rows": frame.height,
         "encoding": encoding,
-        "columns": _listing(columns),
+        # WHICH DELIMITER PRODUCED THESE COLUMNS. A file read with the wrong one still
+        # parses, into one column wearing every heading at once, so the answer has to say
+        # which separator it used for the reader of it to tell.
+        "separator": separator,
+        # `total` is every column the file has; `shown` is the 50 described above.
+        "columns": {"total": frame.width, "shown": columns},
         "sampleRows": sample,
     }
 
@@ -541,17 +588,30 @@ def read_docx(path: Path) -> dict[str, Any]:
             "Open it in Word, re-save it as .docx, and attach it again.",
         ) from None
 
+    # BOUNDED AS IT GOES, and the totals counted separately. Building every paragraph of a
+    # 400-page report to show fifty is the shape that cost the delimited reader its whole
+    # deadline; here it costs memory the reader is bounded on, against a file the door
+    # admits at 10 MB.
     paragraphs, headings = [], []
+    paragraph_count = heading_count = 0
     for para in document.paragraphs:
         text = para.text.strip()
         if not text:
             continue
         if (para.style.name or "").startswith("Heading"):
-            headings.append({"level": para.style.name, "text": _clip(text)})
-        paragraphs.append(_clip(text))
+            heading_count += 1
+            if len(headings) < MAX_ITEMS:
+                headings.append({"level": para.style.name, "text": _clip(text)})
+        paragraph_count += 1
+        if len(paragraphs) < MAX_ITEMS:
+            paragraphs.append(_clip(text))
 
     tables = []
+    table_count = 0
     for table in document.tables:
+        table_count += 1
+        if len(tables) >= MAX_ITEMS:
+            continue
         rows = table.rows
         header = [_clip(c.text.strip()) for c in rows[0].cells] if rows else []
         body = [[_clip(c.text.strip()) for c in r.cells] for r in rows[1 : 1 + MAX_SAMPLE_ROWS]]
@@ -567,9 +627,9 @@ def read_docx(path: Path) -> dict[str, Any]:
         )
 
     return {
-        "paragraphs": _listing(paragraphs),
-        "headings": _listing(headings),
-        "tables": _listing(tables),
+        "paragraphs": {"total": paragraph_count, "shown": paragraphs},
+        "headings": {"total": heading_count, "shown": headings},
+        "tables": {"total": table_count, "shown": tables},
         "media": _zip_media(path),
     }
 
@@ -746,6 +806,54 @@ def describe(path: Path) -> dict[str, Any]:
     return {"ok": True, "file": path.name, "kind": path.suffix.lower().lstrip("."), **body}
 
 
+MAX_MANIFEST_CHARS = 200_000
+_TRIMMED_ITEMS = 5
+
+
+def _without(node: Any, key: str) -> Any:
+    """The manifest with one key dropped wherever it appears."""
+    if isinstance(node, list):
+        return [_without(item, key) for item in node]
+    if isinstance(node, dict):
+        return {k: _without(v, key) for k, v in node.items() if k != key}
+    return node
+
+
+def _shorter_listings(node: Any, limit: int) -> Any:
+    """Every bounded list cut further, with its `total` left alone — the whole is the part
+    of a listing an agent reasons about, and it costs nothing to keep."""
+    if isinstance(node, list):
+        return [_shorter_listings(item, limit) for item in node]
+    if isinstance(node, dict):
+        shrunk = {k: _shorter_listings(v, limit) for k, v in node.items()}
+        shown = shrunk.get("shown")
+        if isinstance(shown, list):
+            shrunk["shown"] = shown[:limit]
+        return shrunk
+    return node
+
+
+def _within_budget(result: dict[str, Any]) -> dict[str, Any]:
+    """The manifest, trimmed if it would flood the window it is returned into.
+
+    ★ THE PER-LIST CAPS MULTIPLY, which is why a bound on the whole is a separate thing from
+    the bounds on its parts. Fifty slides each holding fifty tables of fifty cells sits inside
+    every individual cap and is tens of megabytes as one answer — and this is handed to the
+    model verbatim, so a single oversized reply costs the turn it was meant to serve.
+
+    Sample rows go first and described columns second, because a count is what an agent
+    reasons about and a sample is the illustration. `manifestTrimmed` says it happened, since
+    a quietly shortened answer is the confidently-wrong shape this reader exists to remove.
+    """
+    if len(json.dumps(result, default=str)) <= MAX_MANIFEST_CHARS:
+        return result
+    trimmed = _without(result, "sampleRows")
+    if len(json.dumps(trimmed, default=str)) > MAX_MANIFEST_CHARS:
+        trimmed = _shorter_listings(trimmed, _TRIMMED_ITEMS)
+    trimmed["manifestTrimmed"] = True
+    return trimmed
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(
@@ -777,7 +885,7 @@ def main(argv: list[str]) -> int:
     finally:
         if hasattr(signal, "SIGALRM"):
             signal.alarm(0)
-    print(json.dumps(result, default=str))
+    print(json.dumps(_within_budget(result), default=str))
     return 0
 
 
