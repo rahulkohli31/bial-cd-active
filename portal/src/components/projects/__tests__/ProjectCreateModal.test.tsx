@@ -12,6 +12,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
 import ProjectCreateModal from '../ProjectCreateModal'
 import type { Project } from '../../../utils/projectApi'
+import type { MarketplaceEntry } from '../../../utils/marketplaceApi'
 import { MIN_PROJECT_DESCRIPTION_WORDS, MAX_PROJECT_DESCRIPTION_WORDS, MAX_PROJECT_NAME_WORDS } from '../../../utils/words'
 
 const h = vi.hoisted(() => ({
@@ -238,6 +239,38 @@ describe('ProjectCreateModal — submit', () => {
 
     await act(async () => {
       d.resolve(makeProject())
+      await Promise.resolve()
+    })
+  })
+
+  it('disables the name and description fields too, not only the buttons', async () => {
+    const d = deferred<Project>()
+    h.createProject.mockReturnValue(d.promise)
+    render(<ProjectCreateModal onClose={vi.fn()} onCreated={vi.fn()} />)
+    fillValid()
+
+    fireEvent.click(createBtn())
+    await waitFor(() => expect(nameInput().disabled).toBe(true))
+    expect(descriptionInput().disabled).toBe(true)
+
+    await act(async () => {
+      d.resolve(makeProject())
+      await Promise.resolve()
+    })
+  })
+
+  it('disables the name and description fields during the duplicate-check round trip too', async () => {
+    const d = deferred<MarketplaceEntry[]>()
+    h.checkDuplicateProjects.mockReturnValue(d.promise)
+    render(<ProjectCreateModal onClose={vi.fn()} onCreated={vi.fn()} />)
+    fillValid()
+
+    fireEvent.click(createBtn())
+    await waitFor(() => expect(nameInput().disabled).toBe(true))
+    expect(descriptionInput().disabled).toBe(true)
+
+    await act(async () => {
+      d.resolve([])
       await Promise.resolve()
     })
   })

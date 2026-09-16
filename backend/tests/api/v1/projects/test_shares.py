@@ -15,6 +15,7 @@ import uuid
 
 import pytest
 from pydantic import SecretStr
+from sqlalchemy import select
 
 from src.api.v1.build_sessions.deps import (
     sandbox_dependency,
@@ -22,10 +23,14 @@ from src.api.v1.build_sessions.deps import (
     session_manager_dependency,
 )
 from src.config import settings
+from src.db.models.audit import AuditLog
 from src.db.models.project import Project
+from src.services.auth.csrf import issue_csrf_token
+from src.services.auth.session_jwt import mint_session_jwt
 from src.services.build_sessions import SessionManager
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.build_sessions.manager import shr_name_for
+from src.services.sandbox import SandboxError
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import accessor as storage_accessor
 from src.services.storage import snapshot_key
@@ -127,6 +132,57 @@ async def test_share_succeeds_and_returns_the_recipient(client, db_session, bind
     assert body["sharedWithUserId"] == str(colleague.id)
     assert body["sharedWithDisplayName"] == "Colleague Name"
     assert body["sharedWithEmailLocalPart"] == "colleague"
+
+
+async def test_share_writes_an_audit_row(client, db_session, bind_store) -> None:
+    """`append_audit` could be deleted from `create_share` and the suite would stay green
+    without an assertion like this one — the audit trail is the only record of who was given
+    access and when (the closest thing to attribution a shared-database design has)."""
+    headers, owner = await _auth(db_session)
+    project_id = await _mint_project_with_snapshot(client, headers, owner, db_session, bind_store)
+    colleague = await UserFactory.create(db_session, email="colleague@example.com")
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/v1/projects/{project_id}:share",
+        headers=headers,
+        json={"sharedWithUserId": str(colleague.id)},
+    )
+    assert resp.status_code == 200, resp.text
+
+    audit = await db_session.scalar(
+        select(AuditLog).where(
+            AuditLog.action == "project:share_create", AuditLog.resource_id == project_id
+        )
+    )
+    assert audit is not None
+    assert audit.actor_id == owner.id
+    assert audit.detail is not None
+    assert audit.detail["sharedWithUserId"] == str(colleague.id)
+
+
+async def test_re_sharing_writes_no_second_audit_row(client, db_session, bind_store) -> None:
+    headers, owner = await _auth(db_session)
+    project_id = await _mint_project_with_snapshot(client, headers, owner, db_session, bind_store)
+    colleague = await UserFactory.create(db_session, email="colleague@example.com")
+    await db_session.commit()
+
+    for _ in range(2):
+        resp = await client.post(
+            f"/v1/projects/{project_id}:share",
+            headers=headers,
+            json={"sharedWithUserId": str(colleague.id)},
+        )
+        assert resp.status_code == 200, resp.text
+
+    rows = (
+        await db_session.scalars(
+            select(AuditLog).where(
+                AuditLog.action == "project:share_create", AuditLog.resource_id == project_id
+            )
+        )
+    ).all()
+    assert len(rows) == 1
 
 
 async def test_share_refuses_self_share(client, db_session, bind_store) -> None:
@@ -254,6 +310,79 @@ async def test_unshare_removes_the_share_and_is_idempotent(client, db_session, b
 
     shares = await client.get(f"/v1/projects/{project_id}/shares", headers=headers)
     assert shares.json()["shares"] == []
+
+
+async def test_unshare_writes_an_audit_row(client, db_session, bind_store) -> None:
+    """`append_audit` could be deleted from `revoke_share` and the suite would stay green
+    without an assertion like this one."""
+    headers, owner = await _auth(db_session)
+    project_id = await _mint_project_with_snapshot(client, headers, owner, db_session, bind_store)
+    colleague = await UserFactory.create(db_session, email="colleague@example.com")
+    await db_session.commit()
+    await client.post(
+        f"/v1/projects/{project_id}:share",
+        headers=headers,
+        json={"sharedWithUserId": str(colleague.id)},
+    )
+
+    resp = await client.post(
+        f"/v1/projects/{project_id}:unshare",
+        headers=headers,
+        json={"sharedWithUserId": str(colleague.id)},
+    )
+    assert resp.status_code == 200, resp.text
+
+    audit = await db_session.scalar(
+        select(AuditLog).where(
+            AuditLog.action == "project:share_revoke", AuditLog.resource_id == project_id
+        )
+    )
+    assert audit is not None
+    assert audit.actor_id == owner.id
+    assert audit.detail is not None
+    assert audit.detail["sharedWithUserId"] == str(colleague.id)
+
+
+async def test_unshare_retries_teardown_after_a_failure(
+    client, db_session, bind_store, wired_sandbox, _sandbox_configured, fake_redis
+) -> None:
+    """A revoke that half-fails (the share row is gone, the container is not) must be
+    completable by pressing the same button again — teardown is attempted on every call this
+    endpoint answers 200 from, not only the one that actually deleted the row."""
+    manager, sbx = wired_sandbox
+    headers, owner = await _auth(db_session)
+    project_id = await _mint_project_with_snapshot(client, headers, owner, db_session, bind_store)
+    colleague = await UserFactory.create(db_session, email="colleague@example.com")
+    await db_session.commit()
+    await client.post(
+        f"/v1/projects/{project_id}:share",
+        headers=headers,
+        json={"sharedWithUserId": str(colleague.id)},
+    )
+    app_id = await resolve_app_for_project(db_session, owner.id, uuid.UUID(project_id))
+    await db_session.commit()
+    project = await db_session.get(Project, uuid.UUID(project_id))
+    await manager.launch_shared_preview(db_session, colleague, project, sbx)
+    shared_name = shr_name_for(app_id, colleague.id)
+
+    sbx.teardown_error = SandboxError("ACA delete wedged")
+    first = await client.post(
+        f"/v1/projects/{project_id}:unshare",
+        headers=headers,
+        json={"sharedWithUserId": str(colleague.id)},
+    )
+    assert first.status_code == 503
+    assert shared_name not in sbx.torn_down  # the row is gone; the container is still not
+
+    sbx.teardown_error = None
+    second = await client.post(
+        f"/v1/projects/{project_id}:unshare",
+        headers=headers,
+        json={"sharedWithUserId": str(colleague.id)},
+    )
+    assert second.status_code == 200
+    assert second.json() == {"ok": True}
+    assert shared_name in sbx.torn_down  # the retry actually retried
 
 
 async def test_unshare_404s_for_someone_else_s_project(client, db_session, bind_store) -> None:
@@ -510,6 +639,86 @@ async def test_a_share_recipient_cannot_share_the_project_onward(
         f"/v1/projects/{project_id}:share",
         headers=recipient_headers,
         json={"sharedWithUserId": str(third_party.id)},
+    )
+    assert resp.status_code == 404
+
+
+def _csrf_headers(user) -> dict[str, str]:
+    """A signed-in browser's cookies, session AND csrf together — required by any route
+    carrying `RequireCsrf` (save, relaunch, conversation-create). Mirrors
+    `tests/api/v1/build_sessions/conftest.py::auth_headers`; that fixture lives in a sibling
+    package this file does not otherwise depend on, so it is reproduced locally rather than
+    reached into."""
+    jwt = mint_session_jwt(user.id, user.token_version, settings.auth.access_ttl_seconds)
+    csrf = issue_csrf_token(user.id, user.token_version)
+    return {"Cookie": f"session={jwt}; csrf={csrf}", "X-CSRF-Token": csrf}
+
+
+async def _shared_project(client, db_session, bind_store):
+    """An owner's saved project, shared with a fresh recipient. Returns
+    `(project_id, owner, owner_headers, recipient_headers)`."""
+    owner_headers, owner = await _auth(db_session)
+    project_id = await _mint_project_with_snapshot(
+        client, owner_headers, owner, db_session, bind_store
+    )
+    recipient_headers, recipient = await _auth(db_session)
+    await client.post(
+        f"/v1/projects/{project_id}:share",
+        headers=owner_headers,
+        json={"sharedWithUserId": str(recipient.id)},
+    )
+    return project_id, owner, owner_headers, _csrf_headers(recipient)
+
+
+async def test_a_share_recipient_is_refused_relaunch(
+    client, db_session, bind_store, _sandbox_configured
+) -> None:
+    """R14's API half: a recipient must be refused on the actions that matter, not only on
+    the project CRUD routes. `relaunch_preview` calls `owned_project_or_404` directly — this
+    pins that against a regression that widens it to `resolve_project_access`."""
+    project_id, _owner, _owner_headers, recipient_headers = await _shared_project(
+        client, db_session, bind_store
+    )
+
+    resp = await client.post(
+        "/v1/build-sessions/relaunch",
+        headers=recipient_headers,
+        json={"projectId": project_id},
+    )
+    assert resp.status_code == 404
+
+
+async def test_a_share_recipient_is_refused_save(
+    client, db_session, bind_store, _sandbox_configured
+) -> None:
+    project_id, _owner, _owner_headers, recipient_headers = await _shared_project(
+        client, db_session, bind_store
+    )
+
+    resp = await client.post(
+        f"/v1/build-sessions/projects/{project_id}/save", headers=recipient_headers
+    )
+    assert resp.status_code == 404
+
+
+async def test_a_share_recipient_is_refused_starting_a_chat(
+    client, db_session, bind_store
+) -> None:
+    """Covers both Ask/Plan and Build turns at once: a chat is created before its first
+    message can be sent, and this is the one place ownership is checked for that create."""
+    project_id, _owner, _owner_headers, recipient_headers = await _shared_project(
+        client, db_session, bind_store
+    )
+
+    resp = await client.post(
+        "/v1/conversations",
+        headers=recipient_headers,
+        json={
+            "id": str(uuid.uuid4()),
+            "projectId": project_id,
+            "kind": "build",
+            "title": "Hijacked",
+        },
     )
     assert resp.status_code == 404
 

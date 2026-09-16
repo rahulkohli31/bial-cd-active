@@ -9,7 +9,7 @@
  */
 import { it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup, waitFor, fireEvent } from '@testing-library/react'
-import { MemoryRouter, Routes, Route } from 'react-router-dom'
+import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
 import SharedProjectPage from '../SharedProjectPage'
 import type { Project } from '../../utils/projectApi'
 import { ApiError } from '../../utils/apiError'
@@ -63,12 +63,22 @@ const makeProject = (over: Partial<Project> = {}): Project => ({
   ...over,
 })
 
+/** Reports the router state `/projects` was reached with — the one-shot channel that puts a
+ *  recipient back on "Shared with me" rather than "My projects" (a first-run "New project"
+ *  screen for a citizen who owns nothing of their own). */
+function ProjectsPageProbe(): React.JSX.Element {
+  const { state } = useLocation()
+  return (
+    <div data-testid="projects-page" data-tab={(state as { tab?: string } | null)?.tab ?? ''} />
+  )
+}
+
 function renderAt(projectId = 'p1') {
   return render(
     <MemoryRouter initialEntries={[`/shared/${projectId}`]}>
       <Routes>
         <Route path="/shared/:projectId" element={<SharedProjectPage />} />
-        <Route path="/projects" element={<div data-testid="projects-page" />} />
+        <Route path="/projects" element={<ProjectsPageProbe />} />
         <Route path="/projects/:projectId" element={<div data-testid="owner-workspace" />} />
       </Routes>
     </MemoryRouter>,
@@ -229,4 +239,21 @@ it('hands over the recipients own build (never giveUpSharedView) when the occupa
   )
   expect(h.giveUpSharedView).not.toHaveBeenCalled()
   await waitFor(() => expect(h.launchSharedPreview).toHaveBeenCalledTimes(2)) // retried
+})
+
+it('"Back to projects" carries router state that opens "Shared with me", not "My projects"', async () => {
+  h.getProject.mockResolvedValue(makeProject())
+  h.launchSharedPreview.mockResolvedValue({
+    appId: 'app-1',
+    previewUrl: 'https://example.test/',
+    ready: true,
+    snapshotTakenAt: null,
+  })
+  renderAt()
+  await waitFor(() => expect(h.launchSharedPreview).toHaveBeenCalled())
+
+  fireEvent.click(screen.getByRole('button', { name: /back to projects/i }))
+
+  const target = await screen.findByTestId('projects-page')
+  expect(target.dataset.tab).toBe('shared')
 })

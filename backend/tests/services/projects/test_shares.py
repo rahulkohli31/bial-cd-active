@@ -1,4 +1,4 @@
-"""Sharing business logic (#198 R1-R11) — `services/projects/shares.py` exercised directly
+"""Sharing business logic — `services/projects/shares.py` exercised directly
 against a real DB session, isolated from the HTTP layer so idempotency, self-share refusal,
 and the snapshot-presence gate are pinned independent of how the router wires them.
 
@@ -9,11 +9,14 @@ override (this module has no `app` in scope).
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from src.core.errors import AppApiError
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.projects.shares import (
+    MAX_COLLEAGUE_RESULTS,
     create_share,
     list_shared_with_me,
     list_shares_for_project,
@@ -174,6 +177,27 @@ async def test_colleague_search_never_matches_a_substring_mid_token(db_session) 
     assert results == []
 
 
+async def test_colleague_search_never_matches_a_substring_of_a_shared_email_domain(
+    db_session,
+) -> None:
+    """The scenario R4's own anchored-match rule exists for: on a tenant where every user
+    shares one email domain, a query matching a substring of that domain must not match every
+    user in it — only the START of the local part, never anywhere in the domain."""
+    requester = await UserFactory.create(db_session)
+    await UserFactory.create(db_session, email="anyone@example.com", display_name=None)
+    # "xamp" is a mid-domain substring of every "@example.com" address — must NOT match.
+    results = await search_colleagues(db_session, requester_id=requester.id, query="xamp")
+    assert results == []
+
+
+async def test_colleague_search_caps_at_ten_results(db_session) -> None:
+    requester = await UserFactory.create(db_session)
+    for i in range(MAX_COLLEAGUE_RESULTS + 5):
+        await UserFactory.create(db_session, email=f"cand{i}@example.com", display_name=f"Cand{i}")
+    results = await search_colleagues(db_session, requester_id=requester.id, query="Cand")
+    assert len(results) == MAX_COLLEAGUE_RESULTS
+
+
 async def test_colleague_search_matches_the_start_of_the_email_local_part(db_session) -> None:
     requester = await UserFactory.create(db_session)
     match = await UserFactory.create(db_session, email="priya.k@example.com", display_name=None)
@@ -184,6 +208,21 @@ async def test_colleague_search_matches_the_start_of_the_email_local_part(db_ses
 async def test_colleague_search_excludes_the_requester(db_session) -> None:
     requester = await UserFactory.create(db_session, display_name="Selfsame")
     results = await search_colleagues(db_session, requester_id=requester.id, query="Self")
+    assert results == []
+
+
+async def test_colleague_search_excludes_a_locally_suspended_user(db_session) -> None:
+    """Not a security boundary — a share with a suspended colleague would still stand — but
+    offering them through the picker is a misleading result: a name that reads as pickable for
+    someone who cannot currently sign in to use what they'd be granted."""
+    requester = await UserFactory.create(db_session)
+    await UserFactory.create(
+        db_session,
+        email="suspended@example.com",
+        display_name="Suspended Sam",
+        suspended_at=datetime.now(UTC),
+    )
+    results = await search_colleagues(db_session, requester_id=requester.id, query="Susp")
     assert results == []
 
 

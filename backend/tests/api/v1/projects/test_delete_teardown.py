@@ -762,6 +762,45 @@ async def test_a_sandbox_serving_a_different_project_is_left_alone(
     assert app_a.id != app_b.id  # the two names really are different
 
 
+async def test_deleting_a_shared_project_tears_down_every_recipients_container(
+    app: Any, client: AsyncClient, db_session: AsyncSession, fake_redis: Any
+) -> None:
+    """A project's live shares end with it, not merely their access-grant rows — every
+    recipient's shared-runtime container is torn down alongside the owner's own, not left to
+    bill until the worker's next sweep finds it orphaned. Untested before this: no test in
+    this file, or in `tests/services/projects/`, exercised the delete route against a shared
+    project at all."""
+    from src.db.models.project_share import ProjectShare
+    from src.services.build_sessions.manager import shr_name_for
+    from src.services.redis.keys import registry_key
+    from tests.fakes import FakeSandboxClient
+
+    headers, user, project, app_row = await _project_with_app(db_session)
+    recipient = await UserFactory.create(db_session, email="colleague@example.com")
+    db_session.add(ProjectShare(project_id=project.id, shared_with_user_id=recipient.id))
+    await db_session.commit()
+
+    sandbox = FakeSandboxClient()
+    _wire_sandbox(app, sandbox)
+    _wire_manager(app)
+    await _registry_names(fake_redis, user.id, app_row.id, "ready")
+    shared_name = shr_name_for(app_row.id, recipient.id)
+    await _registry_names(fake_redis, recipient.id, app_row.id, "ready")
+    # `_registry_names` stamps the OWNER's own app name; the recipient's registry entry must
+    # instead name their `shr-` container, which is the whole thing under test here.
+    from src.services.redis.keys import REGISTRY_FIELD_APP_NAME
+
+    await fake_redis.hset(registry_key(recipient.id), REGISTRY_FIELD_APP_NAME, shared_name)
+
+    resp = await _delete(client, project.id, headers)
+
+    assert resp.status_code == 200
+    assert await db_session.get(Project, project.id) is None
+    assert _named(app_row.id) in sandbox.torn_down  # the owner's own container
+    assert shared_name in sandbox.torn_down  # the recipient's shared view
+    assert await fake_redis.exists(registry_key(recipient.id)) == 0
+
+
 async def test_the_start_lock_is_held_across_the_check_and_the_reap(
     app: Any, client: AsyncClient, db_session: AsyncSession, fake_redis: Any
 ) -> None:

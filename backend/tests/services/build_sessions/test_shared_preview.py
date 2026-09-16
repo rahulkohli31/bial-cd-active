@@ -201,6 +201,12 @@ async def test_launch_attaches_to_an_already_live_shared_view(
 
     assert client.restored == [shared_name]  # only ONE restore — the second call attached
     assert second.app_id == app_id
+    # THE BUG THIS PINS: attaching must never report the CURRENT saved snapshot's timestamp —
+    # the container may have been built from an earlier one, and nothing here records which.
+    # `first` (a genuine restore) gets a real timestamp; `second` (an attach) gets none, not a
+    # confidently wrong one.
+    assert first.snapshot_taken_at is not None
+    assert second.snapshot_taken_at is None
 
 
 async def test_refresh_always_restores_even_when_already_live(
@@ -216,10 +222,14 @@ async def test_refresh_always_restores_even_when_already_live(
     client = FakeSandboxClient()
     await manager.launch_shared_preview(db_session, recipient, project, client)
 
-    await manager.launch_shared_preview(db_session, recipient, project, client, force_refresh=True)
+    refreshed = await manager.launch_shared_preview(
+        db_session, recipient, project, client, force_refresh=True
+    )
 
     shared_name = shr_name_for(app_id, recipient.id)
     assert client.restored == [shared_name, shared_name]  # restored TWICE, not attached once
+    # Refresh always restores, so it always gets a real timestamp — never the attach arm's `None`.
+    assert refreshed.snapshot_taken_at is not None
 
 
 async def test_launch_with_no_saved_snapshot_is_a_dead_end_404(

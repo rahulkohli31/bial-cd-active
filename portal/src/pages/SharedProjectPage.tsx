@@ -215,7 +215,10 @@ export default function SharedProjectPage(): React.JSX.Element {
       <div className="flex items-center gap-3 px-6 py-3 border-b border-bial-border bg-white">
         <button
           type="button"
-          onClick={() => navigate('/projects')}
+          // `state: { tab: 'shared' }` puts the recipient back on "Shared with me" — the tab
+          // this project itself only ever appears under — rather than "My projects", a
+          // first-run "New project" screen for a citizen who owns nothing of their own.
+          onClick={() => navigate('/projects', { state: { tab: 'shared' } })}
           className="flex items-center gap-1 text-sm text-neutral hover:text-primary transition flex-shrink-0"
         >
           <ArrowLeft size={15} /> Back to projects

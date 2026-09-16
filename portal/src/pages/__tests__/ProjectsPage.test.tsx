@@ -24,6 +24,7 @@ const h = vi.hoisted(() => ({
   createProject: vi.fn(),
   deleteProject: vi.fn(),
   listProjectConversations: vi.fn(),
+  listSharedWithMe: vi.fn(),
 }))
 
 vi.mock('../../utils/projectApi', () => ({
@@ -38,11 +39,15 @@ vi.mock('../../utils/conversationApi', () => ({
   listProjectConversations: h.listProjectConversations,
   CONVERSATION_LIST_CAP: 200,
 }))
+vi.mock('../../utils/sharingApi', () => ({
+  listSharedWithMe: h.listSharedWithMe,
+}))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 
 import ProjectsPage, { PROJECT_GONE_NOTICE } from '../ProjectsPage'
 import { ApiError } from '../../utils/apiError'
 import type { Project } from '../../utils/projectApi'
+import type { SharedProject } from '../../utils/sharingApi'
 
 function LocationProbe(): React.JSX.Element {
   const loc = useLocation()
@@ -164,6 +169,7 @@ beforeEach(() => {
   h.listProjects.mockResolvedValue(page([]))
   h.listProjectCounts.mockResolvedValue(COUNTS)
   h.listProjectConversations.mockResolvedValue([])
+  h.listSharedWithMe.mockResolvedValue({ items: [], nextCursor: null, hasMore: false })
 })
 afterEach(() => cleanup())
 
@@ -1018,5 +1024,98 @@ describe('page, search and rows-per-page live in the URL', () => {
     await screen.findByText('Ramp Ops')
     expect(screen.queryByText(PROJECT_GONE_NOTICE)).toBeNull()
     expect(screen.getByTestId('projects-notice').textContent).toBe('')
+  })
+})
+
+// --- "Shared with me" -----------------------------------------------------------
+
+const mkShared = (id: string, name: string, over: Partial<SharedProject> = {}): SharedProject => ({
+  projectId: id,
+  projectName: name,
+  projectDescription: 'A tool',
+  sharedByDisplayName: 'Priya K',
+  sharedAt: '2026-07-10T00:00:00Z',
+  ...over,
+})
+
+describe('the "Shared with me" tab', () => {
+  it('fetches nothing shared until the tab is actually opened', async () => {
+    renderPage()
+    await screen.findByText('Nothing here yet')
+    expect(h.listSharedWithMe).not.toHaveBeenCalled()
+  })
+
+  it('shows the empty state with no "New project" control anywhere on it', async () => {
+    renderPage()
+    fireEvent.click(screen.getByRole('radio', { name: 'Shared with me' }))
+    expect(await screen.findByText('Nothing shared with you yet')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /new project/i })).toBeNull()
+  })
+
+  it('renders one card per shared project, and opens it at /shared/:id', async () => {
+    h.listSharedWithMe.mockResolvedValue({
+      items: [mkShared('s1', 'Gate Pass Log')],
+      nextCursor: null,
+      hasMore: false,
+    })
+    renderPage()
+    fireEvent.click(screen.getByRole('radio', { name: 'Shared with me' }))
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Gate Pass Log' }))
+    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('/shared/s1'))
+  })
+
+  it('switching back to "My projects" does not re-fetch what is already loaded', async () => {
+    h.listSharedWithMe.mockResolvedValue({
+      items: [mkShared('s1', 'Gate Pass Log')],
+      nextCursor: null,
+      hasMore: false,
+    })
+    renderPage()
+    fireEvent.click(screen.getByRole('radio', { name: 'Shared with me' }))
+    await screen.findByText('Gate Pass Log')
+
+    fireEvent.click(screen.getByRole('radio', { name: 'My projects' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Shared with me' }))
+    await screen.findByText('Gate Pass Log')
+    expect(h.listSharedWithMe).toHaveBeenCalledTimes(1)
+  })
+
+  it('offers Load more when another page exists, and appends it on click', async () => {
+    h.listSharedWithMe
+      .mockResolvedValueOnce({
+        items: [mkShared('s1', 'First')],
+        nextCursor: 'cursor-1',
+        hasMore: true,
+      })
+      .mockResolvedValueOnce({
+        items: [mkShared('s2', 'Second')],
+        nextCursor: null,
+        hasMore: false,
+      })
+    renderPage()
+    fireEvent.click(screen.getByRole('radio', { name: 'Shared with me' }))
+    await screen.findByText('First')
+
+    fireEvent.click(screen.getByRole('button', { name: /load more/i }))
+    await screen.findByText('Second')
+    expect(screen.getByText('First')).toBeTruthy() // the first page's row is kept, not replaced
+  })
+
+  it('a load failure offers Retry, without losing the rows already on screen', async () => {
+    h.listSharedWithMe
+      .mockResolvedValueOnce({
+        items: [mkShared('s1', 'First')],
+        nextCursor: 'cursor-1',
+        hasMore: true,
+      })
+      .mockRejectedValueOnce(new Error('boom'))
+    renderPage()
+    fireEvent.click(screen.getByRole('radio', { name: 'Shared with me' }))
+    await screen.findByText('First')
+
+    fireEvent.click(screen.getByRole('button', { name: /load more/i }))
+    await screen.findByRole('alert')
+    expect(screen.getByText('First')).toBeTruthy()
   })
 })

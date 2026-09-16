@@ -266,7 +266,8 @@ export default function ProjectCreateModal({ onClose, onCreated }: ProjectCreate
                 onChange={(e) => setName(e.target.value)}
                 maxLength={NAME_MAX}
                 placeholder="e.g. VIP Movement Tracker"
-                className="mt-1.5 w-full border border-bial-border rounded-xl px-3 py-2.5 text-sm text-tertiary placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary"
+                disabled={busy}
+                className="mt-1.5 w-full border border-bial-border rounded-xl px-3 py-2.5 text-sm text-tertiary placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary disabled:opacity-50"
               />
               <div className="flex items-baseline justify-between mt-1">
                 {/* The expectation stated BEFORE the user trips it, not only after. */}
@@ -307,7 +308,8 @@ export default function ProjectCreateModal({ onClose, onCreated }: ProjectCreate
                 maxLength={DESCRIPTION_MAX}
                 rows={4}
                 aria-label="What should this app do?"
-                className="mt-1.5 w-full border border-bial-border rounded-xl px-3 py-2.5 text-sm text-tertiary placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary resize-none"
+                disabled={busy}
+                className="mt-1.5 w-full border border-bial-border rounded-xl px-3 py-2.5 text-sm text-tertiary placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary resize-none disabled:opacity-50"
               />
               <div className="flex items-baseline justify-between mt-1">
                 <span className="text-[11px] text-neutral">

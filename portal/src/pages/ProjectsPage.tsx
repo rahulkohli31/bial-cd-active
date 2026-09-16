@@ -180,7 +180,9 @@ export default function ProjectsPage(): React.JSX.Element {
   // NOT PERSISTED, NOT IN THE URL — unlike `view`/`density` (a habit) and `page`/`q` (a place
   // in a list this page is the only way back to), which tab is open is neither: a shared link
   // to this page is about the citizen's OWN projects either way, and there is nothing here a
-  // colleague would paste around expecting it to land on someone else's "shared with me".
+  // colleague would paste around expecting it to land on someone else's "shared with me". It
+  // CAN still open on "shared" once, via one-shot router state (below) rather than the URL —
+  // see `SharedProjectPage`'s "Back to projects".
   const [tab, setTab] = useState<'mine' | 'shared'>('mine')
 
   // COMMITTED query state — WHAT WAS ASKED FOR, and it lives in the address bar.
@@ -293,9 +295,18 @@ export default function ProjectsPage(): React.JSX.Element {
   const location = useLocation()
   const [notice, setNotice] = useState<string | null>(null)
   useEffect(() => {
-    const carried = (location.state as { notice?: unknown } | null)?.notice
-    if (typeof carried !== 'string' || carried.length === 0) return
-    setNotice(carried)
+    const state = location.state as { notice?: unknown; tab?: unknown } | null
+    const carried = state?.notice
+    const hasNotice = typeof carried === 'string' && carried.length > 0
+    // The same one-shot router-state channel `notice` rides — not the URL, not localStorage,
+    // so a link INTO this page never lands a reader on someone else's "shared with me". Its
+    // one caller today is `SharedProjectPage`'s "Back to projects", putting the recipient who
+    // arrived here from a colleague's project back on the tab they came from, rather than
+    // "My projects" — a first-run "New project" screen for a citizen who owns nothing.
+    const hasTab = state?.tab === 'shared'
+    if (!hasNotice && !hasTab) return
+    if (hasNotice) setNotice(carried)
+    if (hasTab) setTab('shared')
     navigate(`${location.pathname}${location.search}`, { replace: true, state: null })
   }, [location.pathname, location.search, location.state, navigate])
 

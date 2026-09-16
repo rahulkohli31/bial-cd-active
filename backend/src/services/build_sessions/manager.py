@@ -1206,9 +1206,11 @@ class SharedPreview:
     is always framable, but an attached container whose readiness wait timed out hands back
     `ready=False` rather than a 503 — the alternative, condemning the container, would cost a
     colleague's view of it for a slow root route that may simply need a moment. `snapshot_taken_at`
-    is `None` only when the store could not be asked for the timestamp — the restore itself
-    already confirmed the snapshot's PRESENCE before this dataclass is ever built, so a `None`
-    here is a missing detail, never a missing snapshot."""
+    is set ONLY WHEN A RESTORE ACTUALLY RAN — an ATTACH to an already-live container reports
+    `None`, never the CURRENT saved snapshot's timestamp: the container may have been built from
+    an earlier one, and this platform stamps no record of which. Claiming the current timestamp
+    for a container that might not be running it would tell the recipient they are looking at
+    work they are not; saying nothing is the honest answer until that stamp exists."""
 
     app_id: uuid.UUID
     preview_url: str
@@ -3886,7 +3888,6 @@ class SessionManager:
                 # (requirement 21). `newest_restore_source` is never called on this path.
                 if not await self._snapshot_exists_or_bust(owner_app_id):
                     raise NoSnapshotToRelaunchError(owner_app_id)
-                snapshot_taken_at = await _snapshot_written_at(owner_app_id)
                 attached = False
                 if not force_refresh:
                     try:
@@ -3897,12 +3898,18 @@ class SessionManager:
                         scope.spare()
                     except NoLiveSandboxError:
                         pass
+                # `None` on the attach arm — SEE `SharedPreview.snapshot_taken_at`'s OWN
+                # DOCSTRING for why: the container may have been built from an earlier snapshot
+                # than the one this timestamp would name, and this platform stamps no record of
+                # which. Computed only once a restore is confirmed to run, immediately before it.
+                snapshot_taken_at: datetime | None = None
                 if not attached:
                     env = {
                         **build_app_env(owner_app_id),
                         **await provision_app_storage(owner_app_id),
                         **await provision_app_database(db, project.id),
                     }
+                    snapshot_taken_at = await _snapshot_written_at(owner_app_id)
                     try:
                         scope.handle = await self._restore_or_bust(
                             sandbox_client,

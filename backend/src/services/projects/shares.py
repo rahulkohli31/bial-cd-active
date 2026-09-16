@@ -169,7 +169,10 @@ async def search_colleagues(
     the name, not just the first) or the START of the email local part — NEVER a substring
     match, which on a tenant where every user shares one email domain would match every user
     in it against any three characters of that shared domain. Excludes the requester, so they
-    never appear in their own results.
+    never appear in their own results, and excludes a LOCALLY SUSPENDED user — not a security
+    boundary (a share with them would still stand; suspension governs sign-in, not this table),
+    but offering them through the picker is a misleading result: a name that reads as pickable
+    for someone who cannot currently sign in to use what they'd be granted.
 
     ONE MECHANISM, ESCAPED ONCE — both arms are `ILIKE` prefix patterns now, not a Postgres
     POSIX regex for the name and an unescaped `ILIKE` for the email. The email arm used to
@@ -188,6 +191,7 @@ async def search_colleagues(
         sa.select(User)
         .where(
             User.id != requester_id,
+            User.suspended_at.is_(None),
             sa.or_(
                 User.display_name.istartswith(query, autoescape=True),  # the first token
                 User.display_name.ilike(later_token_pattern, escape="\\"),  # any later token

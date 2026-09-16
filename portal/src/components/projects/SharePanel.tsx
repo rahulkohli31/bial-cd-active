@@ -135,8 +135,10 @@ export default function SharePanel({ projectId, projectName, onClose }: SharePan
     setSharingId(colleague.id)
     setActionError(null)
     shareProject(projectId, colleague.id)
-      .then(() => {
-        loadShares()
+      .then((share) => {
+        // The server's own row, appended directly — not discarded in favour of a refetch,
+        // which flashed "Loading…" over the whole who-can-use list on every single add.
+        setShares((prev) => (prev.some((s) => s.id === share.id) ? prev : [share, ...prev]))
         setResults((prev) => prev.filter((c) => c.id !== colleague.id))
       })
       .catch((err: unknown) => setActionError(errorMessage(err, 'Could not share this project.')))
