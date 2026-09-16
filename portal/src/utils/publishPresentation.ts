@@ -11,6 +11,7 @@
  * version ROWS to render.
  */
 import { assertNever } from './assertNever'
+import { MONTHS } from './monthNames'
 import type { ApprovalState, DeploymentView, PublishState } from './deployApi'
 
 /**
@@ -362,17 +363,21 @@ export function canBeTakenDown(state: PublishState, hasServingRow: boolean): boo
   return canBeRestarted(state) || (state === 'in_review' && hasServingRow)
 }
 
-/** `25 Aug 2026, 14:20` — the canvas's form, and the half a citizen recognises. */
+/**
+ * `25 Aug 2026, 14:20` — the canvas's form, and the half a citizen recognises.
+ *
+ * COMPOSED, NOT DELEGATED, for the two reasons `projectDates.ts` composes its own. `Intl` follows
+ * the RUNTIME's locale, so the same instant rendered `14 Sep 2026, 07:33` on one machine and
+ * `Sep 14, 2026, 02:03 AM` on another — a month-first US form one click away from the list's
+ * day-first columns, in a product for an Indian airport. And `Intl` spells September `Sept` in
+ * exactly the locales BIAL's browsers are set to, which is why the months come from the same
+ * table the list reads. Two forms of one date, neither of them the one this docblock promises.
+ */
 export function formatStamp(iso: string): string {
-  const parsed = new Date(iso)
-  if (Number.isNaN(parsed.getTime())) return iso
-  return parsed.toLocaleString(undefined, {
-    day: 'numeric',
-    month: 'short',
-    year: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-  })
+  const at = new Date(iso)
+  if (Number.isNaN(at.getTime())) return iso
+  const time = `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`
+  return `${at.getDate()} ${MONTHS[at.getMonth()]} ${at.getFullYear()}, ${time}`
 }
 
 /** Whether `formatStamp` can render this instant; it hands an unparseable one back unchanged. */

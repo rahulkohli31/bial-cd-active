@@ -18,6 +18,7 @@ import { stripComments } from '../../__tests__/_stripComments'
 import {
   ACTION_LABEL,
   canBeRestarted,
+  formatStamp,
   lookFor,
   presentationFor,
   provenanceRows,
@@ -409,5 +410,32 @@ describe('the states in which an application can be restarted', () => {
     // The other near miss: `taken_offline` has a published address in its history and no
     // container. Publishing again is its remedy, not restarting.
     expect(canBeRestarted('taken_offline')).toBe(false)
+  })
+})
+
+describe('a published date reads the same on every machine', () => {
+  // Midday UTC on purpose: every timezone this product is read in lands on the same calendar day,
+  // so the assertions below are about the FORM rather than about where the reader is sitting.
+  const MIDDAY = '2026-09-14T12:00:00Z'
+
+  it('★ is the day-first form this module promises, not the runtime locale’s', () => {
+    // WHAT THIS PREVENTS. Delegating to `Intl` with no locale gave `14 Sep 2026, 07:33` on one
+    // machine and `Sep 14, 2026, 02:03 AM` on another — a month-first US form one click from the
+    // list's day-first columns, in a product for an Indian airport, and neither of them the form
+    // the docblock states.
+    const stamp = formatStamp(MIDDAY)
+    expect(stamp).toMatch(/^\d{1,2} Sep 2026, \d{2}:\d{2}$/)
+    expect(stamp).not.toMatch(/AM|PM/i)
+  })
+
+  it('★ spells September Sep, which is the whole reason the months are not Intl’s', () => {
+    // `Intl` spells it `Sept` in exactly the locales BIAL's browsers are set to — the same trap
+    // the list's own formatter documents avoiding, sprung here instead.
+    expect(formatStamp(MIDDAY)).not.toContain('Sept')
+    expect(formatStamp(MIDDAY)).toContain(' Sep ')
+  })
+
+  it('hands an unreadable instant back unchanged rather than printing the words', () => {
+    expect(formatStamp('not-a-date')).toBe('not-a-date')
   })
 })
