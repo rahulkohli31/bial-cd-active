@@ -277,6 +277,7 @@ describe('the disclosure lists what is switched on, and only that', () => {
     await openDisclosure()
 
     fireEvent.click(screen.getByLabelText('Read ORBIT in Flight Delay Reason Capture'))
+    fireEvent.click(await screen.findByTestId('connector-turn-off-confirm'))
     await waitFor(() =>
       expect(h.setProjectConnector).toHaveBeenCalledWith('p1', 'orbit', { enabled: false }),
     )
@@ -362,6 +363,7 @@ describe('failures are said out loud, and a failed write puts the switch back', 
 
     const control = screen.getByLabelText('Read ORBIT in Flight Delay Reason Capture')
     fireEvent.click(control)
+    fireEvent.click(await screen.findByTestId('connector-turn-off-confirm'))
     await waitFor(() =>
       expect(screen.getByTestId('integrations-write-failure').textContent).toContain(
         'You do not have access to this yet.',
@@ -371,6 +373,62 @@ describe('failures are said out loud, and a failed write puts the switch back', 
     // be the page disagreeing with the server it just heard from.
     expect(control.getAttribute('data-state')).toBe('checked')
     expect(screen.getByTestId('connector-app-p1').textContent).toContain('On')
+  })
+
+  it('★ asks before cutting an application off, and a cancel leaves it reading', async () => {
+    // WHAT THIS FIXES: the row VANISHED on the press — count down, no message, no undo anywhere
+    // on the page. For a live application that is a production data source going away under
+    // whoever is using it, and the way back is to remember which application it was and find its
+    // own Settings. Less friction than renaming it had.
+    render(<IntegrationsPage />)
+    await openDisclosure()
+
+    const control = screen.getByLabelText('Read ORBIT in Flight Delay Reason Capture')
+    fireEvent.click(control)
+    expect(await screen.findByTestId('connector-turn-off-confirm')).toBeTruthy()
+    expect(h.setProjectConnector).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByTestId('connector-turn-off-cancel'))
+    await waitFor(() => expect(screen.queryByTestId('connector-turn-off-confirm')).toBeNull())
+    // Still on, still listed, still nothing written — a cancel that wrote anyway is precisely
+    // what an absence assertion alone would not catch.
+    expect(h.setProjectConnector).not.toHaveBeenCalled()
+    expect(control.getAttribute('data-state')).toBe('checked')
+    expect(screen.getByTestId('connector-app-p1').textContent).toContain('On')
+  })
+
+  it('★ writes only an off — this list has no on to give', async () => {
+    // The handler ran the write whatever value the switch handed it. Nothing on this page can
+    // hand it `true` — a row leaves the list the moment it is switched off — so the branch was
+    // unreachable rather than wrong, and unreachable branches stop being unreachable.
+    render(<IntegrationsPage />)
+    await openDisclosure()
+
+    fireEvent.click(screen.getByLabelText('Read ORBIT in Flight Delay Reason Capture'))
+    fireEvent.click(await screen.findByTestId('connector-turn-off-confirm'))
+
+    await waitFor(() => expect(h.setProjectConnector).toHaveBeenCalledTimes(1))
+    expect(h.setProjectConnector).toHaveBeenCalledWith('p1', 'orbit', { enabled: false })
+  })
+
+  it('★ …and flipping it back before the list catches up writes nothing at all', async () => {
+    // THE WINDOW THE GUARD IS FOR, and it is not hypothetical: the flip is optimistic, so between
+    // the write settling and the next read dropping the row, the switch sits OFF on a row still on
+    // screen. Flipping it there hands the handler `true` — and the handler used to run its write
+    // regardless of the value, sending a second `enabled: false` for a press that asked for on.
+    render(<IntegrationsPage />)
+    await openDisclosure()
+
+    const control = screen.getByLabelText('Read ORBIT in Flight Delay Reason Capture')
+    fireEvent.click(control)
+    fireEvent.click(await screen.findByTestId('connector-turn-off-confirm'))
+    await waitFor(() => expect(control.getAttribute('data-state')).toBe('unchecked'))
+
+    fireEvent.click(control)
+
+    // No second question, and no second write.
+    expect(screen.queryByTestId('connector-turn-off-confirm')).toBeNull()
+    expect(h.setProjectConnector).toHaveBeenCalledTimes(1)
   })
 })
 
@@ -493,6 +551,7 @@ describe('the page and Settings › Integrations read one source', () => {
     render(<IntegrationsPage />)
     await openDisclosure()
     fireEvent.click(screen.getByLabelText('Read ORBIT in Flight Delay Reason Capture'))
+    fireEvent.click(await screen.findByTestId('connector-turn-off-confirm'))
     await waitFor(() => expect(switches.p1).toBe(false))
     await waitFor(() => expect(screen.queryByTestId('connector-app-p1')).toBeNull())
     cleanup()

@@ -39,10 +39,32 @@ export function dayMonth(iso: string | null | undefined): string {
   return at === null ? NONE : `${at.getDate()} ${MONTHS[at.getMonth()]}`
 }
 
-/** `28 Aug → 15 Sep` — the tile's foot form, both dates in the space the list gives one. */
+/**
+ * `28 Aug → 15 Sep` — the tile's foot form, both dates in the space the list gives one.
+ *
+ * THE YEAR COMES BACK WHEN THE TWO DATES DO NOT SHARE ONE, and only then. The board's form drops
+ * it because a tile has no room for it and both dates are usually the same year — but an
+ * application made in November and touched the following September renders as `11 Nov → 14 Sep`,
+ * which reads as an arrow pointing BACKWARDS in time. The short form is not merely terse there,
+ * it is wrong, and it is wrong exactly on the oldest applications a person owns.
+ */
 export function tileDateRange(
   created: string | null | undefined,
   updated: string | null | undefined,
 ): string {
+  const from = parse(created)
+  const to = parse(updated)
+  if (from !== null && to !== null && from.getFullYear() !== to.getFullYear()) {
+    return `${listDate(created)} → ${listDate(updated)}`
+  }
   return `${dayMonth(created)} → ${dayMonth(updated)}`
+}
+
+/** What the range MEANS, for the hover a tile has no room to print. The list says it in column
+ *  headings; a tile has only the arrow, and an arrow does not say which end is which. */
+export function tileDateTitle(
+  created: string | null | undefined,
+  updated: string | null | undefined,
+): string {
+  return `Created ${listDate(created)} · Details updated ${listDate(updated)}`
 }

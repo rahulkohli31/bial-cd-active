@@ -8,7 +8,7 @@
  * `onOpen`/`onDelete`/`onSettings`, so this renders trivially in a test with no router.
  */
 import type { Project } from '../../utils/projectApi'
-import { tileDateRange } from '../../utils/projectDates'
+import { tileDateRange, tileDateTitle } from '../../utils/projectDates'
 import AppTile from './AppTile'
 import AppStatusBadge from './AppStatusBadge'
 import AppRowMenu from './AppRowMenu'
@@ -47,7 +47,10 @@ export default function ProjectCard({ project, onOpen, onSettings, onDelete, liv
         // is written as created → updated and the list carries the honest labels.
         <div className="flex items-center justify-between gap-2">
           <AppStatusBadge project={project} />
-          <span className="text-[11px] text-neutral tabular-nums whitespace-nowrap">
+          <span
+            className="text-[11px] text-neutral tabular-nums whitespace-nowrap"
+            title={tileDateTitle(project.createdAt, project.updatedAt)}
+          >
             {tileDateRange(project.createdAt, project.updatedAt)}
           </span>
         </div>

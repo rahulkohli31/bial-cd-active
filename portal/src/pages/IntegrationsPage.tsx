@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
-import { Check, ChevronDown, X } from 'lucide-react'
+import { Check, ChevronDown, Database, X } from 'lucide-react'
 import {
   cancelConnectorRequest,
   listConnectors,
@@ -11,6 +11,7 @@ import {
 import type { ConnectorEntry, ConnectorOnProject } from '../utils/connectorApi'
 import { assertNever } from '../utils/assertNever'
 import { errorText } from '../utils/apiError'
+import ConfirmDialog from '../components/ui/ConfirmDialog'
 import AskAccessPanel from '../components/connectors/AskAccessPanel'
 import {
   ConnectorGlyph,
@@ -125,6 +126,20 @@ function OnApplicationRow({
 }: OnApplicationRowProps): React.JSX.Element {
   const [on, setOn] = useState(true)
   const [busy, setBusy] = useState(false)
+  const [asking, setAsking] = useState(false)
+
+  const turnOff = async (): Promise<void> => {
+    setAsking(false)
+    setBusy(true)
+    setOn(false)
+    try {
+      await onTurnOff()
+    } catch {
+      setOn(true)
+    } finally {
+      setBusy(false)
+    }
+  }
 
   return (
     <li
@@ -148,13 +163,30 @@ function OnApplicationRow({
         onCheckedChange={(next) => {
           // The lock, doing as well as saying: `aria-disabled` alone still delivers the click.
           if (busy) return
-          setBusy(true)
-          setOn(next)
-          void onTurnOff()
-            .catch(() => setOn(true))
-            .finally(() => setBusy(false))
+          // THIS LIST ONLY EVER TURNS THINGS OFF — it is the applications a connector is ON for,
+          // so a row leaves it the moment the switch is flipped and there is no "on" to write
+          // from here. The handler used to run the write whatever value it was handed.
+          if (next) return
+          setAsking(true)
         }}
       />
+      {asking && (
+        <ConfirmDialog
+          testId="connector-turn-off"
+          title={`Stop “${project.name}” reading ${connectorName}?`}
+          body={
+            'It stops reading straight away. If the application is live, whoever is using it ' +
+            'sees that data go. Your own access is unchanged, and you can switch it back on ' +
+            'from that application’s own Settings.'
+          }
+          icon={<Database size={17} className="text-status-amber-fg" />}
+          iconClassName="bg-status-amber-bg"
+          confirmLabel="Switch it off"
+          tone="danger"
+          onClose={() => setAsking(false)}
+          onConfirm={turnOff}
+        />
+      )}
     </li>
   )
 }
