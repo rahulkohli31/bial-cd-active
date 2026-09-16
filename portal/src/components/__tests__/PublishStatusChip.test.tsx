@@ -489,7 +489,10 @@ describe('the popover explains the state and offers at most one thing to do', ()
     // Mutation receipt: give `last_published` the url and this goes red. A dead address a
     // citizen can click is indistinguishable to them from an app that has broken.
     expect(screen.queryByTestId('publish-url')).toBeNull()
-    expect(pop.textContent).toContain('taken this app offline')
+    // NAMES NO ACTOR. This state is reachable by the owner's own take-down as well as by an
+    // administrator's, so the sentence says what is true of both and keeps the remedy.
+    expect(pop.textContent).toContain('not running in production')
+    expect(pop.textContent).not.toMatch(/administrator/i)
     expect(pop.textContent).toContain('back at the same address')
     expect(pop.textContent).not.toContain('switched this app off')
     expect(screen.getByTestId('publish-action').textContent).toBe('Publish again')
@@ -546,12 +549,13 @@ describe('the popover explains the state and offers at most one thing to do', ()
 
   it('still names the administrator in the states that genuinely have one', async () => {
     // The paired positive, so the rule above cannot be satisfied by scrubbing the word
-    // everywhere. These four are only reachable THROUGH an administrator.
+    // everywhere. These three are only reachable THROUGH an administrator. `taken_offline` is
+    // deliberately not among them: an owner can now take their own application down, so naming
+    // an administrator there would tell them somebody else did what they just did.
     const ADMIN_STATES: ReadonlyArray<readonly [PublishState, RegExp]> = [
       ['in_review', /with an administrator/i],
       ['changes_requested', /an administrator asked/i],
       ['approved_ready_to_publish', /an administrator approved/i],
-      ['taken_offline', /an administrator has taken/i],
     ]
 
     for (const [state, phrase] of ADMIN_STATES) {

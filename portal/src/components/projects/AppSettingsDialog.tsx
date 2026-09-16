@@ -9,6 +9,7 @@ import { Dialog, DialogContent, DialogTitle } from '../ui/dialog'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '../ui/tabs'
 import { BusyGlyph } from '../ui/Waiting'
 import { DURATION, LAYOUT_EASE } from '../../lib/motion'
+import ProductionTab from './ProductionTab'
 import ProjectDescriptionEditor from './ProjectDescriptionEditor'
 import { SharePanelBody } from './SharePanel'
 
@@ -22,8 +23,8 @@ import { SharePanelBody } from './SharePanel'
  * the per-application Integrations tab exists at all beside the Integrations page: a citizen who
  * wants their connector switch never has to leave to reach it.
  *
- * TABS ARRIVE WITH THEIR UNITS. Integrations and Production are absent, not empty: a tab that
- * renders a blank panel is a control that lies about having a destination.
+ * TABS ARRIVE WITH THEIR UNITS. Integrations is absent rather than empty: a tab that renders a
+ * blank panel is a control that lies about having a destination.
  *
  * IT SURVIVES THE NARROW WIDTHS THE REST OF THE PORTAL SURVIVES. This product's standing promise
  * is that every control stays reachable at 360px, and the workspace toolbar carries a
@@ -34,7 +35,7 @@ import { SharePanelBody } from './SharePanel'
 
 /** The title truncates rather than pushing the close control off a fixed-width panel — the same
  *  treatment the row and the toolbar already give a long application name. */
-export type SettingsTab = 'general' | 'sharing'
+export type SettingsTab = 'general' | 'sharing' | 'production'
 
 export interface AppSettingsDialogProps {
   project: Project
@@ -45,11 +46,15 @@ export interface AppSettingsDialogProps {
   /** Opens the delete confirmation. The dialog collects nothing itself: deleting is the page's,
    *  which owns the cascade, its 404-versus-500 reconciliation and the list underneath. */
   onDelete: () => void
+  /** Told when a production operation settles, so the list underneath can stop showing a chip
+   *  that is now out of date. */
+  onProductionSettled?: () => void
 }
 
 const TABS: { value: SettingsTab; label: string }[] = [
   { value: 'general', label: 'General' },
   { value: 'sharing', label: 'Sharing' },
+  { value: 'production', label: 'Production' },
 ]
 
 /** The VARCHAR(120) column width — a paste backstop, not the rule a person is told about. */
@@ -61,6 +66,7 @@ export default function AppSettingsDialog({
   onClose,
   initialTab = 'general',
   onDelete,
+  onProductionSettled,
 }: AppSettingsDialogProps) {
   const [tab, setTab] = useState<SettingsTab>(initialTab)
   const [name, setName] = useState(project.name)
@@ -223,6 +229,13 @@ export default function AppSettingsDialog({
 
             <TabsContent value="sharing" className="mt-0">
               <SharePanelBody projectId={project.id} />
+            </TabsContent>
+
+            {/* NO `forceMount` HERE, deliberately: Radix unmounts an unchosen panel, and that is
+                what stops the production read polling behind another tab. It is the one thing in
+                this dialog that asks the server anything on a timer. */}
+            <TabsContent value="production" className="mt-0">
+              <ProductionTab projectId={project.id} onSettled={onProductionSettled} />
             </TabsContent>
           </motion.div>
         </Tabs>

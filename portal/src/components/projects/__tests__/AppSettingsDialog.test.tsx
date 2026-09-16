@@ -15,6 +15,7 @@ import { MotionGlobalConfig } from 'motion/react'
 
 const h = vi.hoisted(() => ({
   patchProject: vi.fn(),
+  getDeployment: vi.fn(),
   listShares: vi.fn(),
   searchColleagues: vi.fn(),
   shareProject: vi.fn(),
@@ -24,6 +25,10 @@ const h = vi.hoisted(() => ({
 vi.mock('../../../utils/projectApi', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   patchProject: h.patchProject,
+}))
+vi.mock('../../../utils/deployApi', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  getDeployment: h.getDeployment,
 }))
 vi.mock('../../../utils/sharingApi', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -74,6 +79,7 @@ const settle = () => act(async () => { await new Promise((r) => setTimeout(r, 0)
 beforeEach(() => {
   vi.clearAllMocks()
   h.listShares.mockResolvedValue([])
+  h.getDeployment.mockResolvedValue(null)
   h.searchColleagues.mockResolvedValue([])
   h.patchProject.mockImplementation((_id: string, patch: { name?: string }) =>
     Promise.resolve({ ...PROJECT, ...patch }),
@@ -178,10 +184,29 @@ describe('a tab that is not built yet is absent, not empty', () => {
   it('offers only the tabs that have somewhere to go', async () => {
     open()
     await screen.findByTestId('settings-tab-general')
-    // Liveness beside the absence: the two that exist really rendered, so this is tabs being
+    // Liveness beside the absence: the three that exist really rendered, so this is a tab being
     // withheld rather than the rail failing to draw.
     expect(screen.getByTestId('settings-tab-sharing')).toBeTruthy()
+    expect(screen.getByTestId('settings-tab-production')).toBeTruthy()
     expect(screen.queryByTestId('settings-tab-integrations')).toBeNull()
-    expect(screen.queryByTestId('settings-tab-production')).toBeNull()
+  })
+})
+
+describe('Production is where the two live-app actions live', () => {
+  it('★ reads nothing about production until the tab is actually opened', async () => {
+    // A dialog that fired a deployment read on open would spend one per application a citizen
+    // glances at the name of. The panel is mounted BY the tab, not merely hidden behind it.
+    open()
+    await screen.findByTestId('settings-tab-general')
+    expect(h.getDeployment).not.toHaveBeenCalled()
+  })
+
+  it('mounts the panel, which reads this application, when the tab is chosen', async () => {
+    open()
+    fireEvent.mouseDown(screen.getByTestId('settings-tab-production'))
+    fireEvent.click(screen.getByTestId('settings-tab-production'))
+    expect(await screen.findByTestId('production-tab')).toBeTruthy()
+    await waitFor(() => expect(h.getDeployment).toHaveBeenCalledWith('p1'))
+    await settle()
   })
 })

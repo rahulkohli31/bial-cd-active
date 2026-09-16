@@ -446,3 +446,58 @@ export async function getDeployment(
   if (!res.ok) throw await readApiError(res, 'Failed to read the deployment')
   return toDeploymentView(await res.json())
 }
+
+/**
+ * Recycle the revision this application is ALREADY RUNNING — same version, same address, same
+ * data. 202 with the deployment id to poll, because the container operation behind it outlives
+ * the edge gateway's twenty seconds.
+ *
+ * IT CANNOT RUN A NEWER COMMIT, and that is the rule rather than a detail: re-running the deploy
+ * path against whatever is saved now would put work no reviewer has seen into production. That is
+ * enforced server-side; nothing a client passes can change which version comes back, which is why
+ * this call carries no body at all.
+ *
+ * Throws `ApiError` on every refusal, each with a stated reason the caller shows verbatim: 409
+ * `never_deployed` / `not_live` / `taken_offline` (publish it again instead) / `app_disabled` /
+ * `deploy_in_flight`, and 503 `publishing_unavailable`.
+ */
+export async function restartApp(
+  projectId: string,
+  deps: AuthFetchDeps = {},
+): Promise<{ deploymentId: string }> {
+  const res = await authFetch(
+    `/api/projects/${encodeURIComponent(projectId)}/restart`,
+    { method: 'POST' },
+    deps,
+  )
+  if (!res.ok) throw await readApiError(res, 'Could not restart the app')
+  const body = (await res.json()) as { deploymentId?: unknown }
+  return { deploymentId: typeof body.deploymentId === 'string' ? body.deploymentId : '' }
+}
+
+/**
+ * Take the application out of production. The container goes; the application row, its chats, its
+ * data and its files all stay, and Publish again puts it back at the same address.
+ *
+ * IT IS NOT DELETE AND IT IS NOT THE ADMINISTRATOR'S DISABLE. Delete removes the application;
+ * `disable` additionally severs its database credential and is a lever only an administrator
+ * holds. This one removes a container and nothing else — which is why its confirmation says what
+ * is KEPT rather than what is lost.
+ *
+ * Throws `ApiError` on 409 `never_deployed` / `deploy_in_flight`, and on 503
+ * `teardown_unconfirmed`, which means the removal was not observed rather than that it failed —
+ * retrying is the right move and is safe.
+ */
+export async function takeAppDown(
+  projectId: string,
+  deps: AuthFetchDeps = {},
+): Promise<{ message: string }> {
+  const res = await authFetch(
+    `/api/projects/${encodeURIComponent(projectId)}/takedown`,
+    { method: 'POST' },
+    deps,
+  )
+  if (!res.ok) throw await readApiError(res, 'Could not take the app down')
+  const body = (await res.json()) as { message?: unknown }
+  return { message: typeof body.message === 'string' ? body.message : '' }
+}

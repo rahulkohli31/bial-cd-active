@@ -17,6 +17,7 @@ import { tileDateRange } from '../../utils/projectDates'
 import { useClipped } from '../../hooks/useClipped'
 import { Card } from '../ui/card'
 import AppRowMenu from './AppRowMenu'
+import type { AppRowMenuProps } from './AppRowMenu'
 
 /**
  * The tile's name: clipped with an ellipsis, and revealed in full on hover ONLY when it is
@@ -90,9 +91,10 @@ export interface ProjectCardProps {
   onOpen: () => void
   onSettings: () => void
   onDelete: () => void
+  live?: AppRowMenuProps['live']
 }
 
-export default function ProjectCard({ project, onOpen, onSettings, onDelete }: ProjectCardProps): React.JSX.Element {
+export default function ProjectCard({ project, onOpen, onSettings, onDelete, live }: ProjectCardProps): React.JSX.Element {
   const hasDescription = typeof project.description === 'string' && project.description.trim().length > 0
   // The card is a plain container (no role="button"). The primary open affordance is a
   // real <button> on the title whose stretched ::after covers the whole card, so the card stays
@@ -117,6 +119,7 @@ export default function ProjectCard({ project, onOpen, onSettings, onDelete }: P
           onOpen={onOpen}
           onSettings={onSettings}
           onDelete={onDelete}
+          live={live}
           where="tile"
         />
       </div>

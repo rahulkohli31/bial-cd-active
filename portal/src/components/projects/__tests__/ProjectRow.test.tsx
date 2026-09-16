@@ -207,6 +207,77 @@ describe('ProjectRow — no nested interactive elements, still', () => {
     expect(onOpen).not.toHaveBeenCalled()
   })
 
+})
+
+/**
+ * THE TWO PRODUCTION ENTRIES. They exist only while the application is serving — which is the
+ * precondition the endpoints enforce anyway, so a control offered here in order to be refused
+ * teaches a citizen to distrust the screen.
+ */
+describe('ProjectRow — Restart and Take down', () => {
+  it.each([
+    ['Restart app', 'menu-restart'],
+    ['Take down', 'menu-takedown'],
+  ])('offers %s only while the application is serving', async (label, testid) => {
+    // Absence PAIRED WITH LIVENESS. The menu really opened and really carries its other
+    // entries, so this is the two production entries being withheld — not a menu that failed
+    // to render, which is what an unpaired `toBeNull()` would also accept.
+    render(<ProjectRow project={project({ isServing: false })} onOpen={vi.fn()} onSettings={vi.fn()} onDelete={vi.fn()} />)
+    fireEvent.pointerDown(screen.getByTestId('app-menu-row'))
+    expect(await screen.findByRole('menuitem', { name: 'Open' })).toBeTruthy()
+    expect(screen.queryByTestId(testid)).toBeNull()
+    expect(screen.queryByRole('menuitem', { name: label })).toBeNull()
+  })
+
+  it('offers both once it IS serving', async () => {
+    render(
+      <ProjectRow
+        project={project({ isServing: true })}
+        onOpen={vi.fn()}
+        onSettings={vi.fn()}
+        onDelete={vi.fn()}
+        live={{ onRestart: vi.fn(), onTakeDown: vi.fn(), busy: false }}
+      />,
+    )
+    fireEvent.pointerDown(screen.getByTestId('app-menu-row'))
+    expect(await screen.findByTestId('menu-restart')).toBeTruthy()
+    expect(screen.getByTestId('menu-takedown')).toBeTruthy()
+  })
+
+  it.each([
+    ['menu-restart', 'onRestart'],
+    ['menu-takedown', 'onTakeDown'],
+  ] as const)('runs %s through its own handler', async (testid, handler) => {
+    const live = { onRestart: vi.fn(), onTakeDown: vi.fn(), busy: false }
+    render(
+      <ProjectRow project={project({ isServing: true })} onOpen={vi.fn()} onSettings={vi.fn()} onDelete={vi.fn()} live={live} />,
+    )
+    fireEvent.pointerDown(screen.getByTestId('app-menu-row'))
+    fireEvent.click(await screen.findByTestId(testid))
+    expect(live[handler]).toHaveBeenCalledTimes(1)
+  })
+
+  it('★ mid-operation the two entries are UNAVAILABLE, not absent', async () => {
+    // A control that vanishes while its own action runs reads as a broken screen — the citizen
+    // pressed a thing and the thing left. It stays, announced inert, and refuses the press.
+    const live = { onRestart: vi.fn(), onTakeDown: vi.fn(), busy: true }
+    render(
+      <ProjectRow project={project({ isServing: true })} onOpen={vi.fn()} onSettings={vi.fn()} onDelete={vi.fn()} live={live} />,
+    )
+    fireEvent.pointerDown(screen.getByTestId('app-menu-row'))
+    const restart = await screen.findByTestId('menu-restart')
+    expect(restart.getAttribute('aria-disabled')).toBe('true')
+    expect(screen.getByTestId('menu-takedown').getAttribute('aria-disabled')).toBe('true')
+
+    fireEvent.click(restart)
+    fireEvent.click(screen.getByTestId('menu-takedown'))
+    expect(live.onRestart).not.toHaveBeenCalled()
+    expect(live.onTakeDown).not.toHaveBeenCalled()
+  })
+
+})
+
+describe('ProjectRow — the dates', () => {
   it('renders both dates, each absolute, each in its own column', () => {
     render(
       <ProjectRow

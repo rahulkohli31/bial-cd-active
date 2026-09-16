@@ -24,6 +24,8 @@ const h = vi.hoisted(() => ({
   createProject: vi.fn(),
   deleteProject: vi.fn(),
   listProjectConversations: vi.fn(),
+  restartApp: vi.fn(),
+  takeAppDown: vi.fn(),
 }))
 
 vi.mock('../../utils/projectApi', () => ({
@@ -31,6 +33,11 @@ vi.mock('../../utils/projectApi', () => ({
   listProjectCounts: h.listProjectCounts,
   createProject: h.createProject,
   deleteProject: h.deleteProject,
+}))
+vi.mock('../../utils/deployApi', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  restartApp: h.restartApp,
+  takeAppDown: h.takeAppDown,
 }))
 vi.mock('../../utils/conversationApi', () => ({
   // The send path creates the chat before its first upload; stubbed so no network is reached.
@@ -173,6 +180,8 @@ beforeEach(() => {
   h.listProjects.mockResolvedValue(page([]))
   h.listProjectCounts.mockResolvedValue(COUNTS)
   h.listProjectConversations.mockResolvedValue([])
+  h.restartApp.mockResolvedValue({ deploymentId: 'd1' })
+  h.takeAppDown.mockResolvedValue({ message: 'done' })
 })
 afterEach(() => cleanup())
 
@@ -1061,5 +1070,106 @@ describe('page, search and rows-per-page live in the URL', () => {
     await screen.findByText('Ramp Ops')
     expect(screen.queryByText(PROJECT_GONE_NOTICE)).toBeNull()
     expect(screen.getByTestId('projects-notice').textContent).toBe('')
+  })
+})
+
+/**
+ * RESTART AND TAKE DOWN, REACHED FROM THE LIST.
+ *
+ * The list is not a polling surface and does not become one: it refetches ONCE when an
+ * operation returns, the same refresh a delete already triggers. What it must get right is that
+ * two rows acting at once settle independently — a shared boolean would freeze a whole page of
+ * applications because one of them is restarting.
+ */
+describe('ProjectsPage — the production actions', () => {
+  const serving = (id: string, name: string) => mkProject(id, name, { isServing: true })
+
+  async function openRowMenu(index = 0): Promise<void> {
+    fireEvent.pointerDown(screen.getAllByTestId('app-menu-row')[index])
+    await screen.findByRole('menuitem', { name: 'Open' })
+  }
+
+  it.each([
+    ['menu-restart', 'restartApp'],
+    ['menu-takedown', 'takeAppDown'],
+  ] as const)('runs %s against the row it was opened on', async (testid, call) => {
+    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Draft App'), serving('p2', 'Ramp Ops')]))
+    renderPage()
+    await screen.findByText('Ramp Ops')
+    // The first row is not serving, so its menu carries neither entry — the SECOND row's does.
+    await openRowMenu(1)
+    fireEvent.click(await screen.findByTestId(testid))
+    await waitFor(() => expect(h[call]).toHaveBeenCalledWith('p2'))
+  })
+
+  it('re-reads the list once the operation returns, so the chip stops being stale', async () => {
+    h.listProjects.mockResolvedValue(page([serving('p1', 'Ramp Ops')]))
+    renderPage()
+    await screen.findByText('Ramp Ops')
+    const before = h.listProjects.mock.calls.length
+    await openRowMenu()
+    fireEvent.click(await screen.findByTestId('menu-takedown'))
+    await waitFor(() => expect(h.listProjects.mock.calls.length).toBeGreaterThan(before))
+  })
+
+  it("★ says the server's own reason when it refuses, not a generic failure", async () => {
+    // Every refusal on these two routes names something the owner can act on — publish it
+    // again, wait for the deploy to finish, ask an administrator. Flattening them into
+    // "something went wrong" throws away the only part that helps.
+    h.restartApp.mockRejectedValue(
+      new ApiError('This app has been taken offline. Publish again to put it back.', 409, 'taken_offline'),
+    )
+    h.listProjects.mockResolvedValue(page([serving('p1', 'Ramp Ops')]))
+    renderPage()
+    await screen.findByText('Ramp Ops')
+    await openRowMenu()
+    fireEvent.click(await screen.findByTestId('menu-restart'))
+    expect((await screen.findByTestId('projects-toast')).textContent).toContain(
+      'This app has been taken offline. Publish again to put it back.',
+    )
+  })
+
+  it('★ one row acting does not freeze the other', async () => {
+    // Mutation receipt: make `actingIds` a single `actingId` string and this goes red — the
+    // second application would be announced inert because an unrelated one is restarting.
+    h.restartApp.mockReturnValue(new Promise(() => {}))
+    h.listProjects.mockResolvedValue(page([serving('p1', 'Ramp Ops'), serving('p2', 'Gate Board')]))
+    renderPage()
+    await screen.findByText('Gate Board')
+
+    await openRowMenu(0)
+    fireEvent.click(await screen.findByTestId('menu-restart'))
+
+    await openRowMenu(1)
+    const restart = await screen.findByTestId('menu-restart')
+    expect(restart.getAttribute('aria-disabled')).toBe('false')
+    fireEvent.click(restart)
+    await waitFor(() => expect(h.restartApp).toHaveBeenCalledTimes(2))
+    expect(h.restartApp.mock.calls.map((c: unknown[]) => c[0])).toEqual(['p1', 'p2'])
+  })
+
+  it('★ the acting row itself IS announced inert while its own operation runs', async () => {
+    // The paired positive for the test above: scoping per row must not mean nothing is scoped.
+    h.restartApp.mockReturnValue(new Promise(() => {}))
+    h.listProjects.mockResolvedValue(page([serving('p1', 'Ramp Ops')]))
+    renderPage()
+    await screen.findByText('Ramp Ops')
+    await openRowMenu()
+    fireEvent.click(await screen.findByTestId('menu-restart'))
+    await openRowMenu()
+    await waitFor(() =>
+      expect(screen.getByTestId('menu-restart').getAttribute('aria-disabled')).toBe('true'),
+    )
+  })
+
+  it('offers neither entry on an application that is not serving', async () => {
+    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Draft App')]))
+    renderPage()
+    await screen.findByText('Draft App')
+    await openRowMenu()
+    // Liveness beside the absence: the menu opened and carries its ordinary entries.
+    expect(screen.getByRole('menuitem', { name: 'Settings' })).toBeTruthy()
+    expect(screen.queryByTestId('menu-restart')).toBeNull()
+    expect(screen.queryByTestId('menu-takedown')).toBeNull()
   })
 })

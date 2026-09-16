@@ -47,6 +47,7 @@ import SharedProjectCard from '../components/projects/SharedProjectCard'
 import ProjectCreateModal from '../components/projects/ProjectCreateModal'
 import ProjectDeleteDialog from '../components/projects/ProjectDeleteDialog'
 import AppSettingsDialog from '../components/projects/AppSettingsDialog'
+import { restartApp, takeAppDown } from '../utils/deployApi'
 import { useKeysetList } from '../hooks/useKeysetList'
 import { Input } from '../components/ui/input'
 import { Skeleton } from '../components/ui/skeleton'
@@ -177,7 +178,36 @@ export default function ProjectsPage(): React.JSX.Element {
   // address, so a citizen who came from a search and a page is still on that search and that
   // page when they close it.
   const [settingsFor, setSettingsFor] = useState<Project | null>(null)
+  // WHICH ROWS HAVE AN OPERATION OF THEIR OWN IN FLIGHT. A set rather than a boolean, for the
+  // reason the delete set already gives: two rows acting at once must settle independently.
+  // The list does NOT become a polling surface — it refetches once when an operation returns,
+  // which is the same refresh a delete already triggers.
+  const [actingIds, setActingIds] = useState<ReadonlySet<string>>(() => new Set())
+
   const [toast, setToast] = useState<string | null>(null)
+
+  const runProduction = useCallback(
+    (project: Project, run: (id: string) => Promise<unknown>) => {
+      setActingIds((ids) => new Set(ids).add(project.id))
+      void (async () => {
+        try {
+          await run(project.id)
+        } catch (caught) {
+          // THE SERVER'S STATED REASON. Every refusal on these two routes names something the
+          // owner can act on, and flattening them into "something went wrong" throws that away.
+          setToast(caught instanceof Error ? caught.message : 'That did not work. Try again.')
+        } finally {
+          setActingIds((ids) => {
+            const next = new Set(ids)
+            next.delete(project.id)
+            return next
+          })
+          setReloadNonce((n) => n + 1)
+        }
+      })()
+    },
+    [],
+  )
 
   const [view, setView] = useState<View>(() => readStored(VIEW_KEY, ['list', 'grid'] as const, 'list'))
   const [density, setDensity] = useState<Density>(() => readStored(DENSITY_KEY, ['S', 'M', 'L'] as const, 'M'))
@@ -876,6 +906,15 @@ export default function ProjectsPage(): React.JSX.Element {
                     onOpen={() => openProject(project.id)}
                     onSettings={() => setSettingsFor(project)}
                     onDelete={() => setDeleting(project)}
+                    live={
+                      project.isServing
+                        ? {
+                            onRestart: () => runProduction(project, restartApp),
+                            onTakeDown: () => runProduction(project, takeAppDown),
+                            busy: actingIds.has(project.id),
+                          }
+                        : undefined
+                    }
                   />
                 ))}
               </div>
@@ -888,6 +927,15 @@ export default function ProjectsPage(): React.JSX.Element {
                     onOpen={() => openProject(project.id)}
                     onSettings={() => setSettingsFor(project)}
                     onDelete={() => setDeleting(project)}
+                    live={
+                      project.isServing
+                        ? {
+                            onRestart: () => runProduction(project, restartApp),
+                            onTakeDown: () => runProduction(project, takeAppDown),
+                            busy: actingIds.has(project.id),
+                          }
+                        : undefined
+                    }
                   />
                 ))}
               </div>
@@ -1035,6 +1083,7 @@ export default function ProjectsPage(): React.JSX.Element {
             setReloadNonce((n) => n + 1)
           }}
           onClose={() => setSettingsFor(null)}
+          onProductionSettled={() => setReloadNonce((n) => n + 1)}
           // DELETE HANDS OFF TO THE SAME CONFIRMATION THE MENU OPENS, and the settings dialog
           // closes on the way: two dialogs stacked over one another is two focus traps, and the
           // one underneath is not the one being answered.

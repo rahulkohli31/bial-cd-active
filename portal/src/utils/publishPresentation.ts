@@ -226,11 +226,16 @@ export function presentationFor(state: PublishState): Presentation {
       // NO ARTBOARD. Verbatim from the retired Publish card, which had it right: a
       // taken-down app has a working remedy and a switched-off one does not, and
       // collapsing the two into one word would remove that remedy silently.
+      //
+      // THE SENTENCE NAMES NO ACTOR, because there are two. This state is now reachable by the
+      // owner's own take-down as well as by an administrator's, and telling an owner that an
+      // administrator did what they just did themselves is worse than saying nothing about who.
+      // What does not change is the remedy, which is the half that matters.
       return {
         label: 'Taken offline',
         sentence:
-          'An administrator has taken this app offline. Publishing again puts it back ' +
-          'at the same address.',
+          'This app is not running in production. Publishing again puts it back at the ' +
+          'same address.',
         action: 'publish_again',
         version: 'last_published',
       }

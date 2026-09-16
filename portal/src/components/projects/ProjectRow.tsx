@@ -39,12 +39,14 @@ import { listDate } from '../../utils/projectDates'
 import { useClipped } from '../../hooks/useClipped'
 import type { Project } from '../../utils/projectApi'
 import AppRowMenu from './AppRowMenu'
+import type { AppRowMenuProps } from './AppRowMenu'
 
 export interface ProjectRowProps {
   project: Project
   onOpen: () => void
   onSettings: () => void
   onDelete: () => void
+  live?: AppRowMenuProps['live']
 }
 
 /**
@@ -136,7 +138,7 @@ function ClampedName({ name, onOpen }: { name: string; onOpen: () => void }): Re
   )
 }
 
-export default function ProjectRow({ project, onOpen, onSettings, onDelete }: ProjectRowProps): React.JSX.Element {
+export default function ProjectRow({ project, onOpen, onSettings, onDelete, live }: ProjectRowProps): React.JSX.Element {
   const status = statusFor(project)
 
   return (
@@ -166,7 +168,7 @@ export default function ProjectRow({ project, onOpen, onSettings, onDelete }: Pr
 
       {/* SIBLING of the name button, not a descendant — z-10 lifts it above the stretched
           ::after so it is clickable rather than covered. */}
-      <AppRowMenu appName={project.name} onOpen={onOpen} onSettings={onSettings} onDelete={onDelete} where="row" />
+      <AppRowMenu appName={project.name} onOpen={onOpen} onSettings={onSettings} onDelete={onDelete} live={live} where="row" />
     </div>
   )
 }
