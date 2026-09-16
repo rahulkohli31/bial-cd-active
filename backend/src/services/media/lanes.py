@@ -98,6 +98,17 @@ _ZIP_SIGNATURE: Final = bytes([0x50, 0x4B, 0x03, 0x04])
 _ENCRYPTED_PACKAGE: Final = "EncryptedPackage".encode("utf-16-le")
 
 
+def magic_matches(data: bytes, magic: bytes) -> bool:
+    """True iff `data` opens with the `magic` prefix.
+
+    ONE COPY, AND IT LIVES HERE because this is the lower module — `magic.py` imports it, not
+    the other way about. A security-relevant compare written out three times is three places
+    to get the length guard wrong, and the guard is the whole of it: a slice of a short buffer
+    is silently shorter rather than an error.
+    """
+    return len(data) >= len(magic) and data[: len(magic)] == magic
+
+
 def is_code_lane(media_type: str) -> bool:
     """Is this a file that CODE reads, rather than one the model reads itself?"""
     return media_type in CODE_LANE_MEDIA
@@ -131,7 +142,7 @@ def looks_password_protected(data: bytes) -> bool:
     or `PowerPoint Document`. Directory entry names are UTF-16, so the search is for those
     bytes; a legacy file falls through to the structure check and is told its real problem.
     """
-    return data[:8] == _OLE2_SIGNATURE and _ENCRYPTED_PACKAGE in data
+    return magic_matches(data, _OLE2_SIGNATURE) and _ENCRYPTED_PACKAGE in data
 
 
 PASSWORD_PROTECTED_TEXT: Final = (
@@ -268,7 +279,7 @@ def code_lane_refusal(media_type: str, name: str, data: bytes) -> str | None:
         return f"Unsupported attachment type: {media_type}."
     if looks_password_protected(data):
         return PASSWORD_PROTECTED_TEXT
-    if data[:4] != _ZIP_SIGNATURE:
+    if not magic_matches(data, _ZIP_SIGNATURE):
         return unreadable_office_text(name)
     if part not in data:
         # The OPC part is stored uncompressed in the ZIP's own headers, so a plain substring search

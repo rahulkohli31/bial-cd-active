@@ -281,16 +281,22 @@ async def test_a_reader_killed_by_a_signal_is_named_rather_than_left_to_a_retry(
     JSON object and exit 0, and left unnamed it reaches the tool as unparseable output, which asks
     the model to try again against a failure that repeats exactly.
 
+    MEASURED, NOT INFERRED. A 120,000-column CSV of about a megabyte, read inside the shipped
+    image: exit 134, stdout empty, stderr "memory allocation of 72 bytes failed". Both spellings
+    of the same event are covered below, because the shell reports 128 + signal and Python
+    reports the negative signal number.
+
     Mutation receipt: drop the killed-with-no-output arm and this comes back an empty string.
     """
-    session = _session_double(_Reply(stdout="", stderr="", exit=-6))
+    for exit_code in (-6, 134):
+        session = _session_double(_Reply(stdout="", stderr="", exit=exit_code))
 
-    out = await AttachmentReader(session=session).read(".attachments/roster.xlsx")
+        out = await AttachmentReader(session=session).read(".attachments/roster.xlsx")
 
-    answer = json.loads(out)
-    assert answer["ok"] is False
-    assert answer["error"]["code"] == "too_large"
-    assert "smaller" in answer["error"]["next"]
+        answer = json.loads(out)
+        assert answer["ok"] is False
+        assert answer["error"]["code"] == "too_large"
+        assert "smaller" in answer["error"]["next"]
 
 
 async def test_an_answer_too_large_to_return_is_named_instead_of_returned() -> None:
