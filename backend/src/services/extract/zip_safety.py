@@ -15,6 +15,7 @@ import struct
 # ~300 MB summed-uncompressed ceiling (Express `MAX_DECOMPRESSED_BYTES`). A fixed safety bound.
 MAX_DECOMPRESSED_BYTES = 300 * 1024 * 1024
 
+_ZIP_LOCAL_SIG = b"\x50\x4b\x03\x04"  # PK\x03\x04
 _EOCD_SIG = 0x06054B50
 _CDH_SIG = 0x02014B50
 _EOCD_MIN = 22
@@ -28,6 +29,11 @@ class FileParseError(Exception):
         super().__init__(message)
         self.status = status
         self.code = code
+
+
+def looks_like_zip(data: bytes) -> bool:
+    """True iff `data` starts with the ZIP local-file-header signature (PK\\x03\\x04)."""
+    return len(data) >= 4 and data[:4] == _ZIP_LOCAL_SIG
 
 
 def _find_eocd(data: bytes) -> int:

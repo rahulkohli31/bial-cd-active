@@ -123,11 +123,7 @@ describe('buildUserParts', () => {
 })
 
 describe('releaseUploadedAttachments', () => {
-  it('deletes every file part by id alone, and ignores non-file parts', () => {
-    // ONE ARGUMENT, because there is one object per attachment. A deck used to carry a second —
-    // an internally converted PDF named by `pdfFileId` — and the delete route took it so both
-    // were released together. Nothing converts, the route stopped reading it, and passing it on
-    // asked the server for something it no longer has.
+  it('deletes every file part (passing pdfFileId only for decks) and ignores non-file parts', () => {
     const del = vi.fn(async () => {})
     const parts = [
       deckPart({ attachmentId: 'd1', pdfFileId: 'file_d1' }),
@@ -136,9 +132,9 @@ describe('releaseUploadedAttachments', () => {
       textAttachmentPart('r.csv', 'a,b'),
     ]
     releaseUploadedAttachments(parts, del)
-    expect(del).toHaveBeenCalledTimes(2) // both file parts; text parts skipped
-    expect(del).toHaveBeenCalledWith('d1')
-    expect(del).toHaveBeenCalledWith('img1')
+    expect(del).toHaveBeenCalledTimes(2) // deck + image; text parts skipped
+    expect(del).toHaveBeenCalledWith('d1', { pdfFileId: 'file_d1' })
+    expect(del).toHaveBeenCalledWith('img1', { pdfFileId: undefined })
   })
 
   it('swallows a delete rejection (best-effort, never throws into the send path)', () => {

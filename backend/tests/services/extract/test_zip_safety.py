@@ -7,7 +7,11 @@ import zipfile
 
 import pytest
 
-from src.services.extract.zip_safety import FileParseError, assert_zip_not_bomb
+from src.services.extract.zip_safety import (
+    FileParseError,
+    assert_zip_not_bomb,
+    looks_like_zip,
+)
 
 
 def _zip(entries: dict[str, bytes]) -> bytes:
@@ -16,6 +20,12 @@ def _zip(entries: dict[str, bytes]) -> bytes:
         for name, data in entries.items():
             archive.writestr(name, data)
     return buffer.getvalue()
+
+
+def test_looks_like_zip() -> None:
+    assert looks_like_zip(_zip({"a.txt": b"hi"})) is True
+    assert looks_like_zip(b"not a zip") is False
+    assert looks_like_zip(b"PK") is False  # too short
 
 
 def test_valid_zip_under_cap_passes() -> None:

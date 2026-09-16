@@ -8,7 +8,6 @@ from src.services.media.lanes import looks_password_protected as looks_password_
 from src.services.media.lanes import pdf_looks_password_protected as pdf_looks_password_protected
 from src.services.media.lanes import pdf_looks_truncated as pdf_looks_truncated
 from src.services.media.lanes import pdf_refusal as pdf_refusal
-from src.services.media.lanes import unreadable_office_text as unreadable_office_text
 from src.services.media.magic import ALLOWED_MEDIA as ALLOWED_MEDIA
 from src.services.media.magic import bytes_match_declared as bytes_match_declared
 from src.services.media.magic import chip_kind_for as chip_kind_for

@@ -36,24 +36,6 @@ describe('uploadAttachment', () => {
     expect(JSON.parse(opts.body)).toMatchObject({ attachmentId: 'a1', mediaType: 'image/png', base64: 'AAAA' })
   })
 
-  it('★ puts the conversation on the wire body, which is where the server reads it', async () => {
-    // THE FIELD THE SERVER REFUSES EVERY UPLOAD WITHOUT. The store's own suite asserts the
-    // argument it hands an injected upload double, which is a different claim entirely: removing
-    // `conversationId` from the body built HERE left that test green while every real upload
-    // would come back `CONVERSATION_ID_REQUIRED`.
-    //
-    // Mutation receipt: drop `conversationId` from the JSON body and this goes red.
-    const attachment = { attachmentId: 'a1', key: 'att/u/a1', kind: 'file', name: 'r.csv', mediaType: 'text/csv', size: 9 }
-    const fetchImpl = vi.fn(async () => ({ ok: true, status: 201, json: async () => ({ attachment }) }))
-
-    await uploadAttachment(
-      { attachmentId: 'a1', name: 'r.csv', mediaType: 'text/csv', size: 9, base64: 'AAAA', conversationId: 'conv-42' },
-      deps(fetchImpl),
-    )
-
-    expect(JSON.parse(fetchImpl.mock.calls[0][1].body).conversationId).toBe('conv-42')
-  })
-
   it('throws AttachmentCapError on the conversation-full rejection, wearing the same code', async () => {
     // ★ ONE CODE, ON BOTH SIDES OF THE THROW. The class hardcoded `ATTACHMENT_STORE_FULL` on
     // every instance while the branch that constructs it read a different field, so after the

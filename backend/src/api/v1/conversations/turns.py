@@ -58,17 +58,12 @@ from src.services.agent.mode_prompts import PromptContext
 from src.services.attachments.materialize import (
     AttachmentDelivery,
     code_lane_attachments,
-    names_this_project_still_owns,
 )
 from src.services.build_sessions import SandboxReclaimBlockedError
 from src.services.build_sessions.appdata import APP_SWITCHED_OFF, APP_SWITCHED_OFF_CODE
 from src.services.build_sessions.manager import SessionManager
 from src.services.connectors.access import connected_systems_for_project
-from src.services.messages.projection import (
-    DisplayItem,
-    fill_in_attachment_chips,
-    project_rows,
-)
+from src.services.messages.projection import DisplayItem, project_conversation
 from src.services.messages.store import (
     AttachmentRehydrationError,
     SeqContentionError,
@@ -502,16 +497,7 @@ async def start_turn(
         attachment_ids=body.message.attachment_ids,
     )
     delivery = (
-        AttachmentDelivery(
-            files=tuple(code_lane),
-            storage=storage,
-            # WHAT THE CONTAINER IS ALLOWED TO KEEP. The attachments root belongs to the
-            # project, so placement reconciles it against every conversation in the project
-            # rather than this one — see `names_this_project_still_owns`.
-            keep=await names_this_project_still_owns(
-                db, user_id=user.id, conversation_id=conversation_id
-            ),
-        )
+        AttachmentDelivery(files=tuple(code_lane), storage=storage)
         if code_lane and storage is not None
         else None
     )
@@ -696,12 +682,8 @@ async def turn_events(
             rows = await load_rows(
                 db, user_id=user.id, conversation_id=conversation.id, include_hidden=True
             )
-            # SLICED BEFORE IT IS ENRICHED. The tail is all this frame carries, and resolving
-            # every attachment in the transcript to name eight chips charged a reconnect for
-            # the whole conversation. Same derivation, same enrichment, same result.
-            items = await fill_in_attachment_chips(
-                db, user_id=user.id, items=project_rows(rows)[-8:]
-            )
+            projected = await project_conversation(db, user_id=user.id, rows=rows)
+            items = projected[-8:]  # the turn's own tail; full history is a separate GET
         snapshot = engine.build_snapshot(state, items=items)
 
     # Every DB read this route needs is done. Commit now so the pooled connection goes back

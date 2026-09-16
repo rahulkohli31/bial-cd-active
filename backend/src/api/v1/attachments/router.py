@@ -1,24 +1,25 @@
 """Attachment HTTP endpoints — upload / download / delete, for all ten formats.
 
-The door asks three questions and nothing downstream asks any of them again: is this file one
-of the ten, is it under `ATTACHMENT_MAX_BYTES`, and is it whole and unlocked? A file that
-passes is stored as itself, owner-scoped, and read where it can actually be read. Object keys
-are scoped by `user_id` and re-guarded with `assert_owned`; the envelopes are the ported
-`{error:{message,code?}}` / `{ok:true}`.
+THE DOOR ASKS THREE QUESTIONS AND NOTHING DOWNSTREAM ASKS ANY OF THEM AGAIN. Is this file one of
+the ten? Is it under `ATTACHMENT_MAX_BYTES`? Is it whole and unlocked? A file that passes is
+stored as itself, owner-scoped, and read where it can actually be read.
 
-WHY THIS EXISTS
-
-ONE SIZE FOR EVERY FORMAT, AND ONE PLACE THAT ASKS. There were four independently-declared
-per-file byte numbers — this route's, a duplicate inside a decoder with no callers, the
+ONE SIZE FOR EVERY FORMAT, AND ONE PLACE THAT ASKS. There used to be four independently-declared
+per-file byte numbers — this route's, a duplicate inside a decoder that had no callers, the
 browser's, and the supervisor's write ceiling. Four numbers for one rule is a rule that will
-disagree with itself, and it was one release from doing so. The browser keeps a copy so a
-citizen learns a file is too large before uploading it, and a test holds the two equal.
+disagree with itself, and it was one release away from doing so. The others are gone; the browser
+keeps a copy because a citizen should learn a file is too large before uploading it, and a test
+holds the two equal.
 
-WHAT IS NOT ASKED, DELIBERATELY: length. A PDF's page count used to be measured in a killable
+WHAT IS NOT ASKED, DELIBERATELY. Length. A PDF's page count used to be measured in a killable
 subprocess and capped, because a document was charged a flat figure sized to that cap. Nothing
-prices a document up front now — the window check reads what the provider reports for a
-completed turn — so the cap bounded a cost that no longer exists, at the price of a
-dependency, a process governor and a refusal a citizen could not act on.
+prices a document up front any more — the window check reads what the provider reports for a
+completed turn — so the cap was bounding a cost that no longer exists, at the price of a
+dependency, a process governor and a refusal a citizen could not act on. The token cost of a long
+document is the client's to bear.
+
+Object keys are scoped by `user_id` and re-guarded with `assert_owned`; the envelopes are the
+ported `{error:{message,code?}}` / `{ok:true}`.
 """
 
 from __future__ import annotations
@@ -32,9 +33,10 @@ from typing import Annotated, Any, Final
 import sqlalchemy as sa
 import structlog
 from fastapi import APIRouter, Depends, Request, Response
+from fastapi.responses import JSONResponse
 
 from src.api.deps import CurrentUser, DbSession
-from src.api.v1.attachments.schemas import AttachmentRef, UploadResponse
+from src.api.v1.attachments.schemas import UploadResponse
 
 # The one media type admitted and charged as a document. Imported rather than re-spelled:
 # `_shared.resolve_binaries` is what decides a stored ref IS a document, so a second copy here
@@ -44,7 +46,6 @@ from src.core.errors import AppApiError
 from src.db.models.attachment import MAX_ATTACHMENT_NAME, Attachment
 from src.db.models.conversation import Conversation
 from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses
-from src.services.attachments.materialize import collapse_to_one_line
 from src.services.extract.zip_safety import FileParseError, assert_zip_not_bomb
 from src.services.media import (
     ALLOWED_MEDIA,
@@ -55,7 +56,6 @@ from src.services.media import (
     is_code_lane,
     is_opc_archive,
     pdf_refusal,
-    unreadable_office_text,
 )
 from src.services.ratelimit import rate_limit
 from src.services.storage import (
@@ -207,12 +207,7 @@ def _attachment_name(value: Any) -> str:
         raise AppApiError(400, "name must be a string.")
     if len(value) > MAX_ATTACHMENT_NAME:
         raise AppApiError(400, f"name must be at most {MAX_ATTACHMENT_NAME} characters.")
-    # ★ CONTROL CHARACTERS ARE COLLAPSED, because this string is later rendered inside the
-    # platform's OWN instructions to the model. The turn note lists each attached file as a
-    # bullet and then, in the same list, tells the agent how to read them; a name carrying a
-    # newline and a `- ` writes further bullets of its own, in the one voice the note presents as
-    # trustworthy. The name's content is untrusted, so it is kept — as one line.
-    return collapse_to_one_line(value)
+    return value
 
 
 def _sniff_media_type(data: bytes) -> str | None:
@@ -389,9 +384,6 @@ def _assert_pdf_is_whole_and_unlocked(data: bytes, name: str) -> None:
     "",
     status_code=201,
     response_model=UploadResponse,
-    # ABSENT, NOT NULL. The five legacy fields on `AttachmentRef` are never populated by this
-    # route, and the ported body this replaced carried the six real keys and nothing else.
-    response_model_exclude_none=True,
     dependencies=[Depends(_attachment_limiter)],
     responses=error_responses(
         (
@@ -416,7 +408,7 @@ def _assert_pdf_is_whole_and_unlocked(data: bytes, name: str) -> None:
 )
 async def upload_attachment(
     request: Request, user: CurrentUser, db: DbSession, storage: Storage
-) -> UploadResponse:
+) -> JSONResponse:
     # The wire ceiling — refuse a huge body before buffering it. Not the size cap; see the
     # constant for why the two are different questions.
     content_length = request.headers.get("content-length")
@@ -515,26 +507,13 @@ async def upload_attachment(
             try:
                 assert_zip_not_bomb(data)
             except FileParseError as exc:
-                # ★ THE STATUS AND THE WORDS BOTH CAME FROM THE WRONG PLACE. A tail-truncated
-                # OOXML still carries the ZIP signature and its own OPC part, so it passes
-                # `code_lane_refusal` and lands here — where the bomb guard's message,
-                # `Malformed archive (no ZIP end-of-central-directory)`, was handed to a
-                # citizen under a 413 that says the file was too large. It is neither
-                # oversized nor a bomb: it is incomplete, which is one of the causes this
-                # route's 415 already documents. A declared size over the bound keeps its own
-                # status, because that one really is about size.
-                if exc.status == 413:
-                    raise AppApiError(413, str(exc)) from None
-                raise AppApiError(415, unreadable_office_text(name)) from None
+                raise AppApiError(413, str(exc)) from None
 
     ref = await _store_attachment_bytes(
         db, storage, user.id, attachment_id, media_type, name, conversation_id, data
     )
     kind = chip_kind_for(media_type)
-    # THE DECLARED SCHEMA IS THE ANSWER NOW. Returning a pre-built response meant FastAPI
-    # validated and filtered nothing, so `response_model` was documentation that could drift
-    # from the body beside it without anything saying so.
-    return UploadResponse(attachment=AttachmentRef.model_validate({**ref, "kind": kind}))
+    return JSONResponse(status_code=201, content={"attachment": {**ref, "kind": kind}})
 
 
 async def _load_owned(db: DbSession, user_id: uuid.UUID, attachment_id: str) -> Attachment | None:
@@ -587,7 +566,7 @@ async def download_attachment(
 )
 async def delete_attachment(
     attachment_id: str, user: CurrentUser, db: DbSession, storage: Storage
-) -> OkResponse:
+) -> JSONResponse:
     if not _ID_RE.match(attachment_id):
         raise AppApiError(400, "Invalid attachment id.")
     att = await _load_owned(db, user.id, attachment_id)
@@ -620,4 +599,4 @@ async def delete_attachment(
                 key_count=len(survived),
             )
     # Delete is always idempotent and 200, even when the id is unknown (Express behavior).
-    return OkResponse(ok=True)
+    return JSONResponse(content={"ok": True})

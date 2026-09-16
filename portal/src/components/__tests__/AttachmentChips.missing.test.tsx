@@ -46,7 +46,7 @@ describe('a chip whose file is gone', () => {
     const status = await waitFor(() => screen.getByRole('status'))
     expect(status.textContent).toContain(name)
     expect(status.textContent).toMatch(/no longer available/)
-    // The change has to reach assistive technology, which has no other way to notice it.
+    // R23c: the change has to reach assistive technology, which has no other way to notice it.
     expect(status.getAttribute('aria-live')).toBe('polite')
   })
 

@@ -51,7 +51,7 @@ function AttachmentChip({ att }: { att: AttachmentDescriptor }) {
   // still absorbed in silence for exactly the two formats the branches handle, which is the
   // one thing a control must never do and the defect the state was added to fix.
   if (missing) {
-    // It said only "attachment unavailable", with no name and no next step, and it
+    // R23b/R23c. It said only "attachment unavailable", with no name and no next step, and it
     // announced nothing — a chip that changes under a citizen's press without the page changing
     // is a change assistive technology has no other way to notice. `role="status"` is what
     // carries it; `aria-live="polite"` waits for a pause rather than interrupting.
@@ -91,7 +91,7 @@ function AttachmentChip({ att }: { att: AttachmentDescriptor }) {
           if (url) downloadObjectUrl(url, att.name)
           else setMissing(true)
         }}
-        // The accessible name says WHICH file and WHAT pressing it does. A chip that
+        // R23c: the accessible name says WHICH file and WHAT pressing it does. A chip that
         // downloads and a chip that previews are otherwise the same shape to a screen reader.
         aria-label={`Download ${att.name}`}
         title={`Download ${att.name}`}
@@ -113,7 +113,7 @@ function AttachmentChip({ att }: { att: AttachmentDescriptor }) {
           if (url) openUrlInNewTab(url, att.name)
           else setMissing(true)
         }}
-        // Which file, and what pressing it does — a chip that opens and a chip that
+        // R23c: which file, and what pressing it does — a chip that opens and a chip that
         // downloads are otherwise indistinguishable to a screen reader.
         aria-label={`Open ${att.name}`}
         title={`Open ${att.name}`}

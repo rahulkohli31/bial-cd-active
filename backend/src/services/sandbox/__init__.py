@@ -11,9 +11,6 @@ read-only. Public surface is re-exported explicitly (`X as X`) so ty / mypy
 from __future__ import annotations
 
 from src.services.sandbox.base import (
-    CONTAINER_ATTACHMENTS_ROOT as CONTAINER_ATTACHMENTS_ROOT,
-)
-from src.services.sandbox.base import (
     SANDBOX_NAME_PREFIX as SANDBOX_NAME_PREFIX,
 )
 from src.services.sandbox.base import (
@@ -42,9 +39,6 @@ from src.services.sandbox.base import (
 )
 from src.services.sandbox.base import (
     FileCreateBytes as FileCreateBytes,
-)
-from src.services.sandbox.base import (
-    FileDelete as FileDelete,
 )
 from src.services.sandbox.base import (
     FileInsert as FileInsert,

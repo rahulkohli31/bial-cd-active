@@ -75,17 +75,10 @@ RUN curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v2.11.4/c
 RUN pip3 install --no-cache-dir --break-system-packages \
         "fastapi==0.141.1" "uvicorn[standard]==0.52.2" "websockets==17.0.1"
 
-# The attachment reader's libraries, and the transitive set they pull in. Pinned like their
-# neighbours above, and captured from what this base actually resolved to rather than picked
-# from a changelog.
+# The attachment reader's libraries. Pinned like their neighbours above, and captured from
+# what this base actually resolved to rather than picked from a changelog.
 #
-# THE SECOND LINE IS THE ONE THAT WAS MISSING. Four pinned libraries whose own dependencies
-# float is not a pinned image: a rebuild months later resolves a different lxml or Pillow, and
-# the reader's behaviour moves without a line of this file changing. polars' own runtime
-# package is deliberately NOT pinned — it is selected per CPU, so naming one would refuse to
-# install on a machine the other suits.
-#
-# CHOSEN FOR FAMILIARITY, NOT CAPABILITY, which is the rule this design follows: the agent may edit
+# CHOSEN FOR FAMILIARITY, NOT CAPABILITY, which is the requirement's own rule: the agent may edit
 # the reader, so every library it uses must be one the model can already write from memory with no
 # documentation. Faster and more capable alternatives exist for each and are declined on that
 # ground alone - an unfamiliar library is a cost paid on every turn, by every agent, and
@@ -96,9 +89,7 @@ RUN pip3 install --no-cache-dir --break-system-packages \
 # null and distinct counts, and a lazy scan over a file larger than memory. The size is a real
 # cost, accepted deliberately rather than absorbed silently.
 RUN pip3 install --no-cache-dir --break-system-packages \
-        "openpyxl==3.1.5" "python-docx==1.2.0" "python-pptx==1.0.2" "polars==1.44.1" \
-        "et-xmlfile==2.0.0" "lxml==6.1.3" "pillow==12.3.0" "typing-extensions==4.16.0" \
-        "xlsxwriter==3.2.9"
+        "openpyxl==3.1.5" "python-docx==1.2.0" "python-pptx==1.0.2" "polars==1.44.1"
 
 # Unprivileged user for `next dev` — the untrusted app process. It CANNOT read root's env,
 # so it cannot read the supervisor token. The supervisor demotes

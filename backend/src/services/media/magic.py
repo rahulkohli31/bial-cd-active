@@ -16,7 +16,6 @@ from __future__ import annotations
 from typing import Literal
 
 from src.services.media.lanes import is_code_lane
-from src.services.media.lanes import magic_matches as magic_matches
 
 # Allowlisted media types → magic-byte prefix. WebP is a RIFF container: the "RIFF" prefix is
 # checked here and the "WEBP" form-type at offset 8 separately (see `bytes_match_declared`).
@@ -27,6 +26,11 @@ ALLOWED_MEDIA: dict[str, bytes] = {
     "image/webp": bytes([0x52, 0x49, 0x46, 0x46]),
     "application/pdf": bytes([0x25, 0x50, 0x44, 0x46]),
 }
+
+
+def magic_matches(data: bytes, magic: bytes) -> bool:
+    """True iff `data` opens with the `magic` prefix."""
+    return len(data) >= len(magic) and data[: len(magic)] == magic
 
 
 def bytes_match_declared(media_type: str, data: bytes) -> bool:

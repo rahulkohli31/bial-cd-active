@@ -1,21 +1,25 @@
 """The Plan chat's one way to read an attached file.
 
-Registered on the Plan arm alone, by `toolsets_for_kind` — the one place permitted to read a
-chat kind. Build does not get it and the asymmetry is deliberate: Build holds an unrestricted
-`run_command` and can read, EDIT and re-run the reader as it would any other file, so a
-fixed-shape tool beside that would be a second, weaker way to do what it already does better.
+WHY THIS IS ITS OWN TOOLSET RATHER THAN A WIDER `run_command`. Plan already executes inside the
+container, but only through `check_the_guest_list`: eight read-only binaries, exec-style argv, no
+shell, no runtime, no package manager. `python3` is deliberately absent, so Plan cannot invoke the
+shipped reader the way Build does.
 
-WHY THIS EXISTS
+The obvious fix — add `python3` to the guest list, or let a path outside the app root be named —
+is the one that must not be taken. That surface is SHARED with the reviewer agent, which runs on
+the control plane over untrusted project contents, and `check_the_guest_list(argv)` takes argv and
+nothing else precisely so no body below it can ask which agent is calling. Widening it for
+attachments widens it there too, and the signature is the proof that it cannot be done selectively.
 
-Plan already executes inside the container, but only through `check_the_guest_list`: eight
-read-only binaries, exec-style argv, no shell, no runtime, no package manager. `python3` is
-deliberately absent, so Plan cannot invoke the shipped reader the way Build does.
+So the capability goes where the architecture already sanctions a per-kind difference:
+`toolsets_for_kind` is the one place permitted to read `ChatKind`, and this toolset is registered
+on the Plan arm alone — the same way `_PLAN_OPTIONS_TOOLSET` already is. The reviewer never
+receives it, by construction rather than by a check.
 
-The obvious fix — add `python3` to the guest list, or allow a path outside the app root — is
-the one that must not be taken. That surface is SHARED with the reviewer agent, which runs on
-the control plane over untrusted project contents, and `check_the_guest_list(argv)` takes argv
-and nothing else precisely so no body below it can ask which agent is calling. Widening it for
-attachments widens it there too, and the signature is the proof it cannot be done selectively.
+BUILD DOES NOT GET THIS, and that asymmetry is R15 rather than an oversight: Build holds an
+unrestricted `run_command` and can read, EDIT and re-run the reader as it would any other file.
+Handing it a fixed-shape tool as well would give it a second, weaker way to do what it can already
+do better, and would make the reader look opaque at exactly the moment it stops being so.
 """
 
 from __future__ import annotations
@@ -42,7 +46,7 @@ from src.services.orchestrator.deps import SandboxSession
 
 logger = structlog.get_logger()
 
-# Where the canonical reader is baked. Fixed and known, never discovered, because the point is
+# Where the canonical reader is baked. Fixed and known, never discovered: R11a's whole point is
 # that an agent is TOLD where this is, because an agent that has to find a reader writes one
 # instead — the single failure this design exists to prevent.
 READER_PATH = "/usr/local/lib/bial/read_attachment.py"
@@ -76,22 +80,6 @@ def _suffix_of(path: str) -> str:
     return PurePosixPath(path).suffix
 
 
-#: The largest reader answer worth returning. The manifest is bounded inside the image; this
-#: is the backstop for a container that predates that bound, generous enough that no bounded
-#: manifest can reach it.
-_MAX_REPLY_CHARS: Final = 250_000
-
-
-def _was_killed(exit_code: int) -> bool:
-    """Whether a process was stopped by a signal rather than returning a status.
-
-    Two spellings reach here: a negative code, which is how Python reports a signal, and
-    128 + signal, which is how a shell reports the same thing. Either way nothing in the
-    child got to say why, so the caller is the only place left that can.
-    """
-    return exit_code < 0 or exit_code >= 128
-
-
 @dataclass
 class AttachmentReader:
     """Runs the shipped reader over one attached file, and nothing else.
@@ -116,14 +104,7 @@ class AttachmentReader:
         # The same `to_container_path` `read_file` and `search_files` use, for the same reason and
         # with the same one-prefix scope — `read_attachment` refuses anything that is not an
         # attachment path, so this only ever rewrites the prefix it was built for.
-        # ★ `-I` ISOLATES THE INTERPRETER, and that is a security property rather than a tidy-up.
-        # A bare `python3` runs `site`, which imports `usercustomize` and executes every `.pth`
-        # file under `$HOME/.local` — and the container's `$HOME` belongs to the account the app's
-        # own build runs as. Any Build turn, any `npm` lifecycle script and the generated app
-        # itself could therefore rewrite what the reader does, AFTER the turn note has told the
-        # model this is the trusted shipped copy. `-I` also ignores `PYTHONPATH` and the current
-        # directory, so the app tree cannot shadow a stdlib module the reader imports.
-        argv = ["python3", "-I", READER_PATH, to_container_path(path)]
+        argv = ["python3", READER_PATH, to_container_path(path)]
         run_command = self.session.sandbox_client.exec  # aliased off the JS-oriented exec guard
         try:
             result = await run_command(self.session.handle, argv, timeout_s=_READ_TIMEOUT_SECONDS)
@@ -153,27 +134,6 @@ class AttachmentReader:
                 exit_code=result.exit,
                 stderr=scrub_untrusted(result.stderr, limit=_STDERR_LOG_CHARS),
             )
-            if _was_killed(result.exit) and not result.stdout.strip():
-                # ★ THE ONE FAILURE THE READER CANNOT NAME FOR ITSELF. Its contract is one
-                # JSON object and exit 0 — but polars allocates through Rust, whose
-                # allocator ABORTS on failure rather than raising, so a file that exhausts
-                # the memory ceiling kills the process with a signal and prints nothing.
-                # Python never runs again in that process, so the name has to be given
-                # here. Left unnamed it reaches the tool as unparseable output and asks the
-                # model to try again — against a failure that is perfectly deterministic.
-                return json.dumps(
-                    {
-                        "ok": False,
-                        "file": path.rsplit("/", 1)[-1],
-                        "error": {
-                            "code": "too_large",
-                            "message": (
-                                "This file needed more memory than the reader is allowed."
-                            ),
-                            "next": "Attach a smaller file, or split it into parts.",
-                        },
-                    }
-                )
         return result.stdout
 
 
@@ -238,29 +198,6 @@ def attachment_toolset[DepsT](
                 f"The attachment could not be read right now ({type(exc).__name__}). "
                 "Try once more; if it fails again, say so rather than guessing at the contents."
             ) from None
-
-        if len(raw) > _MAX_REPLY_CHARS:
-            # THE LAST BOUND BEFORE THE MODEL'S WINDOW. The reader bounds its own manifest
-            # now, so this fires only for a container running an image that predates that
-            # bound — and one oversized answer costs the turn it was meant to serve, which is
-            # worse than saying plainly that the file could not be described.
-            logger.warning(
-                "attachment_read_reply_too_large",
-                app_id=str(reader.session.app_id),
-                suffix=_suffix_of(file),
-                chars=len(raw),
-            )
-            return json.dumps(
-                {
-                    "ok": False,
-                    "file": file.rsplit("/", 1)[-1],
-                    "error": {
-                        "code": "too_large",
-                        "message": "The description of this file was too large to return.",
-                        "next": "Attach a smaller file, or split it into parts.",
-                    },
-                }
-            )
 
         # THE READER ALWAYS PRINTS ONE JSON OBJECT AND EXITS 0, including for a corrupt or
         # encrypted file — that is its contract. Anything else means the script itself is wrong or

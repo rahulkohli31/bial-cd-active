@@ -38,8 +38,8 @@ describe('the composer refusal sentence agrees with the real allowlist', () => {
     // ★ THE RECONCILIATION SURVIVES, IN THE ONLY SHAPE THAT STILL MAKES SENSE.
     //
     // This used to check the sentence named each accepted format and no refused one. The
-    // sentence is no longer an inventory: one sentence describes what HAPPENS to a
-    // file, never a list of ten formats, which is the shape the removed rule failed as. A
+    // sentence is no longer an inventory: R21 requires one sentence describing what HAPPENS to a
+    // file — "never a list of ten formats, which is the shape the removed rule failed as". A
     // list goes stale the moment the allowlist moves and tells a citizen nothing about why a
     // spreadsheet behaves differently from a photograph.
     //

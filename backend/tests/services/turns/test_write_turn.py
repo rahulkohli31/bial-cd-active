@@ -19,7 +19,6 @@ import contextlib
 import json
 import uuid
 from collections.abc import Callable
-from typing import Any, cast
 
 import pytest
 import redis.asyncio as aioredis
@@ -62,7 +61,6 @@ from src.db.models.conversation import ChatKind
 from src.db.models.message import Message, MessageEntryKind
 from src.db.models.token_usage import TokenUsage
 from src.services.agent.mode_prompts import PromptContext, workspace_note
-from src.services.attachments.materialize import AttachmentDelivery
 from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions.alarms import HMR_PROTOCOL_DRIFT_EVENT
 from src.services.build_sessions.manager import (
@@ -213,7 +211,6 @@ async def _run(
     prompt: str = "add a status column",
     history: list[ModelMessage] | None = None,
     expects_mutation: bool = False,
-    attachments: AttachmentDelivery | None = None,
 ):
     async def _noop() -> None:
         return None
@@ -232,7 +229,6 @@ async def _run(
         manager=manager,
         sandbox_client=client,
         expects_mutation=expects_mutation,
-        attachments=attachments,
     )
     state = engine.peek(conv.id)
     assert state is not None and state.task is not None
@@ -3065,62 +3061,3 @@ async def test_a_blip_on_the_verify_reading_frames_nothing_and_leaves_the_claim_
     assert _preview_ready_frames(state) == [], "a transport error was framed as a serving app"
     assert state.preview_framed is False
     assert state.claim_preview_frame() is True, "the blip spent the turn's one-shot"
-
-
-async def test_a_failed_placement_tells_the_operator_what_actually_failed(
-    _fresh_engine, db_session, session_factory, fake_redis: aioredis.Redis, fake_storage
-) -> None:
-    """★ THE ONE FAILURE THAT ENDS A WHOLE TURN BEFORE IT STARTS, and the log has to say why.
-
-    `AttachmentPlacementError`'s own message is written for the citizen — it says the file could
-    not be placed and names it, which is all they can act on. The operator needs the other half:
-    an old image answering 400, an unreachable supervisor and an expired storage credential are
-    the same sentence on screen and three different jobs to fix.
-
-    Mutation receipt: log the exception alone instead of its cause and the line below carries
-    "could not be read from storage. Please try again." — true, and useless for finding out why.
-    """
-    from structlog.testing import capture_logs
-
-    from src.services.attachments.materialize import AttachmentDelivery, CodeLaneAttachment
-    from src.services.storage.errors import StorageAuthError
-
-    class _CredentialExpired:
-        async def get(self, key: str) -> bytes:
-            raise StorageAuthError("the SAS token used to read attachments expired at 09:14Z")
-
-    engine = _fresh_engine
-    user, project, conv = await _write_conversation(db_session, "wt-att@rvaiglobal.com")
-    manager, client = SessionManager(), FakeSandboxClient()
-    model, _ = _scripted([[_DECLARED_DONE]])
-    delivery = AttachmentDelivery(
-        files=(
-            CodeLaneAttachment(
-                attachment_id="att_roster",
-                display_name="Gate roster.xlsx",
-                file_name="Gate_roster.xlsx",
-                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                size=4,
-                storage_key=f"att/{user.id}/att_roster",
-            ),
-        ),
-        storage=cast(Any, _CredentialExpired()),
-    )
-
-    with capture_logs() as logs:
-        _, state = await _run(
-            engine,
-            db_session,
-            session_factory,
-            model,
-            user=user,
-            project=project,
-            conv=conv,
-            manager=manager,
-            client=client,
-            attachments=delivery,
-        )
-
-    assert state.status == "failed"
-    failure = next(entry for entry in logs if entry["event"] == "attachment_placement_failed")
-    assert "SAS token" in failure["reason"]

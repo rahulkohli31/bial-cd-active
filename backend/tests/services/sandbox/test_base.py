@@ -19,7 +19,6 @@ from src.services.sandbox.base import (
     ExecResult,
     FileCreate,
     FileCreateBytes,
-    FileDelete,
     FileInsert,
     FileOp,
     FileResult,
@@ -155,22 +154,8 @@ def test_create_bytes_is_a_separate_op_from_create() -> None:
 
 
 def test_file_op_rejects_unknown_action() -> None:
-    """An action the supervisor does not implement cannot be constructed here.
-
-    `delete` was this test's example of an unknown action until the reaper needed one, which is
-    the whole point of the union: an action exists on both sides or on neither.
-    """
     with pytest.raises(ValidationError):
-        _FILE_OP.validate_python({"action": "chmod", "path": "a.tsx"})
-
-
-def test_delete_is_an_action_the_union_carries() -> None:
-    """The reap removes files the citizen deleted, so it needs an op to carry — and one that
-    takes a path and nothing else, because a body with more in it is a capability nobody asked
-    for on the one action here that destroys something."""
-    assert isinstance(
-        _FILE_OP.validate_python({"action": "delete", "path": "att/book.xlsx"}), FileDelete
-    )
+        _FILE_OP.validate_python({"action": "delete", "path": "a.tsx"})
 
 
 def test_file_op_rejects_missing_action_subfield() -> None:

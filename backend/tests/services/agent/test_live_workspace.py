@@ -292,46 +292,16 @@ async def test_the_attachments_prefix_reaches_the_second_root() -> None:
     nothing to exclude — but a sibling is unreachable unless the read surface can address it.
 
     Mutation receipt: drop `to_container_path` from `read_file` and the argv carries the bare
-    `.attachments/roster.csv`, which resolves inside the app tree and finds nothing.
+    `.attachments/roster.xlsx`, which resolves inside the app tree and finds nothing.
     """
     fake = FakeSandbox()
     workspace = _live(fake, stdout="badge,name\n")
 
-    await workspace.read_file(".attachments/roster.csv")
+    await workspace.read_file(".attachments/roster.xlsx")
 
     argv = fake.command_calls[-1]
-    assert "/workspace/attachments/roster.csv" in argv
-    assert ".attachments/roster.csv" not in argv
-
-
-async def test_reading_an_attached_workbook_names_the_reader_instead_of_returning_bytes() -> None:
-    """★ AN ARCHIVE IS NOT TEXT, and `cat` on one answers with neither content nor an error.
-
-    A spreadsheet, document or deck is a zip: its bytes decode to replacement characters, so the
-    window fills with nothing the model can use and the file reads as empty rather than as
-    unreadable. Refused here with the tool that CAN open it named — the same shape the command
-    door already takes for the same paths.
-
-    Mutation receipt: drop the refusal from `read_file` and `cat` runs on the archive.
-    """
-    fake = FakeSandbox()
-    workspace = _live(fake, stdout="PK")
-
-    with pytest.raises(WorkspacePathError) as caught:
-        await workspace.read_file(".attachments/roster.xlsx")
-
-    assert "read_attachment" in str(caught.value)
-    assert not fake.command_calls
-
-
-async def test_an_attached_delimited_file_is_still_read_as_text() -> None:
-    """The refusal above is scoped to the archive kinds. A `.tsv` in the attachments root IS
-    text, and an agent reading it straight is doing something reasonable — refusing it would take
-    away a capability to fix a problem it does not have."""
-    fake = FakeSandbox()
-    workspace = _live(fake, stdout="badge\tname\n")
-
-    assert await workspace.read_file(".attachments/movements.tsv") == "badge\tname\n"
+    assert "/workspace/attachments/roster.xlsx" in argv
+    assert ".attachments/roster.xlsx" not in argv
 
 
 async def test_an_ordinary_app_path_is_not_translated() -> None:
@@ -388,23 +358,3 @@ async def test_search_can_be_scoped_to_the_attachments_root() -> None:
 
     argv = fake.command_calls[-1]
     assert "/workspace/attachments" in argv
-
-
-async def test_a_hit_inside_the_attachments_root_comes_back_in_the_model_s_vocabulary() -> None:
-    """★ A RESULT THE MODEL CANNOT FEED BACK IS A DEAD END, and only the hit loop can prove it.
-
-    `search_files` translates the subdir on the way IN, so grep runs against
-    `/workspace/attachments/…` and every line it prints carries that container-absolute prefix.
-    Returned untranslated, those paths name a location the model was never taught and every read
-    tool refuses — a leading `/` is rejected — so a search over an attachment produced hits
-    nothing could act on.
-
-    Mutation receipt: drop `to_model_path` from the hit loop and the path below comes back
-    container-absolute.
-    """
-    fake = FakeSandbox()
-    workspace = _live(fake, "/workspace/attachments/roster.csv:3:visitors,12\n")
-
-    hits = await workspace.search_files(re.compile("visitors"), ".attachments")
-
-    assert [(hit.path, hit.line_no) for hit in hits] == [(".attachments/roster.csv", 3)]

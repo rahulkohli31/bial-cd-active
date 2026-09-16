@@ -204,7 +204,7 @@ class UserTextItem(CamelModel):
     seq: int
     text: str
     # Attachments on this turn — the UI renders chips; the bytes never travel on this read.
-    # Populated with ids by `project_rows` and filled out by `fill_in_attachment_chips`, which is
+    # Populated with ids by `project_rows` and filled out by `project_conversation`, which is
     # the entry point every route uses.
     attachments: list[AttachmentRefItem] = Field(default_factory=list)
 
@@ -634,8 +634,8 @@ def _user_text_and_refs(content: Any) -> tuple[str, list[str]]:
             ):
                 # BOTH KINDS. A code-lane file leaves the second marker because its bytes
                 # never became a `BinaryContent` — and reading only the first is what made a
-                # spreadsheet's chip vanish on reload while an image's survived: the same
-                # disappearing-chip regression this work exists to close, in the new formats.
+                # spreadsheet's chip vanish on reload while an image's survived, which is the R23a
+                # regression this work exists to close, inverted for the new formats.
                 attachment_id = item.get("attachment_id")
                 if isinstance(attachment_id, str):
                     refs.append(attachment_id)
@@ -1298,11 +1298,10 @@ async def project_conversation(
     type, and those live in the `attachments` table rather than in the message payload, so
     somebody with a database session has to fill them in. That is this.
 
-    IT WRAPS THE PURE FUNCTION RATHER THAN SITTING BESIDE IT, so a route cannot read a
-    transcript and forget the chips — `live == reload` is a stated invariant of this module, and
-    two callers each remembering to enrich is how the two would drift. The catch-up snapshot
-    keeps only a tail, so it slices first and calls `fill_in_attachment_chips` itself; the
-    derivation and the enrichment it uses are the same two this runs.
+    IT WRAPS THE PURE FUNCTION RATHER THAN SITTING BESIDE IT because there are two callers —
+    the reload read and the live turn's catch-up snapshot — and `live == reload` is a stated
+    invariant of this module. Two routes each remembering to enrich is exactly how the two
+    drift; one entry point that cannot be used without enriching is not.
 
     ONE QUERY FOR THE WHOLE TRANSCRIPT. The ids are collected across every item first, so a
     conversation with forty attachments costs one read rather than forty — the N+1 this
@@ -1312,19 +1311,7 @@ async def project_conversation(
     (reclaimed with its conversation) but the reference survives in the payload forever, and
     the browser draws "attachment unavailable" from exactly that state.
     """
-    return await fill_in_attachment_chips(db, user_id=user_id, items=project_rows(rows))
-
-
-async def fill_in_attachment_chips(
-    db: AsyncSession, *, user_id: uuid.UUID, items: list[DisplayItem]
-) -> list[DisplayItem]:
-    """The enrichment on its own, for a caller that has already decided which items it sends.
-
-    The catch-up snapshot keeps the last handful of a transcript, and resolving every id in the
-    whole conversation to fill in eight chips is work proportional to the wrong thing — a chat
-    with forty attachments paid for forty of them on every reconnect. Slicing first and calling
-    this second costs one read either way and reads nothing it will not send.
-    """
+    items = project_rows(rows)
     wanted = {
         ref.attachment_id
         for item in items

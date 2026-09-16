@@ -130,7 +130,7 @@ async def delete_project_cascade(
 
     # Conversations (all kinds), batched: one messages SELECT + one attachments SELECT across
     # the whole project (not a per-conversation N+1). The purge deletes the conversation rows +
-    # their messages (DB cascade) + attachment rows, and hands back the attachment blob
+    # their messages (DB cascade) + attachment rows, and hands back the attachment/deck-PDF blob
     # keys — still gathered before any delete, so the caller's post-commit sweep stays safe.
     conversation_ids = (
         (

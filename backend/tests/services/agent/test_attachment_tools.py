@@ -62,7 +62,7 @@ async def test_it_reads_an_attachment_and_returns_the_manifest() -> None:
 
 
 async def test_it_refuses_a_path_that_is_not_an_attachment() -> None:
-    """★ THE SCOPE. The capability is scoped to attachments — never a widening of which
+    """★ THE SCOPE. R14 requires a capability scoped to attachments — never a widening of which
     paths the agent may name. A tool that would read any path is a second, unguarded `read_file`,
     and it runs `python3`, which the shared read surface deliberately does not offer.
 
@@ -139,36 +139,9 @@ async def test_the_command_is_the_shipped_reader_over_the_container_path() -> No
     )
     await AttachmentReader(session=session).read(".attachments/roster.xlsx")
 
-    assert calls == [["python3", "-I", READER_PATH, "/workspace/attachments/roster.xlsx"]]
+    assert calls == [["python3", READER_PATH, "/workspace/attachments/roster.xlsx"]]
     # The model-facing token must NOT survive into the command.
-    assert ".attachments/" not in calls[0][3]
-
-
-async def test_the_reader_runs_in_an_interpreter_nothing_in_the_container_can_reach() -> None:
-    """★ THE ONE CODE EXECUTION PLAN IS GRANTED MUST NOT BE REWRITABLE FROM THE APP.
-
-    A bare `python3` runs `site`, which imports `usercustomize` and executes every `.pth` file
-    under the account's own home — and that home belongs to the user the app's build runs as. A
-    Build turn, an `npm` lifecycle script or the generated app could therefore change what the
-    reader does, after the turn note has told the model this is the trusted shipped copy. `-I`
-    also ignores `PYTHONPATH` and the working directory, so the app tree cannot shadow a stdlib
-    module the reader imports.
-
-    Mutation receipt: drop `-I` and this goes red while every other reader test stays green.
-    """
-    calls: list[list[str]] = []
-
-    class _Client:
-        async def exec(self, _handle: Any, argv: list[str], *, timeout_s: int) -> Any:
-            calls.append(argv)
-            return type("R", (), {"stdout": '{"ok": true}', "stderr": "", "exit": 0})()
-
-    session = cast(
-        SandboxSession, type("S", (), {"sandbox_client": _Client(), "handle": object()})()
-    )
-    await AttachmentReader(session=session).read(".attachments/roster.xlsx")
-
-    assert calls[0][:2] == ["python3", "-I"]
+    assert ".attachments/" not in calls[0][2]
 
 
 async def test_a_transport_failure_is_a_retry_not_a_fabricated_answer() -> None:
@@ -270,51 +243,6 @@ async def test_a_clean_read_leaves_no_failure_trace() -> None:
         "attachment_read_named_failure",
     ):
         assert _events(logs, event) == []
-
-
-async def test_a_reader_killed_by_a_signal_is_named_rather_than_left_to_a_retry() -> None:
-    """★ THE ONE FAILURE THE READER CANNOT NAME FOR ITSELF.
-
-    polars allocates through Rust, whose allocator ABORTS when it cannot satisfy a request rather
-    than raising anything Python can catch — so a file that exhausts the memory ceiling kills the
-    process with a signal and prints nothing at all. That breaks the reader's own contract of one
-    JSON object and exit 0, and left unnamed it reaches the tool as unparseable output, which asks
-    the model to try again against a failure that repeats exactly.
-
-    MEASURED, NOT INFERRED. A 120,000-column CSV of about a megabyte, read inside the shipped
-    image: exit 134, stdout empty, stderr "memory allocation of 72 bytes failed". Both spellings
-    of the same event are covered below, because the shell reports 128 + signal and Python
-    reports the negative signal number.
-
-    Mutation receipt: drop the killed-with-no-output arm and this comes back an empty string.
-    """
-    for exit_code in (-6, 134):
-        session = _session_double(_Reply(stdout="", stderr="", exit=exit_code))
-
-        out = await AttachmentReader(session=session).read(".attachments/roster.xlsx")
-
-        answer = json.loads(out)
-        assert answer["ok"] is False
-        assert answer["error"]["code"] == "too_large"
-        assert "smaller" in answer["error"]["next"]
-
-
-async def test_an_answer_too_large_to_return_is_named_instead_of_returned() -> None:
-    """★ ONE OVERSIZED REPLY COSTS THE TURN IT WAS MEANT TO SERVE, because the manifest goes to
-    the model verbatim. The reader bounds its own now, so this fires for a container whose image
-    predates that bound — which is precisely when a caller cannot rely on the bound existing.
-
-    Mutation receipt: return the reader's output unchanged and the whole of it reaches the model.
-    """
-    reader = _Recorder(result=json.dumps({"ok": True, "rows": 1, "filler": "x" * 300_000}))
-
-    with capture_logs() as logs:
-        out = await _tool(reader)(None, ".attachments/roster.xlsx")
-
-    answer = json.loads(out)
-    assert answer["ok"] is False
-    assert answer["error"]["code"] == "too_large"
-    assert len(_events(logs, "attachment_read_reply_too_large")) == 1
 
 
 async def test_a_nonzero_exit_is_logged_once_with_its_code_and_capped_stderr() -> None:

@@ -142,9 +142,9 @@ def _plus_connected_data[DepsT](
 ) -> list[AbstractToolset[DepsT]]:
     """Append the connected-data surface when this project actually reads one, on either arm.
 
-    ONE FUNCTION SO THE TWO ARMS CANNOT DIFFER. The rule is the same for Plan and Build, because
-    the second axis this registry gates on is the PROJECT, not the kind — so it is written once
-    and both `case` arms call it."""
+    ONE FUNCTION SO THE TWO ARMS CANNOT DIFFER. The rule is the same for Plan and Build — R4 says
+    both arms, and the second axis this registry now gates on is the PROJECT, not the kind — so it
+    is written once and both `case` arms call it."""
     if not connected_systems:
         return toolsets
     return [*toolsets, cast(AbstractToolset[DepsT], CONNECTOR_TOOLSET)]
@@ -196,7 +196,7 @@ def toolsets_for_kind[DepsT](
             # difference the architecture already sanctions — this function is the one place
             # permitted to read the chat kind.
             #
-            # Optional so the agent-level surface, which has no sandbox at all, still builds a
+            # Optional so the U8 agent-level surface, which has no sandbox at all, still builds a
             # Plan run; a caller with no reader simply does not offer the tool.
             if reader_of is not None:
                 plan_toolsets.append(attachment_toolset(reader_of))
