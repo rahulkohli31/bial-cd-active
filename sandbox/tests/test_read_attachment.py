@@ -223,6 +223,33 @@ def test_a_semicolon_csv_is_read_as_columns_rather_than_as_one_wide_one(tmp_path
     assert out["rows"] == 2
 
 
+def test_a_delimiter_inside_a_quoted_heading_does_not_decide_the_file(tmp_path: Path) -> None:
+    """★ THE SNIFF MUST NOT BE FOOLED BY A HEADING. `owner; deputy; backup; cover` is one
+    column name that happens to hold three semicolons, against two commas that are real
+    delimiters — counted raw, the semicolon wins and an ordinary comma file is read as four
+    columns wearing pieces of each other's names, reported with `ok: true`.
+
+    Quoted fields are therefore removed before anything is counted.
+
+    Mutation receipt: count the raw header line and this file comes back on the wrong
+    separator.
+    """
+    path = tmp_path / "roster.csv"
+    path.write_text(
+        'gate,"owner; deputy; backup; cover",waiting\nA1,ops,12\nA2,ground,7\n',
+        encoding="utf-8",
+    )
+
+    out = run(path)
+
+    assert out["separator"] == ","
+    assert [c["name"] for c in out["columns"]["shown"]] == [
+        "gate",
+        "owner; deputy; backup; cover",
+        "waiting",
+    ]
+
+
 def test_a_comma_in_a_heading_does_not_take_a_tab_file_away_from_tabs(tmp_path: Path) -> None:
     """The sniff must never take a file away from the delimiter its extension implies on equal
     evidence. A `.tsv` whose heading contains a comma has one of each on its header line, and
