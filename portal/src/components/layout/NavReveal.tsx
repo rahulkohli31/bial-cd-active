@@ -180,26 +180,29 @@ export default function NavReveal({ hideable, children }: Props) {
     setState('hidden')
   }, [clearTimers])
 
-  // EVERY DOOR GOES THROUGH `openNav`, which is what records where focus was. Escape's promise is
-  // to put a keyboard user back where they were, and they are as likely to have opened the panel
-  // with the button or the shortcut as by tabbing into it — a door that opened by setting the
-  // state directly would return them to `<body>`.
-  const toggleNav = useCallback(() => {
-    if (state === 'open') closeNav()
-    else openNav()
-  }, [state, closeNav, openNav])
-
   const togglePin = useCallback(() => {
     setPinned((was) => {
       writePinned(!was)
       return !was
     })
-  }, [])
+    // THE FLOAT IS SETTLED HERE, NOT LEFT RUNNING UNDERNEATH. Pinning is reached from inside the
+    // floating panel, so without this the reveal stays "open" behind the docked one — invisible,
+    // and waiting: the next unpin would drop a floating panel over the application, unasked.
+    closeNav()
+  }, [closeNav])
 
-  // Pinning docks the panel, so the floating state must not also be live underneath it.
-  useEffect(() => {
-    if (pinned) clearTimers()
-  }, [pinned, clearTimers])
+  // EVERY DOOR GOES THROUGH `openNav`, which is what records where focus was. Escape's promise is
+  // to put a keyboard user back where they were, and they are as likely to have opened the panel
+  // with the button or the shortcut as by tabbing into it — a door that opened by setting the
+  // state directly would return them to `<body>`.
+  //
+  // While the panel is docked there is nothing to reveal, so the toggle undocks — the same answer
+  // `⌘\` already gives, rather than a button that appears to do nothing.
+  const toggleNav = useCallback(() => {
+    if (pinned) { togglePin(); return }
+    if (state === 'open') closeNav()
+    else openNav()
+  }, [pinned, togglePin, state, closeNav, openNav])
 
   useEffect(() => () => clearTimers(), [clearTimers])
 
@@ -209,7 +212,6 @@ export default function NavReveal({ hideable, children }: Props) {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === '\\' && (e.metaKey || e.ctrlKey)) {
         e.preventDefault()
-        if (pinned) { togglePin(); return }
         toggleNav()
         return
       }
@@ -224,13 +226,22 @@ export default function NavReveal({ hideable, children }: Props) {
     }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
-  }, [hideable, pinned, state, toggleNav, togglePin, closeNav])
+  }, [hideable, state, toggleNav, closeNav])
 
   // THE EDGE ZONE'S LISTENER, INSTALLED CONDITIONALLY. Not installed at all when the navigation
   // is docked, when it is pinned, when the chat is hidden, or below the stacking threshold —
   // four different reasons the gesture should not exist, all answered by not listening rather
   // than by branching inside a handler that has already fired.
   const zoneLive = hideable && !pinned && !chatHidden && !stacked
+
+  // AND A REACH ALREADY UNDER WAY IS ABANDONED WITH IT. Dropping the listener stops new intent
+  // but not a timer already armed — so a pointer resting at the edge when the chat collapses, or
+  // when the pin goes down, would still open the panel a moment later over a screen that no
+  // longer has an edge to reach from.
+  useEffect(() => {
+    if (!zoneLive) clearTimers()
+  }, [zoneLive, clearTimers])
+
   useEffect(() => {
     if (!zoneLive) return undefined
     const onMove = (e: PointerEvent) => {
@@ -268,10 +279,16 @@ export default function NavReveal({ hideable, children }: Props) {
     }, GRACE_MS)
   }, [])
 
+  // PINNED IS A LAYOUT CHANGE, NOT A FLOAT: the panel joins the row rather than covering it.
+  const docked = hideable && pinned && !stacked
+
   const value = useMemo<NavRevealValue>(
     () => ({
       hideable,
-      open: state === 'open',
+      // WHETHER A PANEL IS ON SCREEN, not whether the floating one is. A docked panel is as
+      // present as a floating one, and the menu button's `aria-expanded` is read aloud — reporting
+      // "collapsed" over a panel the reader can see is the one answer that is simply false.
+      open: docked || state === 'open',
       pinned,
       openNav,
       closeNav,
@@ -279,7 +296,7 @@ export default function NavReveal({ hideable, children }: Props) {
       togglePin,
       setChatHidden,
     }),
-    [hideable, state, pinned, openNav, closeNav, toggleNav, togglePin],
+    [hideable, docked, state, pinned, openNav, closeNav, toggleNav, togglePin],
   )
 
   const panel = (
@@ -291,32 +308,31 @@ export default function NavReveal({ hideable, children }: Props) {
     />
   )
 
-  // PINNED IS A LAYOUT CHANGE, NOT A FLOAT. The panel joins the row and the work beside it gives
-  // up the width in one shared move, which is why the pinned panel is drawn here rather than as
-  // another absolutely-positioned copy.
-  // Not when stacked: below the threshold there is not room for a docked 248px column beside the
-  // work, so the preference is honoured where it means something and ignored where it cannot be.
-  if (hideable && pinned && !stacked) {
-    return (
-      <div className="flex h-screen overflow-hidden">
-        <motion.aside
-          layout
-          transition={{ duration: DURATION.layout, ease: LAYOUT_EASE }}
-          className="h-full shrink-0 border-r border-bial-border"
-          data-testid="nav-docked"
-        >
-          <NavRevealContext.Provider value={value}>{panel}</NavRevealContext.Provider>
-        </motion.aside>
-        <div className="min-w-0 flex-1">
-          <NavRevealContext.Provider value={value}>{children}</NavRevealContext.Provider>
-        </div>
-      </div>
-    )
-  }
-
   return (
     <NavRevealContext.Provider value={value}>
-      {children}
+      {/*
+        ONE TREE SHAPE FOR BOTH STATES, AND THE ROW IS ALWAYS THE ROW. React reconciles by position
+        and element type, so a docked branch that returned a root of its own would unmount the whole
+        subtree beside it on every pin — and what is beside it is a running application whose
+        preview is an iframe. An iframe React rebuilds does not resume; it reloads from its `src`.
+        The panel joins and leaves the row; the work never moves out of it.
+      */}
+      <div className="flex h-screen overflow-hidden">
+        {/* Not when stacked: below the threshold there is no room for a docked 248px column beside
+            the work, so the preference is honoured where it means something and ignored where it
+            cannot be. */}
+        {docked && (
+          <motion.aside
+            layout
+            transition={{ duration: DURATION.layout, ease: LAYOUT_EASE }}
+            className="h-full shrink-0 border-r border-bial-border"
+            data-testid="nav-docked"
+          >
+            {panel}
+          </motion.aside>
+        )}
+        <div className="min-w-0 flex-1">{children}</div>
+      </div>
       {zoneLive && (
         // The strip itself is decoration; the listener above is the mechanism. It is
         // `pointer-events-none` throughout so it can never take a click that belonged to the
@@ -339,7 +355,7 @@ export default function NavReveal({ hideable, children }: Props) {
           returnFocusTo.current?.focus()
         }}
       >
-        {hideable && state === 'open' && (
+        {hideable && !docked && state === 'open' && (
           <>
             {stacked && (
               <motion.div

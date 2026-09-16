@@ -10,6 +10,7 @@
  * THE OTHER HALF IS WHAT MUST NOT HAPPEN: no click swallowed while hidden, no reflow of the panes
  * when it arrives, no edge zone at all while the chat is away, and no keyboard trap.
  */
+import { useEffect } from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup, fireEvent, act, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
@@ -46,13 +47,24 @@ const USER = { email: 'asha@bial.aero', display_name: 'Asha Rao', isAdmin: false
 /** Comfortably inside a delay, so a slow machine cannot turn "not yet" into a false failure. */
 const EARLY = 120
 
+/** How many times the subtree beside the panel has been BUILT, not rendered. A running app lives
+ *  down there and some of it is an iframe, which does not survive being rebuilt. */
+let mounts = 0
+
 /** Stands in for the application underneath — and for the toolbar's menu button, which reaches
  *  the reveal through context exactly as the real toolbar does. */
 function Underneath({ chatHidden = false }: { chatHidden?: boolean }) {
   const reveal = useNavReveal()
   const setChatHidden = reveal?.setChatHidden
-  // The workspace is the only writer of the collapsed state, so the test reports it the same way.
-  if (setChatHidden) queueMicrotask(() => setChatHidden(chatHidden))
+  useEffect(() => {
+    mounts += 1
+  }, [])
+  // The workspace is the only writer of the collapsed state, so the test reports it the same way —
+  // and from an effect keyed on the prop, so a test can COLLAPSE the chat mid-flight and not only
+  // start with it collapsed.
+  useEffect(() => {
+    setChatHidden?.(chatHidden)
+  }, [setChatHidden, chatHidden])
   return (
     <div data-testid="content">
       <NavMenuButton />
@@ -92,6 +104,7 @@ const settles = (open: boolean) => waitFor(() => expect(isOpen()).toBe(open))
 
 beforeEach(() => {
   vi.clearAllMocks()
+  mounts = 0
   window.localStorage.clear()
   h.isAuthenticated.mockReturnValue(true)
   h.getStoredUser.mockReturnValue(USER)
@@ -250,13 +263,16 @@ describe('with the chat hidden the edge zone is not installed at all', () => {
 })
 
 describe('pin is a preference about a screen, not a property of an application', () => {
-  it('docks the panel and remembers the choice', () => {
+  it('docks the panel and remembers the choice', async () => {
     renderReveal()
     fireEvent.click(screen.getByTestId('nav-menu-button'))
     fireEvent.click(screen.getByTestId('nav-pin'))
     expect(screen.getByTestId('nav-docked')).not.toBeNull()
-    expect(screen.queryByTestId('nav-floating')).toBeNull()
     expect(window.localStorage.getItem('bial:nav-pinned')).toBe('1')
+    // The float does not vanish, it LEAVES — the panel settles into the dock rather than being
+    // cut. What matters is that it does not stay: a floating copy left open behind the docked one
+    // is what drops a second panel over the application at the next unpin.
+    await settles(false)
   })
 
   it('survives a reload, and applies to a different application', () => {
@@ -277,11 +293,78 @@ describe('pin is a preference about a screen, not a property of an application',
     expect(screen.queryByTestId('nav-edge-zone')).toBeNull()
   })
 
+  it('★ docking the panel does not tear down and rebuild the application beside it', async () => {
+    // WHAT IS UNDERNEATH IS A RUNNING APPLICATION, and part of it is an iframe. React reconciles
+    // by position and element type, so returning a different tree shape for pinned than for
+    // floating unmounts everything below — the iframe reloads from its src, and whatever the
+    // person was looking at is gone. Pin is a preference about chrome; it may not cost a screen.
+    renderReveal()
+    expect(mounts).toBe(1)
+
+    fireEvent.click(screen.getByTestId('nav-menu-button'))
+    fireEvent.click(screen.getByTestId('nav-pin'))
+    await settles(false)
+    expect(screen.getByTestId('nav-docked')).not.toBeNull()
+    expect(mounts).toBe(1)
+
+    fireEvent.click(screen.getByTestId('nav-pin'))
+    expect(screen.queryByTestId('nav-docked')).toBeNull()
+    expect(mounts).toBe(1)
+  })
+
   it('⌘\\ undocks a pinned panel rather than toggling one that is already there', () => {
     window.localStorage.setItem('bial:nav-pinned', '1')
     renderReveal()
     act(() => { fireEvent.keyDown(document, { key: '\\', metaKey: true }) })
     expect(screen.queryByTestId('nav-docked')).toBeNull()
     expect(window.localStorage.getItem('bial:nav-pinned')).toBe('0')
+  })
+
+  it('★ unpinning leaves the application alone instead of dropping a panel over it', async () => {
+    renderReveal()
+    fireEvent.click(screen.getByTestId('nav-menu-button'))
+    fireEvent.click(screen.getByTestId('nav-pin'))
+    await settles(false)
+
+    fireEvent.click(screen.getByTestId('nav-pin'))
+    expect(screen.queryByTestId('nav-docked')).toBeNull()
+    // The float is how the pin was reached in the first place. If pinning had left it open behind
+    // the docked panel, THIS is where it would come back — over the application, asked for by
+    // nobody, because a state nobody could see was still running.
+    expect(isOpen()).toBe(false)
+  })
+
+  it('★ the menu button describes the panel a person can see, and undocks the one they have', () => {
+    window.localStorage.setItem('bial:nav-pinned', '1')
+    renderReveal()
+    const button = screen.getByTestId('nav-menu-button')
+    // Read aloud. A docked panel is on screen, so "collapsed" is not a nuance — it is false.
+    expect(button.getAttribute('aria-expanded')).toBe('true')
+
+    fireEvent.click(button)
+    expect(screen.queryByTestId('nav-docked')).toBeNull()
+    expect(window.localStorage.getItem('bial:nav-pinned')).toBe('0')
+  })
+})
+
+describe('a reach can be interrupted by the screen itself, not only by the pointer', () => {
+  it('★ the chat collapsing mid-reach abandons it, rather than opening a moment later', async () => {
+    const view = renderReveal()
+    pointerAt(4)
+    await after(EARLY)
+    expect(isOpen()).toBe(false)
+
+    // The edge zone goes away under a pointer that is still resting on it. Dropping the listener
+    // stops NEW intent; the timer already armed is the one that would open a panel over a screen
+    // that no longer has an edge to have reached from.
+    view.rerender(
+      <MemoryRouter initialEntries={['/chat/c1']}>
+        <NavReveal hideable>
+          <Underneath chatHidden />
+        </NavReveal>
+      </MemoryRouter>,
+    )
+    await after(REST_MS)
+    expect(isOpen()).toBe(false)
   })
 })
