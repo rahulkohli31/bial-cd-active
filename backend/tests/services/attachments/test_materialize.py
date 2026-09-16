@@ -331,14 +331,16 @@ async def test_another_chats_file_survives_this_chats_turn() -> None:
     file = _file(size=6)
     storage.objects[file.storage_key] = b"PK\x03\x04\r\n"
     sandbox.default_result = ExecResult(
-        stdout=f"{file.file_name}\t6\nsiblings.xlsx\t99\n", stderr="", exit=0
+        stdout=f"{file.file_name}\t6\nsiblings.xlsx\t99\nstale.csv\t4\n", stderr="", exit=0
     )
 
     await AttachmentDelivery(
         files=(file,), storage=storage, keep=frozenset({file.file_name, "siblings.xlsx"})
     ).place(_session(sandbox))
 
-    assert sandbox.deleted_paths == []
+    # THE ABSENCE IS ONLY WORTH SOMETHING BESIDE THE PRESENCE. A reap that never ran at all
+    # would leave the sibling's file alone too, so the same call is made to remove one.
+    assert sandbox.deleted_paths == [f"{CONTAINER_ATTACHMENTS_ROOT}/stale.csv"]
 
 
 async def test_a_container_that_refuses_the_delete_still_answers_the_turn() -> None:
