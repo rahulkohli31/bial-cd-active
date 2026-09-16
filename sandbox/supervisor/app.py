@@ -53,7 +53,13 @@ WORKSPACE = Path(os.environ.get("WORKSPACE", "/workspace/app"))
 # and can already run code, which is the whole reason attachments are here at all — but no
 # snapshot,
 # restore or deploy walks it.
-ATTACHMENTS = Path(os.environ.get("ATTACHMENTS_DIR", "/workspace/attachments"))
+#
+# DERIVED FROM `WORKSPACE`, NEVER SET SEPARATELY. It was its own environment variable, which
+# made the sibling relationship a thing two settings had to agree about — and the control
+# plane, which addresses this root in three places, cannot read either of them. Any value but
+# the default killed every attachment turn: writes landed under the new root while the control
+# plane kept naming the old one, and `_resolve` refused it as escaping the workspace.
+ATTACHMENTS = WORKSPACE.parent / "attachments"
 APP_USER = os.environ.get("APP_USER", "appuser")
 # The dev server's self-announcement. It no longer decides ANYTHING: "✓ Ready in <ms>" is printed
 # once the server is listening, which is BEFORE the first route has compiled, so it announced a
@@ -1401,6 +1407,20 @@ def files(body: FilesBody) -> dict[str, Any]:
         lines.insert(body.insert_line, body.insert_text)
         p.write_text("\n".join(lines), encoding="utf-8")
         return {"ok": True}
+
+    if body.action == "delete":
+        # ★ ATTACHMENTS ONLY, and that is the whole shape of this capability. A delete able
+        # to reach the app tree would be the one action here that can destroy the work the
+        # container exists to hold, and the caller that needs it only ever removes files it
+        # placed in the attachments root itself. `_resolve` has already refused everything
+        # outside both roots; this refuses the other root.
+        if not p.is_relative_to(ATTACHMENTS.resolve()):
+            raise HTTPException(400, "delete is for attachments only")
+        # MISSING IS SUCCESS: the caller is reconciling what the container holds against what
+        # the conversation still owns, and a file already gone is that goal rather than a
+        # failure to stop on.
+        p.unlink(missing_ok=True)
+        return {"ok": True, "deleted": str(p)}
 
     raise HTTPException(400, f"unknown files action: {body.action}")
 

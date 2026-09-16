@@ -53,6 +53,7 @@ from src.core.redaction import (
     scrub_untrusted,
 )
 from src.services.media import CODE_LANE_MEDIA, canonical_suffix, is_opc_archive
+from src.services.sandbox import CONTAINER_ATTACHMENTS_ROOT
 
 if TYPE_CHECKING:
     # Annotation-only, deliberately: `LiveSandboxWorkspace` holds a `SandboxSession`, but this
@@ -123,7 +124,6 @@ ATTACHMENTS_PREFIX = ".attachments/"
 _NOT_TEXT_SUFFIXES: Final[tuple[str, ...]] = tuple(
     sorted(canonical_suffix(media) for media in CODE_LANE_MEDIA if is_opc_archive(media))
 )
-_CONTAINER_ATTACHMENTS_ROOT = "/workspace/attachments"
 
 
 def is_an_attachment_path(path: str) -> bool:
@@ -156,7 +156,7 @@ def to_container_path(path: str) -> str:
     if not is_an_attachment_path(path):
         return path
     tail = path[len(ATTACHMENTS_PREFIX) :] if path.startswith(ATTACHMENTS_PREFIX) else ""
-    return f"{_CONTAINER_ATTACHMENTS_ROOT}/{tail}".rstrip("/")
+    return f"{CONTAINER_ATTACHMENTS_ROOT}/{tail}".rstrip("/")
 
 
 # Dependency lock files, refused at every site the directory set is applied: a lockfile
@@ -418,10 +418,10 @@ def to_model_path(path: str) -> str:
     `.attachments/x`. An app-tree path is returned untouched, so this is a no-op for everything
     except the one reserved prefix.
     """
-    if path == _CONTAINER_ATTACHMENTS_ROOT:
+    if path == CONTAINER_ATTACHMENTS_ROOT:
         return ATTACHMENTS_PREFIX.rstrip("/")
-    if path.startswith(f"{_CONTAINER_ATTACHMENTS_ROOT}/"):
-        return f"{ATTACHMENTS_PREFIX}{path[len(_CONTAINER_ATTACHMENTS_ROOT) + 1 :]}"
+    if path.startswith(f"{CONTAINER_ATTACHMENTS_ROOT}/"):
+        return f"{ATTACHMENTS_PREFIX}{path[len(CONTAINER_ATTACHMENTS_ROOT) + 1 :]}"
     return path
 
 
@@ -746,8 +746,8 @@ def _refuse_an_attachment_operand(token: str) -> str | None:
     """
     if ".." in token.split("/"):
         return None
-    absolute = token == _CONTAINER_ATTACHMENTS_ROOT or token.startswith(
-        f"{_CONTAINER_ATTACHMENTS_ROOT}/"
+    absolute = token == CONTAINER_ATTACHMENTS_ROOT or token.startswith(
+        f"{CONTAINER_ATTACHMENTS_ROOT}/"
     )
     if not (is_an_attachment_path(token) or absolute):
         return None

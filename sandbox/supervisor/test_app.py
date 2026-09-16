@@ -37,8 +37,7 @@ _WS = os.path.join(_BASE, "app")
 _ATT = os.path.join(_BASE, "attachments")
 os.makedirs(_WS, exist_ok=True)
 os.makedirs(_ATT, exist_ok=True)
-os.environ["WORKSPACE"] = _WS
-os.environ["ATTACHMENTS_DIR"] = _ATT
+os.environ["WORKSPACE"] = _WS  # the attachments root is derived from it, as in the container
 atexit.register(shutil.rmtree, _BASE, ignore_errors=True)  # don't leak the temp tree per run
 
 from urllib.parse import unquote  # noqa: E402
@@ -380,6 +379,21 @@ def test_a_file_can_be_written_outside_the_app_tree() -> None:
     assert WORKSPACE.resolve() not in target.resolve().parents
 
 
+def test_the_two_roots_are_siblings_by_construction_not_by_agreement() -> None:
+    """★ THE SETTING THAT HAD EXACTLY ONE SAFE VALUE.
+
+    The attachments root used to be its own environment variable, so the sibling relationship
+    was a thing two settings had to agree about — and the control plane, which addresses this
+    root in three places, cannot read either of them. Any value but the default killed every
+    attachment turn: writes landed under the new root while the control plane named the old one.
+
+    Mutation receipt: give it back its own variable and this fixture, which sets only the
+    workspace, stops producing a sibling.
+    """
+    assert ATTACHMENTS.parent == WORKSPACE.parent
+    assert ATTACHMENTS.name == "attachments"
+
+
 def test_a_relative_path_still_means_the_app_tree() -> None:
     """The second root is reachable only by naming it absolutely, so no existing caller changes
     meaning because /workspace/attachments came into existence — an app that happens to contain
@@ -431,6 +445,56 @@ def test_either_root_can_name_the_other_and_that_is_deliberate() -> None:
 
     assert r.status_code == 200, r.text
     assert (ATTACHMENTS / "crossed.bin").read_bytes() == bytes([0x00, 0x01, 0x02])
+
+
+# --- /files: delete ---------------------------------------------------
+def test_an_attachment_can_be_removed_once_nothing_owns_it() -> None:
+    """★ THE ONLY ACTION HERE THAT REMOVES ANYTHING. Placement writes and skips; deleting an
+    attachment upstream removes a row and a stored object and could not reach the container at
+    all, so a file the citizen deleted stayed readable to the agent until the container died.
+
+    Mutation receipt: drop this action and the caller reconciling the root has nothing to call.
+    """
+    target = ATTACHMENTS / "gone.xlsx"
+    target.write_bytes(b"PK payload")
+
+    r = client.post("/files", json={"action": "delete", "path": str(target)}, headers=AUTH)
+
+    assert r.status_code == 200, r.text
+    assert not target.exists()
+
+
+def test_delete_cannot_reach_the_tree_that_becomes_the_app() -> None:
+    """★ THE REFUSAL THAT MAKES THE ACTION SAFE TO ADD AT ALL.
+
+    Every other action here builds; this one destroys, and the app tree is the work the whole
+    container exists to hold. The caller only ever removes files it placed in the attachments
+    root, so nothing legitimate is lost by refusing the other root outright — and the model
+    reaches `/files` through tools of its own.
+
+    Mutation receipt: remove the root check and this deletes the citizen's source file.
+    """
+    source = WORKSPACE / "src" / "main.py"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("print(1)", encoding="utf-8")
+
+    r = client.post("/files", json={"action": "delete", "path": str(source)}, headers=AUTH)
+
+    assert r.status_code == 400
+    assert source.exists()
+
+
+def test_deleting_a_file_that_is_already_gone_is_success() -> None:
+    """The caller is reconciling what the container holds against what the project still owns,
+    and it works from a listing taken a moment earlier. A file removed in between has reached
+    the goal, so an error there would turn the ordinary race into a failed reconcile."""
+    r = client.post(
+        "/files",
+        json={"action": "delete", "path": str(ATTACHMENTS / "never-existed.csv")},
+        headers=AUTH,
+    )
+
+    assert r.status_code == 200, r.text
 
 
 # --- /files: create_bytes --------------------------------------------
