@@ -28,9 +28,11 @@ see and what the agent is told.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import re
 import uuid
+from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -38,20 +40,21 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.attachment import Attachment
+from src.db.models.conversation import Conversation
 from src.db.models.message import Message
 from src.services.agent.attachment_tools import READER_PATH
 from src.services.agent.read_tools import ATTACHMENTS_PREFIX
 from src.services.conversations.delete import _referenced_attachment_ids
 from src.services.media import CODE_LANE_MEDIA, canonical_suffix
 from src.services.orchestrator.deps import SandboxSession
-from src.services.sandbox import FileCreateBytes, SandboxError
+from src.services.sandbox import (
+    CONTAINER_ATTACHMENTS_ROOT,
+    FileCreateBytes,
+    FileDelete,
+    SandboxError,
+)
 from src.services.storage.base import ObjectStorage
 from src.services.storage.errors import StorageError, StorageNotFoundError
-
-#: The container-absolute root, matching the supervisor's `ATTACHMENTS`. Named here rather than
-#: imported: `sandbox/supervisor` is a separate deployable with no shared package, and
-#: `read_tools._CONTAINER_ATTACHMENTS_ROOT` is the model-facing translation of the same constant.
-CONTAINER_ATTACHMENTS_ROOT = "/workspace/attachments"
 
 # One path segment, and a conservative one. Everything outside this is replaced rather than
 # dropped, so two files whose names differ only in punctuation stay distinguishable.
@@ -59,6 +62,9 @@ _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
 # Long enough that a real name survives whole; short enough that the segment can never approach a
 # filesystem limit once a disambiguating prefix is added.
 _MAX_STEM = 96
+# Long enough to outlast a blip, short enough that nobody notices it in a turn they are
+# already waiting on.
+_RETRY_PAUSE_SECONDS = 0.5
 # Every C0 control, DEL, and the Unicode line/paragraph separators: the characters that let a
 # display name write extra LINES into prose that quotes it.
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f\u2028\u2029]+")
@@ -241,6 +247,50 @@ async def code_lane_attachments(
     return [item for item in placed if item.attachment_id in sent]
 
 
+async def names_this_project_still_owns(
+    db: AsyncSession, *, user_id: uuid.UUID, conversation_id: uuid.UUID
+) -> frozenset[str]:
+    """Every file name this project's conversations could place in the container.
+
+    The attachments root belongs to the CONTAINER, which belongs to the project — so a reap
+    driven by one conversation's files would delete another chat's on its next turn. This is
+    the set that is safe to keep, and anything else in the root is a file whose row is gone.
+
+    NAMED PER CONVERSATION, because that is how names are derived: the collision rule numbers
+    a repeat within one conversation's set, so deriving project-wide would produce names no
+    conversation would ever write and reap live files as strangers.
+    """
+    project = (
+        sa.select(Conversation.project_id)
+        .where(Conversation.id == conversation_id, Conversation.user_id == user_id)
+        .scalar_subquery()
+    )
+    rows = list(
+        (
+            await db.execute(
+                sa.select(Attachment)
+                .join(Conversation, Conversation.id == Attachment.conversation_id)
+                .where(
+                    Attachment.user_id == user_id,
+                    Conversation.project_id == project,
+                    Attachment.media_type.in_(CODE_LANE_MEDIA),
+                )
+                .order_by(Attachment.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_conversation: dict[uuid.UUID | None, list[Attachment]] = defaultdict(list)
+    for row in rows:
+        by_conversation[row.conversation_id].append(row)
+    return frozenset(
+        item.file_name
+        for group in by_conversation.values()
+        for item in _named_without_collisions(group)
+    )
+
+
 async def _ids_already_sent(
     db: AsyncSession, *, user_id: uuid.UUID, conversation_id: uuid.UUID
 ) -> set[str]:
@@ -277,6 +327,11 @@ class AttachmentDelivery:
 
     files: tuple[CodeLaneAttachment, ...]
     storage: ObjectStorage
+    #: Every file name the PROJECT's conversations could place. Anything else in the
+    #: attachments root belongs to a row that no longer exists, and `place` removes it.
+    #: Empty means reap nothing, which is what a caller that cannot answer the question
+    #: should get.
+    keep: frozenset[str] = frozenset()
 
     async def place(self, session: SandboxSession) -> None:
         """Put every file in the container, skipping the ones already there at the right size.
@@ -311,13 +366,7 @@ class AttachmentDelivery:
                     f'"{file.display_name}" could not be read from storage. Please try again.'
                 ) from exc
             try:
-                await session.sandbox_client.files(
-                    session.handle,
-                    FileCreateBytes(
-                        path=file.container_path,
-                        file_b64=base64.b64encode(data).decode("ascii"),
-                    ),
-                )
+                await self._write_once_more_if_it_blips(session, file, data)
             except SandboxError as exc:
                 # THE CITIZEN'S SENTENCE IS UNCHANGED; the operator's half is the `__cause__`.
                 #
@@ -338,8 +387,71 @@ class AttachmentDelivery:
                 )
                 raise AttachmentPlacementError(
                     f'"{file.display_name}" could not be placed in your workspace. '
-                    "Please try again."
+                    "Please try again — the files already sent are kept."
                 ) from detail
+
+        await self._reap_what_no_row_claims(session, present)
+
+    async def _write_once_more_if_it_blips(
+        self, session: SandboxSession, file: CodeLaneAttachment, data: bytes
+    ) -> None:
+        """One write, and one retry, because this runs before the turn can start.
+
+        ★ THE WINDOW IS WIDER THAN IT LOOKS. A conversation may hold twenty files of ten
+        megabytes, each written in its own request under a thirty-second timeout, and every
+        one of them stands between the citizen pressing send and anything appearing. A single
+        blip anywhere in that sequence discarded the whole turn.
+
+        ONE RETRY, NOT MANY, and a short pause: what is being spent is somebody's wait. A
+        write that fails twice is not a blip, and the sentence they get says the files already
+        sent are kept — which is true, because the listing above skips them next time.
+
+        STILL ONE AT A TIME, deliberately. These are base64 in memory, and sending twenty at
+        once multiplies the peak by twenty on a container bounded at 2 GiB.
+        """
+        payload = FileCreateBytes(
+            path=file.container_path,
+            file_b64=base64.b64encode(data).decode("ascii"),
+        )
+        try:
+            await session.sandbox_client.files(session.handle, payload)
+        except SandboxError:
+            await asyncio.sleep(_RETRY_PAUSE_SECONDS)
+            await session.sandbox_client.files(session.handle, payload)
+
+    async def _reap_what_no_row_claims(
+        self, session: SandboxSession, present: dict[str, int]
+    ) -> None:
+        """Remove container files the project no longer owns.
+
+        ★ NOTHING ELSE EVER REMOVED ONE. `place` only writes, deleting an attachment sweeps
+        its row and its stored object, and the conversation cascade sweeps blobs — so a file
+        the citizen deleted stayed readable in the container, and a project's attachments root
+        grew by every file every chat ever carried, on a disk it shares with the build.
+
+        THE SET IS THE PROJECT'S, NOT THIS CONVERSATION'S, and that is what makes it safe: the
+        root is shared by every chat in the project, so reaping what THIS conversation does not
+        hold would delete another chat's files on its next turn.
+
+        BEST EFFORT, exactly like the listing it works from: a container that refuses the
+        delete (an image that predates the action) keeps its files, and the turn goes on. The
+        cost of failing here is disk; the cost of raising is the citizen's turn.
+        """
+        if not self.keep:
+            return
+        # WHAT THIS DELIVERY ITSELF CARRIES IS ALWAYS KEPT, whatever the query answered. A row
+        # carrying no conversation link is reachable by id but invisible to the project join, and
+        # reaping a file the same call just placed would delete it out from under the note that
+        # names it.
+        keepers = self.keep | {file.file_name for file in self.files}
+        for name in sorted(set(present) - keepers):
+            try:
+                await session.sandbox_client.files(
+                    session.handle,
+                    FileDelete(path=f"{CONTAINER_ATTACHMENTS_ROOT}/{name}"),
+                )
+            except SandboxError:
+                return
 
     async def _already_there(self, session: SandboxSession) -> dict[str, int]:
         """`{file name: byte size}` for what the attachments root already holds.

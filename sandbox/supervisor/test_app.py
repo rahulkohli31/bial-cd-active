@@ -457,6 +457,56 @@ def test_either_root_can_name_the_other_and_that_is_deliberate() -> None:
     assert (ATTACHMENTS / "crossed.bin").read_bytes() == bytes([0x00, 0x01, 0x02])
 
 
+# --- /files: delete ---------------------------------------------------
+def test_an_attachment_can_be_removed_once_nothing_owns_it() -> None:
+    """★ THE ONLY ACTION HERE THAT REMOVES ANYTHING. Placement writes and skips; deleting an
+    attachment upstream removes a row and a stored object and could not reach the container at
+    all, so a file the citizen deleted stayed readable to the agent until the container died.
+
+    Mutation receipt: drop this action and the caller reconciling the root has nothing to call.
+    """
+    target = ATTACHMENTS / "gone.xlsx"
+    target.write_bytes(b"PK payload")
+
+    r = client.post("/files", json={"action": "delete", "path": str(target)}, headers=AUTH)
+
+    assert r.status_code == 200, r.text
+    assert not target.exists()
+
+
+def test_delete_cannot_reach_the_tree_that_becomes_the_app() -> None:
+    """★ THE REFUSAL THAT MAKES THE ACTION SAFE TO ADD AT ALL.
+
+    Every other action here builds; this one destroys, and the app tree is the work the whole
+    container exists to hold. The caller only ever removes files it placed in the attachments
+    root, so nothing legitimate is lost by refusing the other root outright — and the model
+    reaches `/files` through tools of its own.
+
+    Mutation receipt: remove the root check and this deletes the citizen's source file.
+    """
+    source = WORKSPACE / "src" / "main.py"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("print(1)", encoding="utf-8")
+
+    r = client.post("/files", json={"action": "delete", "path": str(source)}, headers=AUTH)
+
+    assert r.status_code == 400
+    assert source.exists()
+
+
+def test_deleting_a_file_that_is_already_gone_is_success() -> None:
+    """The caller is reconciling what the container holds against what the project still owns,
+    and it works from a listing taken a moment earlier. A file removed in between has reached
+    the goal, so an error there would turn the ordinary race into a failed reconcile."""
+    r = client.post(
+        "/files",
+        json={"action": "delete", "path": str(ATTACHMENTS / "never-existed.csv")},
+        headers=AUTH,
+    )
+
+    assert r.status_code == 200, r.text
+
+
 # --- /files: create_bytes --------------------------------------------
 def test_files_create_bytes_writes_the_real_bytes_unchanged() -> None:
     """A REAL FILE, NOT TEXT. Every other write action here decodes UTF-8 and rewrites CRLF to

@@ -20,11 +20,11 @@ import pytest
 from src.db.models.conversation import ChatKind
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.services.attachments.materialize import (
-    CONTAINER_ATTACHMENTS_ROOT,
     AttachmentDelivery,
     AttachmentPlacementError,
     CodeLaneAttachment,
     code_lane_attachments,
+    names_this_project_still_owns,
     safe_file_name,
 )
 from src.services.media.lanes import (
@@ -36,7 +36,7 @@ from src.services.media.lanes import (
 )
 from src.services.messages.store import ATTACHMENT_FILE_REF_KIND
 from src.services.orchestrator.deps import SandboxSession
-from src.services.sandbox import SandboxError
+from src.services.sandbox import CONTAINER_ATTACHMENTS_ROOT, SandboxError
 from src.services.sandbox.base import ExecResult
 from src.services.storage.errors import StorageAuthError, StorageNotFoundError
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
@@ -269,6 +269,96 @@ async def test_a_failed_listing_places_everything_rather_than_nothing() -> None:
     await AttachmentDelivery(files=(file,), storage=storage).place(_session(sandbox))
 
     assert file.container_path in sandbox.binary_workspace
+
+
+async def test_one_blip_on_the_way_in_does_not_cost_the_turn() -> None:
+    """★ THE WINDOW IS WIDER THAN IT LOOKS. A conversation may hold twenty files of ten megabytes,
+    each written in its own request under a thirty-second timeout, and all of that stands between
+    the citizen pressing send and anything happening at all. One failure anywhere in the sequence
+    discarded the whole turn and asked them to start again.
+
+    One retry, not many: a write that fails twice half a second apart is not a blip, and what is
+    spent while it waits is somebody's turn.
+
+    Mutation receipt: remove the retry and this raises instead of placing the file.
+    """
+    sandbox = FakeSandbox()
+    sandbox.queue_files_errors(SandboxError("a blip"))
+    storage = FakeStorage()
+    file = _file(name="salaries.xlsx", size=6)
+    storage.objects[file.storage_key] = b"PK\x03\x04\r\n"
+
+    await AttachmentDelivery(files=(file,), storage=storage).place(_session(sandbox))
+
+    assert sandbox.binary_workspace[file.container_path] == b"PK\x03\x04\r\n"
+
+
+async def test_a_file_no_row_claims_is_removed_from_the_container() -> None:
+    """★ NOTHING ELSE EVER REMOVED ONE. Placement only writes, deleting an attachment sweeps
+    its row and its stored object, and the conversation cascade sweeps blobs — so a file the
+    citizen deleted stayed in the container, readable by the agent for as long as the container
+    lived, and the root grew by every file every chat in the project ever carried.
+
+    Mutation receipt: drop the reap and the deleted file stays, which is the bug exactly.
+    """
+    sandbox = FakeSandbox()
+    storage = FakeStorage()
+    file = _file(size=6)
+    storage.objects[file.storage_key] = b"PK\x03\x04\r\n"
+    sandbox.default_result = ExecResult(
+        stdout=f"{file.file_name}\t6\ndeleted.csv\t99\n", stderr="", exit=0
+    )
+
+    await AttachmentDelivery(
+        files=(file,), storage=storage, keep=frozenset({file.file_name})
+    ).place(_session(sandbox))
+
+    assert sandbox.deleted_paths == [f"{CONTAINER_ATTACHMENTS_ROOT}/deleted.csv"]
+
+
+async def test_another_chats_file_survives_this_chats_turn() -> None:
+    """★ THE ROOT IS THE PROJECT'S, NOT THE CONVERSATION'S, and that is what makes the reap safe.
+
+    Every chat in a project shares one container and one attachments root, so a reap driven by
+    what THIS conversation holds would delete a sibling chat's files on its next turn — and the
+    sibling would place them again on the turn after, forever, each chat undoing the other.
+
+    Mutation receipt: narrow the keep set to this delivery's own files and the sibling's file
+    below is deleted.
+    """
+    sandbox = FakeSandbox()
+    storage = FakeStorage()
+    file = _file(size=6)
+    storage.objects[file.storage_key] = b"PK\x03\x04\r\n"
+    sandbox.default_result = ExecResult(
+        stdout=f"{file.file_name}\t6\nsiblings.xlsx\t99\n", stderr="", exit=0
+    )
+
+    await AttachmentDelivery(
+        files=(file,), storage=storage, keep=frozenset({file.file_name, "siblings.xlsx"})
+    ).place(_session(sandbox))
+
+    assert sandbox.deleted_paths == []
+
+
+async def test_a_container_that_refuses_the_delete_still_answers_the_turn() -> None:
+    """The reap is best effort, exactly like the listing it works from. A container running an
+    image that predates the delete action refuses it, and the cost of that is disk; the cost of
+    raising is the citizen's turn, over a file they will never know about."""
+    sandbox = FakeSandbox()
+    storage = FakeStorage()
+    file = _file(size=6)
+    storage.objects[file.storage_key] = b"PK\x03\x04\r\n"
+    sandbox.default_result = ExecResult(
+        stdout=f"{file.file_name}\t6\nstale.csv\t99\n", stderr="", exit=0
+    )
+    sandbox.queue_files_errors(SandboxError("unknown files action"))
+
+    await AttachmentDelivery(
+        files=(file,), storage=storage, keep=frozenset({file.file_name})
+    ).place(_session(sandbox))
+
+    assert sandbox.deleted_paths == []
 
 
 async def test_a_file_that_cannot_be_placed_raises_rather_than_carrying_on() -> None:
@@ -978,3 +1068,130 @@ async def test_the_delivery_round_trips_a_stored_file_into_the_container(db_sess
     assert base64.b64encode(b"PK\x03\x04").decode() != sandbox.binary_workspace[placed].decode(
         "latin-1"
     )
+
+
+async def test_the_keep_set_covers_every_chat_in_the_project(db_session) -> None:
+    """★ THE CONTAINER BELONGS TO THE PROJECT, so the question the reap asks has to be asked
+    of the project. Answered per conversation, a two-chat project deletes the other chat's files
+    on every turn and places them again on the next one, forever.
+
+    Mutation receipt: scope the query to one conversation and the sibling's name disappears
+    from the set, which is the file the next turn would remove.
+    """
+    storage = FakeStorage()
+    user = await UserFactory.create(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    mine = await ConversationFactory.create(db_session, user.id, project_id=project.id)
+    sibling = await ConversationFactory.create(db_session, user.id, project_id=project.id)
+    await _stored(
+        db_session,
+        storage,
+        user_id=user.id,
+        attachment_id="a",
+        media_type=EXCEL_MEDIA_TYPE,
+        name="Gate roster.xlsx",
+        conversation_id=mine.id,
+    )
+    await _stored(
+        db_session,
+        storage,
+        user_id=user.id,
+        attachment_id="b",
+        media_type=CSV_MEDIA_TYPE,
+        name="movements.csv",
+        conversation_id=sibling.id,
+    )
+
+    keep = await names_this_project_still_owns(
+        db_session, user_id=user.id, conversation_id=mine.id
+    )
+
+    assert keep == {"Gate_roster.xlsx", "movements.csv"}
+
+
+async def test_the_keep_set_stops_at_the_project_boundary(db_session) -> None:
+    """A different project is a different container, so a name that only exists there says
+    nothing about what this root may hold — and carrying it across would leave a file no row in
+    this project claims sitting in the workspace for good."""
+    storage = FakeStorage()
+    user = await UserFactory.create(db_session)
+    here = await ProjectFactory.create(db_session, user.id)
+    elsewhere = await ProjectFactory.create(db_session, user.id)
+    mine = await ConversationFactory.create(db_session, user.id, project_id=here.id)
+    theirs = await ConversationFactory.create(db_session, user.id, project_id=elsewhere.id)
+    await _stored(
+        db_session,
+        storage,
+        user_id=user.id,
+        attachment_id="a",
+        media_type=CSV_MEDIA_TYPE,
+        name="mine.csv",
+        conversation_id=mine.id,
+    )
+    await _stored(
+        db_session,
+        storage,
+        user_id=user.id,
+        attachment_id="b",
+        media_type=CSV_MEDIA_TYPE,
+        name="theirs.csv",
+        conversation_id=theirs.id,
+    )
+
+    keep = await names_this_project_still_owns(
+        db_session, user_id=user.id, conversation_id=mine.id
+    )
+
+    assert keep == {"mine.csv"}
+
+
+async def test_the_keep_set_spells_a_collision_the_way_placement_does(db_session) -> None:
+    """★ THE SET IS BUILT PER CONVERSATION BECAUSE THAT IS HOW NAMES ARE BUILT. Two files that
+    reduce to one segment are numbered within the conversation holding them, so a project-wide
+    pass numbers a sibling chat into the sequence and yields spellings nothing ever writes —
+    names that then protect stale files from the reap for the life of the container.
+
+    Mutation receipt: name every row in one pass and the set gains `3-report.csv`, which no
+    conversation would place.
+    """
+    storage = FakeStorage()
+    user = await UserFactory.create(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    mine = await ConversationFactory.create(db_session, user.id, project_id=project.id)
+    sibling = await ConversationFactory.create(db_session, user.id, project_id=project.id)
+    await _stored(
+        db_session,
+        storage,
+        user_id=user.id,
+        attachment_id="a",
+        media_type=CSV_MEDIA_TYPE,
+        name="report.csv",
+        conversation_id=mine.id,
+    )
+    await _stored(
+        db_session,
+        storage,
+        user_id=user.id,
+        attachment_id="b",
+        media_type=CSV_MEDIA_TYPE,
+        name="report.csv",
+        conversation_id=mine.id,
+    )
+    await _stored(
+        db_session,
+        storage,
+        user_id=user.id,
+        attachment_id="c",
+        media_type=CSV_MEDIA_TYPE,
+        name="report.csv",
+        conversation_id=sibling.id,
+    )
+    await _sent(db_session, user_id=user.id, conversation_id=mine.id, ids=["a", "b"])
+
+    placed = await code_lane_attachments(db_session, user_id=user.id, conversation_id=mine.id)
+    keep = await names_this_project_still_owns(
+        db_session, user_id=user.id, conversation_id=mine.id
+    )
+
+    assert {file.file_name for file in placed} == {"report.csv", "2-report.csv"}
+    assert keep == {"report.csv", "2-report.csv"}
