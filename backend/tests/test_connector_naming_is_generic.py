@@ -2,9 +2,9 @@
 
 THE RULE. The platform is generic by name and specific only by value: connectors are the first of
 several integrations, so no table, route, enum, audit action, schema field or component carries
-the word DICE. It appears only as a value of `connector_key` and as the literals on one registry
-entry, which is what makes "add a second connector" a registry entry plus its board copy rather
-than a migration, a route and a component change.
+the word DICE. It appears only as a value of `connector_key` on one registry entry, which is what
+makes "add a second connector" a registry entry plus its board copy rather than a migration, a
+route and a component change.
 
 WHY THIS EXISTS AS A TEST. `src/core/connectors.py` states the rule and even spells out the
 command that checks it — and nothing ran it. A rule whose enforcement is a sentence asking a

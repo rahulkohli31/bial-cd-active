@@ -483,7 +483,7 @@ def test_the_registry_holds_exactly_one_connector() -> None:
 def test_the_entry_carries_the_board_literals() -> None:
     """`ConnectorStates` state 1 draws the row this renders: the name and the one-line subtitle."""
     dice = CONNECTORS["dice"]
-    assert dice.display_name == "DICE"
+    assert dice.display_name == "Flight Fact Data"
     assert dice.subtitle == "Airport operations"
     assert dice.max_window_days == 30
 
@@ -496,8 +496,8 @@ def test_the_ask_subtitle_is_the_ask_board_verbatim() -> None:
     connector: the row's four-word label, and the whole sentence the ask panel opens with. A
     reader who assumed one was a truncation of the other would delete the wrong one."""
     assert CONNECTORS["dice"].ask_subtitle == (
-        "DICE is BIAL’s airport operations data. An administrator decides who may read it — "
-        "you are asking once, for yourself."
+        "Flight Fact Data is BIAL’s airport operations data. An administrator decides who "
+        "may read it — you are asking once, for yourself."
     )
     assert CONNECTORS["dice"].ask_subtitle != CONNECTORS["dice"].subtitle
 
@@ -509,13 +509,13 @@ def test_the_requester_consent_lines_are_the_ask_dialog_verbatim() -> None:
     assert CONNECTORS["dice"].consent_lines_requester == (
         ConsentLine(
             lead="Read-only.",
-            body="Nothing you build can change DICE data.",
+            body="Nothing you build can change Flight Fact Data.",
         ),
         ConsentLine(
             lead="One dataset.",
             body=(
                 "The Flight Fact Report — flight schedules, gates, stands and status. "
-                "Nothing else in DICE."
+                "Nothing else in Flight Fact Data."
             ),
         ),
         ConsentLine(
@@ -531,12 +531,12 @@ def test_the_requester_consent_lines_are_the_ask_dialog_verbatim() -> None:
 def test_the_approver_consent_lines_are_the_decide_dialog_verbatim() -> None:
     """`AdminReview`'s `WHAT APPROVING GIVES THEM`, in the THIRD person. A separate set on purpose:
     the two panels differ in voice and in content, and folding them together would ship
-    `Nothing you build can change DICE data` to the approver while dropping the thirty-day promise
-    from their panel entirely."""
+    `Nothing you build can change Flight Fact Data` to the approver while dropping the
+    thirty-day promise from their panel entirely."""
     assert CONNECTORS["dice"].consent_lines_approver == (
         ConsentLine(
             lead="Read access to the Flight Fact Report.",
-            body="and nothing else in DICE.",
+            body="and nothing else in Flight Fact Data.",
         ),
         ConsentLine(
             lead="Every project they own.",
@@ -597,7 +597,7 @@ def test_the_registry_cannot_be_extended_at_runtime() -> None:
     cannot simply be written here. This asserts the RUNTIME half, which is the one that survives an
     untyped call site, a `getattr`, or a plugin loader.
     """
-    assert CONNECTORS["dice"].display_name == "DICE"
+    assert CONNECTORS["dice"].display_name == "Flight Fact Data"
     smuggler: Any = CONNECTORS
     with pytest.raises(TypeError):
         smuggler["smuggled"] = CONNECTORS["dice"]
