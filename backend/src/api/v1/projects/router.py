@@ -424,7 +424,10 @@ async def project_counts(user: CurrentUser, db: DbSession) -> ProjectCountsRespo
     """The three numbers above the project list.
 
     These are the citizen's OWN projects; `/admin/apps/counts` is the across-owners count, so
-    the two answer different questions and are not each other's cross-check."""
+    the two answer different questions and are not each other's cross-check. Every aggregate
+    below filters on `user_id == this caller`, so a project shared with the caller never
+    contributes to any of the three — the counts strip is silent about "Shared with me" by
+    construction, not by a filter written to exclude it."""
     # DECLARED BEFORE `/{project_id}`, and that ordering is load-bearing: FastAPI matches in
     # declaration order, so a `/counts` registered after the parameterised route would be
     # swallowed by it and answer 422 on a UUID parse instead.

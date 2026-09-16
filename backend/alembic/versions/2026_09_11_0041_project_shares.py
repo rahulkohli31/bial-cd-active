@@ -31,6 +31,11 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    # A brand-new table takes no lock on anything existing by itself, but its two FOREIGN KEY
+    # constraints do: creating them takes a lock on `projects` and `users` while Postgres
+    # validates the reference, the same class of guard `0034`/`0040` set around their own
+    # live-table changes.
+    op.execute("SET LOCAL lock_timeout = '5s'")
     op.create_table(
         "project_shares",
         sa.Column("id", sa.Uuid(), server_default=sa.text("uuidv7()"), nullable=False),
@@ -66,9 +71,12 @@ def upgrade() -> None:
         ["shared_with_user_id"],
         unique=False,
     )
+    op.execute("SET LOCAL lock_timeout = DEFAULT")
 
 
 def downgrade() -> None:
+    op.execute("SET LOCAL lock_timeout = '5s'")
     op.drop_index(op.f("ix_project_shares_shared_with_user_id"), table_name="project_shares")
     op.drop_index(op.f("ix_project_shares_project_id"), table_name="project_shares")
     op.drop_table("project_shares")
+    op.execute("SET LOCAL lock_timeout = DEFAULT")
