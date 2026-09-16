@@ -299,6 +299,30 @@ def test_viewing_a_file_that_is_not_text_shows_it_instead_of_failing() -> None:
     assert chr(0xFFFD) in r.json()["content"]
 
 
+def test_a_binary_view_is_bounded_by_size_not_only_by_lines() -> None:
+    """★ THE LINE BUDGET BOUNDS NOTHING HERE. The caller asks for a window of lines, which is
+    the right bound for source; a binary decoded with replacement characters has almost no
+    newlines, so a two-megabyte image is one line and the window is the whole file.
+
+    The refusal this replaced at least cost nothing. Answering with the file whole spends the
+    model's window on bytes it cannot use, so the view stops and says where it stopped.
+
+    Mutation receipt: drop the cap and the response carries every character of the file.
+    """
+    target = WORKSPACE / "public" / "hero.bin"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(bytes([0xFF, 0xD8, 0xFF]) * 200_000)  # no newline anywhere
+
+    r = client.post(
+        "/files", json={"action": "view", "path": str(target)}, headers=AUTH
+    )
+
+    assert r.status_code == 200, r.text
+    content = r.json()["content"]
+    assert len(content) < 300_000, "the whole file came back"
+    assert "truncated" in content
+
+
 def test_editing_a_file_that_is_not_text_is_refused_rather_than_crashing() -> None:
     """Editing refuses where viewing replaces: writing replacement characters back into the
     file would destroy the bytes the decode could not read. The 422 names the reason, where a

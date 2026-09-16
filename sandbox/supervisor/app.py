@@ -1309,6 +1309,13 @@ def exec_cmd(body: ExecBody) -> dict[str, Any]:
     }
 
 
+# What a single `view` may return. The caller bounds the LINE count; a file with few newlines
+# is unbounded by that, and a binary read as replacement characters is exactly such a file — a
+# two-megabyte image came back as two million characters in one line. Matched to the control
+# plane's own read ceiling rather than invented here.
+VIEW_MAX_CHARS = 256_000
+
+
 def _read_as_text(p: Path, *, editing: bool) -> str:
     """A file's text for the /files actions, or a typed refusal when it is not text.
 
@@ -1323,7 +1330,16 @@ def _read_as_text(p: Path, *, editing: bool) -> str:
             return p.read_text(encoding="utf-8")
         except UnicodeDecodeError as exc:
             raise HTTPException(422, f"{p.name} is not a text file and cannot be edited") from exc
-    return p.read_text(encoding="utf-8", errors="replace")
+    text = p.read_text(encoding="utf-8", errors="replace")
+    if len(text) <= VIEW_MAX_CHARS:
+        return text
+    # SAID, NOT SILENT. A view that stops has to say so, or the model reasons about a file it
+    # has seen a fraction of and reports the conclusion with full confidence.
+    return (
+        text[:VIEW_MAX_CHARS]
+        + f"{chr(10)}… truncated: {p.name} is {len(text):,} characters and the first "
+        + f"{VIEW_MAX_CHARS:,} are shown."
+    )
 
 
 @app.post("/files", dependencies=[Depends(_auth)])
