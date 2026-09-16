@@ -498,3 +498,18 @@ describe('ProjectDescriptionEditor — keyboard + focus (405a1d6 regression)', (
     })
   })
 })
+
+describe('it is a field, so it does not label itself', () => {
+  it('★ draws no heading of its own — the form that holds it names it', () => {
+    // It used to carry the rail's section-label treatment, from a rail section that no longer
+    // exists. In its one remaining home, Settings > General, that put a bold "Description" 24px
+    // above the editor's own uppercase "DESCRIPTION": two labels over one box.
+    render(<ProjectDescriptionEditor projectId="p1" description="stored" onProjectUpdate={vi.fn()} />)
+
+    expect(screen.queryByRole('heading')).toBeNull()
+    // LIVENESS beside the absence: the editor really rendered, and the control it does own works.
+    expect(screen.getByText('stored')).toBeTruthy()
+    openEditor()
+    expect(dialog()).toBeTruthy()
+  })
+})

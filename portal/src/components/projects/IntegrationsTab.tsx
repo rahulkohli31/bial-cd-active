@@ -33,6 +33,16 @@ import ProjectConnectorRow from '../connectors/ProjectConnectorRow'
 const FOOTER =
   'The switch controls this application only. Access itself is granted once, by an administrator.'
 
+/**
+ * …AND WHAT TO SAY WHERE THERE IS NO SWITCH TO EXPLAIN. Every row can be a read-out — nothing
+ * approved yet, or everything still waiting — and the sentence above then names a control that is
+ * not on the panel, beside rows offering no way to change that. This says the one thing a citizen
+ * in that state can act on, and where.
+ */
+const FOOTER_NO_SWITCH =
+  'No data is connected to this application yet. Access is granted once, by an administrator — ask ' +
+  'for it under Integrations, and it then covers every application you own.'
+
 const LABEL = 'The BIAL data this application may read'
 
 /**
@@ -252,7 +262,13 @@ export default function IntegrationsTab({ projectId }: IntegrationsTabProps): Re
         </ul>
       )}
 
-      <p className="m-0 text-[11px] leading-[1.6] text-neutral">{FOOTER}</p>
+      <p className="m-0 text-[11px] leading-[1.6] text-neutral">
+        {/* While the read is still out, `entries` is null and nothing is known — say the
+            general thing rather than claim an absence that may be about to be disproved. */}
+        {entries !== null && !entries.some((entry) => entry.state === 'approved')
+          ? FOOTER_NO_SWITCH
+          : FOOTER}
+      </p>
     </div>
   )
 }

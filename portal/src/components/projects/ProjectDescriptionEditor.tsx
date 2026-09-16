@@ -157,14 +157,10 @@ export default function ProjectDescriptionEditor({
 
   return (
     <section className="font-manrope">
-      <div className="flex items-center justify-between mb-2">
-        {/* THE RAIL'S OWN SECTION-LABEL TREATMENT. `PreviewOff`, `Main` and
-            `NothingBuilt` draw `DESCRIPTION` in exactly the micro-label form `START A CHAT` and
-            `APP STATUS` use — 10.5px, 700, .7px tracking, `#9CA3AF` — with a grey Edit beside it.
-            It shipped as 14px sentence-case bold with a teal Edit, which read as a heading of a
-            different rank from the two sections above it and put the canvas's only primary-action
-            colour on a control that opens a text box. */}
-        <h2 className="text-[10.5px] font-bold uppercase tracking-[.7px] text-canvas-label">Description</h2>
+      {/* NO LABEL OF ITS OWN. This is a field inside a form, and the form labels its fields — a
+          heading here put "Description" 24px above "DESCRIPTION", two labels over one box. Only
+          the Edit control belongs to the editor, and it sits where the label left it. */}
+      <div className="flex items-center justify-end mb-2">
         <button
           type="button"
           ref={editButtonRef}

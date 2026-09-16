@@ -219,6 +219,49 @@ describe('Integrations is the data this one application may read', () => {
     await waitFor(() => expect(h.listProjectConnectors).toHaveBeenCalledWith('p1'))
     await settle()
   })
+
+  /** Opens the tab and waits for the read to land, so the footer is deciding on real rows. */
+  async function openIntegrations(): Promise<void> {
+    open()
+    fireEvent.mouseDown(screen.getByTestId('settings-tab-integrations'))
+    fireEvent.click(screen.getByTestId('settings-tab-integrations'))
+    await screen.findByTestId('integrations-tab')
+    await settle()
+  }
+
+  const entry = (state: string) => ({
+    key: 'dice',
+    displayName: 'Flight Fact Data',
+    dataNoun: 'flight data',
+    state,
+    enabled: false,
+    effectivelyOn: false,
+    window: null,
+    askedAt: null,
+  })
+
+  it('★ does not explain a switch on a panel that has none — it says where access comes from', async () => {
+    // Every row here is a READ-OUT: nothing approved, so nothing to flip. The board's footer
+    // explains what "the switch" controls, which named a control that is not on screen, beside
+    // rows that offer no route to change that. A dead end at the end of a dead end.
+    h.listProjectConnectors.mockResolvedValue([entry('neverAsked')])
+    await openIntegrations()
+
+    const panel = screen.getByTestId('integrations-tab')
+    expect(panel.textContent).toContain('ask for it under Integrations')
+    expect(panel.textContent).not.toContain('The switch controls this application only')
+  })
+
+  it('★ …and does explain it as soon as there is one to explain', async () => {
+    // The other half, and the half that makes the assertion above mean something: the original
+    // sentence is not gone, it is conditional.
+    h.listProjectConnectors.mockResolvedValue([entry('approved')])
+    await openIntegrations()
+
+    expect(screen.getByTestId('integrations-tab').textContent).toContain(
+      'The switch controls this application only',
+    )
+  })
 })
 
 describe('Production is where the two live-app actions live', () => {
