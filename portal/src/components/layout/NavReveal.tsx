@@ -100,6 +100,7 @@ export function NavMenuButton({ className = '' }: { className?: string }) {
     <button
       type="button"
       onClick={reveal.toggleNav}
+      data-nav-door=""
       data-testid="nav-menu-button"
       aria-expanded={reveal.open}
       aria-label="Open the navigation"
@@ -153,6 +154,18 @@ export default function NavReveal({ hideable, children }: Props) {
   // courtesy.
   const restoreOnExit = useRef(false)
 
+  /**
+   * HOW THIS PANEL CAME TO BE OPEN, which decides how lightly it may leave.
+   *
+   * A panel summoned by resting at the screen edge is a GUESS at intent, and it withdraws when
+   * the pointer moves away — that is the whole bargain of the gesture. A panel opened by pressing
+   * the button or the shortcut is not a guess, and dismissing it because the pointer drifted
+   * toward the work is the product taking back something a person asked for. Both used the same
+   * pointer-leave, so an intentional open closed itself 400ms after the press.
+   */
+  const openedBy = useRef<'gesture' | 'deliberate'>('gesture')
+  const panelRef = useRef<HTMLElement | null>(null)
+
   const clearTimers = useCallback(() => {
     if (restTimer.current) { clearTimeout(restTimer.current); restTimer.current = null }
     if (graceTimer.current) { clearTimeout(graceTimer.current); graceTimer.current = null }
@@ -171,7 +184,10 @@ export default function NavReveal({ hideable, children }: Props) {
     // own focus calls, to hold the panel open while the keyboard is inside it — so recording
     // unconditionally would overwrite the citizen's real place with a panel item that is about to
     // be unmounted, and `Esc` would hand focus to nothing.
-    if (state !== 'open') rememberFocus()
+    if (state !== 'open') {
+      rememberFocus()
+      openedBy.current = 'deliberate'
+    }
     setState('open')
   }, [clearTimers, rememberFocus, state])
 
@@ -232,6 +248,29 @@ export default function NavReveal({ hideable, children }: Props) {
   // is docked, when it is pinned, when the chat is hidden, or below the stacking threshold —
   // four different reasons the gesture should not exist, all answered by not listening rather
   // than by branching inside a handler that has already fired.
+  /**
+   * A PRESS OUTSIDE CLOSES IT, which is the gesture people reach for first and the one this panel
+   * did not answer. Above the stacking threshold there is no backdrop — deliberately, so the panel
+   * never swallows a click meant for the work underneath — and with nothing else listening, a
+   * click away simply landed and left the panel sitting over the application.
+   *
+   * A LISTENER RATHER THAN A BACKDROP, so the press still reaches whatever it was aimed at. The
+   * door is excluded by name: it toggles on click, and letting this close on the preceding
+   * pointerdown would make the button reopen what it was pressed to close.
+   */
+  useEffect(() => {
+    if (!hideable || state !== 'open') return undefined
+    const onPress = (e: PointerEvent) => {
+      const target = e.target instanceof Element ? e.target : null
+      if (target === null) return
+      if (panelRef.current?.contains(target) === true) return
+      if (target.closest('[data-nav-door]') !== null) return
+      closeNav()
+    }
+    document.addEventListener('pointerdown', onPress)
+    return () => document.removeEventListener('pointerdown', onPress)
+  }, [hideable, state, closeNav])
+
   const zoneLive = hideable && !pinned && !chatHidden && !stacked
 
   // AND A REACH ALREADY UNDER WAY IS ABANDONED WITH IT. Dropping the listener stops new intent
@@ -251,6 +290,7 @@ export default function NavReveal({ hideable, children }: Props) {
         setState('reaching')
         restTimer.current = setTimeout(() => {
           restTimer.current = null
+          openedBy.current = 'gesture'
           setState('open')
         }, REST_MS)
         return
@@ -272,6 +312,8 @@ export default function NavReveal({ hideable, children }: Props) {
   }, [])
 
   const leaveWithGrace = useCallback(() => {
+    // Nothing to withdraw: this one was asked for.
+    if (openedBy.current === 'deliberate') return
     if (graceTimer.current) clearTimeout(graceTimer.current)
     graceTimer.current = setTimeout(() => {
       graceTimer.current = null
@@ -371,6 +413,7 @@ export default function NavReveal({ hideable, children }: Props) {
             )}
             <motion.aside
               key="nav-floating"
+              ref={panelRef}
               data-testid="nav-floating"
               className="fixed inset-y-0 left-0 z-50 border-r border-bial-border shadow-2xl"
               style={{ width: NAV_WIDTH_PX }}

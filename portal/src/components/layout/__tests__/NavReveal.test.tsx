@@ -172,9 +172,15 @@ describe('the edge zone tells intent from a pass-by', () => {
 })
 
 describe('it leaves on its own terms', () => {
+  /** Opened the way the grace period is FOR: by resting at the edge, not by asking. */
+  async function summonByGesture(): Promise<void> {
+    pointerAt(EDGE_ZONE_PX - 1)
+    await settles(true)
+  }
+
   it('stays for the grace period after the pointer leaves, so a wobble does not slam it', async () => {
     renderReveal()
-    fireEvent.click(screen.getByTestId('nav-menu-button'))
+    await summonByGesture()
     fireEvent.pointerLeave(screen.getByTestId('nav-floating'))
     await after(EARLY)
     expect(isOpen()).toBe(true)
@@ -183,12 +189,64 @@ describe('it leaves on its own terms', () => {
 
   it('stays indefinitely while the pointer is on the panel itself', async () => {
     renderReveal()
-    fireEvent.click(screen.getByTestId('nav-menu-button'))
+    await summonByGesture()
     fireEvent.pointerLeave(screen.getByTestId('nav-floating'))
     await after(EARLY)
     fireEvent.pointerEnter(screen.getByTestId('nav-floating'))
     await after(GRACE_MS * 2)
     expect(isOpen()).toBe(true)
+  })
+
+  it('★ how it opened is decided per open, not once', async () => {
+    // The two openings have different bargains, so the flag has to be RE-SET by whichever one
+    // happens — not merely set by the deliberate one. Press the button, close it, then summon the
+    // same panel by resting at the edge: that one is a guess again, and it must withdraw again.
+    renderReveal()
+    fireEvent.click(screen.getByTestId('nav-menu-button'))
+    act(() => { fireEvent.keyDown(document, { key: '\\', metaKey: true }) })
+    await settles(false)
+
+    await summonByGesture()
+    fireEvent.pointerLeave(screen.getByTestId('nav-floating'))
+    await settles(false)
+  })
+
+  it('★ but a panel that was ASKED for does not withdraw when the pointer wanders off', async () => {
+    // THE BARGAIN IS THE GESTURE'S, NOT THE BUTTON'S. Resting at the edge is a guess at intent, so
+    // it withdraws when the pointer leaves. Pressing the button is not a guess — and because
+    // pressing it leaves the pointer inside the panel's own bounds, the very next move toward the
+    // work fired pointer-leave and took the panel back 400ms later.
+    renderReveal()
+    fireEvent.click(screen.getByTestId('nav-menu-button'))
+    fireEvent.pointerLeave(screen.getByTestId('nav-floating'))
+
+    await after(GRACE_MS * 2)
+    expect(isOpen()).toBe(true)
+  })
+
+  it('★ …and a press outside it does close it, which is the gesture people try first', async () => {
+    // There is no backdrop above the stacking threshold — deliberately, so the panel cannot
+    // swallow a click meant for the work underneath. With nothing listening either, clicking away
+    // did nothing at all and the panel stayed over the application.
+    renderReveal()
+    fireEvent.click(screen.getByTestId('nav-menu-button'))
+    expect(isOpen()).toBe(true)
+
+    fireEvent.pointerDown(screen.getByTestId('underneath'))
+    await settles(false)
+  })
+
+  it('★ and the door is not "outside" — pressing it again closes, rather than reopening', async () => {
+    // The button toggles on CLICK and this listens on POINTERDOWN, so without excluding it the
+    // press would close on the way down and the click would reopen on the way up: a control that
+    // visibly does nothing.
+    renderReveal()
+    fireEvent.click(screen.getByTestId('nav-menu-button'))
+    expect(isOpen()).toBe(true)
+
+    fireEvent.pointerDown(screen.getByTestId('nav-menu-button'))
+    fireEvent.click(screen.getByTestId('nav-menu-button'))
+    await settles(false)
   })
 
   it('Escape closes it and gives focus back to where it came from', async () => {
