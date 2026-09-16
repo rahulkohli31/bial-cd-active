@@ -320,6 +320,23 @@ function presentationForState(state: PublishState): Presentation {
   }
 }
 
+/**
+ * IS THERE A CONTAINER SERVING RIGHT NOW — the precondition the restart and take-down routes
+ * enforce, answered HERE because this module is the one that owns what a publish state means.
+ *
+ * A surface grouping these three states itself would be a second author of the answer, and the
+ * retirement guard's whole subject is client-side predicates that re-decide what the server has
+ * already decided. This one does not re-derive anything: it reads the server's own computed
+ * field, and it exists so exactly one place has to be edited when a fourteenth state arrives.
+ *
+ * `starting_up` IS NOT ONE OF THEM. A deploy in flight has no revision to recycle and the server
+ * refuses both operations while one runs — offering a control in order to have it refused is what
+ * teaches a citizen to distrust the screen.
+ */
+export function canBeRestarted(state: PublishState): boolean {
+  return state === 'live_current' || state === 'live_newer_work' || state === 'live_drift_unknown'
+}
+
 /** `25 Aug 2026, 14:20` — the canvas's form, and the half a citizen recognises. */
 export function formatStamp(iso: string): string {
   const parsed = new Date(iso)

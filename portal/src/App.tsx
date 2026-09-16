@@ -4,6 +4,8 @@ import LoginPage from './pages/LoginPage'
 import AdminPage from './pages/AdminPage'
 import ChatRoute from './pages/ChatRoute'
 import MarketplacePage from './pages/MarketplacePage'
+import SharedApplicationsPage from './pages/SharedApplicationsPage'
+import IntegrationsPage from './pages/IntegrationsPage'
 import ProjectsPage from './pages/ProjectsPage'
 import ProjectPage from './pages/ProjectPage'
 import SharedProjectPage from './pages/SharedProjectPage'
@@ -140,17 +142,15 @@ export default function App() {
 
         {/* Project-first: a project is the thing you open, name, and return to. */}
         <Route path="/projects" element={<Shell><ProjectsPage /></Shell>} />
-        {/* SHARED APPLICATIONS HAS AN ADDRESS OF ITS OWN NOW, and this route is the interim half
-            of that: the list itself is still the one `ProjectsPage` draws, selected by pathname
-            rather than by the tab control it used to carry. The dedicated page replaces the
-            element here and the pathname branch goes with it.
-
-            A DEDICATED PATH IS SAFE IN A WAY `?tab=shared` WAS NOT. The tab was deliberately kept
+        {/* A DEDICATED PATH IS SAFE IN A WAY `?tab=shared` WAS NOT. The tab was deliberately kept
             out of the URL because a link a colleague pasted around would have promised them
             someone else's "shared with me"; this address lands every reader on their own. */}
-        <Route path="/shared-applications" element={<Shell><ProjectsPage /></Shell>} />
+        <Route path="/shared-applications" element={<Shell><SharedApplicationsPage /></Shell>} />
         {/* Cross-user by design: every signed-in BIAL user sees the same catalog. */}
         <Route path="/marketplace" element={<Shell><MarketplacePage /></Shell>} />
+        {/* ONE ROUTE REACHES INTEGRATIONS. It was a dialog with two doors and no address, so
+            nobody could link to it and neither door could be reached from the other's screen. */}
+        <Route path="/integrations" element={<Shell><IntegrationsPage /></Shell>} />
         {/* THE WORKSPACE. A pathless layout route wrapping both addresses inside a project, so
             the shell — and above all the running app it holds — is preserved across a move
             between them: React Router renders the same layout element at the same position

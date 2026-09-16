@@ -164,14 +164,12 @@ afterEach(() => {
 const beacons = () => beaconsFrom(h.authFetch)
 
 describe('ProjectPage — the composer is unconditional', () => {
-  it('no-app project: renders the composer, the description block and the recents — and no app affordances', async () => {
+  it('no-app project: renders the composer — and no app affordances', async () => {
     h.getProject.mockResolvedValue(makeProject({ appId: null, appStatus: null }))
     renderProjectPage()
 
-    expect(await screen.findByTestId('rail-app-status')).toBeTruthy()
+    expect(await screen.findByPlaceholderText(/Describe what you have in mind/i)).toBeTruthy()
     // Regression guard: this control must show regardless of whether the project has an app.
-    expect(screen.getByPlaceholderText(/Describe what you have in mind/i)).toBeTruthy()
-    expect(within(screen.getByTestId('description-rail')).getByRole('button', { name: /edit/i })).toBeTruthy()
     expect(screen.queryByRole('button', { name: /view app/i })).toBeNull()
     expect(screen.queryByRole('button', { name: /continue building/i })).toBeNull()
   })
@@ -183,7 +181,7 @@ describe('ProjectPage — the composer is unconditional', () => {
     ])
     renderProjectPage()
 
-    await screen.findByTestId('rail-app-status')
+    await screen.findByPlaceholderText(/Describe what you have in mind/i)
     // NOT collapsed under an app card — the reverted app-first-fold regression.
     expect(screen.getByPlaceholderText(/Describe what you have in mind/i)).toBeTruthy()
     // Inertness guards: a passive code view, a lifecycle badge and a chat reroute do not come
@@ -201,7 +199,7 @@ describe('ProjectPage — the app arrives behind one deliberate press', () => {
     h.fetchPreviewState.mockResolvedValue(preview({ state: 'asleep', restorable: true }))
     renderProjectPage()
 
-    await screen.findByTestId('rail-app-status')
+    await screen.findByPlaceholderText(/Describe what you have in mind/i)
     await waitFor(() => expect(h.fetchPreviewState).toHaveBeenCalled())
     // R-16's forbidden words — the positive half ("Your app is saved.") is pinned in
     // `AppPane.test.tsx` and `ProjectWorkspace.test.tsx`, which render the pane this file doesn't.
@@ -214,7 +212,7 @@ describe('ProjectPage — the app arrives behind one deliberate press', () => {
     h.fetchPreviewState.mockResolvedValue(preview({ state: 'never_built', restorable: false }))
     renderProjectPage()
 
-    await screen.findByTestId('rail-app-status')
+    await screen.findByPlaceholderText(/Describe what you have in mind/i)
     await waitFor(() => expect(h.fetchPreviewState).toHaveBeenCalled())
     expect(screen.queryByRole('button', { name: /launch application/i })).toBeNull()
   })
@@ -225,7 +223,7 @@ describe('ProjectPage — the app arrives behind one deliberate press', () => {
     h.fetchPreviewState.mockResolvedValue(preview({ state: 'asleep', restorable: true }))
     renderProjectPage()
 
-    await screen.findByTestId('rail-app-status')
+    await screen.findByPlaceholderText(/Describe what you have in mind/i)
     await waitFor(() => expect(h.fetchPreviewState).toHaveBeenCalledWith('p1'))
     expect(h.relaunchPreview).not.toHaveBeenCalled()
   })
@@ -237,87 +235,41 @@ describe('ProjectPage — the app arrives behind one deliberate press', () => {
     h.fetchPreviewState.mockResolvedValue(preview({ state: 'asleep', restorable: true }))
     renderProjectPage()
 
-    await screen.findByTestId('rail-app-status')
+    await screen.findByPlaceholderText(/Describe what you have in mind/i)
     await waitFor(() => expect(h.fetchPreviewState).toHaveBeenCalled())
+    // THE WHOLE POINT: reading the save state runs `git` inside the container, so asking it of a
+    // stopped project would START one — a start the screen caused rather than the citizen.
     expect(h.fetchSaveState).not.toHaveBeenCalled()
-    expect(screen.queryByTestId('rail-save-state')).toBeNull()
-  })
-
-  it('shows the save half only once the workspace is alive', async () => {
-    h.getProject.mockResolvedValue(makeProject({ appId: 'a1', hasRelaunchableSnapshot: true }))
-    h.fetchPreviewState.mockResolvedValue(preview({ state: 'alive', alive: true, previewUrl: 'https://app.example/' }))
-    h.fetchSaveState.mockResolvedValue({ appId: 'a1', dirty: true, containerHead: 'deadbeefcafe', savedHead: 'abc1234def' })
-    renderProjectPage()
-
-    await screen.findByTestId('rail-app-status')
-    const saved = await screen.findByTestId('rail-save-state')
-    expect(saved.textContent).toMatch(/not saved yet/i)
-    // No commit hash here — only whether the container holds work the saved bundle doesn't.
-    expect(saved.textContent).not.toContain('abc1234')
-  })
-
-  it('an unreadable save state says so rather than reporting that everything is saved', async () => {
-    h.getProject.mockResolvedValue(makeProject({ appId: 'a1' }))
-    h.fetchPreviewState.mockResolvedValue(preview({ state: 'alive', alive: true, previewUrl: 'https://app.example/' }))
-    h.fetchSaveState.mockResolvedValue({ appId: 'a1', dirty: null, containerHead: null, savedHead: null })
-    renderProjectPage()
-
-    const saved = await screen.findByTestId('rail-save-state')
-    expect(saved.textContent).toMatch(/could not check/i)
-    expect(saved.textContent).not.toMatch(/everything is saved/i)
   })
 
   it('the removed doors stay gone: no "Open app" link and no "Continue building" anywhere', async () => {
     h.getProject.mockResolvedValue(makeProject({ appId: 'app-123', appStatus: 'approved' }))
     renderProjectPage()
 
-    await screen.findByTestId('rail-app-status')
+    await screen.findByPlaceholderText(/Describe what you have in mind/i)
     expect(screen.queryByRole('link', { name: /open app/i })).toBeNull()
     expect(screen.queryByRole('button', { name: /continue building/i })).toBeNull()
   })
 })
 
-describe('ProjectPage — the description rail (pop-up editor)', () => {
-  it('shows an Edit button and NO attach / file-input control, with no dialog open by default', async () => {
-    h.getProject.mockResolvedValue(makeProject())
-    renderProjectPage()
-
-    await screen.findByTestId('rail-app-status')
-    const rail = screen.getByTestId('description-rail')
-    expect(within(rail).getByRole('button', { name: /edit/i })).toBeTruthy()
-    expect(within(rail).queryByRole('button', { name: /attach|upload/i })).toBeNull()
-    expect(rail.querySelector('input[type="file"]')).toBeNull()
-    expect(screen.queryByRole('dialog')).toBeNull()
-  })
-
-  it('clicking Edit opens a pop-up exposing Save and Cancel', async () => {
-    h.getProject.mockResolvedValue(makeProject())
-    renderProjectPage()
-
-    await screen.findByTestId('rail-app-status')
-    const rail = screen.getByTestId('description-rail')
-    fireEvent.click(within(rail).getByRole('button', { name: /edit/i }))
-
-    const dialog = screen.getByRole('dialog')
-    expect(within(dialog).getByRole('button', { name: /^save$/i })).toBeTruthy()
-    expect(within(dialog).getByRole('button', { name: /^cancel$/i })).toBeTruthy()
-  })
-})
-
 /* The chip itself is not on this page — its three scenarios (names the project, gets one even
    with nothing built, never moves or remounts) are pinned in `WorkspaceToolbar.test.tsx`. What
-   this page can answer for: the rail says nothing about publishing. */
-describe('ProjectPage — publishing is not in the rail', () => {
-  it('keeps every word about publishing out of the description section', async () => {
+   this page can answer for: the rail says nothing about publishing, and nothing about the three
+   sections it gave up to settings. */
+describe('ProjectPage — the rail carries one thing', () => {
+  it('★ says nothing about publishing, the data, the status or the description', async () => {
     h.getProject.mockResolvedValue(makeProject({ appId: 'a1' }))
     renderProjectPage()
 
-    await screen.findByTestId('rail-app-status')
-    const rail = screen.getByTestId('description-rail')
+    const composer = await screen.findByPlaceholderText(/Describe what you have in mind/i)
+    const rail = composer.closest('main') as HTMLElement
+    // Liveness is the composer itself, which is what the rail is FOR.
     expect(within(rail).queryByTestId('publish-chip-stub')).toBeNull()
-    expect(within(rail).getByRole('button', { name: /edit/i })).toBeTruthy()
     expect(rail.textContent).not.toMatch(/publish/i)
     expect(rail.textContent).not.toMatch(/review/i)
+    for (const gone of ['rail-data', 'rail-app-status', 'description-rail', 'rail-save-state']) {
+      expect(screen.queryByTestId(gone), gone).toBeNull()
+    }
   })
 })
 
@@ -327,7 +279,7 @@ describe('ProjectPage — an outlet child that owns its own scroller', () => {
   it('declares its own scroller and brings no page frame of its own', async () => {
     h.getProject.mockResolvedValue(makeProject())
     const { container } = renderProjectPage()
-    await screen.findByTestId('rail-app-status')
+    await screen.findByPlaceholderText(/Describe what you have in mind/i)
 
     const main = container.querySelector('main') as HTMLElement
     expect(main).toBeTruthy()
@@ -344,7 +296,7 @@ describe('ProjectPage — an outlet child that owns its own scroller', () => {
     // "the app did not remount" assertion elsewhere would fail on the first navigation to a chat.
     h.getProject.mockResolvedValue(makeProject())
     const { container } = renderProjectPage()
-    await screen.findByTestId('rail-app-status')
+    await screen.findByPlaceholderText(/Describe what you have in mind/i)
 
     // The pane is the shell's sibling of the Outlet, not rebuilt here.
     expect(container.innerHTML).not.toMatch(/grid-cols-/)
@@ -366,12 +318,12 @@ describe('ProjectPage — nothing points back to a past chat', () => {
     h.getProject.mockResolvedValue(makeProject())
     renderProjectPage()
 
-    await screen.findByTestId('rail-app-status')
+    await screen.findByPlaceholderText(/Describe what you have in mind/i)
     expect(screen.queryByTestId('conversations')).toBeNull()
     expect(h.listProjectConversations).not.toHaveBeenCalled()
     // Paired with a liveness check: an absence assertion passes just as happily when the page
     // crashed and rendered nothing at all.
-    expect(screen.getByTestId('description-rail')).toBeTruthy()
+    expect(screen.getByPlaceholderText(/Describe what you have in mind/i)).toBeTruthy()
     expect(screen.getByPlaceholderText(/Describe what you have in mind/i)).toBeTruthy()
   })
 
@@ -383,11 +335,11 @@ describe('ProjectPage — nothing points back to a past chat', () => {
     ])
     renderProjectPage()
 
-    await screen.findByTestId('rail-app-status')
+    await screen.findByPlaceholderText(/Describe what you have in mind/i)
     expect(screen.queryByText('Scope the fields')).toBeNull()
     expect(screen.queryByText('Build the screen')).toBeNull()
     expect(screen.queryByRole('button', { name: /^delete$/i })).toBeNull()
-    expect(screen.getByTestId('description-rail')).toBeTruthy()
+    expect(screen.getByPlaceholderText(/Describe what you have in mind/i)).toBeTruthy()
   })
 
   it('offers no copy anywhere on the screen that promises past conversations', async () => {
@@ -395,7 +347,7 @@ describe('ProjectPage — nothing points back to a past chat', () => {
     h.getProject.mockResolvedValue(makeProject())
     renderProjectPage()
 
-    await screen.findByTestId('rail-app-status')
+    await screen.findByPlaceholderText(/Describe what you have in mind/i)
     const screenText = document.body.textContent ?? ''
     expect(screenText).not.toMatch(/conversations · this project/i)
     expect(screenText).not.toMatch(/no conversations yet/i)
@@ -669,7 +621,7 @@ describe('ProjectPage — the project-open mark', () => {
     h.getProject.mockResolvedValue(makeProject({ id: 'p-strict', appId: 'a1' }))
     renderTwiceOver('p-strict')
 
-    await screen.findByTestId('rail-app-status')
+    await screen.findByPlaceholderText(/Describe what you have in mind/i)
     await waitFor(() => expect(beacons()).toEqual([{ name: 'project_opened' }]))
   })
 
@@ -681,12 +633,12 @@ describe('ProjectPage — the project-open mark', () => {
     // Mutation check: remove the once-per-project-id guard and this goes red.
     h.getProject.mockResolvedValue(makeProject({ id: 'p-return', appId: 'a1' }))
     renderProjectPage('p-return')
-    await screen.findByTestId('rail-app-status')
+    await screen.findByPlaceholderText(/Describe what you have in mind/i)
     await waitFor(() => expect(beacons()).toEqual([{ name: 'project_opened' }]))
 
     cleanup()
     renderProjectPage('p-return')
-    await screen.findByTestId('rail-app-status')
+    await screen.findByPlaceholderText(/Describe what you have in mind/i)
 
     expect(beacons()).toEqual([{ name: 'project_opened' }])
   })
@@ -697,7 +649,7 @@ describe('ProjectPage — the project-open mark', () => {
     h.getProject.mockResolvedValue(makeProject({ id: 'p-noapp', appId: null }))
     renderProjectPage('p-noapp')
 
-    await screen.findByTestId('rail-app-status')
+    await screen.findByPlaceholderText(/Describe what you have in mind/i)
     await waitFor(() => expect(beacons()).toEqual([{ name: 'project_opened' }]))
 
     const { markAppVisible } = await import('../../utils/observe')
@@ -795,7 +747,7 @@ describe('the project skeleton keeps WORDS and a busy state', () => {
     h.getProject.mockResolvedValue(makeProject({ id: 'p-wait-before' }))
     renderSwitchable('p-wait-before', 'p-wait-after')
     // The project has landed: the wait is NOT running.
-    expect(await screen.findByTestId('rail-app-status')).toBeTruthy()
+    expect(await screen.findByPlaceholderText(/Describe what you have in mind/i)).toBeTruthy()
 
     const before = screen.getByTestId('project-wait')
     expect(before.textContent).toBe('')

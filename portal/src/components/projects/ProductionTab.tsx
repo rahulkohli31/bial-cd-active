@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AlertTriangle, PowerOff, RotateCcw } from 'lucide-react'
 import { restartApp, takeAppDown } from '../../utils/deployApi'
-import type { PublishState } from '../../utils/deployApi'
 import { ApiError } from '../../utils/apiError'
+import { canBeRestarted } from '../../utils/publishPresentation'
 import { BusyGlyph } from '../ui/Waiting'
 import AppStatusPanel from './AppStatusPanel'
 
@@ -27,11 +27,6 @@ import AppStatusPanel from './AppStatusPanel'
  */
 
 type Pending = 'restart' | 'takedown' | null
-
-/** The three states in which an application is actually serving something. */
-function isLive(state: PublishState): boolean {
-  return state === 'live_current' || state === 'live_newer_work' || state === 'live_drift_unknown'
-}
 
 export interface ProductionTabProps {
   projectId: string
@@ -100,7 +95,7 @@ export default function ProductionTab({ projectId, onSettled }: ProductionTabPro
 
             {/* THE TWO ACTIONS ARE OFFERED ONLY WHERE THE SERVER WOULD ACCEPT THEM. A control
                 that exists to be refused teaches a citizen to distrust the screen. */}
-            {isLive(state) && (
+            {canBeRestarted(state) && (
               <div className="mt-4 flex flex-col gap-3 border-t border-bial-border pt-4">
                 <div>
                   <button

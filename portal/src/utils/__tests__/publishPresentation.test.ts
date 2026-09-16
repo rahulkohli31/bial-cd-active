@@ -16,6 +16,7 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import {
   ACTION_LABEL,
+  canBeRestarted,
   lookFor,
   presentationFor,
   provenanceRows,
@@ -371,5 +372,43 @@ describe('the failure code corrects exactly one state', () => {
         expect(presentationFor(state, code), state).toEqual(presentationFor(state))
       }
     }
+  })
+})
+
+/**
+ * ★ WHICH STATES HAVE A CONTAINER TO RECYCLE — the precondition Restart and Take down are
+ * offered under, and the routes' own. It lives in this module rather than at the surface because
+ * a component grouping the states itself would be a second author of the answer, which is the
+ * subject of the deploy retirement guard.
+ *
+ * ASSERTED OVER THE WHOLE TABLE, not over samples: the thing that goes wrong with a predicate
+ * like this is the state nobody thought about, and a fourteenth one has to fail here rather than
+ * quietly fall on whichever side the `||` chain happens to put it.
+ */
+describe('the states in which an application can be restarted', () => {
+  const SERVING = ['live_current', 'live_newer_work', 'live_drift_unknown'] as const
+
+  it.each(SERVING)('%s is serving something', (state) => {
+    expect(canBeRestarted(state)).toBe(true)
+  })
+
+  it('★ and every other state in the table is not', () => {
+    const wrong = EVERY_STATE.filter(
+      (state) => canBeRestarted(state) !== (SERVING as readonly string[]).includes(state),
+    )
+    expect(wrong, `disagreed for: ${wrong.join(', ')}`).toEqual([])
+  })
+
+  it('★ a deploy in flight is NOT restartable', () => {
+    // The one that looks live and is not: `starting_up` has no revision to recycle yet, and the
+    // server refuses both operations while a deploy runs. Called out by name because "it is
+    // nearly live" is exactly the reasoning that would add it.
+    expect(canBeRestarted('starting_up')).toBe(false)
+  })
+
+  it('★ nor is an application that WAS live and was taken down', () => {
+    // The other near miss: `taken_offline` has a published address in its history and no
+    // container. Publishing again is its remedy, not restarting.
+    expect(canBeRestarted('taken_offline')).toBe(false)
   })
 })

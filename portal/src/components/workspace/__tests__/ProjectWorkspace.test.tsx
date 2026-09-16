@@ -838,6 +838,46 @@ const pressSave = async () => fireEvent.click(await screen.findByTestId('save-pr
  * left here is the half only this composition can answer: a save on the project screen raises
  * the nudge, exactly once, and the toolbar's chip moves because of it.
  */
+/**
+ * ★ WHAT THE SAVE CONTROL SAYS, which is the only place that says it now.
+ *
+ * The rail used to write a sentence about unsaved work beside the toolbar's control. Two
+ * renderings of one fact is two things that can disagree, so the sentence went and the control
+ * stayed — it is also where the press is. What must not change is the tri-state's third arm:
+ * `dirty: null` is "the check could not run", and rendering "Saved" over it would be the one
+ * answer this may never give.
+ */
+describe('★ the save control is the whole of what the workspace says about saving', () => {
+  it('offers Save when the workspace is alive and holds work', async () => {
+    dirtyAndAlive()
+    render(<SavingWorkspace />)
+    const save = await screen.findByTestId('save-project')
+    expect(save.textContent).toMatch(/save/i)
+  })
+
+  it('★ offers NOTHING when the check could not run, rather than reporting "Saved"', async () => {
+    // Mutation receipt: read `dirty` as a boolean anywhere on this path and a `null` becomes
+    // `false`, which renders the "Saved" chip over a container nobody could read.
+    api.fetchPreviewState.mockResolvedValue(
+      preview({ state: 'alive', alive: true, previewUrl: APP_URL, restorable: true }),
+    )
+    api.fetchSaveState.mockResolvedValue({
+      appId: 'app-1',
+      dirty: null,
+      containerHead: null,
+      savedHead: null,
+    })
+    render(<SavingWorkspace />)
+
+    // LIVENESS FIRST: the workspace really rendered and really asked, so the absences below are
+    // a control withheld rather than a tree that fell over.
+    await waitFor(() => expect(api.fetchSaveState).toHaveBeenCalled())
+    expect(railComposer()).toBeTruthy()
+    expect(screen.queryByTestId('save-project')).toBeNull()
+    expect(screen.queryByTestId('save-state')).toBeNull()
+  })
+})
+
 describe('★ a save reconciles the toolbar chip', () => {
   it('★ moves the chip off the state it was showing, without a reload', async () => {
     dirtyAndAlive()

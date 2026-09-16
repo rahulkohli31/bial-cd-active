@@ -269,12 +269,22 @@ describe('App — addresses outside a project get no workspace frame', () => {
     expect(shell()).toBeNull()
   })
 
-  it('/shared-applications is its own address, and the list renders there', () => {
+  it('/shared-applications is its own address, with its own page', () => {
     // Which list is on screen is the ADDRESS rather than a control on the page, so that the
     // navigation has one entry per list and a pasted link lands every reader on their OWN
-    // shared applications.
+    // shared applications. It is a PAGE of its own now, not the owner list under another
+    // pathname — so the two cannot come to disagree about what a row offers.
     renderAt('/shared-applications')
-    expect(screen.getByTestId('projects')).toBeTruthy()
+    expect(screen.getByTestId('shared-applications')).toBeTruthy()
+    expect(screen.queryByTestId('projects')).toBeNull()
+    expect(shell()).toBeNull()
+  })
+
+  it('★ /integrations resolves — it was a dialog with two doors and no address', () => {
+    // Nobody could link to it, and neither door was reachable from the other's screen. One
+    // route, outside the workspace frame, like every other list address.
+    renderAt('/integrations')
+    expect(screen.getByTestId('integrations-page')).toBeTruthy()
     expect(shell()).toBeNull()
   })
 })
