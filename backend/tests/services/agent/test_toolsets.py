@@ -390,7 +390,7 @@ async def test_a_project_that_reads_no_connected_data_is_offered_none() -> None:
 
 
 async def test_a_connected_project_gets_exactly_one_more_tool_on_both_arms() -> None:
-    """R4 says both arms, and both arms is what this asserts — a Plan chat reasons about what can
+    """BOTH ARMS, which is what this asserts — a Plan chat reasons about what can
     be built from the data and a Build chat writes the code that reads it.
 
     ONE MORE TOOL, NAMED. Asserted as the off-surface PLUS that name rather than as a fresh list,
@@ -535,7 +535,7 @@ def _reader_from_read_deps(ctx: RunContext[ReadDeps]) -> AttachmentReader:
 async def test_a_plan_chat_offered_a_reader_gets_the_attachment_tool(
     workspace: ExtractedSnapshotWorkspace,
 ) -> None:
-    """★ R14, on the arm the architecture sanctions.
+    """★ THE CAPABILITY, on the arm the architecture sanctions.
 
     Plan already executes in the container, but only the eight read-only binaries on the guest
     list — `python3` is not among them, so it cannot invoke the shipped reader the way Build
@@ -576,27 +576,46 @@ async def test_a_plan_chat_with_no_reader_is_unchanged(
     assert "read_attachment" not in seen["tool_names"]
 
 
-def test_a_build_chat_is_never_offered_the_attachment_tool() -> None:
-    """★ THE ASYMMETRY IS R15, NOT AN OVERSIGHT. Build holds an unrestricted `run_command` and can
-    read, EDIT and re-run the reader as it would any other file. A fixed-shape tool beside that
-    would be a second, weaker way to do what it already does better — and would make the reader
-    look opaque at the exact moment it stops being so.
+def _sandbox_the_model_never_reaches(_ctx: RunContext[Any]) -> Any:
+    """A Build surface needs a sandbox accessor to be built at all; this test lists the tools
+    on it and calls none of them, so resolving one would be answering a question nobody asks."""
+    raise AssertionError("this test reads tool names; it calls no tool")
 
-    Asserted structurally: the Build arm takes no reader accessor at all, so there is no argument
-    that could put this tool on that surface.
+
+async def test_a_build_chat_is_never_offered_the_attachment_tool(
+    workspace: ExtractedSnapshotWorkspace,
+) -> None:
+    """★ THE ASYMMETRY IS DELIBERATE, NOT AN OVERSIGHT. Build holds an unrestricted
+    `run_command` and can read, EDIT and re-run the reader as it would any other file. A
+    fixed-shape tool beside that would be a second, weaker way to do what it already does
+    better — and would make the reader look opaque at the exact moment it stops being so.
+
+    Asserted by BUILDING the Build arm with a reader in hand, which is the only way to tell
+    that the arm ignores it. Reading the function's own source instead proved a spelling: a
+    registration moved into a helper, or renamed, passed while the tool appeared on the
+    surface.
     """
-    import inspect
+    seen: dict[str, Any] = {}
+    agent: Agent[ReadDeps, str] = Agent(deps_type=ReadDeps)
+    await agent.run(
+        "hi",
+        deps=_deps(workspace),
+        model=_tool_listing_model(seen, [text_turn("hello")]),
+        toolsets=toolsets_for_kind(
+            ChatKind.BUILD,
+            workspace_from_read_deps,
+            _sandbox_the_model_never_reaches,
+            reader_of=_reader_from_read_deps,
+        ).toolsets,
+    )
 
-    from src.services.agent import toolsets as toolsets_module
-
-    source = inspect.getsource(toolsets_module.toolsets_for_kind)
-    plan_arm, _, build_arm = source.partition("case ChatKind.BUILD:")
-    assert "attachment_toolset" in plan_arm
-    assert "attachment_toolset" not in build_arm
+    assert "read_attachment" not in seen["tool_names"]
+    # The control: this arm really is the one that can do it for itself.
+    assert "run_command" in seen["tool_names"]
 
 
 def test_the_reviewer_cannot_receive_the_attachment_tool() -> None:
-    """★ THE CONSTRAINT R14 IS REALLY ABOUT. The reviewer agent runs on the control plane over
+    """★ WHAT THE SCOPING IS REALLY ABOUT. The reviewer agent runs on the control plane over
     untrusted project contents and SHARES its read surface with Plan — `check_the_guest_list`
     takes argv and nothing else precisely so no body below it can ask which agent is calling.
 
