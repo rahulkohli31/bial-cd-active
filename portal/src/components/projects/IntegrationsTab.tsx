@@ -229,9 +229,6 @@ export default function IntegrationsTab({ projectId }: IntegrationsTabProps): Re
                 key={entry.key}
                 testId={`app-connector-${entry.key}`}
                 connectorName={entry.displayName}
-                // `null`: the application IS this dialog, so the row draws the connector's name
-                // and both controls say `in this project` rather than repeating it.
-                projectName={null}
                 leading={<ConnectorGlyph />}
                 detail={
                   <div className="mt-0.5">

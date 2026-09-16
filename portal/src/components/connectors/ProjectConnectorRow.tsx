@@ -1,12 +1,11 @@
 /**
  * One connector, one project: a switch and the days it reads.
  *
- * `projectName` SELECTS WHO THE ROW IS ABOUT. Settings › Integrations mounts one per registry
- * connector and passes `null` — the application IS the surface — so the row draws the connector's
- * name and both controls say `in this project`. A mount that lists several applications passes
- * each one's name instead, and the label and the control names follow it. The tab also passes
- * `leading` (the connector's teal tile), `detail` (its state sentence), and, for the two states
- * with no switch to offer, `trailing` (an inert read-out).
+ * THE ROW IS ABOUT ONE APPLICATION, AND IT IS ALWAYS THE SURFACE'S OWN. Its only mount is
+ * Settings › Integrations, which draws one per registry connector — so the row is named for the
+ * CONNECTOR and both controls say `in this application`, because the application is the dialog
+ * they are in. That mount also passes `leading` (the connector's teal tile), `detail` (its state
+ * sentence), and, for the two states with no switch to offer, `trailing` (an inert read-out).
  *
  * IT OWNS ITS WRITE, NOT ITS TRUTH. The row holds no fetch and no list; the mount site passes
  * `onSet` and gets `onSettled` back. What the row DOES own is the mechanics of one write — the
@@ -51,12 +50,6 @@ export interface ProjectConnectorState {
 export interface ProjectConnectorRowProps {
   /** The connector's display name, off the wire. Both controls name it. */
   connectorName: string
-  /**
-   * The application this row is about, when the row is one of several applications. `null` in
-   * Settings › Integrations, where the row is the connector and the application is the whole
-   * surface — it selects the bold label AND how the two controls name themselves.
-   */
-  projectName: string | null
   /** Drawn before the label. The settings tab passes the connector's teal tile. */
   leading?: React.ReactNode
   /** A sentence under the label — the settings tab's project-state line. */
@@ -93,7 +86,6 @@ function signature(state: ProjectConnectorState): string {
 
 export default function ProjectConnectorRow({
   connectorName,
-  projectName,
   leading,
   detail,
   trailing,
@@ -170,8 +162,6 @@ export default function ProjectConnectorRow({
     [shown.enabled, write],
   )
 
-  const where = projectName === null ? 'this application' : projectName
-  const label = projectName ?? connectorName
 
   return (
     <li
@@ -180,7 +170,7 @@ export default function ProjectConnectorRow({
     >
       {leading}
       <div className="min-w-0 flex-1">
-        <div className="truncate text-[12.5px] font-semibold text-primary-900">{label}</div>
+        <div className="truncate text-[12.5px] font-semibold text-primary-900">{connectorName}</div>
         {detail}
       </div>
 
@@ -192,7 +182,7 @@ export default function ProjectConnectorRow({
                   Sep` alone says nothing about which of five projects it belongs to. */}
               <WindowChip
                 window={shown.window}
-                accessibleName={`Days ${connectorName} reads in ${where}: ${formatWindowLabel(shown.window)}`}
+                accessibleName={`Days ${connectorName} reads in this application: ${formatWindowLabel(shown.window)}`}
               />
               {popoverOpen && (
                 <WindowPopover
@@ -212,7 +202,7 @@ export default function ProjectConnectorRow({
           <Switch
             checked={shown.enabled}
             aria-disabled={switchBusy}
-            aria-label={`Read ${connectorName} in ${where}`}
+            aria-label={`Read ${connectorName} in this application`}
             onCheckedChange={toggle}
           />
         </>
