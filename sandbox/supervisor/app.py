@@ -1402,6 +1402,20 @@ def files(body: FilesBody) -> dict[str, Any]:
         p.write_text("\n".join(lines), encoding="utf-8")
         return {"ok": True}
 
+    if body.action == "delete":
+        # ★ ATTACHMENTS ONLY, and that is the whole shape of this capability. A delete able
+        # to reach the app tree would be the one action here that can destroy the work the
+        # container exists to hold, and the caller that needs it only ever removes files it
+        # placed in the attachments root itself. `_resolve` has already refused everything
+        # outside both roots; this refuses the other root.
+        if not p.is_relative_to(ATTACHMENTS.resolve()):
+            raise HTTPException(400, "delete is for attachments only")
+        # MISSING IS SUCCESS: the caller is reconciling what the container holds against what
+        # the conversation still owns, and a file already gone is that goal rather than a
+        # failure to stop on.
+        p.unlink(missing_ok=True)
+        return {"ok": True, "deleted": str(p)}
+
     raise HTTPException(400, f"unknown files action: {body.action}")
 
 
