@@ -289,8 +289,10 @@ def test_a_search_hit_comes_back_in_the_vocabulary_the_model_was_given() -> None
     read tool refuses — `_vet_path_token` rejects a leading `/` — so a search over an attachment
     produced hits nothing could act on.
 
-    Translation has to be symmetric. Mutation receipt: drop `to_model_path` from the hit loop and
-    this comes back container-absolute.
+    Translation has to be symmetric, and that is what this pins: the outbound function and its
+    inverse, as pure functions. The hit loop that must CALL it is driven in
+    `test_live_workspace.py`, because nothing here enters that loop and a receipt quoted
+    against a test that cannot reach the code is worse than none.
     """
     assert to_model_path("/workspace/attachments/roster.csv") == ".attachments/roster.csv"
     assert to_model_path("/workspace/attachments") == ".attachments"

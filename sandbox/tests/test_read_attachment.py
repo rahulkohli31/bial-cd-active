@@ -1,8 +1,9 @@
 """The shipped attachment reader — the three measured defects, and the one return shape.
 
-Runs in the sandbox image, where the four reader libraries live. These are not smoke tests: each
-case below is one of the ways the REPLACED extractor was wrong, asserted so the replacement cannot
-be wrong the same way.
+Runs anywhere the four reader libraries are installed, which the backend's `reader` dependency
+group now guarantees — they were absent everywhere, and this suite skipped itself into silence.
+These are not smoke tests: each case below is one of the ways the REPLACED extractor was wrong,
+asserted so the replacement cannot be wrong the same way.
 
 The fixtures are built here rather than checked in, so what each test proves is visible in the
 test itself — a checked-in .xlsx whose formulas have no cached values looks identical to one whose
