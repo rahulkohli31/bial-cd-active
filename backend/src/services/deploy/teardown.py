@@ -1,4 +1,5 @@
-"""Remove a published app's container — when its app is deleted, and on the admin kill-switch.
+"""Remove a published app's container — when its app is deleted, when its owner takes it out
+of production, and on the admin kill-switch.
 
 WHY THIS EXISTS: without it, deleting a project leaves a live application running — still
 serving, still billing, and named nowhere once the deployment row goes with the app under
@@ -16,10 +17,11 @@ automatic comes for it, because the reaper cannot see a published app at all and
 reconciler on the delete path runs on a timer outside production. The caller records what
 survived.
 
-TWO CALLERS, TWO POSTURES: the delete paths are best-effort as above; `deploy/router.py`'s
-`unpublish` is a synchronous admin lever that must FAIL LOUD, so it reads the return count
-and 503s on zero instead. Note what the count means there: `delete_app` no-ops on an absent
-container and still increments, so non-zero means "no error", not "something was deleted".
+TWO POSTURES, NOT ONE: the delete paths are best-effort as above; the two synchronous levers
+in `deploy/router.py` — an owner's `takedown` and the admin `unpublish` — must FAIL LOUD, so
+they read the survivors back and 503 rather than claim a removal nobody observed. The MECHANISM
+is shared and the SEMANTICS are not: the kill-switch also has `disable` beside it, which severs
+the app's database credential, while an owner's take-down keeps every artefact intact.
 """
 
 from __future__ import annotations

@@ -98,6 +98,32 @@ class DeployRoutedResponse(CamelModel):
     message: str
 
 
+class RestartStartedResponse(CamelModel):
+    """The 202 body of an owner's restart. Carries the id to poll and nothing else it could
+    be wrong about: recycling a revision runs for minutes, so the state the citizen watches
+    comes back through `GET /v1/projects/{id}/deployment` like every other deploy state —
+    one source for "what is it doing now", never a second channel."""
+
+    deployment_id: str
+    app_id: str
+    status: str
+
+
+class TakedownResponse(CamelModel):
+    """An owner's take-down: which deployment left production, and when.
+
+    Take-down is NOT delete and NOT the administrator's kill-switch — the container goes and
+    every artefact stays — so `message` carries the sentence that says so, the way
+    `DeployRoutedResponse` does, rather than leaving each surface to write its own. It also
+    says when a version is still sitting in the review queue, because a take-down withdraws
+    nothing and an owner should not have to discover that."""
+
+    app_id: str
+    deployment_id: str
+    unpublished_at: datetime
+    message: str
+
+
 class UnpublishResponse(CamelModel):
     """The admin kill-switch's response — the deployment that was taken down (or
     already was, on an idempotent repeat) and when."""
