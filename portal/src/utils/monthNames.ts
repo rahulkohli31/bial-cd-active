@@ -10,7 +10,7 @@
  * IT LIVES IN A UTILITY, NOT BESIDE ITS FIRST CONSUMER. Four surfaces now set a date in one of
  * these shapes — a connector row, a window chip, an approval panel and the applications list —
  * and a formatter reached by importing a component drags that component's icons and types into
- * every one of them. `connectors/ConnectorRow.tsx` re-exports it so its own callers are
+ * every one of them. `connectors/connectorPresentation.tsx` re-exports it so its own callers are
  * unchanged.
  *
  * The portal's copy is English throughout; the day and the clock stay LOCAL (the reader is in

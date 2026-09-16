@@ -23,7 +23,6 @@ const h = vi.hoisted(() => ({
   getStoredUser: vi.fn(),
   logout: vi.fn(),
   fetchAppStatusCounts: vi.fn(),
-  listConnectors: vi.fn(),
   projectsListHref: vi.fn(() => '/projects'),
   rememberProjectsSearch: vi.fn(),
 }))
@@ -43,13 +42,6 @@ vi.mock('../../../utils/projectsListMemory', () => ({
   projectsListHref: h.projectsListHref,
   rememberProjectsSearch: h.rememberProjectsSearch,
   recallProjectsSearch: vi.fn(() => ''),
-}))
-// SPREAD THE ORIGINAL. A bare factory silently drops every export it does not name, and the
-// connector dialog's close path calls `notifyConnectorsChanged` — listing only the fetchers makes
-// closing throw, and that reads as "the dialog would not close" rather than "the mock is thin".
-vi.mock('../../../utils/connectorApi', async (importOriginal) => ({
-  ...(await importOriginal<Record<string, unknown>>()),
-  listConnectors: h.listConnectors,
 }))
 
 import AppShell from '../AppShell'
@@ -79,7 +71,6 @@ beforeEach(() => {
   h.fetchUsageToday.mockResolvedValue(USAGE)
   h.onUsageChanged.mockReturnValue(() => {})
   h.fetchAppStatusCounts.mockResolvedValue(counts(0))
-  h.listConnectors.mockResolvedValue([])
   h.projectsListHref.mockReturnValue('/projects')
 })
 afterEach(() => cleanup())
@@ -215,6 +206,7 @@ describe('every destination leaves the workspace through its guard — not just 
     ['nav-projects', '/projects'],
     ['nav-shared-applications', '/shared-applications'],
     ['nav-marketplace', '/marketplace'],
+    ['nav-integrations', '/integrations'],
     ['nav-admin', '/admin'],
   ])('%s runs the exit routine BEFORE navigating', async (testId, expected) => {
     h.getStoredUser.mockReturnValue(ADMIN)
@@ -272,17 +264,6 @@ describe('every destination leaves the workspace through its guard — not just 
     )
   })
 
-  it('the Integrations entry opens the dialog and tears nothing down — it is an overlay', async () => {
-    // INTERIM, until Integrations is a page. An overlay is not a navigation, so it deliberately
-    // does not run the exit guard the four destinations do.
-    const guard = vi.fn((go: () => void) => go())
-    renderAt('/chat/c1', guard)
-    await summonNav()
-    fireEvent.click(await screen.findByTestId('nav-integrations'))
-    await waitFor(() => expect(h.listConnectors).toHaveBeenCalled())
-    expect(guard).not.toHaveBeenCalled()
-    expect(screen.getByTestId('where').textContent).toBe('/chat/c1')
-  })
 })
 
 describe('where the navigation is, per route', () => {

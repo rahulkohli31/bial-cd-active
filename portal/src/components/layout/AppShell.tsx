@@ -1,6 +1,5 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, type ReactNode } from 'react'
 import { useLocation } from 'react-router-dom'
-import IntegrationsDialog from '../connectors/IntegrationsDialog'
 import { rememberProjectsSearch } from '../../utils/projectsListMemory'
 import NavPanel from './NavPanel'
 import NavReveal, { NavMenuButton, useStackedViewport } from './NavReveal'
@@ -20,12 +19,6 @@ import NavReveal, { NavMenuButton, useStackedViewport } from './NavReveal'
  * stacking threshold there is no room for a docked column beside the work, so every route — list
  * routes included — reaches the navigation as a drawer, and the shell draws the button that opens
  * it. A narrow screen loses the permanence, never the destinations.
- *
- * INTEGRATIONS IS AN INTERIM DOOR, DELIBERATELY. The connector dialog has no route of its own
- * yet, and both its existing doors — the profile menu and the workspace rail — are being removed.
- * Hosting it here keeps the capability reachable from its navigation entry for the commit range
- * where the page does not exist, rather than shipping an entry that leads nowhere. It goes when
- * the page lands.
  */
 
 /** The addresses inside an application: the navigation is not on screen on these. */
@@ -46,35 +39,24 @@ export default function AppShell({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (pathname === '/projects') rememberProjectsSearch(search)
   }, [pathname, search])
-  const [integrationsOpen, setIntegrationsOpen] = useState(false)
-  const openIntegrations = () => setIntegrationsOpen(true)
-
-  const dialog = integrationsOpen ? (
-    <IntegrationsDialog onClose={() => setIntegrationsOpen(false)} />
-  ) : null
-
   // Inside an application the workspace toolbar carries the menu button, so the shell adds no
   // bar of its own there — the whole point of that layout is that the platform's chrome gets out
   // of the application's way.
   if (isApplicationRoute(pathname)) {
     return (
-      <NavReveal hideable onOpenIntegrations={openIntegrations}>
-        {children}
-        {dialog}
-      </NavReveal>
+      <NavReveal hideable>{children}</NavReveal>
     )
   }
 
   if (stacked) {
     return (
-      <NavReveal hideable onOpenIntegrations={openIntegrations}>
+      <NavReveal hideable>
         <div className="flex h-screen flex-col overflow-hidden bg-bial-bg font-manrope">
           <div className="flex h-12 shrink-0 items-center gap-2 border-b border-bial-border bg-white px-3">
             <NavMenuButton />
           </div>
           <div className="min-w-0 flex-1 overflow-y-auto">{children}</div>
         </div>
-        {dialog}
       </NavReveal>
     )
   }
@@ -82,10 +64,9 @@ export default function AppShell({ children }: { children: ReactNode }) {
   return (
     <div className="flex h-screen overflow-hidden bg-bial-bg font-manrope">
       <aside className="h-full shrink-0 border-r border-bial-border" data-testid="nav-docked">
-        <NavPanel onOpenIntegrations={openIntegrations} />
+        <NavPanel />
       </aside>
       <div className="min-w-0 flex-1 overflow-y-auto">{children}</div>
-      {dialog}
     </div>
   )
 }

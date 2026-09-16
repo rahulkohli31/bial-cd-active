@@ -9,6 +9,7 @@ import { Dialog, DialogContent, DialogTitle } from '../ui/dialog'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '../ui/tabs'
 import { BusyGlyph } from '../ui/Waiting'
 import { DURATION, LAYOUT_EASE } from '../../lib/motion'
+import IntegrationsTab from './IntegrationsTab'
 import ProductionTab from './ProductionTab'
 import ProjectDescriptionEditor from './ProjectDescriptionEditor'
 import { SharePanelBody } from './SharePanel'
@@ -23,9 +24,6 @@ import { SharePanelBody } from './SharePanel'
  * the per-application Integrations tab exists at all beside the Integrations page: a citizen who
  * wants their connector switch never has to leave to reach it.
  *
- * TABS ARRIVE WITH THEIR UNITS. Integrations is absent rather than empty: a tab that renders a
- * blank panel is a control that lies about having a destination.
- *
  * IT SURVIVES THE NARROW WIDTHS THE REST OF THE PORTAL SURVIVES. This product's standing promise
  * is that every control stays reachable at 360px, and the workspace toolbar carries a
  * scroll-on-overflow fix precisely because that promise was once broken. Below the stacking
@@ -35,7 +33,7 @@ import { SharePanelBody } from './SharePanel'
 
 /** The title truncates rather than pushing the close control off a fixed-width panel — the same
  *  treatment the row and the toolbar already give a long application name. */
-export type SettingsTab = 'general' | 'sharing' | 'production'
+export type SettingsTab = 'general' | 'sharing' | 'integrations' | 'production'
 
 export interface AppSettingsDialogProps {
   project: Project
@@ -54,6 +52,7 @@ export interface AppSettingsDialogProps {
 const TABS: { value: SettingsTab; label: string }[] = [
   { value: 'general', label: 'General' },
   { value: 'sharing', label: 'Sharing' },
+  { value: 'integrations', label: 'Integrations' },
   { value: 'production', label: 'Production' },
 ]
 
@@ -231,9 +230,14 @@ export default function AppSettingsDialog({
               <SharePanelBody projectId={project.id} />
             </TabsContent>
 
-            {/* NO `forceMount` HERE, deliberately: Radix unmounts an unchosen panel, and that is
-                what stops the production read polling behind another tab. It is the one thing in
-                this dialog that asks the server anything on a timer. */}
+            {/* NO `forceMount` ON EITHER OF THESE, deliberately: Radix unmounts an unchosen
+                panel, so neither read fires until its tab is chosen — which is what stops the
+                production read polling behind another tab, and what keeps opening Settings from
+                costing a connector read nobody asked for. */}
+            <TabsContent value="integrations" className="mt-0">
+              <IntegrationsTab projectId={project.id} />
+            </TabsContent>
+
             <TabsContent value="production" className="mt-0">
               <ProductionTab projectId={project.id} onSettled={onProductionSettled} />
             </TabsContent>

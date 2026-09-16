@@ -153,7 +153,7 @@ describe('what the dialog says', () => {
     const dialog = within(await openReview())
 
     // `4 Sep`, never `Sept` (en-GB/en-IN under current CLDR) and never `Sep 4` (en-US). The month
-    // list is spelled once, in `ConnectorRow.tsx`, and every connector surface comes back to it.
+    // list is spelled once, in `connectorPresentation.tsx`, and every connector surface comes back to it.
     // The DATE half is fixed (midday UTC is 4 September in every timezone); the CLOCK half is
     // local, exactly as the queue's own `ASKED` column reads it, so it is computed the same way
     // rather than pinned to the machine the suite runs on.

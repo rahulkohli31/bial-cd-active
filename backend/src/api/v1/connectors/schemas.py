@@ -80,9 +80,9 @@ class ConnectorOnProject(CamelModel):
     """One project behind the Integrations card's disclosure — a name, and nothing else.
 
     NO WINDOW, NO RECORD COUNT, NO LAST-READ DATE. The page answers who may read the data, never
-    what was read or for how long, so this is deliberately NOT `ConnectorProjectEntry`: that shape
-    carries a window because the drill-down it feeds offers one, and reusing it here would put a
-    usage-shaped fact on a page that is not allowed to state one.
+    what was read or for how long, so a window has no place on this shape — putting one here would
+    be a usage-shaped fact on a page that is not allowed to state one. The days a project reads
+    are set where the switch is, in that project's own settings.
 
     NO `enabled` EITHER. Every project on this list has the switch up — that is the list's whole
     definition — so a field that is always `true` would be a second, weaker statement of it."""
@@ -269,33 +269,6 @@ class ProjectConnectorListResponse(CamelModel):
     under it come to disagree with nothing on screen admitting it."""
 
     connectors: list[ProjectConnectorEntry]
-
-
-class ConnectorProjectEntry(CamelModel):
-    """One of the caller's projects, on the drill-down list behind an approved connector row.
-
-    The board draws the project's name, a switch, and the window chip — `Last 7 days` for a
-    preset, `1 – 30 Sep` for a fixed range — with an em dash where a project has no window
-    because the connector was never switched on there."""
-
-    project_id: uuid.UUID
-    name: str
-    enabled: bool
-    #: `null` for a project this connector was never switched on in. See `ProjectConnectorEntry`.
-    window: ConnectorWindow | None = None
-
-
-class ConnectorProjectListResponse(CamelModel):
-    """Every project the caller owns, for one connector, newest first — and whether that IS all
-    of them.
-
-    `truncated` EXISTS BECAUSE NOTHING BOUNDS A CITIZEN'S PROJECT COUNT. The projects listing
-    pages at 25 and no per-user cap exists anywhere, so this read stops at a cap and SAYS so
-    rather than silently returning a prefix — the panel renders it as a line pointing at the
-    search. Same shape, and the same reasoning, as the admin registry listing."""
-
-    projects: list[ConnectorProjectEntry]
-    truncated: bool = False
 
 
 class RelativeWindowChoice(CamelModel):

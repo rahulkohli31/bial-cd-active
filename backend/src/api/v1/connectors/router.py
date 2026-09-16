@@ -47,8 +47,6 @@ from src.api.v1.connectors.schemas import (
     ConnectorEntry,
     ConnectorListResponse,
     ConnectorOnProject,
-    ConnectorProjectEntry,
-    ConnectorProjectListResponse,
     ConnectorWindow,
     ConsentLine,
     ProjectConnectorEntry,
@@ -378,14 +376,6 @@ async def cancel_access_request(
 
 project_router = APIRouter(prefix="/projects/{project_id}/connectors", tags=["connectors"])
 
-# How many of the caller's projects one drill-down returns. NOTHING BOUNDS A CITIZEN'S PROJECT
-# COUNT — `projects/router.py` pages its own listing at 25 and no per-user cap exists anywhere in
-# this tree — so "a citizen's project list is short" is an assumption, not a fact. Same cap and
-# same sentinel-row shape as the admin registry listing, and reported rather than hidden:
-# `ConnectorProjectListResponse.truncated` says when it bit. Declared here rather than imported
-# from the admin router, which is a superadmin surface a citizen route should not depend on.
-LISTING_CAP = 200
-
 # The three presets the `DateRange` popover draws, in the board's order. They are the OFFER, not
 # the rule: `_offered_days` filters them against the connector's own retention before any of them
 # reaches a row. See that function for why the filter is not decoration.
@@ -643,71 +633,6 @@ async def list_project_connectors(
             )
             for key, connector in CONNECTORS.items()
         ]
-    )
-
-
-@router.get(
-    "/{connector_key}/projects",
-    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "No such connector")),
-)
-async def list_connector_projects(
-    connector_key: str, user: CurrentUser, db: DbSession
-) -> ConnectorProjectListResponse:
-    """Every project you own, with this connector's switch and days in each one.
-
-    Newest project first. A project you have never switched this connector on in is present with
-    `enabled: false` and a `null` window — the list is your projects, not your switches, because
-    switching one on is the whole point of opening it.
-
-    Capped at 200 projects. `truncated` is `true` when you own more than that, and the ones past
-    the cap are reachable by narrowing the list rather than by paging.
-
-    Having NO projects is a 200 and an empty list, never a 404 — an administrator can approve
-    somebody before they have made anything, and the grant runs forward from there."""
-    connector = _known_connector(connector_key)
-    # ONE access read for the whole list. Access belongs to the PERSON, so the answer is the same
-    # for every row — reading it per project would be N identical queries and N chances for two
-    # rows in one response to disagree about whether their owner is approved.
-    access = await current_access(db, user_id=user.id, connector_key=connector_key)
-
-    rows = (
-        await db.execute(
-            sa.select(Project.id, Project.name, ProjectConnector)
-            # The connector predicate belongs in the JOIN, not the WHERE: in the WHERE it would
-            # turn this outer join back into an inner one and drop every project the citizen has
-            # not switched this connector on in — which is most of them, and exactly the rows
-            # the panel exists to offer a switch for.
-            .outerjoin(
-                ProjectConnector,
-                sa.and_(
-                    ProjectConnector.project_id == Project.id,
-                    ProjectConnector.connector_key == connector_key,
-                ),
-            )
-            .where(Project.user_id == user.id)
-            # `id` is a UUIDv7, so this is newest-first — the same order and the same expression
-            # the projects listing itself uses, so the panel does not reorder somebody's projects
-            # depending on which screen they opened them from.
-            .order_by(Project.id.desc())
-            # One past the cap: the extra row is never projected, it only answers "is there
-            # more?" without a second COUNT query.
-            .limit(LISTING_CAP + 1)
-            .execution_options(populate_existing=True)
-        )
-    ).all()
-    truncated = len(rows) > LISTING_CAP
-
-    return ConnectorProjectListResponse(
-        projects=[
-            ConnectorProjectEntry(
-                project_id=project_id,
-                name=name,
-                enabled=stored is not None and stored.enabled,
-                window=_resolved(connector, stored, access.request_status)[1],
-            )
-            for project_id, name, stored in rows[:LISTING_CAP]
-        ],
-        truncated=truncated,
     )
 
 

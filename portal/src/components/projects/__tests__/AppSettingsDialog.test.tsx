@@ -6,8 +6,10 @@
  * has; and a failed save must keep what they typed, because the moment a save fails is the moment
  * their text is least replaceable.
  *
- * A TAB THAT IS NOT BUILT YET IS ABSENT, NOT EMPTY, and that is asserted rather than assumed: a
- * tab rendering a blank panel is a control lying about having a destination.
+ * EVERY TAB THE DIALOG OFFERS HAS A DESTINATION, and each is asserted rather than assumed: a tab
+ * rendering a blank panel is a control lying about having one. Two of them read the server, and
+ * neither may read it until it is chosen — a dialog that fired both on open would spend two
+ * requests per application a citizen glances at the name of.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/react'
@@ -17,6 +19,7 @@ const h = vi.hoisted(() => ({
   patchProject: vi.fn(),
   getDeployment: vi.fn(),
   listShares: vi.fn(),
+  listProjectConnectors: vi.fn(),
   searchColleagues: vi.fn(),
   shareProject: vi.fn(),
   revokeShare: vi.fn(),
@@ -29,6 +32,10 @@ vi.mock('../../../utils/projectApi', async (importOriginal) => ({
 vi.mock('../../../utils/deployApi', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   getDeployment: h.getDeployment,
+}))
+vi.mock('../../../utils/connectorApi', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  listProjectConnectors: h.listProjectConnectors,
 }))
 vi.mock('../../../utils/sharingApi', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -80,6 +87,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   h.listShares.mockResolvedValue([])
   h.getDeployment.mockResolvedValue(null)
+  h.listProjectConnectors.mockResolvedValue([])
   h.searchColleagues.mockResolvedValue([])
   h.patchProject.mockImplementation((_id: string, patch: { name?: string }) =>
     Promise.resolve({ ...PROJECT, ...patch }),
@@ -180,15 +188,36 @@ describe('Sharing is the same body the workspace opens', () => {
   })
 })
 
-describe('a tab that is not built yet is absent, not empty', () => {
-  it('offers only the tabs that have somewhere to go', async () => {
+describe('every tab the dialog offers has somewhere to go', () => {
+  it('draws the four, in the order the board sets them', async () => {
     open()
     await screen.findByTestId('settings-tab-general')
-    // Liveness beside the absence: the three that exist really rendered, so this is a tab being
-    // withheld rather than the rail failing to draw.
     expect(screen.getByTestId('settings-tab-sharing')).toBeTruthy()
+    expect(screen.getByTestId('settings-tab-integrations')).toBeTruthy()
     expect(screen.getByTestId('settings-tab-production')).toBeTruthy()
-    expect(screen.queryByTestId('settings-tab-integrations')).toBeNull()
+    expect(
+      screen.getAllByRole('tab').map((tab) => tab.textContent),
+    ).toEqual(['General', 'Sharing', 'Integrations', 'Production'])
+  })
+})
+
+describe('Integrations is the data this one application may read', () => {
+  it('★ asks the server nothing about connectors until the tab is chosen', async () => {
+    open()
+    await screen.findByTestId('settings-tab-general')
+    // Liveness beside the absence: the dialog really opened and really drew its General tab, so
+    // the unmade read is the panel being mounted BY the tab rather than hidden behind it.
+    expect(screen.getByTestId('description-editor')).toBeTruthy()
+    expect(h.listProjectConnectors).not.toHaveBeenCalled()
+  })
+
+  it('mounts the panel, which reads this application, when the tab is chosen', async () => {
+    open()
+    fireEvent.mouseDown(screen.getByTestId('settings-tab-integrations'))
+    fireEvent.click(screen.getByTestId('settings-tab-integrations'))
+    expect(await screen.findByTestId('integrations-tab')).toBeTruthy()
+    await waitFor(() => expect(h.listProjectConnectors).toHaveBeenCalledWith('p1'))
+    await settle()
   })
 })
 

@@ -135,11 +135,10 @@ function writePinned(pinned: boolean): void {
 interface Props {
   /** False on the list routes, where the panel is docked and none of this applies. */
   hideable: boolean
-  onOpenIntegrations: () => void
   children: ReactNode
 }
 
-export default function NavReveal({ hideable, onOpenIntegrations, children }: Props) {
+export default function NavReveal({ hideable, children }: Props) {
   const [state, setState] = useState<RevealState>('hidden')
   const [pinned, setPinned] = useState(readPinned)
   const [chatHidden, setChatHidden] = useState(false)
@@ -289,7 +288,6 @@ export default function NavReveal({ hideable, onOpenIntegrations, children }: Pr
       onTogglePin={togglePin}
       onNavigate={closeNav}
       onItemFocus={openNav}
-      onOpenIntegrations={onOpenIntegrations}
     />
   )
 

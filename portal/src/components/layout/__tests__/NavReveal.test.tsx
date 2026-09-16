@@ -66,7 +66,7 @@ function Underneath({ chatHidden = false }: { chatHidden?: boolean }) {
 function renderReveal(props: { chatHidden?: boolean } = {}) {
   return render(
     <MemoryRouter initialEntries={['/chat/c1']}>
-      <NavReveal hideable onOpenIntegrations={() => undefined}>
+      <NavReveal hideable>
         <Underneath {...props} />
       </NavReveal>
     </MemoryRouter>,
@@ -263,7 +263,7 @@ describe('pin is a preference about a screen, not a property of an application',
     window.localStorage.setItem('bial:nav-pinned', '1')
     render(
       <MemoryRouter initialEntries={['/projects/another-one']}>
-        <NavReveal hideable onOpenIntegrations={() => undefined}>
+        <NavReveal hideable>
           <Underneath />
         </NavReveal>
       </MemoryRouter>,

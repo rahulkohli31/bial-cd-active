@@ -14,9 +14,9 @@ import { highlightTransition } from '../../lib/motion'
  * LEAVES THE WORKSPACE THROUGH ITS GUARD.
  *
  * The header this replaces wired `useWorkspaceExit()` onto the logo AND onto each of its links,
- * separately. Wiring it once here and missing four would change behaviour by omission — the
+ * separately. Wiring it once here and missing one would change behaviour by omission — the
  * unsaved-work dialog, the save offer and the failed-save refusal would simply stop happening on
- * four of five routes, silently, on a plan whose scope explicitly excludes touching that path.
+ * that route, silently, on a plan whose scope explicitly excludes touching that path.
  * `AppShell.test.tsx` asserts it per destination for that reason.
  *
  * THE LIST LINK CARRIES THE LIST BACK. `projectsListHref()` is read at CLICK time, not memoised
@@ -35,16 +35,11 @@ export interface NavDestination {
   Icon: typeof LayoutGrid
 }
 
-/** The Integrations entry's stand-in address while it is still a dialog. Never routed to — it
- *  is the map key that tells this list which entry opens the dialog instead of navigating, and
- *  it becomes a real path when the page lands. */
-const INTEGRATIONS_TO = '/integrations'
-
 export const NAV_DESTINATIONS: readonly NavDestination[] = [
   { label: 'My Applications', to: '/projects', Icon: LayoutGrid },
   { label: 'Shared Applications', to: '/shared-applications', Icon: Users },
   { label: 'App Marketplace', to: '/marketplace', Icon: Store },
-  { label: 'Integrations', to: INTEGRATIONS_TO, Icon: Database },
+  { label: 'Integrations', to: '/integrations', Icon: Database },
 ]
 
 export const ADMIN_DESTINATION: NavDestination = { label: 'Admin', to: '/admin', Icon: ShieldCheck }
@@ -55,13 +50,9 @@ interface Props {
   /** Opens the panel when focus lands on an item — a panel that vanishes under the keyboard is
    *  a trap. Held open by the panel itself for as long as focus is inside it. */
   onItemFocus?: () => void
-  /** INTERIM, REMOVED BY THE INTEGRATIONS PAGE. Integrations has no route yet, so this entry
-   *  opens the dialog the profile menu used to open. An entry that led nowhere would be a defect
-   *  rather than a placeholder, which is why it is wired rather than left dark. */
-  onOpenIntegrations: () => void
 }
 
-export default function NavItems({ onNavigate, onItemFocus, onOpenIntegrations }: Props) {
+export default function NavItems({ onNavigate, onItemFocus }: Props) {
   const navigate = useNavigate()
   const exit = useWorkspaceExit()
   const { pathname } = useLocation()
@@ -95,13 +86,6 @@ export default function NavItems({ onNavigate, onItemFocus, onOpenIntegrations }
   const destinations = isAdmin ? [...NAV_DESTINATIONS, ADMIN_DESTINATION] : NAV_DESTINATIONS
 
   const go = (to: string) => {
-    // The dialog is an OVERLAY, not a destination: it tears no sandbox down and does not leave
-    // the workspace, so it deliberately does not run the exit guard the other four do.
-    if (to === INTEGRATIONS_TO) {
-      onOpenIntegrations()
-      onNavigate?.()
-      return
-    }
     const href = to === '/projects' ? projectsListHref() : to
     exit(() => {
       navigate(href)
@@ -112,8 +96,7 @@ export default function NavItems({ onNavigate, onItemFocus, onOpenIntegrations }
   return (
     <nav aria-label="Primary" className="flex flex-col gap-0.5 px-2.5 py-1">
       {destinations.map(({ label, to, Icon }) => {
-        const active =
-          to !== INTEGRATIONS_TO && (pathname === to || pathname.startsWith(`${to}/`))
+        const active = pathname === to || pathname.startsWith(`${to}/`)
         return (
           <button
             key={to}

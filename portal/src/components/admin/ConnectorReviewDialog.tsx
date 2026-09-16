@@ -59,8 +59,8 @@ import {
   MAX_DELETE_REASON_WORDS,
   MIN_DELETE_REASON_WORDS,
 } from '../../utils/words'
-import { dayMonth } from '../connectors/ConnectorRow'
-import { clockTime } from './columns'
+import { dayMonth } from '../connectors/connectorPresentation'
+import { clockTime } from '../connectors/connectorPresentation'
 
 /**
  * The box's own furniture — the two headings and the consent panel's title, true of any

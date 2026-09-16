@@ -3,11 +3,11 @@
 WHY THIS EXISTS. Connectors are generic by name and specific only by value: the tables are
 `connector_access_requests` and `project_connectors`, the enums are `connector_request_status` and
 `connector_window_kind`, the routes are `/v1/connectors` and `/v1/admin/connector-requests`, and
-the portal ships `IntegrationsDialog` / `ConnectorRow` / `connectorApi.ts`. DICE appears only as a
-value of `connector_key`; the entry below renders as Flight Fact Data. The checkable form of that
-rule is a word-boundary, case-insensitive search for `dice` across `backend/src/` and
-`portal/src/`: it must hit this file and nothing else. (Use a word boundary — a bare substring
-search also matches `indices` in `portal/src/components/chat/ActivityGroup.tsx`.)
+the portal ships `IntegrationsPage` / `ProjectConnectorRow` / `connectorApi.ts`. DICE appears
+only as a value of `connector_key`; the entry below renders as Flight Fact Data. The checkable
+form of that rule is a word-boundary, case-insensitive search for `dice` across `backend/src/`
+and `portal/src/`: it must hit this file and nothing else. (Use a word boundary — a bare
+substring search also matches `indices` in `portal/src/components/chat/ActivityGroup.tsx`.)
 
 A MODULE CONSTANT, NOT A TABLE. There is exactly one connector. A `connectors`
 table would store display strings the boards own, would need seeding in every environment and every
