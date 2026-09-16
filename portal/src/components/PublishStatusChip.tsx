@@ -109,7 +109,7 @@ export default function PublishStatusChip({
   // `unpublishedAt`, no failure code, no approval lineage, no pin. Other response fields
   // are still read, but only to fill a version row the state already asked for, never to
   // decide which state it is.
-  const presentation = state === null ? null : presentationFor(state)
+  const presentation = state === null ? null : presentationFor(state, deployment?.failureCode ?? null)
   // The pill's own colour pair, from the same one field. `lookFor` is exhaustive over the
   // union, so a state the server adds is a compile error rather than an unpainted chip.
   const look = state === null ? null : lookFor(state)

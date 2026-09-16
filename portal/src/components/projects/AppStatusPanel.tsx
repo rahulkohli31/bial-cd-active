@@ -1,27 +1,29 @@
 /**
- * THE APP STATUS PANEL — the rail section the boards draw, always visible: a coloured state
- * pill, three provenance rows, one sentence, one action — nothing behind a popover.
+ * WHERE AN APPLICATION STANDS AND WHAT MAY BE DONE ABOUT IT: a coloured state pill, its
+ * provenance rows, one sentence, one action — nothing behind a popover.
  *
- * WHY THIS EXISTS: the panel and the chip (`PublishStatusChip.tsx`) must never disagree. Both
+ * THIS IS THE BODY OF SETTINGS › PRODUCTION, and it is the ONE owner of Send for review. A
+ * second submit control somewhere else would be a second place to decide whether there is
+ * anything to submit, and the action here is conditional by construction: `presentationFor`
+ * gives a state no action where there is nothing to send.
+ *
+ * WHY IT IS NOT THE CHIP: the panel and `PublishStatusChip.tsx` must never disagree, and both
  * read the one server `publishState` through `utils/publishPresentation.ts` — same words,
  * colour, action, rows — but hold SEPARATE reads, deliberately: they differ in shape and
  * lifetime, so sharing a component was the wrong seam. A same-tab `bial:deployment-changed`
  * nudge reconciles the two reads (one extra poll only while a publish is in flight) — but it
  * reconciles the READ, not the server's per-mount unsaved-work QUESTION, which no read carries.
- * `hiddenSubtree.ts` keeps this panel mounted-but-invisible when the rail closes, which once let
- * a stale question sit behind a closed rail while the freshly-mounted chip offered "Send for
- * review" as though nothing were pending — so the question is retired when the rail closes,
- * trading a re-typed declaration for two surfaces that can no longer contradict each other.
+ * Mounting this behind a tab is what keeps that question fresh: the panel is built when the tab
+ * is chosen and torn down when it is left, so a stale declaration cannot sit behind it.
  *
  * The saved row's date/id come from the SAME status read as every other row (the store's
  * metadata HEAD, no container in the path) — it must render even when the workspace is
  * stopped, which is exactly where `save-state` (container-attached) has nothing to say.
  */
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Check, Copy, ExternalLink } from 'lucide-react'
 import DataClassificationModal from '../DataClassificationModal'
 import { usePublishState } from '../../hooks/usePublishState'
-import { useRailSlot } from './workspaceChannel'
 import { shortSha } from '../../utils/shortSha'
 import { ClipboardRefused, copyToClipboard } from '../../utils/clipboard'
 import {
@@ -36,15 +38,11 @@ import type { ProvenanceRow } from '../../utils/publishPresentation'
 
 export interface AppStatusPanelProps {
   projectId: string
-  /**
-   * The section's own small-caps label, drawn by this component so the pill can share its row.
-   *
-   * A NODE, NOT A STRING — it comes from the rail, which owns the shared label treatment; a
-   * second definition here previously drifted a half-point out of sync. This component owns only
-   * the ROW: label and pill share one 25px band with the pill carried right, replacing a
-   * `float-right` that could not rise onto the heading's line and left a stray empty band.
-   */
-  label: ReactNode
+}
+
+/** The panel's own small-caps label. It was the rail's to draw; there is no rail. */
+function StatusLabel() {
+  return <h3 className="text-[10.5px] font-bold tracking-[.7px] text-neutral">STATUS</h3>
 }
 
 /**
@@ -163,10 +161,10 @@ function NoteRow({ row }: { row: ProvenanceRow }) {
 }
 
 /** The section's head: the label, and whatever the state wants carried to its right. */
-function SectionHead({ label, children }: { label: ReactNode; children?: ReactNode }) {
+function SectionHead({ children }: { children?: React.ReactNode }) {
   return (
     <div className="mb-2.5 flex min-h-[25px] items-center gap-2.5">
-      {label}
+      <StatusLabel />
       {children}
     </div>
   )
@@ -206,7 +204,7 @@ function Row({ row }: { row: ProvenanceRow }) {
   )
 }
 
-export default function AppStatusPanel({ projectId, label }: AppStatusPanelProps) {
+export default function AppStatusPanel({ projectId }: AppStatusPanelProps) {
   const {
     deployment,
     approval,
@@ -219,20 +217,14 @@ export default function AppStatusPanel({ projectId, label }: AppStatusPanelProps
     withdraw,
     withdrawing,
     withdrawError,
-    dismissUnsaved,
   } = usePublishState(projectId)
   const [showModal, setShowModal] = useState(false)
-  const { collapsed } = useRailSlot()
-
-  // NOTHING MAY BE LEFT PENDING BEHIND A HIDDEN RAIL — see the note at the top of this module.
-  // `NO_RAIL` is `collapsed: false`, so a panel mounted outside a workspace never retires
-  // anything.
-  useEffect(() => {
-    if (collapsed && unsaved !== null) dismissUnsaved()
-  }, [collapsed, unsaved, dismissUnsaved])
 
   const state = deployment?.publishState ?? null
-  const presentation = useMemo(() => (state === null ? null : presentationFor(state)), [state])
+  const presentation = useMemo(
+    () => (state === null ? null : presentationFor(state, deployment?.failureCode ?? null)),
+    [state, deployment?.failureCode],
+  )
   const look = useMemo(() => (state === null ? null : lookFor(state)), [state])
   const rows = useMemo(
     () => (state === null ? [] : provenanceRows(state, deployment, approval)),
@@ -245,7 +237,7 @@ export default function AppStatusPanel({ projectId, label }: AppStatusPanelProps
   if (loadError !== null) {
     return (
       <div data-testid="app-status-panel" data-publish-state="unavailable">
-        <SectionHead label={label} />
+        <SectionHead />
         <p className="text-[11.5px] leading-relaxed text-neutral">{loadError}</p>
         <button
           type="button"
@@ -263,7 +255,7 @@ export default function AppStatusPanel({ projectId, label }: AppStatusPanelProps
   if (presentation === null || look === null || state === null) {
     return (
       <div data-testid="app-status-panel" data-publish-state="pending">
-        <SectionHead label={label} />
+        <SectionHead />
         <p className="text-[11.5px] text-neutral">Checking…</p>
       </div>
     )
@@ -271,7 +263,7 @@ export default function AppStatusPanel({ projectId, label }: AppStatusPanelProps
 
   return (
     <div data-testid="app-status-panel" data-publish-state={state}>
-      <SectionHead label={label}>
+      <SectionHead>
         <span
           data-testid="status-pill"
           className={`ms-auto inline-flex items-center gap-[7px] rounded-full px-[10px] py-1 text-[11px] font-bold whitespace-nowrap ${look.pill}`}

@@ -352,22 +352,25 @@ export const NO_SAVE_READING: SaveReading = { dirty: null, recoveryAt: null }
 /**
  * THE ROW'S HANDLERS, held apart from every compared value on purpose.
  *
- * Both are things a citizen PRESSES, so neither is needed at render time — which is what lets them
- * live in a cell nothing subscribes to. `rename` is here because the toolbar row is where a
- * workspace's name is shown, so it is where renaming it belongs.
+ * Every one is something a citizen PRESSES, so none is needed at render time — which is what lets
+ * them live in a cell nothing subscribes to. The two doors are here because the toolbar row is
+ * where an application's name is shown, so it is where the things that are ABOUT the application
+ * rather than about the app running beside it belong.
  */
 export interface WorkspaceActions {
   save: (() => void) | null
   /** Put the app back to its saved version. Settles once the attempt is over, success or not, so
    *  the confirmation it was pressed from can stay busy until then. */
   discard: (() => Promise<void>) | null
-  rename: (() => void) | null
-  /** Open the share panel (#198) — `null` wherever nothing on screen can share (a chat, or
+  /** Open this application's settings — the same dialog the home list opens, which is where the
+   *  name, the description, the status and the data access all live now. */
+  settings: (() => void) | null
+  /** Open the share panel — `null` wherever nothing on screen can share (a chat, or
    *  a shared viewer's own restricted screen, which never registers this channel at all). */
   share: (() => void) | null
 }
 
-export const NO_ACTIONS: WorkspaceActions = { save: null, discard: null, rename: null, share: null }
+export const NO_ACTIONS: WorkspaceActions = { save: null, discard: null, settings: null, share: null }
 
 /**
  * The address, plus the ONE thing that can invalidate it after its publisher is gone.

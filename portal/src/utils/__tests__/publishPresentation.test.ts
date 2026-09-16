@@ -306,7 +306,7 @@ describe('neither surface holds a second copy of the decision', () => {
   const LABELS = EVERY_STATE.map((state) => presentationFor(state).label)
 
   it('the chip and the panel spell no state label of their own', () => {
-    for (const file of ['components/PublishStatusChip.tsx', 'components/workspace/AppStatusPanel.tsx']) {
+    for (const file of ['components/PublishStatusChip.tsx', 'components/projects/AppStatusPanel.tsx']) {
       const source = stripComments(read(file))
       for (const label of LABELS) {
         expect(source.includes(`'${label}'`), `${file} spells "${label}"`).toBe(false)
@@ -319,5 +319,57 @@ describe('neither surface holds a second copy of the decision', () => {
     // Without this, a scan whose needle never appears passes for ever and protects nothing.
     const bad = stripComments(`const label = 'Nothing built yet'`)
     expect(LABELS.some((label) => bad.includes(`'${label}'`))).toBe(true)
+  })
+})
+
+/**
+ * ★ A FAILED RESTART IS NOT A FAILED FIRST DEPLOY, and the correction lives HERE rather than on a
+ * surface — which is the whole point. The chip and the panel both read this module, so a rename
+ * applied at one of them would have produced two descriptions of one failure.
+ *
+ * The server reports `did_not_start` for both events. They are not the same thing to the person
+ * reading them: a first deploy has never had a working version, a restart had one a minute ago.
+ */
+describe('the failure code corrects exactly one state', () => {
+  it.each(['restart_failed', 'restart_not_ready'])('renames did_not_start under %s', (code) => {
+    // Mutation receipt: drop the `failureCode` arm and this goes red on the label — the state
+    // word is "Didn't start", which is true of a first deploy and false here.
+    const { label, action } = presentationFor('did_not_start', code)
+    expect(label).toBe('Could not restart')
+    // AND IT OFFERS NOTHING TO PRESS. A restart runs the SAME version, so a restart that keeps
+    // failing is an application whose own code is the fault; "Try again" would be a control that
+    // is guaranteed to do nothing.
+    expect(action).toBeNull()
+  })
+
+  it('points at the remedy that can actually work', () => {
+    expect(presentationFor('did_not_start', 'restart_failed').sentence).toMatch(/send it for review/i)
+  })
+
+  it('★ leaves an ordinary failed first deploy saying exactly what it always said', () => {
+    // The paired negative: the rename must not swallow the state it is distinguishing itself from.
+    const plain = presentationFor('did_not_start')
+    expect(plain.label).toBe("Didn't start")
+    expect(plain.action).toBe('try_again')
+    expect(presentationFor('did_not_start', 'build_failed')).toEqual(plain)
+  })
+
+  it('★ never shouts over a state that outranks the deployment row', () => {
+    // An administrator's lockout and a pending submission are the more current fact server-side,
+    // and `failureCode` outlives the attempt that wrote it. A correction keyed on the code alone
+    // would answer "Could not restart" to an owner whose application is with a reviewer.
+    for (const state of ['in_review', 'switched_off', 'live_current', 'taken_offline'] as const) {
+      expect(presentationFor(state, 'restart_failed')).toEqual(presentationFor(state))
+    }
+  })
+
+  it('every other state is untouched by every code', () => {
+    // The blunt version of the rule above, over the whole table rather than four samples.
+    for (const state of EVERY_STATE) {
+      if (state === 'did_not_start') continue
+      for (const code of ['restart_failed', 'restart_not_ready', 'build_failed', null]) {
+        expect(presentationFor(state, code), state).toEqual(presentationFor(state))
+      }
+    }
   })
 })

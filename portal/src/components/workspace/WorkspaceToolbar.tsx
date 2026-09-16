@@ -26,15 +26,24 @@ import {
   ChevronLeft,
   ChevronRight,
   ExternalLink,
+  MoreHorizontal,
   PanelLeftClose,
   PanelLeftOpen,
-  Pencil,
   RotateCcw,
   Save,
+  Settings,
   Undo2,
   UserPlus,
 } from 'lucide-react'
 import PublishStatusChip from '../PublishStatusChip'
+import TokenRing from '../layout/TokenRing'
+import { useUsageToday } from '../../hooks/useUsageToday'
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+} from '../ui/dropdown-menu'
 import { NavMenuButton } from '../layout/NavReveal'
 import { BusyGlyph, useElapsedSeconds, ELAPSED_AFTER_MS } from '../ui/Waiting'
 import { usePublishState } from '../../hooks/usePublishState'
@@ -97,6 +106,16 @@ export default function WorkspaceToolbar({
   // a framed app, and drawing them over an empty pane offers controls that cannot do anything.
   const hasApp = paneVisible && address.url !== null
 
+  // WHETHER A REAL APPLICATION IS BEHIND THIS ADDRESS, which is what the `⋯` menu needs and the
+  // `projectId` route param cannot answer: the param is non-null even for a mangled paste that
+  // never resolved to anything. The NAME is the only field on this heading that comes from the
+  // project's own fetch, so it is what means "a project loaded" — the same test the rename
+  // control used to make before it folded into the menu. A chat is not an application screen,
+  // and its surface publishes neither action.
+  const projectActions = !isChat && heading.projectName !== null ? heading.projectName : null
+
+  const usage = useUsageToday()
+
   return (
     <div
       data-testid="workspace-toolbar"
@@ -121,6 +140,38 @@ export default function WorkspaceToolbar({
           not about. The edge gesture and `⌘\` reach the same panel faster for people who learn
           them; this is the one that does not have to be learned. */}
       <NavMenuButton className="flex-shrink-0 narrow:min-h-[44px] narrow:min-w-[44px]" />
+
+      {/* THE DIVIDER IS WHAT TELLS THE TWO APART. A control that summons the navigation and a
+          control that hides the chat pane sat at the same end doing visibly similar things, and
+          read as one. A hairline between them, two different glyph families, and tooltips that
+          name different KINDS of thing — one a place in the platform, the other this pane — are
+          the three ways they stop being mistaken for each other. The divider goes when the
+          collapse does, since a separator with one side is just a line. */}
+      {paneVisible && (
+        <>
+          <span className="h-5 w-px flex-shrink-0 bg-bial-border" aria-hidden="true" />
+          {/* THE COLLAPSE, ON THE ROW RATHER THAN ON THE PANE OR IN THE RAIL. A collapsed rail is
+              invisible and untabbable, so a toggle inside the rail it hides is a one-way door.
+              The row is right for the same reason it holds the title: it survives the collapse
+              AND it survives the pane going away. It is gated on a PANE existing, not on an app
+              existing — which is why it cannot be grouped with the device switcher and the
+              new-tab link at the other end, and why the left is the simpler home for it. */}
+          <button
+            type="button"
+            data-testid="toolbar-collapse"
+            onClick={onToggleCollapsed}
+            aria-expanded={!collapsed}
+            aria-controls={WORKSPACE_RAIL_ID}
+            aria-label={collapsed ? 'Show the chat' : 'Hide the chat'}
+            title={collapsed ? 'Show the chat' : 'Hide the chat'}
+            /* 28×30, and the one control that undoes a collapse — a target too small to hit is a
+               one-way door for exactly the citizen who least wants one. */
+            className="inline-flex h-7 w-[30px] flex-shrink-0 items-center justify-center rounded-lg text-neutral transition hover:bg-bial-bg hover:text-primary narrow:min-h-[44px] narrow:min-w-[44px]"
+          >
+            {collapsed ? <PanelLeftOpen size={15} /> : <PanelLeftClose size={15} />}
+          </button>
+        </>
+      )}
 
       <button
         type="button"
@@ -177,7 +228,7 @@ export default function WorkspaceToolbar({
                WHY IT IS GATED AT `narrow:` AND NOT UNCONDITIONAL. `min-width` in flex does not
                only stop shrinking — it also GROWS an item whose content is narrower than the
                floor. Ungated, a short name would be padded out to 144px at every width and shove
-               the chip and the rename pencil away from the name they belong to. The floor lives
+               the chip away from the name it belongs to. The floor lives
                where the squeeze does. */
             className="min-w-0 truncate text-[15px] font-extrabold tracking-[-0.25px] text-primary-900 narrow:min-w-[9rem]"
           >
@@ -212,59 +263,6 @@ export default function WorkspaceToolbar({
         <span className="ms-2.5 flex-shrink-0">
           <PublishStatusChip projectId={heading.projectId} />
         </span>
-      )}
-
-      {/* RENAME SURVIVES THE REBUILD, moved here from the rail's header once that header was
-          replaced by the board's three sections, none of which is a project name. No board draws
-          a rename control anywhere, but a shipped capability is not deleted because an older
-          board omits it, so it lives next to the name it edits, at the smallest weight the row
-          has.
-
-          WHAT GATES IT IS THE NAME, NOT THE ID. `projectId` is the route param — non-null even for
-          an address that never resolved to a project at all, including a mangled paste that 422s
-          at the boundary — so gating on it drew a pencil over a page with no project behind it,
-          whose press was a measured no-op (rename is nullable and optional at the call site). The
-          NAME is the only field on this heading that is an answer from the project's own fetch, so
-          it is the one that means "a project loaded", on both routes that publish a heading.
-          Explicitly against `null` rather than truthy: a name is a string, and `'' && …` renders a
-          stray text node instead of nothing.
-
-          IT MUST NOT SPREAD TO THE BACK CONTROL ABOVE. That control's whole job is to survive the
-          branch where nothing loaded — it is the way out of a dead address — and gating it on the
-          same fact would strand the citizen on the page. For the same reason the breadcrumb keeps
-          its "Your project" fallback: a missing name silences the pencil, and nothing else in the
-          row. */}
-      {!isChat && heading.projectName !== null && (
-        <button
-          type="button"
-          onClick={() => readActions().rename?.()}
-          aria-label="Rename project"
-          title="Rename project"
-          /* 21×21 — a 13px pencil in 4px of padding — and the second-smallest thing in the row.
-             `inline-flex` centres the glyph once the box grows past it below the threshold; on a
-             plain `<button>` the 44px box would have left the pencil hard against its top-left.
-             Above the threshold this is byte-identical geometry: 13 + 4 + 4, laid out the same. */
-          className="inline-flex flex-shrink-0 items-center justify-center rounded-lg p-1 text-neutral transition hover:bg-surface-muted hover:text-primary narrow:min-h-[44px] narrow:min-w-[44px]"
-        >
-          <Pencil size={13} />
-        </button>
-      )}
-
-      {/* SHARE (#198), the project screen's own control — gated identically to Rename above
-          and for the same reason: it is a fact about THIS project, not about a chat, and the
-          NAME (not the id) is what proves a real project loaded. Placed in the left-hand
-          cluster beside Rename rather than the right-hand action group, since both are
-          "about this project" controls and neither depends on an app existing to serve. */}
-      {!isChat && heading.projectName !== null && (
-        <button
-          type="button"
-          onClick={() => readActions().share?.()}
-          aria-label="Share project"
-          title="Share project"
-          className="inline-flex flex-shrink-0 items-center justify-center rounded-lg p-1 text-neutral transition hover:bg-surface-muted hover:text-primary narrow:min-h-[44px] narrow:min-w-[44px]"
-        >
-          <UserPlus size={13} />
-        </button>
       )}
 
       <div className="ms-auto flex flex-shrink-0 items-center gap-4">
@@ -337,25 +335,56 @@ export default function WorkspaceToolbar({
         <DiscardControl save={save} readActions={readActions} projectId={heading.projectId} />
         <SaveControl save={save} readActions={readActions} />
 
-        {/* THE COLLAPSE, ON THE ROW RATHER THAN ON THE PANE OR IN THE RAIL. A collapsed rail is
-            invisible and untabbable, so a toggle inside the rail it hides is a one-way door. The
-            row is right for the same reason it holds the title: it survives the collapse AND it
-            survives the pane going away, so the control has one home in every state instead of
-            appearing and disappearing with the pane. */}
-        {paneVisible && (
-          <button
-            type="button"
-            onClick={onToggleCollapsed}
-            aria-expanded={!collapsed}
-            aria-controls={WORKSPACE_RAIL_ID}
-            aria-label={collapsed ? 'Show details' : 'Hide details'}
-            title={collapsed ? 'Show details' : 'Hide details'}
-            /* 28×30, and the one control that undoes a collapse — a target too small to hit is a
-               one-way door for exactly the citizen who least wants one. */
-            className="inline-flex h-7 w-[30px] items-center justify-center rounded-lg text-neutral transition hover:bg-bial-bg hover:text-primary narrow:min-h-[44px] narrow:min-w-[44px]"
-          >
-            {collapsed ? <PanelLeftOpen size={15} /> : <PanelLeftClose size={15} />}
-          </button>
+        {/* THE TOKEN COUNTER FOLLOWS THE CITIZEN INTO THE WORKSPACE, which is the one screen
+            where tokens are actually spent. It lives in the navigation panel, and the panel is
+            hidden here — so without this the reading the client requires to stay visible is
+            exactly absent where it matters most. Same hook, same figures, a smaller ring. */}
+        {usage && (
+          <span className="flex-shrink-0">
+            <TokenRing usage={usage} compact />
+          </span>
+        )}
+
+        {/* SETTINGS AND SHARE, AND NOTHING ELSE. Two controls that are about the APPLICATION
+            rather than about the app running in the pane, which is why they fold together and
+            why neither is gated on `hasApp`. Delete is deliberately not here: it is inside
+            Settings, two steps from any list and any workspace. Send for review is not here
+            either — Settings › Production is its one owner, and a second submit control would
+            be a second place to disagree about whether there is anything to submit. */}
+        {projectActions !== null && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                data-testid="workspace-menu"
+                aria-label={`More actions for ${projectName}`}
+                className="inline-flex h-7 w-[30px] flex-shrink-0 items-center justify-center rounded-lg text-neutral transition hover:bg-bial-bg hover:text-primary data-[state=open]:bg-bial-bg data-[state=open]:text-primary narrow:min-h-[44px] narrow:min-w-[44px]"
+              >
+                <MoreHorizontal size={16} />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              align="end"
+              className="min-w-[180px] rounded-md border-bial-border bg-white p-1 shadow-lg"
+            >
+              <DropdownMenuItem
+                data-testid="workspace-menu-settings"
+                onSelect={() => readActions().settings?.()}
+                className="gap-2 rounded-sm px-2 py-1.5 text-sm text-primary-900 focus:bg-surface-muted"
+              >
+                <Settings size={15} />
+                Settings…
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                data-testid="workspace-menu-share"
+                onSelect={() => readActions().share?.()}
+                className="gap-2 rounded-sm px-2 py-1.5 text-sm text-primary-900 focus:bg-surface-muted"
+              >
+                <UserPlus size={15} />
+                Share…
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         )}
       </div>
     </div>

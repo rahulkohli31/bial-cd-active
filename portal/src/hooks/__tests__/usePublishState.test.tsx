@@ -291,6 +291,29 @@ describe('a failed read is reported, never swallowed', () => {
     expect(result.current.deployment).toBeNull()
   })
 
+  it('★ keeps what it already had when a LATER read fails, rather than blanking the surface', async () => {
+    /* THE RULE NOBODY WROTE DOWN, and the first read is deliberately exempt from it. A surface
+       renders the error branch instead of the status — pill, every provenance row and the action
+       replaced by one line — so a 500 on the read that FOLLOWS a save would blank the whole panel
+       on a screen that has just said "Saved". A stale row is worse than a fresh one and far
+       better than no panel at all.
+
+       MUTATION RECEIPT: delete `if (everRead.current) return` from the hook's catch — restoring
+       the blanking branch — and this goes red on `deployment`, which becomes null. */
+    getDeployment.mockResolvedValue(view('draft'))
+    const { result } = renderHook(() => usePublishState('p1'))
+    await waitFor(() => expect(result.current.deployment?.publishState).toBe('draft'))
+
+    getDeployment.mockRejectedValue(new ApiError('Could not read it.', 500))
+    await act(async () => {
+      await result.current.refresh()
+    })
+
+    expect(result.current.deployment?.publishState).toBe('draft')
+    // …and it does not put a failure sentence over a panel that is still showing real rows.
+    expect(result.current.loadError).toBeNull()
+  })
+
   it('clears the error once a later read succeeds', async () => {
     getDeployment.mockRejectedValueOnce(new ApiError('Could not read it.', 500))
     const { result } = renderHook(() => usePublishState('p1'))

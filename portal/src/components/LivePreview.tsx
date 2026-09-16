@@ -20,7 +20,7 @@ import { isRecord } from '../utils/apiError'
 // bounded-height card that scrolls internally, never a fixed-aspect-ratio clip.
 // THE WIDTH TABLE IS `WorkspaceToolbar`'S — the switcher that picks a width lives in the shell's
 // toolbar row. This component still reads the widths, so it imports the one table rather than
-// keeping a second copy that could disagree about what "Tablet" means.
+// keeping a second copy the two ends could disagree about.
 import { DEVICES, type DeviceName } from './workspace/devices'
 
 // THE REVEAL RESTS ON THE FRAMED DOCUMENT VOUCHING FOR ITSELF, AND ON NOTHING ELSE.

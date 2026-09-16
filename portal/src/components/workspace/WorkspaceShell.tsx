@@ -11,6 +11,7 @@
  * no fetch and holds no conversation, and every surface below declares its own scroller.
  */
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
+import { ChevronRight } from 'lucide-react'
 import { memo, useCallback, useEffect, useLayoutEffect, useState, type CSSProperties } from 'react'
 import { useNavReveal } from '../layout/NavReveal'
 import ReclaimWorkspaceDialog from '../projects/ReclaimWorkspaceDialog'
@@ -313,6 +314,30 @@ function ShellFrame() {
         >
           <RailOutlet />
         </div>
+        {/* THE 26px STUB THE CHAT LEAVES BEHIND, and the second way back from a collapse.
+            Until now the toolbar control was the only route, which makes one control the single
+            point of failure for a state that hides the whole left column. The stub is the same
+            rule the toolbar control follows — a toggle may never live inside the thing it hides
+            — applied once more: it sits OUTSIDE the collapsed column, as its own sibling, so it
+            is visible and tabbable precisely when the column is neither. */}
+        {paneVisible && collapsed && (
+          <div
+            data-testid="chat-stub"
+            className="flex w-[26px] flex-shrink-0 items-start justify-center border-r border-bial-border bg-white pt-2"
+          >
+            <button
+              type="button"
+              onClick={() => setCollapsed(false)}
+              aria-expanded={false}
+              aria-controls={WORKSPACE_RAIL_ID}
+              aria-label="Show the chat"
+              title="Show the chat"
+              className="inline-flex h-6 w-6 items-center justify-center rounded text-neutral transition hover:bg-bial-bg hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+            >
+              <ChevronRight size={14} />
+            </button>
+          </div>
+        )}
         {/* THE HANDLE, BETWEEN THE TWO COLUMNS. Rendered only when there are two: a collapsed rail
             has no boundary to move, and a surface that declares no pane — every plan chat — is the
             whole window, so a divider in it would divide nothing. Its own class hides it below the

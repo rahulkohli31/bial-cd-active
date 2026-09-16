@@ -67,13 +67,46 @@ export interface Presentation {
 }
 
 /**
+ * THE FAILURE CODES A RESTART WRITES. `did_not_start` is the state for both a first deploy that
+ * never came up and a restart that did not come back, and those are not the same event to the
+ * person reading them: the first has never had a working version, the second had one a minute
+ * ago. The code is the only thing that tells them apart.
+ */
+const RESTART_FAILED_CODES: ReadonlySet<string> = new Set(['restart_failed', 'restart_not_ready'])
+
+/**
  * THE map: one publish state in, one presentation out, ending in `assertNever` so an unlabelled
  * state is a COMPILE error. TWO STATES DELIBERATELY SHARE THE LABEL "Approved" (the difference
  * is on the button/sentence); every other pair differs in words, so the CLOSED chip stays a
  * complete answer — "Live", "Live · newer work saved" and "Live · couldn't check" are three
  * different things, and the last never reads as "nothing of yours is waiting".
+ *
+ * `failureCode` CORRECTS EXACTLY ONE STATE and is optional for that reason: every caller that
+ * has the deployment in hand should pass it, and a caller that does not still gets the shipped
+ * answer for all thirteen. It is read HERE rather than at a surface so the chip and the panel
+ * cannot come to describe one failed restart in two ways.
  */
-export function presentationFor(state: PublishState): Presentation {
+export function presentationFor(state: PublishState, failureCode: string | null = null): Presentation {
+  // A FAILED RESTART IS NOT A FAILED FIRST DEPLOY, and only this one state is renamed. An
+  // administrator's lockout and a pending submission outrank the deployment row server-side, so
+  // a code that outlived its attempt must not shout over "Switched off" or "In review" —
+  // `did_not_start` is the single state a failed restart is spoken as wrongly.
+  if (state === 'did_not_start' && failureCode !== null && RESTART_FAILED_CODES.has(failureCode)) {
+    return {
+      label: 'Could not restart',
+      // No "try again": a restart runs the SAME version, so a restart that keeps failing is an
+      // application whose own code is the fault. Pressing it again is waiting for nothing.
+      sentence:
+        'Your app did not come back up. A restart runs the same version again, so if it keeps ' +
+        'failing the fault is in the app itself — describe the fix in a chat and send it for review.',
+      action: null,
+      version: 'last_published',
+    }
+  }
+  return presentationForState(state)
+}
+
+function presentationForState(state: PublishState): Presentation {
   switch (state) {
     case 'nothing_built':
       // Canvas, verbatim.

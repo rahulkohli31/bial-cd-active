@@ -1,16 +1,17 @@
 /**
  * The Production tab, and the two things it lets an owner do.
  *
+ * WHAT IT DOES NOT OWN: the status pill, the provenance rows, the published address and Send for
+ * review. Those are `AppStatusPanel`'s, mounted here, with a suite of their own — and the naming
+ * of a failed restart moved further still, into `publishPresentation.ts`, so the chip and the
+ * panel cannot describe one failure in two ways. What is left in this file is the two controls
+ * and the rules about when they may be pressed.
+ *
  * THE COPY IS THE FEATURE HERE, more than in most panels. To a citizen who did not write the
  * code, "restart" is the appliance remedy for "my app is broken" — and it is not one: it recycles
  * the revision already serving, so a fault in the application's own logic survives it exactly.
  * Getting that wrong leaves an owner pressing a button that cannot help them, with nothing on
  * screen telling them so, which is why the sentences are asserted rather than the buttons alone.
- *
- * A FAILED RESTART IS NOT "DIDN'T START". The deployment read reports `did_not_start` for it —
- * the right word for a first deploy and the wrong one on an application whose previous version is
- * still serving — so the panel reads `failureCode` instead. A test that accepted the state word
- * would pin the confusion.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
@@ -19,6 +20,15 @@ const h = vi.hoisted(() => ({
   getDeployment: vi.fn(),
   restartApp: vi.fn(),
   takeAppDown: vi.fn(),
+  usePublishState: vi.fn(),
+}))
+
+// The status panel mounted inside the tab has its own suite and its own read. Stubbed to a bare
+// shell so this file's assertions stay about the two controls the tab itself owns.
+vi.mock('../AppStatusPanel', () => ({
+  default: ({ projectId }: { projectId: string }) => (
+    <div data-testid="status-panel-stub" data-project={projectId} />
+  ),
 }))
 
 vi.mock('../../../utils/deployApi', async (importOriginal) => ({
@@ -72,12 +82,13 @@ beforeEach(() => {
 afterEach(() => cleanup())
 
 describe('a live application', () => {
-  it('states where it stands, its address, and offers both actions', async () => {
+  it('mounts the status panel for this application, and offers both actions', async () => {
     mount()
-    expect((await screen.findByTestId('production-state')).textContent).toBe('Live')
-    expect(screen.getByTestId('production-url').getAttribute('href')).toBe('https://app.example/')
-    expect(screen.getByTestId('production-restart')).toBeTruthy()
+    expect(await screen.findByTestId('production-restart')).toBeTruthy()
     expect(screen.getByTestId('production-takedown')).toBeTruthy()
+    // ★ THE STATUS IS SAID ONCE. This tab does not restate the pill, the rows or the address —
+    // it mounts the one component that owns them, on the same application.
+    expect(screen.getByTestId('status-panel-stub').getAttribute('data-project')).toBe('p1')
   })
 
   it('★ says restart runs the SAME version, so nobody presses it expecting a repair', async () => {
@@ -160,81 +171,20 @@ describe('refusals are the server\'s own words', () => {
   })
 })
 
-describe('a failed restart is not a failed first deploy', () => {
-  it.each(['restart_failed', 'restart_not_ready'])(
-    '★ reads %s as "could not restart" rather than "Didn\'t start"',
-    async (code) => {
-      // Mutation receipt: read `publishState` instead of `failureCode` and this goes red — the
-      // state word is `did_not_start`, which is true of a first deploy and false here.
-      h.getDeployment.mockResolvedValue(view('did_not_start', { failureCode: code, status: 'failed' }))
-      mount()
-      expect((await screen.findByTestId('production-state')).textContent).toBe('Could not restart')
-    },
-  )
-
-  it('points at the remedy that actually works', async () => {
-    h.getDeployment.mockResolvedValue(
-      view('did_not_start', { failureCode: 'restart_failed', status: 'failed' }),
-    )
-    mount()
-    await screen.findByTestId('production-state')
-    // A restart runs the same version, so if it keeps failing the fault is in the application.
-    // Telling them to press it again would be telling them to wait for nothing.
-    expect(screen.getByTestId('production-tab').textContent).toMatch(/send it for review/i)
-  })
-
-  it.each([
-    ['in_review', 'In review'],
-    ['switched_off', 'Switched off'],
-  ] as const)(
-    '★ does not shout over %s, which is the more current fact',
-    async (state, label) => {
-      // `failureCode` outlives the attempt that wrote it, and the server ranks a pending
-      // submission and an administrator's lockout ABOVE the deployment row. A panel that read the
-      // code alone would answer "Could not restart" to an owner whose app is now with a reviewer.
-      h.getDeployment.mockResolvedValue(
-        view(state, { failureCode: 'restart_failed', status: 'failed' }),
-      )
-      mount()
-      expect((await screen.findByTestId('production-state')).textContent).toBe(label)
-    },
-  )
-
-  it('leaves an ordinary failed first deploy saying what it always said', async () => {
-    // The paired negative: the rename above must not swallow the state it is distinguishing from.
-    h.getDeployment.mockResolvedValue(view('did_not_start', { failureCode: 'build_failed', status: 'failed' }))
-    mount()
-    expect((await screen.findByTestId('production-state')).textContent).toBe("Didn't start")
-  })
-})
-
 describe('no control is offered where the endpoint would refuse it', () => {
-  it.each(['draft', 'in_review', 'taken_offline', 'nothing_built'] as const)(
+  it.each(['draft', 'in_review', 'taken_offline', 'nothing_built', 'did_not_start'] as const)(
     'offers neither action on a %s application',
     async (state) => {
       h.getDeployment.mockResolvedValue(view(state))
       mount()
-      // Absence PAIRED WITH LIVENESS: the panel really rendered and really said where the
-      // application stands, so this is the controls being withheld rather than a blank tab.
-      await screen.findByTestId('production-state')
+      // Absence PAIRED WITH LIVENESS: the tab really rendered and really mounted the panel that
+      // says where the application stands, so this is the controls being withheld rather than a
+      // blank tab.
+      expect(await screen.findByTestId('status-panel-stub')).toBeTruthy()
       expect(screen.queryByTestId('production-restart')).toBeNull()
       expect(screen.queryByTestId('production-takedown')).toBeNull()
     },
   )
-
-  it('says plainly where a never-deployed application stands', async () => {
-    h.getDeployment.mockResolvedValue(view('nothing_built'))
-    mount()
-    expect((await screen.findByTestId('production-state')).textContent).toBe('Nothing built yet')
-  })
-
-  it('links no address for an application that is not serving one', async () => {
-    h.getDeployment.mockResolvedValue(view('taken_offline', { url: 'https://gone.example/' }))
-    mount()
-    await screen.findByTestId('production-state')
-    // A dead address a citizen can click is indistinguishable to them from an app that broke.
-    expect(screen.queryByTestId('production-url')).toBeNull()
-  })
 })
 
 describe('the read itself can fail', () => {

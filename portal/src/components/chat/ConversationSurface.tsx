@@ -871,7 +871,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     (generatingChatId === buildId || builds.some((b) => b.id === generatingChatId))
   usePublishSave(
     { dirty: saveDirty, saving, error: saveError, discarding, replying: turnRunningHere, hasSavedVersion },
-    { save: handleSave, discard: handleDiscard, rename: null, share: null },
+    { save: handleSave, discard: handleDiscard, settings: null, share: null },
   )
 
   // A genuine unmount must cancel the in-flight turn-stream reader — a chat switch already

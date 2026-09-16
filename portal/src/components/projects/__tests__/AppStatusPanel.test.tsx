@@ -1,5 +1,6 @@
 /**
- * THE APP STATUS PANEL — every state, drawn open.
+ * THE STATUS PANEL — every state, drawn open. It is the body of Settings › Production now, and
+ * the ONE owner of Send for review.
  *
  * The boards make this the fuller of the two publishing surfaces: a coloured pill, three
  * provenance rows with dates and short build ids, one sentence, one action.
@@ -11,10 +12,9 @@
  * that a state with nothing to do gets no button rather than a dead one.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
 import type { ApprovalState, DeploymentView, PublishState } from '../../../utils/deployApi'
 import type { UsePublishState } from '../../../hooks/usePublishState'
-import { WorkspaceChannelProvider, createWorkspaceChannel } from '../workspaceChannel'
 
 const h = vi.hoisted(() => ({ usePublishState: vi.fn() }))
 vi.mock('../../../hooks/usePublishState', () => ({ usePublishState: h.usePublishState }))
@@ -78,9 +78,7 @@ const hook = (over: Partial<UsePublishState> = {}): UsePublishState =>
   }) as UsePublishState
 
 const wire = (over: Partial<UsePublishState>) => h.usePublishState.mockReturnValue(hook(over))
-// The rail hands the section's label down so the pill can share its row; here it is a plain node,
-// because what this suite is about is the panel's states, not the rail's type scale.
-const mount = () => render(<AppStatusPanel projectId="p1" label={<h2>APP STATUS</h2>} />)
+const mount = () => render(<AppStatusPanel projectId="p1" />)
 const panel = () => screen.getByTestId('app-status-panel')
 
 beforeEach(() => vi.clearAllMocks())
@@ -89,13 +87,14 @@ afterEach(cleanup)
 describe('the state pill', () => {
   it('★ shares the section label\'s row, carried to its right', () => {
     // The pill was a `float-right` in the block BELOW the heading — a float cannot rise onto a
-    // preceding block's line, so it dropped to a row of its own.
+    // preceding block's line, so it dropped to a row of its own. The label is the panel's own
+    // now: there is no rail left to hand one down.
     wire({ deployment: view('draft') })
     mount()
     const pill = screen.getByTestId('status-pill')
     const head = pill.parentElement as HTMLElement
 
-    expect(head.textContent).toContain('APP STATUS')
+    expect(head.textContent).toContain('STATUS')
     expect(head.className).toMatch(/(^|\s)flex(\s|$)/)
     expect(pill.className.split(/\s+/)).toContain('ms-auto')
     expect(pill.className.split(/\s+/)).not.toContain('float-right')
@@ -559,29 +558,23 @@ describe('the unsaved-work question', () => {
     await waitFor(() => expect(saveAndPublish).toHaveBeenCalledTimes(1))
   })
 
-  it('★ retires the question when the details are hidden, rather than leaving it pending unseen', () => {
-    // Hide details keeps this panel MOUNTED and merely invisible, and the question is per-mount
-    // state the chip's own hook instance knows nothing about — so the question and its live
-    // button sat behind a rail nobody could see while the chip beside the project name offered
-    // "Send for review" as though nothing were outstanding.
-    const dismissUnsaved = vi.fn()
-    const channel = createWorkspaceChannel()
-    wire({
-      deployment: view('draft'),
-      unsaved: 'Your workspace has changes that are not saved yet.',
-      dismissUnsaved,
-    })
-    render(
-      <WorkspaceChannelProvider value={channel}>
-        <AppStatusPanel projectId="p1" label={<h2>APP STATUS</h2>} />
-      </WorkspaceChannelProvider>,
-    )
-
-    // Open, the question stands and nothing is retired.
+  it('★ the question is per-mount, which is what keeps it from going stale', () => {
+    // It used to live behind a rail that stayed MOUNTED while hidden, so the question and its
+    // live button could sit unseen while the chip beside the project name offered "Send for
+    // review" as though nothing were outstanding — and the panel had to retire it by hand on the
+    // collapse. Radix unmounts an unchosen tab, so leaving Production and coming back asks the
+    // server again; there is no hidden-but-mounted state left for a stale question to live in.
+    const first = { ...hook({ deployment: view('draft'), unsaved: 'Not saved yet.' }) }
+    h.usePublishState.mockReturnValue(first)
+    const { unmount } = mount()
     expect(screen.getByTestId('status-unsaved')).toBeTruthy()
-    expect(dismissUnsaved).not.toHaveBeenCalled()
 
-    act(() => channel.rail.set({ mode: 'details', stacked: false, collapsed: true }))
-    expect(dismissUnsaved).toHaveBeenCalledTimes(1)
+    unmount()
+    // A FRESH MOUNT ASKS AGAIN, and this time the server says there is nothing outstanding.
+    wire({ deployment: view('draft'), unsaved: null })
+    mount()
+    // Liveness beside the absence: the panel really rendered and really named the state.
+    expect(screen.getByTestId('status-pill').textContent).toContain('Draft')
+    expect(screen.queryByTestId('status-unsaved')).toBeNull()
   })
 })

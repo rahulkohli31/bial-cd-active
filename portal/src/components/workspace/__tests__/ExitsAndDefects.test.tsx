@@ -155,7 +155,7 @@ describe('★ no exit discards unsaved work in silence', () => {
     // goes red while the sign-out-when-clean scenario below stays green.
     dirtyAndAlive()
     render(<Workspace />)
-    await waitFor(() => expect(screen.getByTestId('rail-save-state')).toBeTruthy())
+    await waitFor(() => expect(screen.getByTestId('save-project')).toBeTruthy())
 
     await signOutFromTheProfileMenu()
 
@@ -180,7 +180,7 @@ describe('★ no exit discards unsaved work in silence', () => {
   it('THE BACK CONTROL asks first too', async () => {
     dirtyAndAlive()
     render(<Workspace />)
-    await waitFor(() => expect(screen.getByTestId('rail-save-state')).toBeTruthy())
+    await waitFor(() => expect(screen.getByTestId('save-project')).toBeTruthy())
 
     fireEvent.click(screen.getByRole('button', { name: 'Back to projects' }))
 
@@ -191,7 +191,7 @@ describe('★ no exit discards unsaved work in silence', () => {
   it('cancelling the guard leaves the citizen signed in and where they were', async () => {
     dirtyAndAlive()
     render(<Workspace />)
-    await waitFor(() => expect(screen.getByTestId('rail-save-state')).toBeTruthy())
+    await waitFor(() => expect(screen.getByTestId('save-project')).toBeTruthy())
     fireEvent.click(screen.getByRole('button', { name: 'Back to projects' }))
     await waitFor(() => expect(guardDialog()).toBeTruthy())
 
@@ -201,7 +201,7 @@ describe('★ no exit discards unsaved work in silence', () => {
     expect(screen.getByTestId('where').textContent).toBe('/projects/pB')
     expect(api.logout).not.toHaveBeenCalled()
     // LIVENESS: the workspace is still rendering, not merely un-navigated.
-    expect(screen.getByTestId('description-editor')).toBeTruthy()
+    expect(screen.getByTestId('save-project')).toBeTruthy()
   })
 
   it("★ names WHICH project's work is at risk", async () => {
@@ -209,7 +209,7 @@ describe('★ no exit discards unsaved work in silence', () => {
     // one project — and both exits this dialog covers are taken while thinking about another one.
     dirtyAndAlive()
     render(<Workspace />)
-    await waitFor(() => expect(screen.getByTestId('rail-save-state')).toBeTruthy())
+    await waitFor(() => expect(screen.getByTestId('save-project')).toBeTruthy())
 
     fireEvent.click(screen.getByRole('button', { name: 'Back to projects' }))
 

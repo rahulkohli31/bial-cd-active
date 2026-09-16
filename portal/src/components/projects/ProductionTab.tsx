@@ -3,33 +3,31 @@ import { AlertTriangle, PowerOff, RotateCcw } from 'lucide-react'
 import { getDeployment, restartApp, takeAppDown } from '../../utils/deployApi'
 import type { DeploymentView } from '../../utils/deployApi'
 import { ApiError } from '../../utils/apiError'
-import { presentationFor } from '../../utils/publishPresentation'
 import { BusyGlyph } from '../ui/Waiting'
-import { listDate } from '../../utils/projectDates'
+import AppStatusPanel from './AppStatusPanel'
 
 /**
- * WHERE AN APPLICATION STANDS IN PRODUCTION, AND THE TWO THINGS AN OWNER CAN DO ABOUT IT.
+ * SETTINGS › PRODUCTION — where an application stands, and what an owner may do about it.
+ *
+ * WHERE IT STANDS IS `AppStatusPanel`'S TO SAY, and it is MOUNTED here rather than restated: the
+ * state pill, the provenance rows, the published address with its copy control and Send for
+ * review all come from that one component. This file adds only what the panel has no opinion
+ * about — restarting a live application and taking one out of production. Two renderings of one
+ * status is the failure this whole module is arranged to avoid.
  *
  * RESTART RUNS THE SAME VERSION AGAIN, AND THE COPY HAS TO SAY SO. To a citizen who did not write
  * the code, "restart" is the appliance remedy for "my app is broken" — and it is not one: it
  * recycles the revision already serving, so if the fault is in the application's own logic the
  * restart is a guaranteed no-op that still costs a wait. Saying it plainly is what stops an owner
- * pressing a button that cannot help them, and the failure states point at the remedy that does.
+ * pressing a button that cannot help them.
  *
- * TAKE DOWN'S CONFIRMATION SAYS WHAT IS KEPT, not what is lost, because the fear it answers is
- * "will I lose my work". It removes a container. The application, its chats, its data and its
- * files all stay, and Publish again puts it back at the same address.
+ * TAKE DOWN'S SENTENCE SAYS WHAT IS KEPT, not what is lost, because the fear it answers is "will
+ * I lose my work". It removes a container. The application, its chats, its data and its files all
+ * stay, and Publish again puts it back at the same address.
  *
- * A FAILED RESTART IS NOT "DIDN'T START". The deployment read reports `did_not_start` for it,
- * which is the right word for a first deploy and the wrong one here — the previous version is
- * still serving. `failureCode` is what tells them apart, so this panel reads that rather than the
- * state word, the same way the portal already special-cases a routed submission.
- *
- * ONE POLLER AT A TIME. This panel polls only while an operation of its own is in flight, and
- * stops the moment it settles: the list is not a polling surface and must not become one.
+ * ONE POLLER AT A TIME. This tab polls only while an operation of its own is in flight, and stops
+ * the moment it settles: the list is not a polling surface and must not become one.
  */
-
-const RESTART_FAILED_CODES = new Set(['restart_failed', 'restart_not_ready'])
 
 /** How often the deployment read is re-asked while an operation runs. The read is cheap and the
  *  operations take minutes; anything faster is spent on nothing. */
@@ -96,18 +94,6 @@ export default function ProductionTab({ projectId, initialDeployment = null, onS
   }, [pending, read, onSettled])
 
   const state = deployment?.publishState ?? 'nothing_built'
-  // A FAILED ATTEMPT, not a stale code. `failureCode` outlives the attempt that wrote it, so an
-  // application whose last restart failed and which is serving again would otherwise be announced
-  // as broken. The status is what says the attempt is the one still standing.
-  // IT CORRECTS ONE WORD AND ONLY THAT WORD. `failureCode` outlives the attempt that wrote it,
-  // and an administrator's lockout or a fresh submission outranks the deployment row server-side
-  // — so keying off the code alone would shout "Could not restart" over "Switched off" and "In
-  // review", both of which are the more current fact. `did_not_start` is the single state this
-  // renames, because it is the single state a failed restart is spoken as wrongly.
-  const restartFailed =
-    state === 'did_not_start' &&
-    deployment?.failureCode != null &&
-    RESTART_FAILED_CODES.has(deployment.failureCode)
   const live = state === 'live_current' || state === 'live_newer_work' || state === 'live_drift_unknown'
   const busy = pending !== null || deployment?.status === 'running'
 
@@ -155,41 +141,13 @@ export default function ProductionTab({ projectId, initialDeployment = null, onS
     )
   }
 
-  const presentation = presentationFor(state)
-
   return (
     <div data-testid="production-tab" className="flex flex-col gap-5">
-      <div>
-        <p className="text-xs font-semibold text-neutral">Status</p>
-        <p data-testid="production-state" className="mt-1 text-lg font-bold text-tertiary">
-          {restartFailed ? 'Could not restart' : presentation.label}
-        </p>
-        <p className="mt-1 text-xs leading-relaxed text-neutral">
-          {restartFailed
-            ? 'Your app did not come back up. A restart runs the same version again, so if it ' +
-              'keeps failing the fault is in the app itself — describe the fix in a chat and ' +
-              'send it for review.'
-            : presentation.sentence}
-        </p>
-      </div>
-
-      {deployment?.url !== null && deployment?.url !== undefined && live && (
-        <div>
-          <p className="text-xs font-semibold text-neutral">Address</p>
-          <a
-            data-testid="production-url"
-            href={deployment.url}
-            target="_blank"
-            rel="noreferrer"
-            className="mt-1 block truncate text-sm font-medium text-primary hover:underline"
-          >
-            {deployment.url}
-          </a>
-          {deployment.finishedAt !== null && (
-            <p className="mt-1 text-[11px] text-neutral">Published {listDate(deployment.finishedAt)}</p>
-          )}
-        </div>
-      )}
+      {/* THE PANEL HOLDS ITS OWN READ, deliberately, exactly as the publish chip does. The two
+          reads are reconciled by the same-tab nudge rather than by being shared, because they
+          differ in shape and lifetime — and this tab's read exists to drive the two controls
+          below, which the panel knows nothing about. */}
+      <AppStatusPanel projectId={projectId} />
 
       {refusal !== null && (
         <p role="alert" data-testid="production-refusal" className="flex items-start gap-2 rounded-xl border border-danger/30 bg-red-50/50 p-3 text-xs text-danger">

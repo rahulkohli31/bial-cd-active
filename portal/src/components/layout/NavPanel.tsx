@@ -1,10 +1,7 @@
-import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Pin, PinOff } from 'lucide-react'
 import { useWorkspaceExit } from '../workspace/UnsavedWorkGuard'
-import { isAuthenticated } from '../../utils/auth'
-import { fetchUsageToday, onUsageChanged } from '../../utils/usage'
-import type { UsageToday } from '../../utils/usage'
+import { useUsageToday } from '../../hooks/useUsageToday'
 import { projectsListHref } from '../../utils/projectsListMemory'
 import BIALLogo from '../BIALLogo'
 import NavItems from './NavItems'
@@ -23,8 +20,8 @@ import { NAV_WIDTH_PX } from '../../lib/motion'
  * it and leaving by the brand link used to discard unsaved work in silence. It lands on the
  * remembered list rather than page one.
  *
- * THE USAGE READ LIVES HERE because the ring does. It is gated on `isAuthenticated` so it never
- * fires during logout, and a null read hides the meter without collapsing the foot — the nav's
+ * THE USAGE READ IS SHARED WITH THE WORKSPACE TOOLBAR, which draws the same figures compactly
+ * while this panel is hidden. A null read hides the meter without collapsing the foot — the nav's
  * own structure must not depend on whether a fetch succeeded.
  */
 
@@ -34,7 +31,6 @@ interface Props {
   onTogglePin?: () => void
   onNavigate?: () => void
   onItemFocus?: () => void
-  onOpenIntegrations: () => void
 }
 
 export default function NavPanel({
@@ -42,29 +38,10 @@ export default function NavPanel({
   onTogglePin,
   onNavigate,
   onItemFocus,
-  onOpenIntegrations,
 }: Props) {
   const navigate = useNavigate()
   const exit = useWorkspaceExit()
-  const [usage, setUsage] = useState<UsageToday | null>(null)
-
-  useEffect(() => {
-    let active = true
-    const load = async () => {
-      if (!isAuthenticated()) {
-        if (active) setUsage(null)
-        return
-      }
-      const data = await fetchUsageToday()
-      if (active) setUsage(data)
-    }
-    void load()
-    const off = onUsageChanged(() => void load())
-    return () => {
-      active = false
-      off()
-    }
-  }, [])
+  const usage = useUsageToday()
 
   return (
     <div
@@ -103,7 +80,6 @@ export default function NavPanel({
       <NavItems
         onNavigate={onNavigate}
         onItemFocus={onItemFocus}
-        onOpenIntegrations={onOpenIntegrations}
       />
 
       <div className="mt-auto flex flex-col">
