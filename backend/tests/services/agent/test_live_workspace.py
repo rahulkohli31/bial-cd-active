@@ -388,3 +388,23 @@ async def test_search_can_be_scoped_to_the_attachments_root() -> None:
 
     argv = fake.command_calls[-1]
     assert "/workspace/attachments" in argv
+
+
+async def test_a_hit_inside_the_attachments_root_comes_back_in_the_model_s_vocabulary() -> None:
+    """★ A RESULT THE MODEL CANNOT FEED BACK IS A DEAD END, and only the hit loop can prove it.
+
+    `search_files` translates the subdir on the way IN, so grep runs against
+    `/workspace/attachments/…` and every line it prints carries that container-absolute prefix.
+    Returned untranslated, those paths name a location the model was never taught and every read
+    tool refuses — a leading `/` is rejected — so a search over an attachment produced hits
+    nothing could act on.
+
+    Mutation receipt: drop `to_model_path` from the hit loop and the path below comes back
+    container-absolute.
+    """
+    fake = FakeSandbox()
+    workspace = _live(fake, "/workspace/attachments/roster.csv:3:visitors,12\n")
+
+    hits = await workspace.search_files(re.compile("visitors"), ".attachments")
+
+    assert [(hit.path, hit.line_no) for hit in hits] == [(".attachments/roster.csv", 3)]
