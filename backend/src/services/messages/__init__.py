@@ -23,6 +23,9 @@ from src.services.messages.projection import (
     UserTextItem as UserTextItem,
 )
 from src.services.messages.projection import (
+    fill_in_attachment_chips as fill_in_attachment_chips,
+)
+from src.services.messages.projection import (
     project_conversation as project_conversation,
 )
 from src.services.messages.projection import (
