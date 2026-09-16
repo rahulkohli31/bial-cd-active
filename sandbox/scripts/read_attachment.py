@@ -1,28 +1,21 @@
 #!/usr/bin/env python3
 """Report what an attached file CONTAINS, without sending the file to the model.
 
-WHY THIS SHIPS INSTEAD OF BEING WRITTEN EACH TURN. The platform used to flatten a workbook to
-Markdown on the server, keep the first thousand rows, and say nothing about the rest — so a
-question about a 5,000-row file was answered from a fifth of it, confidently and wrongly. Letting
-an agent write a parser per turn reproduces that: our own from-scratch reader was wrong on its
-first run, and five parsers given one crafted file disagreed on its row count by five orders of
-magnitude. This is known-correct code the agent starts FROM.
+One return shape, always: a single JSON object and exit 0 — a manifest on success, a named
+failure on any other outcome. Never a stack trace, never a bare exception, and never an empty
+manifest, which reads exactly like an empty file. Every truncated list carries the true count
+beside it, because silence about what was omitted is the failure being replaced. It opens one
+path on local disk and reaches no network. Editing it is expected — a Build agent may change
+and re-run it — so the canonical copy lives outside the editable tree and can be restored.
 
-ONE RETURN SHAPE, ALWAYS. Every run prints a single JSON object and exits 0 — a manifest
-on success, a named failure on any other outcome. Never a stack trace, never a bare exception,
-and never an empty manifest, because an empty manifest reads exactly like an empty file and that
-is the class of wrong answer this whole design exists to remove.
+WHY THIS EXISTS
 
-IT STATES THE WHOLE WHENEVER IT SHOWS A PART. Every truncated list carries the true count
-beside it. Silence about what was omitted is the specific failure being replaced.
-
-NO NETWORK. It opens one path on local disk and nothing else. The platform puts the file there
-before the agent's first read; the reader never fetches, so its missing-file branch is a genuine
-error rather than an expected path.
-
-EDITING IT IS EXPECTED. The Build agent may read, change and re-run this file for something the
-base version does not report. The canonical copy is kept outside the editable tree so a working
-copy that has been broken can be restored.
+The platform used to flatten a workbook to Markdown on the server, keep the first thousand rows,
+and say nothing about the rest: a question about a 5,000-row file was answered from a fifth of
+it, confidently and wrongly. Letting an agent write a parser per turn reproduces that — our own
+from-scratch reader was wrong on its first run, and five parsers given one crafted file
+disagreed on its row count by five orders of magnitude. This is known-correct code the agent
+starts FROM rather than a capability it has to invent under time pressure.
 """
 
 from __future__ import annotations
@@ -371,7 +364,7 @@ def read_xlsx(path: Path) -> dict[str, Any]:
                 "isFormula": is_formula,
             }
             if is_formula:
-                # THE R24 CASE. A formula with no cached value is not an empty column; saying so
+                # A FORMULA WITH NO CACHED VALUE is not an empty column; saying so
                 # is the whole point of the second pass.
                 column["hasStoredResult"] = cached is not None
                 if not column["hasStoredResult"]:

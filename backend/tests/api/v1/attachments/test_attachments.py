@@ -304,7 +304,7 @@ async def test_a_workbook_is_admitted_and_a_renamed_archive_is_not(
 async def test_a_password_protected_workbook_is_refused_at_the_door(
     client, db_session, fake_storage
 ) -> None:
-    """★ R6/AE8c. A locked workbook gets the same treatment a locked PDF gets — refused before
+    """★ A locked workbook gets the same treatment a locked PDF gets — refused before
     anything is stored, with the password named — rather than being accepted, charged, and failing
     inside the sandbox several turns later where nothing can explain it."""
     headers, _, conv = await _auth(db_session)
@@ -704,7 +704,7 @@ async def test_a_full_conversation_does_not_exhaust_the_account(
 async def test_a_full_conversation_says_so_and_names_a_way_out(
     client, db_session, fake_storage
 ) -> None:
-    """AE21. The old copy was "Attachment storage is full. Remove some attachments and try
+    """The old copy was "Attachment storage is full. Remove some attachments and try
     again." — advice a citizen cannot follow, because nothing lets them remove one attachment
     from an old conversation. The refusal names the thing that is full and the thing that
     works."""
@@ -782,7 +782,7 @@ async def test_re_uploading_a_known_id_into_a_full_conversation_is_refused(
 async def test_the_conversation_attachment_count_is_enforced_on_the_server(
     client, db_session, fake_storage
 ) -> None:
-    """AE18 — a cap a reload cannot clear.
+    """A cap a reload cannot clear.
 
     The browser has had this number since the beginning and it was never enforced here: the
     portal tallies attachments by walking the messages it has loaded, so the count reset to zero
@@ -907,7 +907,7 @@ async def test_delete_removes_object_and_row(client, db_session, fake_storage) -
 async def test_a_blob_the_sweep_could_not_remove_is_recorded_against_its_id(
     client, db_session, fake_storage, monkeypatch
 ) -> None:
-    """★ U8 — THE ROW GOES FIRST, AND THE LEAK IS WRITTEN DOWN.
+    """★ THE ROW GOES FIRST, AND THE LEAK IS WRITTEN DOWN.
 
     Deleting the object before committing the row meant a commit failure left a row pointing at
     a blob that was already gone: the chip stays in the composer and the file opens to nothing.
@@ -1467,7 +1467,7 @@ async def test_a_scanned_image_only_pdf_is_accepted(client, db_session, fake_sto
 async def test_a_password_protected_pdf_is_refused_at_the_door(
     client, db_session, fake_storage
 ) -> None:
-    """★ AE8c — a locked document is the one PDF failure a citizen can act on, so it keeps its own
+    """★ A locked document is the one PDF failure a citizen can act on, so it keeps its own
     refusal rather than being stored, counted, and failing in front of the model.
 
     Rebuilt without the library that used to detect it: the door reads the trailer's `/Encrypt`
