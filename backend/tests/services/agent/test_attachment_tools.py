@@ -272,6 +272,45 @@ async def test_a_clean_read_leaves_no_failure_trace() -> None:
         assert _events(logs, event) == []
 
 
+async def test_a_reader_killed_by_a_signal_is_named_rather_than_left_to_a_retry() -> None:
+    """★ THE ONE FAILURE THE READER CANNOT NAME FOR ITSELF.
+
+    polars allocates through Rust, whose allocator ABORTS when it cannot satisfy a request rather
+    than raising anything Python can catch — so a file that exhausts the memory ceiling kills the
+    process with a signal and prints nothing at all. That breaks the reader's own contract of one
+    JSON object and exit 0, and left unnamed it reaches the tool as unparseable output, which asks
+    the model to try again against a failure that repeats exactly.
+
+    Mutation receipt: drop the killed-with-no-output arm and this comes back an empty string.
+    """
+    session = _session_double(_Reply(stdout="", stderr="", exit=-6))
+
+    out = await AttachmentReader(session=session).read(".attachments/roster.xlsx")
+
+    answer = json.loads(out)
+    assert answer["ok"] is False
+    assert answer["error"]["code"] == "too_large"
+    assert "smaller" in answer["error"]["next"]
+
+
+async def test_an_answer_too_large_to_return_is_named_instead_of_returned() -> None:
+    """★ ONE OVERSIZED REPLY COSTS THE TURN IT WAS MEANT TO SERVE, because the manifest goes to
+    the model verbatim. The reader bounds its own now, so this fires for a container whose image
+    predates that bound — which is precisely when a caller cannot rely on the bound existing.
+
+    Mutation receipt: return the reader's output unchanged and the whole of it reaches the model.
+    """
+    reader = _Recorder(result=json.dumps({"ok": True, "rows": 1, "filler": "x" * 300_000}))
+
+    with capture_logs() as logs:
+        out = await _tool(reader)(None, ".attachments/roster.xlsx")
+
+    answer = json.loads(out)
+    assert answer["ok"] is False
+    assert answer["error"]["code"] == "too_large"
+    assert len(_events(logs, "attachment_read_reply_too_large")) == 1
+
+
 async def test_a_nonzero_exit_is_logged_once_with_its_code_and_capped_stderr() -> None:
     """★ THE STALE-IMAGE CLASS. A container whose image predates the reader answers exit 2 with
     `python3: can't open file …` on stderr, and the tool turns that into "the reader did not
