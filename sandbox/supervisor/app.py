@@ -299,10 +299,15 @@ def _resolve(path: str) -> Path:
     so no relative path can change meaning because `/workspace/attachments` came into existence —
     an app that happens to contain its own `attachments/` directory still resolves there.
 
-    STILL FAIL-CLOSED, and this is the part worth being careful about: the guard is not relaxed,
-    it is applied twice. A path must resolve INSIDE one of the two roots or it is refused, and
-    `..` is resolved before the check, so neither root can be used as a doorway to the other or to
-    anything outside both.
+    STILL FAIL-CLOSED: a path must resolve INSIDE one of the two roots or it is refused, and
+    `..` is resolved before that check, so nothing outside both roots can be reached. That is
+    the whole of what this function guarantees.
+
+    IT IS NOT A WALL BETWEEN THE TWO ROOTS, and claiming one would be false: in the container
+    they are siblings, so `../attachments/roster.csv` from the app root resolves and is allowed.
+    Deliberately — both roots are the same workspace, and the read surface names the attachments
+    root directly anyway. What the separation buys is that a SNAPSHOT of the app tree carries no
+    attachment: a fact about what is archived, not about what this guard will open.
     """
     p = (WORKSPACE / path).resolve() if not Path(path).is_absolute() else Path(path).resolve()
     for root in (WORKSPACE.resolve(), ATTACHMENTS.resolve()):
@@ -1284,6 +1289,12 @@ def exec_cmd(body: ExecBody) -> dict[str, Any]:
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            # A child's output is bytes, and nothing here can promise they are UTF-8: `cat` on a
+            # spreadsheet, a tool printing a latin-1 path, a binary asset read by mistake. Under
+            # the default `errors="strict"` that decode raises INSIDE this handler, so the request
+            # 500s and the caller — a model — is told its workspace is broken rather than that the
+            # file is not text.
+            errors="replace",
             timeout=body.timeout,
             **_DEMOTE,  # type: ignore[arg-type]
         )
@@ -1298,11 +1309,28 @@ def exec_cmd(body: ExecBody) -> dict[str, Any]:
     }
 
 
+def _read_as_text(p: Path, *, editing: bool) -> str:
+    """A file's text for the /files actions, or a typed refusal when it is not text.
+
+    ★ NOT TEXT IS AN ANSWER, NOT AN OUTAGE. A strict decode raises inside the handler and the
+    request 500s, so a model that views a PNG, a spreadsheet or any compiled asset is told its
+    workspace is broken rather than that the file is not readable as text. Viewing replaces the
+    undecodable bytes — the caller asked to look, and gets to see that it is binary. Editing
+    refuses: writing replacement characters back would destroy the bytes it could not read.
+    """
+    if editing:
+        try:
+            return p.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(422, f"{p.name} is not a text file and cannot be edited") from exc
+    return p.read_text(encoding="utf-8", errors="replace")
+
+
 @app.post("/files", dependencies=[Depends(_auth)])
 def files(body: FilesBody) -> dict[str, Any]:
     p = _resolve(body.path)
     if body.action == "view":
-        text = p.read_text(encoding="utf-8")
+        text = _read_as_text(p, editing=False)
         lines = text.splitlines()
         start, end = 1, len(lines)
         if body.view_range:
@@ -1320,7 +1348,7 @@ def files(body: FilesBody) -> dict[str, Any]:
         if body.old_str is None or body.new_str is None:
             raise HTTPException(400, "str_replace needs old_str and new_str")
         # Normalize to LF on both sides (CRLF has burned BIAL twice).
-        text = p.read_text(encoding="utf-8").replace("\r\n", "\n")
+        text = _read_as_text(p, editing=True).replace("\r\n", "\n")
         old = body.old_str.replace("\r\n", "\n")
         new = body.new_str.replace("\r\n", "\n")
         count = text.count(old)
@@ -1369,7 +1397,7 @@ def files(body: FilesBody) -> dict[str, Any]:
     if body.action == "insert":
         if body.insert_line is None or body.insert_text is None:
             raise HTTPException(400, "insert needs insert_line and insert_text")
-        lines = p.read_text(encoding="utf-8").replace("\r\n", "\n").split("\n")
+        lines = _read_as_text(p, editing=True).replace("\r\n", "\n").split("\n")
         lines.insert(body.insert_line, body.insert_text)
         p.write_text("\n".join(lines), encoding="utf-8")
         return {"ok": True}

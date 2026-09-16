@@ -139,9 +139,36 @@ async def test_the_command_is_the_shipped_reader_over_the_container_path() -> No
     )
     await AttachmentReader(session=session).read(".attachments/roster.xlsx")
 
-    assert calls == [["python3", READER_PATH, "/workspace/attachments/roster.xlsx"]]
+    assert calls == [["python3", "-I", READER_PATH, "/workspace/attachments/roster.xlsx"]]
     # The model-facing token must NOT survive into the command.
-    assert ".attachments/" not in calls[0][2]
+    assert ".attachments/" not in calls[0][3]
+
+
+async def test_the_reader_runs_in_an_interpreter_nothing_in_the_container_can_reach() -> None:
+    """★ THE ONE CODE EXECUTION PLAN IS GRANTED MUST NOT BE REWRITABLE FROM THE APP.
+
+    A bare `python3` runs `site`, which imports `usercustomize` and executes every `.pth` file
+    under the account's own home — and that home belongs to the user the app's build runs as. A
+    Build turn, an `npm` lifecycle script or the generated app could therefore change what the
+    reader does, after the turn note has told the model this is the trusted shipped copy. `-I`
+    also ignores `PYTHONPATH` and the working directory, so the app tree cannot shadow a stdlib
+    module the reader imports.
+
+    Mutation receipt: drop `-I` and this goes red while every other reader test stays green.
+    """
+    calls: list[list[str]] = []
+
+    class _Client:
+        async def exec(self, _handle: Any, argv: list[str], *, timeout_s: int) -> Any:
+            calls.append(argv)
+            return type("R", (), {"stdout": '{"ok": true}', "stderr": "", "exit": 0})()
+
+    session = cast(
+        SandboxSession, type("S", (), {"sandbox_client": _Client(), "handle": object()})()
+    )
+    await AttachmentReader(session=session).read(".attachments/roster.xlsx")
+
+    assert calls[0][:2] == ["python3", "-I"]
 
 
 async def test_a_transport_failure_is_a_retry_not_a_fabricated_answer() -> None:
