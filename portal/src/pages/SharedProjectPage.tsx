@@ -215,10 +215,13 @@ export default function SharedProjectPage(): React.JSX.Element {
       <div className="flex items-center gap-3 px-6 py-3 border-b border-bial-border bg-white">
         <button
           type="button"
-          onClick={() => navigate('/projects')}
+          // BACK TO THE LIST THIS CAME FROM. A recipient reaches this page from Shared
+          // Applications and owns nothing on it; sending them to their own list is not "back",
+          // it is being put somewhere else.
+          onClick={() => navigate('/shared-applications')}
           className="flex items-center gap-1 text-sm text-neutral hover:text-primary transition flex-shrink-0"
         >
-          <ArrowLeft size={15} /> Back to My Applications
+          <ArrowLeft size={15} /> Back to Shared Applications
         </button>
         <h1 className="text-sm font-bold text-tertiary truncate min-w-0">
           {project?.name || 'Shared application'}

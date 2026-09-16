@@ -163,6 +163,31 @@ describe('the navigation the boards draw', () => {
     expect(current[0].textContent).toContain('App Marketplace')
   })
 
+  it.each([
+    ['/shared/p1', 'Shared Applications'],
+    ['/chat/c1', 'My Applications'],
+  ])(
+    '★ still says where you are at %s, whose address shares no prefix with its list',
+    async (path, label) => {
+      // OPENING A ROW CAN LAND YOU SOMEWHERE THE PREFIX TEST CANNOT SEE. A shared application
+      // lives at `/shared/{id}` while its list is `/shared-applications`; a chat lives at
+      // `/chat/{id}` while its application's list is `/projects`. On both, nothing at all was
+      // marked current — so the one thing the navigation is for, saying where you are, was
+      // missing on exactly the screens a person reached by using it.
+      h.getStoredUser.mockReturnValue(ADMIN)
+      renderAt(path)
+      // Inside an application the panel is summoned rather than docked; on the shared viewer it is
+      // already there. Either way the question is what it says once it is on screen.
+      if (screen.queryByTestId('nav-menu-button') !== null) await summonNav()
+      await screen.findByTestId('nav-panel')
+      const current = screen
+        .getAllByRole('button')
+        .filter((b) => b.getAttribute('aria-current') === 'page')
+      expect(current).toHaveLength(1)
+      expect(current[0].textContent).toContain(label)
+    },
+  )
+
   it('hides the Admin entry entirely from a citizen, and asks for no count on their behalf', async () => {
     renderAt('/projects')
     await screen.findByTestId('nav-panel')

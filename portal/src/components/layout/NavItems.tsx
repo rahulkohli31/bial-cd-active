@@ -33,11 +33,19 @@ export interface NavDestination {
   label: string
   to: string
   Icon: typeof LayoutGrid
+  /**
+   * ADDRESSES THAT BELONG HERE WITHOUT SITTING UNDER THIS PATH. Opening one row of a list can
+   * land a reader somewhere whose address shares no prefix with the list's — a shared
+   * application is at `/shared/{id}` while its list is `/shared-applications` — and a plain
+   * prefix test then marks nothing at all, so the one thing the navigation is for, saying where
+   * you are, is exactly absent on the screens a person reached by using it.
+   */
+  owns?: readonly string[]
 }
 
 export const NAV_DESTINATIONS: readonly NavDestination[] = [
-  { label: 'My Applications', to: '/projects', Icon: LayoutGrid },
-  { label: 'Shared Applications', to: '/shared-applications', Icon: Users },
+  { label: 'My Applications', to: '/projects', Icon: LayoutGrid, owns: ['/chat/'] },
+  { label: 'Shared Applications', to: '/shared-applications', Icon: Users, owns: ['/shared/'] },
   { label: 'App Marketplace', to: '/marketplace', Icon: Store },
   { label: 'Integrations', to: '/integrations', Icon: Database },
 ]
@@ -95,8 +103,11 @@ export default function NavItems({ onNavigate, onItemFocus }: Props) {
 
   return (
     <nav aria-label="Primary" className="flex flex-col gap-0.5 px-2.5 py-1">
-      {destinations.map(({ label, to, Icon }) => {
-        const active = pathname === to || pathname.startsWith(`${to}/`)
+      {destinations.map(({ label, to, Icon, owns }) => {
+        const active =
+          pathname === to ||
+          pathname.startsWith(`${to}/`) ||
+          (owns?.some((prefix) => pathname.startsWith(prefix)) ?? false)
         return (
           <button
             key={to}

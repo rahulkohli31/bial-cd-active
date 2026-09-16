@@ -1,4 +1,6 @@
+import { useId } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { LayoutGroup } from 'motion/react'
 import { Pin, PinOff } from 'lucide-react'
 import { useWorkspaceExit } from '../workspace/UnsavedWorkGuard'
 import { useUsageToday } from '../../hooks/useUsageToday'
@@ -42,6 +44,7 @@ export default function NavPanel({
   const navigate = useNavigate()
   const exit = useWorkspaceExit()
   const usage = useUsageToday()
+  const scope = useId()
 
   return (
     <div
@@ -75,10 +78,16 @@ export default function NavPanel({
         )}
       </div>
 
-      <NavItems
-        onNavigate={onNavigate}
-        onItemFocus={onItemFocus}
-      />
+      {/* ONE NAMESPACE PER PANEL. The active-destination pill travels between ROWS by sharing a
+          `layoutId`, and pinning mounts a second panel while the first one is still leaving — two
+          elements claiming one id, which pairs them ACROSS the two panels and leaves the exit
+          unfinished, so the floating copy never goes away. */}
+      <LayoutGroup id={scope}>
+        <NavItems
+          onNavigate={onNavigate}
+          onItemFocus={onItemFocus}
+        />
+      </LayoutGroup>
 
       <div className="mt-auto flex flex-col">
         {usage && <TokenRing usage={usage} />}
