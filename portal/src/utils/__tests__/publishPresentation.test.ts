@@ -14,6 +14,7 @@
 import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
+import { stripComments } from '../../__tests__/_stripComments'
 import {
   ACTION_LABEL,
   canBeRestarted,
@@ -301,8 +302,6 @@ describe('neither surface holds a second copy of the decision', () => {
    * author, and the two would drift the first time only one of them was edited.
    */
   const read = (rel: string) => readFileSync(path.resolve(__dirname, '..', '..', rel), 'utf8')
-  const stripComments = (text: string) =>
-    text.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
 
   const LABELS = EVERY_STATE.map((state) => presentationFor(state).label)
 

@@ -180,6 +180,27 @@ _TAKEDOWN_REVIEW_UNTOUCHED = " The version waiting for an administrator's review
 _TEARDOWN_UNCONFIRMED = "The takedown could not be confirmed. Retrying is safe and will settle it."
 
 
+async def _owned_app_row(
+    db: AsyncSession, *, project_id: uuid.UUID, user_id: uuid.UUID
+) -> AppRegistry | None:
+    """The caller's OWN registry row for this project, or `None`.
+
+    THE `user_id` PREDICATE LIVES HERE AND NOWHERE ELSE in this file. Four routes make this
+    read and each refuses a missing row differently — a 404, a `nothing_built` state, two
+    unlike 409s — so the answer is returned rather than raised; what must not be spelled four
+    times is the scoping, where a dropped predicate is a cross-user leak rather than a style
+    nit. The whole row, not `deploy_target`'s two-column projection: the ladder reads status,
+    the approval pin, the lineage and the rejection note."""
+    return (
+        await db.execute(
+            sa.select(AppRegistry).where(
+                AppRegistry.project_id == project_id,
+                AppRegistry.user_id == user_id,
+            )
+        )
+    ).scalar_one_or_none()
+
+
 @router.post(
     "/{project_id}/deploy",
     response_model=DeployStartedResponse | DeployRoutedResponse,
@@ -284,16 +305,7 @@ async def deploy_project(
     # long after the response left. The invariant above covers that case unchanged.
     await owned_project_or_404(db, user.id, project_id)
 
-    # The full registry row, not `deploy_target`'s two-column projection: the ladder
-    # reads status, the approval pin, the lineage and the rejection note.
-    app_row = (
-        await db.execute(
-            sa.select(AppRegistry).where(
-                AppRegistry.project_id == project_id,
-                AppRegistry.user_id == user.id,
-            )
-        )
-    ).scalar_one_or_none()
+    app_row = await _owned_app_row(db, project_id=project_id, user_id=user.id)
     if app_row is None:
         # The SAME code `_shipping_head` raises below for the other "nothing saved"
         # site, and the same string the pipeline itself settles a `Deployment` row with
@@ -991,14 +1003,7 @@ async def latest_deployment(
     # case the row is for. An unconfigured store reads the same as one that raised.
     await owned_project_or_404(db, user.id, project_id)
 
-    app_row = (
-        await db.execute(
-            sa.select(AppRegistry).where(
-                AppRegistry.project_id == project_id,
-                AppRegistry.user_id == user.id,
-            )
-        )
-    ).scalar_one_or_none()
+    app_row = await _owned_app_row(db, project_id=project_id, user_id=user.id)
     if app_row is None:
         # The one `PublishState` member with no app row behind it at all — computed
         # here rather than in `compute_publish_state`, whose signature takes a
@@ -1105,14 +1110,7 @@ async def restart_project(
             status.HTTP_503_SERVICE_UNAVAILABLE, _UNAVAILABLE, code="publishing_unavailable"
         )
 
-    app_row = (
-        await db.execute(
-            sa.select(AppRegistry).where(
-                AppRegistry.project_id == project_id,
-                AppRegistry.user_id == user.id,
-            )
-        )
-    ).scalar_one_or_none()
+    app_row = await _owned_app_row(db, project_id=project_id, user_id=user.id)
     if app_row is None:
         raise AppApiError(status.HTTP_409_CONFLICT, _RESTART_NEVER_DEPLOYED, code="never_deployed")
 
@@ -1241,14 +1239,7 @@ async def take_project_down(
 
     # No status check anywhere below: a draft, an approved and a pending app all leave
     # production the same way, because that axis and the app's lifecycle are independent.
-    app_row = (
-        await db.execute(
-            sa.select(AppRegistry).where(
-                AppRegistry.project_id == project_id,
-                AppRegistry.user_id == user.id,
-            )
-        )
-    ).scalar_one_or_none()
+    app_row = await _owned_app_row(db, project_id=project_id, user_id=user.id)
     if app_row is None:
         raise AppApiError(
             status.HTTP_409_CONFLICT, _TAKEDOWN_NEVER_DEPLOYED, code="never_deployed"

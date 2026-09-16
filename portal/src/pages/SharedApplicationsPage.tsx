@@ -19,18 +19,9 @@
  * SEARCH IS DESCRIPTION-ONLY, server-side and by design, which is why the box does not promise to
  * find a name.
  */
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
-import {
-  AlertTriangle,
-  ChevronsLeft,
-  ChevronsRight,
-  Info,
-  LayoutGrid,
-  List as ListIcon,
-  Search,
-  X,
-} from 'lucide-react'
+import { useCallback, useEffect, useState } from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import { AlertTriangle, Info, Search, X } from 'lucide-react'
 import {
   listSharedWithMe,
   type SharedProject,
@@ -38,31 +29,12 @@ import {
   type SharedSort,
 } from '../utils/sharingApi'
 import { SharedAppRow, SharedAppTile, sharerName } from '../components/projects/SharedAppRow'
-import {
-  DENSITY_COLS,
-  TOGGLE_ACTIVE,
-  readStoredDensity,
-  readStoredView,
-  storeDensity,
-  storeView,
-  type Density,
-  type View,
-} from '../utils/listView'
+import { ListPager, ListSkeleton, ViewControls } from '../components/projects/listChrome'
+import { DENSITY_COLS, DEFAULT_PAGE_SIZE, PAGE_SIZES } from '../utils/listView'
+import { useListView } from '../hooks/useListView'
+import { useArrivalNotice } from '../hooks/useArrivalNotice'
 import { Input } from '../components/ui/input'
-import { Skeleton } from '../components/ui/skeleton'
-import { ToggleGroup, ToggleGroupItem } from '../components/ui/toggle-group'
-import {
-  Pagination,
-  PaginationContent,
-  PaginationItem,
-  PaginationLink,
-  PaginationNext,
-  PaginationPrevious,
-} from '../components/ui/pagination'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
-
-const PAGE_SIZES = [8, 16, 24, 48] as const
-const DEFAULT_PAGE_SIZE = PAGE_SIZES[0]
 
 /** The Select's value for "no colleague chosen". A sentinel rather than `''`, because Radix
  *  treats an empty string as "no value" and would render the placeholder instead of the word. */
@@ -111,9 +83,7 @@ function intoParams(prev: URLSearchParams, next: Committed): URLSearchParams {
 
 export default function SharedApplicationsPage(): React.JSX.Element {
   const navigate = useNavigate()
-  const location = useLocation()
-  const [view, setView] = useState<View>(readStoredView)
-  const [density, setDensity] = useState<Density>(readStoredDensity)
+  const { view, setView, density, setDensity } = useListView()
 
   const [searchParams, setSearchParams] = useSearchParams()
   const { page, pageSize, q, sharedBy, sort } = readCommitted(searchParams)
@@ -202,29 +172,8 @@ export default function SharedApplicationsPage(): React.JSX.Element {
     if (!loading && totalPages > 0 && page > totalPages) commit({ page: totalPages }, 'replace')
   }, [loading, page, totalPages, commit])
 
-  /**
-   * THE ARRIVAL NOTICE, READ ONCE AND THEN SCRUBBED. A recipient bounced off a share that no
-   * longer exists lands here carrying one sentence, on ROUTER STATE rather than the query string:
-   * a query survives a copy and a bookmark, and that sentence is about a bounce the next reader
-   * never made. The replace is what makes it a one-shot — React Router keeps router state in
-   * `window.history.state`, which the browser restores on reload and replays on Back.
-   */
-  const [notice, setNotice] = useState<string | null>(null)
-  useEffect(() => {
-    const carried = (location.state as { notice?: unknown } | null)?.notice
-    if (typeof carried !== 'string' || carried.length === 0) return
-    setNotice(carried)
-    navigate(`${location.pathname}${location.search}`, { replace: true, state: null })
-  }, [location.pathname, location.search, location.state, navigate])
-
-  const chooseView = (next: View): void => {
-    setView(next)
-    storeView(next)
-  }
-  const chooseDensity = (next: Density): void => {
-    setDensity(next)
-    storeDensity(next)
-  }
+  // A recipient bounced off a share that no longer exists lands here carrying one sentence.
+  const { notice, dismiss: dismissNotice } = useArrivalNotice()
 
   const isEmpty = items.length === 0
   const settled = applied !== null
@@ -234,14 +183,6 @@ export default function SharedApplicationsPage(): React.JSX.Element {
   const showNothingShared = settled && !loading && error === null && isEmpty && !narrowed
   const showNoMatches = settled && !loading && error === null && isEmpty && narrowed
   const showRows = !isEmpty
-
-  // A SLIDING WINDOW, not the first five: pages 1-5 whatever page you are on leaves a reader
-  // past page 5 with nothing marked active and no route deeper but Next, repeatedly.
-  const pageWindow = useMemo(() => {
-    const span = Math.min(5, Math.max(totalPages, 1))
-    const first = Math.min(Math.max(page - Math.floor(span / 2), 1), Math.max(totalPages - span + 1, 1))
-    return Array.from({ length: span }, (_, i) => first + i)
-  }, [page, totalPages])
 
   // DERIVED FROM WHAT THE ROWS ANSWER, never from what was requested — a footer narrating the
   // page that FAILED over the rows that succeeded prints a range past its own total.
@@ -279,7 +220,7 @@ export default function SharedApplicationsPage(): React.JSX.Element {
               <p className="text-sm text-tertiary">{notice}</p>
               <button
                 type="button"
-                onClick={() => setNotice(null)}
+                onClick={dismissNotice}
                 aria-label="Dismiss notice"
                 className="ml-auto text-neutral hover:text-tertiary"
               >
@@ -338,59 +279,12 @@ export default function SharedApplicationsPage(): React.JSX.Element {
           </label>
 
           <div className="ml-auto flex items-center gap-2">
-            {view === 'grid' && (
-              <ToggleGroup
-                type="single"
-                value={density}
-                onValueChange={(v) => v && chooseDensity(v as Density)}
-                aria-label="Card size"
-              >
-                {(['S', 'M', 'L'] as const).map((d) => (
-                  <ToggleGroupItem key={d} value={d} aria-label={`${d} cards`} className={`px-2.5${TOGGLE_ACTIVE}`}>
-                    {d}
-                  </ToggleGroupItem>
-                ))}
-              </ToggleGroup>
-            )}
-
-            <ToggleGroup
-              type="single"
-              value={view}
-              onValueChange={(v) => v && chooseView(v as View)}
-              aria-label="View"
-            >
-              <ToggleGroupItem value="list" aria-label="List view" className={TOGGLE_ACTIVE.trim()}>
-                <ListIcon size={15} />
-              </ToggleGroupItem>
-              <ToggleGroupItem value="grid" aria-label="Grid view" className={TOGGLE_ACTIVE.trim()}>
-                <LayoutGrid size={15} />
-              </ToggleGroupItem>
-            </ToggleGroup>
+            <ViewControls view={view} density={density} onView={setView} onDensity={setDensity} />
           </div>
         </div>
 
         {showSkeleton ? (
-          // Shaped like the view you are in — a card skeleton under a list flashes wrong.
-          view === 'list' ? (
-            <div className="bg-white border border-bial-border rounded-2xl overflow-hidden" aria-busy="true">
-              {[0, 1, 2, 3, 4].map((i) => (
-                <div key={i} className="px-4 py-3.5 border-b border-bial-border last:border-0">
-                  <Skeleton className="h-4 w-48 mb-2" />
-                  <Skeleton className="h-3 w-80" />
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className={`grid gap-4 ${DENSITY_COLS[density]}`} aria-busy="true">
-              {[0, 1, 2, 3, 4, 5].map((i) => (
-                <div key={i} className="bg-white border border-bial-border rounded-2xl px-5 py-4">
-                  <Skeleton className="h-4 w-1/2 mb-3" />
-                  <Skeleton className="h-3 w-3/4 mb-2" />
-                  <Skeleton className="h-3 w-1/4" />
-                </div>
-              ))}
-            </div>
-          )
+          <ListSkeleton view={view} density={density} />
         ) : showFirstPageError ? (
           <div
             data-testid="shared-error"
@@ -523,51 +417,13 @@ export default function SharedApplicationsPage(): React.JSX.Element {
                   Page {appliedPage} of {Math.max(totalPages, 1)}
                 </span>
 
-                <Pagination className="mx-0 w-auto" aria-label="Shared applications pagination">
-                  <PaginationContent className="flex-wrap justify-end">
-                    <PaginationItem>
-                      <PaginationLink
-                        aria-label="First page"
-                        aria-disabled={page <= 1}
-                        onClick={() => page > 1 && commit({ page: 1 }, 'push')}
-                        className={page <= 1 ? 'pointer-events-none opacity-40' : undefined}
-                      >
-                        <ChevronsLeft size={15} />
-                      </PaginationLink>
-                    </PaginationItem>
-                    <PaginationItem>
-                      <PaginationPrevious
-                        aria-disabled={page <= 1}
-                        onClick={() => page > 1 && commit({ page: page - 1 }, 'push')}
-                        className={page <= 1 ? 'pointer-events-none opacity-40' : undefined}
-                      />
-                    </PaginationItem>
-                    {pageWindow.map((n) => (
-                      <PaginationItem key={n}>
-                        <PaginationLink isActive={n === appliedPage} onClick={() => commit({ page: n }, 'push')}>
-                          {n}
-                        </PaginationLink>
-                      </PaginationItem>
-                    ))}
-                    <PaginationItem>
-                      <PaginationNext
-                        aria-disabled={page >= totalPages}
-                        onClick={() => page < totalPages && commit({ page: page + 1 }, 'push')}
-                        className={page >= totalPages ? 'pointer-events-none opacity-40' : undefined}
-                      />
-                    </PaginationItem>
-                    <PaginationItem>
-                      <PaginationLink
-                        aria-label="Last page"
-                        aria-disabled={page >= totalPages}
-                        onClick={() => page < totalPages && commit({ page: totalPages }, 'push')}
-                        className={page >= totalPages ? 'pointer-events-none opacity-40' : undefined}
-                      >
-                        <ChevronsRight size={15} />
-                      </PaginationLink>
-                    </PaginationItem>
-                  </PaginationContent>
-                </Pagination>
+                <ListPager
+                  page={page}
+                  activePage={appliedPage}
+                  totalPages={totalPages}
+                  onGo={(next) => commit({ page: next }, 'push')}
+                  label="Shared applications pagination"
+                />
               </div>
             </div>
           </>

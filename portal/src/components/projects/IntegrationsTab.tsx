@@ -3,6 +3,7 @@ import { X } from 'lucide-react'
 import { listProjectConnectors, setProjectConnector } from '../../utils/connectorApi'
 import type { ProjectConnectorEntry, WindowChoice } from '../../utils/connectorApi'
 import { assertNever } from '../../utils/assertNever'
+import { errorText } from '../../utils/apiError'
 import { ConnectorGlyph, dayMonth } from '../connectors/connectorPresentation'
 import ProjectConnectorRow from '../connectors/ProjectConnectorRow'
 
@@ -91,10 +92,6 @@ function stateLine(entry: ProjectConnectorEntry, view: RowView): { text: string;
   }
 }
 
-function message(caught: unknown): string {
-  return caught instanceof Error ? caught.message : String(caught)
-}
-
 export interface IntegrationsTabProps {
   projectId: string
 }
@@ -116,7 +113,7 @@ export default function IntegrationsTab({ projectId }: IntegrationsTabProps): Re
       const rows = await listProjectConnectors(projectId)
       if (loadSeq.current === seq) setEntries(rows)
     } catch (caught) {
-      if (loadSeq.current === seq) setError(message(caught))
+      if (loadSeq.current === seq) setError(errorText(caught))
     }
   }, [projectId])
 

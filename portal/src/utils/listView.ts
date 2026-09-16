@@ -14,6 +14,12 @@
 export type View = 'list' | 'grid'
 export type Density = 'S' | 'M' | 'L'
 
+/** The rows-per-page sizes the control offers, and the one a list opens on. Named once for every
+ *  application list: a `?pageSize=` outside this set is what each list falls back from, so two
+ *  copies would be two lists disagreeing about which links are honoured. */
+export const PAGE_SIZES = [8, 16, 24, 48] as const
+export const DEFAULT_PAGE_SIZE = PAGE_SIZES[0]
+
 const VIEW_KEY = 'bial.projects.view'
 const DENSITY_KEY = 'bial.projects.density'
 

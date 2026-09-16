@@ -127,7 +127,6 @@ function answersWithTheRequestedPage(
   )
 }
 
-/** Radix's Select is a button, not a `<select>`: `fireEvent.change` on it silently no-ops. */
 /**
  * Delete an application the way a citizen now must: through the row's `⋯` menu. Two steps on
  * purpose — a list does not hand out a one-click route to an irreversible action. The trigger is
@@ -138,6 +137,7 @@ async function deleteFromRowMenu(): Promise<void> {
   fireEvent.click(await screen.findByRole('menuitem', { name: 'Delete' }))
 }
 
+/** Radix's Select is a button, not a `<select>`: `fireEvent.change` on it silently no-ops. */
 async function pickRowsPerPage(option: string): Promise<void> {
   fireEvent.click(screen.getByRole('combobox', { name: 'Rows per page' }))
   fireEvent.click(await screen.findByRole('option', { name: option }))

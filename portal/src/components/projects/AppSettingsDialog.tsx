@@ -31,8 +31,6 @@ import { SharePanelBody } from './SharePanel'
  * no tab and no control becomes unreachable.
  */
 
-/** The title truncates rather than pushing the close control off a fixed-width panel — the same
- *  treatment the row and the toolbar already give a long application name. */
 export type SettingsTab = 'general' | 'sharing' | 'integrations' | 'production'
 
 export interface AppSettingsDialogProps {

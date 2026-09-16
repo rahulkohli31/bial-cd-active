@@ -10,6 +10,7 @@ import {
 } from '../utils/connectorApi'
 import type { ConnectorEntry, ConnectorOnProject } from '../utils/connectorApi'
 import { assertNever } from '../utils/assertNever'
+import { errorText } from '../utils/apiError'
 import AskAccessPanel from '../components/connectors/AskAccessPanel'
 import {
   ConnectorGlyph,
@@ -63,10 +64,6 @@ const DISCLOSURE_FOOTER =
 const NOTHING_ON = 'No application has this switched on yet — the switch is in an application’s own settings.'
 
 const DISCLOSURE_TITLE = 'Applications using this data'
-
-function message(caught: unknown): string {
-  return caught instanceof Error ? caught.message : String(caught)
-}
 
 /** The sentence under the connector's name, and the ink it is set in — one line, state-selected. */
 function statusLine(entry: ConnectorEntry): { text: string; className: string } {
@@ -362,7 +359,7 @@ export default function IntegrationsPage(): React.JSX.Element {
       const rows = await listConnectors()
       if (loadSeq.current === seq) setEntries(rows)
     } catch (caught) {
-      if (loadSeq.current === seq) setError(message(caught))
+      if (loadSeq.current === seq) setError(errorText(caught))
     }
   }, [])
 
@@ -407,7 +404,7 @@ export default function IntegrationsPage(): React.JSX.Element {
         await cancelConnectorRequest(entry.key)
         notifyConnectorsChanged()
       } catch (caught) {
-        setFailure(message(caught))
+        setFailure(errorText(caught))
       } finally {
         setBusyKey(null)
       }
@@ -430,7 +427,7 @@ export default function IntegrationsPage(): React.JSX.Element {
       try {
         await setProjectConnector(projectId, connectorKey, { enabled: false })
       } catch (caught) {
-        setFailure(message(caught))
+        setFailure(errorText(caught))
         throw caught
       }
       notifyConnectorsChanged()

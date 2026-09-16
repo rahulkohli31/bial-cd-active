@@ -49,14 +49,14 @@ DialogOverlay.displayName = DialogPrimitive.Overlay.displayName
  *
  * Radix restores focus to whatever was focused before the content mounted — but the restore runs
  * inside `FocusScope`'s own cleanup, and every dialog in this portal is rendered CONDITIONALLY:
- * `{deleting && <ProjectDeleteDialog …/>}`, `{renaming && <ProjectRenameDialog …/>}`. Pressing
+ * `{deleting && <ProjectDeleteDialog …/>}`, `{settingsFor && <AppSettingsDialog …/>}`. Pressing
  * Escape calls `onOpenChange(false)`, the parent sets its state to `null`, and React deletes the
  * whole subtree — `Dialog`, `FocusScope` and all — in the same commit. There is no closing state
  * for the restore to run in, so it never runs.
  *
- * MEASURED, NOT REASONED. In the portal container, opening the rename dialog and pressing Escape
- * left `document.activeElement === document.body` while the pencil that opened it was still the
- * same node, still connected and still focusable. A keyboard is then at the top of the document
+ * MEASURED, NOT REASONED. In the portal container, opening a dialog from a row control and
+ * pressing Escape left `document.activeElement === document.body` while the control that opened
+ * it was still the same node, still connected and still focusable. A keyboard is then at the top of the document
  * with no idea where it came from — which is the exact strand `ProjectsPage`'s delete already
  * records and fixes by hand, and the reason `aria-disabled` is used everywhere in place of
  * `disabled` (a disabled control throws focus to the body for the same end result).

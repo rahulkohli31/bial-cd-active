@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import path from 'node:path'
+import { stripComments } from './_stripComments'
 
 /**
  * THE ACTION COLOUR IS TEAL, AND NOTHING ELSE PAINTS AN ACTION.
@@ -27,13 +28,6 @@ function sourceFiles(dir) {
 }
 
 const rel = (file) => path.relative(ROOT, file).split(path.sep).join('/')
-
-/** Comments are not source — they are where the reasons live, and several of them quote the
- *  very class names these rules forbid so the next author knows why. Same treatment, and the
- *  same `://` guard, as `tailwind-tokens.test.js`. */
-function stripComments(text) {
-  return text.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
-}
 
 /**
  * Every `bg-secondary` / `bg-secondary-N` / `shadow-secondary` / `ring-secondary`, plus the

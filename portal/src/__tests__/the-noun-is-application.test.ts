@@ -18,6 +18,9 @@
 import { describe, it, expect } from 'vitest'
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
+/** Comments are prose about the code, where the retired name is allowed to appear as history —
+ *  `retired-names-are-past-tense.test.ts` is what holds those honest. */
+import { stripComments } from './_stripComments'
 
 const SRC_ROOT = path.resolve(process.cwd(), 'src')
 
@@ -81,12 +84,6 @@ export function sentencesIn(source: string): string[] {
     found.push(text)
   }
   return found
-}
-
-/** Comments are prose about the code, where the retired name is allowed to appear as history —
- *  `retired-names-are-past-tense.test.ts` is what holds those honest. */
-function stripComments(text: string): string {
-  return text.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
 }
 
 export function copyIn(source: string): string[] {

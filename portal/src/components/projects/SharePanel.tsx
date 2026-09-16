@@ -175,109 +175,109 @@ export function SharePanelBody({ projectId }: SharePanelBodyProps): React.JSX.El
       </p>
 
       <label className="block mt-5">
-          <span className="text-xs font-semibold text-tertiary">Add a colleague</span>
-          <input
-            autoFocus
-            value={query}
-            onChange={(e) => onQueryChange(e.target.value)}
-            placeholder="Search by name or email"
-            className="mt-1.5 w-full border border-bial-border rounded-xl px-3 py-2.5 text-sm text-tertiary placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary"
-          />
-        </label>
+        <span className="text-xs font-semibold text-tertiary">Add a colleague</span>
+        <input
+          autoFocus
+          value={query}
+          onChange={(e) => onQueryChange(e.target.value)}
+          placeholder="Search by name or email"
+          className="mt-1.5 w-full border border-bial-border rounded-xl px-3 py-2.5 text-sm text-tertiary placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary"
+        />
+      </label>
 
-        {/* THE ONE REGION FOR ALL FOUR NAMED STATES (R28) — mounted unconditionally so a
-            reader hears each one land, matching the wait-region convention `ProjectsPage`
-            already establishes for this codebase. */}
-        <div role="status" aria-live="polite" data-testid="colleague-search-status" className="mt-2 min-h-[1.125rem]">
-          {searching ? (
-            <p className="text-xs text-neutral flex items-center gap-1.5">
-              <BusyGlyph size={12} /> Searching…
-            </p>
-          ) : searchNotice ? (
-            <p className="text-xs text-neutral">{searchNotice}</p>
-          ) : null}
+      {/* THE ONE REGION FOR ALL FOUR NAMED STATES (R28) — mounted unconditionally so a
+          reader hears each one land, matching the wait-region convention `ProjectsPage`
+          already establishes for this codebase. */}
+      <div role="status" aria-live="polite" data-testid="colleague-search-status" className="mt-2 min-h-[1.125rem]">
+        {searching ? (
+          <p className="text-xs text-neutral flex items-center gap-1.5">
+            <BusyGlyph size={12} /> Searching…
+          </p>
+        ) : searchNotice ? (
+          <p className="text-xs text-neutral">{searchNotice}</p>
+        ) : null}
+      </div>
+
+      {results.length > 0 && (
+        <ul className="mt-1 flex flex-col gap-0.5 max-h-40 overflow-y-auto">
+          {results.map((colleague) => {
+            const alreadyShared = sharedIds.has(colleague.id)
+            const busy = sharingId === colleague.id
+            return (
+              <li
+                key={colleague.id}
+                className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg hover:bg-bial-bg"
+              >
+                <div className="min-w-0">
+                  <p className="text-sm text-tertiary truncate">
+                    {colleague.displayName || colleague.emailLocalPart}
+                  </p>
+                  <p className="text-[11px] text-neutral truncate">{colleague.emailLocalPart}</p>
+                </div>
+                <button
+                  type="button"
+                  aria-disabled={alreadyShared || busy}
+                  onClick={() => {
+                    if (!alreadyShared && !busy) onShare(colleague)
+                  }}
+                  className="flex-shrink-0 text-xs font-semibold text-primary hover:underline aria-disabled:opacity-50 aria-disabled:no-underline aria-disabled:cursor-not-allowed"
+                >
+                  {alreadyShared ? 'Already shared' : busy ? <BusyGlyph size={12} /> : 'Share'}
+                </button>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+
+      {actionError !== null && (
+        <div role="alert" className="mt-3 bg-red-50 border border-red-200 rounded-xl px-3 py-2.5">
+          <p className="text-xs text-red-600">{actionError}</p>
         </div>
+      )}
 
-        {results.length > 0 && (
-          <ul className="mt-1 flex flex-col gap-0.5 max-h-40 overflow-y-auto">
-            {results.map((colleague) => {
-              const alreadyShared = sharedIds.has(colleague.id)
-              const busy = sharingId === colleague.id
+      <div className="mt-5">
+        <p className="text-xs font-semibold text-tertiary">Who can use this application</p>
+        {sharesLoading ? (
+          <p className="text-xs text-neutral mt-2 flex items-center gap-1.5">
+            <BusyGlyph size={12} /> Loading…
+          </p>
+        ) : sharesError !== null ? (
+          <p className="text-xs text-danger mt-2">{sharesError}</p>
+        ) : shares.length === 0 ? (
+          <p className="text-xs text-neutral/70 italic mt-2">Not shared with anyone yet.</p>
+        ) : (
+          <ul className="mt-2 flex flex-col gap-0.5 max-h-48 overflow-y-auto">
+            {shares.map((share) => {
+              const busy = revokingId === share.sharedWithUserId
               return (
                 <li
-                  key={colleague.id}
+                  key={share.id}
                   className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg hover:bg-bial-bg"
                 >
                   <div className="min-w-0">
                     <p className="text-sm text-tertiary truncate">
-                      {colleague.displayName || colleague.emailLocalPart}
+                      {share.sharedWithDisplayName || share.sharedWithEmailLocalPart}
                     </p>
-                    <p className="text-[11px] text-neutral truncate">{colleague.emailLocalPart}</p>
+                    {/* "Can use", never "view only" (R6, Key Decision 3). */}
+                    <p className="text-[11px] text-neutral truncate">Can use</p>
                   </div>
                   <button
                     type="button"
-                    aria-disabled={alreadyShared || busy}
+                    aria-disabled={busy}
                     onClick={() => {
-                      if (!alreadyShared && !busy) onShare(colleague)
+                      if (!busy) onRevoke(share)
                     }}
-                    className="flex-shrink-0 text-xs font-semibold text-primary hover:underline aria-disabled:opacity-50 aria-disabled:no-underline aria-disabled:cursor-not-allowed"
+                    className="flex-shrink-0 text-xs font-semibold text-neutral hover:text-danger aria-disabled:opacity-50"
                   >
-                    {alreadyShared ? 'Already shared' : busy ? <BusyGlyph size={12} /> : 'Share'}
+                    {busy ? <BusyGlyph size={12} /> : 'Remove'}
                   </button>
                 </li>
               )
             })}
           </ul>
         )}
-
-        {actionError !== null && (
-          <div role="alert" className="mt-3 bg-red-50 border border-red-200 rounded-xl px-3 py-2.5">
-            <p className="text-xs text-red-600">{actionError}</p>
-          </div>
-        )}
-
-        <div className="mt-5">
-          <p className="text-xs font-semibold text-tertiary">Who can use this application</p>
-          {sharesLoading ? (
-            <p className="text-xs text-neutral mt-2 flex items-center gap-1.5">
-              <BusyGlyph size={12} /> Loading…
-            </p>
-          ) : sharesError !== null ? (
-            <p className="text-xs text-danger mt-2">{sharesError}</p>
-          ) : shares.length === 0 ? (
-            <p className="text-xs text-neutral/70 italic mt-2">Not shared with anyone yet.</p>
-          ) : (
-            <ul className="mt-2 flex flex-col gap-0.5 max-h-48 overflow-y-auto">
-              {shares.map((share) => {
-                const busy = revokingId === share.sharedWithUserId
-                return (
-                  <li
-                    key={share.id}
-                    className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg hover:bg-bial-bg"
-                  >
-                    <div className="min-w-0">
-                      <p className="text-sm text-tertiary truncate">
-                        {share.sharedWithDisplayName || share.sharedWithEmailLocalPart}
-                      </p>
-                      {/* "Can use", never "view only" (R6, Key Decision 3). */}
-                      <p className="text-[11px] text-neutral truncate">Can use</p>
-                    </div>
-                    <button
-                      type="button"
-                      aria-disabled={busy}
-                      onClick={() => {
-                        if (!busy) onRevoke(share)
-                      }}
-                      className="flex-shrink-0 text-xs font-semibold text-neutral hover:text-danger aria-disabled:opacity-50"
-                    >
-                      {busy ? <BusyGlyph size={12} /> : 'Remove'}
-                    </button>
-                  </li>
-                )
-              })}
-            </ul>
-          )}
-        </div>
+      </div>
     </>
   )
 }

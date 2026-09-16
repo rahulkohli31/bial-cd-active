@@ -10,10 +10,10 @@
  * edge and no width. "Details updated" keeps its name: the field moves on a rename or a
  * description edit and never on a build or a deploy, so a bare "Updated" would claim otherwise.
  */
-import { statusFor, TONE_CLASS } from '../../utils/appStatusLabel'
 import { listDate } from '../../utils/projectDates'
 import type { Project } from '../../utils/projectApi'
 import AppListRow from './AppListRow'
+import AppStatusBadge from './AppStatusBadge'
 import AppRowMenu from './AppRowMenu'
 import type { AppRowMenuProps } from './AppRowMenu'
 
@@ -26,8 +26,6 @@ export interface ProjectRowProps {
 }
 
 export default function ProjectRow({ project, onOpen, onSettings, onDelete, live }: ProjectRowProps): React.JSX.Element {
-  const status = statusFor(project)
-
   return (
     <AppListRow
       testId="project-row"
@@ -46,11 +44,7 @@ export default function ProjectRow({ project, onOpen, onSettings, onDelete, live
           <p className="hidden sm:block w-28 flex-shrink-0 text-xs text-neutral tabular-nums whitespace-nowrap">
             {listDate(project.updatedAt)}
           </p>
-          <span
-            className={`w-[104px] flex-shrink-0 text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full whitespace-nowrap text-center ${TONE_CLASS[status.tone]}`}
-          >
-            {status.label}
-          </span>
+          <AppStatusBadge project={project} className="w-[104px] flex-shrink-0 text-center" />
         </>
       }
       trailing={

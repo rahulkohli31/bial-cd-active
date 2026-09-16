@@ -130,6 +130,18 @@ export function isSuspended(body: unknown, status: number): boolean {
   return status === 403 && isRecord(body) && body.detail === 'Account suspended'
 }
 
+/**
+ * The sentence to show for something that was THROWN, as opposed to a response that was read.
+ *
+ * Every typed client here throws `ApiError`, whose message is already the backend's own stated
+ * reason, so the `Error` arm is the one that runs in practice and `String(value)` is the backstop
+ * for a reject that is not an `Error` at all. Three connector surfaces each carried a private copy
+ * of this — the shape a shared rule drifts apart in.
+ */
+export function errorText(value: unknown): string {
+  return value instanceof Error ? value.message : String(value)
+}
+
 /** Read a non-2xx `Response` into an `ApiError`. A body that is not JSON degrades to the fallback message. */
 export async function readApiError(res: Response, fallback: string): Promise<ApiError> {
   const body: unknown = await res.json().catch(() => null)

@@ -1,7 +1,8 @@
 /**
- * Daily-token-usage badge helpers (interim). Isolates the navbar indicator's
- * data fetch and the "usage changed, refetch" signal so the single consumer
- * (the navigation's token ring) stays thin and both pieces are testable without a render.
+ * Daily-token-usage badge helpers (interim). Isolates the meter's data fetch and the
+ * "usage changed, refetch" signal so its two consumers — the navigation panel's ring and the
+ * workspace toolbar's compact one, both through `useUsageToday` — stay thin, and so both pieces
+ * are testable without a render.
  *
  * The signal is a window CustomEvent: the meter and the chat state have no shared React
  * parent — the meter reads from the navigation panel and a turn completes deep inside the

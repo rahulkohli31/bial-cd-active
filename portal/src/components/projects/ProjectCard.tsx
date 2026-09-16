@@ -8,33 +8,11 @@
  * `onOpen`/`onDelete`/`onSettings`, so this renders trivially in a test with no router.
  */
 import type { Project } from '../../utils/projectApi'
-import { statusFor, TONE_CLASS } from '../../utils/appStatusLabel'
 import { tileDateRange } from '../../utils/projectDates'
 import AppTile from './AppTile'
+import AppStatusBadge from './AppStatusBadge'
 import AppRowMenu from './AppRowMenu'
 import type { AppRowMenuProps } from './AppRowMenu'
-
-/**
- * The status pill, in the SHARED vocabulary.
- *
- * The card says the same words the project page's chip does, via `appStatusLabel`. The list
- * row reads the identical helper: two views of one list must not describe the same project
- * differently.
- */
-export function AppStatusBadge({
-  project,
-}: {
-  project: Pick<Project, 'appStatus' | 'isServing'>
-}): React.JSX.Element {
-  const status = statusFor(project)
-  return (
-    <span
-      className={`text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full whitespace-nowrap ${TONE_CLASS[status.tone]}`}
-    >
-      {status.label}
-    </span>
-  )
-}
 
 export interface ProjectCardProps {
   project: Project

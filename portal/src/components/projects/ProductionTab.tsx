@@ -9,7 +9,7 @@ import AppStatusPanel from './AppStatusPanel'
 /**
  * SETTINGS › PRODUCTION — where an application stands, and what an owner may do about it.
  *
- * WHERE IT STANDS IS `AppStatusPanel`\'S TO SAY, and it is MOUNTED here rather than restated: the
+ * WHERE IT STANDS IS `AppStatusPanel`'S TO SAY, and it is MOUNTED here rather than restated: the
  * state pill, the provenance rows, the published address with its copy control and Send for
  * review all come from that one component, off ONE deployment read. This file adds only what the
  * panel has no opinion about — restarting a live application and taking one out of production —
@@ -17,11 +17,11 @@ import AppStatusPanel from './AppStatusPanel'
  *
  * RESTART RUNS THE SAME VERSION AGAIN, AND THE COPY HAS TO SAY SO. To a citizen who did not write
  * the code, "restart" is the appliance remedy for "my app is broken" — and it is not one: it
- * recycles the revision already serving, so if the fault is in the application\'s own logic the
+ * recycles the revision already serving, so if the fault is in the application's own logic the
  * restart is a guaranteed no-op that still costs a wait. Saying it plainly is what stops an owner
  * pressing a button that cannot help them.
  *
- * TAKE DOWN\'S SENTENCE SAYS WHAT IS KEPT, not what is lost, because the fear it answers is "will
+ * TAKE DOWN'S SENTENCE SAYS WHAT IS KEPT, not what is lost, because the fear it answers is "will
  * I lose my work". It removes a container. The application, its chats, its data and its files all
  * stay, and Publish again puts it back at the same address.
  */
@@ -61,7 +61,7 @@ export default function ProductionTab({ projectId, onSettled }: ProductionTabPro
           else await takeAppDown(projectId)
           await refresh()
         } catch (err) {
-          // THE SERVER\'S STATED REASON, NOT A GENERIC FAILURE. Every refusal on these two routes
+          // THE SERVER'S STATED REASON, NOT A GENERIC FAILURE. Every refusal on these two routes
           // names something the owner can act on — publish it again, wait for the deploy to
           // finish, ask an administrator — and flattening them into "something went wrong" throws
           // that away.

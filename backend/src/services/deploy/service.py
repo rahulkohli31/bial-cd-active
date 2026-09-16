@@ -601,7 +601,22 @@ class DeployService:
         # 6 — the revision. `create_or_update` returning an FQDN proves the APP exists, not
         # that the new REVISION is healthy; in single-revision mode ARM settles the app
         # while a revision can still fail to activate.
-        await self._await_revision(app_id=app_id, deployment_id=deployment_id)
+        await self._await_healthy_revision(
+            app_id=app_id,
+            deployment_id=deployment_id,
+            failed_code=FAIL_NOT_HEALTHY,
+            failed_message=(
+                "Your app was built but did not start. Your previous version is still "
+                "running. This is usually a problem in the app itself — ask the assistant "
+                "to check it."
+            ),
+            timeout_code=FAIL_NOT_HEALTHY,
+            timeout_detail="the revision did not become healthy in time",
+            timeout_message=(
+                "Your app was built but did not start in time. Your previous version is "
+                "still running. Please try again."
+            ),
+        )
         # THE ADDRESS A PERSON IS GIVEN, not the container's own. `fqdn` is still what proves the
         # app exists, and it is still where the platform reaches it — but BIAL's Container Apps
         # environment is internal and publishes no public DNS, so a colleague who is sent that
@@ -614,7 +629,24 @@ class DeployService:
         # next publish.
         return settings.app_url(self._aca_name(app_id))
 
-    async def _await_revision(self, *, app_id: uuid.UUID, deployment_id: uuid.UUID) -> None:
+    async def _await_healthy_revision(
+        self,
+        *,
+        app_id: uuid.UUID,
+        deployment_id: uuid.UUID,
+        failed_code: str,
+        failed_message: str,
+        timeout_code: str,
+        timeout_detail: str,
+        timeout_message: str,
+    ) -> None:
+        """Poll the revision until it is healthy, or settle this attempt with the caller's own
+        verdict. Both the publish and the restart wait exactly this way and differ only in what
+        they call the two endings, which is why the loop is written once and the words are not.
+
+        A DEADLINE THAT PASSES IS NOT A VERDICT. Only ARM reporting the revision failed says
+        anything about the application; an expired budget says how fast it answers. The caller's
+        `timeout_message` is what has to carry that distinction to the citizen."""
         deadline = asyncio.get_running_loop().time() + self._aca_config.ready_timeout_s
         while True:
             state = await self._aca.get_revision(app_id=app_id, deployment_id=deployment_id)
@@ -622,22 +654,13 @@ class DeployService:
                 return
             if state.failed:
                 raise _DeployFailedError(
-                    FAIL_NOT_HEALTHY,
+                    failed_code,
                     detail=f"revision provisioning state: {state.provisioning_state}",
-                    citizen_message=(
-                        "Your app was built but did not start. Your previous version is "
-                        "still running. This is usually a problem in the app itself — ask "
-                        "the assistant to check it."
-                    ),
+                    citizen_message=failed_message,
                 )
             if asyncio.get_running_loop().time() >= deadline:
                 raise _DeployFailedError(
-                    FAIL_NOT_HEALTHY,
-                    detail="the revision did not become healthy in time",
-                    citizen_message=(
-                        "Your app was built but did not start in time. Your previous version "
-                        "is still running. Please try again."
-                    ),
+                    timeout_code, detail=timeout_detail, citizen_message=timeout_message
                 )
             await asyncio.sleep(_REVISION_POLL_S)
 
@@ -724,46 +747,29 @@ class DeployService:
             container_app_name=self._aca_name(app_id),
             revision_name=revision_name(app_id, deployment_id),
         )
-        await self._await_restarted_revision(app_id=app_id, deployment_id=deployment_id)
+        # A FAILED REVISION AND AN EXPIRED BUDGET ARE NOT THE SAME EVENT, and only the first
+        # is a statement about the application: a slow-but-healthy app is the commonest way to
+        # reach the second, and the container that was already serving is still serving in
+        # both. Both settle this attempt and stop, so neither can reach a remedy that removes
+        # the container or puts a saved bundle back over work the citizen has not saved.
+        await self._await_healthy_revision(
+            app_id=app_id,
+            deployment_id=deployment_id,
+            failed_code=FAIL_RESTART,
+            failed_message=(
+                "Your app did not come back up. A restart runs the same version again, so if "
+                "it keeps failing the fault is in the app itself — ask the assistant to check "
+                "it."
+            ),
+            timeout_code=FAIL_RESTART_NOT_READY,
+            timeout_detail="the recycled revision did not report healthy in time",
+            timeout_message=(
+                "Your app is taking longer than expected to come back. Nothing was changed, "
+                "and the version that was already running is still running — please try again "
+                "in a moment."
+            ),
+        )
         return settings.app_url(self._aca_name(app_id))
-
-    async def _await_restarted_revision(
-        self, *, app_id: uuid.UUID, deployment_id: uuid.UUID
-    ) -> None:
-        """Wait for the recycled revision, keeping a verdict apart from an unknown.
-
-        A DEADLINE THAT PASSES IS "NOT READY YET", NEVER "GONE". Only ARM reporting the
-        revision failed is a positive verdict; an expired budget describes how fast the
-        application answers, not whether it is alive — and a slow-but-healthy app is the
-        commonest way to reach it. Both branches end the same way, by settling this attempt
-        and stopping, so neither can reach a remedy that removes the container or puts a saved
-        bundle back over work the citizen has not saved."""
-        deadline = asyncio.get_running_loop().time() + self._aca_config.ready_timeout_s
-        while True:
-            state = await self._aca.get_revision(app_id=app_id, deployment_id=deployment_id)
-            if state.healthy:
-                return
-            if state.failed:
-                raise _DeployFailedError(
-                    FAIL_RESTART,
-                    detail=f"revision provisioning state: {state.provisioning_state}",
-                    citizen_message=(
-                        "Your app did not come back up. A restart runs the same version "
-                        "again, so if it keeps failing the fault is in the app itself — ask "
-                        "the assistant to check it."
-                    ),
-                )
-            if asyncio.get_running_loop().time() >= deadline:
-                raise _DeployFailedError(
-                    FAIL_RESTART_NOT_READY,
-                    detail="the recycled revision did not report healthy in time",
-                    citizen_message=(
-                        "Your app is taking longer than expected to come back. Nothing was "
-                        "changed, and the version that was already running is still running "
-                        "— please try again in a moment."
-                    ),
-                )
-            await asyncio.sleep(_REVISION_POLL_S)
 
     # --- the drift re-check ------------------------------------------------------
 

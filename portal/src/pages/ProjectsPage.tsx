@@ -22,19 +22,8 @@
  * page-2 failure is shown below the rows already on screen, never clears them.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
-import {
-  Plus,
-  Search,
-  LayoutGrid,
-  List as ListIcon,
-  AlertTriangle,
-  AlertCircle,
-  Info,
-  X,
-  ChevronsLeft,
-  ChevronsRight,
-} from 'lucide-react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import { Plus, Search, AlertTriangle, AlertCircle, Info, X } from 'lucide-react'
 import {
   listProjects,
   listProjectCounts,
@@ -46,31 +35,17 @@ import {
 import { ApiError } from '../utils/apiError'
 import ProjectCard from '../components/projects/ProjectCard'
 import ProjectRow from '../components/projects/ProjectRow'
+import type { AppRowMenuProps } from '../components/projects/AppRowMenu'
 import ProjectCreateModal from '../components/projects/ProjectCreateModal'
 import ProjectDeleteDialog from '../components/projects/ProjectDeleteDialog'
 import AppSettingsDialog from '../components/projects/AppSettingsDialog'
 import { restartApp, takeAppDown } from '../utils/deployApi'
-import {
-  DENSITY_COLS,
-  TOGGLE_ACTIVE,
-  readStoredDensity,
-  readStoredView,
-  storeDensity,
-  storeView,
-  type Density,
-  type View,
-} from '../utils/listView'
+import { ListPager, ListSkeleton, ViewControls } from '../components/projects/listChrome'
+import { DENSITY_COLS, DEFAULT_PAGE_SIZE, PAGE_SIZES } from '../utils/listView'
+import { useListView } from '../hooks/useListView'
+import { useArrivalNotice } from '../hooks/useArrivalNotice'
 import { Input } from '../components/ui/input'
 import { Skeleton } from '../components/ui/skeleton'
-import { ToggleGroup, ToggleGroupItem } from '../components/ui/toggle-group'
-import {
-  Pagination,
-  PaginationContent,
-  PaginationItem,
-  PaginationLink,
-  PaginationNext,
-  PaginationPrevious,
-} from '../components/ui/pagination'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
 
 /**
@@ -89,9 +64,6 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
  * it is derived from the response, two causes can print two sentences again.
  */
 export const PROJECT_GONE_NOTICE = 'That application is no longer available.'
-
-const PAGE_SIZES = [8, 16, 24, 48] as const
-const DEFAULT_PAGE_SIZE = PAGE_SIZES[0]
 
 /**
  * The three summary tiles, and the filter each one applies.
@@ -226,8 +198,7 @@ export default function ProjectsPage(): React.JSX.Element {
     [],
   )
 
-  const [view, setView] = useState<View>(readStoredView)
-  const [density, setDensity] = useState<Density>(readStoredDensity)
+  const { view, setView, density, setDensity } = useListView()
 
   // COMMITTED query state — WHAT WAS ASKED FOR, and it lives in the address bar.
   //
@@ -312,42 +283,10 @@ export default function ProjectsPage(): React.JSX.Element {
     return () => clearTimeout(t)
   }, [q])
 
-  // THE ARRIVAL NOTICE, READ ONCE AND THEN SCRUBBED.
-  //
-  // It rides ROUTER STATE, not the query string. A query survives a copy, a bookmark and a share,
-  // and "that project is no longer available" pinned to a shareable `/projects?notice=…` is a
-  // sentence about a bounce the next reader never made. Router state travels only on the one
-  // navigation that set it.
-  //
-  // BUT IT SURVIVES MORE THAN THAT NAVIGATION UNLESS IT IS TAKEN AWAY. React Router keeps this
-  // in `window.history.state`, which the browser restores on RELOAD and replays on BACK — so
-  // without the replace below, refreshing the list re-announces a project the reader dealt with
-  // ten minutes ago, and stepping back onto the list later does it again. Reading the sentence
-  // into component state and then replacing the entry with a stateless one is what makes this a
-  // one-shot. The replace cannot loop: the re-run reads a `notice` that is no longer there.
-  //
-  // WHICH IS ALSO WHY IT NEVER BECOMES A QUERY PARAMETER. The replace above carries
-  // `location.search` through verbatim, so the page, size and query a reader arrived with survive
-  // being told a project is gone — but the reverse must hold too: a `?notice=…` would be copied
-  // forward by `intoParams`, which preserves the parameters it does not own, and would then
-  // outlive the reload it is supposed to be cleared by. Router state is the only channel that
-  // travels on exactly one navigation and nowhere else, so it stays the channel.
-  //
-  // THE TEXT ARRIVES AFTER ITS REGION, which is why this is an effect and not a `useState`
-  // initialiser. A live region inserted together with its text is missed entirely by
-  // several reader-and-browser combinations — `TurnBanner` and `LivePreview` both record it — so
-  // the region below is mounted on every render, empty, and the sentence lands inside it a tick
-  // later. It is its own region rather than a second tenant of `projects-wait`: that one narrates
-  // a wait that is still running, and two unrelated sentences sharing one polite region read as
-  // one announcement.
-  const location = useLocation()
-  const [notice, setNotice] = useState<string | null>(null)
-  useEffect(() => {
-    const carried = (location.state as { notice?: unknown } | null)?.notice
-    if (typeof carried !== 'string' || carried.length === 0) return
-    setNotice(carried)
-    navigate(`${location.pathname}${location.search}`, { replace: true, state: null })
-  }, [location.pathname, location.search, location.state, navigate])
+  // ITS OWN REGION rather than a second tenant of `projects-wait`: that one narrates a wait that
+  // is still running, and two unrelated sentences sharing one polite region read as one
+  // announcement. See the hook for why the sentence rides router state and is scrubbed.
+  const { notice, dismiss: dismissNotice } = useArrivalNotice()
 
   useEffect(() => {
     const id = ++requestId.current
@@ -421,16 +360,18 @@ export default function ProjectsPage(): React.JSX.Element {
     if (!loading && totalPages > 0 && page > totalPages) commit({ page: totalPages }, 'replace')
   }, [loading, page, totalPages, commit])
 
-  const chooseView = (next: View): void => {
-    setView(next)
-    storeView(next)
-  }
-  const chooseDensity = (next: Density): void => {
-    setDensity(next)
-    storeDensity(next)
-  }
-
   const openProject = (id: string): void => navigate(`/projects/${id}`)
+
+  /** The row menu's two production entries, or `undefined` where there is nothing serving to act
+   *  on. The list and the grid draw different components and must offer the SAME two actions. */
+  const liveControls = (project: Project): AppRowMenuProps['live'] =>
+    project.isServing
+      ? {
+          onRestart: () => runProduction(project, restartApp),
+          onTakeDown: () => runProduction(project, takeAppDown),
+          busy: actingIds.has(project.id),
+        }
+      : undefined
 
   const handleCreated = (project: Project): void => {
     setShowCreate(false)
@@ -546,15 +487,6 @@ export default function ProjectsPage(): React.JSX.Element {
     isEmpty &&
     (!!appliedQuery || appliedFilter !== null)
   const showRows = !isEmpty
-  // A SLIDING WINDOW, not the first five. `Math.min(totalPages, 5)` rendered pages 1-5
-  // whatever page you were on, so from page 6 nothing was marked active and the only way
-  // deeper was clicking Next repeatedly — with the page you were reading not shown at all.
-  const pageWindow = useMemo(() => {
-    const span = Math.min(5, Math.max(totalPages, 1))
-    // Centre on the current page, then clamp so the window never runs past either end.
-    const first = Math.min(Math.max(page - Math.floor(span / 2), 1), Math.max(totalPages - span + 1, 1))
-    return Array.from({ length: span }, (_, i) => first + i)
-  }, [page, totalPages])
 
   // DERIVED FROM WHAT THE ROWS ANSWER, never from what was requested. The footer used to
   // narrate the page that FAILED over the rows that succeeded: 12 projects, page 2 refused,
@@ -609,7 +541,7 @@ export default function ProjectsPage(): React.JSX.Element {
               <p className="text-sm text-tertiary">{notice}</p>
               <button
                 type="button"
-                onClick={() => setNotice(null)}
+                onClick={dismissNotice}
                 aria-label="Dismiss notice"
                 className="ml-auto text-neutral hover:text-tertiary"
               >
@@ -710,39 +642,7 @@ export default function ProjectsPage(): React.JSX.Element {
           </div>
 
           <div className="ml-auto flex items-center gap-2">
-            {view === 'grid' && (
-              <ToggleGroup
-                type="single"
-                value={density}
-                onValueChange={(v) => v && chooseDensity(v as Density)}
-                aria-label="Card size"
-              >
-                {(['S', 'M', 'L'] as const).map((d) => (
-                  <ToggleGroupItem
-                    key={d}
-                    value={d}
-                    aria-label={`${d} cards`}
-                    className={`px-2.5${TOGGLE_ACTIVE}`}
-                  >
-                    {d}
-                  </ToggleGroupItem>
-                ))}
-              </ToggleGroup>
-            )}
-
-            <ToggleGroup
-              type="single"
-              value={view}
-              onValueChange={(v) => v && chooseView(v as View)}
-              aria-label="View"
-            >
-              <ToggleGroupItem value="list" aria-label="List view" className={TOGGLE_ACTIVE.trim()}>
-                <ListIcon size={15} />
-              </ToggleGroupItem>
-              <ToggleGroupItem value="grid" aria-label="Grid view" className={TOGGLE_ACTIVE.trim()}>
-                <LayoutGrid size={15} />
-              </ToggleGroupItem>
-            </ToggleGroup>
+            <ViewControls view={view} density={density} onView={setView} onDensity={setDensity} />
 
             <button
               onClick={() => setShowCreate(true)}
@@ -754,27 +654,7 @@ export default function ProjectsPage(): React.JSX.Element {
         </div>
 
         {showSkeleton ? (
-          // Shaped like the view you are in — a card skeleton under a list flashes wrong.
-          view === 'list' ? (
-            <div className="bg-white border border-bial-border rounded-2xl overflow-hidden" aria-busy="true">
-              {[0, 1, 2, 3, 4].map((i) => (
-                <div key={i} className="px-4 py-3.5 border-b border-bial-border last:border-0">
-                  <Skeleton className="h-4 w-48 mb-2" />
-                  <Skeleton className="h-3 w-80" />
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className={`grid gap-4 ${DENSITY_COLS[density]}`} aria-busy="true">
-              {[0, 1, 2, 3, 4, 5].map((i) => (
-                <div key={i} className="bg-white border border-bial-border rounded-2xl px-5 py-4">
-                  <Skeleton className="h-4 w-1/2 mb-3" />
-                  <Skeleton className="h-3 w-3/4 mb-2" />
-                  <Skeleton className="h-3 w-1/4" />
-                </div>
-              ))}
-            </div>
-          )
+          <ListSkeleton view={view} density={density} />
         ) : showFirstPageError ? (
           <div
             data-testid="projects-error"
@@ -863,15 +743,7 @@ export default function ProjectsPage(): React.JSX.Element {
                     onOpen={() => openProject(project.id)}
                     onSettings={() => setSettingsFor(project)}
                     onDelete={() => setDeleting(project)}
-                    live={
-                      project.isServing
-                        ? {
-                            onRestart: () => runProduction(project, restartApp),
-                            onTakeDown: () => runProduction(project, takeAppDown),
-                            busy: actingIds.has(project.id),
-                          }
-                        : undefined
-                    }
+                    live={liveControls(project)}
                   />
                 ))}
               </div>
@@ -884,15 +756,7 @@ export default function ProjectsPage(): React.JSX.Element {
                     onOpen={() => openProject(project.id)}
                     onSettings={() => setSettingsFor(project)}
                     onDelete={() => setDeleting(project)}
-                    live={
-                      project.isServing
-                        ? {
-                            onRestart: () => runProduction(project, restartApp),
-                            onTakeDown: () => runProduction(project, takeAppDown),
-                            busy: actingIds.has(project.id),
-                          }
-                        : undefined
-                    }
+                    live={liveControls(project)}
                   />
                 ))}
               </div>
@@ -968,58 +832,13 @@ export default function ProjectsPage(): React.JSX.Element {
                   Page {appliedPage} of {Math.max(totalPages, 1)}
                 </span>
 
-                {/* WRAPS rather than overflowing. The number list reached `right: 534px` on a
-                    390px screen with only two pages, which put a horizontal scrollbar on the
-                    landing page and got worse with six. */}
-                <Pagination className="mx-0 w-auto" aria-label="Applications pagination">
-                  <PaginationContent className="flex-wrap justify-end">
-                    {/* Jump-to-first/last were missing; at six pages the difference is four
-                        clicks or one. */}
-                    <PaginationItem>
-                      <PaginationLink
-                        aria-label="First page"
-                        aria-disabled={page <= 1}
-                        onClick={() => page > 1 && commit({ page: 1 }, 'push')}
-                        className={page <= 1 ? 'pointer-events-none opacity-40' : undefined}
-                      >
-                        <ChevronsLeft size={15} />
-                      </PaginationLink>
-                    </PaginationItem>
-                    <PaginationItem>
-                      <PaginationPrevious
-                        aria-disabled={page <= 1}
-                        onClick={() => page > 1 && commit({ page: page - 1 }, 'push')}
-                        className={page <= 1 ? 'pointer-events-none opacity-40' : undefined}
-                      />
-                    </PaginationItem>
-                    {pageWindow.map((n) => (
-                      <PaginationItem key={n}>
-                        <PaginationLink isActive={n === appliedPage} onClick={() => commit({ page: n }, 'push')}>
-                          {n}
-                        </PaginationLink>
-                      </PaginationItem>
-                    ))}
-                    <PaginationItem>
-                      <PaginationNext
-                        aria-disabled={page >= totalPages}
-                        onClick={() => page < totalPages && commit({ page: page + 1 }, 'push')}
-                        className={page >= totalPages ? 'pointer-events-none opacity-40' : undefined}
-                      />
-                    </PaginationItem>
-                    <PaginationItem>
-                      <PaginationLink
-                        aria-label="Last page"
-                        aria-disabled={page >= totalPages}
-                        onClick={() => page < totalPages && commit({ page: totalPages }, 'push')}
-                        className={
-                          page >= totalPages ? 'pointer-events-none opacity-40' : undefined
-                        }
-                      >
-                        <ChevronsRight size={15} />
-                      </PaginationLink>
-                    </PaginationItem>
-                  </PaginationContent>
-                </Pagination>
+                <ListPager
+                  page={page}
+                  activePage={appliedPage}
+                  totalPages={totalPages}
+                  onGo={(next) => commit({ page: next }, 'push')}
+                  label="Applications pagination"
+                />
               </div>
             </div>
           </>

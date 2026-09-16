@@ -33,14 +33,15 @@
  */
 import { useCallback, useRef, useState } from 'react'
 import type { ConnectorWindow, WindowChoice } from '../../utils/connectorApi'
+import { errorText } from '../../utils/apiError'
 import { Popover } from '../ui/popover'
 import { Switch } from '../ui/switch'
 import WindowChip, { formatWindowLabel } from './WindowChip'
 import WindowPopover from './WindowPopover'
 
 /**
- * The two facts this row renders. Both wire objects that a write can answer with —
- * `ProjectConnectorEntry` and `ConnectorProjectEntry` — carry them, so either satisfies this.
+ * The two facts this row renders — a narrowing rather than a wire type, so any object a write can
+ * answer with satisfies it. `ProjectConnectorEntry` is the one that does today.
  */
 export interface ProjectConnectorState {
   enabled: boolean
@@ -88,10 +89,6 @@ export interface ProjectConnectorRowProps {
 function signature(state: ProjectConnectorState): string {
   const w = state.window
   return `${state.enabled}|${w === null ? '' : `${w.kind}:${w.start}:${w.end}:${w.days}`}`
-}
-
-function message(caught: unknown): string {
-  return caught instanceof Error ? caught.message : String(caught)
 }
 
 export default function ProjectConnectorRow({
@@ -157,7 +154,7 @@ export default function ProjectConnectorRow({
           // Back to the props, AND said out loud. Restoring the switch in silence looks
           // identical to the press never landing.
           setOverride(null)
-          onError(message(caught))
+          onError(errorText(caught))
         })
         .finally(() => setSwitchBusy(false))
     },

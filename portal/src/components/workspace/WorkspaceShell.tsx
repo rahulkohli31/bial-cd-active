@@ -108,7 +108,7 @@ function railWidthClass(collapsed: boolean, paneVisible: boolean): string {
  * ONE FACT, ONE ARGUMENT, TWO EXITS. `UnsavedWorkGuard` applies exactly this rule to the in-place
  * exit and writes the reasoning out in full, including what it emphatically is NOT: a claim that
  * anything was saved. Both guards read the SAME `SaveReading` off the channel, which is what stops
- * the tab and the navbar disagreeing about the same app in the same moment.
+ * the tab and the in-place exit disagreeing about the same app in the same moment.
  */
 function useUnsavedWorkWarning(): void {
   const { dirty, recoveryAt } = useWorkspaceSaveState()

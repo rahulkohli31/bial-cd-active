@@ -3,8 +3,8 @@
  *
  * Two guards already exist: a hoisted `beforeunload` for leaving the TAB, and the
  * server-driven reclaim dialog for another project taking the workspace. Unguarded: an
- * in-place navigation OUT of the workspace (navbar links, breadcrumb, opening another
- * project) while unsaved work exists and no 409 is involved — a same-page navigation is
+ * in-place navigation OUT of the workspace (a navigation destination, the back control,
+ * opening another project) while unsaved work exists and no 409 is involved — a same-page navigation is
  * not an unload, so `beforeunload` never fires for it.
  *
  * THE ARMING RULE. `beforeunload` stays armed only on a definite `true` — its prompt has
@@ -74,7 +74,7 @@ export interface UnsavedWorkGuardOptions {
    * WHOSE WORK IS AT RISK, or `null` when the caller cannot say.
    *
    * "This app has changes that are not saved yet" is ambiguous the moment a citizen has more than
-   * one project — and the two exits this dialog covers, the navbar and the back control, are
+   * one project — and the two exits this dialog covers, the navigation and the back control, are
    * exactly the ones taken while thinking about a different app. Naming it costs one prop and
    * removes the ambiguity entirely.
    */

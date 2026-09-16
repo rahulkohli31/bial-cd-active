@@ -1,14 +1,14 @@
 """The citizen's connectors: what the registry offers, where they stand, what each project reads.
 
 TWO ROUTERS, TWO MOUNT POINTS, ONE DOMAIN. `router` hangs off `/v1/connectors` and answers for
-the PERSON — the catalogue, their state, asking, withdrawing the ask, and the drill-down list of
-their own projects. `project_router` hangs off `/v1/projects/{project_id}/connectors` and answers
-for the PROJECT — which connectors it reads and over which days. `ConnectorStates` draws the two
-as separate state machines and says why: an administrator answers once, about a person, and after
-that a project only ever answers "switched on here?" and "how far back?".
+the PERSON — the catalogue, their state, asking, and withdrawing the ask. `project_router` hangs
+off `/v1/projects/{project_id}/connectors` and answers for the PROJECT — which connectors it
+reads and over which days. `ConnectorStates` draws the two as separate state machines and says
+why: an administrator answers once, about a person, and after that a project only ever answers
+"switched on here?" and "how far back?".
 
 THE OWNERSHIP CHECK A REVIEWER SHOULD BE ABLE TO MAKE BY READING TOP TO BOTTOM. There is no
-cross-user read among these six routes. Every statement that touches `connector_access_requests`
+cross-user read among these five routes. Every statement that touches `connector_access_requests`
 carries `user_id == user.id` in its WHERE clause, and every statement that touches
 `project_connectors` reaches it through a join on `projects` whose `user_id` predicate is in the
 same clause (that table deliberately carries no `user_id` of its own — `projects` is its
@@ -136,8 +136,8 @@ async def _on_projects(
     read the connector's switch as up. The card's `state` is the one place the person-level fact
     is stated, so the rows stay and say what they are.
 
-    Newest project first — `id` is a UUIDv7 — matching the order the projects listing and the
-    drill-down both use, so the same projects do not reshuffle between screens."""
+    Newest project first — `id` is a UUIDv7 — the order the projects listing uses, so the same
+    projects do not reshuffle between screens."""
     rows = await db.execute(
         sa.select(Project.id, Project.name)
         .join(ProjectConnector, ProjectConnector.project_id == Project.id)
@@ -358,13 +358,11 @@ async def cancel_access_request(
 
 
 # A SECOND ROUTER IN THE SAME MODULE, and the mount points are why. Everything above hangs off
-# `/v1/connectors` because access belongs to the PERSON. Two of the three routes below hang off
+# `/v1/connectors` because access belongs to the PERSON. The two routes below hang off
 # `/v1/projects/{project_id}/connectors` instead, because the switch and the days belong to the
 # PROJECT (`ConnectorStates`: `Access is yours. The days are the project's.`). One `APIRouter`
 # cannot carry two prefixes, and splitting the file would put one domain's five routes and its
-# shared `_known_connector` in two places. The third — the drill-down list of the caller's own
-# projects — stays on `router`: it is reached from the person's connector row, keys on nothing
-# but `user_id`, and names no project in its path.
+# shared `_known_connector` in two places.
 #
 # THE OWNERSHIP CLAIM EXTENDS UNCHANGED. `project_connectors` carries no `user_id` of its own —
 # `projects` is its ownership anchor — so every statement below reaches it through a join on
@@ -612,7 +610,6 @@ async def list_project_connectors(
     # `populate_existing`: this router's upsert is an INSERT, so — unlike an ORM-enabled UPDATE
     # — it does not synchronise the session's identity map. A read that follows a write in the
     # SAME session must take the database's values, never a stale in-session copy of the row.
-    # The drill-down read says the same thing for the same reason.
     rows = (
         await db.execute(
             sa.select(ProjectConnector)

@@ -1,6 +1,6 @@
 /**
- * THE TOOLBAR ROW — one 54px row under the navbar, on both workspace screens, drawn once by
- * the shell rather than per-surface.
+ * THE TOOLBAR ROW — one 54px row across the top of both workspace screens, drawn once by the
+ * shell rather than per-surface.
  *
  * WHY THIS EXISTS: it used to be three separate headers (rail, conversation panel, framed
  * preview), and the project name lived inside the 400px rail — so it truncated at the rail's
@@ -299,7 +299,7 @@ export default function WorkspaceToolbar({
             </div>
 
             {/* RELOAD IS A FOURTH OCCUPANT the boards do not draw, kept for the same reason the
-                navbar keeps Marketplace: it is a shipped recourse, not decoration. The automatic
+                navigation keeps Marketplace: it is a shipped recourse, not decoration. The automatic
                 remount covers what the platform can detect — a turn ending over a live preview —
                 and "what I see is out of date" (a dev server restarted, an HMR socket that died
                 quietly) is a judgement only the person looking at it can make. Without it their
