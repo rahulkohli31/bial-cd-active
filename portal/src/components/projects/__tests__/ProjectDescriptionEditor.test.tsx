@@ -53,7 +53,7 @@ function deferred<T>() {
   return { promise, resolve, reject }
 }
 
-const textarea = () => screen.getByRole('textbox', { name: /project description/i }) as HTMLTextAreaElement
+const textarea = () => screen.getByRole('textbox', { name: /application description/i }) as HTMLTextAreaElement
 const saveBtn = () => screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement
 const cancelBtn = () => screen.getByRole('button', { name: /cancel/i }) as HTMLButtonElement
 const editBtn = () => screen.getByRole('button', { name: /edit/i }) as HTMLButtonElement
@@ -77,7 +77,7 @@ describe('ProjectDescriptionEditor — read view and pop-up open/close', () => {
     render(<ProjectDescriptionEditor projectId="p1" description="Handles VIP movement." onProjectUpdate={vi.fn()} />)
 
     expect(screen.getByText('Handles VIP movement.')).toBeTruthy()
-    expect(screen.queryByRole('textbox', { name: /project description/i })).toBeNull()
+    expect(screen.queryByRole('textbox', { name: /application description/i })).toBeNull()
     expect(dialog()).toBeNull()
     expect(editBtn()).toBeTruthy()
   })

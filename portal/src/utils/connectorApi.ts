@@ -497,7 +497,7 @@ export async function listProjectConnectors(
     {},
     deps,
   )
-  if (!res.ok) throw await readApiError(res, 'Failed to load this project’s data settings')
+  if (!res.ok) throw await readApiError(res, 'Failed to load this application’s data settings')
   const body: unknown = await res.json()
   const doc = isRecord(body) ? body : {}
   if (!Array.isArray(doc.connectors)) {
@@ -531,6 +531,6 @@ export async function setProjectConnector(
     jsonOpts('PUT', update),
     deps,
   )
-  if (!res.ok) throw await readApiError(res, 'Failed to save this project’s data settings')
+  if (!res.ok) throw await readApiError(res, 'Failed to save this application’s data settings')
   return toProjectConnector(await res.json())
 }

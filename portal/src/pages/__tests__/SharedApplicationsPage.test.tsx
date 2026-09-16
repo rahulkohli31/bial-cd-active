@@ -423,7 +423,7 @@ describe('★ a failing read', () => {
     renderPage()
 
     const card = await screen.findByTestId('shared-error')
-    expect(card.textContent).toContain('Couldn’t load projects shared with you')
+    expect(card.textContent).toContain('Couldn’t load the applications shared with you')
 
     fireEvent.click(within(card).getByRole('button', { name: 'Retry' }))
 
@@ -435,11 +435,11 @@ describe('★ a failing read', () => {
 
 describe('★ a recipient bounced off a dead share', () => {
   it('is told once, in the page\'s own polite region, and the sentence does not survive a reload', async () => {
-    renderPage({ pathname: '/shared-applications', state: { notice: 'That project is no longer available.' } })
+    renderPage({ pathname: '/shared-applications', state: { notice: 'That application is no longer available.' } })
 
     const region = await screen.findByTestId('shared-notice')
     expect(region.getAttribute('aria-live')).toBe('polite')
-    await waitFor(() => expect(region.textContent).toContain('That project is no longer available.'))
+    await waitFor(() => expect(region.textContent).toContain('That application is no longer available.'))
 
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss notice' }))
 

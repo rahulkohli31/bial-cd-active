@@ -45,7 +45,7 @@ export interface ProjectCardProps {
 }
 
 export default function ProjectCard({ project, onOpen, onSettings, onDelete, live }: ProjectCardProps): React.JSX.Element {
-  const name = project.name || 'Untitled project'
+  const name = project.name || 'Untitled application'
 
   return (
     <AppTile

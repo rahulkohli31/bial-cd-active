@@ -56,7 +56,7 @@ import { PROJECT_GONE_NOTICE } from './ProjectsPage'
  * messages; this is not a licence to replace them all with one line.
  */
 function loadErrorFor(err: unknown): string {
-  if (!(err instanceof ApiError)) return 'Could not load this project.'
+  if (!(err instanceof ApiError)) return 'Could not load this application.'
   return err.status === 422 ? PROJECT_GONE_NOTICE : err.message
 }
 
@@ -205,7 +205,7 @@ export default function ProjectPage() {
         {loading ? (
           <main className="flex-1 min-h-0 overflow-y-auto" aria-busy="true">
             <div className="w-full px-5 py-6">
-              <p className="text-sm font-medium text-neutral mb-4">Loading this project…</p>
+              <p className="text-sm font-medium text-neutral mb-4">Loading this application…</p>
               <div className="h-6 w-48 bg-gray-100 rounded animate-pulse mb-4" />
               <div className="h-24 bg-gray-100 rounded-2xl animate-pulse" />
             </div>
@@ -220,10 +220,10 @@ export default function ProjectPage() {
               onClick={goToProjects}
               className="flex items-center gap-1 text-sm text-neutral hover:text-primary transition mb-4"
             >
-              <ArrowLeft size={15} /> Back to projects
+              <ArrowLeft size={15} /> Back to My Applications
             </button>
             <div className="bg-white border border-danger/20 rounded-2xl py-16 px-6 text-center">
-              <p className="text-sm font-semibold text-tertiary">Couldn’t load this project</p>
+              <p className="text-sm font-semibold text-tertiary">Couldn’t load this application</p>
               <p className="text-xs text-neutral mt-1">{loadError || 'It may have been deleted.'}</p>
             </div>
           </div>

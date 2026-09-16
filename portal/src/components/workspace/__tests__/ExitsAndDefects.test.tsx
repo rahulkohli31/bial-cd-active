@@ -182,7 +182,7 @@ describe('★ no exit discards unsaved work in silence', () => {
     render(<Workspace />)
     await waitFor(() => expect(screen.getByTestId('save-project')).toBeTruthy())
 
-    fireEvent.click(screen.getByRole('button', { name: 'Back to projects' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back to My Applications' }))
 
     await waitFor(() => expect(guardDialog()).toBeTruthy())
     expect(screen.getByTestId('where').textContent).toBe('/projects/pB')
@@ -192,7 +192,7 @@ describe('★ no exit discards unsaved work in silence', () => {
     dirtyAndAlive()
     render(<Workspace />)
     await waitFor(() => expect(screen.getByTestId('save-project')).toBeTruthy())
-    fireEvent.click(screen.getByRole('button', { name: 'Back to projects' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back to My Applications' }))
     await waitFor(() => expect(guardDialog()).toBeTruthy())
 
     fireEvent.click(screen.getByRole('button', { name: /stay/i }))
@@ -211,7 +211,7 @@ describe('★ no exit discards unsaved work in silence', () => {
     render(<Workspace />)
     await waitFor(() => expect(screen.getByTestId('save-project')).toBeTruthy())
 
-    fireEvent.click(screen.getByRole('button', { name: 'Back to projects' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back to My Applications' }))
 
     await waitFor(() => expect(guardDialog()).toBeTruthy())
     expect(document.body.textContent).toContain('“Visitor Log” has changes that are not saved yet')

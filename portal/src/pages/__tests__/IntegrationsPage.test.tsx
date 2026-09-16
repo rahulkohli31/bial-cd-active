@@ -498,7 +498,7 @@ describe('the page and Settings › Integrations read one source', () => {
     cleanup()
 
     await openSettingsIntegrations()
-    expect(screen.getByLabelText('Read ORBIT in this project').getAttribute('data-state')).toBe(
+    expect(screen.getByLabelText('Read ORBIT in this application').getAttribute('data-state')).toBe(
       'unchecked',
     )
     expect(screen.getByText('Switch it on when a chat needs flight data')).toBeTruthy()
@@ -508,7 +508,7 @@ describe('the page and Settings › Integrations read one source', () => {
     switches = { p1: false, p2: true }
 
     await openSettingsIntegrations()
-    fireEvent.click(screen.getByLabelText('Read ORBIT in this project'))
+    fireEvent.click(screen.getByLabelText('Read ORBIT in this application'))
     await waitFor(() => expect(switches.p1).toBe(true))
     cleanup()
 

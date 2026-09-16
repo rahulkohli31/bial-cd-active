@@ -241,7 +241,7 @@ describe('★ the two things on this page that change silently now announce', ()
     // PAIRED WITH A REAL CHANGE, so a static page cannot pass this: the caption has to say
     // something different after the search, not merely carry the attribute.
     h.listProjects.mockResolvedValue(page([mkProject('p1', 'One')], { total: 1, totalPages: 1 }))
-    fireEvent.change(screen.getByLabelText('Search projects'), { target: { value: 'One' } })
+    fireEvent.change(screen.getByLabelText('Search applications'), { target: { value: 'One' } })
     await waitFor(() => expect(screen.getByTestId('projects-range').textContent).not.toBe(before))
     expect(screen.getByTestId('projects-range').textContent).toContain('of 1')
   })
@@ -427,7 +427,7 @@ describe('numbered pagination', () => {
       expect(h.listProjects).toHaveBeenCalledWith(expect.objectContaining({ page: 3 })),
     )
 
-    fireEvent.change(screen.getByLabelText('Search projects'), { target: { value: 'vip' } })
+    fireEvent.change(screen.getByLabelText('Search applications'), { target: { value: 'vip' } })
 
     await waitFor(
       () => expect(h.listProjects).toHaveBeenCalledWith(expect.objectContaining({ page: 1, q: 'vip' })),
@@ -452,7 +452,7 @@ describe('the states', () => {
     await screen.findByText('Alpha')
 
     h.listProjects.mockResolvedValue(page([]))
-    fireEvent.change(screen.getByLabelText('Search projects'), { target: { value: 'zzz' } })
+    fireEvent.change(screen.getByLabelText('Search applications'), { target: { value: 'zzz' } })
 
     const noMatch = await screen.findByTestId('projects-no-matches', undefined, { timeout: 3000 })
     expect(noMatch.textContent).toContain('zzz')
@@ -463,7 +463,7 @@ describe('the states', () => {
     renderPage()
 
     const err = await screen.findByTestId('projects-error')
-    expect(err.textContent).toMatch(/Couldn’t load your projects/)
+    expect(err.textContent).toMatch(/Couldn’t load your applications/)
 
     h.listProjects.mockResolvedValue(page([mkProject('p1', 'Alpha')]))
     fireEvent.click(within(err).getByText('Retry'))
@@ -543,14 +543,14 @@ describe('the states', () => {
 })
 
 describe('create and delete', () => {
-  it('has exactly ONE New project button', async () => {
+  it('has exactly ONE Create App button', async () => {
     h.listProjects.mockResolvedValue(page([mkProject('p1', 'Alpha')]))
     renderPage()
     await screen.findByText('Alpha')
 
     // The trap: adding it to the controls row without deleting the page
     // header's one ships two.
-    expect(screen.getAllByRole('button', { name: /New project/i })).toHaveLength(1)
+    expect(screen.getAllByRole('button', { name: /Create App/i })).toHaveLength(1)
   })
 
   it('a 404 on delete removes the row with no error toast', async () => {
@@ -578,7 +578,7 @@ describe('create and delete', () => {
     // testid because the dismiss button's X is an svg too — "some icon in the toast" would
     // let a mutant that deletes the marker pass.
     h.listProjects.mockResolvedValue(page([mkProject('p1', 'Alpha')]))
-    h.deleteProject.mockRejectedValue(new ApiError('Could not delete the project.', 500))
+    h.deleteProject.mockRejectedValue(new ApiError('Could not delete the application.', 500))
     renderPage()
     await screen.findByText('Alpha')
 
@@ -603,11 +603,11 @@ describe('create and delete', () => {
     renderPage()
     await screen.findByTestId('projects-empty')
 
-    fireEvent.change(screen.getByLabelText('Search projects'), { target: { value: 'zzz' } })
+    fireEvent.change(screen.getByLabelText('Search applications'), { target: { value: 'zzz' } })
     await screen.findByTestId('projects-no-matches', undefined, { timeout: 3000 })
 
     h.listProjects.mockResolvedValue(page([mkProject('p1', 'Alpha')]))
-    fireEvent.change(screen.getByLabelText('Search projects'), { target: { value: '' } })
+    fireEvent.change(screen.getByLabelText('Search applications'), { target: { value: '' } })
 
     // Inside the debounce window the rows have not landed, and the first-run panel must not
     // appear in the gap.
@@ -813,10 +813,10 @@ describe('the projects list and the count tiles keep WORDS and a busy state', ()
     h.listProjectCounts.mockReturnValue(new Promise(() => {}))
     renderPage()
 
-    expect(await screen.findByText('Loading your projects…')).toBeTruthy()
+    expect(await screen.findByText('Loading your applications…')).toBeTruthy()
     // Said ONCE, for both waits — no `sr-only` duplicate, and not one sentence per skeleton.
-    expect(screen.getAllByText('Loading your projects…')).toHaveLength(1)
-    const regions = regionsSaying(/Loading your projects/)
+    expect(screen.getAllByText('Loading your applications…')).toHaveLength(1)
+    const regions = regionsSaying(/Loading your applications/)
     expect(regions).toHaveLength(1)
     expect(regions[0]).toBe(screen.getByTestId('projects-wait'))
     // TWO busy containers, one sentence: the tiles grid and the row skeletons. `aria-busy` is a
@@ -837,7 +837,7 @@ describe('the projects list and the count tiles keep WORDS and a busy state', ()
     await waitFor(() => expect(screen.getByTestId('projects-wait').textContent).toBe(''))
 
     const before = screen.getByTestId('projects-wait')
-    expect(regionsSaying(/Loading your projects/)).toHaveLength(0)
+    expect(regionsSaying(/Loading your applications/)).toHaveLength(0)
     // Paired with a liveness assertion: an empty region also describes a crashed render.
     expect(screen.getByText('Alpha')).toBeTruthy()
 
@@ -845,9 +845,9 @@ describe('the projects list and the count tiles keep WORDS and a busy state', ()
     h.listProjects.mockReturnValue(new Promise(() => {}))
     fireEvent.click(screen.getByRole('button', { name: '2' }))
 
-    await waitFor(() => expect(before.textContent).toContain('Loading your projects…'))
+    await waitFor(() => expect(before.textContent).toContain('Loading your applications…'))
     expect(screen.getByTestId('projects-wait')).toBe(before)
-    expect(regionsSaying(/Loading your projects/)).toHaveLength(1)
+    expect(regionsSaying(/Loading your applications/)).toHaveLength(1)
   })
 
   it('★ a page whose reads have all landed says NOTHING — the region is present and silent', async () => {
@@ -858,7 +858,7 @@ describe('the projects list and the count tiles keep WORDS and a busy state', ()
     await screen.findByText('Alpha')
 
     await waitFor(() => expect(screen.getByTestId('projects-wait').textContent).toBe(''))
-    expect(screen.queryByText('Loading your projects…')).toBeNull()
+    expect(screen.queryByText('Loading your applications…')).toBeNull()
     expect(document.querySelectorAll('[aria-busy="true"]')).toHaveLength(0)
   })
 })
@@ -913,7 +913,7 @@ describe('page, search and rows-per-page live in the URL', () => {
     renderPage()
     await screen.findByText('Visitor Log')
 
-    fireEvent.change(screen.getByLabelText('Search projects'), { target: { value: 'ramp' } })
+    fireEvent.change(screen.getByLabelText('Search applications'), { target: { value: 'ramp' } })
     await waitFor(() => expect(screen.queryByText('Visitor Log')).toBeNull(), { timeout: 3000 })
     expect(screen.getByTestId('location-search').textContent).toBe('?q=ramp')
 
@@ -925,7 +925,7 @@ describe('page, search and rows-per-page live in the URL', () => {
 
     await screen.findByText('Ramp Ops')
     // The box holds the term, the request carried it, and the caption counts the FILTERED total.
-    expect((screen.getByLabelText('Search projects') as HTMLInputElement).value).toBe('ramp')
+    expect((screen.getByLabelText('Search applications') as HTMLInputElement).value).toBe('ramp')
     expect(h.listProjects.mock.calls[0][0]).toEqual({ page: 1, limit: 8, q: 'ramp' })
     expect(screen.getByText(/Showing 1–1 of 1/)).toBeTruthy()
     expect(screen.queryByText('Visitor Log')).toBeNull()
@@ -967,7 +967,7 @@ describe('page, search and rows-per-page live in the URL', () => {
     expect(h.listProjects).toHaveBeenCalledTimes(1)
     expect(h.listProjects.mock.calls[0][0]).toEqual({ page: 2, limit: 24, q: 'ramp' })
 
-    expect((screen.getByLabelText('Search projects') as HTMLInputElement).value).toBe('ramp')
+    expect((screen.getByLabelText('Search applications') as HTMLInputElement).value).toBe('ramp')
     expect(screen.getByRole('combobox', { name: 'Rows per page' }).textContent).toContain('24')
     expect(screen.getByText(/Page 2 of 2/)).toBeTruthy()
   })
@@ -991,7 +991,7 @@ describe('page, search and rows-per-page live in the URL', () => {
     await screen.findByText('Ramp Ops')
     expect(stack.depth).toBe(1)
 
-    const box = screen.getByLabelText('Search projects')
+    const box = screen.getByLabelText('Search applications')
     for (const value of ['r', 'ra', 'ram', 'ramp']) fireEvent.change(box, { target: { value } })
 
     await waitFor(() => expect(screen.getByTestId('location-search').textContent).toBe('?q=ramp'))
@@ -1277,7 +1277,7 @@ describe('★ the three summary tiles filter the list beneath them', () => {
     renderPage('/projects?filter=inPipeline')
     await screen.findByText('Waiting')
 
-    fireEvent.change(screen.getByLabelText('Search projects'), { target: { value: 'Waiting' } })
+    fireEvent.change(screen.getByLabelText('Search applications'), { target: { value: 'Waiting' } })
 
     await waitFor(
       () =>
@@ -1323,7 +1323,7 @@ describe('★ the three summary tiles filter the list beneath them', () => {
     // Liveness first: the page settled on its no-matches card rather than on nothing at all.
     await screen.findByTestId('projects-no-matches')
     expect(screen.queryByTestId('projects-empty')).toBeNull()
-    expect(screen.getByText('No project matches that filter.')).toBeTruthy()
+    expect(screen.getByText('No application matches that filter.')).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: 'Clear the filter' }))
 

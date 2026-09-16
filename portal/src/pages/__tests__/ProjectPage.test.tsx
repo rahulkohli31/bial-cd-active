@@ -469,7 +469,7 @@ describe('ProjectPage — a dead address says something on the way out', () => {
 
     // LIVENESS FIRST: the page is on screen and settled, so the three absences below are absences
     // rather than a crashed tree that renders nothing at all.
-    expect(await screen.findByText(/Couldn’t load this project/i)).toBeTruthy()
+    expect(await screen.findByText(/Couldn’t load this application/i)).toBeTruthy()
     expect(screen.queryByText(PROJECT_GONE_NOTICE)).toBeNull()
     expect(screen.queryByTestId('projects-notice')).toBeNull()
     expect(screen.queryByTestId('location')).toBeNull()
@@ -557,7 +557,7 @@ describe('ProjectPage — a mangled address never shows the validator', () => {
     // PRESENCE FIRST, and it is what makes the four absences below mean anything: a page that
     // crashed on this branch would satisfy every `not.toMatch` for free.
     expect(await screen.findByText(PROJECT_GONE_NOTICE)).toBeTruthy()
-    expect(screen.getByText(/Couldn’t load this project/i)).toBeTruthy()
+    expect(screen.getByText(/Couldn’t load this application/i)).toBeTruthy()
 
     const onScreen = document.body.textContent ?? ''
     // The `type`, which no rendering path carries today — pinned so that a future change which
@@ -579,7 +579,7 @@ describe('ProjectPage — a mangled address never shows the validator', () => {
     h.getProject.mockRejectedValue(mangled())
     renderProjectPage(MANGLED_ID)
 
-    fireEvent.click(await screen.findByRole('button', { name: /back to projects/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /back to my applications/i }))
     await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('/projects'))
     // The involuntary-exit sentence belongs to the dead-address bounce; a press the citizen made carries nothing.
     expect(screen.getByTestId('location-notice').textContent).toBe('')
@@ -662,7 +662,7 @@ describe('ProjectPage — the project-open mark', () => {
     h.getProject.mockRejectedValue(new ApiError('boom', 500))
     renderProjectPage('p-broken')
 
-    await screen.findByText(/couldn.t load this project/i)
+    await screen.findByText(/couldn.t load this application/i)
     expect(beacons()).toEqual([])
   })
 
@@ -729,10 +729,10 @@ describe('the project skeleton keeps WORDS and a busy state', () => {
     h.getProject.mockReturnValue(new Promise(() => {}))
     renderProjectPage('p-wait-words')
 
-    expect(screen.getByText('Loading this project…')).toBeTruthy()
+    expect(screen.getByText('Loading this application…')).toBeTruthy()
     // Said ONCE — no `sr-only` duplicate beside the visible sentence.
-    expect(screen.getAllByText('Loading this project…')).toHaveLength(1)
-    const regions = regionsSaying(/Loading this project/)
+    expect(screen.getAllByText('Loading this application…')).toHaveLength(1)
+    const regions = regionsSaying(/Loading this application/)
     expect(regions).toHaveLength(1)
     const region = screen.getByTestId('project-wait')
     expect(regions[0]).toBe(region)
@@ -751,15 +751,15 @@ describe('the project skeleton keeps WORDS and a busy state', () => {
 
     const before = screen.getByTestId('project-wait')
     expect(before.textContent).toBe('')
-    expect(regionsSaying(/Loading this project/)).toHaveLength(0)
+    expect(regionsSaying(/Loading this application/)).toHaveLength(0)
 
     // `projectId` is a param on a route that is NOT remounted when it changes, so this is the
     // real product path in which a settled screen flips back to loading.
     h.getProject.mockReturnValue(new Promise(() => {}))
     fireEvent.click(screen.getByTestId('switch-project'))
 
-    await waitFor(() => expect(before.textContent).toContain('Loading this project…'))
+    await waitFor(() => expect(before.textContent).toContain('Loading this application…'))
     expect(screen.getByTestId('project-wait')).toBe(before)
-    expect(regionsSaying(/Loading this project/)).toHaveLength(1)
+    expect(regionsSaying(/Loading this application/)).toHaveLength(1)
   })
 })

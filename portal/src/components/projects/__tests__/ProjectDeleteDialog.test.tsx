@@ -115,7 +115,7 @@ describe('ProjectDeleteDialog — confirm gating', () => {
     expect(screen.queryByLabelText(/type the project name/i)).toBeNull()
     // Liveness, so the absence above means something.
     expect(screen.getByLabelText(/why are you deleting/i)).toBeTruthy()
-    expect(screen.getByText(/are you sure you want to delete this project/i)).toBeTruthy()
+    expect(screen.getByText(/are you sure you want to delete this application/i)).toBeTruthy()
   })
 
   it('says what happens to the reason, and does not overpromise who reads it', async () => {

@@ -182,7 +182,7 @@ describe('what the row names on each address', () => {
   it('the project screen: back and the project name, and NOT a second copy of the state', () => {
     render(<Workspace />)
 
-    expect(screen.getByRole('button', { name: 'Back to projects' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Back to My Applications' })).toBeTruthy()
     expect(title().textContent).toBe('Visitor Log — Airport Office')
     expect(title().tagName).toBe('H1')
     // The rail's APP STATUS section already carries this state; a chip beside the title would
@@ -238,8 +238,8 @@ describe('what the row names on each address', () => {
 
     expect(row()).toBeTruthy()
     expect(row().className).toMatch(/h-\[54px\]/)
-    expect(row().textContent).toContain('Your project')
-    expect(screen.getByRole('button', { name: 'Back to project' })).toBeTruthy()
+    expect(row().textContent).toContain('Your application')
+    expect(screen.getByRole('button', { name: 'Back to the application' })).toBeTruthy()
   })
 
   it('★ a chat still inside its load window is drawn as a CHAT, not as the project screen', () => {
@@ -255,11 +255,11 @@ describe('what the row names on each address', () => {
 
     // On the project screen "Your project" IS the <h1>; on a chat it is the breadcrumb, and the
     // <h1> is the chat's own (empty) slot.
-    expect(row().textContent).toContain('Your project')
+    expect(row().textContent).toContain('Your application')
     expect(title().textContent).toBe('')
     expect(screen.queryByRole('button', { name: /rename/i })).toBeNull()
     // With no project resolved there is none to return to, so back goes to the list.
-    expect(screen.getByRole('button', { name: 'Back to projects' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Back to My Applications' })).toBeTruthy()
     // LIVENESS: the row is drawn at full height throughout, which is the property that stops the
     // layout shifting when the fetch lands.
     expect(row().className).toMatch(/h-\[54px\]/)
@@ -273,7 +273,7 @@ describe('what the row names on each address', () => {
       />,
     )
 
-    fireEvent.click(screen.getByRole('button', { name: 'Back to project' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back to the application' }))
     expect(screen.getByTestId('where').textContent).toBe('/projects/pA')
   })
 
@@ -282,7 +282,7 @@ describe('what the row names on each address', () => {
     // "never", and in both the row keeps its height, its word and its way out.
     render(<Workspace entry="/chat/c1" chat={{ heading: { ...CHAT_HEADING, projectName: null } }} />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Back to project' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back to the application' }))
     expect(screen.getByTestId('where').textContent).toBe('/projects/pA')
   })
 
@@ -341,7 +341,7 @@ describe('collapsing the rail', () => {
     // column rather than inside it, for the same reason the toolbar control is not in the rail.
     expect(screen.getAllByRole('button', { name: 'Show the chat' })).toHaveLength(2)
     expect(screen.getByTestId('chat-stub')).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Back to projects' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Back to My Applications' })).toBeTruthy()
   })
 
   it('★ collapses in BOTH directions, because below the threshold the columns stack', () => {
@@ -734,12 +734,12 @@ describe('the back control, and the menu that replaced two controls', () => {
 
   it('goes to the projects list from a project, and to the project from a chat', () => {
     render(<Workspace />)
-    fireEvent.click(screen.getByRole('button', { name: 'Back to projects' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back to My Applications' }))
     expect(screen.getByTestId('where').textContent).toBe('/projects')
 
     cleanup()
     render(<Workspace entry="/chat/c1" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Back to project' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back to the application' }))
     expect(screen.getByTestId('where').textContent).toBe('/projects/pA')
   })
 
@@ -748,7 +748,7 @@ describe('the back control, and the menu that replaced two controls', () => {
     // without a word. It routes through the same guard the navigation's links do.
     render(<Workspace project={{ heading: PROJECT_HEADING, save: { dirty: true, saving: false, error: null } }} />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Back to projects' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back to My Applications' }))
 
     expect(await screen.findByRole('dialog')).toBeTruthy()
     expect(screen.getByTestId('where').textContent).toBe('/projects/pA')
@@ -804,7 +804,7 @@ describe('the back control, and the menu that replaced two controls', () => {
     // LIVENESS: the row is fully drawn around that absence — full height, a word in the name
     // slot — so this is a control that is gone rather than a tree that failed to render.
     expect(row().className).toMatch(/h-\[54px\]/)
-    expect(title().textContent).toBe('Your project')
+    expect(title().textContent).toBe('Your application')
 
     cleanup()
     const settings = vi.fn()
@@ -821,7 +821,7 @@ describe('the back control, and the menu that replaced two controls', () => {
        validator sentence this unit came to remove. */
     render(<Workspace project={{ heading: { ...PROJECT_HEADING, projectName: null } }} />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Back to projects' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back to My Applications' }))
     expect(screen.getByTestId('where').textContent).toBe('/projects')
   })
 
@@ -832,9 +832,9 @@ describe('the back control, and the menu that replaced two controls', () => {
        allowed to read the same `null`; it is not allowed to change what the slot says. */
     render(<Workspace entry="/chat/c1" chat={{ heading: { ...CHAT_HEADING, projectName: null } }} />)
 
-    expect(row().textContent).toContain('Your project')
+    expect(row().textContent).toContain('Your application')
     expect(title().textContent).toBe('Add an out-time column')
-    expect(screen.getByRole('button', { name: 'Back to project' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Back to the application' })).toBeTruthy()
     // The menu is about the APPLICATION; a chat address never had it, name or no name.
     expect(screen.queryByTestId('workspace-menu')).toBeNull()
   })
@@ -881,7 +881,7 @@ describe('the back control carries the projects list state back', () => {
     // on the destination below would miss.
     expect(screen.getByTestId('surface')).toBeTruthy()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Back to projects' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back to My Applications' }))
 
     expect(screen.getByTestId('where-full').textContent).toBe('/projects?page=2&pageSize=20&q=ramp')
   })
@@ -889,7 +889,7 @@ describe('the back control carries the projects list state back', () => {
   it('falls back to the bare list when nothing has been remembered this session', () => {
     renderAt('/projects/pA')
 
-    fireEvent.click(screen.getByRole('button', { name: 'Back to projects' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back to My Applications' }))
 
     expect(screen.getByTestId('where-full').textContent).toBe('/projects')
   })
@@ -1010,7 +1010,7 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
     fireEvent.click(screen.getByRole('button', { name: 'Hide the chat' }))
   }
 
-  const back = () => screen.getByRole('button', { name: 'Back to projects' })
+  const back = () => screen.getByRole('button', { name: 'Back to My Applications' })
   const menu = () => screen.getByTestId('workspace-menu')
   const devices = () => ['Desktop', 'Mobile'].map((name) => screen.getByRole('button', { name }))
   const reload = () => screen.getByRole('button', { name: 'Reload your app' })
@@ -1159,7 +1159,7 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
     expect(title().textContent).toBe(long)
     expect(cls(title())).toMatch(/\btruncate\b/)
     expect(cls(row())).toMatch(/h-\[54px\]/)
-    expect(screen.getByRole('button', { name: 'Back to project' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Back to the application' })).toBeTruthy()
     expect(save()).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Reload your app' })).toBeTruthy()
   })

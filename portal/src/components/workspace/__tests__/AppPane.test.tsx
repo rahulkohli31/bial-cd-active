@@ -895,13 +895,13 @@ describe('★ taking the workspace back', () => {
     renderPane((c) => c.workspace.set(reportFor(reading({ state: 'slot_taken' }))))
 
     // The remedy is offered, unnamed — a missing holder is a reason to say less, not to do less.
-    const remedy = screen.getByRole('button', { name: /^Stop the other project and open this app instead$/ })
+    const remedy = screen.getByRole('button', { name: /^Stop the other application and open this one instead$/ })
     expect(remedy).toBeTruthy()
     // And there is nothing to open, so the go-to is correctly absent rather than empty-quoted.
     expect(screen.queryByRole('button', { name: /^Open /i })).toBeNull()
     // Nor does the sentence invent a name or leave a hollow pair of quotes where one belongs.
     const board = screen.getByTestId('app-pane-empty').textContent ?? ''
-    expect(board).toContain('Another project is using your workspace.')
+    expect(board).toContain('Another application is using your workspace.')
     expect(board).not.toMatch(/[“"]\s*[”"]/)
   })
 

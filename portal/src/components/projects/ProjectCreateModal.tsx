@@ -205,7 +205,7 @@ export default function ProjectCreateModal({ onClose, onCreated }: ProjectCreate
             <p className="text-sm text-neutral mt-0.5">
               {screen === 'duplicates'
                 ? "These published apps sound similar to what you're describing."
-                : 'A project owns one app, its description, and its chats.'}
+                : 'An application owns its screens, its description, and its chats.'}
             </p>
           </div>
           <button

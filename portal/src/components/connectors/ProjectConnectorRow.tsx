@@ -173,7 +173,7 @@ export default function ProjectConnectorRow({
     [shown.enabled, write],
   )
 
-  const where = projectName === null ? 'this project' : projectName
+  const where = projectName === null ? 'this application' : projectName
   const label = projectName ?? connectorName
 
   return (

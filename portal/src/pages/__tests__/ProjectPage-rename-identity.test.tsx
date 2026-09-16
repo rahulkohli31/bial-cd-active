@@ -171,7 +171,7 @@ describe("the toolbar menu keeps the identity guard `ChatRoute.tsx` already has"
     fireEvent.click(screen.getByTestId('switch-pB'))
 
     // LIVENESS FIRST: the screen is doing something, not sitting inside a crashed boundary.
-    await screen.findByText('Loading this project…')
+    await screen.findByText('Loading this application…')
     // The menu is gone rather than standing over a project that is no longer on screen — a
     // guard keyed on identity, so a mismatch hides it instead of leaving it enabled against A's
     // name while the address reads B.

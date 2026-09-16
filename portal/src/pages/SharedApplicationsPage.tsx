@@ -397,7 +397,7 @@ export default function SharedApplicationsPage(): React.JSX.Element {
             className="bg-white border border-danger/30 rounded-2xl py-16 px-6 text-center"
           >
             <AlertTriangle size={22} className="mx-auto text-danger mb-3" />
-            <p className="text-sm font-semibold text-tertiary">Couldn’t load projects shared with you</p>
+            <p className="text-sm font-semibold text-tertiary">Couldn’t load the applications shared with you</p>
             <p className="text-xs text-neutral mt-1 mb-3">The server did not answer. Nothing has been lost.</p>
             <button
               onClick={() => setReloadNonce((n) => n + 1)}
@@ -416,7 +416,7 @@ export default function SharedApplicationsPage(): React.JSX.Element {
           >
             <p className="text-sm font-semibold text-tertiary">Nothing shared with you yet</p>
             <p className="text-xs text-neutral mt-1">
-              When a colleague shares a project with you, it will show up here.
+              When a colleague shares an application with you, it will show up here.
             </p>
           </div>
         ) : showNoMatches ? (

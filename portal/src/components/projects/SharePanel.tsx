@@ -152,7 +152,7 @@ export function SharePanelBody({ projectId }: SharePanelBodyProps): React.JSX.El
         loadShares()
         setResults((prev) => prev.filter((c) => c.id !== colleague.id))
       })
-      .catch((err: unknown) => setActionError(errorMessage(err, 'Could not share this project.')))
+      .catch((err: unknown) => setActionError(errorMessage(err, 'Could not share this application.')))
       .finally(() => setSharingId(null))
   }
 
@@ -171,7 +171,7 @@ export function SharePanelBody({ projectId }: SharePanelBodyProps): React.JSX.El
           the body rather than with either frame. */}
       <p className="text-xs text-neutral leading-relaxed">
         Anyone you add can open and use this app. Anything they enter is saved into the
-        project&rsquo;s real data.
+        application&rsquo;s real data.
       </p>
 
       <label className="block mt-5">
@@ -237,7 +237,7 @@ export function SharePanelBody({ projectId }: SharePanelBodyProps): React.JSX.El
         )}
 
         <div className="mt-5">
-          <p className="text-xs font-semibold text-tertiary">Who can use this project</p>
+          <p className="text-xs font-semibold text-tertiary">Who can use this application</p>
           {sharesLoading ? (
             <p className="text-xs text-neutral mt-2 flex items-center gap-1.5">
               <BusyGlyph size={12} /> Loading…

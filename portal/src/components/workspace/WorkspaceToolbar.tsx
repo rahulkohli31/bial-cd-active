@@ -96,7 +96,7 @@ export default function WorkspaceToolbar({
   // open) or failed (the project was deleted out from under an open chat), and in both cases the
   // row keeps its height, its back control and a word in the slot — which is what stops the layout
   // shifting under someone when the fetch lands.
-  const projectName = heading.projectName ?? 'Your project'
+  const projectName = heading.projectName ?? 'Your application'
 
   /** The same predicate `WorkspaceShell`'s back handler uses, so the label cannot promise a
    *  destination the press does not go to. */
@@ -179,8 +179,8 @@ export default function WorkspaceToolbar({
         // WHAT IT SAYS IS WHAT IT DOES. The shell sends this to the chat's own project only when
         // there IS one to send it to; a chat whose project has not resolved yet goes to the
         // projects list, and must say so rather than promising a project it cannot reach.
-        aria-label={backToProject ? 'Back to project' : 'Back to projects'}
-        title={backToProject ? 'Back to project' : 'Back to projects'}
+        aria-label={backToProject ? 'Back to the application' : 'Back to My Applications'}
+        title={backToProject ? 'Back to the application' : 'Back to My Applications'}
         /* THE SMALLEST TARGET IN THE ROW, at 20×20 — a 16px chevron in 2px of padding. Below the
            stacking threshold it presents 44×44. The GLYPH does not move: `min-h`/`min-w`
            grow the box around it and `justify-center` keeps it in the middle, so nothing about the

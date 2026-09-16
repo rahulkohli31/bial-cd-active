@@ -163,11 +163,11 @@ describe('ProjectCard', () => {
     expect(onOpen).toHaveBeenCalledTimes(1)
   })
 
-  it('falls back to "Untitled project" for an empty name, in the menu\'s label too', () => {
+  it('falls back to "Untitled application" for an empty name, in the menu\'s label too', () => {
     render(<ProjectCard project={mkProject('')} onOpen={vi.fn()} onSettings={vi.fn()} onDelete={vi.fn()} />)
-    expect(screen.getByRole('button', { name: 'Untitled project' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Untitled application' })).toBeTruthy()
     // A page of tiles must not be a page of controls all called "More actions for".
-    expect(screen.getByRole('button', { name: 'More actions for Untitled project' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'More actions for Untitled application' })).toBeTruthy()
   })
 
   it('shows both dates as the board draws them — created, then updated', () => {

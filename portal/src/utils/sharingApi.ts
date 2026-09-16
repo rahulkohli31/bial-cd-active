@@ -76,7 +76,7 @@ export async function listProjectShares(
   deps: AuthFetchDeps = {},
 ): Promise<ProjectShare[]> {
   const res = await authFetch(`/api/projects/${encodeURIComponent(projectId)}/shares`, {}, deps)
-  if (!res.ok) throw await readApiError(res, 'Failed to load this project’s shares')
+  if (!res.ok) throw await readApiError(res, 'Failed to load this application’s shares')
   const body: unknown = await res.json()
   const doc = isRecord(body) ? body : {}
   return Array.isArray(doc.shares)
@@ -99,7 +99,7 @@ export async function shareProject(
     { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ sharedWithUserId }) },
     deps,
   )
-  if (!res.ok) throw await readApiError(res, 'Failed to share this project')
+  if (!res.ok) throw await readApiError(res, 'Failed to share this application')
   const share = toProjectShare(await res.json())
   if (share === null) throw new ApiError('The server returned a share we could not read.', 500)
   return share
@@ -220,7 +220,7 @@ export async function listSharedWithMe(
   if (args.sort) params.set('sort', args.sort)
   const qs = params.toString()
   const res = await authFetch(`/api/projects/shared${qs ? `?${qs}` : ''}`, {}, deps)
-  if (!res.ok) throw await readApiError(res, 'Failed to load projects shared with you')
+  if (!res.ok) throw await readApiError(res, 'Failed to load the applications shared with you')
   const body: unknown = await res.json()
   const doc = isRecord(body) ? body : {}
   return {

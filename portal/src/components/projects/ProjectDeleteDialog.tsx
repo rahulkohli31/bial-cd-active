@@ -157,7 +157,7 @@ export default function ProjectDeleteDialog({
         </p>
 
         <p className="text-sm font-semibold text-tertiary mt-4">
-          Are you sure you want to delete this project?
+          Are you sure you want to delete this application?
         </p>
 
         {/* NAMED, NOT ASKED. Telling someone which account a permanent deletion is about to
@@ -172,7 +172,7 @@ export default function ProjectDeleteDialog({
 
         <label className="block mt-3">
           <span className="text-xs font-semibold text-tertiary">
-            Why are you deleting this project?
+            Why are you deleting this application?
           </span>
           <Textarea
             autoFocus
@@ -180,7 +180,7 @@ export default function ProjectDeleteDialog({
             onChange={(e) => setRemark(e.target.value)}
             rows={3}
             maxLength={MAX_DELETE_REASON_CHARS}
-            aria-label="Why are you deleting this project?"
+            aria-label="Why are you deleting this application?"
             aria-describedby={`${RULE_ID} ${COUNT_ID}`}
             className="mt-1.5 resize-y"
           />

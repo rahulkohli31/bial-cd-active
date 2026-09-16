@@ -124,7 +124,7 @@ export default function AppSettingsDialog({
       >
         <div className="flex items-start justify-between gap-3 border-b border-bial-border px-6 py-4">
           <DialogTitle className="min-w-0 truncate text-base font-bold text-tertiary">
-            {project.name || 'Untitled project'}
+            {project.name || 'Untitled application'}
           </DialogTitle>
           <button
             type="button"

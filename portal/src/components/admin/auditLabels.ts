@@ -72,7 +72,7 @@ const LABELS: Record<string, AuditLabel> = {
     title: 'App deleted',
     description: 'The app, its files and its database were permanently removed.',
   },
-  'project:delete': { title: 'Project deleted' },
+  'project:delete': { title: 'Application deleted' },
 
   // --- access to things that matter --------------------------------------------------
   'bundle:download': {

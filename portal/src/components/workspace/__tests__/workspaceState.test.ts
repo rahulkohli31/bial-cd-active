@@ -175,7 +175,7 @@ describe('★ the five a citizen reads, each from its own real inputs', () => {
     expect(state.name).toBe('held-by-another-project')
     expect(state.headline).toBe('“Car pool” is using your workspace.')
     expect(state.detail).toBe(
-      'You have one workspace at a time. Open that project to pick up where you left off.',
+      'You have one workspace at a time. Open that application to pick up where you left off.',
     )
     expect(state.busy ?? false).toBe(false)
   })
@@ -549,15 +549,15 @@ describe('★ the hand-over state — one card, two sentences, and the order is 
     const state = resolve({ preview: reading({ state: 'slot_taken' }) })
 
     expect(state.name).toBe('held-by-another-project')
-    expect(state.headline).toBe('Another project is using your workspace.')
-    expect(state.detail).toBe('You have one workspace at a time, and we could not tell which project has it.')
+    expect(state.headline).toBe('Another application is using your workspace.')
+    expect(state.detail).toBe('You have one workspace at a time, and we could not tell which application has it.')
     expect(rendered({ preview: reading({ state: 'slot_taken' }) })).not.toMatch(/[“"]\s*[”"]/)
     // The take-back leads because it is the ONLY one, not because it was promoted — there is no
     // go-to to lead with, and `AppPane` draws its second control INSIDE the first one's block, so
     // a lone alternative parked in `secondAction` would be a remedy nothing renders.
     expect(state.action).toEqual({
       kind: 'take-back',
-      label: 'Stop the other project and open this app instead',
+      label: 'Stop the other application and open this one instead',
     })
     expect(state.secondAction ?? null).toBeNull()
   })
@@ -717,7 +717,7 @@ describe('★ taking the workspace back — the second control, and its five end
     ] as const) {
       const state = resolve({ preview: heldBy('Roster', 'p-9'), startOutcome })
       expect(state.name).toBe('held-by-another-project')
-      expect(state.detail).toBe('You have one workspace at a time. Open that project to pick up where you left off.')
+      expect(state.detail).toBe('You have one workspace at a time. Open that application to pick up where you left off.')
       expect(state.note ?? null).toBeNull()
     }
   })

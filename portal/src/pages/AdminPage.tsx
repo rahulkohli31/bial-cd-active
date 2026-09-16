@@ -121,7 +121,7 @@ export default function AdminPage() {
               onClick={() => navigate('/projects')}
               className="mt-6 px-5 py-2.5 rounded-xl bg-primary text-white text-sm font-semibold hover:bg-primary/90 transition"
             >
-              Back to projects
+              Back to My Applications
             </button>
           </div>
         </div>

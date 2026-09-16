@@ -101,7 +101,7 @@ export default function SharedProjectPage(): React.JSX.Element {
           bounceGone()
           return
         }
-        setProjectError(err instanceof Error ? err.message : 'Could not load this project.')
+        setProjectError(err instanceof Error ? err.message : 'Could not load this application.')
       }
     })()
     return () => {
@@ -130,7 +130,7 @@ export default function SharedProjectPage(): React.JSX.Element {
           setBlocked(reclaim)
           return
         }
-        setLaunchError(err instanceof Error ? err.message : 'Could not open this shared project.')
+        setLaunchError(err instanceof Error ? err.message : 'Could not open this shared application.')
       })
       .finally(() => setLaunching(false))
   }, [projectId])
@@ -162,7 +162,7 @@ export default function SharedProjectPage(): React.JSX.Element {
           setBlocked(reclaim)
           return
         }
-        setLaunchError(err instanceof Error ? err.message : 'Could not refresh this shared project.')
+        setLaunchError(err instanceof Error ? err.message : 'Could not refresh this shared application.')
       })
       .finally(() => setRefreshing(false))
   }, [projectId])
@@ -218,10 +218,10 @@ export default function SharedProjectPage(): React.JSX.Element {
           onClick={() => navigate('/projects')}
           className="flex items-center gap-1 text-sm text-neutral hover:text-primary transition flex-shrink-0"
         >
-          <ArrowLeft size={15} /> Back to projects
+          <ArrowLeft size={15} /> Back to My Applications
         </button>
         <h1 className="text-sm font-bold text-tertiary truncate min-w-0">
-          {project?.name || 'Shared project'}
+          {project?.name || 'Shared application'}
         </h1>
         {/* "Can use", never "view only" — Key Decision 3. What this recipient has is not a
             read-only preview; anything they enter here is saved into the project's real data,
@@ -255,7 +255,7 @@ export default function SharedProjectPage(): React.JSX.Element {
         {projectError !== null ? (
           <div className="flex-1 flex items-center justify-center p-6">
             <div className="bg-white border border-danger/20 rounded-2xl py-16 px-6 text-center max-w-md">
-              <p className="text-sm font-semibold text-tertiary">Couldn’t load this project</p>
+              <p className="text-sm font-semibold text-tertiary">Couldn’t load this application</p>
               <p className="text-xs text-neutral mt-1">{projectError}</p>
             </div>
           </div>
@@ -285,7 +285,7 @@ export default function SharedProjectPage(): React.JSX.Element {
         ) : preview !== null && preview.ready ? (
           <iframe
             key={`${preview.previewUrl}#${frameNonce}`}
-            title={project?.name || 'Shared project'}
+            title={project?.name || 'Shared application'}
             src={preview.previewUrl}
             className="flex-1 w-full border-0"
           />

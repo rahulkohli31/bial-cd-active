@@ -186,7 +186,7 @@ describe('sentence always, action selectively — and only one of the three', ()
     renderIn(<PlanChatWorkspaceLine />, (c) => c.workspace.set(report))
 
     // LIVENESS: the sentence is spoken here, so this is a withheld control on a live line.
-    expect(screen.getByTestId('plan-chat-workspace-state').textContent).toMatch(/another project/i)
+    expect(screen.getByTestId('plan-chat-workspace-state').textContent).toMatch(/another application/i)
     expect(screen.queryByRole('button')).toBeNull()
   })
 

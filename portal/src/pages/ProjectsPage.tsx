@@ -88,7 +88,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
  * also why the line is a CONSTANT rather than the server's own message piped through: the moment
  * it is derived from the response, two causes can print two sentences again.
  */
-export const PROJECT_GONE_NOTICE = 'That project is no longer available.'
+export const PROJECT_GONE_NOTICE = 'That application is no longer available.'
 
 const PAGE_SIZES = [8, 16, 24, 48] as const
 const DEFAULT_PAGE_SIZE = PAGE_SIZES[0]
@@ -368,7 +368,7 @@ export default function ProjectsPage(): React.JSX.Element {
         if (requestId.current !== id) return
         // The rows already on screen are LEFT INTACT. A later page failing must not blank
         // the list the reader is using; the message goes underneath them instead.
-        setError(caught instanceof Error ? caught : new Error('Could not load your projects.'))
+        setError(caught instanceof Error ? caught : new Error('Could not load your applications.'))
         setAppliedQuery(debouncedQ)
         setAppliedFilter(filter)
       })
@@ -464,7 +464,7 @@ export default function ProjectsPage(): React.JSX.Element {
       // The row never left, so this is not "put it back" — it is the totals and the counts
       // strip catching up with whatever the failed attempt did or did not change.
       setReloadNonce((n) => n + 1)
-      setToast(caught instanceof Error ? caught.message : 'Could not delete the project.')
+      setToast(caught instanceof Error ? caught.message : 'Could not delete the application.')
     } finally {
       setDeletingIds((ids) => {
         const next = new Set(ids)
@@ -573,7 +573,7 @@ export default function ProjectsPage(): React.JSX.Element {
           Your apps
         </h1>
         <p className="text-sm text-neutral mt-1">
-          Each project is one tool — its app, its description, and its chats.
+          Each application is one tool — its screens, its description, and its chats.
         </p>
 
         {/* THE PAGE'S ONE POLITE REGION — permanently mounted, empty when nothing is in flight.
@@ -589,7 +589,7 @@ export default function ProjectsPage(): React.JSX.Element {
             `sr-only` copy: two elements carrying one sentence is that sentence read twice, which
             `Announcer.tsx` records as having broken three tests. */}
         <div role="status" aria-live="polite" data-testid="projects-wait">
-          {waiting ? <p className="text-sm font-medium text-neutral mt-3">Loading your projects…</p> : null}
+          {waiting ? <p className="text-sm font-medium text-neutral mt-3">Loading your applications…</p> : null}
         </div>
 
         {/* WHY THIS IS NOT THE TOAST AT THE BOTTOM OF THIS FILE. That channel is
@@ -694,8 +694,8 @@ export default function ProjectsPage(): React.JSX.Element {
         )}
         </div>
 
-        {/* ONE controls row: search, density (grid only), view, New project. The
-            New project button lives HERE and nowhere else — adding it to the page
+        {/* ONE controls row: search, density (grid only), view, Create App. The
+            Create App button lives HERE and nowhere else — adding it to the page
             header too would ship two of them. */}
         <div className="flex items-center gap-3 flex-wrap mb-4">
           <div className="relative flex-1 min-w-[220px] max-w-md">
@@ -703,8 +703,8 @@ export default function ProjectsPage(): React.JSX.Element {
             <Input
               value={q}
               onChange={(e) => commit({ q: e.target.value, page: 1 }, 'replace')}
-              placeholder="Search projects…"
-              aria-label="Search projects"
+              placeholder="Search applications…"
+              aria-label="Search applications"
               className="pl-9"
             />
           </div>
@@ -748,7 +748,7 @@ export default function ProjectsPage(): React.JSX.Element {
               onClick={() => setShowCreate(true)}
               className="flex items-center gap-1.5 px-3.5 py-2 text-sm font-semibold bg-primary text-white rounded-lg hover:bg-primary/90 transition whitespace-nowrap"
             >
-              <Plus size={15} /> New project
+              <Plus size={15} /> Create App
             </button>
           </div>
         </div>
@@ -781,7 +781,7 @@ export default function ProjectsPage(): React.JSX.Element {
             className="bg-white border border-danger/30 rounded-2xl py-16 px-6 text-center"
           >
             <AlertTriangle size={22} className="mx-auto text-danger mb-3" />
-            <p className="text-sm font-semibold text-tertiary">Couldn’t load your projects</p>
+            <p className="text-sm font-semibold text-tertiary">Couldn’t load your applications</p>
             <p className="text-xs text-neutral mt-1 mb-3">The server did not answer. Nothing has been lost.</p>
             <button
               onClick={() => setReloadNonce((n) => n + 1)}
@@ -796,14 +796,14 @@ export default function ProjectsPage(): React.JSX.Element {
             className="bg-white border border-bial-border rounded-2xl py-16 px-6 text-center"
           >
             <p className="text-sm font-semibold text-tertiary">Nothing here yet</p>
-            <p className="text-xs text-neutral mt-1 mb-4">Create a project and describe what you need inside it.</p>
+            <p className="text-xs text-neutral mt-1 mb-4">Create an application and describe what you need inside it.</p>
             {/* The SAME dialog the controls row opens — there is exactly one way to make a
                 project. No composer, no chat-kind toggle, no second path. */}
             <button
               onClick={() => setShowCreate(true)}
               className="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-semibold bg-primary text-white rounded-lg hover:bg-primary/90 transition"
             >
-              <Plus size={15} /> New project
+              <Plus size={15} /> Create App
             </button>
           </div>
         ) : showNoMatches ? (
@@ -819,7 +819,7 @@ export default function ProjectsPage(): React.JSX.Element {
             <p className="text-xs text-neutral mt-1">
               {appliedQuery
                 ? `No project matches “${appliedQuery}”. Try a different search.`
-                : 'No project matches that filter.'}
+                : 'No application matches that filter.'}
             </p>
             {/* ONE BUTTON THAT CLEARS WHATEVER IS APPLIED, because clearing only half of a
                 search-and-filter pair lands the reader on this same card again. The label says
@@ -971,7 +971,7 @@ export default function ProjectsPage(): React.JSX.Element {
                 {/* WRAPS rather than overflowing. The number list reached `right: 534px` on a
                     390px screen with only two pages, which put a horizontal scrollbar on the
                     landing page and got worse with six. */}
-                <Pagination className="mx-0 w-auto" aria-label="Projects pagination">
+                <Pagination className="mx-0 w-auto" aria-label="Applications pagination">
                   <PaginationContent className="flex-wrap justify-end">
                     {/* Jump-to-first/last were missing; at six pages the difference is four
                         clicks or one. */}

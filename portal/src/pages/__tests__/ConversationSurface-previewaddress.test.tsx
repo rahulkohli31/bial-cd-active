@@ -548,7 +548,7 @@ describe('BuilderPage — the project arm, and the hard load it exists for', () 
   it('a move to another project never frames the project it just left, not for one commit', async () => {
     // WHAT THE STAMP MADE POSSIBLE, AND WHAT THE LABEL TAKES BACK. One instance of this component
     // survives a project switch, and the poll's answer is state — the effect that drops it runs
-    // AFTER the commit. So the first render at the new project holds the previous project's live
+    // AFTER the commit. So the first render at the Create App holds the previous project's live
     // URL while the stamp above already points at the project now on screen: one commit of
     // somebody else's app in this pane. `paneProps` records every bag the pane was handed, so the
     // window is visible here even though it closes before any `waitFor` could look.

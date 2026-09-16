@@ -104,7 +104,7 @@ describe('the dialog opens on General and names the application', () => {
 
   it('falls back to a generic title on an application with no name', () => {
     open({ project: { ...PROJECT, name: '' } })
-    expect(screen.getByText('Untitled project')).toBeTruthy()
+    expect(screen.getByText('Untitled application')).toBeTruthy()
   })
 
   it('opens straight onto a tab a door asked for', async () => {

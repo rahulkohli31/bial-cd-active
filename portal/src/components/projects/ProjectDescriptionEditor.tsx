@@ -215,7 +215,7 @@ export default function ProjectDescriptionEditor({
 
             <textarea
               ref={textareaRef}
-              aria-label="Project description"
+              aria-label="Application description"
               placeholder={TEXTAREA_PLACEHOLDER}
               value={text}
               onChange={onChange}
@@ -245,7 +245,7 @@ export default function ProjectDescriptionEditor({
             <p className="mt-2 text-xs text-neutral">
               Once your app is published, this becomes its listing in the Marketplace —
               visible to everyone at BIAL and searchable by these words. It&apos;s also how the
-              platform checks whether something similar already exists before a new project is
+              platform checks whether something similar already exists before a new application is
               created.
             </p>
 
