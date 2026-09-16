@@ -43,18 +43,15 @@ interface UploadAttachmentArgs {
 }
 
 /**
- * The uploaded ref, traced from its one real consumer (`attachmentStore.ts`'s
- * `buildUserParts`, which spreads exactly these fields into a `file` message
- * part per `messageTypes.ts`'s `FilePart` union) — `attachmentId`/`key`/`kind`/
- * `name`/`mediaType`/`size` always; `format`/`text`/`truncated`/`truncationNote`
- * for the office hybrid; `pdfFileId`/`pageCount` for the deck hybrid.
+ * What the upload route answers with, and the whole of it: the six fields
+ * `attachmentStore.ts`'s `buildUserParts` spreads into a `file` message part.
  *
- * `truncationNote` is now also on `messageTypes.ts`'s `FilePartOffice` —
- * added converting `attachmentStore.ts`, closing the gap flagged here.
- *
- * `pageCount` WENT WITH THE PAGE CAP, on both sides of the wire. Its siblings survive because
- * they still render historic messages; a page count was only ever produced by the admission check
- * that is gone, so declaring it here would promise a field the route can never send.
+ * ★ SIX FIELDS BECAUSE SIX IS WHAT AN UPLOAD CAN PRODUCE. Five more lived here —
+ * `format`, `text`, `truncated`, `truncationNote`, `pdfFileId` — for the office and deck
+ * hybrids, and both producers are gone. They survive on the SERVER'S `AttachmentRef`, where
+ * they still render a message sent before that change; this type is the response to a fresh
+ * upload, which can never carry one. Declaring them here promised a field the route cannot
+ * send.
  */
 export interface AttachmentRef {
   attachmentId: string
@@ -63,11 +60,6 @@ export interface AttachmentRef {
   name: string
   mediaType: string
   size: number
-  format?: string
-  text?: string
-  truncated?: boolean
-  truncationNote?: string
-  pdfFileId?: string
 }
 
 /**

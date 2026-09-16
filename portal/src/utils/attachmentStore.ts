@@ -3,10 +3,12 @@
  * the Anthropic request shape and onto display. A part this composer MINTS is prose, or a `file`
  * whose bytes sit in the object store — there is one producer now, and it is the uploaded one.
  *
- * OLDER PART SHAPES STILL ARRIVE FROM HISTORY and are still rendered: an inline text attachment,
- * an `office` part carrying server-extracted Markdown, a `deck` part naming a converted PDF by
- * `pdfFileId`. Nothing produces them any more, and the readers stay because a transcript written
- * before this change is still a transcript someone opens.
+ * OLDER PART SHAPES STILL ARRIVE FROM HISTORY and still draw a chip: an inline text attachment,
+ * an `office` part, a `deck` part. What they no longer carry INTO the chip is their extras —
+ * the server-extracted Markdown an office part held, and the converted PDF a deck part named by
+ * `pdfFileId` — because nothing produces either any more and nothing reads them. The chip is
+ * drawn from the kind and the media type, which every one of those shapes still has, so a
+ * transcript written before this change is still a transcript someone can open.
  *
  * The send path is byte-free: the browser sends only the new message — prose and OWNED refs for
  * stored binaries (`wireMessageFromParts`); the server rehydrates bytes and replays history from
