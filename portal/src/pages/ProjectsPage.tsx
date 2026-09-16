@@ -695,10 +695,10 @@ export default function ProjectsPage(): React.JSX.Element {
             <p className="text-sm font-semibold text-tertiary">No matches</p>
             {/* The query the ROWS answer, not the one still being typed. With a tile selected
                 and nothing typed there is no phrase to quote, and quoting an empty one would
-                print `No project matches “”`. */}
+                print `No application matches “”`. */}
             <p className="text-xs text-neutral mt-1">
               {appliedQuery
-                ? `No project matches “${appliedQuery}”. Try a different search.`
+                ? `No application matches “${appliedQuery}”. Try a different search.`
                 : 'No application matches that filter.'}
             </p>
             {/* ONE BUTTON THAT CLEARS WHATEVER IS APPLIED, because clearing only half of a
@@ -773,7 +773,7 @@ export default function ProjectsPage(): React.JSX.Element {
                 touch. */}
             {error !== null && (
               <p role="alert" className="text-xs text-danger text-center mt-4">
-                Couldn’t load more projects.{' '}
+                Couldn’t load more applications.{' '}
                 <button
                   type="button"
                   onClick={() => setReloadNonce((n) => n + 1)}

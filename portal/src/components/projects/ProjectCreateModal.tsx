@@ -200,7 +200,7 @@ export default function ProjectCreateModal({ onClose, onCreated }: ProjectCreate
         <div className="flex items-start justify-between">
           <div>
             <DialogTitle className="text-base font-bold text-tertiary">
-              {screen === 'duplicates' ? 'This might already exist' : 'New project'}
+              {screen === 'duplicates' ? 'This might already exist' : 'Create App'}
             </DialogTitle>
             <p className="text-sm text-neutral mt-0.5">
               {screen === 'duplicates'

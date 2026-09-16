@@ -11,9 +11,14 @@
  * under them, and a sweep is only true on the day it runs — the next hand-written heading, or the
  * next fallback message, is what this exists to catch.
  *
- * IT IS A GREP, NOT A PARSER, and that is a deliberate trade. It can miss copy assembled from
- * variables; it cannot fire on an identifier, because an identifier is never a bare JSX text node
- * nor the whole value of an `aria-label`. Wrong in the harmless direction.
+ * IT IS A GREP, NOT A PARSER, and that is a deliberate trade — but the trade has to be made in the
+ * right direction, and the first version of it was not. Three real strings walked through: a
+ * conditional label written as a ternary, a count built in a template literal, and a line of JSX
+ * text a `{' '}` joiner split in two. The scans below each answer one of those; the shape of the
+ * miss is always the same, which is that copy does not arrive in one syntactic piece.
+ *
+ * IT STILL CANNOT SEE COPY ASSEMBLED FROM VARIABLES, and that limit is honest rather than fixable
+ * by a wider regex. What it can promise is that no LITERAL a person reads carries the retired noun.
  */
 import { describe, it, expect } from 'vitest'
 import { readdirSync, readFileSync, statSync } from 'node:fs'
@@ -39,6 +44,14 @@ const QUOTED = /'([^'\\\n]+)'|"([^"\\\n]+)"|`([^`$\\\n]+)`/g
 /** JSX text: what sits between two tags, with no expression in it. */
 const JSX_TEXT = />([^<>{}]+)</g
 
+/**
+ * A JSX expression carrying nothing but a space — `{' '}` — which is how a line of copy too long
+ * for one source line is joined back together. It splits one sentence into two text nodes, and it
+ * hid "Couldn't load more projects." through an entire sweep. Removed before the scan so the
+ * sentence is read as the one sentence a person sees.
+ */
+const JSX_SPACE_JOINER = /\{\s*['"`]\s*['"`]\s*\}/g
+
 const RETIRED_NOUN = /\bprojects?\b/i
 
 /**
@@ -63,31 +76,35 @@ function sourceFiles(dir: string, ext: string, found: string[] = []): string[] {
 }
 
 /**
- * A SENTENCE in a plain module, as opposed to a key, a class name or a route. The test is crude
- * and deliberately so: twelve characters, a space, no slash, and a first word that is not
- * dotted. It finds the error copy and the workspace's lines, and it leaves `'bial:nav-pinned'`
- * and `'text-sm font-bold'` alone.
+ * EVERY quoted literal, of any length. The length floor this used to carry is what let `'project'`
+ * and `'projects'` — a pluralising count in the admin table — through: copy is not always a
+ * sentence, and a single word on screen is read exactly as loudly as a paragraph.
  */
-const SENTENCE = /'([^'\\\n]{12,})'|"([^"\\\n]{12,})"|`([^`$\\\n]{12,})`/g
+const SENTENCE = /'([^'\\\n]+)'|"([^"\\\n]+)"/g
 
-/** Tailwind, which is the one thing in a component file that looks like a sentence and is not. */
-const CLASSES = /\b(?:flex|grid|text-|bg-|border|rounded|px-|py-|mt-|mb-|gap-|w-|h-|min-|max-|hover:|focus)/
+/**
+ * WHAT A LITERAL LOOKS LIKE WHEN IT IS NOT COPY, and this is the whole of the calibration now that
+ * the length floor is gone. A route, a storage key, a testid, a class fragment, an identifier and a
+ * template hole all carry one of these characters; a sentence a person reads carries none of them.
+ * Cheaper than parsing, and it costs a miss rather than a false alarm — a piece of copy that
+ * happens to contain a full stop is simply not checked. It subsumes a Tailwind-specific test this
+ * used to carry: every class list in this tree contains a hyphen.
+ */
+const NOT_A_SENTENCE = /[/.\-_${}:]/
 
 export function sentencesIn(source: string): string[] {
   const clean = stripComments(source)
   const found: string[] = []
   for (const match of clean.matchAll(SENTENCE)) {
-    const text = match[1] ?? match[2] ?? match[3] ?? ''
-    const [first = ''] = text.split(' ')
-    if (!text.includes(' ') || text.includes('/') || first.includes('.')) continue
-    if (CLASSES.test(text) || text.startsWith('bial')) continue
+    const text = match[1] ?? match[2] ?? ''
+    if (NOT_A_SENTENCE.test(text)) continue
     found.push(text)
   }
   return found
 }
 
 export function copyIn(source: string): string[] {
-  const clean = stripComments(source)
+  const clean = stripComments(source).replace(JSX_SPACE_JOINER, ' ')
   const found: string[] = []
   for (const [, value] of clean.matchAll(COPY_ATTRIBUTES)) found.push(value)
   for (const [, expression] of clean.matchAll(COPY_EXPRESSIONS)) {
@@ -140,6 +157,27 @@ describe('the noun a person reads is "application"', () => {
     const fixture = `const oops = 'Failed to load projects'`
     expect(sentencesIn(fixture).filter((copy) => RETIRED_NOUN.test(copy))).toEqual([
       'Failed to load projects',
+    ])
+  })
+
+  it('★ catches the three shapes that walked past the first sweep', () => {
+    // Every one of these is a real string this guard failed to see, found by a reviewer rather
+    // than by the guard. A length floor hid the first two; the third is a literal chosen inside an
+    // expression, which is where every conditional label in this tree lives.
+    const named = (source: string) =>
+      sentencesIn(source).filter((copy) => RETIRED_NOUN.test(copy))
+
+    expect(named("`${n} ${n === 1 ? 'project' : 'projects'}`")).toEqual(['project', 'projects'])
+    expect(named("const title = 'New project'")).toEqual(['New project'])
+    expect(named("{done ? 'All set' : 'New project'}")).toEqual(['New project'])
+  })
+
+  it('★ reads a line of copy a {\' \'} joiner split across two source lines', () => {
+    // THE ONE NO LITERAL SCAN CAN REACH: this is JSX text, so the joiner that wraps it for line
+    // length turns one sentence a person reads into two text nodes, and the noun lands in neither.
+    const fixture = `<p>Couldn’t load more projects.{' '}<button>Try again</button></p>`
+    expect(copyIn(fixture).filter((copy) => RETIRED_NOUN.test(copy))).toEqual([
+      'Couldn’t load more projects.',
     ])
   })
 

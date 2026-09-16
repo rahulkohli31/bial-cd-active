@@ -460,7 +460,7 @@ export function createConnectorRequestColumns({
           const count = row.original.usingItIn
           return (
             <span className="text-neutral whitespace-nowrap">
-              {count === null ? '—' : `${count} ${count === 1 ? 'project' : 'projects'}`}
+              {count === null ? '—' : `${count} ${count === 1 ? 'application' : 'applications'}`}
             </span>
           )
         },
