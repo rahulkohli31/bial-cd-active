@@ -80,6 +80,22 @@ def _suffix_of(path: str) -> str:
     return PurePosixPath(path).suffix
 
 
+#: The largest reader answer worth returning. The manifest is bounded inside the image; this
+#: is the backstop for a container that predates that bound, generous enough that no bounded
+#: manifest can reach it.
+_MAX_REPLY_CHARS: Final = 250_000
+
+
+def _was_killed(exit_code: int) -> bool:
+    """Whether a process was stopped by a signal rather than returning a status.
+
+    Two spellings reach here: a negative code, which is how Python reports a signal, and
+    128 + signal, which is how a shell reports the same thing. Either way nothing in the
+    child got to say why, so the caller is the only place left that can.
+    """
+    return exit_code < 0 or exit_code >= 128
+
+
 @dataclass
 class AttachmentReader:
     """Runs the shipped reader over one attached file, and nothing else.
@@ -141,6 +157,27 @@ class AttachmentReader:
                 exit_code=result.exit,
                 stderr=scrub_untrusted(result.stderr, limit=_STDERR_LOG_CHARS),
             )
+            if _was_killed(result.exit) and not result.stdout.strip():
+                # ★ THE ONE FAILURE THE READER CANNOT NAME FOR ITSELF. Its contract is one
+                # JSON object and exit 0 — but polars allocates through Rust, whose
+                # allocator ABORTS on failure rather than raising, so a file that exhausts
+                # the memory ceiling kills the process with a signal and prints nothing.
+                # Python never runs again in that process, so the name has to be given
+                # here. Left unnamed it reaches the tool as unparseable output and asks the
+                # model to try again — against a failure that is perfectly deterministic.
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "file": path.rsplit("/", 1)[-1],
+                        "error": {
+                            "code": "too_large",
+                            "message": (
+                                "This file needed more memory than the reader is allowed."
+                            ),
+                            "next": "Attach a smaller file, or split it into parts.",
+                        },
+                    }
+                )
         return result.stdout
 
 
@@ -205,6 +242,29 @@ def attachment_toolset[DepsT](
                 f"The attachment could not be read right now ({type(exc).__name__}). "
                 "Try once more; if it fails again, say so rather than guessing at the contents."
             ) from None
+
+        if len(raw) > _MAX_REPLY_CHARS:
+            # THE LAST BOUND BEFORE THE MODEL'S WINDOW. The reader bounds its own manifest
+            # now, so this fires only for a container running an image that predates that
+            # bound — and one oversized answer costs the turn it was meant to serve, which is
+            # worse than saying plainly that the file could not be described.
+            logger.warning(
+                "attachment_read_reply_too_large",
+                app_id=str(reader.session.app_id),
+                suffix=_suffix_of(file),
+                chars=len(raw),
+            )
+            return json.dumps(
+                {
+                    "ok": False,
+                    "file": file.rsplit("/", 1)[-1],
+                    "error": {
+                        "code": "too_large",
+                        "message": "The description of this file was too large to return.",
+                        "next": "Attach a smaller file, or split it into parts.",
+                    },
+                }
+            )
 
         # THE READER ALWAYS PRINTS ONE JSON OBJECT AND EXITS 0, including for a corrupt or
         # encrypted file — that is its contract. Anything else means the script itself is wrong or
