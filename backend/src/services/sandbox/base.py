@@ -25,7 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 #: The container-absolute root the supervisor keeps attachments in — a SIBLING of the
 #: app tree, so nothing that snapshots, restores or deploys the tree carries a chat's files
-#: with it. The supervisor reads the same value from `ATTACHMENTS_DIR`; `sandbox/` is a
+#: with it. The supervisor derives the same path from its own workspace root; `sandbox/` is a
 #: separate deployable with no shared package, so the two are kept in step by their tests.
 CONTAINER_ATTACHMENTS_ROOT: Final = "/workspace/attachments"
 

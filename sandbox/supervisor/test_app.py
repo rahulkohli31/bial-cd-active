@@ -37,8 +37,7 @@ _WS = os.path.join(_BASE, "app")
 _ATT = os.path.join(_BASE, "attachments")
 os.makedirs(_WS, exist_ok=True)
 os.makedirs(_ATT, exist_ok=True)
-os.environ["WORKSPACE"] = _WS
-os.environ["ATTACHMENTS_DIR"] = _ATT
+os.environ["WORKSPACE"] = _WS  # the attachments root is derived from it, as in the container
 atexit.register(shutil.rmtree, _BASE, ignore_errors=True)  # don't leak the temp tree per run
 
 from urllib.parse import unquote  # noqa: E402
@@ -378,6 +377,21 @@ def test_a_file_can_be_written_outside_the_app_tree() -> None:
     assert target.read_bytes() == b"PK payload"
     # The point of the whole arrangement: it is NOT in the tree that becomes the app.
     assert WORKSPACE.resolve() not in target.resolve().parents
+
+
+def test_the_two_roots_are_siblings_by_construction_not_by_agreement() -> None:
+    """★ THE SETTING THAT HAD EXACTLY ONE SAFE VALUE.
+
+    The attachments root used to be its own environment variable, so the sibling relationship
+    was a thing two settings had to agree about — and the control plane, which addresses this
+    root in three places, cannot read either of them. Any value but the default killed every
+    attachment turn: writes landed under the new root while the control plane named the old one.
+
+    Mutation receipt: give it back its own variable and this fixture, which sets only the
+    workspace, stops producing a sibling.
+    """
+    assert ATTACHMENTS.parent == WORKSPACE.parent
+    assert ATTACHMENTS.name == "attachments"
 
 
 def test_a_relative_path_still_means_the_app_tree() -> None:

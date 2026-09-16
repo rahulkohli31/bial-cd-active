@@ -53,7 +53,13 @@ WORKSPACE = Path(os.environ.get("WORKSPACE", "/workspace/app"))
 # and can already run code, which is the whole reason attachments are here at all — but no
 # snapshot,
 # restore or deploy walks it.
-ATTACHMENTS = Path(os.environ.get("ATTACHMENTS_DIR", "/workspace/attachments"))
+#
+# DERIVED FROM `WORKSPACE`, NEVER SET SEPARATELY. It was its own environment variable, which
+# made the sibling relationship a thing two settings had to agree about — and the control
+# plane, which addresses this root in three places, cannot read either of them. Any value but
+# the default killed every attachment turn: writes landed under the new root while the control
+# plane kept naming the old one, and `_resolve` refused it as escaping the workspace.
+ATTACHMENTS = WORKSPACE.parent / "attachments"
 APP_USER = os.environ.get("APP_USER", "appuser")
 # The dev server's self-announcement. It no longer decides ANYTHING: "✓ Ready in <ms>" is printed
 # once the server is listening, which is BEFORE the first route has compiled, so it announced a
