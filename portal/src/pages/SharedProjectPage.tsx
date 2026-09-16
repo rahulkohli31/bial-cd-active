@@ -67,8 +67,10 @@ export default function SharedProjectPage(): React.JSX.Element {
   const [step, setStep] = useState<HandoverStep | null>(null)
   const [resolving, setResolving] = useState(false)
 
+  // BACK TO THE LIST THIS READER CAME FROM, which is Shared Applications — a recipient bounced
+  // off a share that no longer exists has no business landing on somebody else's owned list.
   const bounceGone = useCallback(
-    () => navigate('/projects', { replace: true, state: { notice: PROJECT_GONE_NOTICE } }),
+    () => navigate('/shared-applications', { replace: true, state: { notice: PROJECT_GONE_NOTICE } }),
     [navigate],
   )
 
@@ -78,7 +80,7 @@ export default function SharedProjectPage(): React.JSX.Element {
   // 404 the resolver already gives every other reader gives the same answer to both.
   useEffect(() => {
     if (!projectId) {
-      navigate('/projects', { replace: true })
+      navigate('/shared-applications', { replace: true })
       return
     }
     let active = true

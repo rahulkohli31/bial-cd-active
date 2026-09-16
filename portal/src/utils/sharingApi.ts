@@ -4,9 +4,10 @@
  * `projectApi.ts`'s shape: `fn(args, deps = {})`, camelCase wire, `ApiError` via
  * `readApiError`, response bodies narrowed from `unknown` — never cast, never `any`.
  */
-import { ApiError, isRecord, optionalString, readApiError } from './apiError'
+import { ApiError, isRecord, optionalCount, optionalString, readApiError } from './apiError'
 import { authFetch } from './api'
 import type { AuthFetchDeps } from './api'
+import { DEFAULT_PAGE_SIZE } from './projectApi'
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' }
 
@@ -119,13 +120,24 @@ export async function unshareProject(
   if (!res.ok) throw await readApiError(res, 'Failed to revoke this share')
 }
 
-/** One row of "Shared with me" — the project, who shared it, and when. No email: the
- *  stricter attribution rule `MarketplaceEntry.builderDisplayName` already established for
- *  showing one citizen's identity to another (display name only). */
+/**
+ * One row of "Shared with me" — the application, who shared it, and the two dates that are not
+ * the same question. `sharedAt` says when access was granted; `projectUpdatedAt` is the OWNER's
+ * last change to the application behind it.
+ *
+ * No email: the stricter attribution rule `MarketplaceEntry.builderDisplayName` already
+ * established for showing one citizen's identity to another (display name only).
+ *
+ * `sharedByUserId` IS THE FILTER'S HANDLE AND THE NAME IS ONLY ITS LABEL. A display name is
+ * nullable and not unique, so a list filtered by name would collapse two colleagues who share
+ * one and hand the recipient the other's applications.
+ */
 export interface SharedProject {
   projectId: string
   projectName: string
   projectDescription: string | null
+  projectUpdatedAt: string
+  sharedByUserId: string
   sharedByDisplayName: string | null
   sharedAt: string
 }
@@ -136,27 +148,76 @@ function toSharedProject(value: unknown): SharedProject | null {
     projectId: value.projectId,
     projectName: typeof value.projectName === 'string' ? value.projectName : '',
     projectDescription: optionalString(value.projectDescription),
+    projectUpdatedAt: typeof value.projectUpdatedAt === 'string' ? value.projectUpdatedAt : '',
+    sharedByUserId: typeof value.sharedByUserId === 'string' ? value.sharedByUserId : '',
     sharedByDisplayName: optionalString(value.sharedByDisplayName),
     sharedAt: typeof value.sharedAt === 'string' ? value.sharedAt : '',
   }
 }
 
-/** One keyset page of `SharedProject` rows — the shape `useKeysetList` expects. */
-export interface SharedProjectsPage {
-  items: SharedProject[]
-  nextCursor: string | null
-  hasMore: boolean
+/** One option of the "Shared by" filter, with how many of the recipient's rows are that
+ *  colleague's. The count describes the SEARCH, not the whole list, so the filter never offers
+ *  a colleague with no matching rows behind them. */
+export interface SharedProjectSharer {
+  userId: string
+  displayName: string | null
+  shareCount: number
 }
 
-/** Projects a colleague has shared with the caller, newest grant first. Keyset-paginated —
- *  a list every sharer writes into, unlike the caller's own numbered-offset project list. */
+function toSharer(value: unknown): SharedProjectSharer | null {
+  if (!isRecord(value) || typeof value.userId !== 'string' || value.userId === '') return null
+  return {
+    userId: value.userId,
+    displayName: optionalString(value.displayName),
+    shareCount: optionalCount(value.shareCount) ?? 0,
+  }
+}
+
+/** What the shared list's order control offers. A closed set — the server 422s anything else
+ *  rather than quietly serving the default order, which to the person using the control looks
+ *  like the control simply does not work. */
+export type SharedSort = 'recentlyShared' | 'name'
+
+/** One NUMBERED page of `SharedProject` rows, with the "Shared by" filter's own options beside
+ *  them. The facet rides this read rather than a second endpoint: the options and the rows they
+ *  filter are one question asked once. */
+export interface SharedProjectsPage {
+  items: SharedProject[]
+  sharers: SharedProjectSharer[]
+  page: number
+  pageSize: number
+  total: number
+  totalPages: number
+}
+
+export interface ListSharedArgs {
+  /** 1-based. */
+  page?: number
+  limit?: number
+  /** DESCRIPTION-ONLY, server-side. A page promising name search would be making a false offer. */
+  q?: string
+  /** A colleague's user id, never their name. */
+  sharedBy?: string
+  sort?: SharedSort
+}
+
+function asCount(value: unknown, fallback: number): number {
+  return optionalCount(value) ?? fallback
+}
+
+/** Applications a colleague has shared with the caller. Numbered-offset like the owner's own
+ *  list: the same `Showing 1–8 of 12` design, and a real `total` is what lets a reader whose
+ *  last page emptied under a revoke step back to a page that still exists. */
 export async function listSharedWithMe(
-  args: { cursor?: string | null; limit?: number } = {},
+  args: ListSharedArgs = {},
   deps: AuthFetchDeps = {},
 ): Promise<SharedProjectsPage> {
   const params = new URLSearchParams()
-  if (args.cursor) params.set('cursor', args.cursor)
+  if (args.page !== undefined) params.set('page', String(args.page))
   if (args.limit !== undefined) params.set('limit', String(args.limit))
+  if (args.q) params.set('q', args.q)
+  if (args.sharedBy) params.set('sharedBy', args.sharedBy)
+  if (args.sort) params.set('sort', args.sort)
   const qs = params.toString()
   const res = await authFetch(`/api/projects/shared${qs ? `?${qs}` : ''}`, {}, deps)
   if (!res.ok) throw await readApiError(res, 'Failed to load projects shared with you')
@@ -169,7 +230,17 @@ export async function listSharedWithMe(
           return entry === null ? [] : [entry]
         })
       : [],
-    nextCursor: optionalString(doc.nextCursor),
-    hasMore: doc.hasMore === true,
+    sharers: Array.isArray(doc.sharers)
+      ? doc.sharers.flatMap((row) => {
+          const sharer = toSharer(row)
+          return sharer === null ? [] : [sharer]
+        })
+      : [],
+    page: asCount(doc.page, 1),
+    pageSize: asCount(doc.pageSize, DEFAULT_PAGE_SIZE),
+    // An absent total is UNKNOWN, and guessing it from the page would render a confident
+    // "of 8" that is simply wrong.
+    total: asCount(doc.total, 0),
+    totalPages: asCount(doc.totalPages, 0),
   }
 }

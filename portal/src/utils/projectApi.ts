@@ -103,11 +103,22 @@ export interface ProjectCounts {
   inPipeline: number
 }
 
+/**
+ * Which summary tile the list is narrowed to. The two values are `ProjectCounts`' own field
+ * names, so a tile's number and the rows behind it are named by one word and cannot drift into
+ * describing two different sets.
+ *
+ * `totalApplications` is deliberately absent: "everything" is the absence of a filter, which is
+ * what makes the total tile a clear-all rather than a fourth state. The server 422s it.
+ */
+export type ProjectFilter = 'inProduction' | 'inPipeline'
+
 export interface ListProjectsArgs {
   /** 1-based. The server 422s outside 1..100000 rather than overflowing its OFFSET. */
   page?: number
   limit?: number
   q?: string
+  filter?: ProjectFilter
 }
 
 export interface CreateProjectArgs {
@@ -221,6 +232,7 @@ export async function listProjects(args: ListProjectsArgs = {}, deps: AuthFetchD
   if (args.page !== undefined) params.set('page', String(args.page))
   if (args.limit !== undefined) params.set('limit', String(args.limit))
   if (args.q) params.set('q', args.q)
+  if (args.filter) params.set('filter', args.filter)
   const qs = params.toString()
   const res = await authFetch(`/api/projects${qs ? `?${qs}` : ''}`, {}, deps)
   if (!res.ok) throw await readApiError(res, 'Failed to load projects')

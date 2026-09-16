@@ -33,8 +33,8 @@ export function listDate(iso: string | null | undefined): string {
   return at === null ? NONE : `${at.getDate()} ${MONTHS[at.getMonth()]} ${at.getFullYear()}`
 }
 
-/** `28 Aug` — one end of the tile's range. */
-function dayMonth(iso: string | null | undefined): string {
+/** `28 Aug` — one end of the tile's range, and the tile form of a single date. */
+export function dayMonth(iso: string | null | undefined): string {
   const at = parse(iso)
   return at === null ? NONE : `${at.getDate()} ${MONTHS[at.getMonth()]}`
 }

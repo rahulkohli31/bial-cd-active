@@ -318,10 +318,55 @@ async def resolve_duplicate_check(
     return OkResponse(ok=True)
 
 
+#: What the summary tiles above the list narrow it to. THE VALUES ARE `ProjectCountsResponse`'s
+#: OWN FIELD NAMES, so the number on a tile and the rows behind it are named by one word and
+#: cannot drift into describing two different sets. `totalApplications` is deliberately absent:
+#: "everything" is the absence of a filter, and a second spelling of it would be a state the
+#: page can enter and has no way to clear.
+ProjectFilter = Literal["inProduction", "inPipeline"]
+
+
+def _clean_project_filter(value: str | None) -> ProjectFilter | None:
+    """Normalize `?filter=`; absent → unfiltered, unrecognized → 422 (never a silent default).
+
+    Each branch RETURNS THE LITERAL rather than the argument, the same way `_clean_shared_sort`
+    does: equality against a string does not narrow `str` to a `Literal` for the checkers, and a
+    `cast` over an `in` test would assert the correspondence instead of demonstrating it.
+    """
+    if value is None:
+        return None
+    if value == "inProduction":
+        return "inProduction"
+    if value == "inPipeline":
+        return "inPipeline"
+    raise AppApiError(422, "filter must be one of: inProduction, inPipeline.")
+
+
+def _tile_predicate(app_filter: ProjectFilter, live: sa.Subquery) -> sa.ColumnElement[bool]:
+    """The predicate behind one tile's number, written ONCE and read by both the count and the
+    list — over `live`, the caller's own `live_app_ids` collapse.
+
+    ONE DEFINITION IS WHAT MAKES A TILE CLICKABLE. A tile states a number and then selects the
+    rows behind it, so a filter computed from a second definition would show "3 in production"
+    over a list the same filter can only produce two of — and a reader cannot tell which half to
+    believe. There is one app per project (`uq_app_registry_project`), so the same two predicates
+    select projects here and count app rows in `project_counts`.
+    """
+    if app_filter == "inProduction":
+        return live.c.app_id.is_not(None)
+    # In the pipeline: submitted or decided, but not yet serving. APPROVED belongs here only
+    # while it is NOT live — an approved app that is serving is `inProduction`, and counting it
+    # twice would make the three numbers sum to more than the citizen has.
+    return sa.and_(
+        AppRegistry.status.in_((AppStatus.PENDING, AppStatus.REJECTED, AppStatus.APPROVED)),
+        live.c.app_id.is_(None),
+    )
+
+
 @router.get(
     "",
     responses=error_responses(
-        AUTH_401, (422, ErrorEnvelope, "Invalid page/pageSize or over-long q")
+        AUTH_401, (422, ErrorEnvelope, "Invalid page/pageSize/filter or over-long q")
     ),
 )
 async def list_projects(
@@ -330,9 +375,21 @@ async def list_projects(
     page: PageQuery = 1,
     limit: LimitQuery = DEFAULT_PAGE_SIZE,
     q: SearchQuery = None,
+    app_filter: Annotated[
+        str | None,
+        # The closed set is named in the schema even though the type is `str | None`, so a
+        # generated client can see the two legal values rather than a free-form string —
+        # validation itself lives in `_clean_project_filter`, which keeps this platform's 422
+        # shape. Aliased because `filter` shadows a builtin on the Python side only.
+        Query(alias="filter", description="Narrow to one summary tile: inProduction, inPipeline."),
+    ] = None,
 ) -> ProjectListResponse:
     """One NUMBERED page of the caller's projects, newest-first, optionally filtered by a
-    case-insensitive name/description substring.
+    case-insensitive name/description substring and by one summary tile.
+
+    `filter` is the tile a citizen clicked, and it selects exactly the set that tile counted —
+    `_tile_predicate` is the single definition both read. Absent means everything, which is what
+    the "Total applications" tile is.
 
     `total` is read separately from the page, so a create landing between the two reads can
     make the count and the rows disagree for one render; say something true when they do
@@ -358,6 +415,7 @@ async def list_projects(
     page = clean_page(page)
     search = clean_search(q)
     limit = clean_limit(limit)
+    tile = _clean_project_filter(app_filter)
     # LEFT-JOIN the project's ONE app (uq_app_registry_project) so the page carries the
     # read-only appId/appStatus discovery without an N+1; the outer join keeps app-less
     # projects listed.
@@ -390,6 +448,8 @@ async def list_projects(
                 Project.description.icontains(search, autoescape=True),
             )
         )
+    if tile is not None:
+        query = query.where(_tile_predicate(tile, live))
     # THE COUNT DOES NOT NEED EITHER JOIN, and carrying them was the other half of the same
     # cost: neither can change how many rows match. `AppRegistry.project_id` is unique
     # (`uq_app_registry_project` — one app per project), and `live.c.app_id` is unique
@@ -405,6 +465,19 @@ async def list_projects(
                 Project.name.icontains(search, autoescape=True),
                 Project.description.icontains(search, autoescape=True),
             )
+        )
+    if tile is not None:
+        # THE ONE PREDICATE THAT DOES NEED THE JOINS, which is why they are taken here and
+        # nowhere else: a tile filter is a condition ON those joins, so a count taken without
+        # them would number pages over a wider set than the rows are cut from — the reader
+        # clicks page 3 and finds it empty.
+        count_query = (
+            count_query.outerjoin(
+                AppRegistry,
+                sa.and_(AppRegistry.project_id == Project.id, AppRegistry.user_id == user.id),
+            )
+            .outerjoin(live, live.c.app_id == AppRegistry.id)
+            .where(_tile_predicate(tile, live))
         )
     count_stmt = sa.select(sa.func.count()).select_from(count_query.subquery())
     total = int(await db.scalar(count_stmt) or 0)
@@ -447,25 +520,21 @@ async def project_counts(user: CurrentUser, db: DbSession) -> ProjectCountsRespo
     # applications 0" above a list showing 18 projects, which reads as broken rather than as
     # a subtle distinction, and the mockup shows the two numbers agreeing for that reason.
     total = sa.select(sa.func.count()).select_from(Project).where(Project.user_id == user.id)
+    # BOTH READ `_tile_predicate`, which is the whole reason a tile can be clicked: the number
+    # here and the rows `list_projects` returns for `?filter=` come from one expression, so a
+    # tile cannot show a total its own filter is unable to produce. The join is OUTER on both,
+    # because the predicate — not the join — is what decides liveness.
     in_production = (
         sa.select(sa.func.count())
         .select_from(AppRegistry)
-        .join(live, live.c.app_id == AppRegistry.id)
-        .where(AppRegistry.user_id == user.id)
+        .outerjoin(live, live.c.app_id == AppRegistry.id)
+        .where(AppRegistry.user_id == user.id, _tile_predicate("inProduction", live))
     )
-    # In the pipeline: submitted or decided, but not yet serving. PENDING and REJECTED are
-    # unambiguous. APPROVED belongs here only while it is NOT live — an approved app that is
-    # serving is counted by `in_production`, and counting it twice would make the three
-    # numbers sum to more than the citizen has.
     in_pipeline = (
         sa.select(sa.func.count())
         .select_from(AppRegistry)
         .outerjoin(live, live.c.app_id == AppRegistry.id)
-        .where(
-            AppRegistry.user_id == user.id,
-            AppRegistry.status.in_((AppStatus.PENDING, AppStatus.REJECTED, AppStatus.APPROVED)),
-            live.c.app_id.is_(None),
-        )
+        .where(AppRegistry.user_id == user.id, _tile_predicate("inPipeline", live))
     )
     return ProjectCountsResponse(
         in_production=(await db.execute(in_production)).scalar_one(),

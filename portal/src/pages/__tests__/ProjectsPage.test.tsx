@@ -1173,3 +1173,169 @@ describe('ProjectsPage — the production actions', () => {
     expect(screen.queryByTestId('menu-takedown')).toBeNull()
   })
 })
+
+// --- the summary strip is the filter ---------------------------------
+
+/**
+ * THE THREE NUMBERS BECAME THE PAGE'S ONE FILTER CONTROL.
+ *
+ * Each tile counts a set and then selects it, which is only honest while the count and the rows
+ * come from one definition — pinned server-side, where the decision is actually made. What these
+ * cover is the half a browser owns: that a tile is a real control, that there is exactly one
+ * filter state, and that the total tile is always the way out of it.
+ */
+describe('★ the three summary tiles filter the list beneath them', () => {
+  const LIVE = mkProject('p1', 'Live One', { isServing: true })
+  const PIPELINE = mkProject('p2', 'Waiting')
+  const NEITHER = mkProject('p3', 'Nothing Built')
+
+  /** A server that honours `filter` and `q` the way the real one does. A list that ignored
+   *  either would let every assertion below pass against rows nobody asked for. */
+  function answersPerFilter(): void {
+    h.listProjects.mockImplementation(
+      (args: { page: number; limit: number; q?: string; filter?: string }) => {
+        const byTile =
+          args.filter === 'inProduction'
+            ? [LIVE]
+            : args.filter === 'inPipeline'
+              ? [PIPELINE]
+              : [LIVE, PIPELINE, NEITHER]
+        const term = args.q
+        const rows = term ? byTile.filter((p) => p.name.includes(term)) : byTile
+        return Promise.resolve(
+          page(rows, {
+            page: args.page,
+            pageSize: args.limit,
+            total: rows.length,
+            totalPages: rows.length === 0 ? 0 : 1,
+          }),
+        )
+      },
+    )
+  }
+
+  const tile = (label: RegExp): HTMLElement => screen.getByRole('button', { name: label })
+
+  it('clicking “In production” narrows the list, and the tile reads as selected', async () => {
+    answersPerFilter()
+    renderPage()
+    await screen.findByText('Nothing Built')
+
+    fireEvent.click(tile(/In production/))
+
+    await waitFor(() => expect(screen.queryByText('Nothing Built')).toBeNull())
+    // Liveness beside the absence: the list narrowed rather than failing to render.
+    expect(screen.getByText('Live One')).toBeTruthy()
+    expect(tile(/In production/).getAttribute('aria-pressed')).toBe('true')
+    expect(h.listProjects).toHaveBeenLastCalledWith(
+      expect.objectContaining({ filter: 'inProduction' }),
+    )
+    // Committed to the address, like every other thing that decides which rows are on screen.
+    expect(screen.getByTestId('location-search').textContent).toBe('?filter=inProduction')
+  })
+
+  it('clicking the selected tile again clears it and restores the full list', async () => {
+    answersPerFilter()
+    renderPage('/projects?filter=inProduction')
+    await screen.findByText('Live One')
+
+    fireEvent.click(tile(/In production/))
+
+    await screen.findByText('Nothing Built')
+    expect(tile(/In production/).getAttribute('aria-pressed')).toBe('false')
+    expect(screen.getByTestId('location-search').textContent).toBe('')
+  })
+
+  it('“Total applications” is selected whenever nothing else is, and clears the rest', async () => {
+    answersPerFilter()
+    renderPage('/projects?filter=inProduction')
+    await screen.findByText('Live One')
+    expect(tile(/Total applications/).getAttribute('aria-pressed')).toBe('false')
+
+    fireEvent.click(tile(/Total applications/))
+
+    await screen.findByText('Nothing Built')
+    expect(tile(/Total applications/).getAttribute('aria-pressed')).toBe('true')
+    expect(tile(/In production/).getAttribute('aria-pressed')).toBe('false')
+    expect(screen.getByTestId('location-search').textContent).toBe('')
+  })
+
+  it('filters identically in the grid, since the strip sits above that branch', async () => {
+    answersPerFilter()
+    renderPage('/projects?filter=inProduction')
+    await screen.findByText('Live One')
+
+    fireEvent.click(screen.getByLabelText('Grid view'))
+
+    await waitFor(() => expect(screen.getAllByTestId('project-card').length).toBe(1))
+    expect(screen.getByText('Live One')).toBeTruthy()
+    expect(tile(/In production/).getAttribute('aria-pressed')).toBe('true')
+  })
+
+  it('composes with the search rather than replacing it', async () => {
+    answersPerFilter()
+    renderPage('/projects?filter=inPipeline')
+    await screen.findByText('Waiting')
+
+    fireEvent.change(screen.getByLabelText('Search projects'), { target: { value: 'Waiting' } })
+
+    await waitFor(
+      () =>
+        expect(h.listProjects).toHaveBeenLastCalledWith(
+          expect.objectContaining({ filter: 'inPipeline', q: 'Waiting' }),
+        ),
+      { timeout: 3000 },
+    )
+    expect(tile(/In review, in progress or deployed/).getAttribute('aria-pressed')).toBe('true')
+  })
+
+  it('each tile is a real button whose count still reads as a count', async () => {
+    answersPerFilter()
+    renderPage()
+    const production = await screen.findByRole('button', { name: /In production/ })
+
+    // A NATIVE BUTTON, not a div with an onClick: Enter and Space come for free, and so does
+    // the tab order. `getByRole` above already refuses anything that is not one.
+    expect(production.tagName).toBe('BUTTON')
+    expect(production.getAttribute('tabindex')).toBeNull()
+    production.focus()
+    expect(document.activeElement).toBe(production)
+    // The number is still the tile's own text, inside the region that announces a change to it.
+    expect(production.textContent).toContain('2')
+    expect(screen.getByTestId('projects-counts').contains(production)).toBe(true)
+  })
+
+  it('a tile counting nothing is not a control, and the clear-all never is', async () => {
+    h.listProjectCounts.mockResolvedValue({ inProduction: 0, totalApplications: 5, inPipeline: 1 })
+    answersPerFilter()
+    renderPage()
+    await screen.findByText('Nothing Built')
+
+    expect(tile(/In production/).hasAttribute('disabled')).toBe(true)
+    // The way OUT of a filter must never go dead, whatever the numbers say.
+    expect(tile(/Total applications/).hasAttribute('disabled')).toBe(false)
+  })
+
+  it('an empty filtered list does not claim the account is empty', async () => {
+    h.listProjects.mockResolvedValue(page([], { total: 0, totalPages: 0 }))
+    renderPage('/projects?filter=inProduction')
+
+    // Liveness first: the page settled on its no-matches card rather than on nothing at all.
+    await screen.findByTestId('projects-no-matches')
+    expect(screen.queryByTestId('projects-empty')).toBeNull()
+    expect(screen.getByText('No project matches that filter.')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Clear the filter' }))
+
+    await waitFor(() => expect(screen.getByTestId('location-search').textContent).toBe(''))
+  })
+
+  it('reads a filter the server would refuse as no filter at all', async () => {
+    answersPerFilter()
+    renderPage('/projects?filter=banana')
+
+    await screen.findByText('Nothing Built')
+    expect(h.listProjects).toHaveBeenLastCalledWith(expect.objectContaining({ filter: undefined }))
+    expect(tile(/Total applications/).getAttribute('aria-pressed')).toBe('true')
+  })
+})

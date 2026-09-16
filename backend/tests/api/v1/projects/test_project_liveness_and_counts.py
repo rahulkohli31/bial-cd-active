@@ -317,3 +317,131 @@ async def test_a_project_with_no_app_is_not_serving_on_the_single_endpoint(
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["isServing"] is False
+
+
+# --- the tiles as a filter -----------------------------------------------------
+
+
+async def _names(client, headers, **params) -> set[str]:
+    resp = await client.get(_PROJECTS, headers=headers, params=params)
+    assert resp.status_code == 200, resp.text
+    return {item["name"] for item in resp.json()["items"]}
+
+
+async def _mixed_estate(db, user_id) -> None:
+    """One citizen's estate holding a row in every state the three tiles divide it into, plus
+    two that no tile but the total claims: a draft taken back down, and a project with nothing
+    built in it."""
+    _, live_one = await _project_with_app(db, user_id, name="Live One")
+    await _deploy(db, live_one, user_id)
+    _, republished = await _project_with_app(db, user_id, name="Republished")
+    await _deploy(db, republished, user_id, unpublished_at=dt.datetime.now(dt.UTC))
+    await _deploy(db, republished, user_id)
+    await _project_with_app(db, user_id, name="Approved Only", status=AppStatus.APPROVED)
+    await _project_with_app(db, user_id, name="Waiting", status=AppStatus.PENDING)
+    await _project_with_app(db, user_id, name="Changes Asked", status=AppStatus.REJECTED)
+    _, taken_down = await _project_with_app(db, user_id, name="Taken Down")
+    await _deploy(db, taken_down, user_id, unpublished_at=dt.datetime.now(dt.UTC))
+    await ProjectFactory.create(db, user_id, name="Nothing Built")
+
+
+async def test_each_tile_filters_to_exactly_the_set_it_counted(client, db_session) -> None:
+    """THE AGREEMENT THE SHARED PREDICATE EXISTS FOR, now that a tile is also a control.
+
+    A number a citizen can click has to produce rows, and as many of them as it claimed. A
+    filter cut from a second definition would offer "2 in production" and then show one, which
+    reads as the list being broken rather than as two queries disagreeing.
+    """
+    headers, user = await _auth(db_session)
+    await _mixed_estate(db_session, user.id)
+
+    counts = (await client.get(_COUNTS, headers=headers)).json()
+    production = await client.get(_PROJECTS, headers=headers, params={"filter": "inProduction"})
+    pipeline = await client.get(_PROJECTS, headers=headers, params={"filter": "inPipeline"})
+
+    assert {row["name"] for row in production.json()["items"]} == {"Live One", "Republished"}
+    assert production.json()["total"] == counts["inProduction"] == 2
+    assert {row["name"] for row in pipeline.json()["items"]} == {
+        "Approved Only",
+        "Waiting",
+        "Changes Asked",
+    }
+    assert pipeline.json()["total"] == counts["inPipeline"] == 3
+
+
+async def test_the_unfiltered_list_is_what_the_total_tile_selects(client, db_session) -> None:
+    """The total tile is the clear-all, so it is the ABSENCE of a filter. There is no third
+    value meaning everything: serving one would be a state the page can enter and has no
+    control to leave."""
+    headers, user = await _auth(db_session)
+    await _mixed_estate(db_session, user.id)
+
+    unfiltered = await client.get(_PROJECTS, headers=headers)
+    counts = (await client.get(_COUNTS, headers=headers)).json()
+    named = await client.get(_PROJECTS, headers=headers, params={"filter": "totalApplications"})
+
+    assert unfiltered.json()["total"] == counts["totalApplications"] == 7
+    assert named.status_code == 422, named.text
+
+
+async def test_a_tile_filter_and_a_search_narrow_together(client, db_session) -> None:
+    """The tile composes with the search rather than replacing it — searching inside a filtered
+    set goes further in, and the total describes both."""
+    headers, user = await _auth(db_session)
+    await _mixed_estate(db_session, user.id)
+
+    both = await client.get(
+        _PROJECTS, headers=headers, params={"filter": "inProduction", "q": "Republished"}
+    )
+
+    assert {row["name"] for row in both.json()["items"]} == {"Republished"}
+    assert both.json()["total"] == 1
+
+
+async def test_the_page_numbers_are_cut_from_the_filtered_total(client, db_session) -> None:
+    """A total taken without the filter's own joins would number pages over the whole list —
+    the reader clicks page 3 of a two-row filter and finds it empty."""
+    headers, user = await _auth(db_session)
+    await _mixed_estate(db_session, user.id)
+
+    resp = await client.get(
+        _PROJECTS, headers=headers, params={"filter": "inProduction", "limit": 1}
+    )
+
+    assert resp.json()["total"] == 2
+    assert resp.json()["totalPages"] == 2
+    assert len(resp.json()["items"]) == 1
+
+
+async def test_a_filter_never_reaches_another_citizens_applications(client, db_session) -> None:
+    """The owner predicate is asserted UNFILTERED as well as filtered, and that is not padding.
+
+    Under `?filter=inProduction` the liveness collapse is already owner-scoped, so the tile
+    predicate hides another citizen's live application all by itself — a list that had dropped
+    `WHERE project.user_id = :me` entirely would still answer this filter correctly. The
+    unfiltered read is the one that bites on the scope predicate, which is the cross-user leak.
+    """
+    headers, user = await _auth(db_session)
+    other_headers, other = await _auth(db_session)
+    _, mine = await _project_with_app(db_session, user.id, name="Mine")
+    await _deploy(db_session, mine, user.id)
+    _, theirs = await _project_with_app(db_session, other.id, name="Theirs")
+    await _deploy(db_session, theirs, other.id)
+
+    assert await _names(client, headers) == {"Mine"}
+    assert await _names(client, headers, filter="inProduction") == {"Mine"}
+    assert await _names(client, other_headers) == {"Theirs"}
+    assert await _names(client, other_headers, filter="inProduction") == {"Theirs"}
+
+
+async def test_an_unrecognized_filter_is_refused_in_this_platforms_envelope(
+    client, db_session
+) -> None:
+    """Refused, never quietly served unfiltered: to the person pressing the tile, a typo
+    answered with everything looks like the control simply does not work."""
+    headers, _ = await _auth(db_session)
+
+    resp = await client.get(_PROJECTS, headers=headers, params={"filter": "live"})
+
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["error"]["message"] == "filter must be one of: inProduction, inPipeline."
