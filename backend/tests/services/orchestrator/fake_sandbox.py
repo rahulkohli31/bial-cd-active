@@ -21,11 +21,13 @@ from collections import deque
 from typing import Literal, assert_never
 
 from src.services.sandbox import (
+    CONTAINER_ATTACHMENTS_ROOT,
     DevLogs,
     DevStatus,
     ExecResult,
     FileCreate,
     FileCreateBytes,
+    FileDelete,
     FileInsert,
     FileOp,
     FileResult,
@@ -70,12 +72,6 @@ workspace was born with."""
 FAKE_SUPERVISOR_TOKEN = "tok_supervisor_SECRET_never_leak_me"  # noqa: S105
 
 
-#: The supervisor's second root, named here rather than imported: `sandbox/supervisor` is a
-#: separate deployable with no shared package. Kept in step with `attachments/materialize`'s
-#: `CONTAINER_ATTACHMENTS_ROOT` and the supervisor's own `ATTACHMENTS`.
-ATTACHMENTS_ROOT = "/workspace/attachments"
-
-
 def _lf(text: str) -> str:
     """LF-normalize like the supervisor does before it touches a file."""
     return text.replace("\r\n", "\n").replace("\r", "\n")
@@ -114,6 +110,8 @@ class FakeSandbox(SandboxClient):
         self.default_result = ExecResult(stdout="", stderr="", exit=0)
         self.attach_error: SandboxError | None = None
         self.files_error: SandboxError | None = None  # raised by every files() op when set
+        self._files_error_queue: list[SandboxError] = []
+        self.deleted_paths: list[str] = []  # what a reap removed, in the order it went
         self.dev_start_error: SandboxError | None = None  # raised by every dev_start when set
         self._exec_error_queue: deque[SandboxError] = deque()
         self._attach_error_queue: deque[SandboxError] = deque()
@@ -164,6 +162,12 @@ class FakeSandbox(SandboxClient):
         """Each queued error is raised by ONE `exec` call, then exec returns to normal — a
         supervisor blip, distinct from a queued non-zero exit (a NORMAL return, never raised)."""
         self._exec_error_queue.extend(errors)
+
+    def queue_files_errors(self, *errors: SandboxError) -> None:
+        """Each queued error is raised by ONE `files` call, then the write succeeds — the
+        transient blip a placement retry exists for, distinct from `files_error`, which is the
+        every-call variant a retry cannot get past."""
+        self._files_error_queue.extend(errors)
 
     def queue_attach_errors(self, *errors: SandboxError) -> None:
         """Each queued error is raised by ONE `attach_existing` call, then attach succeeds
@@ -294,6 +298,8 @@ class FakeSandbox(SandboxClient):
         return None
 
     async def files(self, handle: SandboxHandle, op: FileOp) -> FileResult:
+        if self._files_error_queue:  # one blip, then the write lands — see the queue helper
+            raise self._files_error_queue.pop(0)
         if self.files_error is not None:  # models a mid-run infra failure (e.g. SandboxGoneError)
             raise self.files_error
         if isinstance(op, FileView):
@@ -306,6 +312,12 @@ class FakeSandbox(SandboxClient):
             return self._str_replace(op)
         if isinstance(op, FileInsert):
             return self._insert(op)
+        if isinstance(op, FileDelete):
+            # Mirrors the supervisor: attachments only, and a missing file is success.
+            self.binary_workspace.pop(op.path, None)
+            self.workspace.pop(op.path, None)
+            self.deleted_paths.append(op.path)
+            return FileResult(ok=True, detail={"deleted": op.path})
         if isinstance(op, FileCreateBytes):
             # A SEPARATE STORE, not `workspace`, because `workspace` is `dict[str, str]` and
             # these are real bytes. Coercing them into the text map would make the fake model
@@ -364,7 +376,7 @@ class FakeSandbox(SandboxClient):
         # containing its own `attachments/` directory resolving where it always did. Without this
         # arm the fake refuses a write the real supervisor accepts, and the platform's own
         # attachment placement is untestable against it.
-        if path.startswith(f"{ATTACHMENTS_ROOT}/") and ".." not in path.split("/"):
+        if path.startswith(f"{CONTAINER_ATTACHMENTS_ROOT}/") and ".." not in path.split("/"):
             return
         if path.startswith("/") or ".." in path.split("/"):
             raise SandboxError(f"path escapes the workspace: {path}")

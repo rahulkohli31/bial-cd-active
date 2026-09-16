@@ -58,6 +58,7 @@ from src.services.agent.mode_prompts import PromptContext
 from src.services.attachments.materialize import (
     AttachmentDelivery,
     code_lane_attachments,
+    names_this_project_still_owns,
 )
 from src.services.build_sessions import SandboxReclaimBlockedError
 from src.services.build_sessions.appdata import APP_SWITCHED_OFF, APP_SWITCHED_OFF_CODE
@@ -497,7 +498,16 @@ async def start_turn(
         attachment_ids=body.message.attachment_ids,
     )
     delivery = (
-        AttachmentDelivery(files=tuple(code_lane), storage=storage)
+        AttachmentDelivery(
+            files=tuple(code_lane),
+            storage=storage,
+            # WHAT THE CONTAINER IS ALLOWED TO KEEP. The attachments root belongs to the
+            # project, so placement reconciles it against every conversation in the project
+            # rather than this one — see `names_this_project_still_owns`.
+            keep=await names_this_project_still_owns(
+                db, user_id=user.id, conversation_id=conversation_id
+            ),
+        )
         if code_lane and storage is not None
         else None
     )

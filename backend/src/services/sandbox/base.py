@@ -23,6 +23,13 @@ from typing import Annotated, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+#: The container-absolute root the supervisor keeps attachments in — a SIBLING of the
+#: app tree, so nothing that snapshots, restores or deploys the tree carries a chat's files
+#: with it. The supervisor reads the same value from `ATTACHMENTS_DIR`; `sandbox/` is a
+#: separate deployable with no shared package, so the two are kept in step by their tests.
+CONTAINER_ATTACHMENTS_ROOT: Final = "/workspace/attachments"
+
+
 # --- typed exceptions --------------------------------------------------------
 
 
@@ -647,8 +654,21 @@ class FileCreateBytes(_FileOpBase):
     file_b64: str
 
 
+class FileDelete(_FileOpBase):
+    """Remove an attached file from the workspace. Attachments only, by design.
+
+    The supervisor refuses this action for any path outside the attachments root, so the
+    capability cannot be turned on the app's own source — the one thing a container's files
+    are FOR. It exists because nothing else could remove a file: `place` only ever writes,
+    a deleted attachment stayed readable in the container, and a project's root grew by
+    every file every chat ever carried until the disk it shares with the build ran out.
+    """
+
+    action: Literal["delete"] = "delete"
+
+
 FileOp = Annotated[
-    FileView | FileStrReplace | FileCreate | FileInsert | FileCreateBytes,
+    FileView | FileStrReplace | FileCreate | FileInsert | FileCreateBytes | FileDelete,
     Field(discriminator="action"),
 ]
 """The typed `/files` request. `files()` takes one `FileOp` and returns one
