@@ -26,6 +26,7 @@ import uuid
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -45,8 +46,10 @@ from sqlalchemy import func, select
 
 from src.api.v1.conversations._shared import (
     MAX_ATTACHMENT_BLOCKS,
+    MAX_ATTACHMENT_TEXT_CHARS,
     MAX_FILES_PER_MESSAGE,
     MAX_MESSAGE_TEXT_CHARS,
+    TurnMessage,
 )
 from src.api.v1.conversations._shared import chat_model as chat_model_dep
 from src.api.v1.conversations.transition import PLAN_TOO_LONG_CODE
@@ -617,6 +620,26 @@ async def test_five_files_of_any_mix_send_and_the_sixth_is_refused(
         },
     )
     assert over.status_code == 422, over.text
+
+
+def test_a_fence_block_is_bounded_like_the_prose_it_becomes() -> None:
+    """★ THREE MEGABYTES OF MODEL-VISIBLE TEXT ON ONE TURN, under a ceiling sized for a
+    producer that no longer exists.
+
+    A block was allowed 600,000 characters because an office extraction arrived this way, and
+    five of them rode one message: no magic bytes, no lane check, no stored row, no quota, and
+    nothing a reclaimer could see. Nothing produces a block now, so the bound is the one that
+    fits what a block IS — prose in the prompt, held to what a person may type.
+
+    Mutation receipt: restore the old ceiling and a block ten times the typed limit is admitted.
+    """
+    assert MAX_ATTACHMENT_TEXT_CHARS == MAX_MESSAGE_TEXT_CHARS
+
+    with pytest.raises(ValidationError):
+        TurnMessage(
+            text="read this",
+            attachment_texts=["x" * (MAX_MESSAGE_TEXT_CHARS + 1)],
+        )
 
 
 def test_the_server_file_count_is_the_composer_s_number() -> None:
