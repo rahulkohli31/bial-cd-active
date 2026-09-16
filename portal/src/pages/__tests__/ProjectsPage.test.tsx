@@ -1089,17 +1089,71 @@ describe('ProjectsPage — the production actions', () => {
     await screen.findByRole('menuitem', { name: 'Open' })
   }
 
-  it.each([
-    ['menu-restart', 'restartApp'],
-    ['menu-takedown', 'takeAppDown'],
-  ] as const)('runs %s against the row it was opened on', async (testid, call) => {
+  /** Take-down is asked about before it runs; restart is not. */
+  async function pressTakeDown(): Promise<void> {
+    fireEvent.click(await screen.findByTestId('menu-takedown'))
+    fireEvent.click(await screen.findByTestId('take-down-confirm'))
+  }
+
+  it('runs menu-restart against the row it was opened on', async () => {
     h.listProjects.mockResolvedValue(page([mkProject('p1', 'Draft App'), serving('p2', 'Ramp Ops')]))
     renderPage()
     await screen.findByText('Ramp Ops')
     // The first row is not serving, so its menu carries neither entry — the SECOND row's does.
     await openRowMenu(1)
-    fireEvent.click(await screen.findByTestId(testid))
-    await waitFor(() => expect(h[call]).toHaveBeenCalledWith('p2'))
+    fireEvent.click(await screen.findByTestId('menu-restart'))
+    await waitFor(() => expect(h.restartApp).toHaveBeenCalledWith('p2'))
+  })
+
+  it('runs menu-takedown against the row it was opened on, once confirmed', async () => {
+    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Draft App'), serving('p2', 'Ramp Ops')]))
+    renderPage()
+    await screen.findByText('Ramp Ops')
+    await openRowMenu(1)
+    await pressTakeDown()
+    await waitFor(() => expect(h.takeAppDown).toHaveBeenCalledWith('p2'))
+  })
+
+  it('★ takes nothing down until the owner says so, and names which one it is asking about', async () => {
+    // THE CALIBRATION THIS FIXES. One click in a menu ended an application for everyone at BIAL,
+    // with no question and nothing to undo — beside a Delete that demands a written reason and a
+    // Send for review, which changes nothing, that opens a questionnaire.
+    h.listProjects.mockResolvedValue(page([serving('p1', 'Ramp Ops')]))
+    renderPage()
+    await screen.findByText('Ramp Ops')
+    await openRowMenu()
+    fireEvent.click(await screen.findByTestId('menu-takedown'))
+
+    expect(screen.getByText(/Take “Ramp Ops” out of production\?/)).toBeTruthy()
+    expect(h.takeAppDown).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByTestId('take-down-cancel'))
+    await waitFor(() => expect(screen.queryByTestId('take-down-confirm')).toBeNull())
+    // The row is still there and still serving — a cancel that quietly ran it anyway is exactly
+    // the failure an absence assertion on its own would miss.
+    expect(h.takeAppDown).not.toHaveBeenCalled()
+    expect(screen.getByText('Ramp Ops')).toBeTruthy()
+  })
+
+  it('★ says what a take-down kept, in the server\'s own words', async () => {
+    // The server composes the sentence — it names what survives, and appends the review-queue
+    // fact when a version is waiting — and both callers dropped it, so a take-down that worked
+    // produced no message at all: the only signal was a chip changing colour in a row a reader
+    // may have scrolled past.
+    h.takeAppDown.mockResolvedValue({
+      message: 'Your app is no longer running in production. Everything it holds is kept.',
+    })
+    h.listProjects.mockResolvedValue(page([serving('p1', 'Ramp Ops')]))
+    renderPage()
+    await screen.findByText('Ramp Ops')
+    await openRowMenu()
+    await pressTakeDown()
+
+    const notice = await screen.findByTestId('projects-toast')
+    expect(notice.getAttribute('data-tone')).toBe('confirmation')
+    expect(notice.textContent).toContain('Everything it holds is kept')
+    // And it names its subject, because this list can be searched and paged out from under it.
+    expect(notice.textContent).toContain('Ramp Ops')
   })
 
   it('re-reads the list once the operation returns, so the chip stops being stale', async () => {
@@ -1108,7 +1162,7 @@ describe('ProjectsPage — the production actions', () => {
     await screen.findByText('Ramp Ops')
     const before = h.listProjects.mock.calls.length
     await openRowMenu()
-    fireEvent.click(await screen.findByTestId('menu-takedown'))
+    await pressTakeDown()
     await waitFor(() => expect(h.listProjects.mock.calls.length).toBeGreaterThan(before))
   })
 

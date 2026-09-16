@@ -23,7 +23,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { Plus, Search, AlertTriangle, AlertCircle, Info, X } from 'lucide-react'
+import { Plus, Search, AlertTriangle, AlertCircle, CheckCircle2, Info, X } from 'lucide-react'
 import {
   listProjects,
   listProjectCounts,
@@ -38,6 +38,7 @@ import ProjectRow from '../components/projects/ProjectRow'
 import type { AppRowMenuProps } from '../components/projects/AppRowMenu'
 import ProjectCreateModal from '../components/projects/ProjectCreateModal'
 import ProjectDeleteDialog from '../components/projects/ProjectDeleteDialog'
+import TakeDownDialog from '../components/projects/TakeDownDialog'
 import AppSettingsDialog from '../components/projects/AppSettingsDialog'
 import { restartApp, takeAppDown } from '../utils/deployApi'
 import { ListPager, ListSkeleton, ViewControls } from '../components/projects/listChrome'
@@ -163,6 +164,7 @@ export default function ProjectsPage(): React.JSX.Element {
   const navigate = useNavigate()
   const [showCreate, setShowCreate] = useState(false)
   const [deleting, setDeleting] = useState<Project | null>(null)
+  const [takingDown, setTakingDown] = useState<Project | null>(null)
   // THE SETTINGS DIALOG IS AN OVERLAY OVER THIS LIST, not a route. Opening it changes no
   // address, so a citizen who came from a search and a page is still on that search and that
   // page when they close it.
@@ -173,18 +175,40 @@ export default function ProjectsPage(): React.JSX.Element {
   // which is the same refresh a delete already triggers.
   const [actingIds, setActingIds] = useState<ReadonlySet<string>>(() => new Set())
 
-  const [toast, setToast] = useState<string | null>(null)
+  /**
+   * WHAT THE STRIP AT THE FOOT SAYS, and whether it is bad news. The tone is carried rather than
+   * assumed: a take-down that worked has something an owner needs to be told — nothing was
+   * deleted, and a version waiting for review is untouched — and a red bar is the wrong voice for
+   * it. `subject` names the application, because this list can scroll, filter and empty
+   * underneath a notice that then refers to nothing on screen.
+   */
+  const [toast, setToast] = useState<
+    { text: string; tone: 'failure' | 'confirmation'; subject: string } | null
+  >(null)
 
   const runProduction = useCallback(
     (project: Project, run: (id: string) => Promise<unknown>) => {
       setActingIds((ids) => new Set(ids).add(project.id))
       void (async () => {
         try {
-          await run(project.id)
+          const settled: unknown = await run(project.id)
+          // THE SENTENCE THE SERVER ALREADY WROTE. A take-down composes one — it says what is
+          // kept, and appends the review-queue fact when there is a version waiting — and both
+          // callers used to drop it, so a successful take-down produced no message at all and
+          // the only signal was a chip changing colour in a row you may have scrolled past.
+          const said =
+            typeof settled === 'object' && settled !== null && 'message' in settled
+              ? String((settled as { message: unknown }).message)
+              : ''
+          if (said !== '') setToast({ text: said, tone: 'confirmation', subject: project.name })
         } catch (caught) {
           // THE SERVER'S STATED REASON. Every refusal on these two routes names something the
           // owner can act on, and flattening them into "something went wrong" throws that away.
-          setToast(caught instanceof Error ? caught.message : 'That did not work. Try again.')
+          setToast({
+            text: caught instanceof Error ? caught.message : 'That did not work. Try again.',
+            tone: 'failure',
+            subject: project.name,
+          })
         } finally {
           setActingIds((ids) => {
             const next = new Set(ids)
@@ -368,7 +392,10 @@ export default function ProjectsPage(): React.JSX.Element {
     project.isServing
       ? {
           onRestart: () => runProduction(project, restartApp),
-          onTakeDown: () => runProduction(project, takeAppDown),
+          // ASKED ABOUT, NOT PERFORMED. Restart interrupts the application for a moment; a
+          // take-down ends it for everyone at BIAL until somebody publishes again, and the two
+          // sat next to each other in one menu at the same single click.
+          onTakeDown: () => setTakingDown(project),
           busy: actingIds.has(project.id),
         }
       : undefined
@@ -405,7 +432,11 @@ export default function ProjectsPage(): React.JSX.Element {
       // The row never left, so this is not "put it back" — it is the totals and the counts
       // strip catching up with whatever the failed attempt did or did not change.
       setReloadNonce((n) => n + 1)
-      setToast(caught instanceof Error ? caught.message : 'Could not delete the application.')
+      setToast({
+        text: caught instanceof Error ? caught.message : 'Could not delete the application.',
+        tone: 'failure',
+        subject: project.name,
+      })
     } finally {
       setDeletingIds((ids) => {
         const next = new Set(ids)
@@ -876,22 +907,51 @@ export default function ProjectsPage(): React.JSX.Element {
         />
       )}
 
-      {/* This channel only ever carries a failure (a successful delete is silent — the
-          row is just gone), so it is deliberately NOT wired to a dismiss timer the way
-          AdminPage's toast is. A confirmation may fade on its own;
-          something that went wrong waits for the reader to dismiss it, and the reader is the
-          only thing that clears this one. The AlertCircle marks it as a failure the same way
-          the other two sites now mark theirs, so the appearance carries the fact even
-          without reading the words. */}
+      {takingDown !== null && (
+        <TakeDownDialog
+          appName={takingDown.name}
+          onClose={() => setTakingDown(null)}
+          onConfirm={() => {
+            // The dialog closes on the press rather than on the answer: the row carries the busy
+            // state from here on, and a modal held open over a list that is refreshing underneath
+            // is a second thing to dismiss for no gain.
+            const project = takingDown
+            setTakingDown(null)
+            runProduction(project, takeAppDown)
+          }}
+        />
+      )}
+
+      {/* NEITHER OUTCOME IS SILENT ANY MORE, and the two do not share a voice. A delete stays
+          silent on success — the row is simply gone, which says it — but a take-down leaves the
+          row exactly where it was, so without a sentence the only signal is a chip changing
+          colour somewhere a reader may have already scrolled past.
+          A confirmation fades on its own; something that went wrong waits to be dismissed, and
+          the marker carries which one it is without reading the words. Both name the application:
+          this list can be searched, paged and emptied under a notice that would otherwise be
+          left referring to nothing on screen. */}
       {toast !== null && (
         <div
           role="alert"
           data-testid="projects-toast"
-          className="fixed bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-3 bg-red-600 text-white text-sm font-medium px-4 py-2.5 rounded-xl shadow-lg"
+          data-tone={toast.tone}
+          className={`fixed bottom-6 left-1/2 -translate-x-1/2 flex max-w-[min(34rem,calc(100vw-3rem))] items-start gap-3 rounded-xl px-4 py-2.5 text-sm font-medium shadow-lg ${
+            toast.tone === 'failure' ? 'bg-red-600 text-white' : 'bg-primary text-white'
+          }`}
         >
-          <AlertCircle size={15} className="flex-shrink-0" data-testid="projects-toast-marker" />
-          {toast}
-          <button onClick={() => setToast(null)} aria-label="Dismiss" className="text-white/80 hover:text-white">
+          {toast.tone === 'failure' ? (
+            <AlertCircle size={15} className="mt-0.5 flex-shrink-0" data-testid="projects-toast-marker" />
+          ) : (
+            <CheckCircle2 size={15} className="mt-0.5 flex-shrink-0" data-testid="projects-toast-done" />
+          )}
+          <span className="min-w-0">
+            <span className="font-bold">{toast.subject}</span> — {toast.text}
+          </span>
+          <button
+            onClick={() => setToast(null)}
+            aria-label="Dismiss"
+            className="mt-0.5 flex-shrink-0 text-white/80 hover:text-white"
+          >
             <X size={15} />
           </button>
         </div>
