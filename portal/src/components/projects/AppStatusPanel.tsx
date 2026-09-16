@@ -52,6 +52,13 @@ export interface AppStatusPanelProps {
     /** The ending of the LAST attempt, which is not always a fact about production — a
      *  restart that failed leaves one on a row newer than the container still serving. */
     failureCode: string | null
+    /**
+     * Whether a publish is ON RECORD and not taken down — a succeeded attempt with an address,
+     * carrying no takedown stamp. It is not the same question as `state`: the lifecycle arms
+     * outrank the deployment row when a state is NAMED, so an application serving one version
+     * while a newer one waits for review is named `in_review` and this is still true.
+     */
+    hasServingRow: boolean
     refresh: () => Promise<void>
   }) => React.ReactNode
 }
@@ -373,7 +380,15 @@ export default function AppStatusPanel({ projectId, actions }: AppStatusPanelPro
       {/* THE FOOT, where anything the owner may do to a LIVE application goes. Below the
           state's own action rather than beside it: one of them changes which version is
           serving, and the others do not. */}
-      {actions?.({ state, failureCode: deployment?.failureCode ?? null, refresh })}
+      {actions?.({
+        state,
+        failureCode: deployment?.failureCode ?? null,
+        hasServingRow:
+          deployment?.status === 'succeeded' &&
+          deployment.url !== null &&
+          deployment.unpublishedAt === null,
+        refresh,
+      })}
 
       {showModal && (
         <DataClassificationModal

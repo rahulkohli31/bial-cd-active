@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { AlertTriangle, PowerOff, RotateCcw } from 'lucide-react'
 import { restartApp, takeAppDown } from '../../utils/deployApi'
 import { ApiError } from '../../utils/apiError'
-import { canBeRestarted, RESTART_FAILED_CODES } from '../../utils/publishPresentation'
+import { canBeRestarted, canBeTakenDown, RESTART_FAILED_CODES } from '../../utils/publishPresentation'
 import { BusyGlyph } from '../ui/Waiting'
 import AppStatusPanel from './AppStatusPanel'
 
@@ -93,7 +93,7 @@ export default function ProductionTab({ projectId, onSettled }: ProductionTabPro
     <div data-testid="production-tab" className="flex flex-col gap-5">
       <AppStatusPanel
         projectId={projectId}
-        actions={({ state, failureCode, refresh }) => (
+        actions={({ state, failureCode, hasServingRow, refresh }) => (
           <>
             {/* A RESTART THAT FAILED ON AN APPLICATION THAT IS STILL SERVING. The status
                 above says Live, and it is right — the previous revision never stopped. But
@@ -122,10 +122,14 @@ export default function ProductionTab({ projectId, onSettled }: ProductionTabPro
               </p>
             )}
 
-            {/* THE TWO ACTIONS ARE OFFERED ONLY WHERE THE SERVER WOULD ACCEPT THEM. A control
-                that exists to be refused teaches a citizen to distrust the screen. */}
-            {canBeRestarted(state) && (
+            {/* EACH ACTION IS OFFERED WHERE THE SERVER WOULD ACCEPT IT, and the two are not
+                accepted on the same grounds — see `canBeTakenDown`. A control that exists in
+                order to be refused teaches a citizen to distrust the screen; a control WITHHELD
+                where the server would have accepted it is the same lesson learned the other way
+                round, and it is the one an owner cannot work around. */}
+            {(canBeRestarted(state) || canBeTakenDown(state, hasServingRow)) && (
               <div className="mt-4 flex flex-col gap-3 border-t border-bial-border pt-4">
+                {canBeRestarted(state) && (
                 <div>
                   <button
                     type="button"
@@ -142,7 +146,9 @@ export default function ProductionTab({ projectId, onSettled }: ProductionTabPro
                     you have saved since.
                   </p>
                 </div>
+                )}
 
+                {canBeTakenDown(state, hasServingRow) && (
                 <div>
                   <button
                     type="button"
@@ -157,8 +163,10 @@ export default function ProductionTab({ projectId, onSettled }: ProductionTabPro
                   <p className="mt-1.5 text-[11px] leading-relaxed text-neutral">
                     Stops serving it to BIAL staff. Its chats, its data and its files are all kept,
                     and Publish again puts it back at the same address.
+                    {state === 'in_review' && ' The version waiting for review is untouched.'}
                   </p>
                 </div>
+                )}
               </div>
             )}
           </>

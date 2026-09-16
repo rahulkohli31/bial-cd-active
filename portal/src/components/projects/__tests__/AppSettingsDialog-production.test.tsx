@@ -21,6 +21,7 @@ const h = vi.hoisted(() => ({
   refresh: vi.fn(),
   state: 'live_current' as string,
   failureCode: null as string | null,
+  hasServingRow: true,
 }))
 
 vi.mock('../../../utils/deployApi', async (importOriginal) => ({
@@ -42,11 +43,17 @@ vi.mock('../AppStatusPanel', () => ({
     actions?: (ctx: {
       state: string
       failureCode: string | null
+      hasServingRow: boolean
       refresh: () => Promise<void>
     }) => React.ReactNode
   }) => (
     <div data-testid="status-panel-stub" data-project={projectId}>
-      {actions?.({ state: h.state, failureCode: h.failureCode, refresh: h.refresh })}
+      {actions?.({
+        state: h.state,
+        failureCode: h.failureCode,
+        hasServingRow: h.hasServingRow,
+        refresh: h.refresh,
+      })}
     </div>
   ),
 }))
@@ -61,6 +68,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   h.state = 'live_current'
   h.failureCode = null
+  h.hasServingRow = true
   h.restartApp.mockResolvedValue({ deploymentId: 'd2' })
   h.takeAppDown.mockResolvedValue({ message: 'done' })
   h.refresh.mockResolvedValue(undefined)
@@ -214,8 +222,9 @@ describe('no control is offered where the endpoint would refuse it', () => {
     'did_not_start',
     'switched_off',
     'starting_up',
-  ])('offers neither action on a %s application', (state) => {
+  ])('offers neither action on a %s application with nothing serving', (state) => {
     h.state = state
+    h.hasServingRow = false
     mount()
     // Absence PAIRED WITH LIVENESS: the tab really rendered and really mounted the panel that
     // says where the application stands, so this is the controls being withheld rather than a
@@ -223,6 +232,37 @@ describe('no control is offered where the endpoint would refuse it', () => {
     expect(screen.getByTestId('status-panel-stub')).toBeTruthy()
     expect(screen.queryByTestId('production-restart')).toBeNull()
     expect(screen.queryByTestId('production-takedown')).toBeNull()
+  })
+
+  it('★ offers Take down on a live application whose NEXT version is in review', () => {
+    // SUBMITTING FOR REVIEW DOES NOT STOP THE VERSION ALREADY SERVING. The lifecycle arm simply
+    // outranks the deployment row when the state is named, so this reads `in_review` — and one
+    // predicate for both controls hid the only lever an owner had over a container that is up.
+    // The server never refused it: the route makes no status check at all, and had gone as far as
+    // authoring the sentence about the queued version being untouched.
+    h.state = 'in_review'
+    h.hasServingRow = true
+    mount()
+
+    expect(screen.getByTestId('production-takedown')).toBeTruthy()
+    // …and NOT Restart, which is refused here — the two are not accepted on the same grounds.
+    expect(screen.queryByTestId('production-restart')).toBeNull()
+    // The server's own reassurance, said where the decision is made rather than after it.
+    expect(screen.getByTestId('production-tab').textContent).toContain(
+      'The version waiting for review is untouched',
+    )
+  })
+
+  it('★ …but not on a switched-off one, where an administrator already stopped it', () => {
+    // A kill-switch severs the application's database too. Offering an owner a control over a
+    // container an administrator has stopped is offering a refusal.
+    h.state = 'switched_off'
+    h.hasServingRow = true
+    mount()
+
+    expect(screen.getByTestId('status-panel-stub')).toBeTruthy()
+    expect(screen.queryByTestId('production-takedown')).toBeNull()
+    expect(screen.queryByTestId('production-restart')).toBeNull()
   })
 
   it.each(['live_current', 'live_newer_work', 'live_drift_unknown'])(

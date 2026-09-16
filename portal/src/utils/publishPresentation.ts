@@ -340,6 +340,28 @@ export function canBeRestarted(state: PublishState): boolean {
   return state === 'live_current' || state === 'live_newer_work' || state === 'live_drift_unknown'
 }
 
+/**
+ * …AND TAKE DOWN IS NOT RESTART'S TWIN, which one shared predicate quietly made it.
+ *
+ * The two are refused on different grounds. A restart needs a revision to recycle, so it is
+ * offered only where the platform can name one. A take-down needs a container to remove, and the
+ * route that does it says so in as many words: it makes no status check at all, because whether an
+ * application is in production is a separate question from Draft / In review / Approved.
+ *
+ * THE STATE THAT SEPARATES THEM IS `in_review`. Submitting a new version for review does not stop
+ * the version already serving — the lifecycle arm simply outranks the deployment row when the
+ * state is named — so an owner with a live application and a version in the queue was shown no way
+ * to take it out of production. The server had gone as far as authoring the sentence for exactly
+ * that case, saying the queued version is untouched; nothing could reach it.
+ *
+ * `switched_off` is deliberately NOT here. That is an administrator's kill-switch, which severs
+ * the application's database as well, and offering an owner a control over a container an
+ * administrator has already stopped is offering a refusal.
+ */
+export function canBeTakenDown(state: PublishState, hasServingRow: boolean): boolean {
+  return canBeRestarted(state) || (state === 'in_review' && hasServingRow)
+}
+
 /** `25 Aug 2026, 14:20` — the canvas's form, and the half a citizen recognises. */
 export function formatStamp(iso: string): string {
   const parsed = new Date(iso)
