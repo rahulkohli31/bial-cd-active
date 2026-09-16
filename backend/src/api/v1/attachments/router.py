@@ -57,6 +57,7 @@ from src.services.media import (
     is_code_lane,
     is_opc_archive,
     pdf_refusal,
+    unreadable_office_text,
 )
 from src.services.ratelimit import rate_limit
 from src.services.storage import (
@@ -513,7 +514,17 @@ async def upload_attachment(
             try:
                 assert_zip_not_bomb(data)
             except FileParseError as exc:
-                raise AppApiError(413, str(exc)) from None
+                # ★ THE STATUS AND THE WORDS BOTH CAME FROM THE WRONG PLACE. A tail-truncated
+                # OOXML still carries the ZIP signature and its own OPC part, so it passes
+                # `code_lane_refusal` and lands here — where the bomb guard's message,
+                # `Malformed archive (no ZIP end-of-central-directory)`, was handed to a
+                # citizen under a 413 that says the file was too large. It is neither
+                # oversized nor a bomb: it is incomplete, which is one of the causes this
+                # route's 415 already documents. A declared size over the bound keeps its own
+                # status, because that one really is about size.
+                if exc.status == 413:
+                    raise AppApiError(413, str(exc)) from None
+                raise AppApiError(415, unreadable_office_text(name)) from None
 
     ref = await _store_attachment_bytes(
         db, storage, user.id, attachment_id, media_type, name, conversation_id, data

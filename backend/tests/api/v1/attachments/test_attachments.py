@@ -308,7 +308,15 @@ async def test_a_password_protected_workbook_is_refused_at_the_door(
     anything is stored, with the password named — rather than being accepted, charged, and failing
     inside the sandbox several turns later where nothing can explain it."""
     headers, _, conv = await _auth(db_session)
-    locked = bytes([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) + bytes(64)
+    # THE STREAM NAME, NOT ONLY THE SIGNATURE: every legacy `.xls` carries those eight
+    # bytes too, so a fixture without the encrypted package pins a check that cannot
+    # tell the two apart.
+    locked = (
+        bytes([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])
+        + bytes(48)
+        + "EncryptedPackage".encode("utf-16-le")
+        + bytes(32)
+    )
 
     resp = await client.post(
         "/v1/attachments",
@@ -442,6 +450,41 @@ async def test_the_wire_ceiling_clears_a_legal_file_encoded(
         },
     )
     assert resp.status_code == 201
+
+
+async def test_a_truncated_workbook_is_refused_as_incomplete_not_as_too_large(
+    client, db_session, fake_storage
+) -> None:
+    """★ THE STATUS AND THE WORDS BOTH CAME FROM THE WRONG PLACE.
+
+    A file whose tail is missing still carries the ZIP signature and its own OPC part, so it
+    passes the lane's checks and reaches the bomb guard — which answered with its own vocabulary,
+    "Malformed archive (no ZIP end-of-central-directory)", under a 413 that tells the citizen the
+    file was too large. It is neither oversized nor a bomb: it is incomplete, which is one of the
+    causes this route's 415 already documents, and the sentence for it already exists.
+
+    Mutation receipt: re-raise every parse error as a 413 and this comes back 413 wearing the
+    parser's words.
+    """
+    headers, _, conv = await _auth(db_session)
+    whole = _zip_with({"xl/workbook.xml": b"<workbook/>"})
+
+    resp = await client.post(
+        "/v1/attachments",
+        headers=headers,
+        json={
+            "conversationId": str(conv.id),
+            "attachmentId": "att_truncated",
+            "name": "roster.xlsx",
+            "mediaType": EXCEL_MEDIA_TYPE,
+            "base64": _b64(whole[:-24]),
+        },
+    )
+
+    assert resp.status_code == 415, resp.text
+    message = resp.json()["error"]["message"]
+    assert "roster.xlsx" in message
+    assert "central-directory" not in message.lower()
 
 
 async def test_a_zip_bomb_is_refused_on_the_upload_lane(client, db_session, fake_storage) -> None:
@@ -1590,7 +1633,12 @@ async def test_a_locked_pdf_and_a_locked_workbook_say_the_identical_sentence(
     Mutation check: fork either sentence and this goes red on the equality, not on a substring.
     """
     headers, _, conv = await _auth(db_session)
-    ole2 = bytes([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) + b"\x00" * 64
+    ole2 = (
+        bytes([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])
+        + bytes(48)
+        + "EncryptedPackage".encode("utf-16-le")
+        + bytes(32)
+    )
 
     pdf = await _upload_pdf(client, headers, conv, "att_lp", encrypted_pdf())
     workbook = await client.post(
