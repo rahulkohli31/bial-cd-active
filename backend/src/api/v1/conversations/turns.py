@@ -64,7 +64,11 @@ from src.services.build_sessions import SandboxReclaimBlockedError
 from src.services.build_sessions.appdata import APP_SWITCHED_OFF, APP_SWITCHED_OFF_CODE
 from src.services.build_sessions.manager import SessionManager
 from src.services.connectors.access import connected_systems_for_project
-from src.services.messages.projection import DisplayItem, project_conversation
+from src.services.messages.projection import (
+    DisplayItem,
+    fill_in_attachment_chips,
+    project_rows,
+)
 from src.services.messages.store import (
     AttachmentRehydrationError,
     SeqContentionError,
@@ -692,8 +696,12 @@ async def turn_events(
             rows = await load_rows(
                 db, user_id=user.id, conversation_id=conversation.id, include_hidden=True
             )
-            projected = await project_conversation(db, user_id=user.id, rows=rows)
-            items = projected[-8:]  # the turn's own tail; full history is a separate GET
+            # SLICED BEFORE IT IS ENRICHED. The tail is all this frame carries, and resolving
+            # every attachment in the transcript to name eight chips charged a reconnect for
+            # the whole conversation. Same derivation, same enrichment, same result.
+            items = await fill_in_attachment_chips(
+                db, user_id=user.id, items=project_rows(rows)[-8:]
+            )
         snapshot = engine.build_snapshot(state, items=items)
 
     # Every DB read this route needs is done. Commit now so the pooled connection goes back
