@@ -56,12 +56,10 @@ export default function NavPanel({
           className="flex items-center gap-2.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1 rounded-lg"
           aria-label="BIAL Citizen Developer — go to My Applications"
         >
+          {/* The mark CARRIES the wordmark — a second copy beside it drew the brand twice, and
+              at 248px the two overlapped into "Develope" on top of "Developer" with the pin
+              glyph across them. It wraps to two lines here on its own. */}
           <BIALLogo />
-          <span className="text-[15px] font-extrabold leading-tight tracking-[-0.2px] text-primary">
-            BIAL Citizen
-            <br />
-            Developer
-          </span>
         </button>
         {onTogglePin && (
           <button

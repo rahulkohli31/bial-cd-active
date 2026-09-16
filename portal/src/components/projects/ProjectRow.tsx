@@ -11,6 +11,7 @@
  * description edit and never on a build or a deploy, so a bare "Updated" would claim otherwise.
  */
 import { listDate } from '../../utils/projectDates'
+import { COLUMN } from '../../utils/listView'
 import type { Project } from '../../utils/projectApi'
 import AppListRow from './AppListRow'
 import AppStatusBadge from './AppStatusBadge'
@@ -38,13 +39,15 @@ export default function ProjectRow({ project, onOpen, onSettings, onDelete, live
               column of dates a ruler down the page rather than a ragged edge. Hidden below
               `sm`, where the row has no width to spare and the name is what a citizen is
               scanning for. */}
-          <p className="hidden sm:block w-28 flex-shrink-0 text-xs text-neutral tabular-nums whitespace-nowrap">
+          <p className={`hidden sm:block ${COLUMN.date} text-xs text-neutral tabular-nums whitespace-nowrap`}>
             {listDate(project.createdAt)}
           </p>
-          <p className="hidden sm:block w-28 flex-shrink-0 text-xs text-neutral tabular-nums whitespace-nowrap">
+          <p className={`hidden sm:block ${COLUMN.date} text-xs text-neutral tabular-nums whitespace-nowrap`}>
             {listDate(project.updatedAt)}
           </p>
-          <AppStatusBadge project={project} className="w-[104px] flex-shrink-0 text-center" />
+          <div className={`${COLUMN.status} flex justify-center`}>
+            <AppStatusBadge project={project} />
+          </div>
         </>
       }
       trailing={

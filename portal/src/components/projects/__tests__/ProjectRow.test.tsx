@@ -311,4 +311,28 @@ describe('ProjectRow — the dates', () => {
     expect(both).toHaveLength(2)
     for (const cell of both) expect(cell.className).toMatch(/whitespace-nowrap/)
   })
+
+  it('★ the status pill is never held narrower than the words inside it', () => {
+    // WHAT THIS PREVENTS: the pill carried the column's fixed 104px itself, and `CHANGES
+    // REQUESTED` needs about 121px at 10px bold uppercase — so seventeen pixels of red text sat
+    // OUTSIDE its own pink background, running to within a few pixels of the `⋯`.
+    //
+    // jsdom has no layout, so the assertion is structural, and that is the stronger form anyway:
+    // the fixed width belongs to the COLUMN and the pill sizes to its own text, which makes the
+    // overflow unreachable rather than merely retuned. Paired with the label itself, because
+    // "has no width class" passes just as well on a pill that rendered nothing.
+    render(
+      <ProjectRow
+        project={project({ appStatus: 'rejected' })}
+        onOpen={vi.fn()}
+        onSettings={vi.fn()}
+        onDelete={vi.fn()}
+      />,
+    )
+    const pill = screen.getByText('Changes requested')
+    expect(pill.className).toMatch(/rounded-full/)
+    expect(pill.className).not.toMatch(/\bw-/)
+    // …and the column that reserves the space is still there, or the row has simply lost its ruler.
+    expect(pill.parentElement?.className).toMatch(/w-\[122px\]/)
+  })
 })

@@ -41,7 +41,7 @@ import ProjectDeleteDialog from '../components/projects/ProjectDeleteDialog'
 import AppSettingsDialog from '../components/projects/AppSettingsDialog'
 import { restartApp, takeAppDown } from '../utils/deployApi'
 import { ListPager, ListSkeleton, ViewControls } from '../components/projects/listChrome'
-import { DENSITY_COLS, DEFAULT_PAGE_SIZE, PAGE_SIZES } from '../utils/listView'
+import { COLUMN, DENSITY_COLS, DEFAULT_PAGE_SIZE, PAGE_SIZES } from '../utils/listView'
 import { useListView } from '../hooks/useListView'
 import { useArrivalNotice } from '../hooks/useArrivalNotice'
 import { Input } from '../components/ui/input'
@@ -726,15 +726,15 @@ export default function ProjectsPage(): React.JSX.Element {
                   <span className="flex-1">Application</span>
                   {/* LEFT-ALIGNED, and the heading sits over its own column at the same fixed
                       width the cell uses — which is the whole of what makes the dates scan. */}
-                  <span className="hidden sm:block w-28 flex-shrink-0">Created</span>
+                  <span className={`hidden sm:block ${COLUMN.date}`}>Created</span>
                   {/* "Details updated", NOT "Last updated": `updatedAt` moves only when the
                       project ROW is written — a rename or a description edit — and never
                       when the app is built, previewed, published or deployed. Naming it for
                       what it tracks is what stops the column reading as "when the app
                       last changed". */}
-                  <span className="hidden sm:block w-28 flex-shrink-0">Details updated</span>
-                  <span className="w-[104px] flex-shrink-0 text-center">Status</span>
-                  <span className="w-[26px] flex-shrink-0" aria-hidden />
+                  <span className={`hidden sm:block ${COLUMN.date}`}>Details updated</span>
+                  <span className={`${COLUMN.status} text-center`}>Status</span>
+                  <span className={COLUMN.menu} aria-hidden />
                 </div>
                 {items.map((project) => (
                   <ProjectRow

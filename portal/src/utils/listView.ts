@@ -56,6 +56,22 @@ export function storeDensity(value: Density): void {
   store(DENSITY_KEY, value)
 }
 
+/**
+ * THE COLUMN RULER, read by both lists and by both of their headings.
+ *
+ * A heading that sits over a different width than its cells turns a column of dates into a ragged
+ * edge, and four separate copies of one number is how that drift starts. The status column is the
+ * widest of the three deliberately: at 104px the longest labels a pill can carry — `CHANGES
+ * REQUESTED` and `NOTHING BUILT YET` — did not fit INSIDE their own background, and spilled red
+ * uppercase text across the gap to the `⋯`. The width belongs to the column; the pill sizes to
+ * its own words, which is what makes that failure unreachable rather than merely fixed.
+ */
+export const COLUMN = {
+  date: 'w-24 flex-shrink-0',
+  status: 'w-[122px] flex-shrink-0',
+  menu: 'w-[26px] flex-shrink-0',
+} as const
+
 /** Grid columns per density. S is denser, L roomier — the mockup's S/M/L control. */
 export const DENSITY_COLS: Record<Density, string> = {
   S: 'grid-cols-1 sm:grid-cols-3 lg:grid-cols-4',

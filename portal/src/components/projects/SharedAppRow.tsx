@@ -14,6 +14,7 @@ import { ArrowRight } from 'lucide-react'
 import AppListRow from './AppListRow'
 import AppTile from './AppTile'
 import { dayMonth, listDate } from '../../utils/projectDates'
+import { COLUMN } from '../../utils/listView'
 import type { SharedProject } from '../../utils/sharingApi'
 
 /** What the list shows for a colleague with no display name stored — the same neutral words the
@@ -84,10 +85,10 @@ export function SharedAppRow({ project, onOpen }: SharedAppProps): React.JSX.Ele
           </div>
           {/* The same fixed-width, left-aligned, tabular treatment the owner's dates get: the
               three together are what make a column of dates a ruler down the page. */}
-          <p className="hidden sm:block w-28 flex-shrink-0 text-xs text-neutral tabular-nums whitespace-nowrap">
+          <p className={`hidden sm:block ${COLUMN.date} text-xs text-neutral tabular-nums whitespace-nowrap`}>
             {listDate(project.sharedAt)}
           </p>
-          <p className="hidden sm:block w-28 flex-shrink-0 text-xs text-neutral tabular-nums whitespace-nowrap">
+          <p className={`hidden sm:block ${COLUMN.date} text-xs text-neutral tabular-nums whitespace-nowrap`}>
             {listDate(project.projectUpdatedAt)}
           </p>
         </>

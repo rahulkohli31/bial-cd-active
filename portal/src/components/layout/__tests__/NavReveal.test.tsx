@@ -347,6 +347,19 @@ describe('pin is a preference about a screen, not a property of an application',
   })
 })
 
+describe('the brand is drawn once', () => {
+  it('★ the panel header carries one wordmark, not two stacked on each other', () => {
+    // `BIALLogo` already contains the wordmark, and the header set a second one beside it. At the
+    // panel's 248px both wrapped, and the two collided — "Develope" drawn over "Developer", with
+    // the pin glyph across the text. On every screen in the product.
+    renderReveal()
+    fireEvent.click(screen.getByTestId('nav-menu-button'))
+    const header = screen.getByTestId('nav-panel').firstElementChild
+    const drawn = (header?.textContent ?? '').match(/BIAL\s*Citizen\s*Developer/g) ?? []
+    expect(drawn).toHaveLength(1)
+  })
+})
+
 describe('a reach can be interrupted by the screen itself, not only by the pointer', () => {
   it('★ the chat collapsing mid-reach abandons it, rather than opening a moment later', async () => {
     const view = renderReveal()

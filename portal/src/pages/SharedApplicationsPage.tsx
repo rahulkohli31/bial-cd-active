@@ -30,7 +30,7 @@ import {
 } from '../utils/sharingApi'
 import { SharedAppRow, SharedAppTile, sharerName } from '../components/projects/SharedAppRow'
 import { ListPager, ListSkeleton, ViewControls } from '../components/projects/listChrome'
-import { DENSITY_COLS, DEFAULT_PAGE_SIZE, PAGE_SIZES } from '../utils/listView'
+import { COLUMN, DENSITY_COLS, DEFAULT_PAGE_SIZE, PAGE_SIZES } from '../utils/listView'
 import { useListView } from '../hooks/useListView'
 import { useArrivalNotice } from '../hooks/useArrivalNotice'
 import { Input } from '../components/ui/input'
@@ -343,10 +343,10 @@ export default function SharedApplicationsPage(): React.JSX.Element {
                 <div className="flex items-center gap-4 px-4 py-2.5 bg-bial-bg/60 border-b border-bial-border text-[10px] font-bold uppercase tracking-wider text-neutral">
                   <span className="flex-1">Application</span>
                   <span className="hidden sm:block w-[168px] flex-shrink-0">Shared by</span>
-                  <span className="hidden sm:block w-28 flex-shrink-0">Shared on</span>
+                  <span className={`hidden sm:block ${COLUMN.date}`}>Shared on</span>
                   {/* "Details updated", NOT "Last updated": the owner's `updatedAt` moves on a
                       rename or a description edit and never on a build or a deploy. */}
-                  <span className="hidden sm:block w-28 flex-shrink-0">Details updated</span>
+                  <span className={`hidden sm:block ${COLUMN.date}`}>Details updated</span>
                   <span className="w-[88px] flex-shrink-0" aria-hidden />
                 </div>
                 {items.map((project) => (
