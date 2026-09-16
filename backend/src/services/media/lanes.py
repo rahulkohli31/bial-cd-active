@@ -93,6 +93,9 @@ def canonical_suffix(media_type: str) -> str:
 # from an ordinary one WITHOUT opening it — which is what makes refusing at the door possible.
 _OLE2_SIGNATURE: Final = bytes([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])
 _ZIP_SIGNATURE: Final = bytes([0x50, 0x4B, 0x03, 0x04])
+# The stream Office writes an encrypted package into, as it appears in the compound document's
+# directory: UTF-16, which is how those entries are stored.
+_ENCRYPTED_PACKAGE: Final = "EncryptedPackage".encode("utf-16-le")
 
 
 def is_code_lane(media_type: str) -> bool:
@@ -116,8 +119,19 @@ def is_opc_archive(media_type: str) -> bool:
 
 
 def looks_password_protected(data: bytes) -> bool:
-    """Is this an encrypted Office file? True for the OLE2 wrapper Office writes for one."""
-    return data[:8] == _OLE2_SIGNATURE
+    """Is this an encrypted Office file?
+
+    ★ THE SIGNATURE ALONE CANNOT TELL, and answering on it sent a citizen somewhere with no
+    way out. Every legacy `.xls`, `.doc` and `.ppt` is an OLE2 compound document too, so a
+    renamed `sales.xls` was refused with "Remove the password" — advice about a password the
+    file does not have, for a file that is merely the wrong format.
+
+    What separates them is inside the container: Office stores an encrypted workbook as a
+    stream named `EncryptedPackage`, while a legacy file's streams are `Workbook`, `WordDocument`
+    or `PowerPoint Document`. Directory entry names are UTF-16, so the search is for those
+    bytes; a legacy file falls through to the structure check and is told its real problem.
+    """
+    return data[:8] == _OLE2_SIGNATURE and _ENCRYPTED_PACKAGE in data
 
 
 PASSWORD_PROTECTED_TEXT: Final = (
@@ -221,6 +235,17 @@ def pdf_refusal(name: str, data: bytes) -> str | None:
     return None
 
 
+def unreadable_office_text(name: str) -> str:
+    """What a citizen is told about an Office file the platform cannot open.
+
+    Shared with the upload door's archive check, which used to answer with the bomb guard's
+    own words — `Malformed archive (no ZIP end-of-central-directory)` — parser vocabulary
+    about a file the citizen sees as a spreadsheet, and under a status that says it was too
+    large when it was not.
+    """
+    return f'"{name}" could not be read as an Office file. Re-save it and attach it again.'
+
+
 def code_lane_refusal(media_type: str, name: str, data: bytes) -> str | None:
     """Why this code-lane upload is refused, or None if it may be stored.
 
@@ -244,7 +269,7 @@ def code_lane_refusal(media_type: str, name: str, data: bytes) -> str | None:
     if looks_password_protected(data):
         return PASSWORD_PROTECTED_TEXT
     if data[:4] != _ZIP_SIGNATURE:
-        return f'"{name}" could not be read as an Office file. Re-save it and attach it again.'
+        return unreadable_office_text(name)
     if part not in data:
         # The OPC part is stored uncompressed in the ZIP's own headers, so a plain substring search
         # over the bytes is enough to tell the three formats apart without unpacking anything.
