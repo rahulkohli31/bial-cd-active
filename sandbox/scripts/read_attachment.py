@@ -443,6 +443,31 @@ def _text_encoding(path: Path) -> str:
 _CANDIDATE_SEPARATORS = (",", chr(9), ";", "|")
 
 
+def _outside_quotes(line: str) -> str:
+    """The line with every quoted field removed, for counting delimiters in.
+
+    ★ A HEADING MAY CONTAIN THE OTHER DELIMITER, and counting raw characters let it decide.
+    `gate,"owner; deputy; backup",waiting` holds three semicolons and two commas, so a comma
+    file was read as a semicolon one and came back as four columns wearing pieces of each
+    other's names — with `ok: true`, which is the failure this whole script exists to remove.
+    """
+    kept: list[str] = []
+    quoted = False
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if char == '"':
+            # A doubled quote INSIDE a quoted field is an escaped quote, not the end of it.
+            if quoted and line[index + 1 : index + 2] == '"':
+                index += 2
+                continue
+            quoted = not quoted
+        elif not quoted:
+            kept.append(char)
+        index += 1
+    return "".join(kept)
+
+
 def _separator(path: Path, encoding: str, default: str) -> str:
     """The delimiter the file actually uses, not the one its extension implies.
 
@@ -451,14 +476,16 @@ def _separator(path: Path, encoding: str, default: str) -> str:
     perfectly into ONE column called `gate;owner;busy`, and an agent builds a schema from
     that — a wrong answer with nothing in it that looks wrong.
 
-    Judged on the header line, where a delimiter repeats and a stray one in prose does not.
+    Judged on the header line OUTSIDE its quoted fields, where a delimiter repeats and one
+    inside a heading does not.
     The extension's own separator wins a tie, so an ordinary file keeps the behaviour it had.
     """
     with path.open("rb") as handle:
         head = handle.read(_ENCODING_SAMPLE_BYTES)
     lines = head.decode(encoding, errors="replace").splitlines()
     line = lines[0] if lines else ""
-    counts = {candidate: line.count(candidate) for candidate in _CANDIDATE_SEPARATORS}
+    bare = _outside_quotes(line)
+    counts = {candidate: bare.count(candidate) for candidate in _CANDIDATE_SEPARATORS}
     best = max(_CANDIDATE_SEPARATORS, key=lambda candidate: counts[candidate])
     return best if counts[best] > counts[default] else default
 
