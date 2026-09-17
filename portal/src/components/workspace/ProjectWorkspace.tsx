@@ -406,7 +406,15 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
 
   return (
     <>
-      <WorkspaceRail project={project} />
+      <WorkspaceRail
+        project={project}
+        lifecycle={{
+          drainingAt: workspace.drainingAt,
+          // The save read carries it: a refusal is durable and a citizen must meet it on their
+          // NEXT visit, not only in the session it happened in.
+          writeBackRefusedAt: workspace.save?.writeBackRefusedAt ?? null,
+        }}
+      />
       {settingsOpen && (
         <AppSettingsDialog
           project={project}

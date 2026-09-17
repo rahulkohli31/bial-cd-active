@@ -663,6 +663,34 @@ class Promotion:
     detail: str
 
 
+async def newest_diverted_at(app_id: uuid.UUID) -> datetime | None:
+    """When a platform write-back for this app was last REFUSED, or `None` if none ever was.
+
+    The citizen is owed this sentence. Shutdown now writes their work back with nobody watching,
+    and when the ancestry guard refuses, the tree is parked and their app comes back from the last
+    SAVED version instead — which looks, from the screen, exactly like a normal reopen. Saying so
+    is what makes removing the exit prompts honest rather than merely quieter.
+
+    ONE LIST AND ONE HEAD, unlike `list_parked_trees`, which heads every object it finds: this is
+    on a poll, and it needs only the newest. The keys are stamped sortably for exactly this.
+
+    `None` on an unconfigured or unreadable store. A notice we cannot substantiate is one we do
+    not make — the opposite failure, claiming a refusal that did not happen, would send somebody
+    looking for work that was never set aside."""
+    try:
+        store = get_storage()
+    except StorageUnconfiguredError:
+        return None
+    try:
+        keys = await all_keys_under(store, divert_prefix(app_id))
+    except StorageError:
+        return None
+    if not keys:
+        return None
+    meta = await store.head(max(keys))
+    return meta.last_modified if meta else None
+
+
 async def list_parked_trees(app_id: uuid.UUID) -> list[ParkedTree]:
     """Every quarantine and divert object for one app, newest first — the useful one is almost
     always the last, and scrolling to the bottom is how an operator promotes the wrong one.

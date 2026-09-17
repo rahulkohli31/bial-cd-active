@@ -301,6 +301,14 @@ export interface SaveState {
    *  stays true while this is set. What it licenses is a truer WARNING, never a claim of
    *  safety-by-saving — the rail's `saveSentence` is where that reasoning is written down. */
   recoveryAt: string | null
+  /** WHEN A PLATFORM WRITE-BACK FOR THIS APP WAS LAST REFUSED, or `null` if none ever was.
+   *
+   *  Shutdown writes the citizen's work back with nobody watching. When the tree does not descend
+   *  from what they themselves saved, the guard sets it aside and the app comes back from the
+   *  SAVED version instead — which, from the screen, looks exactly like an ordinary reopen. This
+   *  is what lets the project screen say so, and saying so is what makes removing the exit
+   *  prompts honest rather than merely quieter. */
+  writeBackRefusedAt: string | null
 }
 
 /**
@@ -337,7 +345,8 @@ export const sameSaveState = (a: SaveState | null, b: SaveState | null): boolean
     a.dirty === b.dirty &&
     a.containerHead === b.containerHead &&
     a.savedHead === b.savedHead &&
-    a.recoveryAt === b.recoveryAt)
+    a.recoveryAt === b.recoveryAt &&
+    a.writeBackRefusedAt === b.writeBackRefusedAt)
 
 /** Push the project's current tree to durable storage. THE USER'S CLICK — nothing else writes
  *  the bundle. A 409 means the workspace is no longer running, and is surfaced, never
@@ -952,6 +961,8 @@ function toSaveState(body: unknown): SaveState {
     containerHead: typeof body.containerHead === 'string' ? body.containerHead : null,
     savedHead: typeof body.savedHead === 'string' ? body.savedHead : null,
     recoveryAt: typeof body.recoveryAt === 'string' ? body.recoveryAt : null,
+    writeBackRefusedAt:
+      typeof body.writeBackRefusedAt === 'string' ? body.writeBackRefusedAt : null,
   }
 }
 
@@ -1021,6 +1032,17 @@ export type SurfacePresence = 'visible' | 'hidden'
  */
 export type RenewalOutcome = 'renewed' | 'not_this_container' | 'nothing_running'
 
+/** What a renewal answered, and when the container it reached hits its absolute ceiling. */
+export interface Renewal {
+  outcome: RenewalOutcome
+  /**
+   * When this container is collected no matter who is renewing it, or `null` when no ceiling
+   * applies. NULL IS NOT "SOON" — a screen that read it as imminent would announce a collection
+   * that is not coming.
+   */
+  drainingAt: string | null
+}
+
 /**
  * Tell the platform a screen that can frame this project is still open, so its container stays.
  *
@@ -1040,7 +1062,7 @@ export async function renewPresence(
   projectId: string,
   presence: SurfacePresence,
   deps: AuthFetchDeps = {},
-): Promise<RenewalOutcome | null> {
+): Promise<Renewal | null> {
   try {
     const res = await authFetch(
       `${BASE}/projects/${encodeURIComponent(projectId)}/renew`,
@@ -1055,10 +1077,54 @@ export async function renewPresence(
     const body: unknown = await res.json().catch(() => null)
     if (!isRecord(body)) return null
     const outcome = body.outcome
-    return outcome === 'renewed' || outcome === 'not_this_container' || outcome === 'nothing_running'
-      ? outcome
-      : null
+    if (outcome !== 'renewed' && outcome !== 'not_this_container' && outcome !== 'nothing_running') {
+      return null
+    }
+    return {
+      outcome,
+      drainingAt: typeof body.drainingAt === 'string' ? body.drainingAt : null,
+    }
   } catch {
     return null
   }
+}
+
+/** One app's activity, as the applications page reads it. */
+export type ActivityPhase = 'starting' | 'open' | 'closing'
+
+export interface ProjectActivity {
+  projectId: string
+  phase: ActivityPhase
+  drainingAt: string | null
+}
+
+const ACTIVITY_PHASES: ReadonlySet<string> = new Set(['starting', 'open', 'closing'])
+
+/**
+ * Which of this citizen's apps are starting, open right now, or closing down.
+ *
+ * IT THROWS RATHER THAN ANSWERING EMPTY. An empty list is a positive statement that nothing is
+ * happening, and the page clears every marker on it — so a read that could not be made must reach
+ * the caller as a failure, where the existing markers are held, rather than as an answer.
+ */
+export async function fetchActivity(deps: AuthFetchDeps = {}): Promise<ProjectActivity[]> {
+  const res = await authFetch(`${BASE}/activity`, {}, deps)
+  if (!res.ok) throw await readApiError(res, 'Could not check what is running')
+  const body: unknown = await res.json().catch(() => null)
+  if (!isRecord(body) || !Array.isArray(body.projects)) {
+    throw new ApiError('Could not check what is running', res.status)
+  }
+  const rows: ProjectActivity[] = []
+  for (const raw of body.projects) {
+    if (!isRecord(raw)) continue
+    const { projectId, phase, drainingAt } = raw
+    if (typeof projectId !== 'string' || typeof phase !== 'string') continue
+    if (!ACTIVITY_PHASES.has(phase)) continue
+    rows.push({
+      projectId,
+      phase: phase as ActivityPhase,
+      drainingAt: typeof drainingAt === 'string' ? drainingAt : null,
+    })
+  }
+  return rows
 }

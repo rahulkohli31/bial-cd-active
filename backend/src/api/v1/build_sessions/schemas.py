@@ -568,6 +568,15 @@ class RenewPresenceResponse(CamelModel):
     #: When the stay now lapses, or `None` when nothing was renewed. The client does not display
     #: it; it is what makes a renewal auditable from a response body.
     stay_until: datetime | None = None
+    #: When this container reaches the absolute ceiling and is collected no matter who is
+    #: renewing it, or `None` when no ceiling applies.
+    #:
+    #: IT RIDES THE RENEWAL RATHER THAN A READ OF ITS OWN. The screen that needs to say this is
+    #: the screen already renewing every 45 seconds, and the instant is a fact about the very
+    #: container being renewed — a second endpoint call per tick would buy nothing. NULL IS NOT
+    #: "SOON": it means no ceiling applies, and a client that rendered it as imminent would be
+    #: announcing a collection that is not coming.
+    draining_at: datetime | None = None
 
 
 # --- The activity read (R13) --------------------------------------------------

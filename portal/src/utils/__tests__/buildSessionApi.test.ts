@@ -866,6 +866,7 @@ describe('discardUnsavedChanges — the Discard button', () => {
     containerHead: 'aaa',
     savedHead: 'aaa',
     recoveryAt: null,
+    writeBackRefusedAt: null,
   }
 
   it('POSTs to the discard route with the CSRF header and the conversationId body', async () => {
@@ -925,6 +926,7 @@ describe('sameSaveState — what a poll is allowed to call "no change"', () => {
     containerHead: '059d936',
     savedHead: null,
     recoveryAt: null,
+    writeBackRefusedAt: null,
     ...over,
   })
 
@@ -935,6 +937,16 @@ describe('sameSaveState — what a poll is allowed to call "no change"', () => {
     // no other test in the repo going red. Drop the `a.recoveryAt === b.recoveryAt` conjunct and
     // this is the assertion that catches it.
     expect(sameSaveState(reading(), reading({ recoveryAt: '2026-09-10T10:38:43Z' }))).toBe(false)
+  })
+
+  it('★ sees a change in `writeBackRefusedAt` too', () => {
+    // The same mutant, one field along, and this one is a SAFETY sentence: the project screen
+    // says a platform write-back was refused, and that notice is the whole of what makes removing
+    // the exit prompts honest. A comparator blind to it would keep the previous reading and the
+    // sentence would never appear.
+    expect(
+      sameSaveState(reading(), reading({ writeBackRefusedAt: '2026-09-17T22:14:00Z' })),
+    ).toBe(false)
   })
 
   it('still calls two identical readings the same, recovery instant included', () => {

@@ -73,6 +73,12 @@ export interface WorkspaceReading {
   /** The save model — non-null only while the workspace is `alive`. See the cost note above. */
   save: SaveState | null
   /**
+   * When this container is collected no matter who is renewing it, or `null` when no ceiling
+   * applies. Reported by the renewal, which is the only call that reaches the container this
+   * screen is holding open.
+   */
+  drainingAt: string | null
+  /**
    * HOW MANY TIMES THE POLL HAS ANSWERED — a heartbeat, not a value.
    *
    * It exists because `setPreview` deliberately keeps the OLD object when the reading has not
@@ -125,6 +131,10 @@ export function useWorkspaceState({
   // See `WorkspaceReading.readTick`. Counted rather than flagged for the same reason `epoch` is:
   // a boolean that means "a read landed" can be batched away between two commits, a number cannot.
   const [readTick, setReadTick] = useState(0)
+  // WHEN THIS CONTAINER REACHES THE CEILING, reported by the renewal that reaches it. Held as
+  // state rather than derived, because only a renewal can answer it and the poll's own read
+  // carries nothing about it. `null` means no ceiling applies — never "soon".
+  const [drainingAt, setDrainingAt] = useState<string | null>(null)
 
   const refresh = useCallback(() => setEpoch((n) => n + 1), [])
   // WHAT THE PANE LAST SAID ABOUT ITS FRAME. A ref, not state: it changes what the next read ASKS
@@ -217,7 +227,15 @@ export function useWorkspaceState({
       // workspace, with nobody looking.
       const hidden = document.visibilityState !== 'visible'
       const presence = presenceToRenew(accelerated, hidden)
-      if (presence) void renewPresence(projectId, presence)
+      if (presence) {
+        // NOT AWAITED. The renewal is a fact this surface reports, not one the read waits on: a
+        // slow renewal must never delay the answer the screen is rendering. Its own result is
+        // recorded when it lands, and a failure records nothing at all.
+        void renewPresence(projectId, presence).then((renewal) => {
+          if (!live || projectRef.current !== projectId) return
+          if (renewal?.outcome === 'renewed') setDrainingAt(renewal.drainingAt)
+        })
+      }
       const generation = ++latest
       try {
         const next = await fetchPreviewState(projectId)
@@ -367,6 +385,7 @@ export function useWorkspaceState({
     }),
     preview,
     save,
+    drainingAt,
     readTick,
     reportStartOutcome,
     reportStartPending,

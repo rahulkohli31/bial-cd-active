@@ -1,4 +1,5 @@
 import RailComposer from './RailComposer'
+import WorkspaceLifecycleNotes from './WorkspaceLifecycleNotes'
 import type { Project } from '../../utils/projectApi'
 
 /**
@@ -23,16 +24,28 @@ import type { Project } from '../../utils/projectApi'
  * toolbar's menu and from the home list alike.
  */
 export interface WorkspaceRailProps {
+  /**
+   * WHAT THE PLATFORM OWES THIS CITIZEN ABOUT THEIR APP'S LIFE. Optional because the rail is
+   * also rendered where neither fact is known, and a missing note must never read as "no
+   * ceiling" or "the write-back was fine".
+   */
+  lifecycle?: { drainingAt: string | null; writeBackRefusedAt: string | null }
   project: Project
 }
 
-export default function WorkspaceRail({ project }: WorkspaceRailProps) {
+export default function WorkspaceRail({ project, lifecycle }: WorkspaceRailProps) {
   return (
     // `min-h-0` is what actually lets this flex child scroll: without it the child's min-content
     // height wins and the overflow never has anywhere to happen. `justify-center` is what puts the
     // composer in the middle of a column it is alone in; on a short window the scroller takes over
     // and nothing is pushed out of reach.
     <main className="flex flex-1 min-h-0 flex-col justify-center overflow-y-auto bg-white">
+      {lifecycle && (
+        <WorkspaceLifecycleNotes
+          drainingAt={lifecycle.drainingAt}
+          writeBackRefusedAt={lifecycle.writeBackRefusedAt}
+        />
+      )}
       <section className="px-[18px] py-4">
         <h2 className="text-[10.5px] font-bold tracking-[.7px] text-primary-900">START A CHAT</h2>
         <RailComposer projectId={project.id} />

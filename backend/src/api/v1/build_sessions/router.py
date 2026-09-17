@@ -98,6 +98,7 @@ from src.services.build_sessions import (
 from src.services.build_sessions.drain import draining_at
 from src.services.build_sessions.locks import (
     an_instant_on_the_hash,
+    read_registry,
     read_registry_and_starting_marker,
     renew_presence_stay,
     stamp_is_proven,
@@ -105,6 +106,7 @@ from src.services.build_sessions.locks import (
 from src.services.build_sessions.snapshot import (
     ParkedTreeNotOursError,
     list_parked_trees,
+    newest_diverted_at,
     promote_parked,
 )
 from src.services.orchestrator.client_errors import (
@@ -779,6 +781,18 @@ class SaveStateResponse(CamelModel):
     # recovery copy is what the platform can resume from; `savedHead` is what its owner chose to
     # keep, and only that one is a thing they can ask to come back to.
     recovery_at: datetime | None = None
+    # WHEN A PLATFORM WRITE-BACK FOR THIS APP WAS LAST REFUSED, or None if none ever was.
+    #
+    # Shutdown writes the citizen's work back with nobody watching, and when the tree does not
+    # descend from what they themselves saved, the ancestry guard sets it aside and the app comes
+    # back from the SAVED version — which from the screen is indistinguishable from an ordinary
+    # reopen. This is what lets the project screen say so, and saying so is the whole of what
+    # makes removing the exit prompts honest rather than merely quieter.
+    #
+    # None ALSO COVERS "COULD NOT ASK". A notice that cannot be substantiated is one not made:
+    # claiming a refusal that did not happen would send somebody looking for work that was never
+    # set aside.
+    write_back_refused_at: datetime | None = None
     saved_head: str | None = None
 
 
@@ -1385,13 +1399,24 @@ async def renew_presence(
         # surface could be holding open. A 404 would be wrong — the PROJECT exists and is theirs.
         return RenewPresenceResponse(outcome=RenewalOutcome.NOTHING_RUNNING)
     with build_coordination_or_503():
+        redis = get_redis()
         outcome, stay_until = await renew_presence_stay(
-            get_redis(),
+            redis,
             user.id,
             app_name=app_name_for(app_id),
             presence=body.presence,
         )
-        return RenewPresenceResponse(outcome=outcome, stay_until=stay_until)
+        # Only for the container this renewal actually reached. A ceiling instant reported
+        # alongside `not_this_container` would be another project's, wearing this one's name.
+        mark: datetime | None = None
+        if outcome is RenewalOutcome.RENEWED:
+            reg = await read_registry(redis, user.id)
+            if reg is not None:
+                enabled, after_hours = _drain_switch()
+                mark = draining_at(
+                    _registry_identity(reg), enabled=enabled, after_hours=after_hours
+                )
+        return RenewPresenceResponse(outcome=outcome, stay_until=stay_until, draining_at=mark)
     raise _coordination_is_gone()
 
 
@@ -1451,7 +1476,12 @@ async def save_state(
     if sandbox is None:
         return SaveStateResponse()
     state = await manager.project_save_state(db, user, project_id, sandbox_client=sandbox)
-    return SaveStateResponse(**_save_state_fields(state))
+    # ASKED HERE RATHER THAN INSIDE THE SAVE STATE, because it is a fact about the OBJECT STORE
+    # and not about the container: a write-back refused days ago is still owed a sentence, and
+    # the save state is a comparison of two commits. One list and one head, alongside the two
+    # heads this read already pays for.
+    refused = await newest_diverted_at(state.app_id) if state.app_id else None
+    return SaveStateResponse(**_save_state_fields(state), write_back_refused_at=refused)
 
 
 # --- the app's own client-error report ----------------
