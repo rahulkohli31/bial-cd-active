@@ -316,6 +316,39 @@ async def test_create_app_maps_transient(
         await cp.create_app(name="sbx-x", env=_ENV, tags=_TAGS)
 
 
+async def test_a_create_conflict_is_retried_rather_than_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ A CONFLICT ON A CREATE IS SOMETHING IN FLIGHT, NOT A DECISION.
+
+    This call is an upsert — an existing container is updated rather than refused — so a 409 is
+    ARM saying another operation currently owns the name. The one that matters here is a delete
+    still settling: a container name is stable across teardown and recreate, so a citizen
+    reopening a project they have just left arrives inside exactly that window, and a terminal
+    answer there fails a start that would have succeeded moments later.
+
+    `is_transient` alone does not admit it — 409 is neither 429 nor 5xx — which is why this is a
+    clause of its own rather than a threshold change.
+
+    Mutation check: fold the 409 arm back into the terminal branch and this goes red while every
+    other case in this file stays green."""
+    cp = _control_plane(monkeypatch, _raises("begin_create_or_update", _http_error(409)))
+
+    with pytest.raises(AcaTransientError):
+        await cp.create_app(name="sbx-x", env=_ENV, tags=_TAGS)
+
+
+async def test_a_delete_conflict_is_still_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The asymmetry is deliberate: only the CREATE side has a window worth waiting through. A
+    delete that conflicts is answered by the owed-row ledger and a later sweep, not by spinning
+    the ladder here while a citizen waits."""
+    cp = _control_plane(monkeypatch, _raises("begin_delete", _http_error(409)))
+
+    with pytest.raises(AcaError) as ei:
+        await cp.delete_app(name="sbx-x")
+    assert not isinstance(ei.value, AcaTransientError)
+
+
 @pytest.mark.parametrize("status", [400, 404])
 async def test_create_app_maps_terminal(monkeypatch: pytest.MonkeyPatch, status: int) -> None:
     cp = _control_plane(monkeypatch, _raises("begin_create_or_update", _http_error(status)))
