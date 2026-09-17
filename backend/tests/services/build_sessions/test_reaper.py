@@ -6,23 +6,28 @@ from __future__ import annotations
 
 import ast
 import base64
+import contextlib
 import time
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 import redis.asyncio as aioredis
+import sqlalchemy as sa
 import structlog.testing
 from pydantic import SecretStr
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import (
     LIVENESS_LEASE_TTL_SECONDS,
     RELAUNCH_PREVIEW_STAY_SECONDS,
 )
 from src.config import settings
-from src.services.build_sessions import locks, pass_history, reaper
+from src.db.models.pending_teardown import PendingTeardown
+from src.services.build_sessions import app_name_for, locks, pass_history, reaper
 from src.services.build_sessions.alarms import SERVING_PROOF_ABSENT_AT_TEARDOWN
 from src.services.build_sessions.pass_history import CopyAttempt
 from src.services.build_sessions.snapshot import reset_divert_streaks_for_tests
@@ -55,6 +60,7 @@ from src.services.sandbox.base import (
 )
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
+from tests.factories import AppRegistryFactory, UserFactory
 from tests.fakes import (
     FakeSandboxClient,
     FakeStorage,
@@ -360,12 +366,16 @@ async def test_sweep_all_skips_live_users(fake_redis: aioredis.Redis) -> None:
     assert await locks.read_registry(fake_redis, USER) is not None
 
 
-async def test_reaper_teardown_failure_keeps_state_for_retry(fake_redis: aioredis.Redis) -> None:
+async def test_reaper_teardown_failure_keeps_state_when_nothing_can_own_the_debt(
+    fake_redis: aioredis.Redis,
+) -> None:
+    # No `app_id`, so the owed-row ledger has nothing to write back for and refuses the debt.
+    # Registry + lock are then KEPT for a later sweep — the only retry left, and never an
+    # orphaned live container.
     await _seed(fake_redis, USER, with_lock=True, with_heartbeat=False)
     client = FakeSandboxClient()
     client.teardown_error = SandboxError("teardown boom")
     assert await reaper.reap_user(fake_redis, USER, client) is False
-    # Teardown failed -> registry + lock KEPT for a later sweep (never orphan a live box).
     assert await locks.read_registry(fake_redis, USER) is not None
     assert await locks.lock_is_held(fake_redis, USER) is True
 
@@ -1141,18 +1151,108 @@ async def test_the_reap_clears_the_lease_with_the_registry(fake_redis: aioredis.
     assert await fake_redis.exists(lease_key(USER)) == 0
 
 
-async def test_a_failed_teardown_keeps_the_lease_with_the_rest_of_the_state(
+async def test_a_failed_teardown_keeps_the_lease_when_nothing_can_own_the_debt(
     fake_redis: aioredis.Redis,
 ) -> None:
-    # The teardown-failure arm keeps lock + registry so a later sweep retries. The lease is
-    # part of that state: clearing it while the container is still standing would strip the
-    # protection off a container that may STILL be building.
+    # With no owed row to carry the retry, this arm keeps lock + registry so a later sweep can
+    # find the container again. The lease is part of that state: clearing it while the container
+    # is still standing would strip the protection off one that may STILL be building.
     await _seed(fake_redis, USER, with_lock=True, with_heartbeat=False)
     await _hold_a_lease(fake_redis, USER)
     client = FakeSandboxClient()
     client.teardown_error = SandboxError("teardown boom")
     assert await reaper.reap_user(fake_redis, USER, client) is False
     assert await locks.liveness_lease_is_held(fake_redis, USER) is True
+
+
+# --- and when something CAN own it -------------------------------------------
+#
+# The arm above is the fallback, not the shape. Holding a citizen's lock and registry so a later
+# sweep can retry spends their one workspace on a failure of OURS: until an ARM that was refusing
+# us starts answering again, they cannot start their next project at all. An owed row still names
+# the container after the record is gone, so the state can go and the retry survives.
+
+
+async def test_a_failed_teardown_hands_the_debt_over_and_gives_the_slot_back(
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ Mutation check: keep the registry and lock here the way the arm above does, and this goes
+    red on both the freed slot and the row that carries the debt."""
+    user = await UserFactory.create(db_session)
+    app = await AppRegistryFactory.create(db_session, user_id=user.id)
+    born = "2026-07-14T00:00:00+00:00"
+    await _seed(
+        fake_redis, user.id, app_name=app_name_for(app.id), with_heartbeat=False, created_at=born
+    )
+    await _hold_a_lease(fake_redis, user.id)
+    await _preserve(fake_storage, app.id)
+    client = FakeSandboxClient()
+    client.teardown_error = SandboxError("ARM said no")
+
+    async with _the_test_session(db_session, monkeypatch):
+        assert await reaper.reap_user(fake_redis, user.id, client, app_id=app.id) is False
+
+    assert await locks.read_registry(fake_redis, user.id) is None
+    assert await locks.lock_is_held(fake_redis, user.id) is False
+    assert await locks.liveness_lease_is_held(fake_redis, user.id) is False
+    owed = (
+        (
+            await db_session.execute(
+                sa.select(PendingTeardown).where(PendingTeardown.user_id == user.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [row.app_name for row in owed] == [app_name_for(app.id)]
+    # The record's OWN birthday rides onto the row: it is what tells this container from whatever
+    # is created under the same name next.
+    assert owed[0].instance_ref == datetime.fromisoformat(born)
+    assert owed[0].project_id == app.project_id
+
+
+async def test_a_failed_teardown_keeps_its_state_when_the_app_row_has_gone(
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A container whose app no longer exists has no project to name and no copy to promise, so
+    the ledger refuses it and the old retry stands. Sparing, never forgetting."""
+    stranger = uuid.uuid4()
+    await _seed(fake_redis, USER, with_lock=True, with_heartbeat=False)
+    await _preserve(fake_storage, stranger)
+    client = FakeSandboxClient()
+    client.teardown_error = SandboxError("ARM said no")
+
+    async with _the_test_session(db_session, monkeypatch):
+        assert await reaper.reap_user(fake_redis, USER, client, app_id=stranger) is False
+
+    assert await locks.read_registry(fake_redis, USER) is not None
+    assert await locks.lock_is_held(fake_redis, USER) is True
+    assert (await db_session.scalar(sa.select(sa.func.count()).select_from(PendingTeardown))) == 0
+
+
+@contextlib.asynccontextmanager
+async def _the_test_session(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[None]:
+    """Bind the ledger's own session factory to the rolled-back test session.
+
+    The ledger resolves `async_session_factory` at CALL time precisely so this is possible — left
+    alone it would open a real connection, commit outside this test's transaction, and then fail
+    to see the user and app rows that only exist inside it."""
+    import src.db.base as db_base
+
+    @contextlib.asynccontextmanager
+    async def _session() -> AsyncIterator[AsyncSession]:
+        yield db_session
+
+    monkeypatch.setattr(db_base, "async_session_factory", lambda: _session())
+    yield
 
 
 # --- the boundary a second process may never cross ---------------------------

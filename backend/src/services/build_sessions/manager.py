@@ -62,6 +62,7 @@ from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import Conversation
 from src.db.models.harness_counter import HarnessCounter
 from src.db.models.message import Message, MessageEntryKind
+from src.db.models.pending_teardown import PendingTeardown
 from src.db.models.project import Project
 from src.db.models.user import User
 from src.services.build_sessions.alarms import (
@@ -844,6 +845,24 @@ async def _occupying_project(
                 app_id=app_id, project_id=project_id, project_name=project_name
             )
     return None
+
+
+async def _is_already_on_its_way_out(db: AsyncSession, user_id: uuid.UUID, app_name: str) -> bool:
+    """Is this container one the platform has already promised to destroy?
+
+    THE ONE WORKSPACE COUNTS SERVING CONTAINERS, NOT OWED ONES. A registry record survives for
+    as long as the shutdown routine takes to stop the agent, write the tree back and wait on an
+    ARM delete — minutes, on a throttled subscription hours — and for every one of those minutes
+    the record still says `ready` and still names a container. Read as an occupant it would put a
+    hand-over dialog in front of a citizen about a project the platform is already closing, and
+    on a failure of ours it would cost them their next project outright. An owed row is the
+    platform's debt; nobody pays for it with their own quota."""
+    owed = await db.scalar(
+        sa.select(PendingTeardown.id).where(
+            PendingTeardown.user_id == user_id, PendingTeardown.app_name == app_name
+        )
+    )
+    return owed is not None
 
 
 async def _occupying_shared_project(
@@ -2277,6 +2296,11 @@ class SessionManager:
             return
         occupied_by = reg.get(REGISTRY_FIELD_APP_NAME)
         if occupied_by is None or occupied_by == spare_app:
+            return
+        if await _is_already_on_its_way_out(db, user.id, occupied_by):
+            # ONE MORE SILENT EXIT, and it belongs with the four above: nothing is being taken.
+            # The container this record names is already owed a deletion, so it is closing down
+            # rather than holding anybody's workspace.
             return
         # A COLLEAGUE'S SHARED VIEW, CHECKED FIRST (#198, requirement 24). `shr_name_for`
         # hashes the (app, recipient) pair the identical forward-match-only way `app_name_for`

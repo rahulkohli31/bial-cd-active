@@ -1,13 +1,18 @@
-"""The scheduled sandbox sweep: `sweep_all` on the worker, every five minutes.
+"""The scheduled sandbox sweep on the worker, every five minutes: `sweep_all` over the registry,
+then `sweep_owed_teardowns` over the deletions this platform still owes.
+
+TWO INPUTS, BECAUSE THE REGISTRY CANNOT SEE THE SECOND POPULATION. A container whose deletion is
+owed has had its registry record cleared — that is what hands the citizen their workspace back
+after a failure of ours — so the scan reaches everything except exactly the containers that
+already went wrong once. The owed row is the only thing that still names one.
 
 TWO GATES BIND THIS PATH AND NEITHER IS OPTIONAL, because passing no `app_id` is how the
 durable-copy precondition is opted out of and this is where almost all of the deleting happens:
 `_owning_app_ids` resolves the owner so the gate binds, and `may_destroy_on_this_control_plane`
 keeps the unattended timer off every non-production control plane.
 
-THE PER-PASS CEILING IS THE ONE GUARD THIS PATH DELIBERATELY DOES NOT TAKE. It reaches only what
-the registry already has a record of, and a bounded sweep that never finishes its list would
-leave the same users unreconciled on every tick.
+THE PER-PASS CEILING IS THE ONE GUARD THIS PATH DELIBERATELY DOES NOT TAKE. A bounded sweep that
+never finishes its list would leave the same users unreconciled on every tick.
 """
 
 from __future__ import annotations
@@ -64,6 +69,7 @@ async def reap_abandoned_sandboxes() -> None:
         return
 
     from src.services.build_sessions.reaper import sweep_all
+    from src.services.build_sessions.shutdown import sweep_owed_teardowns
     from src.services.redis import get_redis
     from src.services.sandbox import SandboxNotConfiguredError, get_sandbox
 
@@ -76,14 +82,31 @@ async def reap_abandoned_sandboxes() -> None:
             live_users=set(),
             app_ids_by_name=await _owning_app_ids(),
         )
+        # THE REGISTRY IS NO LONGER THE ONLY INPUT. A container the platform owes a deletion for
+        # has had its registry record cleared — that is what gives the citizen their workspace
+        # back — so the scan above cannot see it at all. The owed row is the only thing that
+        # still names it, and this is the pass that acts on one.
+        owed = await sweep_owed_teardowns(get_redis(), get_sandbox())
     except SandboxNotConfiguredError:
         _log.info("sandbox_reap_pass_disabled", reason="unconfigured")
         return
 
-    if result.failed:
-        _log.warning("sandbox_reap_pass_partial", reaped=result.reaped, failed=result.failed)
+    if result.failed or owed.failed:
+        _log.warning(
+            "sandbox_reap_pass_partial",
+            reaped=result.reaped,
+            failed=result.failed,
+            owed_settled=owed.settled,
+            owed_still_outstanding=owed.still_owed,
+            owed_failed=owed.failed,
+        )
     else:
-        _log.info("sandbox_reap_pass_completed", reaped=result.reaped)
+        _log.info(
+            "sandbox_reap_pass_completed",
+            reaped=result.reaped,
+            owed_settled=owed.settled,
+            owed_still_outstanding=owed.still_owed,
+        )
 
 
 async def _owning_app_ids() -> dict[str, uuid.UUID]:

@@ -667,6 +667,40 @@ async def _take_the_copy_we_promised(
     return True
 
 
+async def _hand_the_debt_over(
+    reg: dict[str, str], *, user_uuid: uuid.UUID, app_id: uuid.UUID | None
+) -> bool:
+    """Put a deletion this reap could not perform on the owed-row ledger. True when it took it.
+
+    IMPORTED HERE, NOT AT MODULE SCOPE, and the reason is the same weight this module's other
+    function-scoped import cites: the ledger reaches `src.db.base`, which BUILDS THE ORM ENGINE
+    at import, and this module is imported cold by a standalone-import test.
+
+    NEVER RAISES. This sits inside the teardown-failure arm, and an exception escaping it would
+    end the whole sweep on the one path that already knows something went wrong. A ledger that
+    would not take the debt leaves the old behaviour — lock and registry kept for a later pass —
+    which is slower for the citizen but loses nothing."""
+    from src.services.build_sessions.shutdown import owe_a_teardown_the_reap_could_not_perform
+
+    try:
+        return await owe_a_teardown_the_reap_could_not_perform(
+            user_id=user_uuid,
+            app_id=app_id,
+            app_name=reg.get(REGISTRY_FIELD_APP_NAME, ""),
+            # The record's OWN birthday, which is what the owed row's instance check compares
+            # against: it is re-stamped at every registration, so it can tell this container from
+            # whatever is created under the same name next. No stamp, no discriminator, no row.
+            instance_ref=an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT),
+        )
+    except Exception:
+        _log.exception(
+            "could not record the deletion this reap failed to perform",
+            user_id=str(user_uuid),
+            app_name=reg.get(REGISTRY_FIELD_APP_NAME, ""),
+        )
+        return False
+
+
 async def reap_user(
     redis: aioredis.Redis,
     user_uuid: uuid.UUID,
@@ -680,9 +714,12 @@ async def reap_user(
     `strict` separates "nothing was registered" from "teardown failed". A sweep needs neither
     (fire-and-forget, retried in five minutes); a caller about to ACT does — a still-standing
     container would walk the client back into the refusal `release_project_sandbox` just told it
-    was resolved, so `strict=True` re-raises and it can answer 503. Lock + registry are KEPT on
-    failure either way. `app_id` opts into the durable-copy gate: `None` suits callers whose
-    builder is about to get a fresh container; the unwatched janitor always passes it."""
+    was resolved, so `strict=True` re-raises and it can answer 503. On a failed teardown the
+    deletion is handed to the owed-row ledger and this citizen's lock + registry are released;
+    only when nothing can take that debt are they kept for a later sweep instead. `app_id` opts
+    into the durable-copy gate AND is what the ledger needs to take the debt at all: `None` suits
+    callers whose builder is about to get a fresh container; the unwatched janitor always passes
+    it."""
     reg = await read_registry(redis, user_uuid)
     if reg is None:
         # No sandbox registered — just clear any orphaned lock so a crashed-tab user is
@@ -753,11 +790,23 @@ async def reap_user(
     try:
         await sandbox_client.teardown(_minimal_handle(reg))  # step 2: idempotent teardown
     except SandboxError:
-        # Teardown failed — KEEP the lock + registry so a later sweep retries; clearing
-        # them now would orphan a still-live container. Not silent (logged).
+        # THE DELETION BECOMES A DEBT, and the citizen stops paying for it. Holding the lock and
+        # registry here is how a later sweep used to find the container again — and it spent
+        # this citizen's one workspace on a failure of ours, so their next project could not
+        # start until an ARM that was refusing us started answering again. An owed row still
+        # names the container after the record is gone, so the state can go and the retry
+        # survives. Not silent (logged).
         _log.exception(
-            "reaper teardown failed; leaving state for a later sweep", user_id=str(user_uuid)
+            "reaper teardown failed; the deletion is now a debt this platform owes",
+            user_id=str(user_uuid),
         )
+        if await _hand_the_debt_over(reg, user_uuid=user_uuid, app_id=app_id):
+            await delete_registry(redis, user_uuid)
+            await release_liveness_lease(redis, user_uuid)
+            await reap_lock(redis, user_uuid)
+        # Nothing took the debt — no app owns this container, or its record cannot say WHICH
+        # container it is — so the state stays exactly where it was and a later sweep retries
+        # through it. Sparing, never forgetting.
         if strict:
             raise
         return False
@@ -766,10 +815,10 @@ async def reap_user(
     # container's whole life is over, so whether it ever served anybody is now a settled fact.
     _sound_the_alarm_if_the_proof_is_absent(reg, user_uuid=user_uuid)
     await delete_registry(redis, user_uuid)  # registry cleared
-    # ...and the liveness lease goes WITH the record it belonged to. Only here, after a
-    # teardown that actually succeeded: the failure arm above keeps lock + registry so a
-    # later sweep retries, and dropping the lease there would strip the protection off a
-    # container that is still standing and may still be building.
+    # ...and the liveness lease goes WITH the record it belonged to. The failure arm above
+    # releases it too, but only once an owed row has taken the deletion over; where nothing can,
+    # it is kept, because dropping it would strip the protection off a container that is still
+    # standing and may still be building.
     await release_liveness_lease(redis, user_uuid)
     await reap_lock(redis, user_uuid)  # step 3: release the (possibly drifted) lock — LAST
     return True
@@ -940,12 +989,16 @@ async def _container_age_source(
     return identity_from_tags({TAG_CREATED_AT: reg.get(REGISTRY_FIELD_CREATED_AT, "")})
 
 
-def _the_ceiling_switch() -> tuple[bool, int]:
+def the_ceiling_switch() -> tuple[bool, int]:
     """The ceiling's flag and its hours, or `(False, 0)` when no sandbox is configured.
 
     A LOCAL IMPORT, like `workers/sandbox_reap.py`'s destroy gate: this module is imported by the
     worker and by a standalone-import test, and neither may be made to drag the settings tree in
-    at module level."""
+    at module level.
+
+    Shared with the shutdown routine rather than re-read there: two readings of "what the ceiling
+    is" would be two numbers to keep in step, on the one question that decides whether a
+    container can be immortal."""
     from src.config import settings
 
     if settings.sandbox is None:
@@ -977,7 +1030,7 @@ async def _past_the_ceiling(
     arm it is standing in; this does not guess.
 
     Costs one ARM tag read, and only while the flag is on and something is about to be spared."""
-    enabled, after_hours = _the_ceiling_switch()
+    enabled, after_hours = the_ceiling_switch()
     if not enabled:
         return False
     app_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
