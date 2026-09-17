@@ -85,7 +85,7 @@ describe('ProjectDescriptionEditor — the field is the write surface', () => {
 
     expect(textarea().value).toBe('')
     expect(textarea().placeholder).toBe('Who uses it, and what do they do with it?')
-    expect(screen.getByText('0/120 words')).toBeTruthy()
+    expect(screen.getByText('0 of 15–120 words')).toBeTruthy()
   })
 
   it('★ draws no heading of its own — the form that holds it names it', () => {
@@ -320,10 +320,14 @@ describe('ProjectDescriptionEditor — required + word bound (#191)', () => {
     render(<ProjectDescriptionEditor projectId="p1" description="stored text" onProjectUpdate={vi.fn()} />)
 
     type(wordsOf(3))
-    expect(screen.getByText('3/120 words').className).toMatch(/text-danger/)
+    // THE FLOOR IS ON SCREEN, not only in the gate. A count alone leaves an owner below the
+    // minimum with a dead Save and a red number that never says what would fix it.
+    expect(screen.getByText('3 of 15–120 words').className).toMatch(/text-danger/)
 
     type(wordsOf(MIN_PROJECT_DESCRIPTION_WORDS))
-    expect(screen.getByText(`${MIN_PROJECT_DESCRIPTION_WORDS}/120 words`).className).not.toMatch(/text-danger/)
+    expect(
+      screen.getByText(`${MIN_PROJECT_DESCRIPTION_WORDS} of 15–120 words`).className,
+    ).not.toMatch(/text-danger/)
   })
 })
 

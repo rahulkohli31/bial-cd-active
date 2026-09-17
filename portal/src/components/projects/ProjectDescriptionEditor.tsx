@@ -1,10 +1,9 @@
 /**
  * The application's description — EDITED WHERE IT IS READ.
  *
- * It used to be a read-only paragraph with an Edit button that opened a second dialog on top of
- * the settings dialog, to type into a textarea. Two modals deep, two focus traps, two Escape
- * meanings, for a field the settings dialog was already showing. The textarea is the surface now:
- * type in it, and Save appears because there is something to save.
+ * The textarea IS the surface: type in it, and Save appears because there is something to save.
+ * A field the settings dialog is already showing does not need a second dialog on top of it to
+ * be typed into.
  *
  * One behaviour is load-bearing, not polish: every failure leaves the field untouched. The text
  * only changes on a *successful* save (to the server's canonical copy) or by the user typing.
@@ -111,8 +110,11 @@ export default function ProjectDescriptionEditor({
       />
 
       <div className="mt-1.5 flex items-center justify-between gap-3">
+        {/* THE COUNTER STATES BOTH BOUNDS, not just the ceiling. Save is gated on the floor too,
+            so a count alone leaves an owner with a description written before the rule holding a
+            dead Save button and a red number that never says what would fix it. */}
         <span className={`text-xs ${counterClass}`}>
-          {words}/{MAX_PROJECT_DESCRIPTION_WORDS} words
+          {words} of {MIN_PROJECT_DESCRIPTION_WORDS}–{MAX_PROJECT_DESCRIPTION_WORDS} words
         </span>
 
         {/* THE CONTROLS APPEAR BECAUSE THERE IS SOMETHING TO DO. An always-present Save on a
