@@ -44,6 +44,8 @@ from src.services.storage.keys import recovery_key as recovery_key
 from src.services.storage.keys import snapshot_key as snapshot_key
 from src.services.storage.keys import submission_key as submission_key
 from src.services.storage.keys import submissions_prefix as submissions_prefix
+from src.services.storage.keys import version_key as version_key
+from src.services.storage.keys import version_prefix as version_prefix
 from src.services.storage.listing import all_keys_under as all_keys_under
 from src.services.storage.snapshot_read import ExtractedSnapshot as ExtractedSnapshot
 from src.services.storage.snapshot_read import NoAppYet as NoAppYet
