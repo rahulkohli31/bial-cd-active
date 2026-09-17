@@ -4,7 +4,7 @@
  * that will not parse, and a range whose two ends are in different years.
  */
 import { describe, it, expect } from 'vitest'
-import { dayMonth, listDate, tileDateRange, tileDateTitle } from '../projectDates'
+import { dayMonth, listDate, tileDateRange, tileDateTitle, versionStamp } from '../projectDates'
 
 const NOV_2025 = '2025-11-11T09:00:00Z'
 const SEP_2026 = '2026-09-14T09:00:00Z'
@@ -55,5 +55,30 @@ describe('the arrow does not say which end is which, so the hover does', () => {
     expect(tileDateTitle(NOV_2025, SEP_2026)).toBe(
       'Created 11 Nov 2025 · Details updated 14 Sep 2026',
     )
+  })
+})
+
+describe('versionStamp', () => {
+  it('names today and yesterday, and dates anything older', () => {
+    const now = new Date()
+    now.setHours(14, 2, 0, 0)
+    expect(versionStamp(now.toISOString())).toBe('Today, 14:02')
+
+    const yesterday = new Date(now)
+    yesterday.setDate(yesterday.getDate() - 1)
+    yesterday.setHours(9, 41, 0, 0)
+    expect(versionStamp(yesterday.toISOString())).toBe('Yesterday, 09:41')
+
+    // Older than yesterday: the day and month, and the clock alongside it — two saves on one
+    // day is the ordinary case, so a date alone could name both.
+    const older = new Date(now)
+    older.setDate(older.getDate() - 16)
+    older.setHours(9, 41, 0, 0)
+    expect(versionStamp(older.toISOString())).toMatch(/^\d{1,2} \w{3}, 09:41$/)
+  })
+
+  it('renders an unparseable stamp as a dash rather than Invalid Date', () => {
+    expect(versionStamp('not-a-date')).toBe('—')
+    expect(versionStamp(null)).toBe('—')
   })
 })
